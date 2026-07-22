@@ -6791,7 +6791,12 @@ mod tests {
             .unwrap();
     }
 
-    fn create_role_account_boe_bucket(coord: &Coordinator, name: &str) {
+    fn create_role_account_bucket(
+        coord: &Coordinator,
+        name: &str,
+        ownership: crate::coordinator::BucketObjectOwnership,
+        object_lock_enabled: bool,
+    ) {
         coord
             .create_bucket(&crate::coordinator::CreateBucketRequest {
                 name: parse_bucket_name(name).unwrap(),
@@ -6804,10 +6809,37 @@ mod tests {
                 ),
                 namespace: BucketNamespace::Global,
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
-                ownership: crate::coordinator::BucketObjectOwnership::BucketOwnerEnforced,
-                object_lock_enabled: false,
+                ownership,
+                object_lock_enabled,
             })
             .unwrap();
+    }
+
+    fn create_role_account_boe_bucket(coord: &Coordinator, name: &str) {
+        create_role_account_bucket(
+            coord,
+            name,
+            crate::coordinator::BucketObjectOwnership::BucketOwnerEnforced,
+            false,
+        );
+    }
+
+    fn create_role_account_boe_object_lock_bucket(coord: &Coordinator, name: &str) {
+        create_role_account_bucket(
+            coord,
+            name,
+            crate::coordinator::BucketObjectOwnership::BucketOwnerEnforced,
+            true,
+        );
+    }
+
+    fn create_role_account_acl_bucket(coord: &Coordinator, name: &str) {
+        create_role_account_bucket(
+            coord,
+            name,
+            crate::coordinator::BucketObjectOwnership::ObjectWriter,
+            false,
+        );
     }
 
     fn role_session_live_identity() -> auth::LiveRoleIdentity {
@@ -6841,27 +6873,38 @@ mod tests {
         )
     }
 
-    fn install_put_role_session(frontend: &mut HttpFrontend) -> InstalledPostSession {
+    fn install_role_session_for_object_action_with_effect(
+        frontend: &mut HttpFrontend,
+        action: &str,
+        policy_name: &str,
+        effect: Option<auth::PolicyEffect>,
+    ) -> InstalledPostSession {
         let live_role = role_session_live_identity();
-        let identity_policy = auth::IdentityPolicy::new(
-            Some(auth::PolicyVersion::V2012_10_17),
-            vec![auth::IdentityPolicyStatement::new(
-                auth::PolicyEffect::Allow,
-                vec![auth::IamActionPattern::new("s3:PutObject").unwrap()],
-                vec![auth::IamResourcePattern::new("arn:aws:s3:::mybucket/mykey").unwrap()],
-            )
-            .unwrap()],
-        )
-        .unwrap();
+        let permission_policies = effect
+            .map(|effect| {
+                let identity_policy = auth::IdentityPolicy::new(
+                    Some(auth::PolicyVersion::V2012_10_17),
+                    vec![auth::IdentityPolicyStatement::new(
+                        effect,
+                        vec![auth::IamActionPattern::new(action).unwrap()],
+                        vec![auth::IamResourcePattern::new("arn:aws:s3:::mybucket/mykey").unwrap()],
+                    )
+                    .unwrap()],
+                )
+                .unwrap();
+                auth::InlineIdentityPolicy::new(
+                    auth::InlinePolicyName::new(policy_name).unwrap(),
+                    Arc::new(identity_policy),
+                )
+            })
+            .into_iter()
+            .collect();
         let role_record = auth::RoleAuthorizationRecord::new(
             Arc::new(live_role.clone()),
             auth::RoleRecordTimestamps::new(1, 1).unwrap(),
             auth::RoleMaximumSessionDuration::new(3_600).unwrap(),
             role_trust_policy(),
-            vec![auth::InlineIdentityPolicy::new(
-                auth::InlinePolicyName::new("put-policy").unwrap(),
-                Arc::new(identity_policy),
-            )],
+            permission_policies,
         )
         .unwrap();
         let mut roles = auth::RoleIdentityStore::new();
@@ -6875,6 +6918,96 @@ mod tests {
         )
         .unwrap();
         issue_live_session(frontend)
+    }
+
+    fn install_put_role_session(frontend: &mut HttpFrontend) -> InstalledPostSession {
+        install_role_session_for_object_action_with_effect(
+            frontend,
+            "s3:PutObject",
+            "put-policy",
+            Some(auth::PolicyEffect::Allow),
+        )
+    }
+
+    fn install_get_role_session(frontend: &mut HttpFrontend) -> InstalledPostSession {
+        install_role_session_for_object_action_with_effect(
+            frontend,
+            "s3:GetObject",
+            "get-policy",
+            Some(auth::PolicyEffect::Allow),
+        )
+    }
+
+    fn put_role_account_object(frontend: &HttpFrontend, data: &[u8]) {
+        put_role_account_object_with_optional_attributes(
+            frontend,
+            data,
+            None,
+            ObjectLockState::default(),
+        );
+    }
+
+    fn put_role_account_object_with_optional_attributes(
+        frontend: &HttpFrontend,
+        data: &[u8],
+        tags: Option<&str>,
+        object_lock: ObjectLockState,
+    ) {
+        let account = s3_types::AccountIdentity::new(
+            "111122223333",
+            s3_types::CanonicalUserId::from_principal("111122223333"),
+            "bucket owner",
+        );
+        let metadata = crate::metadata_blob::MetadataBlob::default();
+        let system_metadata = server_core::system_metadata::SystemMetadata::default();
+        frontend
+            .coordinator
+            .put_object(&crate::coordinator::PutObjectRequest {
+                object: crate::coordinator::ObjectRequest::new(
+                    parse_bucket_name("mybucket").unwrap(),
+                    parse_object_key("mykey").unwrap(),
+                    crate::coordinator::Requester::authenticated_owner_account_admin(account),
+                    None,
+                ),
+                data,
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags,
+                cond: &crate::conditional::WriteCondition::default(),
+                acl: crate::coordinator::PutObjectAcl::None.into(),
+                policy_context: crate::coordinator::PutObjectPolicyContext::default(),
+                object_lock,
+                encryption: crate::coordinator::WriteEncryptionRequest::none(),
+            })
+            .unwrap();
+    }
+
+    fn put_role_get_object_bucket_policy(frontend: &HttpFrontend, effect: auth::PolicyEffect) {
+        let effect = match effect {
+            auth::PolicyEffect::Allow => "Allow",
+            auth::PolicyEffect::Deny => "Deny",
+        };
+        let config = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"{effect}","Principal":{{"AWS":"arn:aws:iam::111122223333:role/test/put-role"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::mybucket/mykey"}}]}}"#,
+        );
+        frontend
+            .coordinator
+            .put_bucket_policy(&crate::coordinator::PutBucketPolicyRequest {
+                bucket: crate::coordinator::BucketRequest::new(
+                    test_bucket_name("mybucket"),
+                    crate::coordinator::Requester::authenticated_owner_account_admin(
+                        s3_types::AccountIdentity::new(
+                            "111122223333",
+                            s3_types::CanonicalUserId::from_principal("111122223333"),
+                            "bucket owner",
+                        ),
+                    ),
+                    None,
+                ),
+                config: &config,
+                confirm_remove_self_bucket_access: false,
+            })
+            .unwrap();
     }
 
     fn issue_live_session(frontend: &HttpFrontend) -> InstalledPostSession {
@@ -6943,6 +7076,257 @@ mod tests {
     }
 
     #[test]
+    fn assumed_role_get_object_uses_current_role_permissions_after_authentication() {
+        let tmp = test_util::tempdir();
+        let mut frontend = setup_frontend(tmp.path());
+        create_role_account_boe_object_lock_bucket(&frontend.coordinator, "mybucket");
+        put_role_account_object_with_optional_attributes(
+            &frontend,
+            b"role data",
+            Some(
+                "<Tagging><TagSet><Tag><Key>review</Key><Value>hidden</Value></Tag></TagSet></Tagging>",
+            ),
+            ObjectLockState {
+                retention: Some(ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: 4_102_444_800,
+                }),
+                legal_hold: StoredLegalHoldStatus::On,
+            },
+        );
+        let session = install_get_role_session(&mut frontend);
+        let request = signed_v4_get_req_with_credentials(
+            &session.access_key_id,
+            &session.secret_key,
+            Some(&session.token),
+        );
+
+        let auth_context = frontend
+            .authenticate(&request, None)
+            .expect("temporary credential should authenticate before authorization lookup");
+        let response = frontend
+            .dispatch_routed(
+                &request,
+                &auth_context,
+                S3Operation::GetObject {
+                    bucket: test_bucket_name("mybucket"),
+                    key: "mykey".to_string(),
+                },
+            )
+            .expect("current role identity policy should authorize GetObject");
+
+        assert_eq!(response.status_code, 200);
+        let mut response_header_names = response
+            .headers
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        response_header_names.sort_unstable();
+        assert_eq!(
+            response_header_names,
+            [
+                "accept-ranges",
+                "content-length",
+                "content-type",
+                "etag",
+                "last-modified",
+                "x-amz-server-side-encryption",
+                "x-amz-version-id",
+            ]
+        );
+        assert_eq!(
+            find_header(&response, "x-amz-server-side-encryption"),
+            Some("AES256")
+        );
+        assert_eq!(response.into_test_body_bytes().unwrap(), b"role data");
+    }
+
+    #[test]
+    fn assumed_role_get_object_keeps_unpinned_adjacent_and_missing_reads_closed() {
+        let tmp = test_util::tempdir();
+        let mut frontend = setup_frontend(tmp.path());
+        create_role_account_boe_bucket(&frontend.coordinator, "mybucket");
+        put_role_account_object(&frontend, b"role data");
+        let session = install_get_role_session(&mut frontend);
+
+        let head_request = signed_v4_req_with_credentials(
+            http::Method::HEAD,
+            b"",
+            Vec::new(),
+            &session.access_key_id,
+            &session.secret_key,
+            Some(&session.token),
+        );
+        let head_auth = frontend
+            .authenticate(&head_request, None)
+            .expect("temporary credential should authenticate before HEAD authorization");
+        assert!(matches!(
+            frontend.dispatch_routed(
+                &head_request,
+                &head_auth,
+                S3Operation::HeadObject {
+                    bucket: test_bucket_name("mybucket"),
+                    key: "mykey".to_string(),
+                },
+            ),
+            Err(ServerError::AccessDenied)
+        ));
+
+        let range_request = signed_v4_req_with_credentials(
+            http::Method::GET,
+            b"",
+            vec![("range".to_string(), "bytes=0-0".to_string())],
+            &session.access_key_id,
+            &session.secret_key,
+            Some(&session.token),
+        );
+        let range_auth = frontend
+            .authenticate(&range_request, None)
+            .expect("temporary credential should authenticate before range authorization");
+        assert!(matches!(
+            frontend.dispatch_routed(
+                &range_request,
+                &range_auth,
+                S3Operation::GetObject {
+                    bucket: test_bucket_name("mybucket"),
+                    key: "mykey".to_string(),
+                },
+            ),
+            Err(ServerError::AccessDenied)
+        ));
+
+        let missing_request = signed_v4_get_req_with_credentials(
+            &session.access_key_id,
+            &session.secret_key,
+            Some(&session.token),
+        );
+        let missing_auth = frontend
+            .authenticate(&missing_request, None)
+            .expect("temporary credential should authenticate before missing-key authorization");
+        assert!(matches!(
+            frontend.dispatch_routed(
+                &missing_request,
+                &missing_auth,
+                S3Operation::GetObject {
+                    bucket: test_bucket_name("mybucket"),
+                    key: "missing-key".to_string(),
+                },
+            ),
+            Err(ServerError::AccessDenied)
+        ));
+    }
+
+    #[test]
+    fn assumed_role_get_object_keeps_acl_enabled_resource_policy_reads_closed() {
+        let tmp = test_util::tempdir();
+        let mut frontend = setup_frontend(tmp.path());
+        create_role_account_acl_bucket(&frontend.coordinator, "mybucket");
+        put_role_account_object(&frontend, b"role data");
+        let session = install_get_role_session(&mut frontend);
+        put_role_get_object_bucket_policy(&frontend, auth::PolicyEffect::Allow);
+        let request = signed_v4_get_req_with_credentials(
+            &session.access_key_id,
+            &session.secret_key,
+            Some(&session.token),
+        );
+
+        let auth_context = frontend
+            .authenticate(&request, None)
+            .expect("temporary credential should authenticate before ACL-mode authorization");
+        assert!(matches!(
+            frontend.dispatch_routed(
+                &request,
+                &auth_context,
+                S3Operation::GetObject {
+                    bucket: test_bucket_name("mybucket"),
+                    key: "mykey".to_string(),
+                },
+            ),
+            Err(ServerError::AccessDenied)
+        ));
+    }
+
+    #[test]
+    fn assumed_role_get_object_denials_match_aws_wire_messages() {
+        let cases = [
+            (
+                "implicit-deny",
+                None,
+                None,
+                " because no identity-based policy allows the s3:GetObject action",
+            ),
+            (
+                "identity-explicit-deny",
+                Some(auth::PolicyEffect::Deny),
+                Some(auth::PolicyEffect::Allow),
+                " with an explicit deny in an identity-based policy",
+            ),
+            (
+                "resource-explicit-deny",
+                Some(auth::PolicyEffect::Allow),
+                Some(auth::PolicyEffect::Deny),
+                " with an explicit deny in a resource-based policy",
+            ),
+            (
+                "dual-explicit-deny",
+                Some(auth::PolicyEffect::Deny),
+                Some(auth::PolicyEffect::Deny),
+                " with an explicit deny in a resource-based policy",
+            ),
+        ];
+
+        for (label, identity_effect, resource_effect, suffix) in cases {
+            let tmp = test_util::tempdir();
+            let mut frontend = setup_frontend(tmp.path());
+            create_role_account_boe_bucket(&frontend.coordinator, "mybucket");
+            put_role_account_object(&frontend, b"role data");
+            let session = install_role_session_for_object_action_with_effect(
+                &mut frontend,
+                "s3:GetObject",
+                "get-policy",
+                identity_effect,
+            );
+            if let Some(effect) = resource_effect {
+                put_role_get_object_bucket_policy(&frontend, effect);
+            }
+            let request = signed_v4_get_path_req_with_credentials(
+                "/mybucket/mykey",
+                &session.access_key_id,
+                &session.secret_key,
+                Some(&session.token),
+            );
+            let response = frontend
+                .handle_s3_request(&request, &WireResponseIds::new("request-id", "host-id"));
+
+            assert_eq!(response.status_code, 403, "{label}");
+            let mut response_headers = response
+                .headers
+                .iter()
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.as_str()))
+                .collect::<Vec<_>>();
+            response_headers.sort_unstable();
+            assert_eq!(
+                response_headers,
+                [("content-type".to_string(), "application/xml")],
+                "{label}"
+            );
+            assert_eq!(
+                response.into_test_body_bytes().unwrap(),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>AccessDenied</Code>\
+                     <Message>User: arn:aws:sts::111122223333:assumed-role/put-role/put-session \
+                     is not authorized to perform: s3:GetObject on resource: \
+                     \"arn:aws:s3:::mybucket/mykey\"{suffix}</Message>\
+                     <RequestId>request-id</RequestId><HostId>host-id</HostId></Error>"
+                )
+                .as_bytes(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
     fn assumed_role_authorization_provider_failure_occurs_after_authentication() {
         let tmp = test_util::tempdir();
         let mut frontend = setup_frontend(tmp.path());
@@ -6970,6 +7354,43 @@ mod tests {
                 &request,
                 &auth_context,
                 S3Operation::PutObject {
+                    bucket: test_bucket_name("mybucket"),
+                    key: "mykey".to_string(),
+                },
+            ),
+            Err(ServerError::IdentityProvider(
+                auth::IdentityProviderError::Unavailable
+            ))
+        ));
+    }
+
+    #[test]
+    fn assumed_role_get_provider_failure_occurs_after_authentication() {
+        let tmp = test_util::tempdir();
+        let mut frontend = setup_frontend(tmp.path());
+        create_role_account_boe_bucket(&frontend.coordinator, "mybucket");
+        put_role_account_object(&frontend, b"role data");
+        let live_role = role_session_live_identity();
+        frontend.identity_provider =
+            auth::IdentityProvider::new(RoleAuthorizationFailureProvider {
+                role: Arc::new(live_role),
+            })
+            .expect("initialize session-token key ring");
+        let session = issue_live_session(&frontend);
+        let request = signed_v4_get_req_with_credentials(
+            &session.access_key_id,
+            &session.secret_key,
+            Some(&session.token),
+        );
+
+        let auth_context = frontend
+            .authenticate(&request, None)
+            .expect("role liveness and signature verification should succeed");
+        assert!(matches!(
+            frontend.dispatch_routed(
+                &request,
+                &auth_context,
+                S3Operation::GetObject {
                     bucket: test_bucket_name("mybucket"),
                     key: "mykey".to_string(),
                 },
@@ -7377,7 +7798,9 @@ mod tests {
         b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n".to_vec()
     }
 
-    fn signed_v4_put_req_with_credentials(
+    fn signed_v4_req_for_path_with_credentials(
+        method: http::Method,
+        path: &str,
         body: &[u8],
         extra_headers: Vec<(String, String)>,
         access_key_id: &str,
@@ -7413,8 +7836,8 @@ mod tests {
         let canonical_headers = canonical_headers(&canonical_headers_input);
         let canonical_query = canonical_query_string("");
         let canonical_req = canonical_request(
-            "PUT",
-            "/",
+            method.as_str(),
+            path,
             &canonical_query,
             &canonical_headers,
             &signed_headers_str,
@@ -7437,7 +7860,75 @@ mod tests {
                 access_key_id, scope, signed_headers_str, signature
             ),
         ));
-        new_req(http::Method::PUT, "/", "", headers, body.to_vec())
+        new_req(method, path, "", headers, body.to_vec())
+    }
+
+    fn signed_v4_req_with_credentials(
+        method: http::Method,
+        body: &[u8],
+        extra_headers: Vec<(String, String)>,
+        access_key_id: &str,
+        secret_key: &SecretKey,
+        security_token: Option<&str>,
+    ) -> S3Request {
+        signed_v4_req_for_path_with_credentials(
+            method,
+            "/",
+            body,
+            extra_headers,
+            access_key_id,
+            secret_key,
+            security_token,
+        )
+    }
+
+    fn signed_v4_put_req_with_credentials(
+        body: &[u8],
+        extra_headers: Vec<(String, String)>,
+        access_key_id: &str,
+        secret_key: &SecretKey,
+        security_token: Option<&str>,
+    ) -> S3Request {
+        signed_v4_req_with_credentials(
+            http::Method::PUT,
+            body,
+            extra_headers,
+            access_key_id,
+            secret_key,
+            security_token,
+        )
+    }
+
+    fn signed_v4_get_req_with_credentials(
+        access_key_id: &str,
+        secret_key: &SecretKey,
+        security_token: Option<&str>,
+    ) -> S3Request {
+        signed_v4_req_with_credentials(
+            http::Method::GET,
+            b"",
+            Vec::new(),
+            access_key_id,
+            secret_key,
+            security_token,
+        )
+    }
+
+    fn signed_v4_get_path_req_with_credentials(
+        path: &str,
+        access_key_id: &str,
+        secret_key: &SecretKey,
+        security_token: Option<&str>,
+    ) -> S3Request {
+        signed_v4_req_for_path_with_credentials(
+            http::Method::GET,
+            path,
+            b"",
+            Vec::new(),
+            access_key_id,
+            secret_key,
+            security_token,
+        )
     }
 
     fn signed_v4_put_req(body: &[u8], extra_headers: Vec<(String, String)>) -> S3Request {

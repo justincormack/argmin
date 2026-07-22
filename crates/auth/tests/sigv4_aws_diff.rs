@@ -144,6 +144,7 @@ fn differential_request_strategy() -> impl Strategy<Value = DifferentialRequest>
     let method = prop_oneof![
         Just("GET".to_string()),
         Just("HEAD".to_string()),
+        Just("POST".to_string()),
         Just("PUT".to_string()),
         Just("DELETE".to_string()),
     ];

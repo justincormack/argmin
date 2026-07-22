@@ -186,6 +186,37 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::Auth(auth::AuthError::AccessDenied)
         | ServerError::AccessDenied
         | ServerError::BlockPublicPolicyAccessDenied { .. } => "Access Denied".to_string(),
+        ServerError::AssumedRolePolicyAccessDenied {
+            principal_arn,
+            action,
+            resource,
+            kind,
+        } => {
+            let suffix = match kind {
+                server_core::error::AssumedRolePolicyDenialKind::NoIdentityPolicyAllow => {
+                    format!(
+                        " because no identity-based policy allows the {} action",
+                        action.as_str()
+                    )
+                }
+                server_core::error::AssumedRolePolicyDenialKind::ExplicitIdentityPolicyDeny => {
+                    " with an explicit deny in an identity-based policy".to_string()
+                }
+                server_core::error::AssumedRolePolicyDenialKind::ExplicitResourcePolicyDeny => {
+                    " with an explicit deny in a resource-based policy".to_string()
+                }
+                server_core::error::AssumedRolePolicyDenialKind::ExplicitIdentityAndResourcePolicyDeny => {
+                    // AWS has emitted both source suffixes for this state. Use
+                    // one observed spelling while retaining the dual-source
+                    // decision in the typed error.
+                    " with an explicit deny in a resource-based policy".to_string()
+                }
+            };
+            format!(
+                "User: {principal_arn} is not authorized to perform: {} on resource: \"{resource}\"{suffix}",
+                action.as_str()
+            )
+        }
         ServerError::ObjectLockProtectedAccessDenied => {
             "Access Denied because object protected by object lock.".to_string()
         }
@@ -805,6 +836,7 @@ impl S3Response {
                 Self::new(400).chunked_xml_body(body)
             }
             ServerError::AccessDenied
+            | ServerError::AssumedRolePolicyAccessDenied { .. }
             | ServerError::ObjectLockProtectedAccessDenied
             | ServerError::Auth(auth::AuthError::MissingAuth)
             | ServerError::Auth(auth::AuthError::AccessDenied) => {

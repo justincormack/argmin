@@ -186,7 +186,20 @@ struct AuthorizedObjectReadSnapshotRequest<'a> {
     expected_bucket_owner: Option<&'a str>,
     missing_discovery: MissingObjectDiscovery,
     modern_action: ModernReadAction,
+    role_read_surface: RoleReadSurface,
     snapshot_mode: ObjectReadSnapshotMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::coordinator) enum RoleReadSurface {
+    CurrentGetObject,
+    UnpinnedAdjacent,
+}
+
+impl RoleReadSurface {
+    fn permits(self, action: ModernReadAction) -> bool {
+        self == Self::CurrentGetObject && action == ModernReadAction::ReadCurrent
+    }
 }
 
 enum ObjectAuthLoadedBucketHandle<'a> {
@@ -378,6 +391,13 @@ impl Coordinator {
         ),
         ServerError,
     > {
+        if req.requester.is_assumed_role_session()
+            && !req.role_read_surface.permits(req.modern_action)
+        {
+            // Apply the role-session surface fence before ownership-mode
+            // dispatch so ACL-enabled buckets cannot bypass it.
+            return Err(ServerError::AccessDenied);
+        }
         let bucket = self.load_bucket_handle_for_modern_object_read_with_storage_node(
             storage_node,
             req.bucket,
@@ -388,7 +408,13 @@ impl Coordinator {
                 self.authorize_object_read_snapshot_boe(storage_node, req, bucket)
             }
             ObjectAuthLoadedBucketHandle::NonBoe(bucket) => {
-                self.authorize_object_read_snapshot_non_boe(storage_node, req, bucket)
+                if req.requester.is_assumed_role_session() {
+                    // ACL-enabled role-session reads need their own AWS
+                    // authorization and ownership matrix.
+                    Err(ServerError::AccessDenied)
+                } else {
+                    self.authorize_object_read_snapshot_non_boe(storage_node, req, bucket)
+                }
             }
         }
     }
@@ -1406,6 +1432,12 @@ impl Coordinator {
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<ObjectAttributePermissions, ServerError> {
         if !action.discloses_optional_attributes() {
+            return Ok(ObjectAttributePermissions::default());
+        }
+        if requester.is_assumed_role_session() {
+            // These optional GetObject response fields require separate
+            // GetObjectRetention, GetObjectLegalHold, and GetObjectTagging
+            // authorization. Their role-session composition is not yet pinned.
             return Ok(ObjectAttributePermissions::default());
         }
 

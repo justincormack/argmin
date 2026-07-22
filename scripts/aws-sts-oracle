@@ -23,6 +23,8 @@ Options:
                      self-cleaning, permissionless IAM-user access-key
                      deactivation matrix; does not run the ordinary expiry suite
   --cross-account   Also include cross-account success and denial probes
+  --signature-stress
+                     Send 256 identical and 256 freshly signed caller-identity POSTs
   --region REGION   Override the STS signing region (default: TEST_S3_REGION or us-east-1)
   --endpoint URL    Override the regional STS endpoint
   --s3-control-endpoint URL
@@ -52,6 +54,7 @@ assume_role=false
 cross_account=false
 disabled_credential=false
 expiry_collision=false
+signature_stress=false
 region=""
 endpoint=""
 s3_control_endpoint=""
@@ -78,6 +81,10 @@ while (($#)); do
         --cross-account)
             assume_role=true
             cross_account=true
+            shift
+            ;;
+        --signature-stress)
+            signature_stress=true
             shift
             ;;
         --region)
@@ -145,6 +152,9 @@ export AWS_TEST_REGION="$region"
 export STS_TEST_ENDPOINT="$endpoint"
 export S3_CONTROL_TEST_ENDPOINT="$s3_control_endpoint"
 export S3_TEST_TIMEOUT_SECS="$timeout_secs"
+if [[ "$signature_stress" == true ]]; then
+    export STS_TEST_IDENTICAL_SIGNATURE_STRESS=1
+fi
 
 aws_with_optional_session_credentials() {
     local access_key="$1"
@@ -985,6 +995,14 @@ wait_for_role_get_object_result() {
                 "$error_file" && \
             grep -Fq 'with an explicit deny in a resource-based policy' "$error_file"; then
             ((consecutive_results += 1))
+        elif [[ "$expected" == explicit-identity-or-resource-deny ]] && \
+            grep -Fq \
+                'An error occurred (AccessDenied) when calling the GetObject operation:' \
+                "$error_file" && \
+            grep -Eq \
+                'with an explicit deny in an? (identity|resource)-based policy' \
+                "$error_file"; then
+            ((consecutive_results += 1))
         elif [[ "$expected" == implicit-deny ]] && \
             grep -Fq \
                 'An error occurred (AccessDenied) when calling the GetObject operation:' \
@@ -1029,6 +1047,8 @@ create_role_get_object_fixture() {
         role-get-resource-allow \
         role-get-identity-deny \
         role-get-resource-deny \
+        role-get-resource-deny-deny-role-control \
+        role-get-both-deny \
         role-get-neither; do
         empty_body="$tmpdir/${key}-body"
         : >"$empty_body"
@@ -1129,10 +1149,15 @@ create_role_get_object_fixture() {
         external_s3_test_die "GetObject deny role does not have the required permissions boundary"
     deny_policy="$tmpdir/role-get-object-deny.json"
     jq -n \
-        --arg resource "arn:aws:s3:::${STS_TEST_POST_BUCKET}/role-get-identity-deny" \
+        --arg identity_deny "arn:aws:s3:::${STS_TEST_POST_BUCKET}/role-get-identity-deny" \
+        --arg both_deny "arn:aws:s3:::${STS_TEST_POST_BUCKET}/role-get-both-deny" \
         '{
             Version: "2012-10-17",
-            Statement: [{Effect: "Deny", Action: "s3:GetObject", Resource: $resource}]
+            Statement: [{
+                Effect: "Deny",
+                Action: "s3:GetObject",
+                Resource: [$identity_deny, $both_deny]
+            }]
         }' >"$deny_policy"
     aws_primary iam put-role-policy \
         --role-name "$STS_TEST_GET_DENY_ROLE_NAME" \
@@ -1998,6 +2023,16 @@ create_assume_role_fixture() {
                     Resource: ($bucket_arn + "/role-get-resource-deny")
                 },
                 {
+                    Sid: "DenyGetObjectForIdentityDenyRole",
+                    Effect: "Deny",
+                    Principal: {AWS: $get_deny_principal},
+                    Action: "s3:GetObject",
+                    Resource: [
+                        ($bucket_arn + "/role-get-resource-deny-deny-role-control"),
+                        ($bucket_arn + "/role-get-both-deny")
+                    ]
+                },
+                {
                     Sid: "AllowMatchingIamUserPrincipalArn",
                     Effect: "Allow",
                     Principal: {AWS: $iam_user_principal},
@@ -2176,6 +2211,20 @@ create_assume_role_fixture() {
         "$STS_TEST_GET_ALLOW_SESSION_TOKEN" \
         role-get-resource-deny \
         explicit-resource-deny
+    wait_for_role_get_object_result \
+        role-get-resource-deny-deny-role-control \
+        "$STS_TEST_GET_DENY_ACCESS_KEY" \
+        "$STS_TEST_GET_DENY_SECRET_KEY" \
+        "$STS_TEST_GET_DENY_SESSION_TOKEN" \
+        role-get-resource-deny-deny-role-control \
+        explicit-resource-deny
+    wait_for_role_get_object_result \
+        role-get-both-deny-control \
+        "$STS_TEST_GET_DENY_ACCESS_KEY" \
+        "$STS_TEST_GET_DENY_SECRET_KEY" \
+        "$STS_TEST_GET_DENY_SESSION_TOKEN" \
+        role-get-both-deny \
+        explicit-identity-or-resource-deny
     wait_for_role_get_object_result \
         role-get-neither-control \
         "$STS_TEST_GET_ALLOW_ACCESS_KEY" \

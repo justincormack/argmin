@@ -221,7 +221,7 @@ fn tag_resource_with_credentials(
         &url,
         tag_resource_body(tags).as_bytes(),
         [("x-amz-account-id", CTX.account_id())],
-        "s3",
+        s3_tests::SigningService::S3Control,
         credentials,
     )
 }
@@ -255,7 +255,7 @@ fn untag_resource_query_with_credentials(
         &url,
         &[],
         [("x-amz-account-id", CTX.account_id())],
-        "s3",
+        s3_tests::SigningService::S3Control,
         credentials,
     )
 }

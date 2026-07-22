@@ -225,7 +225,7 @@ impl Coordinator {
             bucket: bucket_summary,
             snapshot,
             attribute_permissions,
-        } = self.authorize_get_object_with_storage_node(
+        } = self.authorize_get_object_with_storage_node_for_role_surface(
             &storage_node,
             &GetObjectRequest {
                 object: ObjectVersionRequest::new(
@@ -238,6 +238,7 @@ impl Coordinator {
                 cond: req.cond,
                 sse_customer: req.sse_customer,
             },
+            super::authz::RoleReadSurface::UnpinnedAdjacent,
         )?;
         let storage::ObjectReadSnapshot {
             stored,
@@ -860,7 +861,7 @@ impl Coordinator {
             bucket: bucket_summary,
             snapshot,
             attribute_permissions,
-        } = self.authorize_get_object_with_storage_node(
+        } = self.authorize_get_object_with_storage_node_for_role_surface(
             &storage_node,
             &GetObjectRequest {
                 object: ObjectVersionRequest::new(
@@ -873,6 +874,7 @@ impl Coordinator {
                 cond: req.cond,
                 sse_customer: req.sse_customer,
             },
+            super::authz::RoleReadSurface::UnpinnedAdjacent,
         )?;
         let storage::ObjectReadSnapshot {
             stored,

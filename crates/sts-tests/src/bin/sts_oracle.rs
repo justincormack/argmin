@@ -13,14 +13,16 @@ use aws_smithy_types::{date_time::Format as DateTimeFormat, DateTime};
 use ring::hmac;
 use s3_tests::{
     build_test_agent, post_object_raw_to_test_endpoint_with_headers,
-    presign_url_for_service_with_credentials, send_signed_request_for_service_with_credentials,
-    send_signed_request_to_endpoint_for_service_with_credentials,
+    presign_url_for_service_with_credentials,
+    send_checked_signed_request_for_service_with_credentials as send_signed_request_for_service_with_credentials,
+    send_checked_signed_request_to_endpoint_for_service_with_credentials as send_signed_request_to_endpoint_for_service_with_credentials,
     shape::{
         assert_shape, assert_shape_with_request_id_validator, error_response_headers,
         expected_error, id_headers, response_header_value, shape, xml_tag_text, ShapeSpec,
     },
-    sigv4_post_fields_for_credentials, sigv4_post_fields_for_service_with_credentials,
-    PresignedRequest, RawResponse, SignedRequestCredentials,
+    sign_request_headers_for_service_with_checked_credentials, sigv4_post_fields_for_credentials,
+    sigv4_post_fields_for_service_with_credentials, PresignedRequest, RawResponse,
+    SignedRequestCredentials, SigningService,
 };
 
 const QUERY_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
@@ -28,7 +30,7 @@ const QUERY_POST_MAX_BODY_BYTES: usize = 10_000_000;
 const OBSERVED_GET_BOUNDARY_ENDPOINT: &str = "https://sts.eu-central-1.amazonaws.com";
 const OBSERVED_GET_BOUNDARY_REGION: &str = "eu-central-1";
 const OBSERVED_GET_BOUNDARY_ACCESS_KEY_BYTES: usize = 20;
-const ORACLE_STANDARD_SIGNED_GET_MAX_QUERY_BYTES: usize = 15_844;
+const ORACLE_STANDARD_SIGNED_GET_MAX_QUERY_BYTES: usize = 15_953;
 const STS_XMLNS: &str = "https://sts.amazonaws.com/doc/2011-06-15/";
 const AWS_FAULT_XMLNS: &str = "http://webservices.amazon.com/AWSFault/2005-15-09";
 const STS_WRONG_REGION_SCOPE_MESSAGE: &str = "Credential should be scoped to a valid region. ";
@@ -104,6 +106,7 @@ impl QueryRequest<'_> {
                     &format!("{endpoint}/?{query}"),
                     b"",
                     headers,
+                    SigningService::Sts,
                     service,
                     credentials,
                 )
@@ -121,6 +124,7 @@ impl QueryRequest<'_> {
                     &format!("{endpoint}/"),
                     body.as_bytes(),
                     headers,
+                    SigningService::Sts,
                     service,
                     credentials,
                 )
@@ -168,10 +172,10 @@ fn sts_wire_shape(label: &str, response: &RawResponse) -> ShapeSpec {
 fn assert_get_caller_identity_success(label: &str, response: &RawResponse, account_id: &str) {
     let arn = xml_tag_text(&response.body, "Arn")
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| panic!("{label}: missing Arn"));
+        .unwrap_or_else(|| panic!("{label}: missing Arn in response {response:?}"));
     let user_id = xml_tag_text(&response.body, "UserId")
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| panic!("{label}: missing UserId"));
+        .unwrap_or_else(|| panic!("{label}: missing UserId in response {response:?}"));
     assert_shape(
         label,
         response,
@@ -191,6 +195,83 @@ fn assert_get_caller_identity_success(label: &str, response: &RawResponse, accou
             .sub("user_id", user_id)
             .sub("account", account_id),
     );
+}
+
+fn run_identical_signature_stress(
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    account_id: &str,
+) {
+    const ATTEMPTS: usize = 256;
+    let url = format!("{endpoint}/");
+    let body = b"Action=GetCallerIdentity&Version=2011-06-15";
+    let signed = sign_request_headers_for_service_with_checked_credentials(
+        "POST",
+        &url,
+        body,
+        [("content-type", QUERY_CONTENT_TYPE)],
+        SigningService::Sts,
+        "sts",
+        credentials,
+    );
+    let timeout = env::var("S3_TEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(120));
+    let agent = build_test_agent(endpoint, credentials.tls_ca_pem, timeout);
+
+    for attempt in 1..=ATTEMPTS {
+        let mut request = agent.post(&url);
+        for (name, value) in signed.headers() {
+            request = request.header(name, value);
+        }
+        let mut response = request
+            .send(body)
+            .unwrap_or_else(|error| panic!("identical-signature-{attempt}: {error}"));
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value
+                        .to_str()
+                        .expect("response header is valid UTF-8")
+                        .to_string(),
+                )
+            })
+            .collect();
+        let status = response.status().as_u16();
+        let body_read_error = response.body_read_error().map(ToOwned::to_owned);
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        let response = RawResponse {
+            status,
+            headers,
+            body,
+            body_read_error,
+        };
+        assert_get_caller_identity_success(
+            &format!("identical-signature-{attempt}"),
+            &response,
+            account_id,
+        );
+    }
+    println!("identical-signature-stress-{ATTEMPTS}: ok");
+
+    for attempt in 1..=ATTEMPTS {
+        let response = QueryRequest::Post {
+            body: std::str::from_utf8(body).expect("query body is UTF-8"),
+            content_type: Some(QUERY_CONTENT_TYPE),
+        }
+        .send(endpoint, credentials);
+        assert_get_caller_identity_success(
+            &format!("resigned-signature-{attempt}"),
+            &response,
+            account_id,
+        );
+    }
+    println!("resigned-signature-stress-{ATTEMPTS}: ok");
 }
 
 fn assert_probe(probe: &Probe<'_>, response: &RawResponse, account_id: &str) {
@@ -432,24 +513,24 @@ fn run_query_limit_probes(
         query_body_with_ignored_value(ORACLE_STANDARD_SIGNED_GET_MAX_QUERY_BYTES);
     let maximum_query_response = QueryRequest::Get(&maximum_query).send(endpoint, credentials);
     assert_get_caller_identity_success(
-        "query-get-maximum-15844-query-bytes",
+        "query-get-maximum-15953-query-bytes",
         &maximum_query_response,
         account_id,
     );
-    println!("query-get-maximum-15844-query-bytes: ok");
+    println!("query-get-maximum-15953-query-bytes: ok");
 
     let (overlong_query, _) =
         query_body_with_ignored_value(ORACLE_STANDARD_SIGNED_GET_MAX_QUERY_BYTES + 1);
     let overlong_query_response = QueryRequest::Get(&overlong_query).send(endpoint, credentials);
     assert_shape(
-        "query-get-overlong-15845-query-bytes",
+        "query-get-overlong-15954-query-bytes",
         &overlong_query_response,
         &shape()
             .status(400)
             .headers(std::iter::empty::<(&str, &str)>())
             .body_empty(),
     );
-    println!("query-get-overlong-15845-query-bytes: ok");
+    println!("query-get-overlong-15954-query-bytes: ok");
 
     let (smaller_query, _) = query_body_with_ignored_value(15_800);
     let smaller_query_with_header_response = send_signed_request_for_service_with_credentials(
@@ -457,6 +538,7 @@ fn run_query_limit_probes(
         &format!("{endpoint}/?{smaller_query}"),
         b"",
         [("x-test-padding", "x")],
+        SigningService::Sts,
         "sts",
         credentials,
     );
@@ -472,18 +554,19 @@ fn run_query_limit_probes(
         &format!("{endpoint}/?{maximum_query}"),
         b"",
         [("x-test-padding", "")],
+        SigningService::Sts,
         "sts",
         credentials,
     );
     assert_shape(
-        "query-get-15844-query-bytes-with-signed-header",
+        "query-get-15953-query-bytes-with-signed-header",
         &maximum_query_with_header_response,
         &shape()
             .status(400)
             .headers(std::iter::empty::<(&str, &str)>())
             .body_empty(),
     );
-    println!("query-get-15844-query-bytes-with-signed-header: ok");
+    println!("query-get-15953-query-bytes-with-signed-header: ok");
 }
 
 fn assert_signing_scope_error(label: &str, response: &RawResponse, message: &str) {
@@ -1024,6 +1107,7 @@ fn run_s3_header_session_authentication_probes(
             endpoint,
             b"",
             headers,
+            SigningService::S3,
             "s3",
             credentials,
         );
@@ -1187,6 +1271,7 @@ fn run_s3_header_scope_probes(endpoint: &str, fixture: S3HeaderScopeProbeSet<'_>
         endpoint,
         b"",
         [("x-amz-security-token", fixture.live_security_token)],
+        SigningService::S3,
         "s3",
         fixture.live_credentials,
     );
@@ -1346,6 +1431,7 @@ fn run_s3_header_scope_probes(endpoint: &str, fixture: S3HeaderScopeProbeSet<'_>
                 endpoint,
                 b"",
                 headers,
+                SigningService::S3,
                 service,
                 signing_credentials,
             );
@@ -1379,6 +1465,7 @@ fn run_s3_header_scope_probes(endpoint: &str, fixture: S3HeaderScopeProbeSet<'_>
         endpoint,
         b"",
         [("x-amz-security-token", fixture.live_security_token)],
+        SigningService::S3,
         "sts",
         wrong_region_credentials,
     );
@@ -1538,6 +1625,7 @@ fn run_s3_session_context_probes(
             &format!("{endpoint}/{label}"),
             b"",
             [("x-amz-security-token", fixture.security_token)],
+            SigningService::S3,
             "s3",
             fixture.credentials,
         );
@@ -1616,6 +1704,7 @@ fn run_s3_iam_user_context_probes(
             &format!("{endpoint}/{label}"),
             b"",
             std::iter::empty::<(&str, &str)>(),
+            SigningService::S3,
             "s3",
             fixture.credentials,
         );
@@ -1628,6 +1717,7 @@ fn run_s3_iam_user_context_probes(
         &format!("{endpoint}/{label}"),
         b"",
         std::iter::empty::<(&str, &str)>(),
+        SigningService::S3,
         "s3",
         fixture.credentials,
     );
@@ -1732,6 +1822,7 @@ fn run_s3_role_policy_mutation_probes(
             &format!("{endpoint}/{label}"),
             b"",
             [("x-amz-security-token", security_token)],
+            SigningService::S3,
             "s3",
             credentials,
         );
@@ -1757,6 +1848,7 @@ fn run_s3_role_policy_mutation_probes(
         &request_endpoint,
         b"",
         [("x-amz-security-token", fixture.pre_security_token)],
+        SigningService::S3,
         "s3",
         bad_signature_credentials,
     );
@@ -1781,23 +1873,29 @@ struct S3RoleGetObjectProbeSet<'a> {
     identity_deny_session_arn: &'a str,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum S3RoleGetObjectExpected {
     Success,
     ImplicitDeny,
     ExplicitIdentityDeny,
     ExplicitResourceDeny,
+    ExplicitIdentityOrResourceDeny,
 }
 
+const EXPLICIT_IDENTITY_DENY_SUFFIX: &str = " with an explicit deny in an identity-based policy";
+const EXPLICIT_RESOURCE_DENY_SUFFIX: &str = " with an explicit deny in a resource-based policy";
+
+#[allow(clippy::too_many_arguments)]
 fn assert_s3_role_get_object_result(
     label: &str,
+    key: &str,
     response: &RawResponse,
     bucket: &str,
     credentials: SignedRequestCredentials<'_>,
     security_token: &str,
     assumed_role_arn: &str,
     expected: S3RoleGetObjectExpected,
-) {
+) -> S3RoleGetObjectExpected {
     if matches!(expected, S3RoleGetObjectExpected::Success) {
         assert_shape(
             label,
@@ -1814,7 +1912,7 @@ fn assert_s3_role_get_object_result(
                 .body_empty(),
         );
         println!("{label}: ok");
-        return;
+        return S3RoleGetObjectExpected::Success;
     }
 
     let response =
@@ -1824,11 +1922,14 @@ fn assert_s3_role_get_object_result(
         S3RoleGetObjectExpected::ImplicitDeny => {
             " because no identity-based policy allows the s3:GetObject action"
         }
-        S3RoleGetObjectExpected::ExplicitIdentityDeny => {
-            " with an explicit deny in an identity-based policy"
-        }
-        S3RoleGetObjectExpected::ExplicitResourceDeny => {
-            " with an explicit deny in a resource-based policy"
+        S3RoleGetObjectExpected::ExplicitIdentityDeny => EXPLICIT_IDENTITY_DENY_SUFFIX,
+        S3RoleGetObjectExpected::ExplicitResourceDeny => EXPLICIT_RESOURCE_DENY_SUFFIX,
+        S3RoleGetObjectExpected::ExplicitIdentityOrResourceDeny => {
+            if response.body.contains(EXPLICIT_IDENTITY_DENY_SUFFIX) {
+                EXPLICIT_IDENTITY_DENY_SUFFIX
+            } else {
+                EXPLICIT_RESOURCE_DENY_SUFFIX
+            }
         }
     };
     assert_shape(
@@ -1839,7 +1940,7 @@ fn assert_s3_role_get_object_result(
             .headers(error_response_headers())
             .sub("assumed_role_arn", assumed_role_arn)
             .sub("bucket", bucket)
-            .sub("key", label)
+            .sub("key", key)
             .sub("denial_suffix", suffix)
             .body(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -1849,7 +1950,15 @@ fn assert_s3_role_get_object_result(
                  <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
             ),
     );
-    println!("{label}: ok");
+    let observed = if suffix == EXPLICIT_IDENTITY_DENY_SUFFIX {
+        S3RoleGetObjectExpected::ExplicitIdentityDeny
+    } else if suffix == EXPLICIT_RESOURCE_DENY_SUFFIX {
+        S3RoleGetObjectExpected::ExplicitResourceDeny
+    } else {
+        expected
+    };
+    println!("{label}: ok ({observed:?})");
+    observed
 }
 
 fn run_s3_role_get_object_probes(
@@ -1899,10 +2008,12 @@ fn run_s3_role_get_object_probes(
             &format!("{endpoint}/{label}"),
             b"",
             [("x-amz-security-token", security_token)],
+            SigningService::S3,
             "s3",
             credentials,
         );
         assert_s3_role_get_object_result(
+            label,
             label,
             &response,
             bucket,
@@ -1912,6 +2023,38 @@ fn run_s3_role_get_object_probes(
             expected,
         );
     }
+
+    let mut identity_denials = 0;
+    let mut resource_denials = 0;
+    for attempt in 1..=64 {
+        let label = format!("role-get-both-deny-{attempt}");
+        let response = send_signed_request_for_service_with_credentials(
+            "GET",
+            &format!("{endpoint}/role-get-both-deny"),
+            b"",
+            [("x-amz-security-token", fixture.identity_deny_security_token)],
+            SigningService::S3,
+            "s3",
+            fixture.identity_deny_credentials,
+        );
+        match assert_s3_role_get_object_result(
+            &label,
+            "role-get-both-deny",
+            &response,
+            bucket,
+            fixture.identity_deny_credentials,
+            fixture.identity_deny_security_token,
+            fixture.identity_deny_session_arn,
+            S3RoleGetObjectExpected::ExplicitIdentityOrResourceDeny,
+        ) {
+            S3RoleGetObjectExpected::ExplicitIdentityDeny => identity_denials += 1,
+            S3RoleGetObjectExpected::ExplicitResourceDeny => resource_denials += 1,
+            observed => panic!("{label}: unexpected dual-deny observation {observed:?}"),
+        }
+    }
+    println!(
+        "role-get-both-deny-observations: identity={identity_denials} resource={resource_denials}"
+    );
 }
 
 fn build_s3_root_presigned_request(
@@ -4830,6 +4973,7 @@ fn assert_s3_presigned_streaming_upload_has_no_parts(
         &url,
         b"",
         headers,
+        SigningService::S3,
         "s3",
         credentials,
     );
@@ -4857,6 +5001,7 @@ fn assert_s3_presigned_streaming_object_absent(
         &url,
         b"",
         headers,
+        SigningService::S3,
         "s3",
         credentials,
     );
@@ -8358,6 +8503,7 @@ fn run_s3_deleted_issuer_convergence_probes(
                 s3_endpoint,
                 b"",
                 [("x-amz-security-token", security_token)],
+                SigningService::S3,
                 "s3",
                 credentials,
             );
@@ -8510,6 +8656,7 @@ fn run_s3_header_expiry_input_probes(
                 auth_endpoint,
                 b"",
                 headers,
+                SigningService::S3,
                 "s3",
                 signing_credentials,
             );
@@ -8582,6 +8729,7 @@ fn run_s3_header_expiry_input_probes(
                 scope_endpoint,
                 b"",
                 headers,
+                SigningService::S3,
                 service,
                 signing_credentials,
             );
@@ -9413,6 +9561,7 @@ fn run_disabled_credential_active_controls(
                 s3_endpoint,
                 b"",
                 std::iter::empty::<(&str, &str)>(),
+                SigningService::S3,
                 "s3",
                 credentials,
             )
@@ -9423,6 +9572,7 @@ fn run_disabled_credential_active_controls(
         s3_endpoint,
         b"",
         std::iter::empty::<(&str, &str)>(),
+        SigningService::S3,
         "s3",
         credentials,
     );
@@ -9463,6 +9613,7 @@ fn run_disabled_credential_active_controls(
                 s3_bucket_endpoint,
                 b"",
                 std::iter::empty::<(&str, &str)>(),
+                SigningService::S3,
                 "s3",
                 credentials,
             )
@@ -9473,6 +9624,7 @@ fn run_disabled_credential_active_controls(
         s3_bucket_endpoint,
         b"",
         std::iter::empty::<(&str, &str)>(),
+        SigningService::S3,
         "s3",
         credentials,
     );
@@ -9599,6 +9751,7 @@ fn run_disabled_credential_convergence_controls(
                 s3_endpoint,
                 b"",
                 std::iter::empty::<(&str, &str)>(),
+                SigningService::S3,
                 "s3",
                 credentials,
             )
@@ -9623,6 +9776,7 @@ fn run_disabled_credential_convergence_controls(
                 s3_bucket_endpoint,
                 b"",
                 std::iter::empty::<(&str, &str)>(),
+                SigningService::S3,
                 "s3",
                 credentials,
             )
@@ -9633,6 +9787,7 @@ fn run_disabled_credential_convergence_controls(
         s3_bucket_endpoint,
         b"",
         std::iter::empty::<(&str, &str)>(),
+        SigningService::S3,
         "s3",
         credentials,
     );
@@ -9809,6 +9964,7 @@ fn run_disabled_credential_probes(
                 s3_endpoint,
                 b"",
                 headers.iter().copied(),
+                SigningService::S3,
                 "s3",
                 signing_credentials,
             );
@@ -9846,6 +10002,7 @@ fn run_disabled_credential_probes(
                     s3_bucket_endpoint,
                     b"",
                     headers.iter().copied(),
+                    SigningService::S3,
                     service,
                     signing_credentials,
                 );
@@ -10312,6 +10469,7 @@ fn run_expired_deleted_session_probes(
             s3_endpoint,
             b"",
             [("x-amz-security-token", security_token)],
+            SigningService::S3,
             "s3",
             signing_credentials,
         );
@@ -10984,6 +11142,7 @@ fn run_cross_service_routing_probes(
             ("content-type", QUERY_CONTENT_TYPE),
             ("x-amz-account-id", account_id),
         ],
+        SigningService::Sts,
         "sts",
         credentials,
     );
@@ -10998,6 +11157,7 @@ fn run_cross_service_routing_probes(
             ("content-type", QUERY_CONTENT_TYPE),
             ("x-amz-account-id", account_id),
         ],
+        SigningService::S3Control,
         "s3",
         credentials,
     );
@@ -11022,6 +11182,7 @@ fn run_cross_service_routing_probes(
             ("content-type", QUERY_CONTENT_TYPE),
             ("x-amz-account-id", account_id),
         ],
+        SigningService::Sts,
         "sts",
         credentials,
     );
@@ -11043,6 +11204,7 @@ fn run_cross_service_routing_probes(
             ("content-type", QUERY_CONTENT_TYPE),
             ("x-amz-account-id", account_id),
         ],
+        SigningService::S3Control,
         "s3",
         credentials,
     );
@@ -11073,6 +11235,7 @@ fn run_cross_service_routing_probes(
             ("content-type", "application/xml"),
             ("x-amz-account-id", account_id),
         ],
+        SigningService::Sts,
         "sts",
         credentials,
     );
@@ -11094,6 +11257,7 @@ fn run_cross_service_routing_probes(
             ("content-type", "application/xml"),
             ("x-amz-account-id", account_id),
         ],
+        SigningService::S3Control,
         "s3",
         credentials,
     );
@@ -11180,6 +11344,7 @@ fn run_cross_service_routing_probes(
             &format!("{sts_endpoint}{request_target}"),
             body,
             headers.clone(),
+            SigningService::Sts,
             "sts",
             credentials,
         );
@@ -11202,6 +11367,7 @@ fn run_cross_service_routing_probes(
             &format!("{s3_control_endpoint}{request_target}"),
             body,
             headers,
+            SigningService::S3Control,
             "s3",
             credentials,
         );
@@ -11264,6 +11430,7 @@ fn run_cross_service_routing_probes(
         &format!("{sts_endpoint}{tags_path}"),
         b"",
         cors_headers,
+        SigningService::Sts,
         "sts",
         credentials,
     );
@@ -11275,6 +11442,7 @@ fn run_cross_service_routing_probes(
         &format!("{s3_control_endpoint}{tags_path}"),
         b"",
         cors_headers,
+        SigningService::S3Control,
         "s3",
         credentials,
     );
@@ -11446,6 +11614,7 @@ fn run_cross_service_routing_probes(
             &format!("{sts_endpoint}{signed_path}"),
             b"",
             [("x-amz-account-id", account_id)],
+            SigningService::Sts,
             "sts",
             credentials,
         );
@@ -11466,6 +11635,7 @@ fn run_cross_service_routing_probes(
             &format!("{s3_control_endpoint}{signed_path}"),
             b"",
             [("x-amz-account-id", account_id)],
+            SigningService::S3Control,
             "s3",
             credentials,
         );
@@ -11509,6 +11679,7 @@ fn run_cross_service_routing_probes(
             &format!("{sts_endpoint}{tags_path}"),
             b"",
             probe.headers.iter().copied(),
+            SigningService::Sts,
             "sts",
             credentials,
         );
@@ -11521,6 +11692,7 @@ fn run_cross_service_routing_probes(
             &format!("{s3_control_endpoint}{tags_path}"),
             b"",
             probe.headers.iter().copied(),
+            SigningService::S3Control,
             "s3",
             credentials,
         );
@@ -11543,9 +11715,15 @@ fn run_cross_service_routing_probes(
         secret_key: &wrong_secret,
         ..credentials
     };
-    for (endpoint_kind, endpoint, correct_service, wrong_service) in [
-        ("sts", sts_endpoint, "sts", "s3"),
-        ("s3-control", s3_control_endpoint, "s3", "sts"),
+    for (endpoint_kind, endpoint, signing_service, correct_service, wrong_service) in [
+        ("sts", sts_endpoint, SigningService::Sts, "sts", "s3"),
+        (
+            "s3-control",
+            s3_control_endpoint,
+            SigningService::S3Control,
+            "s3",
+            "sts",
+        ),
     ] {
         for (scope, service) in [
             ("correct-service", correct_service),
@@ -11562,6 +11740,7 @@ fn run_cross_service_routing_probes(
                     &format!("{endpoint}{tags_path}"),
                     b"",
                     [("x-amz-account-id", account_id)],
+                    signing_service,
                     service,
                     signing_credentials,
                 );
@@ -11676,6 +11855,7 @@ fn run_cross_service_routing_probes(
             &format!("{sts_endpoint}{}", probe.request_path),
             probe.body,
             probe.headers.iter().copied(),
+            SigningService::Sts,
             "sts",
             bad_signature_credentials,
         );
@@ -11703,6 +11883,7 @@ fn run_cross_service_routing_probes(
             &format!("{s3_control_endpoint}{}", probe.request_path),
             probe.body,
             probe.headers.iter().copied(),
+            SigningService::S3Control,
             "s3",
             bad_signature_credentials,
         );
@@ -11758,6 +11939,7 @@ fn run_list_tags_for_resource_success_probe(
         &format!("{sts_endpoint}{path}"),
         b"",
         [("x-amz-account-id", account_id)],
+        SigningService::Sts,
         "sts",
         credentials,
     );
@@ -11769,6 +11951,7 @@ fn run_list_tags_for_resource_success_probe(
         &format!("{s3_control_endpoint}{path}"),
         b"",
         [("x-amz-account-id", account_id)],
+        SigningService::S3Control,
         "s3",
         credentials,
     );
@@ -11946,6 +12129,7 @@ fn run_list_tags_for_resource_success_probe(
                 &format!("{sts_endpoint}{request_target}"),
                 probe.body,
                 probe.headers.iter().copied(),
+                SigningService::Sts,
                 "sts",
                 signing_credentials,
             );
@@ -11958,6 +12142,7 @@ fn run_list_tags_for_resource_success_probe(
                 &format!("{s3_control_endpoint}{request_target}"),
                 probe.body,
                 probe.headers.iter().copied(),
+                SigningService::S3Control,
                 "s3",
                 signing_credentials,
             );
@@ -12016,6 +12201,7 @@ fn run_list_tags_for_resource_success_probe(
             ),
             identical_tag_keys_probe.body,
             identical_tag_keys_probe.headers.iter().copied(),
+            SigningService::S3Control,
             "s3",
             credentials,
         );
@@ -12055,6 +12241,7 @@ fn run_list_tags_for_resource_success_probe(
                 &format!("{sts_endpoint}{request_target}"),
                 probe.body,
                 probe.headers.iter().copied(),
+                SigningService::Sts,
                 "s3",
                 signing_credentials,
             );
@@ -12068,6 +12255,7 @@ fn run_list_tags_for_resource_success_probe(
                 &format!("{s3_control_endpoint}{request_target}"),
                 probe.body,
                 probe.headers.iter().copied(),
+                SigningService::S3Control,
                 "sts",
                 signing_credentials,
             );
@@ -12125,6 +12313,7 @@ fn run_list_tags_for_resource_success_probe(
                 &format!("{sts_endpoint}{request_path}"),
                 body,
                 headers.iter().copied(),
+                SigningService::Sts,
                 "sts",
                 credentials,
             );
@@ -12140,6 +12329,7 @@ fn run_list_tags_for_resource_success_probe(
                 &format!("{s3_control_endpoint}{request_path}"),
                 body,
                 headers.iter().copied(),
+                SigningService::S3Control,
                 "s3",
                 credentials,
             );
@@ -12169,6 +12359,10 @@ fn main() {
         region: &region,
         tls_ca_pem: None,
     };
+    if env::var("STS_TEST_IDENTICAL_SIGNATURE_STRESS").as_deref() == Ok("1") {
+        run_identical_signature_stress(&endpoint, credentials, &account_id);
+        return;
+    }
     if env::var("STS_TEST_PRESIGNED_STREAMING_ONLY").as_deref() == Ok("1") {
         let recreated_access_key = required_env("STS_TEST_RECREATED_ROLE_ACCESS_KEY");
         let recreated_secret_key = required_env("STS_TEST_RECREATED_ROLE_SECRET_KEY");

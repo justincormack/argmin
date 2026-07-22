@@ -2823,8 +2823,67 @@ identity-based policy permits `s3:GetObject`. Complete raw goldens pin the
 successful empty-object response, including its semantic zero content length,
 and the principal-, action-, resource-, and policy-source-specific denial
 messages. Local `GetObject` role-policy composition remains deliberately
-disabled until the implementation and focused decision/HTTP coverage land as
-the next reviewed Phase 3 slice.
+closed at this evidence checkpoint rather than inheriting generic policy
+composition before the implementation and focused coverage below. Repeated AWS
+probes of simultaneous identity- and resource-policy explicit denies have
+produced both the identity-policy and resource-policy source suffixes, while
+the corresponding single-source controls remain stable. One 64-request sample
+against the same object and unchanged policies returned 26 identity-policy and
+38 resource-policy suffixes.
+
+The corresponding local slice now enables only an ordinary full-payload
+`GetObject` for an existing current-version object on a same-account
+BucketOwnerEnforced bucket. It uses the same current-role/session and resource-
+policy composition boundary as the AWS matrix: either allow is sufficient,
+either explicit deny wins, and no allow denies. Authentication still completes
+before mutable role-policy lookup, and provider corruption or outage retains
+its typed internal classification.
+
+The read request carries a typed role-read surface in addition to its policy
+action so a successful `s3:GetObject` decision cannot silently authorize HEAD,
+ranged GET, `partNumber`, versioned reads, or GetObjectAttributes. Optional
+retention, legal-hold, and tag-count response fields also remain hidden from
+role sessions until their additional action composition is pinned. Cross-
+account role reads, ACL-enabled buckets, and missing-object discovery remain
+closed. The role-read surface fence runs before BucketOwnerEnforced versus ACL-
+enabled dispatch, so a matching ACL-bucket resource policy cannot bypass those
+limits.
+
+An allowed decision remains separate from four typed AWS-pinned denial kinds:
+no identity-policy allow, explicit identity-policy deny, explicit resource-
+policy deny, and simultaneous explicit denies in both sources. The denial
+retains the path-free assumed-role session ARN, typed action, and exact object
+ARN through HTTP rendering. Full routed HTTP tests pin the complete XML body,
+including principal, action, resource, policy-source suffix, request ID, and
+host ID. AWS has returned both source suffixes for the simultaneous-deny state;
+the local renderer uses the observed resource-policy spelling without erasing
+the dual-source state from the typed error. Focused decision tests also cover
+the complete same-account matrix,
+cross-account and ACL-enabled closure, adjacent actions, identity binding, and
+provider failure; end-to-end tests prove current-object success,
+authentication-before-provider-failure ordering, and HEAD/range/missing-key
+closure.
+
+Testing this slice exposed that AWS accepts some correctly signed STS requests
+carrying `x-amz-content-sha256` and rejects others with
+`SignatureDoesNotMatch`. This is recorded as observable AWS behavior rather
+than a transient harness failure. The underlying oracle defect was that the
+hand-built signer had applied the S3 signing profile to STS: STS hashes the
+payload in the canonical request but its standard signing profile does not emit
+that header. Removing the 109-byte signed header also moves the observed STS
+GET request-head boundary from a 15,844-byte query succeeding and 15,845 bytes
+failing to 15,953 bytes succeeding and 15,954 bytes failing. The target API is
+now a typed `S3`, `S3Control`, or `Sts` value, separate from the raw credential-
+scope service used by malformed-scope probes, and both profile mappings are
+exhaustive. `S3Control` remains distinct from `S3` because it targets a distinct
+endpoint even though both currently use the S3 credential-scope name and
+payload-header rule. The signer also preserves serialized malformed-percent
+paths rather than repairing them before signing. Ordinary hand-signed oracle
+requests are independently compared with the AWS SDK SigV4 signer at the same
+timestamp before transmission. POST, malformed paths, wrong credential scopes,
+and all three target-service profiles have focused differential coverage; a
+dedicated stress mode sends both one fixed signature and freshly generated
+signatures 256 times each.
 
 - extend the minimal role identity records with role configuration, trust, and
   permission-policy state

@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use auth::canonical::canonical_query_string;
+use aws_credential_types::Credentials;
 use aws_sdk_s3::client::customize::CustomizableOperation;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::delete_objects::builders::DeleteObjectsFluentBuilder;
@@ -23,6 +24,12 @@ use aws_sdk_s3::types::{
     ServerSideEncryptionRule, VersioningConfiguration,
 };
 use aws_sdk_s3::Client;
+use aws_sigv4::http_request::{
+    sign, PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest,
+    SignatureLocation, SigningSettings, UriPathNormalizationMode,
+};
+use aws_sigv4::sign::v4;
+use aws_smithy_runtime_api::client::identity::Identity;
 use base64::Engine;
 use md5_legacy::Digest;
 use ring::hmac;
@@ -1249,6 +1256,29 @@ pub struct SignedRequestCredentials<'a> {
     pub tls_ca_pem: Option<&'a [u8]>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigningService {
+    S3,
+    S3Control,
+    Sts,
+}
+
+impl SigningService {
+    fn credential_scope_name(self) -> &'static str {
+        match self {
+            Self::S3 | Self::S3Control => "s3",
+            Self::Sts => "sts",
+        }
+    }
+
+    fn includes_content_sha256_header(self) -> bool {
+        match self {
+            Self::S3 | Self::S3Control => true,
+            Self::Sts => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresignedRequest {
     uri: String,
@@ -1633,6 +1663,7 @@ where
         url_str,
         body,
         extra_headers,
+        SigningService::S3,
         "s3",
         credentials,
         true,
@@ -1759,14 +1790,46 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sign_request_headers_for_service_with_credentials<K, V, I>(
     method: &str,
     url_str: &str,
     body: &[u8],
     extra_headers: I,
-    service: &str,
+    signing_service: SigningService,
+    credential_service: &str,
     credentials: SignedRequestCredentials<'_>,
     include_host_signed_header: bool,
+) -> SignedRequestHeaders
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    sign_request_headers_for_service_with_credentials_at_time(
+        method,
+        url_str,
+        body,
+        extra_headers,
+        signing_service,
+        credential_service,
+        credentials,
+        include_host_signed_header,
+        SystemTime::now(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_request_headers_for_service_with_credentials_at_time<K, V, I>(
+    method: &str,
+    url_str: &str,
+    body: &[u8],
+    extra_headers: I,
+    signing_service: SigningService,
+    credential_service: &str,
+    credentials: SignedRequestCredentials<'_>,
+    include_host_signed_header: bool,
+    signing_time: SystemTime,
 ) -> SignedRequestHeaders
 where
     K: AsRef<str>,
@@ -1776,10 +1839,7 @@ where
     let parsed = url::Url::parse(url_str).expect("parse signed URL");
     let path = parsed.path();
     let query = normalize_query(parsed.query().unwrap_or(""));
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let secs = signing_time.duration_since(UNIX_EPOCH).unwrap().as_secs();
     let amz_date = format_amz_date(secs);
     let date_stamp = amz_date[..8].to_string();
     let host = parsed
@@ -1792,12 +1852,15 @@ where
             }
         })
         .expect("URL host");
-    let payload_hash = sha256_hex(body);
+    let payload_hash = auth::canonical::sha256_hex(body);
 
-    let mut request_headers: Vec<(String, String)> = vec![
-        ("x-amz-content-sha256".to_string(), payload_hash.clone()),
-        ("x-amz-date".to_string(), amz_date),
-    ];
+    let mut request_headers: Vec<(String, String)> = vec![("x-amz-date".to_string(), amz_date)];
+    if signing_service.includes_content_sha256_header() {
+        // S3 and S3 Control require the payload hash on the wire. STS still
+        // incorporates the payload hash into the canonical request but does
+        // not emit this header.
+        request_headers.push(("x-amz-content-sha256".to_string(), payload_hash.clone()));
+    }
     if include_host_signed_header {
         request_headers.push(("host".to_string(), host));
     }
@@ -1805,26 +1868,33 @@ where
         request_headers.push((name.as_ref().to_lowercase(), value.as_ref().to_string()));
     }
     let (signed_headers, canonical_headers) = canonicalize_request_headers(&mut request_headers);
+    // `Url::path` is already the serialized wire path. Preserve it exactly:
+    // routing probes deliberately contain malformed percent escapes, and AWS
+    // signs those bytes rather than repairing `%` to `%25`.
     let canonical_request =
         format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
 
-    let scope = format!("{date_stamp}/{}/{service}/aws4_request", credentials.region);
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{}\n{scope}\n{}",
+    let scope = format!(
+        "{date_stamp}/{}/{credential_service}/aws4_request",
+        credentials.region
+    );
+    let string_to_sign = auth::canonical::string_to_sign(
         request_headers
             .iter()
             .find(|(name, _)| name == "x-amz-date")
             .map(|(_, value)| value.as_str())
             .expect("signed request contains x-amz-date"),
-        sha256_hex(canonical_request.as_bytes())
+        &scope,
+        &auth::canonical::sha256_hex(canonical_request.as_bytes()),
     );
-    let signing_key = derive_signing_key_with_service(
-        credentials.secret_key,
+    let signing_secret = auth::credential::SecretKey::new(credentials.secret_key.to_string());
+    let signing_key = auth::sigv4::derive_signing_key(
+        &signing_secret,
         &date_stamp,
         credentials.region,
-        service,
+        credential_service,
     );
-    let signature: String = hmac_sha256(&signing_key, string_to_sign.as_bytes())
+    let signature: String = hmac_sha256(signing_key.as_ref(), string_to_sign.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
@@ -1833,6 +1903,177 @@ where
         credentials.access_key
     );
     request_headers.push(("authorization".to_string(), authorization));
+
+    SignedRequestHeaders {
+        headers: request_headers,
+    }
+}
+
+/// Sign with the hand-built implementation after checking its derived SigV4
+/// headers against the AWS SDK signer for the same inputs and timestamp.
+pub fn sign_request_headers_for_service_with_checked_credentials<K, V, I>(
+    method: &str,
+    url_str: &str,
+    body: &[u8],
+    extra_headers: I,
+    signing_service: SigningService,
+    credential_service: &str,
+    credentials: SignedRequestCredentials<'_>,
+) -> SignedRequestHeaders
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    let signing_time = SystemTime::now();
+    let extra_headers = extra_headers
+        .into_iter()
+        .map(|(name, value)| (name.as_ref().to_string(), value.as_ref().to_string()))
+        .collect::<Vec<_>>();
+    let hand_rolled = sign_request_headers_for_service_with_credentials_at_time(
+        method,
+        url_str,
+        body,
+        extra_headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        signing_service,
+        credential_service,
+        credentials,
+        true,
+        signing_time,
+    );
+    let aws = sign_request_headers_for_service_with_aws_signer_at_time(
+        method,
+        url_str,
+        body,
+        extra_headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        signing_service,
+        credential_service,
+        credentials,
+        signing_time,
+    );
+    assert_reference_signing_headers_match(
+        method,
+        signing_service,
+        credential_service,
+        &hand_rolled,
+        &aws,
+    );
+    hand_rolled
+}
+
+fn assert_reference_signing_headers_match(
+    method: &str,
+    signing_service: SigningService,
+    credential_service: &str,
+    hand_rolled: &SignedRequestHeaders,
+    aws: &SignedRequestHeaders,
+) {
+    for name in ["authorization", "x-amz-content-sha256", "x-amz-date"] {
+        let hand_rolled_value = hand_rolled
+            .headers
+            .iter()
+            .find_map(|(header_name, value)| (header_name == name).then_some(value.as_str()));
+        let aws_value = aws
+            .headers
+            .iter()
+            .find_map(|(header_name, value)| (header_name == name).then_some(value.as_str()));
+        assert!(
+            hand_rolled_value == aws_value,
+            "{method} {signing_service:?} hand-built SigV4 {name} diverged from the AWS signer for credential service {credential_service:?}"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_request_headers_for_service_with_aws_signer_at_time<K, V, I>(
+    method: &str,
+    url_str: &str,
+    body: &[u8],
+    extra_headers: I,
+    signing_service: SigningService,
+    credential_service: &str,
+    credentials: SignedRequestCredentials<'_>,
+    signing_time: SystemTime,
+) -> SignedRequestHeaders
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    let parsed = url::Url::parse(url_str).expect("parse AWS-signed URL");
+    let host = parsed
+        .host_str()
+        .map(|host| {
+            if let Some(port) = parsed.port() {
+                format!("{host}:{port}")
+            } else {
+                host.to_string()
+            }
+        })
+        .expect("AWS-signed URL host");
+    let mut request_headers = vec![("host".to_string(), host)];
+    request_headers.extend(extra_headers.into_iter().map(|(name, value)| {
+        (
+            name.as_ref().to_ascii_lowercase(),
+            value.as_ref().to_string(),
+        )
+    }));
+
+    let identity: Identity = Credentials::new(
+        credentials.access_key,
+        credentials.secret_key,
+        None,
+        None,
+        "argmin-aws-oracle",
+    )
+    .into();
+    let mut settings = SigningSettings::default();
+    settings.percent_encoding_mode = PercentEncodingMode::Single;
+    settings.payload_checksum_kind = if signing_service.includes_content_sha256_header() {
+        PayloadChecksumKind::XAmzSha256
+    } else {
+        PayloadChecksumKind::NoHeader
+    };
+    settings.signature_location = SignatureLocation::Headers;
+    settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    let params = v4::SigningParams::builder()
+        .identity(&identity)
+        .region(credentials.region)
+        .name(credential_service)
+        .time(signing_time)
+        .settings(settings)
+        .build()
+        .expect("build AWS SigV4 signing parameters")
+        .into();
+    let header_refs = request_headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let signable_request = SignableRequest::new(
+        method,
+        url_str,
+        header_refs.into_iter(),
+        SignableBody::Bytes(body),
+    )
+    .expect("build AWS SigV4 signable request");
+    let (instructions, _signature) = sign(signable_request, &params)
+        .expect("sign AWS oracle request")
+        .into_parts();
+    let (signing_headers, signing_params) = instructions.into_parts();
+    assert!(
+        signing_params.is_empty(),
+        "header signing must not produce query parameters"
+    );
+    request_headers.extend(signing_headers.into_iter().map(|header| {
+        (
+            header.name().to_ascii_lowercase(),
+            header.value().to_string(),
+        )
+    }));
 
     SignedRequestHeaders {
         headers: request_headers,
@@ -1856,7 +2097,7 @@ where
         url_str,
         body,
         extra_headers,
-        "s3",
+        SigningService::S3,
         SignedRequestCredentials {
             access_key: CTX.access_key(),
             secret_key: CTX.secret_key(),
@@ -2128,6 +2369,7 @@ where
         url_str,
         body,
         extra_headers,
+        SigningService::S3,
         "s3",
         SignedRequestCredentials {
             access_key: CTX.access_key(),
@@ -2138,6 +2380,7 @@ where
         true,
         Vec::new(),
         true,
+        HeaderSigner::Custom,
     )
 }
 
@@ -2159,7 +2402,7 @@ where
         url_str,
         body,
         extra_headers,
-        "s3",
+        SigningService::S3,
         credentials,
     )
 }
@@ -2184,11 +2427,13 @@ where
         url_str,
         body,
         extra_headers,
+        SigningService::S3,
         "s3",
         credentials,
         false,
         Vec::new(),
         false,
+        HeaderSigner::Custom,
     )
 }
 
@@ -2217,21 +2462,24 @@ where
         url_str,
         body,
         extra_headers,
+        SigningService::S3,
         "s3",
         credentials,
         false,
         unsigned_headers,
         true,
+        HeaderSigner::Custom,
     )
 }
 
-/// Send a raw signed request using an explicit SigV4 service name.
+/// Send a raw signed request using the target service's normal credential
+/// scope.
 pub fn send_signed_request_for_service_with_credentials<K, V, I>(
     method: &str,
     url_str: &str,
     body: &[u8],
     extra_headers: I,
-    service: &str,
+    signing_service: SigningService,
     credentials: SignedRequestCredentials<'_>,
 ) -> RawResponse
 where
@@ -2245,7 +2493,35 @@ where
         url_str,
         body,
         extra_headers,
-        service,
+        signing_service,
+        credentials,
+    )
+}
+
+/// Send a hand-signed AWS oracle request after independently verifying the
+/// generated signature headers with the AWS SDK signer.
+pub fn send_checked_signed_request_for_service_with_credentials<K, V, I>(
+    method: &str,
+    url_str: &str,
+    body: &[u8],
+    extra_headers: I,
+    signing_service: SigningService,
+    credential_service: &str,
+    credentials: SignedRequestCredentials<'_>,
+) -> RawResponse
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    send_checked_signed_request_to_endpoint_for_service_with_credentials(
+        method,
+        url_str,
+        url_str,
+        body,
+        extra_headers,
+        signing_service,
+        credential_service,
         credentials,
     )
 }
@@ -2258,7 +2534,7 @@ pub fn send_signed_request_to_endpoint_for_service_with_credentials<K, V, I>(
     signed_url_str: &str,
     body: &[u8],
     extra_headers: I,
-    service: &str,
+    signing_service: SigningService,
     credentials: SignedRequestCredentials<'_>,
 ) -> RawResponse
 where
@@ -2272,12 +2548,54 @@ where
         signed_url_str,
         body,
         extra_headers,
-        service,
+        signing_service,
+        signing_service.credential_scope_name(),
         credentials,
         false,
         Vec::new(),
         true,
+        HeaderSigner::Custom,
     )
+}
+
+/// Send a hand-signed AWS oracle request to one endpoint after independently
+/// checking the signature for the distinct signed URL with the AWS SDK signer.
+#[allow(clippy::too_many_arguments)]
+pub fn send_checked_signed_request_to_endpoint_for_service_with_credentials<K, V, I>(
+    method: &str,
+    connect_url_str: &str,
+    signed_url_str: &str,
+    body: &[u8],
+    extra_headers: I,
+    signing_service: SigningService,
+    credential_service: &str,
+    credentials: SignedRequestCredentials<'_>,
+) -> RawResponse
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    send_signed_request_to_endpoint_for_service_with_credentials_inner(
+        method,
+        connect_url_str,
+        signed_url_str,
+        body,
+        extra_headers,
+        signing_service,
+        credential_service,
+        credentials,
+        false,
+        Vec::new(),
+        true,
+        HeaderSigner::CustomChecked,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum HeaderSigner {
+    Custom,
+    CustomChecked,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2287,11 +2605,13 @@ fn send_signed_request_to_endpoint_for_service_with_credentials_inner<K, V, I>(
     signed_url_str: &str,
     body: &[u8],
     extra_headers: I,
-    service: &str,
+    signing_service: SigningService,
+    credential_service: &str,
     credentials: SignedRequestCredentials<'_>,
     allow_response_body_error: bool,
     unsigned_headers: Vec<(String, String)>,
     include_host_signed_header: bool,
+    signer: HeaderSigner,
 ) -> RawResponse
 where
     K: AsRef<str>,
@@ -2316,15 +2636,33 @@ where
             }
         })
         .expect("URL host");
-    let signed_request = sign_request_headers_for_service_with_credentials(
-        method,
-        signed_url_str,
-        body,
-        extra_headers,
-        service,
-        credentials,
-        include_host_signed_header,
-    );
+    let signed_request = match signer {
+        HeaderSigner::Custom => sign_request_headers_for_service_with_credentials(
+            method,
+            signed_url_str,
+            body,
+            extra_headers,
+            signing_service,
+            credential_service,
+            credentials,
+            include_host_signed_header,
+        ),
+        HeaderSigner::CustomChecked => {
+            assert!(
+                include_host_signed_header,
+                "checked signer requires the host header"
+            );
+            sign_request_headers_for_service_with_checked_credentials(
+                method,
+                signed_url_str,
+                body,
+                extra_headers,
+                signing_service,
+                credential_service,
+                credentials,
+            )
+        }
+    };
 
     const MAX_SLOWDOWN_RETRIES: u32 = 4;
     const MAX_TRANSPORT_RETRIES: u32 = 3;
@@ -3320,6 +3658,161 @@ mod tests {
                 ("x-two".to_string(), "last".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn hand_rolled_sts_post_signing_matches_aws_signer() {
+        let credentials = SignedRequestCredentials {
+            access_key: "AKIAIOSFODNN7EXAMPLE",
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            region: "us-east-1",
+            tls_ca_pem: None,
+        };
+        let signing_time = UNIX_EPOCH + Duration::from_secs(1_738_555_506);
+        let body = b"Action=GetCallerIdentity&Action=NoSuchAction&Version=2011-06-15";
+        let extra_headers = [("content-type", "application/x-www-form-urlencoded")];
+
+        let mut hand_rolled = sign_request_headers_for_service_with_credentials_at_time(
+            "POST",
+            "https://sts.us-east-1.amazonaws.com/",
+            body,
+            extra_headers,
+            SigningService::Sts,
+            "sts",
+            credentials,
+            true,
+            signing_time,
+        )
+        .headers;
+        let mut aws = sign_request_headers_for_service_with_aws_signer_at_time(
+            "POST",
+            "https://sts.us-east-1.amazonaws.com/",
+            body,
+            extra_headers,
+            SigningService::Sts,
+            "sts",
+            credentials,
+            signing_time,
+        )
+        .headers;
+        hand_rolled.sort();
+        aws.sort();
+
+        assert_eq!(hand_rolled, aws);
+    }
+
+    #[test]
+    fn hand_rolled_signing_preserves_malformed_percent_wire_paths() {
+        let credentials = SignedRequestCredentials {
+            access_key: "AKIAIOSFODNN7EXAMPLE",
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            region: "us-east-1",
+            tls_ca_pem: None,
+        };
+        let signing_time = UNIX_EPOCH + Duration::from_secs(1_738_555_506);
+
+        for path in ["%", "%2", "%GG"] {
+            let url = format!("https://sts.us-east-1.amazonaws.com/v20180820/tags/{path}");
+            let hand_rolled = sign_request_headers_for_service_with_credentials_at_time(
+                "GET",
+                &url,
+                b"",
+                [("x-amz-account-id", "111122223333")],
+                SigningService::Sts,
+                "sts",
+                credentials,
+                true,
+                signing_time,
+            );
+            let aws = sign_request_headers_for_service_with_aws_signer_at_time(
+                "GET",
+                &url,
+                b"",
+                [("x-amz-account-id", "111122223333")],
+                SigningService::Sts,
+                "sts",
+                credentials,
+                signing_time,
+            );
+
+            assert_reference_signing_headers_match(
+                "GET",
+                SigningService::Sts,
+                "sts",
+                &hand_rolled,
+                &aws,
+            );
+        }
+    }
+
+    #[test]
+    fn signing_service_controls_payload_header_independently_of_credential_scope() {
+        let credentials = SignedRequestCredentials {
+            access_key: "AKIAIOSFODNN7EXAMPLE",
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            region: "us-east-1",
+            tls_ca_pem: None,
+        };
+        let signing_time = UNIX_EPOCH + Duration::from_secs(1_738_555_506);
+        let cases = [
+            (
+                SigningService::S3,
+                "sts",
+                "https://s3.us-east-1.amazonaws.com/",
+                true,
+            ),
+            (
+                SigningService::S3Control,
+                "",
+                "https://s3-control.us-east-1.amazonaws.com/",
+                true,
+            ),
+            (
+                SigningService::Sts,
+                "s3",
+                "https://sts.us-east-1.amazonaws.com/",
+                false,
+            ),
+        ];
+
+        for (signing_service, credential_service, url, expected_header) in cases {
+            let hand_rolled = sign_request_headers_for_service_with_credentials_at_time(
+                "POST",
+                url,
+                b"Action=GetCallerIdentity&Version=2011-06-15",
+                [("content-type", "application/x-www-form-urlencoded")],
+                signing_service,
+                credential_service,
+                credentials,
+                true,
+                signing_time,
+            );
+            let aws = sign_request_headers_for_service_with_aws_signer_at_time(
+                "POST",
+                url,
+                b"Action=GetCallerIdentity&Version=2011-06-15",
+                [("content-type", "application/x-www-form-urlencoded")],
+                signing_service,
+                credential_service,
+                credentials,
+                signing_time,
+            );
+            assert_reference_signing_headers_match(
+                "POST",
+                signing_service,
+                credential_service,
+                &hand_rolled,
+                &aws,
+            );
+            assert_eq!(
+                hand_rolled
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name == "x-amz-content-sha256"),
+                expected_header,
+                "unexpected payload header for {signing_service:?}"
+            );
+        }
     }
 
     #[test]

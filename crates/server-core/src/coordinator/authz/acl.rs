@@ -1223,6 +1223,23 @@ impl Coordinator {
         storage_node: &Arc<storage::StorageCluster>,
         req: &GetObjectRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
+        self.authorize_get_object_with_storage_node_for_role_surface(
+            storage_node,
+            req,
+            if req.object.version_id.is_none() {
+                RoleReadSurface::CurrentGetObject
+            } else {
+                RoleReadSurface::UnpinnedAdjacent
+            },
+        )
+    }
+
+    pub(in crate::coordinator) fn authorize_get_object_with_storage_node_for_role_surface(
+        &self,
+        storage_node: &Arc<storage::StorageCluster>,
+        req: &GetObjectRequest<'_>,
+        role_read_surface: RoleReadSurface,
+    ) -> Result<AuthorizedObjectRead, ServerError> {
         let (bucket, snapshot, attribute_permissions) = self
             .authorize_object_read_snapshot_with_storage_node(
                 storage_node,
@@ -1234,6 +1251,7 @@ impl Coordinator {
                     expected_bucket_owner: req.expected_bucket_owner(),
                     missing_discovery: MissingObjectDiscovery::ReadBucket,
                     modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
+                    role_read_surface,
                     snapshot_mode: ObjectReadSnapshotMode::FullPayloadLayout,
                 },
             )?;
@@ -1260,6 +1278,7 @@ impl Coordinator {
                     expected_bucket_owner: req.expected_bucket_owner(),
                     missing_discovery: MissingObjectDiscovery::ReadBucket,
                     modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
+                    role_read_surface: RoleReadSurface::UnpinnedAdjacent,
                     snapshot_mode: ObjectReadSnapshotMode::MetadataOnly,
                 },
             )?;
@@ -1285,6 +1304,7 @@ impl Coordinator {
                 modern_action: ModernReadAction::from_get_object_attributes_version(
                     req.object.version_id,
                 ),
+                role_read_surface: RoleReadSurface::UnpinnedAdjacent,
                 snapshot_mode: if req.want_parts {
                     ObjectReadSnapshotMode::MultipartParts
                 } else {
@@ -1314,6 +1334,7 @@ impl Coordinator {
                     expected_bucket_owner: req.expected_bucket_owner(),
                     missing_discovery: MissingObjectDiscovery::ReadBucket,
                     modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
+                    role_read_surface: RoleReadSurface::UnpinnedAdjacent,
                     snapshot_mode: ObjectReadSnapshotMode::MultipartParts,
                 },
             )?;

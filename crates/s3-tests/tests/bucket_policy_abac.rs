@@ -472,7 +472,7 @@ fn tag_resource(bucket: &str, tags: &[(&str, &str)]) -> s3_tests::RawResponse {
         &url,
         tag_resource_body(tags).as_bytes(),
         [("x-amz-account-id", CTX.account_id())],
-        "s3",
+        s3_tests::SigningService::S3Control,
         raw_primary_credentials(),
     )
 }
