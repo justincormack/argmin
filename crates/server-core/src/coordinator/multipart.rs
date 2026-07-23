@@ -189,17 +189,10 @@ fn composite_checksum_value_from_complete_parts(
 
 impl Coordinator {
     pub(super) fn map_object_pg_action_error(error: storage::ObjectPgActionError) -> ServerError {
+        if super::object_pg_action_error_is_metadata_command_contention(&error) {
+            return ServerError::OperationAborted;
+        }
         match error {
-            storage::ObjectPgActionError::Store(
-                storage::StoreError::MetadataCommandLogConflict { .. }
-                | storage::StoreError::MetadataCommandLogGap { .. }
-                | storage::StoreError::MetadataCommandPendingConflict { .. },
-            ) => ServerError::OperationAborted,
-            storage::ObjectPgActionError::Metadata(ref error)
-                if super::metadata_error_is_command_contention(error) =>
-            {
-                ServerError::OperationAborted
-            }
             storage::ObjectPgActionError::Store(error) => super::map_store_error(error),
             storage::ObjectPgActionError::InvalidRequest { reason } => {
                 ServerError::InvalidRequest { reason }

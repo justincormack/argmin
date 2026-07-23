@@ -664,6 +664,13 @@ choice.
   replacement version to be latest; accepting merely opposite latest flags
   would hide stale marker publication.
 
+  Local metadata-command contention that escapes the bounded storage retry
+  budget during an ETag-conditional delete is rendered as
+  `ConditionalRequestConflict`, matching the AWS overlap response rather than
+  leaking the generic `OperationAborted` used by unconditional operations.
+  Route/admission failures remain `OperationAborted`, and the shared race still
+  observes the first conditional response without retrying it.
+
   Deterministic coordinator regressions pause conceptually between entry
   authorization and the atomic storage callback. They prove that DeleteObject
   and DeleteObjects re-read a different-ETag replacement, accept and delete a

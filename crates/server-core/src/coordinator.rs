@@ -125,6 +125,36 @@ pub(super) fn metadata_error_is_command_contention(error: &storage::MetadataErro
     )
 }
 
+fn store_error_is_metadata_command_contention(error: &storage::StoreError) -> bool {
+    match error {
+        storage::StoreError::MetadataCommandContention { .. }
+        | storage::StoreError::MetadataCommandLogConflict { .. }
+        | storage::StoreError::MetadataCommandLogGap { .. }
+        | storage::StoreError::MetadataCommandPendingConflict { .. } => true,
+        storage::StoreError::StorageRpc { code, .. } => {
+            *code == storage::StorageRpcErrorCode::MetadataCommandContention
+        }
+        storage::StoreError::ShardStore { source, .. } => {
+            store_error_is_metadata_command_contention(source)
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn object_pg_action_error_is_metadata_command_contention(
+    error: &storage::ObjectPgActionError,
+) -> bool {
+    match error {
+        storage::ObjectPgActionError::Store(error) => {
+            store_error_is_metadata_command_contention(error)
+        }
+        storage::ObjectPgActionError::Metadata(error) => {
+            metadata_error_is_command_contention(error)
+        }
+        _ => false,
+    }
+}
+
 fn store_error_is_retryable_contention(error: &storage::StoreError) -> bool {
     match error {
         storage::StoreError::MetadataCommandContention { .. }

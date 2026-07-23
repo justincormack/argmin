@@ -7868,6 +7868,121 @@ fn delete_object_marker_version_reservation_maps_command_log_conflict_to_operati
 }
 
 #[test]
+fn conditional_delete_maps_metadata_command_budget_exhaustion_to_request_conflict() {
+    let cond = DeleteCondition::IfMatch("\"etag\"".into());
+    let error = Coordinator::map_delete_object_pg_action_error(
+        storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandContention {
+            context: "object version reservation retry budget exhausted",
+        }),
+        &cond,
+        "key",
+    );
+    assert!(matches!(
+        error,
+        ServerError::ConditionalRequestConflict { key, condition }
+            if key == "key" && condition == "If-Match"
+    ));
+
+    let error = Coordinator::map_delete_object_pg_action_error(
+        storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandContention {
+            context: "object version reservation retry budget exhausted",
+        }),
+        &DeleteCondition::None,
+        "key",
+    );
+    assert!(matches!(error, ServerError::OperationAborted));
+
+    let error = Coordinator::map_delete_object_pg_action_error(
+        storage::ObjectPgActionError::Store(storage::StoreError::RouteMapExpired {
+            cluster_epoch: storage::ClusterEpoch::INITIAL,
+            valid_until_ms: 1,
+            now_ms: 2,
+        }),
+        &cond,
+        "key",
+    );
+    assert!(matches!(error, ServerError::OperationAborted));
+}
+
+#[test]
+fn conditional_delete_marker_version_reservation_conflict_is_request_conflict() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    put_bucket_versioning_test(
+        &coord,
+        "bucket",
+        BucketVersioningState::Enabled,
+        test_requester(),
+        None,
+    )
+    .unwrap();
+    let put = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"original",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::ReserveObjectVersion,
+    );
+    let cond = DeleteCondition::IfMatch(put.etag.into());
+    let error = coord
+        .delete_object(&delete_object_request(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            false,
+            &cond,
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ServerError::ConditionalRequestConflict { ref key, condition }
+            if key == "key" && condition == "If-Match"
+    ));
+    drop(hook_guard);
+
+    let versions = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            prefix: Some("key"),
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 100,
+            requested_max_keys: Some(100),
+        })
+        .unwrap();
+    assert_eq!(versions.versions.len(), 1);
+    assert!(!versions.versions[0].is_delete_marker);
+}
+
+#[test]
 fn create_multipart_upload_request_maps_command_log_conflict_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);

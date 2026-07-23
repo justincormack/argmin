@@ -15,6 +15,22 @@ use crate::conditional::{check_delete_conditions, DeleteCondition};
 use crate::error::ServerError;
 
 impl Coordinator {
+    pub(super) fn map_delete_object_pg_action_error(
+        error: storage::ObjectPgActionError,
+        cond: &DeleteCondition,
+        key: &str,
+    ) -> ServerError {
+        if !cond.is_empty() && super::object_pg_action_error_is_metadata_command_contention(&error)
+        {
+            ServerError::ConditionalRequestConflict {
+                key: key.to_string(),
+                condition: "If-Match",
+            }
+        } else {
+            Self::map_object_pg_action_error(error)
+        }
+    }
+
     pub(super) fn apply_authorized_delete_object(
         &self,
         storage_node: &std::sync::Arc<StorageCluster>,
@@ -61,7 +77,9 @@ impl Coordinator {
                         }
                         Ok(())
                     })
-                    .map_err(Self::map_object_pg_action_error)??;
+                    .map_err(|error| {
+                        Self::map_delete_object_pg_action_error(error, cond, key.as_str())
+                    })??;
 
                 if let storage::DeletedCurrentObject::Live {
                     generation_id,
@@ -258,7 +276,9 @@ impl Coordinator {
                             Ok(())
                         },
                     )
-                    .map_err(Self::map_object_pg_action_error)??;
+                    .map_err(|error| {
+                        Self::map_delete_object_pg_action_error(error, cond, key.as_str())
+                    })??;
 
                 Ok(DeleteObjectResult {
                     version_id: Some(marker.version_id),
