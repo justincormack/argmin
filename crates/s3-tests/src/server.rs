@@ -16,6 +16,12 @@ pub const TEST_SECOND_ACCESS_KEY: &str = "AKIAISECONDUSEREXAMPLE";
 pub const TEST_SECOND_SECRET_KEY: &str = "secondUserSecretKeyExampleDontUse";
 pub const TEST_OWNER_ROOT_ACCESS_KEY: &str = "AKIAIROOTOWNEREXAMPLE";
 pub const TEST_OWNER_ROOT_SECRET_KEY: &str = "rootOwnerSecretKeyExampleDontUse";
+pub const TEST_STS_ACCESS_KEY: &str = "AKIAISTSISSUEREXAMPLE";
+pub const TEST_STS_SECRET_KEY: &str = "stsIssuerSecretKeyExampleDontUseForAnything";
+pub const TEST_STS_CALLER_ARN: &str = "arn:aws:iam::111122223333:user/argmin-sts-tests/issuer";
+pub const TEST_STS_ROLE_NAME: &str = "argmin-sts-test-role";
+pub const TEST_STS_ROLE_ARN: &str =
+    "arn:aws:iam::111122223333:role/argmin-sts-tests/argmin-sts-test-role";
 pub const TEST_REGION: &str = "us-east-1";
 
 /// Alternate test credentials (non-owner user).
@@ -95,11 +101,12 @@ struct LocalTraceEnvInputs {
 /// is aborted when the TestServer is dropped.
 pub struct TestServer {
     endpoint: String,
+    sts_endpoint: Option<String>,
     tls_ca_pem: Option<&'static [u8]>,
     storage_cluster: Arc<storage::StorageCluster>,
     control_coordinator: server_core::coordinator::Coordinator,
     _temp_dir: test_util::TempDir,
-    _server_task: tokio::task::JoinHandle<()>,
+    _server_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 pub fn open_test_storage_cluster(data_path: &Path, pg_ids: &[u32]) -> Arc<storage::StorageCluster> {
@@ -152,6 +159,19 @@ impl TestServer {
         };
         std_listener.set_nonblocking(true).expect("set nonblocking");
         let listener = tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+        let (sts_endpoint, sts_listener) = if transport == TestServerTransport::Https {
+            let std_listener = TcpListener::bind("127.0.0.1:0").expect("bind STS to random port");
+            let port = std_listener.local_addr().unwrap().port();
+            std_listener
+                .set_nonblocking(true)
+                .expect("set STS listener nonblocking");
+            (
+                Some(format!("https://localhost:{port}")),
+                Some(tokio::net::TcpListener::from_std(std_listener).expect("tokio STS listener")),
+            )
+        } else {
+            (None, None)
+        };
 
         // Create temp directory for storage
         let temp_dir = test_util::tempdir();
@@ -227,8 +247,70 @@ impl TestServer {
                 auth::AuthorizationProfile::OwnerAccountAdmin,
             ))
             .unwrap();
-        let identity_provider = auth::IdentityProvider::in_memory(credentials)
-            .expect("initialize session-token key ring");
+        credentials
+            .add_record(configured_credential(
+                TEST_STS_ACCESS_KEY,
+                TEST_STS_SECRET_KEY,
+                TEST_ACCOUNT_ID,
+                TEST_STS_CALLER_ARN,
+                "test-account",
+                auth::AuthorizationProfile::Standard,
+            ))
+            .unwrap();
+        let sts_account = AccountIdentity::new(
+            TEST_ACCOUNT_ID,
+            CanonicalUserId::from_principal(TEST_ACCOUNT_ID),
+            "test-account",
+        );
+        let sts_role = auth::IamRoleIdentity::new(
+            auth::AwsAccountId::new(TEST_ACCOUNT_ID).unwrap(),
+            auth::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap(),
+            auth::RoleName::new(TEST_STS_ROLE_NAME).unwrap(),
+            auth::IamPath::new("/argmin-sts-tests/").unwrap(),
+        );
+        let live_sts_role = auth::LiveRoleIdentity::new(sts_account.clone(), sts_role).unwrap();
+        let mut roles = auth::RoleIdentityStore::new();
+        roles.add(live_sts_role.clone()).unwrap();
+        let mut authorization = auth::AuthorizationRecordStore::new();
+        authorization
+            .add_role(
+                auth::RoleAuthorizationRecord::new(
+                    Arc::new(live_sts_role),
+                    auth::RoleRecordTimestamps::new(1, 1).unwrap(),
+                    auth::RoleMaximumSessionDuration::new(3_600).unwrap(),
+                    Arc::new(
+                        auth::RoleTrustPolicy::new(
+                            Some(auth::PolicyVersion::V2012_10_17),
+                            vec![auth::RoleTrustPolicyStatement::new(
+                                auth::PolicyEffect::Allow,
+                                vec![auth::RoleTrustPrincipal::new(TEST_STS_CALLER_ARN).unwrap()],
+                            )
+                            .unwrap()],
+                        )
+                        .unwrap(),
+                    ),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let sts_caller_key = auth::ConfiguredPrincipalAuthorizationKey::new(
+            auth::AwsAccountId::new(TEST_ACCOUNT_ID).unwrap(),
+            auth::ConfiguredPrincipalIdentity::new(TEST_STS_CALLER_ARN),
+        );
+        authorization
+            .add_configured_principal(
+                auth::ConfiguredPrincipalAuthorizationRecord::new(
+                    sts_caller_key,
+                    sts_account,
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let identity_provider =
+            auth::IdentityProvider::in_memory_with_authorization(credentials, roles, authorization)
+                .expect("initialize session-token key ring");
         let frontend_storage_handle =
             storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
         let frontends: Vec<server_http::http::HttpFrontend> = (0..POOL_SIZE)
@@ -266,6 +348,7 @@ impl TestServer {
             abort_on_500: true,
             ..server_http::http::serve::ServeConfig::default()
         };
+        let sts_frontends = sts_listener.as_ref().map(|_| frontends.clone());
         let server_task = match transport {
             TestServerTransport::Http => tokio::spawn(server_http::http::serve::serve(
                 listener,
@@ -286,14 +369,30 @@ impl TestServer {
                 ))
             }
         };
+        let mut server_tasks = vec![server_task];
+        if let (Some(listener), Some(frontends)) = (sts_listener, sts_frontends) {
+            let tls_acceptor = make_test_tls_acceptor();
+            server_tasks.push(tokio::spawn(server_http::http::serve::serve_sts_tls(
+                listener,
+                tls_acceptor,
+                frontends,
+                TEST_MAX_CONNECTIONS,
+                TEST_MAX_INFLIGHT_REQUESTS,
+                server_http::http::serve::ServeConfig {
+                    abort_on_500: true,
+                    ..server_http::http::serve::ServeConfig::default()
+                },
+            )));
+        }
 
         TestServer {
             endpoint,
+            sts_endpoint,
             tls_ca_pem: (transport == TestServerTransport::Https).then_some(TEST_TLS_CA_CERT_PEM),
             storage_cluster,
             control_coordinator,
             _temp_dir: temp_dir,
-            _server_task: server_task,
+            _server_tasks: server_tasks,
         }
     }
 
@@ -304,6 +403,11 @@ impl TestServer {
 
     pub fn tls_ca_pem(&self) -> Option<&'static [u8]> {
         self.tls_ca_pem
+    }
+
+    /// The dedicated local STS endpoint, available for HTTPS test servers.
+    pub fn sts_endpoint(&self) -> Option<&str> {
+        self.sts_endpoint.as_deref()
     }
 
     /// Run one deterministic lifecycle sweep at a caller-provided timestamp.
@@ -332,7 +436,9 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        self._server_task.abort();
+        for task in &self._server_tasks {
+            task.abort();
+        }
     }
 }
 

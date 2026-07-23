@@ -157,6 +157,15 @@ pub struct CreateMultipartUploadResponseContext<'a> {
     pub sse_customer: Option<&'a SseCustomerResponseHeaders>,
 }
 
+pub(crate) struct StsAssumeRoleResponse<'a> {
+    pub access_key_id: &'a str,
+    pub secret_access_key: &'a str,
+    pub session_token: &'a str,
+    pub expiration_epoch_seconds: u64,
+    pub assumed_role_id: &'a str,
+    pub assumed_role_arn: &'a str,
+}
+
 fn client_error_message(err: &ServerError) -> String {
     const INTERNAL_ERROR_MESSAGE: &str = "We encountered an internal error. Please try again.";
 
@@ -597,6 +606,60 @@ fn current_request_id() -> String {
 }
 
 impl S3Response {
+    pub(crate) fn sts_assume_role(
+        result: &StsAssumeRoleResponse<'_>,
+        wire_ids: &WireResponseIds,
+    ) -> Self {
+        let body = format!(
+            "<AssumeRoleResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  \
+             <AssumeRoleResult>\n    <AssumedRoleUser>\n      \
+             <AssumedRoleId>{}</AssumedRoleId>\n      <Arn>{}</Arn>\n    \
+             </AssumedRoleUser>\n    <Credentials>\n      <AccessKeyId>{}</AccessKeyId>\n      \
+             <SecretAccessKey>{}</SecretAccessKey>\n      <SessionToken>{}</SessionToken>\n      \
+             <Expiration>{}</Expiration>\n    </Credentials>\n  </AssumeRoleResult>\n  \
+             <ResponseMetadata>\n    <RequestId>{}</RequestId>\n  \
+             </ResponseMetadata>\n</AssumeRoleResponse>\n",
+            xml::xml_escape_text(result.assumed_role_id),
+            xml::xml_escape_text(result.assumed_role_arn),
+            xml::xml_escape_text(result.access_key_id),
+            xml::xml_escape_text(result.secret_access_key),
+            xml::xml_escape_text(result.session_token),
+            xml::format_timestamp(result.expiration_epoch_seconds.saturating_mul(1_000)),
+            xml::xml_escape_text(wire_ids.request_id()),
+        );
+        let mut response = Self::new(200)
+            .header("Content-Type", "text/xml")
+            .header("x-amzn-requestid", wire_ids.request_id())
+            .header("x-amz-sts-extended-request-id", wire_ids.host_id())
+            .fixed_body(body.into_bytes());
+        response.include_wire_ids = false;
+        response
+    }
+
+    pub(crate) fn sts_error(
+        status: u16,
+        code: &str,
+        message: &str,
+        wire_ids: &WireResponseIds,
+    ) -> Self {
+        let body = format!(
+            "<ErrorResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\">\n  \
+             <Error>\n    <Type>Sender</Type>\n    <Code>{}</Code>\n    \
+             <Message>{}</Message>\n  </Error>\n  <RequestId>{}</RequestId>\n\
+             </ErrorResponse>\n",
+            xml::xml_escape_text(code),
+            xml::xml_escape_text(message),
+            xml::xml_escape_text(wire_ids.request_id()),
+        );
+        let mut response = Self::new(status)
+            .header("Content-Type", "text/xml")
+            .header("x-amzn-requestid", wire_ids.request_id())
+            .header("x-amz-sts-extended-request-id", wire_ids.host_id())
+            .fixed_body(body.into_bytes());
+        response.include_wire_ids = false;
+        response
+    }
+
     fn client_error_response_with_ids(
         err: &ServerError,
         resource: &str,

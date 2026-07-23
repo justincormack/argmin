@@ -28,6 +28,8 @@ pub enum AuthorizationRecordError {
     AccountMismatch,
     #[error("duplicate stable role ID")]
     DuplicateStableRoleId,
+    #[error("duplicate live IAM role ARN")]
+    DuplicateRoleArn,
     #[error("duplicate configured principal authorization record")]
     DuplicateConfiguredPrincipal,
 }
@@ -359,6 +361,7 @@ impl ConfiguredPrincipalAuthorizationRecord {
 /// Bootstrap collection of current mutable IAM authorization records.
 pub struct AuthorizationRecordStore {
     roles: HashMap<StableRoleId, Arc<RoleAuthorizationRecord>>,
+    role_arns: HashMap<crate::IamRoleArn, StableRoleId>,
     configured_principals:
         HashMap<ConfiguredPrincipalAuthorizationKey, Arc<ConfiguredPrincipalAuthorizationRecord>>,
 }
@@ -368,6 +371,7 @@ impl AuthorizationRecordStore {
     pub fn new() -> Self {
         Self {
             roles: HashMap::new(),
+            role_arns: HashMap::new(),
             configured_principals: HashMap::new(),
         }
     }
@@ -377,11 +381,25 @@ impl AuthorizationRecordStore {
         record: RoleAuthorizationRecord,
     ) -> Result<(), AuthorizationRecordError> {
         let stable_id = record.identity().role().stable_id().clone();
+        let role_arn = record.identity().role().arn().clone();
         if self.roles.contains_key(&stable_id) {
             return Err(AuthorizationRecordError::DuplicateStableRoleId);
         }
+        if self.role_arns.contains_key(&role_arn) {
+            return Err(AuthorizationRecordError::DuplicateRoleArn);
+        }
+        self.role_arns.insert(role_arn, stable_id.clone());
         self.roles.insert(stable_id, Arc::new(record));
         Ok(())
+    }
+
+    #[must_use]
+    pub fn role_by_arn(
+        &self,
+        role_arn: &crate::IamRoleArn,
+    ) -> Option<Arc<RoleAuthorizationRecord>> {
+        let stable_id = self.role_arns.get(role_arn)?;
+        self.roles.get(stable_id).cloned()
     }
 
     pub fn add_configured_principal(
@@ -608,9 +626,9 @@ mod tests {
     #[test]
     fn stores_reject_duplicate_authorization_keys() {
         let role = live_role();
-        let record = || {
+        let record = |role: Arc<LiveRoleIdentity>| {
             RoleAuthorizationRecord::new(
-                Arc::clone(&role),
+                role,
                 RoleRecordTimestamps::new(1, 1).unwrap(),
                 RoleMaximumSessionDuration::new(3_600).unwrap(),
                 trust_policy(),
@@ -619,10 +637,26 @@ mod tests {
             .unwrap()
         };
         let mut store = AuthorizationRecordStore::new();
-        store.add_role(record()).unwrap();
+        store.add_role(record(Arc::clone(&role))).unwrap();
         assert_eq!(
-            store.add_role(record()),
+            store.add_role(record(Arc::clone(&role))),
             Err(AuthorizationRecordError::DuplicateStableRoleId)
+        );
+        let duplicate_arn = Arc::new(
+            LiveRoleIdentity::new(
+                account(),
+                IamRoleIdentity::new(
+                    AwsAccountId::new("123456789012").unwrap(),
+                    StableRoleId::new("ARGRKLMNOPQRST0123456789").unwrap(),
+                    RoleName::new("test-role").unwrap(),
+                    IamPath::new("/").unwrap(),
+                ),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            store.add_role(record(duplicate_arn)),
+            Err(AuthorizationRecordError::DuplicateRoleArn)
         );
 
         let key = ConfiguredPrincipalAuthorizationKey::new(

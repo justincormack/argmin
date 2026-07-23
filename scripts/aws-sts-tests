@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/_external-s3-test-env.sh
+source "$ROOT/scripts/_external-s3-test-env.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: ./scripts/aws-sts-tests [options] [cargo test args...]
+
+Run the shared STS integration tests against AWS. The script creates one
+self-cleaning role trusted directly to the primary test principal. Extra
+arguments are passed to cargo test.
+
+Options:
+  --region REGION       Override the STS signing region (default: TEST_S3_REGION or us-east-1)
+  --endpoint URL        Override STS_TEST_ENDPOINT (default: regional AWS STS endpoint)
+  --timeout-secs SECS   Override the HTTP timeout (default: TEST_S3_TIMEOUT_SECS or 120)
+  --dotenv PATH         Read AWS variables from a different env file
+  -h, --help            Show this help
+
+Examples:
+  ./scripts/aws-sts-tests
+  ./scripts/aws-sts-tests -- --nocapture
+EOF
+}
+
+region=""
+endpoint=""
+timeout_secs=""
+dotenv_path="$ROOT/.env"
+cargo_args=()
+
+while (($#)); do
+    case "$1" in
+        --region)
+            [[ $# -ge 2 ]] || external_s3_test_die "--region requires a value"
+            region="$2"
+            shift 2
+            ;;
+        --endpoint)
+            [[ $# -ge 2 ]] || external_s3_test_die "--endpoint requires a value"
+            endpoint="$2"
+            shift 2
+            ;;
+        --timeout-secs)
+            [[ $# -ge 2 ]] || external_s3_test_die "--timeout-secs requires a value"
+            timeout_secs="$2"
+            shift 2
+            ;;
+        --dotenv)
+            [[ $# -ge 2 ]] || external_s3_test_die "--dotenv requires a value"
+            dotenv_path="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            cargo_args+=("$@")
+            break
+            ;;
+        *)
+            cargo_args+=("$1")
+            shift
+            ;;
+    esac
+done
+
+cd "$ROOT"
+external_s3_test_load_dotenv "$dotenv_path"
+external_s3_test_require_shell_var TEST_AWS_PRIMARY_ACCESS_KEY
+external_s3_test_require_shell_var TEST_AWS_PRIMARY_SECRET_KEY
+external_s3_test_require_shell_var TEST_AWS_PRIMARY_ACCOUNT_ID
+command -v aws >/dev/null || external_s3_test_die "aws CLI is required"
+command -v jq >/dev/null || external_s3_test_die "jq is required"
+
+region="${region:-${TEST_S3_REGION:-us-east-1}}"
+endpoint="${endpoint:-https://sts.${region}.amazonaws.com}"
+endpoint="${endpoint%/}"
+[[ "$endpoint" == https://?* ]] || external_s3_test_die "STS endpoint must use https://"
+timeout_secs="${timeout_secs:-${TEST_S3_TIMEOUT_SECS:-120}}"
+
+export AWS_TEST_ACCESS_KEY="$TEST_AWS_PRIMARY_ACCESS_KEY"
+export AWS_TEST_SECRET_KEY="$TEST_AWS_PRIMARY_SECRET_KEY"
+export AWS_TEST_ACCOUNT_ID="$TEST_AWS_PRIMARY_ACCOUNT_ID"
+export AWS_TEST_REGION="$region"
+export STS_TEST_ENDPOINT="$endpoint"
+export S3_TEST_TIMEOUT_SECS="$timeout_secs"
+
+aws_primary() {
+    (
+        unset AWS_PROFILE AWS_SESSION_TOKEN
+        export AWS_ACCESS_KEY_ID="$TEST_AWS_PRIMARY_ACCESS_KEY"
+        export AWS_SECRET_ACCESS_KEY="$TEST_AWS_PRIMARY_SECRET_KEY"
+        export AWS_DEFAULT_REGION="$region"
+        export AWS_REGION="$region"
+        export AWS_PAGER=""
+        aws "$@"
+    )
+}
+
+tmpdir="$(mktemp -d)"
+role_name="path-shape-shared-${BASHPID}-${RANDOM}"
+role_path="/argmin-sts-oracle/same-account/"
+role_created=false
+trust_policy="$tmpdir/trust-policy.json"
+convergence_stdout="$tmpdir/assume-role-convergence.out"
+convergence_stderr="$tmpdir/assume-role-convergence.err"
+
+cleanup() {
+    local status=$?
+    set +e
+    trap - EXIT
+    if [[ "$role_created" == true ]]; then
+        if ! aws_primary iam delete-role --role-name "$role_name"; then
+            echo "error: failed to delete temporary shared STS test role $role_name" >&2
+            ((status != 0)) || status=1
+        fi
+    fi
+    rm -f "$trust_policy" "$convergence_stdout" "$convergence_stderr"
+    rmdir "$tmpdir"
+    exit "$status"
+}
+trap cleanup EXIT
+
+caller_arn="$(aws_primary sts get-caller-identity --query Arn --output text)"
+jq -n --arg caller_arn "$caller_arn" '{
+    Version: "2012-10-17",
+    Statement: [{
+        Effect: "Allow",
+        Principal: {AWS: $caller_arn},
+        Action: "sts:AssumeRole"
+    }]
+}' >"$trust_policy"
+
+role_arn="$(aws_primary iam create-role \
+    --role-name "$role_name" \
+    --path "$role_path" \
+    --assume-role-policy-document "file://${trust_policy}" \
+    --max-session-duration 3600 \
+    --query 'Role.Arn' \
+    --output text)"
+role_created=true
+aws_primary iam wait role-exists --role-name "$role_name"
+
+ready=false
+consecutive_successes=0
+for ((attempt = 1; attempt <= 30; attempt++)); do
+    if aws_primary sts assume-role \
+        --role-arn "$role_arn" \
+        --role-session-name shared-test-convergence \
+        --query 'AssumedRoleUser.Arn' \
+        --output text \
+        >"$convergence_stdout" 2>"$convergence_stderr"; then
+        ((consecutive_successes += 1))
+        if ((consecutive_successes == 3)); then
+            ready=true
+            break
+        fi
+    else
+        consecutive_successes=0
+    fi
+    sleep 2
+done
+if [[ "$ready" != true ]]; then
+    if [[ -s "$convergence_stdout" ]]; then
+        echo "last AssumeRole convergence stdout:" >&2
+        cat "$convergence_stdout" >&2
+    fi
+    if [[ -s "$convergence_stderr" ]]; then
+        echo "last AssumeRole convergence stderr:" >&2
+        cat "$convergence_stderr" >&2
+    fi
+    external_s3_test_die "shared STS test role did not converge to three consecutive successes"
+fi
+
+export STS_TEST_ROLE_ARN="$role_arn"
+export STS_TEST_ROLE_NAME="$role_name"
+
+sts_cmd=(cargo test -p sts-tests --test assume_role --no-fail-fast)
+sts_cmd+=("${cargo_args[@]}")
+external_s3_test_print_command "external shared sts-tests" "${sts_cmd[@]}"
+"${sts_cmd[@]}"

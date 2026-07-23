@@ -808,6 +808,13 @@ mod tests {
             Ok(None)
         }
 
+        fn lookup_role_authorization_by_arn(
+            &self,
+            _role_arn: &crate::IamRoleArn,
+        ) -> Result<Option<Arc<crate::RoleAuthorizationRecord>>, IdentityProviderError> {
+            Ok(None)
+        }
+
         fn lookup_configured_principal_authorization(
             &self,
             _key: &crate::ConfiguredPrincipalAuthorizationKey,

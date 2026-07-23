@@ -553,6 +553,27 @@ pub async fn serve_tls(
     .await;
 }
 
+/// Run a TLS-only STS Query API listener.
+pub async fn serve_sts_tls(
+    listener: TcpListener,
+    tls_acceptor: TlsAcceptor,
+    frontends: Vec<HttpFrontend>,
+    max_connections: u32,
+    max_inflight_requests: u32,
+    config: ServeConfig,
+) {
+    serve_plain_or_tls(
+        listener,
+        frontends,
+        max_connections,
+        max_inflight_requests,
+        config,
+        EndpointKind::StsOnly,
+        Some(tls_acceptor),
+    )
+    .await;
+}
+
 async fn serve_plain_or_tls(
     listener: TcpListener,
     frontends: Vec<HttpFrontend>,
@@ -563,8 +584,8 @@ async fn serve_plain_or_tls(
     tls_acceptor: Option<TlsAcceptor>,
 ) {
     assert!(
-        endpoint_kind != EndpointKind::SharedRegional || tls_acceptor.is_some(),
-        "SharedRegional endpoints require TLS"
+        matches!(endpoint_kind, EndpointKind::S3Only) || tls_acceptor.is_some(),
+        "SharedRegional and StsOnly endpoints require TLS"
     );
     assert!(!frontends.is_empty(), "at least one frontend required");
     let host_id = frontends
@@ -1005,61 +1026,63 @@ async fn handle(
         return Ok(resp);
     }
 
-    if let Some(bucket) = post_object_bucket(&parts) {
-        let mut body = body;
-        let s3req = match S3Request::from_hyper_headers_with_source_ip(
-            parts,
-            transport_security,
-            source_ip,
-            request_epoch_seconds,
-        )
-        .map(|req| req.with_tls_version(tls_version))
-        {
-            Ok(req) => req,
-            Err(err) => {
-                return Ok(s3_response_to_hyper(
-                    S3Response::error_with_ids(&err, "", &wire_ids),
-                    Some(req_permit),
-                    state.config.stream_read_chunk_size,
-                    state.config.panic_on_500,
-                    state.config.abort_on_500,
-                    response_trace,
-                ));
+    if state.endpoint_kind != EndpointKind::StsOnly {
+        if let Some(bucket) = post_object_bucket(&parts) {
+            let mut body = body;
+            let s3req = match S3Request::from_hyper_headers_with_source_ip(
+                parts,
+                transport_security,
+                source_ip,
+                request_epoch_seconds,
+            )
+            .map(|req| req.with_tls_version(tls_version))
+            {
+                Ok(req) => req,
+                Err(err) => {
+                    return Ok(s3_response_to_hyper(
+                        S3Response::error_with_ids(&err, "", &wire_ids),
+                        Some(req_permit),
+                        state.config.stream_read_chunk_size,
+                        state.config.panic_on_500,
+                        state.config.abort_on_500,
+                        response_trace,
+                    ));
+                }
+            };
+            let origin = s3req.header("origin").map(str::to_string);
+            let method = s3req.method.as_str().to_string();
+            let mut resp = handle_streaming_post_object(
+                Arc::clone(&state),
+                s3req,
+                &mut body,
+                bucket.clone(),
+                trace.clone(),
+                wire_ids.clone(),
+            )
+            .await;
+            append_actual_cors_headers(
+                &state,
+                &mut resp,
+                &bucket,
+                origin.as_deref(),
+                &method,
+                &trace,
+            )
+            .await;
+            let retain_unread_request_body = response_requests_connection_close(&resp);
+            let mut resp = s3_response_to_hyper(
+                resp,
+                Some(req_permit),
+                state.config.stream_read_chunk_size,
+                state.config.panic_on_500,
+                state.config.abort_on_500,
+                response_trace,
+            );
+            if retain_unread_request_body {
+                resp.body_mut().retain_unread_request_body(body);
             }
-        };
-        let origin = s3req.header("origin").map(str::to_string);
-        let method = s3req.method.as_str().to_string();
-        let mut resp = handle_streaming_post_object(
-            Arc::clone(&state),
-            s3req,
-            &mut body,
-            bucket.clone(),
-            trace.clone(),
-            wire_ids.clone(),
-        )
-        .await;
-        append_actual_cors_headers(
-            &state,
-            &mut resp,
-            &bucket,
-            origin.as_deref(),
-            &method,
-            &trace,
-        )
-        .await;
-        let retain_unread_request_body = response_requests_connection_close(&resp);
-        let mut resp = s3_response_to_hyper(
-            resp,
-            Some(req_permit),
-            state.config.stream_read_chunk_size,
-            state.config.panic_on_500,
-            state.config.abort_on_500,
-            response_trace,
-        );
-        if retain_unread_request_body {
-            resp.body_mut().retain_unread_request_body(body);
+            return Ok(resp);
         }
-        return Ok(resp);
     }
 
     if parts.method == http::Method::OPTIONS {
@@ -1087,7 +1110,17 @@ async fn handle(
         let wire_ids_for_blocking = wire_ids.clone();
         let resp = spawn_blocking_with_trace(trace, move || {
             let frontend = acquire_frontend(&state_ref);
-            frontend.handle_service_request(state_ref.endpoint_kind, &s3req, &wire_ids_for_blocking)
+            match state_ref.endpoint_kind {
+                EndpointKind::StsOnly => {
+                    frontend.handle_sts_request(&s3req, &wire_ids_for_blocking)
+                }
+                EndpointKind::S3Only | EndpointKind::SharedRegional => frontend
+                    .handle_service_request(
+                        state_ref.endpoint_kind,
+                        &s3req,
+                        &wire_ids_for_blocking,
+                    ),
+            }
         })
         .await
         .unwrap_or_else(|_| internal_error_response(&wire_ids));
@@ -1145,7 +1178,14 @@ async fn handle(
     let wire_ids_for_blocking = wire_ids.clone();
     let resp = spawn_blocking_with_trace(trace, move || {
         let frontend = acquire_frontend(&state_ref);
-        frontend.handle_service_request(state_ref.endpoint_kind, &s3req, &wire_ids_for_blocking)
+        match state_ref.endpoint_kind {
+            EndpointKind::StsOnly => frontend.handle_sts_request(&s3req, &wire_ids_for_blocking),
+            EndpointKind::S3Only | EndpointKind::SharedRegional => frontend.handle_service_request(
+                state_ref.endpoint_kind,
+                &s3req,
+                &wire_ids_for_blocking,
+            ),
+        }
     })
     .await
     .unwrap_or_else(|_| internal_error_response(&wire_ids));
@@ -1955,6 +1995,9 @@ fn is_streaming_write_for_endpoint(
     endpoint_kind: EndpointKind,
     parts: &http::request::Parts,
 ) -> Result<Option<StreamingWriteOp>, ServerError> {
+    if endpoint_kind == EndpointKind::StsOnly {
+        return Ok(None);
+    }
     if parts.method != http::Method::PUT {
         return Ok(None);
     }
@@ -2003,6 +2046,9 @@ fn buffered_body_limit_for_request_parts(
     endpoint_kind: EndpointKind,
     parts: &http::request::Parts,
 ) -> usize {
+    if endpoint_kind == EndpointKind::StsOnly {
+        return super::sts::MAX_STS_QUERY_BODY_SIZE;
+    }
     let path = parts.uri.path();
     let query = parts.uri.query().unwrap_or("");
     let method = parts.method.as_str();

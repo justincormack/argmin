@@ -351,20 +351,23 @@ ARGMIN_TRACE_FILE=/tmp/argmin.trace \
 cargo run -p argmin-s3 --features deep-tracing --release
 ```
 
-## AWS-backed S3 tests and STS discovery oracle
+## AWS-backed S3 and STS tests, and the STS discovery oracle
 
 This repo keeps the shared compatibility tests separate from discovery probes:
 
 - `crates/s3-tests` owns S3 API compatibility tests and the reusable raw
   signing, HTTP, and golden-shape test support
-- `crates/sts-tests` owns STS Query, AssumeRole, and temporary-credential
-  conformance probes; it reuses the public S3 test support where those probes
-  exercise temporary credentials through S3
+- `crates/sts-tests/tests` owns the STS compatibility tests that run unchanged
+  against AWS and the embedded local endpoint
+- `crates/sts-tests/src/bin/sts_oracle.rs` remains a temporary AWS-only
+  discovery reference while its behavior is moved into shared tests
 
 `./scripts/aws-tests` runs the same `s3-tests` corpus against AWS that is run
-against the local endpoint. It does not invoke the STS oracle. The live STS
+against the local endpoint. `./scripts/aws-sts-tests` does the same for the
+shared STS corpus and creates the one self-cleaning role required by the
+current issuance tests. Neither command invokes the STS oracle. The live STS
 oracle is an explicitly selected discovery tool, run with
-`./scripts/aws-sts-oracle`; `--assume-role` enables its self-cleaning
+`./scripts/aws-sts-oracle`; `--assume-role` enables its larger self-cleaning
 same-account fixture.
 
 External runs fail fast if the AWS-specific environment is incomplete, rather
@@ -433,6 +436,7 @@ Recommended command:
 
 ```bash
 ./scripts/aws-tests
+./scripts/aws-sts-tests
 ```
 
 Separate STS discovery:

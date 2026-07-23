@@ -311,9 +311,11 @@ impl S3Operation {
 pub(crate) enum EndpointKind {
     /// Ordinary S3 only. This is the only endpoint kind available over HTTP.
     S3Only,
-    /// One TLS listener serving S3 and the initial S3 Control surface. STS is
-    /// added to this endpoint after the bounded Query parser lands.
+    /// One TLS listener serving S3 and the initial S3 Control surface.
     SharedRegional,
+    /// Regional STS Query API endpoint. It is selected by listener
+    /// configuration and cannot be reached by changing request authority.
+    StsOnly,
 }
 
 /// Service selected from the trusted endpoint and request target.
@@ -515,15 +517,19 @@ pub(crate) fn route_service(
     path: &str,
     query: &str,
 ) -> Result<ServiceOperation, ServiceRouteError> {
-    if endpoint == EndpointKind::SharedRegional && is_s3_control_candidate_path(path) {
-        return route_s3_control(method, path)
-            .map(ServiceOperation::S3Control)
-            .map_err(ServiceRouteError::S3Control);
+    match endpoint {
+        EndpointKind::SharedRegional if is_s3_control_candidate_path(path) => {
+            route_s3_control(method, path)
+                .map(ServiceOperation::S3Control)
+                .map_err(ServiceRouteError::S3Control)
+        }
+        EndpointKind::S3Only | EndpointKind::SharedRegional => route(method, path, query)
+            .map(ServiceOperation::S3)
+            .map_err(ServiceRouteError::S3),
+        EndpointKind::StsOnly => {
+            unreachable!("the S3-family router cannot route an STS-only endpoint")
+        }
     }
-
-    route(method, path, query)
-        .map(ServiceOperation::S3)
-        .map_err(ServiceRouteError::S3)
 }
 
 /// Validate an S3 bucket name per AWS rules.

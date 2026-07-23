@@ -20,6 +20,8 @@ pub enum IdentityError {
     InvalidStableRoleId,
     #[error("invalid IAM role name")]
     InvalidRoleName,
+    #[error("invalid IAM role ARN")]
+    InvalidRoleArn,
     #[error("invalid IAM path")]
     InvalidIamPath,
     #[error("invalid role session name")]
@@ -190,6 +192,17 @@ impl IamUserArn {
             return None;
         }
         Some(Self(value.to_string()))
+    }
+}
+
+impl IamRoleArn {
+    pub fn new(value: impl Into<String>) -> Result<Self, IdentityError> {
+        let value = value.into();
+        let parsed = parse_iam_principal_arn(&value).ok_or(IdentityError::InvalidRoleArn)?;
+        if parsed.kind() != IamPrincipalArnKind::Role {
+            return Err(IdentityError::InvalidRoleArn);
+        }
+        Ok(Self(value))
     }
 }
 
@@ -629,6 +642,20 @@ mod tests {
             role("/").arn().as_str(),
             "arn:aws:iam::123456789012:role/test-role"
         );
+    }
+
+    #[test]
+    fn iam_role_arn_accepts_only_well_formed_role_principals() {
+        let arn = "arn:aws:iam::123456789012:role/team/nested/test-role";
+        assert_eq!(IamRoleArn::new(arn).unwrap().as_str(), arn);
+        for invalid in [
+            "arn:aws:iam::123456789012:user/team/nested/test-role",
+            "arn:aws:iam::123456789012:role/",
+            "arn:aws:iam::12345678901:role/test-role",
+            "not-an-arn",
+        ] {
+            assert_eq!(IamRoleArn::new(invalid), Err(IdentityError::InvalidRoleArn));
+        }
     }
 
     #[test]

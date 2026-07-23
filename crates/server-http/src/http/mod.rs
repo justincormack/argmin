@@ -6,6 +6,7 @@ pub mod request;
 pub mod response;
 pub mod router;
 pub mod serve;
+mod sts;
 pub mod xml;
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -643,6 +644,21 @@ pub struct HttpFrontend {
     pub host_id: Arc<str>,
     #[cfg(test)]
     actual_cors_metadata_lookup_count: std::sync::atomic::AtomicUsize,
+}
+
+impl Clone for HttpFrontend {
+    fn clone(&self) -> Self {
+        Self {
+            coordinator: Arc::clone(&self.coordinator),
+            identity_provider: self.identity_provider.clone(),
+            host_id: Arc::clone(&self.host_id),
+            #[cfg(test)]
+            actual_cors_metadata_lookup_count: std::sync::atomic::AtomicUsize::new(
+                self.actual_cors_metadata_lookup_count
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
 }
 
 enum S3HyperBodyState {
@@ -6610,6 +6626,14 @@ mod tests {
         fn lookup_role_authorization(
             &self,
             _stable_role_id: &auth::StableRoleId,
+        ) -> Result<Option<Arc<auth::RoleAuthorizationRecord>>, auth::IdentityProviderError>
+        {
+            Err(self.0)
+        }
+
+        fn lookup_role_authorization_by_arn(
+            &self,
+            _role_arn: &auth::IamRoleArn,
         ) -> Result<Option<Arc<auth::RoleAuthorizationRecord>>, auth::IdentityProviderError>
         {
             Err(self.0)

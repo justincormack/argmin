@@ -1019,6 +1019,14 @@ mod tests {
             Err(self.0)
         }
 
+        fn lookup_role_authorization_by_arn(
+            &self,
+            _role_arn: &crate::IamRoleArn,
+        ) -> Result<Option<Arc<crate::RoleAuthorizationRecord>>, crate::IdentityProviderError>
+        {
+            Err(self.0)
+        }
+
         fn lookup_configured_principal_authorization(
             &self,
             _key: &crate::ConfiguredPrincipalAuthorizationKey,
@@ -1075,6 +1083,14 @@ mod tests {
         fn lookup_role_authorization(
             &self,
             _stable_role_id: &crate::StableRoleId,
+        ) -> Result<Option<Arc<crate::RoleAuthorizationRecord>>, crate::IdentityProviderError>
+        {
+            Ok(None)
+        }
+
+        fn lookup_role_authorization_by_arn(
+            &self,
+            _role_arn: &crate::IamRoleArn,
         ) -> Result<Option<Arc<crate::RoleAuthorizationRecord>>, crate::IdentityProviderError>
         {
             Ok(None)
