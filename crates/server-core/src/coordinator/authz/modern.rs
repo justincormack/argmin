@@ -159,16 +159,6 @@ impl Coordinator {
         bucket: BoeLoadedBucketHandle<'_>,
         existing_object: Option<&StoredObject>,
     ) -> Result<AuthorizedPutObjectWrite, ServerError> {
-        if req.object.requester().is_assumed_role_session()
-            && !role_put_object_shape_uses_only_pinned_permissions(
-                &req.acl,
-                req.object_lock,
-                req.tags,
-                req.policy_context.if_match,
-            )
-        {
-            return Err(ServerError::AccessDenied);
-        }
         let key = req.object.key();
         let bucket_info = ValidatedBucket(bucket.bucket().clone());
         let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
@@ -602,24 +592,17 @@ impl Coordinator {
             None
         };
         let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
-        let can_discover_missing = if req.requester.is_assumed_role_session() {
-            // The current AWS matrix covers an existing object only. Do not
-            // infer role-session ListBucket composition or missing-key
-            // disclosure from the configured-principal path.
-            false
-        } else {
-            req.missing_discovery.requester_can_discover_missing(
-                self,
-                BucketPolicyAccess {
-                    requester: req.requester,
-                    bucket: &bucket_info,
-                    bucket_tags: bucket_tags.as_deref(),
-                    policy: bucket_policy.as_deref(),
-                },
-                req.key.as_str(),
-                req.version_id,
-            )?
-        };
+        let can_discover_missing = req.missing_discovery.requester_can_discover_missing(
+            self,
+            BucketPolicyAccess {
+                requester: req.requester,
+                bucket: &bucket_info,
+                bucket_tags: bucket_tags.as_deref(),
+                policy: bucket_policy.as_deref(),
+            },
+            req.key.as_str(),
+            req.version_id,
+        )?;
         #[cfg(test)]
         if self.should_probe_object_read_snapshot(bucket.bucket().name.as_str()) {
             let object_pg_ready = storage_node
@@ -905,18 +888,6 @@ impl Coordinator {
     }
 }
 
-fn role_put_object_shape_uses_only_pinned_permissions(
-    acl: &PutObjectWriteAcl<'_>,
-    object_lock: s3_types::ObjectLockState,
-    tags: Option<&str>,
-    if_match: Option<&str>,
-) -> bool {
-    matches!(acl, PutObjectWriteAcl::None)
-        && object_lock == s3_types::ObjectLockState::default()
-        && tags.is_none()
-        && if_match.is_none()
-}
-
 fn requester_is_modern_bucket_owner_account(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
@@ -935,84 +906,6 @@ fn requester_is_modern_bucket_owner_account(
         return false;
     };
     Coordinator::bucket_owner_account_id(&bucket.owner_principal) == Some(requester_account_id)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AssumedRoleObjectPolicyDecision {
-    Allowed,
-    Denied(Option<crate::error::AssumedRolePolicyDenialKind>),
-}
-
-impl AssumedRoleObjectPolicyDecision {
-    fn is_allowed(self) -> bool {
-        self == Self::Allowed
-    }
-}
-
-fn assumed_role_object_policy_decision(
-    requester: &Requester,
-    bucket: BoeBucketSummary<'_>,
-    key: &str,
-    action: auth::PolicyAction,
-    resource_policy: auth::PolicyEvaluation,
-) -> Result<Option<AssumedRoleObjectPolicyDecision>, ServerError> {
-    if !requester.is_assumed_role_session() {
-        return Ok(None);
-    }
-
-    let identity_policy = requester
-        .evaluate_identity_permissions(&auth::IdentityPolicyRequest::S3 {
-            action,
-            resource: auth::S3IdentityPolicyResource::Object {
-                bucket: bucket.name.as_str(),
-                key,
-            },
-        })
-        .map_err(ServerError::IdentityProvider)?;
-    match (identity_policy, resource_policy) {
-        (auth::PolicyEvaluation::ExplicitDeny, auth::PolicyEvaluation::ExplicitDeny) => {
-            return Ok(Some(AssumedRoleObjectPolicyDecision::Denied(Some(
-                crate::error::AssumedRolePolicyDenialKind::ExplicitIdentityAndResourcePolicyDeny,
-            ))));
-        }
-        (_, auth::PolicyEvaluation::ExplicitDeny) => {
-            return Ok(Some(AssumedRoleObjectPolicyDecision::Denied(Some(
-                crate::error::AssumedRolePolicyDenialKind::ExplicitResourcePolicyDeny,
-            ))));
-        }
-        (auth::PolicyEvaluation::ExplicitDeny, _) => {
-            return Ok(Some(AssumedRoleObjectPolicyDecision::Denied(Some(
-                crate::error::AssumedRolePolicyDenialKind::ExplicitIdentityPolicyDeny,
-            ))));
-        }
-        _ => {}
-    }
-
-    let identity_allow = identity_policy == auth::PolicyEvaluation::ExplicitAllow;
-    let resource_allow = resource_policy == auth::PolicyEvaluation::ExplicitAllow
-        && modern_bucket_policy_allow_survives_restrict_public_buckets(requester, bucket);
-    let decision = if requester_is_modern_bucket_owner_account(requester, bucket) {
-        // The Phase 0 oracle pins same-account role permissions as a union of
-        // identity and resource policies, with an explicit deny on either side
-        // taking precedence.
-        if identity_allow || resource_allow {
-            AssumedRoleObjectPolicyDecision::Allowed
-        } else if identity_policy == auth::PolicyEvaluation::NoMatch
-            && resource_policy == auth::PolicyEvaluation::NoMatch
-        {
-            AssumedRoleObjectPolicyDecision::Denied(Some(
-                crate::error::AssumedRolePolicyDenialKind::NoIdentityPolicyAllow,
-            ))
-        } else {
-            AssumedRoleObjectPolicyDecision::Denied(None)
-        }
-    } else {
-        // Cross-account role-session resource grants need their own AWS matrix,
-        // especially for exact session-principal grants. Keep this path closed
-        // until its AWS-visible composition is pinned.
-        AssumedRoleObjectPolicyDecision::Denied(None)
-    };
-    Ok(Some(decision))
 }
 
 fn requester_can_modern_bucket_owner_account_admin(
@@ -1037,12 +930,11 @@ fn modern_bucket_policy_allow_survives_restrict_public_buckets(
     requester_is_modern_bucket_owner_account(requester, bucket)
 }
 
-fn non_role_put_object_policy_allows(
+fn put_object_policy_allows(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
     decision: auth::PolicyEvaluation,
 ) -> bool {
-    debug_assert!(!requester.is_assumed_role_session());
     match decision {
         auth::PolicyEvaluation::ExplicitDeny => false,
         auth::PolicyEvaluation::ExplicitAllow
@@ -1108,10 +1000,6 @@ pub(in crate::coordinator) fn write_multipart_upload_with_bucket_policy(
     policy_context: &PutObjectPolicyContext<'_>,
     policy: Option<&auth::BucketPolicy>,
 ) -> Result<ModernObjectWriteAuthorization, ServerError> {
-    if requester.is_assumed_role_session() {
-        // Multipart role-session authorization is not yet AWS-pinned.
-        return Ok(ModernObjectWriteAuthorization::Denied);
-    }
     let decision = bucket_policy_decision_for_put_object_action_modern(
         requester,
         bucket,
@@ -1121,7 +1009,7 @@ pub(in crate::coordinator) fn write_multipart_upload_with_bucket_policy(
         policy_context,
         policy,
     )?;
-    let allowed = non_role_put_object_policy_allows(requester, bucket, decision);
+    let allowed = put_object_policy_allows(requester, bucket, decision);
     Ok(if allowed {
         ModernObjectWriteAuthorization::Allowed
     } else {
@@ -1141,14 +1029,6 @@ pub(in crate::coordinator) fn put_object_authorization_with_bucket_policy(
     if action == ModernWriteAction::CreateMultipartUpload && requester.is_anonymous() {
         return Ok(ModernObjectWriteAuthorization::Denied);
     }
-    if action != ModernWriteAction::PutObject && requester.is_assumed_role_session() {
-        // Multipart role-session authorization is not yet AWS-pinned.
-        return Ok(ModernObjectWriteAuthorization::Denied);
-    }
-    if policy_context.copy_source.is_some() && requester.is_assumed_role_session() {
-        // CopyObject role-session authorization is not yet AWS-pinned.
-        return Ok(ModernObjectWriteAuthorization::Denied);
-    }
     let decision = bucket_policy_decision_for_put_object_action_modern(
         requester,
         bucket,
@@ -1158,30 +1038,12 @@ pub(in crate::coordinator) fn put_object_authorization_with_bucket_policy(
         policy_context,
         policy,
     )?;
-    let allowed = if action == ModernWriteAction::PutObject {
-        if let Some(role_decision) = assumed_role_object_policy_decision(
-            requester,
-            bucket,
-            key,
-            auth::PolicyAction::PutObject,
-            decision,
-        )? {
-            role_decision.is_allowed()
-        } else {
-            non_role_put_object_policy_allows(requester, bucket, decision)
-        }
-    } else {
-        non_role_put_object_policy_allows(requester, bucket, decision)
-    };
+    let allowed = put_object_policy_allows(requester, bucket, decision);
     if !allowed {
         return Ok(ModernObjectWriteAuthorization::Denied);
     }
 
     if policy_context.request_object_tags_xml.is_some() {
-        if requester.is_assumed_role_session() {
-            // Role-session PutObjectTagging composition is not yet AWS-pinned.
-            return Ok(ModernObjectWriteAuthorization::Denied);
-        }
         let tagging_decision = bucket_policy_decision_for_put_object_action_modern(
             requester,
             bucket,
@@ -1191,8 +1053,7 @@ pub(in crate::coordinator) fn put_object_authorization_with_bucket_policy(
             policy_context,
             policy,
         )?;
-        let tagging_allowed =
-            non_role_put_object_policy_allows(requester, bucket, tagging_decision);
+        let tagging_allowed = put_object_policy_allows(requester, bucket, tagging_decision);
         if !tagging_allowed {
             return Ok(ModernObjectWriteAuthorization::Denied);
         }
@@ -1319,9 +1180,6 @@ fn modern_read_object_authorization_for_single_action(
     policy: Option<&auth::BucketPolicy>,
     existing_object_tags_mode: ExistingObjectTagsMode,
 ) -> Result<ModernObjectReadAuthorization, ServerError> {
-    if requester.is_assumed_role_session() && action != ModernReadAction::ReadCurrent {
-        return Ok(ModernObjectReadAuthorization::Denied);
-    }
     let decision = bucket_policy_decision_for_object_with_preloaded_tags_modern(
         requester,
         bucket,
@@ -1331,38 +1189,6 @@ fn modern_read_object_authorization_for_single_action(
         policy,
         existing_object_tags_mode,
     )?;
-    if let Some(role_decision) = assumed_role_object_policy_decision(
-        requester,
-        bucket,
-        object.key().as_str(),
-        action.policy_action(),
-        decision,
-    )? {
-        return match role_decision {
-            AssumedRoleObjectPolicyDecision::Allowed => Ok(ModernObjectReadAuthorization::Allowed),
-            AssumedRoleObjectPolicyDecision::Denied(Some(kind)) => {
-                let principal_arn = requester.session_principal_arn().ok_or_else(|| {
-                    ServerError::InternalError {
-                        reason: "assumed-role requester has no session principal ARN".to_string(),
-                    }
-                })?;
-                Err(ServerError::AssumedRolePolicyAccessDenied {
-                    principal_arn: principal_arn.as_str().to_string(),
-                    action: action.policy_action(),
-                    resource: format!(
-                        "arn:aws:s3:::{}/{}",
-                        bucket.name.as_str(),
-                        object.key().as_str()
-                    ),
-                    kind,
-                })
-            }
-            AssumedRoleObjectPolicyDecision::Denied(None) => {
-                Ok(ModernObjectReadAuthorization::Denied)
-            }
-        };
-    }
-
     let modern_default_allowed =
         modern_read_object_default_allowed(requester, bucket, object, action);
 
@@ -1488,10 +1314,7 @@ pub(super) fn copy_source_read_authorization_with_bucket_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s3_types::{
-        AccountIdentity, ObjectLockMode, ObjectLockState, ObjectRetention, StoredLegalHoldStatus,
-    };
-    use std::sync::Arc;
+    use s3_types::{AccountIdentity, ObjectLockState};
     use storage::{
         BucketName, BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls,
         BucketVersioningState, CanonicalUserId, EcShape, EffectiveBucketEncryptionConfig,
@@ -1580,528 +1403,8 @@ mod tests {
         auth::parse_bucket_policy(body).unwrap()
     }
 
-    fn role_session_identity(
-        account_id: &str,
-    ) -> (auth::AuthenticatedIdentity, auth::LiveRoleIdentity) {
-        let account = AccountIdentity::new(
-            account_id,
-            CanonicalUserId::from_principal(account_id),
-            "role account",
-        );
-        let role = auth::IamRoleIdentity::new(
-            auth::AwsAccountId::new(account_id).unwrap(),
-            auth::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap(),
-            auth::RoleName::new("put-role").unwrap(),
-            auth::IamPath::new("/test/").unwrap(),
-        );
-        let live_role = auth::LiveRoleIdentity::new(account.clone(), role.clone()).unwrap();
-        let session = auth::AssumedRoleSessionIdentity::new(
-            role,
-            auth::RoleSessionName::new("put-session").unwrap(),
-            auth::SessionLifetime::new(1_700_000_000, 1_700_003_600).unwrap(),
-            None,
-        );
-        (
-            auth::AuthenticatedIdentity::assumed_role_session(account, session).unwrap(),
-            live_role,
-        )
-    }
-
-    fn role_session_requester_for_account_and_action(
-        account_id: &str,
-        policy_effect: Option<auth::PolicyEffect>,
-        action: &str,
-    ) -> Requester {
-        let (identity, live_role) = role_session_identity(account_id);
-        let permission_policies = policy_effect
-            .map(|effect| {
-                vec![auth::InlineIdentityPolicy::new(
-                    auth::InlinePolicyName::new("put-policy").unwrap(),
-                    Arc::new(
-                        auth::IdentityPolicy::new(
-                            Some(auth::PolicyVersion::V2012_10_17),
-                            vec![auth::IdentityPolicyStatement::new(
-                                effect,
-                                vec![auth::IamActionPattern::new(action).unwrap()],
-                                vec![
-                                    auth::IamResourcePattern::new("arn:aws:s3:::test-bucket/key")
-                                        .unwrap(),
-                                ],
-                            )
-                            .unwrap()],
-                        )
-                        .unwrap(),
-                    ),
-                )]
-            })
-            .unwrap_or_default();
-        let role_record = auth::RoleAuthorizationRecord::new(
-            Arc::new(live_role.clone()),
-            auth::RoleRecordTimestamps::new(1_700_000_000, 1_700_000_000).unwrap(),
-            auth::RoleMaximumSessionDuration::new(3_600).unwrap(),
-            Arc::new(
-                auth::RoleTrustPolicy::new(
-                    Some(auth::PolicyVersion::V2012_10_17),
-                    vec![auth::RoleTrustPolicyStatement::new(
-                        auth::PolicyEffect::Allow,
-                        vec![auth::RoleTrustPrincipal::new("*").unwrap()],
-                    )
-                    .unwrap()],
-                )
-                .unwrap(),
-            ),
-            permission_policies,
-        )
-        .unwrap();
-        let mut roles = auth::RoleIdentityStore::new();
-        roles.add(live_role).unwrap();
-        let mut authorization = auth::AuthorizationRecordStore::new();
-        authorization.add_role(role_record).unwrap();
-        let provider = auth::IdentityProvider::in_memory_with_authorization(
-            auth::CredentialStore::new(),
-            roles,
-            authorization,
-        )
-        .unwrap();
-        let resolved = provider
-            .resolve_principal_authorization(&identity)
-            .map(Some);
-        Requester::from_auth(
-            &auth::AuthContext {
-                mode: auth::AuthMode::HeaderSigV4,
-                access_key_id: Some("ARGS0123456789ABCDEFGHIJ".to_string()),
-                identity: Some(identity),
-                authorization_profile: auth::AuthorizationProfile::Standard,
-                request_epoch_secs: Some(1_700_000_100),
-                signing_region: Some("us-east-1".to_string()),
-                streaming: None,
-            },
-            resolved,
-        )
-    }
-
-    fn role_session_requester(policy_effect: Option<auth::PolicyEffect>) -> Requester {
-        role_session_requester_for_account_and_action("111122223333", policy_effect, "s3:PutObject")
-    }
-
-    fn role_session_get_requester(policy_effect: Option<auth::PolicyEffect>) -> Requester {
-        role_session_requester_for_account_and_action("111122223333", policy_effect, "s3:GetObject")
-    }
-
-    fn role_resource_policy_for_account_and_action(
-        account_id: &str,
-        effect: &str,
-        action: &str,
-    ) -> auth::BucketPolicy {
-        parse_policy(&format!(
-            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"{effect}","Principal":{{"AWS":"arn:aws:iam::{account_id}:role/test/put-role"}},"Action":"{action}","Resource":"arn:aws:s3:::test-bucket/key"}}]}}"#,
-        ))
-    }
-
-    fn role_resource_policy(effect: &str) -> auth::BucketPolicy {
-        role_resource_policy_for_account_and_action("111122223333", effect, "s3:PutObject")
-    }
-
-    fn role_get_resource_policy(effect: &str) -> auth::BucketPolicy {
-        role_resource_policy_for_account_and_action("111122223333", effect, "s3:GetObject")
-    }
-
-    fn authorize_role_put(
-        requester: &Requester,
-        policy: Option<&auth::BucketPolicy>,
-    ) -> Result<ModernObjectWriteAuthorization, ServerError> {
-        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
-        put_object_authorization_with_bucket_policy(
-            requester,
-            BoeBucketSummary::assume_boe(&bucket),
-            preloaded_bucket_tags(None),
-            "key",
-            ModernWriteAction::PutObject,
-            &PutObjectPolicyContext::default(),
-            policy,
-        )
-    }
-
-    fn authorize_role_get(
-        requester: &Requester,
-        policy: Option<&auth::BucketPolicy>,
-        action: ModernReadAction,
-    ) -> Result<ModernObjectReadAuthorization, ServerError> {
-        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
-        let object = stored_live_object("arn:aws:iam::111122223333:user/bucket-owner");
-        read_object_authorization_with_bucket_policy(
-            requester,
-            BoeBucketSummary::assume_boe(&bucket),
-            preloaded_bucket_tags(None),
-            &object,
-            action,
-            policy,
-        )
-    }
-
-    fn assert_role_get_policy_denial(
-        result: Result<ModernObjectReadAuthorization, ServerError>,
-        expected_kind: crate::error::AssumedRolePolicyDenialKind,
-    ) {
-        match result {
-            Err(ServerError::AssumedRolePolicyAccessDenied {
-                principal_arn,
-                action,
-                resource,
-                kind,
-            }) => {
-                assert_eq!(
-                    principal_arn,
-                    "arn:aws:sts::111122223333:assumed-role/put-role/put-session"
-                );
-                assert_eq!(action, auth::PolicyAction::GetObject);
-                assert_eq!(resource, "arn:aws:s3:::test-bucket/key");
-                assert_eq!(kind, expected_kind);
-            }
-            other => panic!("expected typed role-policy denial, got {other:?}"),
-        }
-    }
-
     fn preloaded_bucket_tags<'a>(tags: Option<&'a [(String, String)]>) -> PreloadedBucketTags<'a> {
         PreloadedBucketTags::new(tags)
-    }
-
-    #[test]
-    fn same_account_role_put_composes_identity_and_resource_policies_deny_first() {
-        let resource_allow = role_resource_policy("Allow");
-        let resource_deny = role_resource_policy("Deny");
-
-        assert_eq!(
-            authorize_role_put(
-                &role_session_requester(Some(auth::PolicyEffect::Allow)),
-                None
-            )
-            .unwrap(),
-            ModernObjectWriteAuthorization::Allowed
-        );
-        assert_eq!(
-            authorize_role_put(&role_session_requester(None), Some(&resource_allow)).unwrap(),
-            ModernObjectWriteAuthorization::Allowed
-        );
-        assert_eq!(
-            authorize_role_put(
-                &role_session_requester(Some(auth::PolicyEffect::Deny)),
-                Some(&resource_allow),
-            )
-            .unwrap(),
-            ModernObjectWriteAuthorization::Denied
-        );
-        assert_eq!(
-            authorize_role_put(
-                &role_session_requester(Some(auth::PolicyEffect::Allow)),
-                Some(&resource_deny),
-            )
-            .unwrap(),
-            ModernObjectWriteAuthorization::Denied
-        );
-        assert_eq!(
-            authorize_role_put(&role_session_requester(None), None).unwrap(),
-            ModernObjectWriteAuthorization::Denied
-        );
-    }
-
-    #[test]
-    fn cross_account_role_put_remains_closed_until_aws_composition_is_pinned() {
-        let requester = role_session_requester_for_account_and_action(
-            "444455556666",
-            Some(auth::PolicyEffect::Allow),
-            "s3:PutObject",
-        );
-        let resource_allow =
-            role_resource_policy_for_account_and_action("444455556666", "Allow", "s3:PutObject");
-
-        assert_eq!(
-            authorize_role_put(&requester, Some(&resource_allow)).unwrap(),
-            ModernObjectWriteAuthorization::Denied
-        );
-    }
-
-    #[test]
-    fn same_account_role_get_composes_identity_and_resource_policies_deny_first() {
-        let resource_allow = role_get_resource_policy("Allow");
-        let resource_deny = role_get_resource_policy("Deny");
-
-        assert_eq!(
-            authorize_role_get(
-                &role_session_get_requester(Some(auth::PolicyEffect::Allow)),
-                None,
-                ModernReadAction::ReadCurrent,
-            )
-            .unwrap(),
-            ModernObjectReadAuthorization::Allowed
-        );
-        assert_eq!(
-            authorize_role_get(
-                &role_session_get_requester(None),
-                Some(&resource_allow),
-                ModernReadAction::ReadCurrent,
-            )
-            .unwrap(),
-            ModernObjectReadAuthorization::Allowed
-        );
-        assert_role_get_policy_denial(
-            authorize_role_get(
-                &role_session_get_requester(Some(auth::PolicyEffect::Deny)),
-                Some(&resource_allow),
-                ModernReadAction::ReadCurrent,
-            ),
-            crate::error::AssumedRolePolicyDenialKind::ExplicitIdentityPolicyDeny,
-        );
-        assert_role_get_policy_denial(
-            authorize_role_get(
-                &role_session_get_requester(Some(auth::PolicyEffect::Allow)),
-                Some(&resource_deny),
-                ModernReadAction::ReadCurrent,
-            ),
-            crate::error::AssumedRolePolicyDenialKind::ExplicitResourcePolicyDeny,
-        );
-        assert_role_get_policy_denial(
-            authorize_role_get(
-                &role_session_get_requester(Some(auth::PolicyEffect::Deny)),
-                Some(&resource_deny),
-                ModernReadAction::ReadCurrent,
-            ),
-            crate::error::AssumedRolePolicyDenialKind::ExplicitIdentityAndResourcePolicyDeny,
-        );
-        assert_role_get_policy_denial(
-            authorize_role_get(
-                &role_session_get_requester(None),
-                None,
-                ModernReadAction::ReadCurrent,
-            ),
-            crate::error::AssumedRolePolicyDenialKind::NoIdentityPolicyAllow,
-        );
-    }
-
-    #[test]
-    fn cross_account_role_get_remains_closed_until_aws_composition_is_pinned() {
-        let requester = role_session_requester_for_account_and_action(
-            "444455556666",
-            Some(auth::PolicyEffect::Allow),
-            "s3:GetObject",
-        );
-        let resource_allow =
-            role_resource_policy_for_account_and_action("444455556666", "Allow", "s3:GetObject");
-
-        assert_eq!(
-            authorize_role_get(
-                &requester,
-                Some(&resource_allow),
-                ModernReadAction::ReadCurrent,
-            )
-            .unwrap(),
-            ModernObjectReadAuthorization::Denied
-        );
-    }
-
-    #[test]
-    fn role_get_keeps_unpinned_adjacent_actions_closed() {
-        let requester = role_session_requester_for_account_and_action(
-            "111122223333",
-            Some(auth::PolicyEffect::Allow),
-            "s3:*",
-        );
-
-        for action in [
-            ModernReadAction::ReadVersion,
-            ModernReadAction::AttributesCurrent,
-            ModernReadAction::AttributesVersion,
-        ] {
-            assert_eq!(
-                authorize_role_get(&requester, None, action).unwrap(),
-                ModernObjectReadAuthorization::Denied,
-                "{action:?} must remain closed"
-            );
-        }
-
-        assert!(RoleReadSurface::CurrentGetObject.permits(ModernReadAction::ReadCurrent));
-        assert!(!RoleReadSurface::CurrentGetObject.permits(ModernReadAction::ReadVersion));
-        assert!(!RoleReadSurface::UnpinnedAdjacent.permits(ModernReadAction::ReadCurrent));
-    }
-
-    #[test]
-    fn role_put_object_scope_denies_unpinned_adjacent_operations() {
-        let requester = role_session_requester(Some(auth::PolicyEffect::Allow));
-        let bucket = modern_bucket(Some(BucketObjectOwnership::BucketOwnerEnforced));
-        let bucket = BoeBucketSummary::assume_boe(&bucket);
-        let tagged_context = PutObjectPolicyContext {
-            request_object_tags_xml: Some(
-                "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>",
-            ),
-            ..PutObjectPolicyContext::default()
-        };
-
-        assert_eq!(
-            put_object_authorization_with_bucket_policy(
-                &requester,
-                bucket,
-                preloaded_bucket_tags(None),
-                "key",
-                ModernWriteAction::PutObject,
-                &tagged_context,
-                None,
-            )
-            .unwrap(),
-            ModernObjectWriteAuthorization::Denied
-        );
-        assert_eq!(
-            put_object_authorization_with_bucket_policy(
-                &requester,
-                bucket,
-                preloaded_bucket_tags(None),
-                "key",
-                ModernWriteAction::CreateMultipartUpload,
-                &PutObjectPolicyContext::default(),
-                None,
-            )
-            .unwrap(),
-            ModernObjectWriteAuthorization::Denied
-        );
-        assert_eq!(
-            put_object_authorization_with_bucket_policy(
-                &requester,
-                bucket,
-                preloaded_bucket_tags(None),
-                "key",
-                ModernWriteAction::CompleteMultipartUploadReplay,
-                &PutObjectPolicyContext::default(),
-                None,
-            )
-            .unwrap(),
-            ModernObjectWriteAuthorization::Denied
-        );
-        assert_eq!(
-            put_object_authorization_with_bucket_policy(
-                &requester,
-                bucket,
-                preloaded_bucket_tags(None),
-                "key",
-                ModernWriteAction::PutObject,
-                &PutObjectPolicyContext {
-                    copy_source: Some("source-bucket/source-key"),
-                    ..PutObjectPolicyContext::default()
-                },
-                None,
-            )
-            .unwrap(),
-            ModernObjectWriteAuthorization::Denied
-        );
-    }
-
-    #[test]
-    fn role_put_object_shape_rejects_every_unpinned_supplemental_permission() {
-        assert!(role_put_object_shape_uses_only_pinned_permissions(
-            &PutObjectWriteAcl::None,
-            ObjectLockState::default(),
-            None,
-            None,
-        ));
-        assert!(!role_put_object_shape_uses_only_pinned_permissions(
-            &PutObjectWriteAcl::Canned(PutObjectAcl::BucketOwnerFullControl),
-            ObjectLockState::default(),
-            None,
-            None,
-        ));
-        assert!(!role_put_object_shape_uses_only_pinned_permissions(
-            &PutObjectWriteAcl::None,
-            ObjectLockState {
-                retention: Some(ObjectRetention {
-                    retain_until_unix_seconds: 1_800_000_000,
-                    mode: ObjectLockMode::Governance,
-                }),
-                legal_hold: StoredLegalHoldStatus::NotSet,
-            },
-            None,
-            None,
-        ));
-        assert!(!role_put_object_shape_uses_only_pinned_permissions(
-            &PutObjectWriteAcl::None,
-            ObjectLockState {
-                retention: None,
-                legal_hold: StoredLegalHoldStatus::Off,
-            },
-            None,
-            None,
-        ));
-        assert!(!role_put_object_shape_uses_only_pinned_permissions(
-            &PutObjectWriteAcl::None,
-            ObjectLockState::default(),
-            Some("<Tagging><TagSet></TagSet></Tagging>"),
-            None,
-        ));
-        assert!(!role_put_object_shape_uses_only_pinned_permissions(
-            &PutObjectWriteAcl::None,
-            ObjectLockState::default(),
-            None,
-            Some("etag"),
-        ));
-    }
-
-    #[test]
-    fn requester_rejects_authorization_resolved_for_a_different_role() {
-        let role_a = role_session_requester(Some(auth::PolicyEffect::Allow));
-        let role_a_authorization = role_a.principal_authorization.clone();
-        let (role_b_identity, _) = role_session_identity("444455556666");
-        let requester = Requester::from_auth(
-            &auth::AuthContext {
-                mode: auth::AuthMode::HeaderSigV4,
-                access_key_id: Some("ARGS0123456789ABCDEFGHIJ".to_string()),
-                identity: Some(role_b_identity),
-                authorization_profile: auth::AuthorizationProfile::Standard,
-                request_epoch_secs: Some(1_700_000_100),
-                signing_region: Some("us-east-1".to_string()),
-                streaming: None,
-            },
-            role_a_authorization,
-        );
-
-        assert!(matches!(
-            authorize_role_put(&requester, None),
-            Err(ServerError::IdentityProvider(
-                auth::IdentityProviderError::InvalidRecord
-            ))
-        ));
-        assert!(matches!(
-            authorize_role_get(&requester, None, ModernReadAction::ReadCurrent),
-            Err(ServerError::IdentityProvider(
-                auth::IdentityProviderError::InvalidRecord
-            ))
-        ));
-    }
-
-    #[test]
-    fn role_authorization_provider_failure_is_typed_and_fails_closed() {
-        let (identity, _) = role_session_identity("111122223333");
-        let requester = Requester::from_auth(
-            &auth::AuthContext {
-                mode: auth::AuthMode::HeaderSigV4,
-                access_key_id: Some("ARGS0123456789ABCDEFGHIJ".to_string()),
-                identity: Some(identity),
-                authorization_profile: auth::AuthorizationProfile::Standard,
-                request_epoch_secs: Some(1_700_000_100),
-                signing_region: Some("us-east-1".to_string()),
-                streaming: None,
-            },
-            Err(auth::IdentityProviderError::Unavailable),
-        );
-
-        assert!(matches!(
-            authorize_role_put(&requester, None),
-            Err(ServerError::IdentityProvider(
-                auth::IdentityProviderError::Unavailable
-            ))
-        ));
-        assert!(matches!(
-            authorize_role_get(&requester, None, ModernReadAction::ReadCurrent),
-            Err(ServerError::IdentityProvider(
-                auth::IdentityProviderError::Unavailable
-            ))
-        ));
     }
 
     #[test]

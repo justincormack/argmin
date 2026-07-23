@@ -1449,16 +1449,10 @@ impl HttpFrontend {
         &self,
         auth: &AuthContext,
         req: &S3Request,
-    ) -> crate::coordinator::Requester {
-        let principal_authorization = auth
-            .identity
-            .as_ref()
-            .map(|identity| {
-                self.identity_provider
-                    .resolve_principal_authorization(identity)
-            })
-            .transpose();
-        crate::coordinator::Requester::from_auth(auth, principal_authorization)
+    ) -> Result<crate::coordinator::Requester, ServerError> {
+        let supported = auth::ConfiguredOrAnonymousAuth::try_from(auth)
+            .map_err(|_| ServerError::AccessDenied)?;
+        Ok(crate::coordinator::Requester::from_auth(supported)
             .with_source_ip(req.source_ip())
             .with_request_epoch_seconds(Some(req.request_epoch_seconds()))
             .with_secure_transport(Some(req.transport_security.is_secure()))
@@ -1471,7 +1465,7 @@ impl HttpFrontend {
                 req.tls_version
                     .map(|version| version.policy_value().to_string()),
             )
-            .with_content_sha256(req.header("x-amz-content-sha256").map(str::to_string))
+            .with_content_sha256(req.header("x-amz-content-sha256").map(str::to_string)))
     }
 
     fn map_auth_error(error: auth::AuthError) -> ServerError {
@@ -1612,7 +1606,7 @@ impl HttpFrontend {
         let expected_bucket_owner = expected_bucket_owner(req);
         match operation {
             S3ControlOperation::ListTagsForResource { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let control = crate::coordinator::BucketTagControlRequest {
                     bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                 };
@@ -1632,7 +1626,7 @@ impl HttpFrontend {
             }
             S3ControlOperation::TagResource { bucket } => {
                 let tags = xml::TagSet::parse_tag_resource_xml(&req.body)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let control = crate::coordinator::BucketTagControlRequest {
                     bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                 };
@@ -1668,7 +1662,7 @@ impl HttpFrontend {
                     .iter()
                     .map(|key| (key.clone(), String::new()))
                     .collect::<Vec<_>>();
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let control = crate::coordinator::BucketTagControlRequest {
                     bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                 };
@@ -1736,7 +1730,7 @@ impl HttpFrontend {
         // Dispatch to coordinator
         match operation {
             S3Operation::ListBuckets => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let owner_account = Self::authenticated_account(auth)?;
                 let prefix = req.query_param_lossy("prefix");
                 let mut buckets = self
@@ -1759,7 +1753,7 @@ impl HttpFrontend {
                 )?;
                 let namespace = parse_bucket_namespace(req, &bucket)?;
                 let ownership = parse_bucket_ownership(req.header("x-amz-object-ownership"))?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator
                     .create_bucket(&crate::coordinator::CreateBucketRequest {
                         name: bucket.clone(),
@@ -1772,7 +1766,7 @@ impl HttpFrontend {
                 Ok(S3Response::create_bucket(bucket.as_str()))
             }
             S3Operation::DeleteBucket { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.delete_bucket(&bucket_request(
                     &bucket,
                     requester,
@@ -1781,7 +1775,7 @@ impl HttpFrontend {
                 Ok(S3Response::delete_bucket())
             }
             S3Operation::HeadBucket { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let info = self.coordinator.head_bucket(&bucket_request(
                     &bucket,
                     requester,
@@ -1790,7 +1784,7 @@ impl HttpFrontend {
                 Ok(S3Response::head_bucket(&info, self.coordinator.region()))
             }
             S3Operation::GetBucketLocation { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.get_bucket_location(&bucket_request(
                     &bucket,
                     requester,
@@ -1815,7 +1809,7 @@ impl HttpFrontend {
                     .as_deref()
                     .map(|value| parse_requested_max_keys(Some(value)))
                     .transpose()?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
 
                 let result = self.coordinator.list_objects_v2(
                     &crate::coordinator::ListObjectsV2Request {
@@ -1872,7 +1866,7 @@ impl HttpFrontend {
                     .as_deref()
                     .map(|value| parse_requested_max_keys(Some(value)))
                     .transpose()?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
 
                 let result = self.coordinator.list_objects_v2(
                     &crate::coordinator::ListObjectsV2Request {
@@ -1903,7 +1897,7 @@ impl HttpFrontend {
                     // CopyObject path
                     let (src_bucket, src_key, src_version_id) =
                         parse_copy_source_header(copy_source)?;
-                    let requester = self.requester_from_auth(auth, req);
+                    let requester = self.requester_from_auth(auth, req)?;
                     let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
                     let dst_sse_customer = parse_sse_customer_request(req)?;
                     let destination_managed_encryption =
@@ -2045,7 +2039,7 @@ impl HttpFrontend {
                     let (metadata_blob, system_metadata) =
                         parse_put_object_request_metadata(request_headers.iter().copied())?;
                     let cond = write_condition_from_headers(req)?;
-                    let requester = self.requester_from_auth(auth, req);
+                    let requester = self.requester_from_auth(auth, req)?;
                     let acl = parse_put_object_write_acl(req)?;
                     let policy_context = put_object_policy_context_from_request(
                         req,
@@ -2098,7 +2092,7 @@ impl HttpFrontend {
                 let sse_customer = parse_sse_customer_request(req)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 #[cfg(feature = "deep-tracing")]
                 let trace = current_trace_context();
                 if let Some(pn_str) = req.query_param_lossy("partNumber") {
@@ -2230,7 +2224,7 @@ impl HttpFrontend {
                                 .to_string(),
                     });
                 }
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let result =
                     self.coordinator
                         .delete_object(&crate::coordinator::DeleteObjectRequest {
@@ -2254,7 +2248,7 @@ impl HttpFrontend {
                 let sse_customer = parse_sse_customer_request(req)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 #[cfg(feature = "deep-tracing")]
                 let trace = current_trace_context();
                 if let Some(pn_str) = req.query_param_lossy("partNumber") {
@@ -2356,7 +2350,7 @@ impl HttpFrontend {
 
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
-                let requester_ctx = self.requester_from_auth(auth, req);
+                let requester_ctx = self.requester_from_auth(auth, req)?;
                 let result = self.coordinator.get_object_attributes(
                     &crate::coordinator::GetObjectAttributesRequest {
                         object: object_version_request(
@@ -2397,7 +2391,7 @@ impl HttpFrontend {
                 )?;
                 let bypass_governance = parse_bypass_governance_retention(req);
                 let (xml_entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let mut entries: Vec<crate::coordinator::DeleteEntry> = Vec::new();
                 let mut validation_errors: Vec<crate::coordinator::DeleteError> = Vec::new();
                 for e in &xml_entries {
@@ -2467,7 +2461,7 @@ impl HttpFrontend {
             S3Operation::PutBucketVersioning { bucket } => {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let versioning_state = xml::parse_versioning_config_xml(&req.body)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.put_bucket_versioning(
                     &crate::coordinator::PutBucketVersioningRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2477,7 +2471,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_versioning())
             }
             S3Operation::GetBucketVersioning { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let state = self.coordinator.get_bucket_versioning(&bucket_request(
                     &bucket,
                     requester,
@@ -2491,7 +2485,7 @@ impl HttpFrontend {
                     RequestChecksumRequirement::ContentMd5OrChecksumHeader,
                 )?;
                 let config = xml::parse_bucket_object_lock_configuration_xml(&req.body)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.put_bucket_object_lock_configuration(
                     &crate::coordinator::PutBucketObjectLockConfigurationRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2501,7 +2495,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_object_lock_configuration())
             }
             S3Operation::GetBucketObjectLockConfiguration { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let config =
                     self.coordinator
                         .get_bucket_object_lock_configuration(&bucket_request(
@@ -2514,7 +2508,7 @@ impl HttpFrontend {
             S3Operation::PutBucketEncryption { bucket } => {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let config = xml::parse_bucket_encryption_xml(&req.body)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.put_bucket_encryption(
                     &crate::coordinator::PutBucketEncryptionRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2524,7 +2518,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_encryption())
             }
             S3Operation::GetBucketEncryption { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let config = self.coordinator.get_bucket_encryption(&bucket_request(
                     &bucket,
                     requester,
@@ -2533,7 +2527,7 @@ impl HttpFrontend {
                 Ok(S3Response::get_bucket_encryption(config))
             }
             S3Operation::DeleteBucketEncryption { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.delete_bucket_encryption(&bucket_request(
                     &bucket,
                     requester,
@@ -2555,7 +2549,7 @@ impl HttpFrontend {
                 )?;
                 let config = xml::parse_cors_config_xml(&req.body)?;
                 let config_xml = xml::get_cors_config_xml(&config);
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator
                     .put_bucket_cors(&crate::coordinator::PutBucketConfigRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2564,7 +2558,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_cors())
             }
             S3Operation::GetBucketCors { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 match self.coordinator.get_bucket_cors(&bucket_request(
                     &bucket,
                     requester,
@@ -2577,7 +2571,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketCors { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.delete_bucket_cors(&bucket_request(
                     &bucket,
                     requester,
@@ -2592,7 +2586,7 @@ impl HttpFrontend {
                 )?;
                 let tags = xml::TagSet::parse_tagging_xml(&req.body, 50)?;
                 let tags_xml = tags.to_xml();
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator
                     .put_bucket_tags(&crate::coordinator::PutBucketConfigRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2601,7 +2595,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_tagging())
             }
             S3Operation::GetBucketTagging { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 match self.coordinator.get_bucket_tags(&bucket_request(
                     &bucket,
                     requester,
@@ -2614,7 +2608,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketTagging { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.delete_bucket_tags(&bucket_request(
                     &bucket,
                     requester,
@@ -2628,7 +2622,7 @@ impl HttpFrontend {
                     RequestChecksumRequirement::ContentMd5OrChecksumHeader,
                 )?;
                 let enabled = xml::parse_bucket_abac_xml(&req.body)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator
                     .put_bucket_abac(&crate::coordinator::PutBucketAbacRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2637,7 +2631,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_abac())
             }
             S3Operation::GetBucketAbac { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let enabled = self.coordinator.get_bucket_abac(&bucket_request(
                     &bucket,
                     requester,
@@ -2653,7 +2647,7 @@ impl HttpFrontend {
                     xml::parse_bucket_lifecycle_configuration_xml(&req.body)?,
                 )?;
                 let config_xml = xml::get_bucket_lifecycle_configuration_xml(&config);
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.put_bucket_lifecycle(
                     &crate::coordinator::PutBucketConfigRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2663,7 +2657,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_lifecycle())
             }
             S3Operation::GetBucketLifecycle { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 match self.coordinator.get_bucket_lifecycle(&bucket_request(
                     &bucket,
                     requester,
@@ -2676,7 +2670,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketLifecycle { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.delete_bucket_lifecycle(&bucket_request(
                     &bucket,
                     requester,
@@ -2694,7 +2688,7 @@ impl HttpFrontend {
                 let bypass_governance = req
                     .header("x-amz-bypass-governance-retention")
                     .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let version_id = self.coordinator.put_object_retention(
                     &crate::coordinator::PutObjectRetentionRequest {
                         object: object_version_request(
@@ -2712,7 +2706,7 @@ impl HttpFrontend {
             }
             S3Operation::GetObjectRetention { bucket, key } => {
                 let vid = parse_version_id(req)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let retention = self
                     .coordinator
                     .get_object_retention(&object_version_request(
@@ -2731,7 +2725,7 @@ impl HttpFrontend {
                 )?;
                 let vid = parse_version_id(req)?;
                 let legal_hold = xml::parse_object_legal_hold_xml(&req.body)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let version_id = self.coordinator.put_object_legal_hold(
                     &crate::coordinator::PutObjectLegalHoldRequest {
                         object: object_version_request(
@@ -2748,7 +2742,7 @@ impl HttpFrontend {
             }
             S3Operation::GetObjectLegalHold { bucket, key } => {
                 let vid = parse_version_id(req)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let legal_hold =
                     self.coordinator
                         .get_object_legal_hold(&object_version_request(
@@ -2765,7 +2759,7 @@ impl HttpFrontend {
                 let vid = parse_version_id(req)?;
                 let tags = xml::TagSet::parse_tagging_xml(&req.body, 10)?;
                 let tags_xml = tags.to_xml();
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator
                     .put_object_tags(&crate::coordinator::PutObjectTagsRequest {
                         object: object_version_request(
@@ -2781,7 +2775,7 @@ impl HttpFrontend {
             }
             S3Operation::GetObjectTagging { bucket, key } => {
                 let vid = parse_version_id(req)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 if let Some(tags_xml) = self.coordinator.get_object_tags(
                     &object_version_request(&bucket, &key, vid, requester, expected_bucket_owner)?,
                 )? {
@@ -2796,7 +2790,7 @@ impl HttpFrontend {
             }
             S3Operation::DeleteObjectTagging { bucket, key } => {
                 let vid = parse_version_id(req)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator
                     .delete_object_tags(&object_version_request(
                         &bucket,
@@ -2809,7 +2803,7 @@ impl HttpFrontend {
             }
             S3Operation::GetObjectAcl { bucket, key } => {
                 let version_id = parse_version_id(req)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let result = self.coordinator.get_object_acl(&object_version_request(
                     &bucket,
                     &key,
@@ -2831,7 +2825,7 @@ impl HttpFrontend {
             S3Operation::PutObjectAcl { bucket, key } => {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let version_id = parse_version_id(req)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let result_version_id = if req.header("x-amz-acl").is_some() {
                     if !req.body.is_empty() {
                         return Err(ServerError::InvalidArgument {
@@ -2882,7 +2876,7 @@ impl HttpFrontend {
             S3Operation::PutBucketPublicAccessBlock { bucket } => {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let config = xml::parse_public_access_block_xml(&req.body)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.put_bucket_public_access_block(
                     &crate::coordinator::PutBucketPublicAccessBlockRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2892,7 +2886,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_public_access_block())
             }
             S3Operation::GetBucketPublicAccessBlock { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 match self
                     .coordinator
                     .get_bucket_public_access_block(&bucket_request(
@@ -2909,7 +2903,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketPublicAccessBlock { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator
                     .delete_bucket_public_access_block(&bucket_request(
                         &bucket,
@@ -2921,7 +2915,7 @@ impl HttpFrontend {
             S3Operation::PutBucketOwnershipControls { bucket } => {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let value = xml::parse_ownership_controls_xml(&req.body)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.put_bucket_ownership_controls(
                     &crate::coordinator::PutBucketOwnershipControlsRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2931,7 +2925,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_ownership_controls())
             }
             S3Operation::GetBucketOwnershipControls { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 match self
                     .coordinator
                     .get_bucket_ownership_controls(&bucket_request(
@@ -2948,7 +2942,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketOwnershipControls { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator
                     .delete_bucket_ownership_controls(&bucket_request(
                         &bucket,
@@ -2971,7 +2965,7 @@ impl HttpFrontend {
                                 .expect("S3Request stores only validated UTF-8")
                         }),
                 )?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.put_bucket_policy(
                     &crate::coordinator::PutBucketPolicyRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2982,7 +2976,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_policy())
             }
             S3Operation::GetBucketPolicy { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 match self.coordinator.get_bucket_policy(&bucket_request(
                     &bucket,
                     requester,
@@ -2995,7 +2989,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::GetBucketPolicyStatus { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let is_public = self.coordinator.get_bucket_policy_status(&bucket_request(
                     &bucket,
                     requester,
@@ -3004,7 +2998,7 @@ impl HttpFrontend {
                 Ok(S3Response::get_bucket_policy_status(is_public))
             }
             S3Operation::DeleteBucketPolicy { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.delete_bucket_policy(&bucket_request(
                     &bucket,
                     requester,
@@ -3013,7 +3007,7 @@ impl HttpFrontend {
                 Ok(S3Response::delete_bucket_policy())
             }
             S3Operation::GetBucketAcl { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let result = self.coordinator.get_bucket_acl(&bucket_request(
                     &bucket,
                     requester,
@@ -3031,7 +3025,7 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::PutBucketAcl { bucket } => {
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let acl = if req.header("x-amz-acl").is_some() {
                     if !req.body.is_empty() {
                         return Err(ServerError::InvalidArgument {
@@ -3141,7 +3135,7 @@ impl HttpFrontend {
                 } else {
                     None
                 };
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let acl = parse_put_object_write_acl(req)?;
                 let object_lock = parse_object_lock_headers(req)?;
                 let policy_context = put_object_policy_context_from_request(
@@ -3198,7 +3192,7 @@ impl HttpFrontend {
                     });
                 };
 
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let upload_request = multipart_object_request(
                     &bucket,
                     &key,
@@ -3275,7 +3269,7 @@ impl HttpFrontend {
                         Err(err) => return Err(err),
                     };
                 let upload_id_text = upload_id.as_str().to_string();
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let upload_request = multipart_object_request(
                     &bucket,
                     &key,
@@ -3385,7 +3379,7 @@ impl HttpFrontend {
             S3Operation::AbortMultipartUpload { bucket, key } => {
                 let upload_id =
                     parse_required_upload_id(req.query_param_lossy("uploadId").as_deref())?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator
                     .abort_multipart_upload(&multipart_object_request(
                         &bucket,
@@ -3412,7 +3406,7 @@ impl HttpFrontend {
                     .filter(|marker| !marker.is_empty());
                 let parsed_upload_id_marker =
                     parse_optional_upload_id_marker(effective_upload_id_marker)?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let result = self.coordinator.list_multipart_uploads(
                     &crate::coordinator::ListMultipartUploadsRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -3446,7 +3440,7 @@ impl HttpFrontend {
                 )?;
                 let upload_id =
                     parse_required_upload_id(req.query_param_lossy("uploadId").as_deref())?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
                 let result =
                     self.coordinator
                         .list_parts(&crate::coordinator::ListPartsRequest {
@@ -3506,7 +3500,7 @@ impl HttpFrontend {
                     .as_deref()
                     .map(|value| parse_requested_max_keys(Some(value)))
                     .transpose()?;
-                let requester = self.requester_from_auth(auth, req);
+                let requester = self.requester_from_auth(auth, req)?;
 
                 let result = self.coordinator.list_object_versions(
                     &crate::coordinator::ListObjectVersionsRequest {
@@ -3999,7 +3993,7 @@ impl HttpFrontend {
             parse_managed_encryption_form_fields(form_fields, sse_customer_request.is_some())?;
         let cond = write_condition_from_headers(req)?;
 
-        let requester = self.requester_from_auth(effective_auth, req);
+        let requester = self.requester_from_auth(effective_auth, req)?;
         let acl = parse_put_object_acl(field("acl"));
         let request_encryption = crate::coordinator::WriteEncryptionRequest::from_request_parts(
             sse_customer_request.as_ref(),
@@ -4379,7 +4373,7 @@ impl HttpFrontend {
 
         let bucket_name = parse_bucket_name(bucket)?;
         let object_key = parse_object_key(key)?;
-        let requester = self.requester_from_auth(&auth, req);
+        let requester = self.requester_from_auth(&auth, req)?;
         let storage_node = self.coordinator.storage_node_for_request();
         let stream_cleanup = self.coordinator.retained_stream_upload_cleanup(
             &storage_route_admission,
@@ -4677,7 +4671,7 @@ impl HttpFrontend {
         let storage_route_admission = self.coordinator.admit_storage_route_for_request()?;
         self.enforce_bucket_region_raw(&storage_route_admission, bucket, &auth)?;
 
-        let requester = self.requester_from_auth(&auth, req);
+        let requester = self.requester_from_auth(&auth, req)?;
         let expected_bucket_owner = expected_bucket_owner(req).map(str::to_string);
         let bucket_name = parse_bucket_name(bucket)?;
         let upload = multipart_object_request(
@@ -6657,51 +6651,6 @@ mod tests {
         }
     }
 
-    struct RoleAuthorizationFailureProvider {
-        role: Arc<auth::LiveRoleIdentity>,
-    }
-
-    impl auth::IdentityProviderBackend for RoleAuthorizationFailureProvider {
-        fn lookup_long_lived_credential(
-            &self,
-            _access_key_id: &str,
-        ) -> Result<Option<Arc<auth::StoredCredential>>, auth::IdentityProviderError> {
-            Ok(None)
-        }
-
-        fn lookup_live_role_identity(
-            &self,
-            stable_role_id: &auth::StableRoleId,
-        ) -> Result<Option<Arc<auth::LiveRoleIdentity>>, auth::IdentityProviderError> {
-            Ok((self.role.role().stable_id() == stable_role_id).then(|| Arc::clone(&self.role)))
-        }
-
-        fn lookup_role_authorization(
-            &self,
-            _stable_role_id: &auth::StableRoleId,
-        ) -> Result<Option<Arc<auth::RoleAuthorizationRecord>>, auth::IdentityProviderError>
-        {
-            Err(auth::IdentityProviderError::Unavailable)
-        }
-
-        fn lookup_configured_principal_authorization(
-            &self,
-            _key: &auth::ConfiguredPrincipalAuthorizationKey,
-        ) -> Result<
-            Option<Arc<auth::ConfiguredPrincipalAuthorizationRecord>>,
-            auth::IdentityProviderError,
-        > {
-            Ok(None)
-        }
-
-        fn find_account_by_canonical_user_id(
-            &self,
-            _canonical_user_id: &s3_types::CanonicalUserId,
-        ) -> Result<Option<auth::AccountIdentity>, auth::IdentityProviderError> {
-            Ok(None)
-        }
-    }
-
     static EXPECTED_PANIC_ON_500_HOOK: std::sync::Once = std::sync::Once::new();
 
     struct SuppressExpectedPanicOn500Diagnostics {
@@ -6972,616 +6921,6 @@ mod tests {
                 object_lock_enabled,
             })
             .unwrap();
-    }
-
-    fn create_role_account_bucket(
-        coord: &Coordinator,
-        name: &str,
-        ownership: crate::coordinator::BucketObjectOwnership,
-        object_lock_enabled: bool,
-    ) {
-        coord
-            .create_bucket(&crate::coordinator::CreateBucketRequest {
-                name: parse_bucket_name(name).unwrap(),
-                requester: crate::coordinator::Requester::authenticated_owner_account_admin(
-                    s3_types::AccountIdentity::new(
-                        "111122223333",
-                        s3_types::CanonicalUserId::from_principal("111122223333"),
-                        "bucket owner",
-                    ),
-                ),
-                namespace: BucketNamespace::Global,
-                acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
-                ownership,
-                object_lock_enabled,
-            })
-            .unwrap();
-    }
-
-    fn create_role_account_boe_bucket(coord: &Coordinator, name: &str) {
-        create_role_account_bucket(
-            coord,
-            name,
-            crate::coordinator::BucketObjectOwnership::BucketOwnerEnforced,
-            false,
-        );
-    }
-
-    fn create_role_account_boe_object_lock_bucket(coord: &Coordinator, name: &str) {
-        create_role_account_bucket(
-            coord,
-            name,
-            crate::coordinator::BucketObjectOwnership::BucketOwnerEnforced,
-            true,
-        );
-    }
-
-    fn create_role_account_acl_bucket(coord: &Coordinator, name: &str) {
-        create_role_account_bucket(
-            coord,
-            name,
-            crate::coordinator::BucketObjectOwnership::ObjectWriter,
-            false,
-        );
-    }
-
-    fn role_session_live_identity() -> auth::LiveRoleIdentity {
-        auth::LiveRoleIdentity::new(
-            s3_types::AccountIdentity::new(
-                "111122223333",
-                s3_types::CanonicalUserId::from_principal("111122223333"),
-                "role account",
-            ),
-            auth::IamRoleIdentity::new(
-                auth::AwsAccountId::new("111122223333").unwrap(),
-                auth::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap(),
-                auth::RoleName::new("put-role").unwrap(),
-                auth::IamPath::new("/test/").unwrap(),
-            ),
-        )
-        .unwrap()
-    }
-
-    fn role_trust_policy() -> Arc<auth::RoleTrustPolicy> {
-        Arc::new(
-            auth::RoleTrustPolicy::new(
-                Some(auth::PolicyVersion::V2012_10_17),
-                vec![auth::RoleTrustPolicyStatement::new(
-                    auth::PolicyEffect::Allow,
-                    vec![auth::RoleTrustPrincipal::new("*").unwrap()],
-                )
-                .unwrap()],
-            )
-            .unwrap(),
-        )
-    }
-
-    fn install_role_session_for_object_action_with_effect(
-        frontend: &mut HttpFrontend,
-        action: &str,
-        policy_name: &str,
-        effect: Option<auth::PolicyEffect>,
-    ) -> InstalledPostSession {
-        let live_role = role_session_live_identity();
-        let permission_policies = effect
-            .map(|effect| {
-                let identity_policy = auth::IdentityPolicy::new(
-                    Some(auth::PolicyVersion::V2012_10_17),
-                    vec![auth::IdentityPolicyStatement::new(
-                        effect,
-                        vec![auth::IamActionPattern::new(action).unwrap()],
-                        vec![auth::IamResourcePattern::new("arn:aws:s3:::mybucket/mykey").unwrap()],
-                    )
-                    .unwrap()],
-                )
-                .unwrap();
-                auth::InlineIdentityPolicy::new(
-                    auth::InlinePolicyName::new(policy_name).unwrap(),
-                    Arc::new(identity_policy),
-                )
-            })
-            .into_iter()
-            .collect();
-        let role_record = auth::RoleAuthorizationRecord::new(
-            Arc::new(live_role.clone()),
-            auth::RoleRecordTimestamps::new(1, 1).unwrap(),
-            auth::RoleMaximumSessionDuration::new(3_600).unwrap(),
-            role_trust_policy(),
-            permission_policies,
-        )
-        .unwrap();
-        let mut roles = auth::RoleIdentityStore::new();
-        roles.add(live_role).unwrap();
-        let mut authorization = auth::AuthorizationRecordStore::new();
-        authorization.add_role(role_record).unwrap();
-        frontend.identity_provider = auth::IdentityProvider::in_memory_with_authorization(
-            auth::CredentialStore::new(),
-            roles,
-            authorization,
-        )
-        .unwrap();
-        issue_live_session(frontend)
-    }
-
-    fn install_put_role_session(frontend: &mut HttpFrontend) -> InstalledPostSession {
-        install_role_session_for_object_action_with_effect(
-            frontend,
-            "s3:PutObject",
-            "put-policy",
-            Some(auth::PolicyEffect::Allow),
-        )
-    }
-
-    fn install_get_role_session(frontend: &mut HttpFrontend) -> InstalledPostSession {
-        install_role_session_for_object_action_with_effect(
-            frontend,
-            "s3:GetObject",
-            "get-policy",
-            Some(auth::PolicyEffect::Allow),
-        )
-    }
-
-    fn put_role_account_object(frontend: &HttpFrontend, data: &[u8]) {
-        put_role_account_object_with_optional_attributes(
-            frontend,
-            data,
-            None,
-            ObjectLockState::default(),
-        );
-    }
-
-    fn put_role_account_object_with_optional_attributes(
-        frontend: &HttpFrontend,
-        data: &[u8],
-        tags: Option<&str>,
-        object_lock: ObjectLockState,
-    ) {
-        let account = s3_types::AccountIdentity::new(
-            "111122223333",
-            s3_types::CanonicalUserId::from_principal("111122223333"),
-            "bucket owner",
-        );
-        let metadata = crate::metadata_blob::MetadataBlob::default();
-        let system_metadata = server_core::system_metadata::SystemMetadata::default();
-        frontend
-            .coordinator
-            .put_object(&crate::coordinator::PutObjectRequest {
-                object: crate::coordinator::ObjectRequest::new(
-                    parse_bucket_name("mybucket").unwrap(),
-                    parse_object_key("mykey").unwrap(),
-                    crate::coordinator::Requester::authenticated_owner_account_admin(account),
-                    None,
-                ),
-                data,
-                metadata: &metadata,
-                system_metadata: &system_metadata,
-                tags,
-                cond: &crate::conditional::WriteCondition::default(),
-                acl: crate::coordinator::PutObjectAcl::None.into(),
-                policy_context: crate::coordinator::PutObjectPolicyContext::default(),
-                object_lock,
-                encryption: crate::coordinator::WriteEncryptionRequest::none(),
-            })
-            .unwrap();
-    }
-
-    fn put_role_get_object_bucket_policy(frontend: &HttpFrontend, effect: auth::PolicyEffect) {
-        let effect = match effect {
-            auth::PolicyEffect::Allow => "Allow",
-            auth::PolicyEffect::Deny => "Deny",
-        };
-        let config = format!(
-            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"{effect}","Principal":{{"AWS":"arn:aws:iam::111122223333:role/test/put-role"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::mybucket/mykey"}}]}}"#,
-        );
-        frontend
-            .coordinator
-            .put_bucket_policy(&crate::coordinator::PutBucketPolicyRequest {
-                bucket: crate::coordinator::BucketRequest::new(
-                    test_bucket_name("mybucket"),
-                    crate::coordinator::Requester::authenticated_owner_account_admin(
-                        s3_types::AccountIdentity::new(
-                            "111122223333",
-                            s3_types::CanonicalUserId::from_principal("111122223333"),
-                            "bucket owner",
-                        ),
-                    ),
-                    None,
-                ),
-                config: &config,
-                confirm_remove_self_bucket_access: false,
-            })
-            .unwrap();
-    }
-
-    fn issue_live_session(frontend: &HttpFrontend) -> InstalledPostSession {
-        let stable_role_id = auth::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap();
-        let issuer = frontend
-            .identity_provider
-            .lookup_live_role_identity(&stable_role_id)
-            .unwrap()
-            .unwrap();
-        let material = auth::generate_session_credential_material().unwrap();
-        let access_key_id = material.access_key_id().to_string();
-        let secret_key = material.secret_key().clone();
-        let now = i64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        )
-        .unwrap();
-        let token = frontend
-            .identity_provider
-            .seal_session_credential_v1(
-                material,
-                &issuer,
-                auth::RoleSessionName::new("put-session").unwrap(),
-                auth::SessionLifetime::new(now - 60, now + 3_600).unwrap(),
-                None,
-            )
-            .unwrap();
-        InstalledPostSession {
-            access_key_id,
-            secret_key,
-            token,
-        }
-    }
-
-    #[test]
-    fn assumed_role_put_object_uses_current_role_permissions_after_authentication() {
-        let tmp = test_util::tempdir();
-        let mut frontend = setup_frontend(tmp.path());
-        create_role_account_boe_bucket(&frontend.coordinator, "mybucket");
-        let session = install_put_role_session(&mut frontend);
-        let request = signed_v4_put_req_with_credentials(
-            b"role data",
-            Vec::new(),
-            &session.access_key_id,
-            &session.secret_key,
-            Some(&session.token),
-        );
-
-        let auth_context = frontend
-            .authenticate(&request, None)
-            .expect("temporary credential should authenticate before authorization lookup");
-        let response = frontend
-            .dispatch_routed(
-                &request,
-                &auth_context,
-                S3Operation::PutObject {
-                    bucket: test_bucket_name("mybucket"),
-                    key: "mykey".to_string(),
-                },
-            )
-            .expect("current role identity policy should authorize PutObject");
-
-        assert_eq!(response.status_code, 200);
-    }
-
-    #[test]
-    fn assumed_role_get_object_uses_current_role_permissions_after_authentication() {
-        let tmp = test_util::tempdir();
-        let mut frontend = setup_frontend(tmp.path());
-        create_role_account_boe_object_lock_bucket(&frontend.coordinator, "mybucket");
-        put_role_account_object_with_optional_attributes(
-            &frontend,
-            b"role data",
-            Some(
-                "<Tagging><TagSet><Tag><Key>review</Key><Value>hidden</Value></Tag></TagSet></Tagging>",
-            ),
-            ObjectLockState {
-                retention: Some(ObjectRetention {
-                    mode: ObjectLockMode::Governance,
-                    retain_until_unix_seconds: 4_102_444_800,
-                }),
-                legal_hold: StoredLegalHoldStatus::On,
-            },
-        );
-        let session = install_get_role_session(&mut frontend);
-        let request = signed_v4_get_req_with_credentials(
-            &session.access_key_id,
-            &session.secret_key,
-            Some(&session.token),
-        );
-
-        let auth_context = frontend
-            .authenticate(&request, None)
-            .expect("temporary credential should authenticate before authorization lookup");
-        let response = frontend
-            .dispatch_routed(
-                &request,
-                &auth_context,
-                S3Operation::GetObject {
-                    bucket: test_bucket_name("mybucket"),
-                    key: "mykey".to_string(),
-                },
-            )
-            .expect("current role identity policy should authorize GetObject");
-
-        assert_eq!(response.status_code, 200);
-        let mut response_header_names = response
-            .headers
-            .iter()
-            .map(|(name, _)| name.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-        response_header_names.sort_unstable();
-        assert_eq!(
-            response_header_names,
-            [
-                "accept-ranges",
-                "content-length",
-                "content-type",
-                "etag",
-                "last-modified",
-                "x-amz-server-side-encryption",
-                "x-amz-version-id",
-            ]
-        );
-        assert_eq!(
-            find_header(&response, "x-amz-server-side-encryption"),
-            Some("AES256")
-        );
-        assert_eq!(response.into_test_body_bytes().unwrap(), b"role data");
-    }
-
-    #[test]
-    fn assumed_role_get_object_keeps_unpinned_adjacent_and_missing_reads_closed() {
-        let tmp = test_util::tempdir();
-        let mut frontend = setup_frontend(tmp.path());
-        create_role_account_boe_bucket(&frontend.coordinator, "mybucket");
-        put_role_account_object(&frontend, b"role data");
-        let session = install_get_role_session(&mut frontend);
-
-        let head_request = signed_v4_req_with_credentials(
-            http::Method::HEAD,
-            b"",
-            Vec::new(),
-            &session.access_key_id,
-            &session.secret_key,
-            Some(&session.token),
-        );
-        let head_auth = frontend
-            .authenticate(&head_request, None)
-            .expect("temporary credential should authenticate before HEAD authorization");
-        assert!(matches!(
-            frontend.dispatch_routed(
-                &head_request,
-                &head_auth,
-                S3Operation::HeadObject {
-                    bucket: test_bucket_name("mybucket"),
-                    key: "mykey".to_string(),
-                },
-            ),
-            Err(ServerError::AccessDenied)
-        ));
-
-        let range_request = signed_v4_req_with_credentials(
-            http::Method::GET,
-            b"",
-            vec![("range".to_string(), "bytes=0-0".to_string())],
-            &session.access_key_id,
-            &session.secret_key,
-            Some(&session.token),
-        );
-        let range_auth = frontend
-            .authenticate(&range_request, None)
-            .expect("temporary credential should authenticate before range authorization");
-        assert!(matches!(
-            frontend.dispatch_routed(
-                &range_request,
-                &range_auth,
-                S3Operation::GetObject {
-                    bucket: test_bucket_name("mybucket"),
-                    key: "mykey".to_string(),
-                },
-            ),
-            Err(ServerError::AccessDenied)
-        ));
-
-        let missing_request = signed_v4_get_req_with_credentials(
-            &session.access_key_id,
-            &session.secret_key,
-            Some(&session.token),
-        );
-        let missing_auth = frontend
-            .authenticate(&missing_request, None)
-            .expect("temporary credential should authenticate before missing-key authorization");
-        assert!(matches!(
-            frontend.dispatch_routed(
-                &missing_request,
-                &missing_auth,
-                S3Operation::GetObject {
-                    bucket: test_bucket_name("mybucket"),
-                    key: "missing-key".to_string(),
-                },
-            ),
-            Err(ServerError::AccessDenied)
-        ));
-    }
-
-    #[test]
-    fn assumed_role_get_object_keeps_acl_enabled_resource_policy_reads_closed() {
-        let tmp = test_util::tempdir();
-        let mut frontend = setup_frontend(tmp.path());
-        create_role_account_acl_bucket(&frontend.coordinator, "mybucket");
-        put_role_account_object(&frontend, b"role data");
-        let session = install_get_role_session(&mut frontend);
-        put_role_get_object_bucket_policy(&frontend, auth::PolicyEffect::Allow);
-        let request = signed_v4_get_req_with_credentials(
-            &session.access_key_id,
-            &session.secret_key,
-            Some(&session.token),
-        );
-
-        let auth_context = frontend
-            .authenticate(&request, None)
-            .expect("temporary credential should authenticate before ACL-mode authorization");
-        assert!(matches!(
-            frontend.dispatch_routed(
-                &request,
-                &auth_context,
-                S3Operation::GetObject {
-                    bucket: test_bucket_name("mybucket"),
-                    key: "mykey".to_string(),
-                },
-            ),
-            Err(ServerError::AccessDenied)
-        ));
-    }
-
-    #[test]
-    fn assumed_role_get_object_denials_match_aws_wire_messages() {
-        let cases = [
-            (
-                "implicit-deny",
-                None,
-                None,
-                " because no identity-based policy allows the s3:GetObject action",
-            ),
-            (
-                "identity-explicit-deny",
-                Some(auth::PolicyEffect::Deny),
-                Some(auth::PolicyEffect::Allow),
-                " with an explicit deny in an identity-based policy",
-            ),
-            (
-                "resource-explicit-deny",
-                Some(auth::PolicyEffect::Allow),
-                Some(auth::PolicyEffect::Deny),
-                " with an explicit deny in a resource-based policy",
-            ),
-            (
-                "dual-explicit-deny",
-                Some(auth::PolicyEffect::Deny),
-                Some(auth::PolicyEffect::Deny),
-                " with an explicit deny in a resource-based policy",
-            ),
-        ];
-
-        for (label, identity_effect, resource_effect, suffix) in cases {
-            let tmp = test_util::tempdir();
-            let mut frontend = setup_frontend(tmp.path());
-            create_role_account_boe_bucket(&frontend.coordinator, "mybucket");
-            put_role_account_object(&frontend, b"role data");
-            let session = install_role_session_for_object_action_with_effect(
-                &mut frontend,
-                "s3:GetObject",
-                "get-policy",
-                identity_effect,
-            );
-            if let Some(effect) = resource_effect {
-                put_role_get_object_bucket_policy(&frontend, effect);
-            }
-            let request = signed_v4_get_path_req_with_credentials(
-                "/mybucket/mykey",
-                &session.access_key_id,
-                &session.secret_key,
-                Some(&session.token),
-            );
-            let response = frontend
-                .handle_s3_request(&request, &WireResponseIds::new("request-id", "host-id"));
-
-            assert_eq!(response.status_code, 403, "{label}");
-            let mut response_headers = response
-                .headers
-                .iter()
-                .map(|(name, value)| (name.to_ascii_lowercase(), value.as_str()))
-                .collect::<Vec<_>>();
-            response_headers.sort_unstable();
-            assert_eq!(
-                response_headers,
-                [("content-type".to_string(), "application/xml")],
-                "{label}"
-            );
-            assert_eq!(
-                response.into_test_body_bytes().unwrap(),
-                format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                     <Error><Code>AccessDenied</Code>\
-                     <Message>User: arn:aws:sts::111122223333:assumed-role/put-role/put-session \
-                     is not authorized to perform: s3:GetObject on resource: \
-                     \"arn:aws:s3:::mybucket/mykey\"{suffix}</Message>\
-                     <RequestId>request-id</RequestId><HostId>host-id</HostId></Error>"
-                )
-                .as_bytes(),
-                "{label}"
-            );
-        }
-    }
-
-    #[test]
-    fn assumed_role_authorization_provider_failure_occurs_after_authentication() {
-        let tmp = test_util::tempdir();
-        let mut frontend = setup_frontend(tmp.path());
-        create_role_account_boe_bucket(&frontend.coordinator, "mybucket");
-        let live_role = role_session_live_identity();
-        frontend.identity_provider =
-            auth::IdentityProvider::new(RoleAuthorizationFailureProvider {
-                role: Arc::new(live_role),
-            })
-            .expect("initialize session-token key ring");
-        let session = issue_live_session(&frontend);
-        let request = signed_v4_put_req_with_credentials(
-            b"role data",
-            Vec::new(),
-            &session.access_key_id,
-            &session.secret_key,
-            Some(&session.token),
-        );
-
-        let auth_context = frontend
-            .authenticate(&request, None)
-            .expect("role liveness and signature verification should succeed");
-        assert!(matches!(
-            frontend.dispatch_routed(
-                &request,
-                &auth_context,
-                S3Operation::PutObject {
-                    bucket: test_bucket_name("mybucket"),
-                    key: "mykey".to_string(),
-                },
-            ),
-            Err(ServerError::IdentityProvider(
-                auth::IdentityProviderError::Unavailable
-            ))
-        ));
-    }
-
-    #[test]
-    fn assumed_role_get_provider_failure_occurs_after_authentication() {
-        let tmp = test_util::tempdir();
-        let mut frontend = setup_frontend(tmp.path());
-        create_role_account_boe_bucket(&frontend.coordinator, "mybucket");
-        put_role_account_object(&frontend, b"role data");
-        let live_role = role_session_live_identity();
-        frontend.identity_provider =
-            auth::IdentityProvider::new(RoleAuthorizationFailureProvider {
-                role: Arc::new(live_role),
-            })
-            .expect("initialize session-token key ring");
-        let session = issue_live_session(&frontend);
-        let request = signed_v4_get_req_with_credentials(
-            &session.access_key_id,
-            &session.secret_key,
-            Some(&session.token),
-        );
-
-        let auth_context = frontend
-            .authenticate(&request, None)
-            .expect("role liveness and signature verification should succeed");
-        assert!(matches!(
-            frontend.dispatch_routed(
-                &request,
-                &auth_context,
-                S3Operation::GetObject {
-                    bucket: test_bucket_name("mybucket"),
-                    key: "mykey".to_string(),
-                },
-            ),
-            Err(ServerError::IdentityProvider(
-                auth::IdentityProviderError::Unavailable
-            ))
-        ));
     }
 
     fn test_bucket_name(name: &str) -> BucketName {
@@ -8076,38 +7415,6 @@ mod tests {
             http::Method::PUT,
             body,
             extra_headers,
-            access_key_id,
-            secret_key,
-            security_token,
-        )
-    }
-
-    fn signed_v4_get_req_with_credentials(
-        access_key_id: &str,
-        secret_key: &SecretKey,
-        security_token: Option<&str>,
-    ) -> S3Request {
-        signed_v4_req_with_credentials(
-            http::Method::GET,
-            b"",
-            Vec::new(),
-            access_key_id,
-            secret_key,
-            security_token,
-        )
-    }
-
-    fn signed_v4_get_path_req_with_credentials(
-        path: &str,
-        access_key_id: &str,
-        secret_key: &SecretKey,
-        security_token: Option<&str>,
-    ) -> S3Request {
-        signed_v4_req_for_path_with_credentials(
-            http::Method::GET,
-            path,
-            b"",
-            Vec::new(),
             access_key_id,
             secret_key,
             security_token,
@@ -13467,7 +12774,9 @@ mod tests {
         data: &[u8],
         checksum_algorithm: Option<ChecksumAlgorithm>,
     ) -> crate::coordinator::UploadPartResult {
-        let requester = crate::coordinator::Requester::from_auth(&test_auth(), Ok(None))
+        let auth = test_auth();
+        let supported = auth::ConfiguredOrAnonymousAuth::try_from(&auth).unwrap();
+        let requester = crate::coordinator::Requester::from_auth(supported)
             .with_request_epoch_seconds(Some(storage::clock::current_time_millis() / 1_000));
         let bucket_name = test_bucket_name(bucket);
         let upload_id = parse_present_upload_id(upload_id).unwrap();
@@ -13873,6 +13182,86 @@ mod tests {
     }
 
     // ── aws-chunked decode edge cases ──────────────────────────────────
+
+    #[test]
+    fn unsupported_authenticated_identity_fails_closed_across_core_request_adapters() {
+        let tmp = test_util::tempdir();
+        let mut frontend = setup_frontend(tmp.path());
+        create_sigv4_test_bucket(&frontend.coordinator, "mybucket", false);
+        let session = install_maximum_live_post_session(&mut frontend);
+        let request = signed_v4_put_req_with_credentials(
+            &[],
+            Vec::new(),
+            &session.access_key_id,
+            &session.secret_key,
+            Some(&session.token),
+        );
+
+        let auth = frontend
+            .authenticate_with_payload_check(&request, false, Some("mybucket"))
+            .expect("temporary credential should still authenticate");
+        assert!(auth.identity.as_ref().unwrap().role_session().is_some());
+        assert!(matches!(
+            auth::ConfiguredOrAnonymousAuth::try_from(&auth),
+            Err(auth::UnsupportedAuthorizationIdentity)
+        ));
+
+        // Buffered S3.
+        assert!(matches!(
+            frontend.dispatch_routed(&make_req(""), &auth, S3Operation::ListBuckets),
+            Err(ServerError::AccessDenied)
+        ));
+
+        // S3 Control.
+        assert!(matches!(
+            frontend.dispatch_s3_control(
+                &make_req(""),
+                &auth,
+                S3ControlOperation::ListTagsForResource {
+                    bucket: test_bucket_name("mybucket"),
+                },
+            ),
+            Err(ServerError::AccessDenied)
+        ));
+
+        // POST Object.
+        let post_request = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "",
+            vec![(
+                "host".to_string(),
+                "examplebucket.s3.amazonaws.com".to_string(),
+            )],
+            Vec::new(),
+        );
+        let post_fields =
+            signed_post_session_object_condition_policy_fields(&session, &[&session.token], true);
+        assert!(matches!(
+            frontend.prepare_streaming_post_object(
+                &post_request,
+                "mybucket",
+                &post_fields,
+                Some("upload.txt"),
+            ),
+            Err(ServerError::AccessDenied)
+        ));
+
+        // Streaming PutObject and UploadPart.
+        assert!(matches!(
+            frontend.prepare_streaming_put(&request, "mybucket", "mykey", false),
+            Err(ServerError::AccessDenied)
+        ));
+        assert!(matches!(
+            frontend.prepare_streaming_part(&request, "mybucket", "mykey", "upload-id", "1",),
+            Err(ServerError::AccessDenied)
+        ));
+
+        let anonymous = AuthContext::anonymous();
+        assert!(auth::ConfiguredOrAnonymousAuth::try_from(&anonymous).is_ok());
+        let configured = test_auth();
+        assert!(auth::ConfiguredOrAnonymousAuth::try_from(&configured).is_ok());
+    }
 
     #[test]
     fn streaming_session_authentication_precedes_chunk_signature_verification() {

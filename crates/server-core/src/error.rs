@@ -15,14 +15,6 @@ pub enum ManagedEncryptionReadHeader {
     KmsKeyId,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AssumedRolePolicyDenialKind {
-    NoIdentityPolicyAllow,
-    ExplicitIdentityPolicyDeny,
-    ExplicitResourcePolicyDeny,
-    ExplicitIdentityAndResourcePolicyDeny,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     #[error("bucket not found: {name}")]
@@ -323,16 +315,6 @@ pub enum ServerError {
 
     #[error("access denied")]
     AccessDenied,
-
-    #[error(
-        "assumed-role policy access denied for {principal_arn} action {action:?} resource {resource}: {kind:?}"
-    )]
-    AssumedRolePolicyAccessDenied {
-        principal_arn: String,
-        action: auth::PolicyAction,
-        resource: String,
-        kind: AssumedRolePolicyDenialKind,
-    },
 
     /// Denial because governance/compliance retention or a legal hold
     /// protects the object (retention shortening, mode change, or delete
@@ -680,7 +662,6 @@ impl ServerError {
             Self::AccessControlListNotSupported => "AccessControlListNotSupported",
             Self::InvalidBucketAclWithObjectOwnership => "InvalidBucketAclWithObjectOwnership",
             Self::AccessDenied
-            | Self::AssumedRolePolicyAccessDenied { .. }
             | Self::ObjectLockProtectedAccessDenied
             | Self::PostPolicyAccessDenied { .. }
             | Self::PostPolicyConditionAccessDenied { .. }
@@ -833,7 +814,6 @@ impl ServerError {
             Self::UnsupportedStreamingToken { .. } => 400,
             Self::PostObjectHeaderAuthUnsupported => 400,
             Self::AccessDenied
-            | Self::AssumedRolePolicyAccessDenied { .. }
             | Self::ObjectLockProtectedAccessDenied
             | Self::PostPolicyAccessDenied { .. }
             | Self::PostPolicyConditionAccessDenied { .. }

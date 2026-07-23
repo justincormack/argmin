@@ -927,40 +927,6 @@ mod tests {
         ))
     }
 
-    fn assumed_role_requester() -> Requester {
-        let account_id = "123456789012";
-        let account = s3_types::AccountIdentity::new(
-            account_id,
-            s3_types::CanonicalUserId::from_principal(account_id),
-            "Test account",
-        );
-        let role = auth::IamRoleIdentity::new(
-            auth::AwsAccountId::new(account_id).unwrap(),
-            auth::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap(),
-            auth::RoleName::new("test-role").unwrap(),
-            auth::IamPath::new("/team/").unwrap(),
-        );
-        let session = auth::AssumedRoleSessionIdentity::new(
-            role,
-            auth::RoleSessionName::new("test-session").unwrap(),
-            auth::SessionLifetime::new(1_700_000_000, 1_700_003_600).unwrap(),
-            None,
-        );
-        let identity = auth::AuthenticatedIdentity::assumed_role_session(account, session).unwrap();
-        Requester::from_auth(
-            &auth::AuthContext {
-                mode: auth::AuthMode::HeaderSigV4,
-                access_key_id: Some("ARGS0123456789ABCDEFGHIJ".to_string()),
-                identity: Some(identity),
-                authorization_profile: auth::AuthorizationProfile::Standard,
-                request_epoch_secs: Some(1_700_000_000),
-                signing_region: Some("us-east-1".to_string()),
-                streaming: None,
-            },
-            Ok(None),
-        )
-    }
-
     fn parse_policy(body: &str) -> auth::BucketPolicy {
         auth::parse_bucket_policy(body).unwrap()
     }
@@ -979,65 +945,6 @@ mod tests {
             }
             other => panic!("expected InternalError, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn object_policy_request_propagates_assumed_role_principal_context() {
-        let requester = assumed_role_requester();
-        let role_arn = requester.role_principal_arn().unwrap().as_str();
-        let session_arn = requester.session_principal_arn().unwrap().as_str();
-        let userid = requester.aws_userid().unwrap().as_str();
-        let policy = parse_policy(&format!(
-            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{session_arn}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/key","Condition":{{"ArnEquals":{{"aws:PrincipalArn":"{role_arn}"}},"StringEquals":{{"aws:userid":"{userid}"}},"DateEquals":{{"aws:TokenIssueTime":"2023-11-14T22:13:20Z"}}}}}}]}}"#,
-        ));
-        let request = object_policy_request(ObjectPolicyRequestInput {
-            requester: &requester,
-            bucket_name: "bucket",
-            bucket_abac_enabled: false,
-            key: "key",
-            action: auth::PolicyAction::PutObject,
-            policy_context: PutObjectPolicyContext::default(),
-            policy: &policy,
-            existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
-            existing_object_tags_not_evaluable: false,
-            bucket_tags: &[],
-            request_object_tags: &[],
-            version_id: None,
-        })
-        .unwrap();
-
-        assert_eq!(
-            policy.evaluate(&request),
-            auth::PolicyEvaluation::ExplicitAllow
-        );
-    }
-
-    #[test]
-    fn bucket_policy_request_propagates_assumed_role_principal_context() {
-        let requester = assumed_role_requester();
-        let role_arn = requester.role_principal_arn().unwrap().as_str();
-        let session_arn = requester.session_principal_arn().unwrap().as_str();
-        let userid = requester.aws_userid().unwrap().as_str();
-        let policy = parse_policy(&format!(
-            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{session_arn}"}},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{{"ArnEquals":{{"aws:PrincipalArn":"{role_arn}"}},"StringEquals":{{"aws:userid":"{userid}"}},"DateEquals":{{"aws:TokenIssueTime":"2023-11-14T22:13:20Z"}}}}}}]}}"#,
-        ));
-        let request = bucket_policy_request(BucketPolicyRequestInput {
-            requester: &requester,
-            bucket_name: "bucket",
-            bucket_abac_enabled: false,
-            action: auth::PolicyAction::ListBucket,
-            policy: &policy,
-            bucket_tags: auth::bucket_policy::BucketTags::Unavailable,
-            request_tags: None,
-            policy_context: None,
-            requested_max_keys: None,
-        })
-        .unwrap();
-
-        assert_eq!(
-            policy.evaluate(&request),
-            auth::PolicyEvaluation::ExplicitAllow
-        );
     }
 
     #[test]

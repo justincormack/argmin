@@ -38,12 +38,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 # Local-only S3 behavior tests.
 cargo test -p s3-local-tests
 
-# AWS-backed S3 tests and live STS compatibility oracle.
+# AWS-backed S3 tests.
 ./scripts/aws-tests
 
-# Run one AWS protocol surface in isolation.
-./scripts/aws-tests --s3-only
-./scripts/aws-tests --sts-only
+# Explicit STS discovery oracle (not part of aws-tests).
+./scripts/aws-sts-oracle
 
 # Standalone binary UAT acceptance run.
 ./scripts/uat-s3-tests --test bucket_crud
@@ -131,14 +130,14 @@ For external AWS-backed workflows, prefer the wrapper scripts under
 `./scripts/` rather than reconstructing long `cargo test` commands by hand.
 
 - `./scripts/aws-tests`
-  - runs the external `s3-tests` package and live STS oracle by default
-  - accepts `--s3-only` or `--sts-only` to select one protocol surface
+  - runs the external `s3-tests` package
   - loads AWS credentials from `.env`
   - sets the required service endpoint and shared `AWS_TEST_*` variables
-  - runs the self-cleaning same-account `AssumeRole` fixture for STS coverage
-  - forwards extra arguments to the S3 `cargo test` command; `--sts-only`
-    rejects Cargo test selectors because the live probes execute from the
-    oracle binary's `main`
+  - forwards extra arguments to the `cargo test` command
+- `./scripts/aws-sts-oracle`
+  - runs the separate, explicitly selected STS discovery probes
+  - is not invoked by `./scripts/aws-tests`
+  - accepts `--assume-role` for its self-cleaning same-account fixture
 - `./scripts/uat-s3-tests`
   - starts the standalone `argmin-s3` binary over HTTPS
   - configures UAT-only primary, alternate, same-account constrained, and
@@ -150,10 +149,9 @@ For external AWS-backed workflows, prefer the wrapper scripts under
   - loads the primary AWS credentials from `.env`
   - uses the same AWS user as `./scripts/aws-tests`
 
-The AWS-backed scripts accept `--region`. `aws-tests` also accepts `--s3-only`
-and `--sts-only`; additional `cargo test` selectors and `-- --nocapture` style
-test-binary arguments apply to its S3 run. `uat-s3-tests` accepts additional
-`cargo nextest run` selectors and options.
+The AWS-backed scripts accept `--region`. `aws-tests` accepts additional
+`cargo test` selectors and `-- --nocapture` style test-binary arguments.
+`uat-s3-tests` accepts additional `cargo nextest run` selectors and options.
 
 ## Standalone `argmin-s3` UAT `s3-tests`
 
@@ -347,9 +345,9 @@ ARGMIN_TRACE_FILE=/tmp/argmin.trace \
 cargo run -p argmin-s3 --features deep-tracing --release
 ```
 
-## AWS-backed S3 and STS tests
+## AWS-backed S3 tests and STS discovery oracle
 
-This repo keeps the protocol surfaces independently selectable:
+This repo keeps the shared compatibility tests separate from discovery probes:
 
 - `crates/s3-tests` owns S3 API compatibility tests and the reusable raw
   signing, HTTP, and golden-shape test support
@@ -357,11 +355,11 @@ This repo keeps the protocol surfaces independently selectable:
   conformance probes; it reuses the public S3 test support where those probes
   exercise temporary credentials through S3
 
-`./scripts/aws-tests` runs both surfaces by default so the ordinary AWS
-compatibility command retains the complete protocol surface. Its STS leg runs
-the live oracle with a self-cleaning same-account `AssumeRole` fixture; it does
-not use Cargo's test harness, which would execute only the oracle binary's local
-unit tests. Use `--s3-only` or `--sts-only` for focused work.
+`./scripts/aws-tests` runs the same `s3-tests` corpus against AWS that is run
+against the local endpoint. It does not invoke the STS oracle. The live STS
+oracle is an explicitly selected discovery tool, run with
+`./scripts/aws-sts-oracle`; `--assume-role` enables its self-cleaning
+same-account fixture.
 
 External runs fail fast if the AWS-specific environment is incomplete, rather
 than silently skipping coverage.
@@ -426,30 +424,30 @@ Recommended command:
 ./scripts/aws-tests
 ```
 
-Focused protocol surfaces:
+Separate STS discovery:
 
 ```bash
-./scripts/aws-tests --s3-only
-./scripts/aws-tests --sts-only
+./scripts/aws-sts-oracle
+./scripts/aws-sts-oracle --assume-role
 ```
 
 Privileged bucket-policy root-principal coverage:
 
 ```bash
-./scripts/aws-tests --s3-only --test bucket_policy_root -- --nocapture
+./scripts/aws-tests --test bucket_policy_root -- --nocapture
 ```
 
 You can override the region or forward any normal `cargo test` selectors:
 
 ```bash
-./scripts/aws-tests --s3-only --region us-west-2 --test versioning -- --nocapture
-./scripts/aws-tests --s3-only object_lock
+./scripts/aws-tests --region us-west-2 --test versioning -- --nocapture
+./scripts/aws-tests object_lock
 ```
 
 The shared S3/STS HTTP support defaults to a 30 second operation-attempt
-timeout. The AWS wrappers default `S3_TEST_TIMEOUT_SECS` to 120 seconds; use
-`--timeout-secs` to override it for either or both selected protocol surfaces.
-AWS and local clients otherwise use the same AWS SDK stalled-stream protection.
+timeout. The AWS scripts default `S3_TEST_TIMEOUT_SECS` to 120 seconds; use
+`--timeout-secs` to override it for the selected script. AWS and local clients
+otherwise use the same AWS SDK stalled-stream protection.
 
 ### AWS convergence and retries
 
@@ -603,7 +601,7 @@ The working pattern, in order:
    [aws-compatibility.md](aws-compatibility.md), with a comment pointing at
    the guide entry.
 7. **Validate against AWS before trusting it.** Run the touched binaries via
-   `./scripts/aws-tests --s3-only --test <binary> -- <test names>`. One AWS
+   `./scripts/aws-tests --test <binary> -- <test names>`. One AWS
    data point covers one request shape — probe adjacent shapes (bucket vs
    object scope, existing vs missing resource, with vs without an optional
    header) before concluding anything about drift. If AWS disagrees with the

@@ -145,6 +145,52 @@ impl AuthContext {
     }
 }
 
+/// Authentication context whose identity is supported by configured-principal
+/// authorization, or which represents an anonymous request.
+///
+/// The inner context is private so callers must use the exhaustive conversion
+/// below when crossing into authorization code.
+#[derive(Clone, Copy)]
+pub struct ConfiguredOrAnonymousAuth<'a> {
+    context: &'a AuthContext,
+}
+
+impl<'a> TryFrom<&'a AuthContext> for ConfiguredOrAnonymousAuth<'a> {
+    type Error = UnsupportedAuthorizationIdentity;
+
+    fn try_from(context: &'a AuthContext) -> Result<Self, Self::Error> {
+        match context
+            .identity
+            .as_ref()
+            .map(crate::AuthenticatedIdentity::kind)
+        {
+            None | Some(crate::PrincipalIdentity::Configured { .. }) => Ok(Self { context }),
+            Some(crate::PrincipalIdentity::AssumedRoleSession(_)) => {
+                Err(UnsupportedAuthorizationIdentity)
+            }
+        }
+    }
+}
+
+impl<'a> ConfiguredOrAnonymousAuth<'a> {
+    #[must_use]
+    pub const fn context(self) -> &'a AuthContext {
+        self.context
+    }
+}
+
+/// The authenticated identity has no authorization implementation yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedAuthorizationIdentity;
+
+impl std::fmt::Display for UnsupportedAuthorizationIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("authenticated identity is not supported by authorization")
+    }
+}
+
+impl std::error::Error for UnsupportedAuthorizationIdentity {}
+
 /// Borrowed access to lowercased request headers.
 pub trait HeaderSource {
     fn first_value<'a>(&'a self, name: &str) -> Option<&'a str>;

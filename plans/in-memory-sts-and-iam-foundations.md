@@ -2,14 +2,26 @@
 
 ## Status
 
+_This plan is under review and is not to be followed_
+
 Phase 0 design, AWS-oracle, and fixture work is complete for the first usable
 `AssumeRole` milestone as of 2026-07-19. Phase 1 identity-provider and stateless
 credential foundations and Phase 2 temporary-credential authentication
-plumbing are complete as of 2026-07-20. Phase 3 role authorization is complete,
-and the Phase 4 typed S3/S3 Control endpoint-routing foundation is complete as
-of 2026-07-22. The bounded STS Query classifier/parser is the next
-implementation slice. The first implementation target is a test-enablement
-vertical slice, not a production identity service.
+plumbing are complete as of 2026-07-20. The reusable Phase 3 policy-language,
+identity-record, session-policy, trust-policy, and current-role-provider
+foundations are retained, but the operation-specific S3 role-authorization
+integration was rejected on 2026-07-22 and Phase 3 is not complete. It made
+credential provenance select S3 behavior, accumulated assumed-role-only deny
+and suppression branches, and produced an object-existence oracle by handling
+missing objects differently from existing objects. The Phase 4 typed S3/S3
+Control endpoint-routing foundation is complete and retained, but the bounded
+STS Query classifier/parser is blocked until the replacement Phase 3
+authorization architecture is complete. The tests added with the rejected S3
+integration are not accepted as conformance evidence: they primarily exercise
+internal helpers and an in-process role-only path, and several encode the
+credential-specific fences themselves. No useful temporary-credential S3
+conformance suite has landed yet. The first implementation target remains a
+test-enablement vertical slice, not a production identity service.
 
 The first public STS operation will be `AssumeRole`. It will be exposed on the
 existing HTTP listener and backed by process-local, in-memory role state. Issued
@@ -78,6 +90,10 @@ The first usable milestone must:
    documentation.
 9. Add AWS-backed conformance coverage before relying on assumptions from the
    public documentation.
+10. Make credential acquisition transparent to S3 authorization: temporary
+    credentials may add authenticated principal/session facts and policy
+    restrictions, but must never select a reduced or parallel S3 operation
+    implementation.
 
 ## Initial Non-Goals
 
@@ -173,29 +189,40 @@ Active static credentials retain their post-signature unexpected-token check,
 and expiring stored records remain static rather than becoming STS
 credentials.
 
-### Structured session authentication exists but role authorization does not
+### Structured session authentication exists; its S3 integration must be reset
 
 `AccountIdentity` remains the durable account/owner value. Authentication now
 composes it with a typed configured principal or assumed-role session identity,
 and exposes the IAM role ARN, STS session ARN, stable role ID, assumed-role ID,
 and `aws:userid` through distinct accessors. The first ordinary header-auth
 slice can now populate the assumed-role-session variant. Existing S3
-authorization paths explicitly refuse to reinterpret it as a configured user;
-role permission evaluation remains Phase 3. Session and principal tags remain
-later versioned policy context as described below.
+authorization paths correctly refuse to reinterpret it as a configured user.
+Current role authorization records and initial identity/session-policy
+evaluation now exist, but their first S3 integration added role-only operation
+fences instead of extending the common authorization substrate. Those fences
+are rejected design debt and must be removed before STS issuance is exposed.
+Session and principal tags remain later versioned policy context as described
+below.
 
-### S3 has resource policies but not IAM identity policies
+### S3 resource authorization and IAM identity evaluation are not yet unified
 
 The bucket-policy evaluator models a useful subset of resource-policy actions,
-principals, resources, conditions, and explicit deny. There is no equivalent
-identity-policy attachment/evaluation path for users or roles, and there is no
-trust-policy evaluator for `sts:AssumeRole`.
+principals, resources, conditions, and explicit deny. Typed identity, session,
+and trust policies and their initial evaluation rules now exist. The remaining
+architectural gap is that S3 still has one mature operation-specific
+authorization path for configured credentials and a second, partial path for
+role sessions. The second path special-cases credential kind, supports only
+selected operations, and fails adjacent operations closed even where the
+ordinary S3 behavior is already pinned.
 
-This means `AssumeRole` cannot be implemented correctly by merely issuing a
-credential. The role trust policy and caller identity permissions must combine
-according to AWS's same-account/cross-account rules, and the resulting session
-needs a real permission decision. `AuthorizationProfile::OwnerAccountAdmin`
-must not be used as a shortcut for either.
+`AssumeRole` cannot be completed correctly by issuing a credential into that
+split. Authentication must first resolve every authenticated caller into a
+common principal-authorization context. Existing S3 operation entrypoints must
+then combine identity/session decisions, resource policies, ACLs, ownership,
+and public-access controls without inspecting whether the signature used a
+long-lived or temporary credential. `AuthorizationProfile::OwnerAccountAdmin`
+must not be used as a shortcut for role permission, but temporary credentials
+must not select a separate S3 implementation either.
 
 ### HTTP dispatch assumes S3
 
@@ -716,7 +743,56 @@ Presigned and POST requests need the same semantics as header auth. Streaming
 requests must bind the seed request to the temporary credential and must not
 drop the validated session identity when constructing streaming signing state.
 
-### 6. Introduce a reusable IAM policy core
+### 6. Introduce one credential-neutral authorization boundary and reusable IAM policy core
+
+Authentication and authorization have different responsibilities.
+Authentication may distinguish long-lived and temporary credentials in order
+to validate their different cryptographic material, token, expiry, and issuer-
+liveness contracts. After authentication, credential kind must not select S3
+authorization behavior. It is an architectural error for an S3 operation to
+ask whether its requester is an assumed-role session in order to allow, deny,
+mask, load, or render that operation.
+
+Authentication must produce two separate typed values:
+
+- immutable authenticated principal facts used for principal matching,
+  condition keys, ownership identity, denial text, and audit identity
+- a provider-resolved principal-authorization context containing the current
+  identity-policy decision source and any credential-authenticated restriction
+  such as a session policy
+
+The second value is not an assumed-role escape hatch. Configured IAM users,
+role sessions, account root, legacy bootstrap principals during migration, and
+anonymous requests must all have explicit authorization-source variants. S3
+code consumes their common decision interface. Principal kind remains visible
+only where AWS semantics genuinely depend on identity, including role ARN
+versus session ARN resource-policy matching, `aws:PrincipalArn`, `aws:userid`,
+`aws:TokenIssueTime`, enhanced denial identity, and later STS role chaining.
+
+Keep one operation-specific S3 authorization entrypoint per public operation.
+Those entrypoints already own important AWS behavior such as validation
+ordering, missing-resource masking, ACL and ownership behavior, optional
+response attributes, and typed authorized capabilities. Extend the policy
+inputs consumed by those entrypoints; do not add credential-specific sibling
+entrypoints, role-only surface enums, or fail-closed branches for operations
+that are already supported for another credential kind.
+
+Policy evaluation and policy-source composition must remain distinct:
+
+1. evaluate every applicable identity-policy attachment and combine it with
+   explicit-deny precedence
+2. intersect role permissions with a supplied session policy when one exists
+3. evaluate the S3 resource policy using the authenticated principal facts
+4. combine identity/session and resource decisions with the operation's
+   existing account relationship, ACL, ownership, and public-access rules
+5. return a typed authorization decision containing both allow/deny and the
+   AWS-visible denial reason, without encoding a credential kind in the error
+   type
+
+Unsupported IAM grammar must be rejected when a policy is admitted. It must
+not be handled by making every S3 operation for one credential kind return
+`AccessDenied`. Likewise, incomplete STS parameter support must be rejected at
+the STS API boundary rather than contaminating S3 authorization.
 
 Do not fork bucket-policy parsing into unrelated trust and identity evaluators.
 The Phase 0 policy decision is to extract the common language and matching
@@ -784,6 +860,14 @@ the initial tests, but its combination rules must be real:
 - resource-policy grants, identity-policy grants, ACLs, public access block,
   ownership controls, and current owner/root behavior combine according to the
   AWS-pinned S3 rules
+
+These composition rules depend on the authenticated principal, policy source,
+resource-policy principal form, account relationship, and operation. They do
+not depend on whether SigV4 authentication opened a session token. AWS-facing
+S3 tests for long-lived credentials remain authoritative for ordinary S3
+operation behavior. Add role-session AWS probes only for genuinely role-
+specific IAM semantics, not as a prerequisite for allowing each existing S3
+operation to traverse the common authorization path.
 
 The plan should not claim full IAM policy support until every grammar and
 condition family is covered. Unknown or unevaluable security-relevant policy
@@ -2738,10 +2822,199 @@ AWS-pinned token/signature/expiry precedence on every SigV4 mode and produce a
 typed authenticated session; injected credential and issuer-liveness provider
 failures remain distinct from invalid credentials and deleted issuers.
 Phase 2 did not by itself make a role session usable through an S3
-authorization path; the first such path is supplied by the Phase 3 PutObject
-composition slice below.
+authorization path. The former Phase 3 PutObject/GetObject path below was an
+operation-specific experiment and is rejected; replacement Phase 3 integrates
+principal authorization below the existing S3 operation contracts instead.
 
 ### Phase 3: IAM policy and role core
+
+Status: reset and in progress. The policy-language and identity-provider
+foundations below are retained. The operation-specific assumed-role S3
+integration and its test strategy are rejected and must be replaced before
+Phase 4 STS Query work resumes.
+
+#### Replacement architecture acceptance criteria
+
+The replacement must satisfy these invariants before migrating any operation:
+
+1. No S3 authorization, missing-resource, ownership, ACL, optional-attribute,
+   or error-rendering decision branches on credential kind or asks whether the
+   requester is an assumed-role session.
+2. Authentication resolves immutable principal facts and a current
+   principal-authorization context. A provider failure remains distinct from
+   authentication failure, but S3 consumes the same authorization interface
+   for every authenticated principal.
+3. Identity policy, session restriction, resource policy, ACL, ownership,
+   public-access block, and account relationship remain separately evaluable
+   typed inputs. Their composition is centralized and does not live in a
+   function named for assumed roles.
+4. Existing operation-specific `authorize_*` entrypoints remain responsible
+   for AWS S3 ordering, validation, missing-resource masking, and authorized
+   capability construction.
+5. Enhanced denial details are carried by a principal-neutral typed denial.
+   The renderer selects AWS text from the evaluated policy source and
+   authenticated principal facts, not from credential provenance.
+6. Unsupported policy syntax is rejected on admission and unsupported STS
+   parameters are rejected by STS. Neither is represented by closing arbitrary
+   S3 operations for role sessions.
+7. Principal kind remains available only for genuine identity semantics:
+   policy `Principal` matching, role/session ARN selection, global condition
+   keys, ownership identity, denial identity, audit identity, and role
+   chaining.
+
+#### Test-framework reset
+
+The S3 integration tests added during the rejected slice are not evidence that
+the design is correct. Internal decision tests may remain as implementation
+tests only after they are rewritten against the common policy composer; tests
+whose expected result is an assumed-role-only fence must be deleted, not
+updated to bless a different fence. In-process HTTP tests remain useful for
+adapter invariants and exact response rendering, but they cannot establish AWS
+S3 behavior.
+
+S3 conformance belongs in the existing external `s3-tests` harness:
+
+- select an existing authorization-focused S3 scenario corpus and make its
+  authenticated caller fixture explicit
+- define one caller fixture carrying the SDK client, raw SigV4 credentials
+  including an optional session token, account relationship, and only the
+  principal facts that an identity-specific assertion needs; do not add a
+  role-specific request client alongside the existing S3 helpers
+- allow the fixture to supply either a long-lived credential or an STS-issued
+  credential without changing the S3 request, expected result, retry policy,
+  raw-wire assertion, or cleanup path
+- configure equivalent user/role identity policies, resource policies,
+  ownership controls, ACLs, and account relationships on AWS and locally
+- reuse the existing AWS-facing standard-credential results for ordinary S3
+  behavior; add AWS cases only where role/session identity, session policy, or
+  role-principal resource-policy semantics can change the answer
+- use raw responses whenever status/code alone would hide a body, header, or
+  ordering difference; exact enhanced-denial tests must compare semantic
+  headers and complete XML after sanitizing request IDs
+- run the same local suite through the public HTTP listener; no coordinator or
+  `HttpFrontend` helper may construct the result under test
+
+`sts-tests` owns Query parsing, `AssumeRole` authorization, issuance response,
+credential lifecycle, and STS wire errors. It may verify that issued
+credentials authenticate to S3, but it must not grow a parallel S3
+authorization oracle. Once the local STS endpoint exists, temporary-
+credential S3 conformance must obtain credentials through it. Before then, a
+test-only issuer may unblock development only if it emits the exact production
+credential/token type through the shared provider and the resulting requests
+still enter through the public S3 HTTP listener.
+
+The first useful red tests are credential-neutral authorization scenarios, not
+more operation-specific role tests:
+
+1. for the same no-`GetObject`, no-`ListBucket` policy state, a caller receives
+   indistinguishable existing/missing `GetObject` denials; `s3:ListBucket`
+   remains the explicit permission that authorizes missing-key discovery
+2. the established `GetObject` missing-key 403/404 matrix is unchanged when
+   the caller uses temporary credentials
+3. ordinary GET, HEAD, range, version, attributes, ACL, tagging, Object Lock,
+   copy, and multipart requests reach their existing operation-specific
+   authorization contracts with a role-session principal
+4. identical policy-source decisions produce identical S3 outcomes across
+   principal fixtures, except for AWS-defined principal text and condition-key
+   values
+5. policy/provider failures occur after successful authentication and before
+   storage or response disclosure for both long-lived and temporary
+   credentials
+
+#### Replacement implementation sequence
+
+##### 3A. Inventory and freeze
+
+- stop STS Query/issuance feature work
+- enumerate every production credential-kind branch after authentication and
+  classify it as identity semantics, provider integrity, or forbidden S3
+  behavior
+- record the current assumed-role-only gates and the tests that encode them;
+  the initial inventory contains ten S3 deny/suppression gates plus the
+  assumed-role-only policy composer
+- add the first external red tests before removing a gate
+- retain authentication/token tests and AWS policy evidence, but do not treat
+  the rejected local S3 tests as a compatibility baseline
+
+##### 3B. Unify authenticated principal authorization
+
+- replace the optional role-only authorization payload on `Requester` with a
+  required typed authorization-source value for every authenticated principal
+- represent anonymous, account root/bootstrap authority, configured IAM user,
+  and role session explicitly without copying an `AuthorizationProfile` onto a
+  role session
+- resolve mutable identity-policy state after signature authentication through
+  one provider capability; validate principal/record identity and retain typed
+  unavailable/invalid-record failures
+- carry session-policy restriction as one field of the role session's
+  authorization source, not as a reason for S3 to identify the credential kind
+- prevent storage, HTTP routing, and S3 operation code from observing
+  `LongLived` versus `Session` credential variants after `Requester` is built
+
+##### 3C. Introduce a common policy-source composer
+
+- replace `AssumedRoleObjectPolicyDecision` with principal-neutral identity and
+  resource decision types
+- evaluate identity attachments uniformly; intersect session restrictions only
+  when the authorization source contains one
+- compose policy sources according to account relationship and the matched
+  resource-policy principal form, including exact role/session grants, rather
+  than branching on credential kind
+- include typed explicit-deny and implicit-deny provenance needed for enhanced
+  AWS errors
+- use the same composer for bucket and object resources through typed request
+  adapters; do not create one universal request full of optional fields
+- keep ACL, ownership, public-access block, and operation-specific fallback
+  outside the policy-language evaluator but feed them through one reviewed S3
+  authorization composition layer
+
+##### 3D. Migrate the complete S3 authorization surface
+
+Migrate by existing authorization family, keeping its external tests green at
+each step:
+
+1. object reads, including GET/HEAD/range/part/version/attributes, optional
+   response attributes, delete markers, and missing-key/version masking
+2. object writes, including ordinary/conditional/tagged/Object-Lock PUT and
+   ACL requirements
+3. copy source and destination authorization
+4. multipart create/upload/copy/complete/abort/list authorization
+5. object ACL, tagging, retention, and legal-hold operations
+6. bucket and account-scoped actions, including ListBucket discovery
+7. S3 Control tag actions through the same identity decision source
+
+For each family, delete its assumed-role fence and role-surface plumbing in the
+same coherent slice that connects the common composer. Do not temporarily
+default a migrated family to broad allow or generic deny. Standard-credential
+tests define the S3 contract; role-specific policy tests exercise only the
+additional identity/session inputs.
+
+##### 3E. Delete the parallel path and prove the boundary
+
+- remove `RoleReadSurface`, `role_put_object_shape_uses_only_pinned_permissions`,
+  `AssumedRoleObjectPolicyDecision`, `AssumedRolePolicyAccessDenied`, every
+  assumed-role-only operation gate, and every test whose purpose was to pin
+  those gates
+- rename any retained denial type and formatter around policy provenance rather
+  than principal kind
+- make credential kind inaccessible from `server-core` S3 authorization code;
+  keep it inside authentication and STS/token code
+- audit all production `is_assumed_role_session` uses: none may remain in S3
+  authorization; retained uses must be identity/condition/STS semantics and be
+  documented at the call site
+- run the external credential-parameterized S3 suite against AWS and local,
+  then the normal workspace and standalone gates
+
+Phase 3 exit condition: temporary credentials are merely another way to
+authenticate a principal. Every supported S3 operation traverses the same
+operation-specific authorization entrypoint and common policy-source composer;
+there are no credential-kind branches in S3 authorization, no assumed-role-
+only closed surfaces, and no parallel S3 conformance framework. The external
+S3 suite demonstrates the established behavior with both long-lived and STS-
+issued credentials, while role/session-specific tests are limited to semantics
+that can actually differ by principal or policy source.
+
+#### Retained foundation work
 
 Phase 3 began by extracting the policy version, effect, normalized condition
 clause, statement-core, evaluation-result, and wildcard/action matching
@@ -2822,6 +3095,16 @@ account; opaque or account-mismatched configured principals remain lossless but
 make a dependent deny fail closed rather than bypassing it. Identity/session
 decisions and the resulting resource-policy decision were still separate at
 the end of that context-only slice.
+
+#### Rejected operation-specific S3 integration record
+
+The following paragraphs record what the rejected slices implemented and the
+AWS evidence they collected. They are historical context, not the current
+design or an accepted compatibility baseline. In particular, every statement
+that an adjacent assumed-role operation “remains closed” describes debt to
+remove under 3D, not a supported security boundary. The AWS observations about
+policy composition, principal forms, and denial text remain useful inputs to
+the common composer.
 
 The first S3 authorization-boundary slice now carries the token-versioned
 session authorization context as part of the assumed-role identity so it
@@ -2956,12 +3239,12 @@ signatures 256 times each.
   authentication
 - seed deterministic roles in embedded tests and UAT-only setup
 
-Exit condition: a constructed role session can authenticate and use S3 with
-only the AWS-equivalent permissions of its current role, sealed session, and
-resource-policy combination. The configured caller's identity-policy path is
-also capable of representing `sts:AssumeRole`; no broad profile shortcut is
-involved. An injected current-role authorization-provider failure fails closed
-without being misreported as an authentication failure.
+The rejected slice claimed an exit condition after a constructed role session
+could use selected S3 operations with its current role, sealed session, and
+resource-policy combination. That claim is withdrawn: selective operation
+enablement, assumed-role-only closure tests, and a parallel policy composer do
+not complete Phase 3. The current Phase 3 exit condition is defined in the
+replacement sequence above.
 
 ### Phase 4: STS Query endpoint and core `AssumeRole`
 
@@ -2975,9 +3258,12 @@ is also complete: service context survives route, authentication, and dispatch
 errors; ARN validation precedes authentication; the full method/path matrix is
 locally locked; empty tag-list XML is AWS-oracle-backed; and the body/query
 validation and authentication-precedence matrix is locally locked with the
-explicit duplicate-`tagKeys` non-500 incompatibility documented above. The next
-slice is the bounded STS Query classifier/parser and typed STS operation
-payload.
+explicit duplicate-`tagKeys` non-500 incompatibility documented above. This
+routing work is independent of the rejected Phase 3 S3 authorization design
+and is retained. The bounded STS Query classifier/parser and typed STS
+operation payload must not begin until replacement Phase 3 reaches its exit
+condition; issuing more credentials into the parallel authorization path would
+deepen the architectural debt and produce misleading end-to-end tests.
 
 - generalize the existing S3 Control endpoint-family routing into typed service
   and endpoint-kind routing only after the dual-endpoint AWS method/path/
@@ -3007,9 +3293,14 @@ permissions.
 
 ### Phase 5: End-to-end conformance and standalone UAT
 
-- extend the dedicated `sts-tests` crate from its Phase 0 AWS oracle into the
-  endpoint-neutral STS/temporary-credentials conformance suite
-- run it against AWS and the embedded local server
+- extend the dedicated `sts-tests` crate from its Phase 0 AWS oracle into an
+  endpoint-neutral STS Query, issuance, and credential-lifecycle conformance
+  suite; do not duplicate S3 authorization scenarios there
+- extend the existing external `s3-tests` harness so selected authorization
+  scenarios can obtain their caller through STS while preserving the same S3
+  operation, expected response, and cleanup contract used for long-lived
+  credentials
+- run both suites against AWS and the public local HTTP endpoints
 - add standalone `argmin-s3` UAT coverage with multiple workers
 - cover issuance/use races, simultaneous sessions, expiry, restart loss,
   ciphertext tampering, access-key/token mismatch, and role deletion/update
@@ -3056,6 +3347,31 @@ in-memory role through AWS-compatible public APIs.
 
 ## Test Strategy
 
+The rejected Phase 3 test approach is not a foundation to extend. A test that
+constructs a role requester, calls an internal authorization helper, and
+asserts the role-only denial encoded by that helper proves only that the
+special case exists. It does not establish AWS compatibility or protect the
+external S3 contract. Existing tests of that form must be reclassified as
+unit-level implementation coverage or removed with the rejected branch.
+
+The suite ownership boundary is:
+
+- `s3-tests`: all S3 behavior, including S3 requests authenticated with
+  credentials returned by STS
+- `sts-tests`: STS Query behavior, assume-role authorization, issuance,
+  credential/token lifecycle, and STS error rendering
+- `server-core` and `server-http` tests: pure policy-composition invariants,
+  provider failure typing, adapter invariants, and literal renderer anchors;
+  never the sole evidence for an S3 behavior claim
+- standalone UAT: public-listener composition, worker sharing, TLS endpoint
+  selection, and issue-then-use flows
+
+The useful integration abstraction is a caller/identity fixture, not a second
+operation harness. S3 scenarios must not know whether the fixture acquired a
+long-lived key from configuration or temporary credentials from `AssumeRole`.
+They may inspect authenticated principal facts only when the scenario is
+specifically testing an AWS identity-dependent result.
+
 ### Unit and property tests
 
 - typed credential/identity invariants
@@ -3074,6 +3390,10 @@ in-memory role through AWS-compatible public APIs.
   input
 - XML escaping and golden rendering
 - trust/identity/session policy combination tables
+- principal-neutral identity/resource-policy composition tables shared by
+  configured users and role sessions
+- tests proving credential kind is unavailable to S3 authorization code after
+  requester construction
 - role ARN, role-session ARN, account, canonical user, and wildcard principal
   matching
 - path-bearing role invariants: IAM role ARN and `aws:PrincipalArn` retain the
@@ -3084,6 +3404,9 @@ in-memory role through AWS-compatible public APIs.
 ### Local integration tests
 
 - issue then immediately use temporary credentials on another worker
+- rerun the selected external S3 authorization corpus with a temporary-
+  credential caller through the public listener; do not call coordinator or
+  frontend dispatch helpers from these conformance tests
 - reject configuration that enables S3 Control or STS on a plain-HTTP listener;
   run their endpoint-neutral conformance scenarios over the local TLS listener,
   while retaining separate ordinary-S3 HTTP coverage
@@ -3101,7 +3424,8 @@ in-memory role through AWS-compatible public APIs.
   issuer-liveness and authorization-provider failures exercise their distinct
   fail-closed paths
 - role permission allow, implicit deny, explicit deny, session-policy
-  restriction, resource-policy allow/deny, and ACL interaction
+  restriction, resource-policy allow/deny, ACL interaction, and missing-object
+  discovery through the same S3 scenarios used for long-lived callers
 - same-account and cross-account assume-role paths, with explicit caller
   identity-policy attachments where AWS requires them
 - path-bearing role response, principal-matching, `aws:PrincipalArn`,
@@ -3113,14 +3437,17 @@ in-memory role through AWS-compatible public APIs.
 
 ### AWS-backed tests
 
-Add a focused test binary rather than spreading STS setup through unrelated S3
-files. It should use the same scenario against AWS and Argmin:
+Keep STS setup and issuance assertions in a focused STS test binary rather than
+spreading Query-protocol setup through unrelated S3 files. Pass the resulting
+credential fixture into the existing S3 harness for S3 assertions. The full
+flow against AWS and Argmin is:
 
 1. call `AssumeRole`, including a path-bearing role and a caller whose
    cross-account permission comes from an explicit identity policy
 2. validate response shape without pinning random values
 3. build an S3 client from access key, secret, and session token
-4. exercise allowed and denied S3 actions
+4. provide the issued caller to the credential-parameterized S3 authorization
+   corpus and exercise allowed and denied S3 actions there
 5. exercise raw malformed/token/expiry cases where the SDK hides wire details
 6. clean up with the long-lived primary client
 
@@ -3135,13 +3462,18 @@ Use the repository's normal gates, scaled during development and complete
 before committing:
 
 - focused `auth`, `server-http`, `server-core`, and new STS/IAM tests
+- targeted external `s3-tests` authorization scenarios with both configured
+  and temporary caller fixtures against the public local endpoint
 - targeted `sts-tests` temporary-credential suite locally and against AWS
 - standalone UAT targeted suite
 - `cargo fmt`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo nextest run`
-- `./scripts/coverage` to measure the new integration surface
 - relevant security/parser fuzz targets
+
+`./scripts/coverage` remains the integration-coverage measurement tool, but it
+is not a normal integration or commit gate. Run it deliberately when measuring
+or improving coverage rather than on every implementation slice.
 
 ## Operational And Security Boundaries
 
@@ -3200,9 +3532,15 @@ The initial milestone is complete only when all of the following are true:
   the authorization boundary
 - the role session's S3 permissions come from policy evaluation, including
   explicit deny, rather than `AuthorizationProfile`
+- every supported S3 operation uses its existing operation-specific
+  authorization entrypoint and the common principal-policy composer; no S3
+  authorization branch, missing-resource rule, optional-response rule, or
+  error mapper switches on long-lived versus temporary credential kind
 - cross-account `AssumeRole` uses an explicit caller identity-policy attachment,
   and temporary request context exposes authenticated `aws:TokenIssueTime`
-- local, AWS-backed, and standalone UAT coverage passes
+- the external `s3-tests` authorization corpus passes with long-lived and
+  STS-issued caller fixtures against AWS and local, the separate `sts-tests`
+  Query/issuance suite passes, and standalone UAT passes
 - restart, key rotation, per-session revocation, and non-replication limitations
   are documented
 - all unsupported `AssumeRole` parameters are explicitly rejected and tracked
