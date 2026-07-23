@@ -2338,6 +2338,43 @@ Forty-seventh Phase 3 slice:
   checker, formatting, the full storage suite (2,242 tests), workspace-wide
   strict Clippy, and the full parallel workspace suite (7,510 tests) pass.
 
+Forty-eighth Phase 3 slice:
+
+- read-handle acquisition now requires a non-cloneable
+  `StorageNodeActiveReadHandleAcquireRoute` borrowed from the admitted RPC
+  frame. The capability validates every current route, binds each complete
+  `ShardLocation` to its exact `ShardKey`, owns the complete sorted acquisition
+  subject and read-operation ID, and mutably borrows the exact server session
+  whose registry/node domain was validated at construction. It captures the
+  immutable current-route fence and revalidates that fence immediately before
+  changing that session's node-wide deletion-exclusion registry.
+- explicit read-handle release now runs in retained-cleanup admission and uses
+  a separate session-bound capability. It deliberately does not re-resolve the
+  old shard routes: the successful acquisition and the live Unix session are
+  the authority for releasing only that session's exact operation ID. The
+  capability mutably borrows the validated target session, so it cannot later
+  be applied to another session. Session disconnect continues to release its
+  owned handles through RAII without a second route lookup.
+- the long-lived read-handle lease intentionally does not retain an active
+  route-admission permit. Its deletion-exclusion entries survive route-map
+  publication, while publication remains free to drain the acquisition frame.
+  Explicit release is admitted during `Draining`, must complete before
+  publication advances, and remains usable after an earlier publication has
+  replaced the route that authorized acquisition.
+- deterministic capability coverage rejects retained and foreign acquisition
+  admission, crossed location/key subjects, active and foreign release
+  admission, a foreign read-handle registry with the correct node, a foreign
+  node with the correct registry, and acquisition after the capability's
+  captured deadline even after a same-epoch raw-route renewal. It also proves
+  releasing one operation cannot release another. An installed Unix regression
+  proves a live handle survives publication, releases afterward, and a
+  successor handle releases while the next publication is draining.
+- remaining frontend capability migration and capability requirements on the
+  node-client traits remain open in Phase 3.
+- focused capability and installed Unix regressions, all 2,244 storage tests,
+  formatting, the storage boundary checker, workspace-wide strict Clippy, and
+  the full parallel workspace suite pass (7,512 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

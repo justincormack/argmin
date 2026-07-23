@@ -11081,22 +11081,7 @@ pub(crate) fn decode_placed_segment_shard_backfill_count_response(
 pub(crate) fn encode_read_handle_acquire_request(
     request: &StorageRpcReadHandleAcquireRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    validate_read_operation_id(&request.read_operation_id)?;
-    if request.locations.is_empty() {
-        return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
-            "read handle acquire must include at least one shard location",
-        ));
-    }
-    if request.locations.len() != request.shard_keys.len() {
-        return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
-            "read handle acquire locations and shard keys must have the same length",
-        ));
-    }
-    validate_read_handle_location_count(request.locations.len())?;
-    validate_read_handle_locations(&request.locations)?;
-    for (location, shard_key) in request.locations.iter().zip(request.shard_keys.iter()) {
-        validate_shard_location_matches_key(location, shard_key)?;
-    }
+    validate_read_handle_acquire_request(request)?;
     let mut out = Vec::new();
     put_string(&mut out, &request.read_operation_id);
     put_u32(
@@ -11115,6 +11100,28 @@ pub(crate) fn encode_read_handle_acquire_request(
         put_bytes(&mut out, shard_key.as_bytes());
     }
     Ok(out)
+}
+
+pub(crate) fn validate_read_handle_acquire_request(
+    request: &StorageRpcReadHandleAcquireRequest,
+) -> Result<(), StorageRpcPayloadError> {
+    validate_read_operation_id(&request.read_operation_id)?;
+    if request.locations.is_empty() {
+        return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+            "read handle acquire must include at least one shard location",
+        ));
+    }
+    if request.locations.len() != request.shard_keys.len() {
+        return Err(StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
+            "read handle acquire locations and shard keys must have the same length",
+        ));
+    }
+    validate_read_handle_location_count(request.locations.len())?;
+    validate_read_handle_locations(&request.locations)?;
+    for (location, shard_key) in request.locations.iter().zip(request.shard_keys.iter()) {
+        validate_shard_location_matches_key(location, shard_key)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn decode_read_handle_acquire_request(
@@ -11149,16 +11156,13 @@ pub(crate) fn decode_read_handle_acquire_request(
         shard_keys.push(decoder.read_shard_key()?);
     }
     decoder.finish()?;
-    validate_read_operation_id(&read_operation_id)?;
-    validate_read_handle_locations(&locations)?;
-    for (location, shard_key) in locations.iter().zip(shard_keys.iter()) {
-        validate_shard_location_matches_key(location, shard_key)?;
-    }
-    Ok(StorageRpcReadHandleAcquireRequest {
+    let request = StorageRpcReadHandleAcquireRequest {
         read_operation_id,
         locations,
         shard_keys,
-    })
+    };
+    validate_read_handle_acquire_request(&request)?;
+    Ok(request)
 }
 
 pub(crate) fn encode_read_handle_acquire_response(
@@ -11212,7 +11216,7 @@ pub(crate) fn decode_read_handle_acquire_response(
 pub(crate) fn encode_read_handle_release_request(
     request: &StorageRpcReadHandleReleaseRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    validate_read_handle_release_operation_id(&request.read_operation_id)?;
+    validate_read_handle_release_request(request)?;
     let mut out = Vec::new();
     put_string(&mut out, &request.read_operation_id);
     Ok(out)
@@ -11229,8 +11233,15 @@ pub(crate) fn decode_read_handle_release_request(
         ),
     )?;
     decoder.finish()?;
-    validate_read_handle_release_operation_id(&read_operation_id)?;
-    Ok(StorageRpcReadHandleReleaseRequest { read_operation_id })
+    let request = StorageRpcReadHandleReleaseRequest { read_operation_id };
+    validate_read_handle_release_request(&request)?;
+    Ok(request)
+}
+
+pub(crate) fn validate_read_handle_release_request(
+    request: &StorageRpcReadHandleReleaseRequest,
+) -> Result<(), StorageRpcPayloadError> {
+    validate_read_handle_release_operation_id(&request.read_operation_id)
 }
 
 pub(crate) fn encode_read_handle_release_response(

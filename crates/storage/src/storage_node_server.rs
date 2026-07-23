@@ -182,6 +182,7 @@ use crate::storage_rpc::{
     encode_stream_segment_append_prepare_response, encode_stream_upload_match_response,
     encode_stream_upload_segments_response, encode_stream_upload_session_response,
     encode_stream_uploads_list_response, read_storage_rpc_request_frame_from,
+    validate_read_handle_acquire_request, validate_read_handle_release_request,
     write_storage_rpc_frame_to, StorageRpcAbortMultipartCleanupResponse,
     StorageRpcAbortMultipartCommandBuildRequest,
     StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketBatchRequest,
@@ -3486,6 +3487,14 @@ struct StorageNodeActiveShardRoute<'a> {
     shard_key: &'a ShardKey,
 }
 
+struct StorageNodeActiveReadHandleAcquireRoute<'a> {
+    _route_permit: &'a StorageNodeRouteAdmissionPermit,
+    fence: StorageNodeRouteFence,
+    session: &'a mut StorageNodeSession,
+    read_operation_id: String,
+    entries: Vec<(ShardLocation, ShardKey)>,
+}
+
 struct StorageNodeActivePrimaryDataRoute<'a> {
     handler: &'a StorageNodeConnectionHandler,
     _route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -3584,6 +3593,13 @@ struct StorageNodeRetainedShardInspectionRoute<'a> {
     raw_pg_id: PgId,
     location: ShardLocation,
     shard_key: &'a ShardKey,
+}
+
+struct StorageNodeRetainedReadHandleReleaseRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    route_permit: &'a StorageNodeRouteAdmissionPermit,
+    session: &'a mut StorageNodeSession,
+    read_operation_id: String,
 }
 
 struct StorageNodeRetainedShardAckDeleteRoute<'a> {
@@ -6164,6 +6180,24 @@ impl StorageNodeActiveShardRoute<'_> {
     }
 }
 
+impl StorageNodeActiveReadHandleAcquireRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
+        self.fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )
+    }
+
+    fn acquire(self) -> Result<Vec<ShardLocation>, StorageRpcErrorResponse> {
+        self.require_valid_now()?;
+        self.session
+            .acquire_read_handles(ValidatedReadHandleAcquireRequest {
+                read_operation_id: self.read_operation_id,
+                entries: self.entries,
+            })
+    }
+}
+
 impl StorageNodeActivePrimaryDataRoute<'_> {
     fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
         self.fence.validate_rpc_at(
@@ -6322,6 +6356,19 @@ impl StorageNodeRetainedShardInspectionRoute<'_> {
             .node
             .read_shard_file(self.location.data_pg_id().get(), self.shard_key)
             .map_err(StorageNodeDataRouteError::Store)
+    }
+}
+
+impl StorageNodeRetainedReadHandleReleaseRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
+        self.handler
+            .validate_retained_cleanup_admission(self.route_permit, "read handle release")
+    }
+
+    fn release(self) -> Result<(), StorageRpcErrorResponse> {
+        self.require_valid_now()?;
+        self.session.release_read_handles(&self.read_operation_id);
+        Ok(())
     }
 }
 
@@ -6730,6 +6777,7 @@ impl StorageNodeConnectionHandler {
                         | StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease
                         | StorageRpcMessageKind::LifecycleSweepClaimRelease
                         | StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease
+                        | StorageRpcMessageKind::ReadHandlesRelease
                         | StorageRpcMessageKind::ShardHistoricalRead
                         | StorageRpcMessageKind::ShardDelete
                         | StorageRpcMessageKind::ShardAckHistoricalLoad
@@ -6843,7 +6891,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ReadHandlesAcquire => {
                 match decode_read_handle_acquire_request(&frame.payload) {
-                    Ok(request) => self.read_handles_acquire_response(session, request),
+                    Ok(request) => {
+                        self.read_handles_acquire_response(session, route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6852,7 +6902,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ReadHandlesRelease => {
                 match decode_read_handle_release_request(&frame.payload) {
-                    Ok(request) => self.read_handles_release_response(session, request),
+                    Ok(request) => {
+                        self.read_handles_release_response(session, route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8405,17 +8457,19 @@ impl StorageNodeConnectionHandler {
     fn read_handles_acquire_response(
         &self,
         session: &mut StorageNodeSession,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcReadHandleAcquireRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let locations = match self.validate_shard_locations(&request.locations) {
-            Ok(locations) => locations,
+        let route = match self.active_read_handle_acquire_route(
+            route_permit,
+            session,
+            &request,
+            "read handle acquire",
+        ) {
+            Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        let response = match session.acquire_read_handles(ValidatedReadHandleAcquireRequest {
-            read_operation_id: request.read_operation_id,
-            locations,
-            shard_keys: request.shard_keys,
-        }) {
+        let response = match route.acquire() {
             Ok(locations) => {
                 let payload =
                     encode_read_handle_acquire_response(&StorageRpcReadHandleAcquireResponse {
@@ -8431,9 +8485,21 @@ impl StorageNodeConnectionHandler {
     fn read_handles_release_response(
         &self,
         session: &mut StorageNodeSession,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcReadHandleReleaseRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        session.release_read_handles(&request.read_operation_id);
+        let route = match self.retained_read_handle_release_route(
+            route_permit,
+            session,
+            &request,
+            "read handle release",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        if let Err(error) = route.release() {
+            return encode_storage_rpc_error_response(&error);
+        }
         let payload = encode_read_handle_release_response(&StorageRpcReadHandleReleaseResponse);
         Ok(encode_storage_rpc_success_response(&payload))
     }
@@ -14777,17 +14843,6 @@ impl StorageNodeConnectionHandler {
         Ok(encode_storage_rpc_success_response(&[]))
     }
 
-    fn validate_shard_locations(
-        &self,
-        locations: &[StorageRpcShardLocation],
-    ) -> Result<Vec<ShardLocation>, StorageRpcErrorResponse> {
-        let mut validated = Vec::with_capacity(locations.len());
-        for &location in locations {
-            validated.push(self.validate_shard_location(location)?);
-        }
-        Ok(validated)
-    }
-
     fn try_begin_shard_delete(
         &self,
         location: ShardLocation,
@@ -14802,14 +14857,6 @@ impl StorageNodeConnectionHandler {
             location,
             shard_key: shard_key.clone(),
         })
-    }
-
-    fn validate_shard_location(
-        &self,
-        location: StorageRpcShardLocation,
-    ) -> Result<ShardLocation, StorageRpcErrorResponse> {
-        self.validate_pg_route(location.node_id, location.cluster_epoch, location.pg_id)?;
-        Ok(self.validated_shard_location(location))
     }
 
     fn validated_shard_location(&self, location: StorageRpcShardLocation) -> ShardLocation {
@@ -15840,6 +15887,38 @@ impl StorageNodeConnectionHandler {
         })
     }
 
+    fn active_read_handle_acquire_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        session: &'a mut StorageNodeSession,
+        request: &StorageRpcReadHandleAcquireRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeActiveReadHandleAcquireRoute<'a>, StorageRpcErrorResponse> {
+        self.validate_active_admission(route_permit, operation)?;
+        self.validate_read_handle_session(session, operation)?;
+        validate_read_handle_acquire_request(request).map_err(|error| StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::PayloadDecode,
+            message: format!("invalid {operation} subject: {error}"),
+        })?;
+        let mut entries = Vec::with_capacity(request.locations.len());
+        for (&location, shard_key) in request.locations.iter().zip(&request.shard_keys) {
+            self.validate_pg_route(location.node_id, location.cluster_epoch, location.pg_id)?;
+            entries.push((self.validated_shard_location(location), shard_key.clone()));
+        }
+        let fence = StorageNodeRouteFence::current(&self.config, self.current_route_map_lease());
+        fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )?;
+        Ok(StorageNodeActiveReadHandleAcquireRoute {
+            _route_permit: route_permit,
+            fence,
+            session,
+            read_operation_id: request.read_operation_id.clone(),
+            entries,
+        })
+    }
+
     fn active_primary_data_route<'a>(
         &'a self,
         route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -16048,6 +16127,43 @@ impl StorageNodeConnectionHandler {
                 request.location.node_id,
             ),
             shard_key: &request.shard_key,
+        })
+    }
+
+    fn retained_read_handle_release_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        session: &'a mut StorageNodeSession,
+        request: &StorageRpcReadHandleReleaseRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeRetainedReadHandleReleaseRoute<'a>, StorageRpcErrorResponse> {
+        self.validate_retained_cleanup_admission(route_permit, operation)?;
+        self.validate_read_handle_session(session, operation)?;
+        validate_read_handle_release_request(request).map_err(|error| StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::PayloadDecode,
+            message: format!("invalid {operation} subject: {error}"),
+        })?;
+        Ok(StorageNodeRetainedReadHandleReleaseRoute {
+            handler: self,
+            route_permit,
+            session,
+            read_operation_id: request.read_operation_id.clone(),
+        })
+    }
+
+    fn validate_read_handle_session(
+        &self,
+        session: &StorageNodeSession,
+        operation: &'static str,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        if Arc::ptr_eq(&session.shared_handles, &self.read_handles)
+            && Arc::ptr_eq(&session.node, &self.node)
+        {
+            return Ok(());
+        }
+        Err(StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::Internal,
+            message: format!("{operation} session belongs to a different storage-node domain"),
         })
     }
 
@@ -17018,8 +17134,7 @@ struct StorageNodeSession {
 
 struct ValidatedReadHandleAcquireRequest {
     read_operation_id: String,
-    locations: Vec<ShardLocation>,
-    shard_keys: Vec<ShardKey>,
+    entries: Vec<(ShardLocation, ShardKey)>,
 }
 
 impl StorageNodeSession {
@@ -17100,14 +17215,8 @@ impl StorageNodeSession {
         &mut self,
         request: ValidatedReadHandleAcquireRequest,
     ) -> Result<Vec<ShardLocation>, StorageRpcErrorResponse> {
-        let entries: Vec<(ShardLocation, ShardKey)> = request
-            .locations
-            .iter()
-            .copied()
-            .zip(request.shard_keys.iter().cloned())
-            .collect();
         match self.read_operations.get(&request.read_operation_id) {
-            Some(existing) if existing.entries == entries && existing.is_acquired => {
+            Some(existing) if existing.entries == request.entries && existing.is_acquired => {
                 return Ok(existing
                     .entries
                     .iter()
@@ -17135,15 +17244,20 @@ impl StorageNodeSession {
         self.shared_handles
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .try_acquire(&entries)?;
+            .try_acquire(&request.entries)?;
+        let locations = request
+            .entries
+            .iter()
+            .map(|(location, _)| *location)
+            .collect();
         self.read_operations.insert(
             request.read_operation_id,
             SessionReadHandle {
-                entries,
+                entries: request.entries,
                 is_acquired: true,
             },
         );
-        Ok(request.locations)
+        Ok(locations)
     }
 
     fn release_read_handles(&mut self, read_operation_id: &str) {
@@ -24964,6 +25078,130 @@ mod tests {
     }
 
     #[test]
+    fn read_handle_session_survives_publication_and_releases_during_drain() {
+        let tmp = test_util::tempdir();
+        let config = bounded_runtime_refresh_config(test_config(&tmp));
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_for_thread = Arc::clone(&server);
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server_for_thread.accept_one().unwrap());
+        let first_location = test_location(1, 0, config.node_id.as_u32());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let acquire = send_frame(
+            &mut client,
+            7,
+            StorageRpcMessageKind::ReadHandlesAcquire,
+            read_handle_acquire_payload("read-before-publication", first_location),
+        );
+        decode_storage_rpc_response_payload(&acquire.payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.read_handle_count(first_location), 1);
+
+        let mut second_config = bounded_runtime_refresh_config(config);
+        second_config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        second_config.pg_routes[0].cluster_epoch = second_config.cluster_epoch;
+        server
+            .install_control_plane_runtime_config(second_config.clone())
+            .unwrap();
+        assert_eq!(
+            server.read_handle_count(first_location),
+            1,
+            "route publication must not terminate a live read-handle session"
+        );
+        let release_after_publication = send_frame(
+            &mut client,
+            8,
+            StorageRpcMessageKind::ReadHandlesRelease,
+            read_handle_release_payload("read-before-publication"),
+        );
+        decode_storage_rpc_response_payload(&release_after_publication.payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.read_handle_count(first_location), 0);
+
+        let second_location = test_location(2, 0, second_config.node_id.as_u32());
+        let acquire_during_current_route = send_frame(
+            &mut client,
+            9,
+            StorageRpcMessageKind::ReadHandlesAcquire,
+            read_handle_acquire_payload("read-during-drain", second_location),
+        );
+        decode_storage_rpc_response_payload(&acquire_during_current_route.payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.read_handle_count(second_location), 1);
+
+        let admitted = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let mut third_config = bounded_runtime_refresh_config(second_config);
+        third_config.cluster_epoch = ClusterEpoch::new(3).unwrap();
+        third_config.pg_routes[0].cluster_epoch = third_config.cluster_epoch;
+        let (installed_tx, installed_rx) = mpsc::channel();
+        let installing_server = Arc::clone(&server);
+        let installer = thread::spawn(move || {
+            installing_server
+                .install_control_plane_runtime_config(third_config)
+                .unwrap();
+            installed_tx.send(()).unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let transition = server
+                .route_admission
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .transition;
+            if transition == StorageNodeRouteTransitionState::Draining {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "route install did not begin draining"
+            );
+            thread::yield_now();
+        }
+        assert!(matches!(
+            installed_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let release_during_drain = send_frame(
+            &mut client,
+            10,
+            StorageRpcMessageKind::ReadHandlesRelease,
+            read_handle_release_payload("read-during-drain"),
+        );
+        decode_storage_rpc_response_payload(&release_during_drain.payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.read_handle_count(second_location), 0);
+        assert!(matches!(
+            installed_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(admitted);
+        installed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        installer.join().unwrap();
+        assert_eq!(
+            server.config_snapshot().cluster_epoch,
+            ClusterEpoch::new(3).unwrap()
+        );
+        drop(client);
+        join.join().unwrap();
+    }
+
+    #[test]
     fn storage_node_server_idle_timeout_preserves_active_read_handles_until_release() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
@@ -26530,6 +26768,257 @@ mod tests {
             server._node.get_pg(0).unwrap().stat_shard(&other_shard_key),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn read_handle_capabilities_bind_admission_subject_deadline_and_session() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let handler = server.connection_handler();
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let foreign_active_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let foreign_retained_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let mut session =
+            StorageNodeSession::new(Arc::clone(&server.read_handles), Arc::clone(&server._node));
+        let foreign_handles = Arc::new(Mutex::new(StorageNodeReadHandleState::default()));
+        let mut foreign_session =
+            StorageNodeSession::new(Arc::clone(&foreign_handles), Arc::clone(&server._node));
+        let foreign_node =
+            Arc::new(SharedStorageNode::topology_only(&[0], config.default_ec_shape).unwrap());
+        let mut foreign_node_session =
+            StorageNodeSession::new(Arc::clone(&server.read_handles), foreign_node);
+        let first_location = test_location(1, 0, config.node_id.as_u32());
+        let second_location = test_location_with_shard(1, 0, config.node_id.as_u32(), 1);
+        let first_request = StorageRpcReadHandleAcquireRequest {
+            read_operation_id: "capability-read-a".to_string(),
+            locations: vec![first_location.into()],
+            shard_keys: vec![test_shard_key(0)],
+        };
+        let second_request = StorageRpcReadHandleAcquireRequest {
+            read_operation_id: "capability-read-b".to_string(),
+            locations: vec![second_location.into()],
+            shard_keys: vec![test_shard_key(1)],
+        };
+
+        crate::clock::with_time_override(1_000, || {
+            for error in [
+                match handler.active_read_handle_acquire_route(
+                    &retained_permit,
+                    &mut session,
+                    &first_request,
+                    "test read-handle acquire",
+                ) {
+                    Err(error) => error,
+                    Ok(_) => panic!("retained admission created read-handle acquire authority"),
+                },
+                match handler.active_read_handle_acquire_route(
+                    &foreign_active_permit,
+                    &mut session,
+                    &first_request,
+                    "test read-handle acquire",
+                ) {
+                    Err(error) => error,
+                    Ok(_) => panic!("foreign admission created read-handle acquire authority"),
+                },
+                match handler.active_read_handle_acquire_route(
+                    &active_permit,
+                    &mut foreign_session,
+                    &first_request,
+                    "test read-handle acquire",
+                ) {
+                    Err(error) => error,
+                    Ok(_) => panic!("foreign registry created read-handle acquire authority"),
+                },
+                match handler.active_read_handle_acquire_route(
+                    &active_permit,
+                    &mut foreign_node_session,
+                    &first_request,
+                    "test read-handle acquire",
+                ) {
+                    Err(error) => error,
+                    Ok(_) => panic!("foreign node created read-handle acquire authority"),
+                },
+            ] {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+            }
+            let crossed_request = StorageRpcReadHandleAcquireRequest {
+                shard_keys: vec![test_shard_key(1)],
+                ..first_request.clone()
+            };
+            let crossed = match handler.active_read_handle_acquire_route(
+                &active_permit,
+                &mut session,
+                &crossed_request,
+                "test read-handle acquire",
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("crossed shard subject created read-handle acquire authority"),
+            };
+            assert_eq!(crossed.code, StorageRpcErrorCode::PayloadDecode);
+            let malformed_request = StorageRpcReadHandleAcquireRequest {
+                read_operation_id: String::new(),
+                ..first_request.clone()
+            };
+            let malformed = match handler.active_read_handle_acquire_route(
+                &active_permit,
+                &mut session,
+                &malformed_request,
+                "test read-handle acquire",
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("malformed subject created read-handle acquire authority"),
+            };
+            assert_eq!(malformed.code, StorageRpcErrorCode::PayloadDecode);
+
+            handler
+                .active_read_handle_acquire_route(
+                    &active_permit,
+                    &mut session,
+                    &first_request,
+                    "test read-handle acquire",
+                )
+                .unwrap()
+                .acquire()
+                .unwrap();
+            handler
+                .active_read_handle_acquire_route(
+                    &active_permit,
+                    &mut session,
+                    &second_request,
+                    "test read-handle acquire",
+                )
+                .unwrap()
+                .acquire()
+                .unwrap();
+        });
+        assert_eq!(server.read_handle_count(first_location), 1);
+        assert_eq!(server.read_handle_count(second_location), 1);
+
+        let expiring_request = StorageRpcReadHandleAcquireRequest {
+            read_operation_id: "capability-read-expired".to_string(),
+            ..first_request.clone()
+        };
+        let expiring_route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_read_handle_acquire_route(
+                    &active_permit,
+                    &mut session,
+                    &expiring_request,
+                    "test read-handle acquire",
+                )
+                .unwrap()
+        });
+        let mut extended = config.clone();
+        extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        crate::clock::with_time_override(1_000, || {
+            server
+                .install_control_plane_runtime_config(extended)
+                .unwrap();
+        });
+        crate::clock::with_time_override(6_000, || {
+            let error = expiring_route.acquire().unwrap_err();
+            assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+        });
+        assert_eq!(server.read_handle_count(first_location), 1);
+
+        let first_release = StorageRpcReadHandleReleaseRequest {
+            read_operation_id: first_request.read_operation_id.clone(),
+        };
+        for error in [
+            match handler.retained_read_handle_release_route(
+                &active_permit,
+                &mut session,
+                &first_release,
+                "test read-handle release",
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("active admission created read-handle release authority"),
+            },
+            match handler.retained_read_handle_release_route(
+                &foreign_retained_permit,
+                &mut session,
+                &first_release,
+                "test read-handle release",
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("foreign admission created read-handle release authority"),
+            },
+            match handler.retained_read_handle_release_route(
+                &retained_permit,
+                &mut foreign_session,
+                &first_release,
+                "test read-handle release",
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("foreign registry created read-handle release authority"),
+            },
+            match handler.retained_read_handle_release_route(
+                &retained_permit,
+                &mut foreign_node_session,
+                &first_release,
+                "test read-handle release",
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("foreign node created read-handle release authority"),
+            },
+        ] {
+            assert_eq!(error.code, StorageRpcErrorCode::Internal);
+        }
+        let malformed_release = StorageRpcReadHandleReleaseRequest {
+            read_operation_id: String::new(),
+        };
+        let malformed = match handler.retained_read_handle_release_route(
+            &retained_permit,
+            &mut session,
+            &malformed_release,
+            "test read-handle release",
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed subject created read-handle release authority"),
+        };
+        assert_eq!(malformed.code, StorageRpcErrorCode::PayloadDecode);
+        crate::clock::with_time_override(6_000, || {
+            handler
+                .retained_read_handle_release_route(
+                    &retained_permit,
+                    &mut session,
+                    &first_release,
+                    "test read-handle release",
+                )
+                .unwrap()
+                .release()
+                .unwrap();
+        });
+        assert_eq!(server.read_handle_count(first_location), 0);
+        assert_eq!(server.read_handle_count(second_location), 1);
+
+        let second_release = StorageRpcReadHandleReleaseRequest {
+            read_operation_id: second_request.read_operation_id,
+        };
+        handler
+            .retained_read_handle_release_route(
+                &retained_permit,
+                &mut session,
+                &second_release,
+                "test read-handle release",
+            )
+            .unwrap()
+            .release()
+            .unwrap();
+        assert_eq!(server.read_handle_count(second_location), 0);
+        assert_eq!(foreign_handles.lock().unwrap().live_read_operations, 0);
     }
 
     #[test]
@@ -30590,16 +31079,14 @@ mod tests {
             session
                 .acquire_read_handles(ValidatedReadHandleAcquireRequest {
                     read_operation_id: format!("read-op-{i}"),
-                    locations: vec![location],
-                    shard_keys: vec![test_shard_key(location.shard_index().get())],
+                    entries: vec![(location, test_shard_key(location.shard_index().get()))],
                 })
                 .unwrap();
         }
         let error = session
             .acquire_read_handles(ValidatedReadHandleAcquireRequest {
                 read_operation_id: "read-op-over-limit".to_string(),
-                locations: vec![location],
-                shard_keys: vec![test_shard_key(location.shard_index().get())],
+                entries: vec![(location, test_shard_key(location.shard_index().get()))],
             })
             .unwrap_err();
 
