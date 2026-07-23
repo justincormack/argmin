@@ -36,6 +36,7 @@ Options:
                          (local debug endpoint defaults off unless explicitly enabled)
   --release              Use a release argmin-s3 binary
   --no-cleanup           Keep the temporary data directory after the run
+  --no-cleanup-fail      Keep the temporary data directory only when the run fails
   -h, --help             Show this help
 
 Examples:
@@ -61,6 +62,7 @@ repeat_count="${ARGMIN_UAT_REPEAT:-1}"
 release=0
 cleanup=0
 keep_temp_data_dir=0
+keep_failed_temp_data_dir=0
 server_binary=""
 cargo_args=()
 
@@ -113,6 +115,10 @@ while (($#)); do
             ;;
         --no-cleanup)
             keep_temp_data_dir=1
+            shift
+            ;;
+        --no-cleanup-fail)
+            keep_failed_temp_data_dir=1
             shift
             ;;
         -h|--help)
@@ -2308,7 +2314,7 @@ cleanup_server() {
             fi
         done
     fi
-    if ((cleanup)); then
+    if ((cleanup && (status == 0 || keep_failed_temp_data_dir == 0))); then
         rm -rf "$data_dir"
     else
         echo "UAT data directory kept at $data_dir" >&2

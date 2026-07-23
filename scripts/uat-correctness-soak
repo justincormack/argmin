@@ -20,7 +20,8 @@ Options:
   --bucket-prefix PFX  Bucket prefix passed to uat-s3-tests
   --binary PATH        Run an already-built argmin-s3-compatible binary
   --release            Use a release argmin-s3 binary
-  --no-cleanup         Keep generated UAT data directories after passing runs
+  --no-cleanup         Keep every generated UAT data directory
+  --no-cleanup-fail    Keep only the failed UAT data directory
   -h, --help           Show this help
 EOF
 }
@@ -73,6 +74,10 @@ while (($# > 0)); do
             ;;
         --no-cleanup)
             uat_options+=("--no-cleanup")
+            shift
+            ;;
+        --no-cleanup-fail)
+            uat_options+=("--no-cleanup-fail")
             shift
             ;;
         -h|--help)

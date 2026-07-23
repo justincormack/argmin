@@ -153,6 +153,11 @@ The AWS-backed scripts accept `--region`. `aws-tests` accepts additional
 `cargo test` selectors and `-- --nocapture` style test-binary arguments.
 `uat-s3-tests` accepts additional `cargo nextest run` selectors and options.
 
+Long correctness soaks can use
+`./scripts/uat-correctness-soak --no-cleanup-fail` to remove each successful
+child run while retaining the failed run's data directory and server logs.
+Use `--no-cleanup` only when every child run must be retained.
+
 ## Standalone `argmin-s3` UAT `s3-tests`
 
 `./scripts/uat-s3-tests` is the acceptance route for running the same
