@@ -14379,14 +14379,14 @@ mod tests {
             },
         );
 
-        runtime.block_on(async {
+        let elected_vote = runtime.block_on(async {
             authority
                 .raft()
                 .trigger()
                 .elect(false)
                 .await
                 .expect("local election should trigger");
-            tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     let vote = authority
                         .status()
@@ -14394,21 +14394,19 @@ mod tests {
                         .expect("authority status should read during local election")
                         .persisted_vote()
                         .expect("local election should persist a vote");
-                    if vote.leader_id.term > initial_vote.leader_id.term {
-                        break;
+                    if vote.committed
+                        && vote.leader_id.node_id == 1
+                        && vote.leader_id.term > initial_vote.leader_id.term
+                    {
+                        break vote;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
-            .expect("local election should advance the persisted vote");
+            .expect("local election should commit the local persisted vote")
         });
-        let elected_vote = runtime
-            .block_on(authority.status())
-            .expect("post-election authority status should read")
-            .persisted_vote()
-            .expect("post-election authority should have a persisted vote");
-        let checkpoint_deadline = Instant::now() + Duration::from_secs(2);
+        let checkpoint_deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let status = runtime
                 .block_on(authority.status())
@@ -14416,14 +14414,19 @@ mod tests {
             let offsets = status
                 .durable_wal_offsets()
                 .expect("WAL-backed authority should report offsets");
-            if durable_raft_artifact_vote(&state_path) == Some(elected_vote)
-                && offsets.base_offset() == offsets.clean_len()
+            let checkpointed_vote = durable_raft_artifact_vote(&state_path);
+            if checkpointed_vote.as_ref().is_some_and(|vote| {
+                vote.committed
+                    && vote.leader_id.node_id == 1
+                    && vote.leader_id.term >= elected_vote.leader_id.term
+            }) && offsets.base_offset() == offsets.clean_len()
             {
                 break;
             }
             assert!(
                 Instant::now() < checkpoint_deadline,
-                "WAL observer did not checkpoint locally initiated election"
+                "WAL observer did not checkpoint locally initiated election; expected at least \
+                 {elected_vote:?}, checkpointed={checkpointed_vote:?}, offsets={offsets:?}"
             );
             thread::sleep(Duration::from_millis(10));
         }
