@@ -1,0 +1,206 @@
+Assumed-role GetObject denial leaks object existence
+Link: https://chatgpt.com/codex/cloud/security/findings/cb048dd21104819190e01e73e9e75503?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 548fca9
+Author: justin@specialbusservice.com
+Created: 22/07/2026, 15:53:56
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+A security bug was introduced. The new assumed-role GetObject denial path returns detailed policy-denial messages only after an existing object has been loaded, while the missing-object path remains generic AccessDenied. This creates an object-existence oracle for unauthorized assumed-role callers.
+For assumed-role GetObject authorization, missing objects are deliberately mapped to generic AccessDenied by forcing can_discover_missing to false. However, when the object exists, the authorization callback is executed and a denied same-account assumed role can receive the new AssumedRolePolicyAccessDenied error with an AWS-style detailed message such as "because no identity-based policy allows the s3:GetObject action". For a missing key, the response remains the generic "Access Denied". An authenticated assumed-role session without GetObject/ListBucket permission can therefore probe guessed object keys and distinguish existing objects from missing objects by comparing 403 response bodies.
+
+# Validation
+## Rubric
+- [x] Assumed-role GetObject requests force can_discover_missing=false before object load, intending to hide missing keys.
+- [x] Missing object storage errors map to generic ServerError::AccessDenied when can_discover_missing=false.
+- [x] Existing objects execute the read authorization callback and same-account assumed roles without GetObject policy get typed AssumedRolePolicyAccessDenied(NoIdentityPolicyAllow).
+- [x] HTTP response rendering exposes different client-visible messages for generic AccessDenied versus AssumedRolePolicyAccessDenied while both are 403 AccessDenied.
+- [x] A targeted PoC/debugger trace demonstrates the two paths and their attacker-observable differential.
+## Report
+Validated the object-existence oracle. Direct crash reproduction is not applicable to this authorization/response-body logic flaw; targeted Rust tests completed without crashing. Valgrind validation was attempted but valgrind is not installed in the container. I then used LLDB non-interactively to trace the two divergent paths.
+
+Evidence:
+1. Missing-object hiding is explicitly enabled for assumed-role GetObject: crates/server-core/src/coordinator/authz/modern.rs:605-609 sets can_discover_missing=false when req.requester.is_assumed_role_session().
+2. With can_discover_missing=false, ObjectNotFound maps to generic ServerError::AccessDenied: crates/server-core/src/coordinator/authz/acl.rs:1192-1196.
+3. For an existing object, same-account assumed role with no matching identity/resource policy reaches AssumedRoleObjectPolicyDecision::Denied(Some(NoIdentityPolicyAllow)): crates/server-core/src/coordinator/authz/modern.rs:1000-1005, then becomes ServerError::AssumedRolePolicyAccessDenied at modern.rs:1334-1358.
+4. HTTP rendering makes the two 403 AccessDenied responses distinguishable: generic ServerError::AccessDenied renders "Access Denied" at crates/server-http/src/http/response.rs:185-188, while AssumedRolePolicyAccessDenied renders a detailed message at response.rs:189-218.
+
+Targeted PoC tests added in the artifact patch:
+- server-core PoC output: "POC existing object denial = AssumedRolePolicyAccessDenied(NoIdentityPolicyAllow); missing object denial = AccessDenied".
+- server-http PoC output: "POC generic 403 AccessDenied message: Access Denied" versus "POC detailed 403 assumed-role AccessDenied message: User: arn:aws:sts::111122223333:assumed-role/put-role/put-session is not authorized to perform: s3:GetObject on resource: \"arn:aws:s3:::test-bucket/key\" because no identity-based policy allows the s3:GetObject action".
+
+Debugger evidence: LLDB breakpoint at modern.rs:1003 showed the existing-object path in assumed_role_object_policy_decision with action=GetObject and resource_policy=NoMatch returning NoIdentityPolicyAllow. After continuing, a breakpoint at acl.rs:1194 showed the missing-object path with can_discover_missing=false returning generic AccessDenied. This confirms an unauthorized assumed-role caller can distinguish existing from missing keys by comparing 403 response bodies.
+
+# Resolution
+Fixed by commit `768bd24c` (`Remove premature assumed-role authorization support`).
+
+The premature assumed-role authorization implementation was removed rather than patching only the observable response difference. The commit:
+
+- removes the assumed-role-specific identity/resource-policy composition and object-policy decision path from `server-core`;
+- removes the assumed-role missing-object discovery branch, typed denial kinds, `AssumedRolePolicyAccessDenied` server error, and detailed HTTP rendering that created the object-existence signal;
+- removes the wider set of assumed-role behavioral gates and tests whose behavior had not been established by a shared AWS/local conformance suite;
+- introduces the opaque `auth::ConfiguredOrAnonymousAuth` proof, constructed by an exhaustive principal-kind classification in the `auth` crate;
+- requires that proof when `server-core::Requester::from_auth` is called, so `server-core` contains no credential-kind authorization branch and cannot receive an unsupported authenticated identity accidentally;
+- maps unsupported authenticated identities to the ordinary generic `AccessDenied` response in `server-http`; and
+- locks the fail-closed boundary across buffered S3, S3 Control, POST Object, streaming PutObject, and streaming UploadPart adapters.
+
+As a result, an assumed-role session may still be authenticated, but it cannot enter core authorization. Both existing and missing GetObject targets are rejected at the same pre-authorization boundary with generic `AccessDenied`, and the detailed assumed-role denial renderer no longer exists.
+
+Verification completed after the fix:
+
+- `cargo nextest run`: 7,486 passed, 0 failed, 0 skipped;
+- `cargo nextest run -p server-http unsupported_authenticated_identity_fails_closed_across_core_request_adapters`: passed; and
+- `cargo clippy -p auth -p server-core -p server-http --all-targets --all-features -- -D warnings`: passed.
+
+# Evidence
+crates/server-core/src/coordinator/authz/acl.rs (L1192 to 1196)
+  Note: When can_discover_missing is false, ObjectNotFound is mapped to generic ServerError::AccessDenied.
+```
+        match error {
+            storage::ObjectPgActionError::Metadata(storage::MetadataError::ObjectNotFound) => {
+                if !can_discover_missing {
+                    ServerError::AccessDenied
+                } else if let Some(version_id) = version_id {
+```
+
+crates/server-core/src/coordinator/authz/modern.rs (L1000 to 1005)
+  Note: For existing objects, an assumed role with no matching identity or resource policy is converted into a typed NoIdentityPolicyAllow denial.
+```
+        } else if identity_policy == auth::PolicyEvaluation::NoMatch
+            && resource_policy == auth::PolicyEvaluation::NoMatch
+        {
+            AssumedRoleObjectPolicyDecision::Denied(Some(
+                crate::error::AssumedRolePolicyDenialKind::NoIdentityPolicyAllow,
+            ))
+```
+
+crates/server-core/src/coordinator/authz/modern.rs (L1334 to 1358)
+  Note: The typed assumed-role policy denial is returned from the authorization callback, which only runs after an object exists and has been loaded.
+```
+    if let Some(role_decision) = assumed_role_object_policy_decision(
+        requester,
+        bucket,
+        object.key().as_str(),
+        action.policy_action(),
+        decision,
+    )? {
+        return match role_decision {
+            AssumedRoleObjectPolicyDecision::Allowed => Ok(ModernObjectReadAuthorization::Allowed),
+            AssumedRoleObjectPolicyDecision::Denied(Some(kind)) => {
+                let principal_arn = requester.session_principal_arn().ok_or_else(|| {
+                    ServerError::InternalError {
+                        reason: "assumed-role requester has no session principal ARN".to_string(),
+                    }
+                })?;
+                Err(ServerError::AssumedRolePolicyAccessDenied {
+                    principal_arn: principal_arn.as_str().to_string(),
+                    action: action.policy_action(),
+                    resource: format!(
+                        "arn:aws:s3:::{}/{}",
+                        bucket.name.as_str(),
+                        object.key().as_str()
+                    ),
+                    kind,
+                })
+```
+
+crates/server-core/src/coordinator/authz/modern.rs (L605 to 609)
+  Note: Assumed-role reads force can_discover_missing to false, so missing keys are intentionally hidden behind generic AccessDenied.
+```
+        let can_discover_missing = if req.requester.is_assumed_role_session() {
+            // The current AWS matrix covers an existing object only. Do not
+            // infer role-session ListBucket composition or missing-key
+            // disclosure from the configured-principal path.
+            false
+```
+
+crates/server-http/src/http/response.rs (L189 to 218)
+  Note: The new typed denial is rendered as a detailed client-visible AccessDenied message, making it distinguishable from the generic missing-object AccessDenied response.
+```
+        ServerError::AssumedRolePolicyAccessDenied {
+            principal_arn,
+            action,
+            resource,
+            kind,
+        } => {
+            let suffix = match kind {
+                server_core::error::AssumedRolePolicyDenialKind::NoIdentityPolicyAllow => {
+                    format!(
+                        " because no identity-based policy allows the {} action",
+                        action.as_str()
+                    )
+                }
+                server_core::error::AssumedRolePolicyDenialKind::ExplicitIdentityPolicyDeny => {
+                    " with an explicit deny in an identity-based policy".to_string()
+                }
+                server_core::error::AssumedRolePolicyDenialKind::ExplicitResourcePolicyDeny => {
+                    " with an explicit deny in a resource-based policy".to_string()
+                }
+                server_core::error::AssumedRolePolicyDenialKind::ExplicitIdentityAndResourcePolicyDeny => {
+                    // AWS has emitted both source suffixes for this state. Use
+                    // one observed spelling while retaining the dual-source
+                    // decision in the typed error.
+                    " with an explicit deny in a resource-based policy".to_string()
+                }
+            };
+            format!(
+                "User: {principal_arn} is not authorized to perform: {} on resource: \"{resource}\"{suffix}",
+                action.as_str()
+            )
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. The code evidence and validation demonstrate a real, client-observable authorization side channel in the runtime GetObject path: missing denied keys return generic "Access Denied" while existing denied keys return detailed AssumedRolePolicyAccessDenied text. The issue is in scope because it is in server-http/server-core production authorization/response code. Severity should not be higher because exploitation requires valid assumed-role session credentials, the default argmin-s3 binary does not appear to expose a production STS issuer or configured role store, and the proven impact is limited to object existence/key metadata rather than object contents, credentials, write access, or authentication bypass.
+## Likelihood
+high - Exploitation is low-complexity once an attacker has accepted assumed-role credentials and network reachability, but those are meaningful prerequisites. The default binary listens on localhost and no production STS endpoint/role configuration path was found, reducing likelihood for default deployments; deployments or embeddings that enable assumed-role sessions remain realistically affected. | Remote network vector
+## Impact
+medium - The vulnerability leaks whether guessed object keys exist in a bucket to an unauthorized assumed-role caller. It does not expose object bytes, secrets, write capability, or broad account compromise, but object names/existence can be sensitive metadata and the project calibration treats bucket/object metadata disclosure as medium.
+## Assumptions
+- The attacker has valid temporary assumed-role credentials accepted by the server's IdentityProvider, but lacks s3:GetObject and ListBucket-style permission for the target bucket/key.
+- The attacker can send HTTP GetObject requests to the argmin-s3 frontend and can compare 403 response bodies.
+- Object keys are guessable or derived from outside knowledge; the bug does not provide bulk listing by itself.
+- No deployment manifests were present in the checkout, so exposure is inferred from runtime configuration defaults and code.
+- reachable argmin-s3 S3 HTTP frontend
+- valid assumed-role session credential/session token
+- same-account assumed-role path with no matching identity/resource allow for s3:GetObject
+- guessed bucket and object key names
+## Path
+attacker assumed-role creds
+  -> HTTP GetObject /bucket/guessed-key
+  -> server-core read authz
+     -> missing: AccessDenied body "Access Denied"
+     -> existing denied: detailed AssumedRolePolicyAccessDenied body
+  -> object existence oracle
+## Path evidence
+- `crates/server-http/src/http/mod.rs:1943-2056` - HTTP S3 GetObject dispatch constructs a requester from authentication context and calls coordinator.get_object for attacker-controlled bucket/key requests.
+- `crates/server-core/src/coordinator/authz/modern.rs:605-609` - Assumed-role object reads deliberately set can_discover_missing=false, intending to hide missing object keys.
+- `crates/server-core/src/coordinator/authz/acl.rs:1192-1196` - When can_discover_missing is false, ObjectNotFound is converted to generic ServerError::AccessDenied.
+- `crates/server-core/src/coordinator/authz/modern.rs:1000-1005` - For existing objects, a same-account assumed role with no matching identity/resource allow is converted to Denied(Some(NoIdentityPolicyAllow)).
+- `crates/server-core/src/coordinator/authz/modern.rs:1334-1358` - The existing-object assumed-role denial is returned as ServerError::AssumedRolePolicyAccessDenied with principal, action, and resource details.
+- `crates/server-http/src/http/response.rs:185-218` - HTTP error rendering makes generic AccessDenied body "Access Denied" but AssumedRolePolicyAccessDenied body a detailed message, creating the oracle.
+- `crates/server-core/src/error.rs:830-832` - Both generic AccessDenied and AssumedRolePolicyAccessDenied are returned as HTTP 403, so the distinguishing signal is the response body.
+- `crates/argmin-s3/src/config.rs:506-510` - The S3 frontend listen address is environment-configurable and defaults to 127.0.0.1:9000.
+- `crates/argmin-s3/src/main.rs:7939-8017` - The production frontend binds the configured TCP listener and serves HTTP/TLS S3 traffic.
+- `crates/argmin-s3/src/main.rs:7909-7914` - The argmin-s3 binary initializes an in-memory IdentityProvider; no production STS HTTP issuer was found, limiting default assumed-role reachability.
+## Narrative
+The finding is a real authorization side channel in in-scope runtime code. GetObject reaches server-core authorization through the HTTP dispatcher. For assumed-role reads, modern.rs forces can_discover_missing=false, and acl.rs maps ObjectNotFound to generic ServerError::AccessDenied. However, when the object exists, the authorization callback evaluates same-account assumed-role policy state and can return AssumedRolePolicyAccessDenied(NoIdentityPolicyAllow). server-http then renders generic AccessDenied as "Access Denied" but renders AssumedRolePolicyAccessDenied as a detailed message containing the principal, action, resource, and policy-denial suffix. Both are 403 AccessDenied, but the body difference is attacker-observable. Impact is limited to object/key existence metadata, not object contents or credential disclosure, and exploitation requires valid assumed-role credentials; therefore medium severity is appropriate, not high/critical.
+## Controls
+- SigV4 request authentication
+- session-token authentication support in auth crate
+- server-core identity/resource policy authorization
+- generic AccessDenied missing-key hiding for assumed roles
+- HTTP 403 for both generic and typed access denials
+- configurable TLS, max connections, and max in-flight request limits
+## Blindspots
+- Static-only review; no cloud APIs or live deployment inspection were performed.
+- No Kubernetes, Terraform, Docker, or ingress manifests were present, so public exposure and load balancer type are unknown.
+- The validation PoC exercised targeted Rust tests/debugger paths; a full end-to-end deployed HTTP assumed-role scenario depends on how roles/session tokens are enabled in a real deployment.
+- The argmin-s3 binary's default IdentityProvider appears to use configured long-lived credentials and no roles, so assumed-role reachability may be lower in default standalone deployments than in library embeddings or future STS-enabled deployments.
