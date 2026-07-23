@@ -16,7 +16,7 @@ use placement::NodeId;
 use std::num::NonZeroU64;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 12;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 13;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -1552,6 +1552,7 @@ const fn cluster_map_history_route_reference_kind_code(
         PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource => 2,
         PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired => 3,
         PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand => 4,
+        PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim => 5,
     }
 }
 
@@ -1563,6 +1564,7 @@ fn read_cluster_map_history_route_reference_kind(
         2 => Ok(PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource),
         3 => Ok(PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired),
         4 => Ok(PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand),
+        5 => Ok(PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim),
         value => Err(ControlPlaneError::CommandDecode {
             message: format!("invalid cluster-map history route reference kind {value}"),
         }),
@@ -1992,6 +1994,11 @@ mod tests {
                                 ClusterEpoch::new(11).unwrap(),
                                 PgId::new(3),
                             ),
+                            PgClusterMapHistoryRouteReference::new(
+                                PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
+                                ClusterEpoch::new(9).unwrap(),
+                                PgId::new(3),
+                            ),
                         ])
                         .unwrap(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -2290,8 +2297,8 @@ mod tests {
     fn control_plane_command_codec_rejects_incompatible_or_malformed_payloads() {
         assert_decode_error_contains(b"not a command", "truncated");
 
-        let encoded = command_frame_with_version(1, 5, |body| write_u64(body, 1_000));
-        assert_decode_error_contains(&encoded, "unsupported control-plane command version 1");
+        let encoded = command_frame_with_version(12, 5, |body| write_u64(body, 1_000));
+        assert_decode_error_contains(&encoded, "unsupported control-plane command version 12");
 
         let mut encoded = encode_control_plane_command(&ControlPlaneCommand::SetPgState {
             pg_id: PgId::new(7),

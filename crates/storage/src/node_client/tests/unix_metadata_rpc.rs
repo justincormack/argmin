@@ -243,6 +243,36 @@ fn unix_storage_node_client_reads_cluster_map_history_reference_summary() {
         };
         pg.record_placed_segment_shard_backfill(&backfill, backfill.request.ec.m, None)
             .unwrap();
+        let reclaim_bucket = crate::tests::bucket_name("unix-history-reclaim-claim");
+        let reclaim_key = crate::tests::object_key("reclaim-object");
+        let reclaim_generation = GenerationId::new(13).unwrap();
+        PgMetadataStore::put_object_segments_reclaim(
+            &*pg,
+            &ObjectSegmentsReclaimRecord {
+                bucket: reclaim_bucket.clone(),
+                key: reclaim_key.clone(),
+                generation_id: reclaim_generation,
+                created_at: 2,
+                segments: Vec::new(),
+            },
+        )
+        .unwrap();
+        PgMetadataStore::acquire_object_payload_reclaim_claim(
+            &*pg,
+            &reclaim_bucket,
+            1,
+            &reclaim_key,
+            reclaim_generation,
+            ObjectPayloadReclaimKind::ObjectSegments,
+            "unix-history-reclaim-claim",
+            "unix-history-reclaim-owner",
+            ClusterEpoch::new(2).unwrap(),
+            2,
+            None,
+            2,
+        )
+        .unwrap()
+        .expect("durable reclaim root must be claimable");
         pg.refresh_metadata_command_state_digest().unwrap();
     }
     let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -255,7 +285,7 @@ fn unix_storage_node_client_reads_cluster_map_history_reference_summary() {
 
     let references = client.cluster_map_history_route_references().unwrap();
     let summary = references.summary();
-    assert_eq!(references.len(), 3);
+    assert_eq!(references.len(), 4);
     assert_eq!(
         summary.oldest_live_placement_epoch,
         Some(ClusterEpoch::new(6).unwrap())
@@ -265,8 +295,12 @@ fn unix_storage_node_client_reads_cluster_map_history_reference_summary() {
         Some(ClusterEpoch::new(3).unwrap())
     );
     assert_eq!(
+        summary.oldest_object_payload_reclaim_claim_epoch,
+        Some(ClusterEpoch::new(2).unwrap())
+    );
+    assert_eq!(
         summary.oldest_required_epoch(),
-        Some(ClusterEpoch::new(3).unwrap())
+        Some(ClusterEpoch::new(2).unwrap())
     );
     server_thread.join().unwrap();
 }

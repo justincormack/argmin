@@ -1,6 +1,85 @@
 use super::*;
 
 #[test]
+fn unix_object_payload_reclaim_claim_release_survives_expired_route() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    let bucket = crate::tests::bucket_name("expired-reclaim-claim-route-bucket");
+    let key = crate::tests::object_key("expired-reclaim-claim-route-key");
+    let generation_id = GenerationId::new(81).unwrap();
+    let claim = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        PgMetadataStore::put_object_segments_reclaim(
+            &*pg,
+            &ObjectSegmentsReclaimRecord {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                generation_id,
+                created_at: 10,
+                segments: Vec::new(),
+            },
+        )
+        .unwrap();
+        let claim = PgMetadataStore::acquire_object_payload_reclaim_claim(
+            &*pg,
+            &bucket,
+            1,
+            &key,
+            generation_id,
+            ObjectPayloadReclaimKind::ObjectSegments,
+            "expired-reclaim-route-claim",
+            "expired-reclaim-route-owner",
+            config.cluster_epoch,
+            10,
+            Some(20),
+            10,
+        )
+        .unwrap()
+        .expect("seeded reclaim root must be claimable");
+        pg.refresh_metadata_command_state_digest().unwrap();
+        claim
+    };
+    config.route_map_validity =
+        RouteMapValidity::until_ms(crate::clock::current_time_millis().saturating_sub(1)).unwrap();
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+
+    ObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
+        &client,
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
+        &claim,
+    )
+    .expect("retained reclaim claim release must survive active route expiry");
+    server_thread.join().unwrap();
+
+    let node = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    let pg = node.get_pg(0).unwrap();
+    assert!(
+        PgMetadataStore::object_payload_reclaim_claim(&*pg)
+            .unwrap()
+            .is_none(),
+        "retained Unix reclaim cleanup must release the exact durable claim"
+    );
+}
+
+#[test]
 fn unix_retained_stream_abort_cleans_expired_route_session() {
     let tmp = test_util::tempdir();
     let mut config = test_config(&tmp);

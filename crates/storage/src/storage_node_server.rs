@@ -25,8 +25,8 @@ use crate::data_dir::prepare_private_data_dir;
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{
     is_stream_create_bucket_write_operation_kind, MetadataCommandEnvelope, MetadataCommandId,
-    MetadataCommandLogIndex, MetadataCommandPayload, PutObjectMetadataMutation,
-    ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+    MetadataCommandLogIndex, MetadataCommandPayload, ObjectPayloadReclaimCommand,
+    PutObjectMetadataMutation, ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
@@ -326,9 +326,9 @@ use crate::{
     BucketSnapshotRequest, BucketSubresourceKind, BucketWriteDrainRecord,
     BucketWriteReservationProof, BucketWriteReservationRecord, CreateMultipartUploadReq,
     CreateStreamUploadReq, EcShape, LifecycleSweepClaimRecord, MultipartUploadRecord, NodeId,
-    ObjectKey, ObjectPgActionError, PrepareStreamUploadSegmentAppendReq, RouteMapValidity,
-    ShardKey, ShardLocation, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadTarget,
-    UploadId,
+    ObjectKey, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectPgActionError,
+    PrepareStreamUploadSegmentAppendReq, RouteMapValidity, ShardKey, ShardLocation,
+    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadTarget, UploadId,
 };
 use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 
@@ -3143,6 +3143,12 @@ enum StorageNodeMultipartUploadRouteError {
     Upload(BucketSnapshotLoadError),
 }
 
+#[derive(Debug)]
+enum StorageNodeObjectPayloadReclaimRouteError {
+    Route(StorageRpcErrorResponse),
+    Reclaim(BucketSnapshotLoadError),
+}
+
 enum StorageNodeRetainedStreamAbortApplyError {
     Route(StorageRpcErrorResponse),
     Apply(BucketSnapshotLoadError),
@@ -3227,6 +3233,16 @@ struct StorageNodeRetainedLifecycleSweepClaimRoute<'a> {
     raw_pg_id: PgId,
     pg_id: BucketPgId,
     claim: &'a LifecycleSweepClaimRecord,
+}
+
+struct StorageNodeRetainedObjectPayloadReclaimClaimRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    route_permit: &'a StorageNodeRouteAdmissionPermit,
+    node_id: NodeId,
+    route_cluster_epoch: ClusterEpoch,
+    raw_pg_id: PgId,
+    pg_id: ObjectMetadataPgId,
+    claim: &'a ObjectPayloadReclaimClaimRecord,
 }
 
 struct StorageNodeRetainedStreamAbortRoute<'a> {
@@ -3728,6 +3744,85 @@ impl StorageNodeActiveObjectRoute<'_> {
 }
 
 impl StorageNodeActivePrimaryObjectRoute<'_> {
+    fn payload_reclaim_exists(
+        &self,
+        generation_id: GenerationId,
+    ) -> Result<bool, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::payload_reclaim_exists(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            generation_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn load_object_payload_reclaim(
+        &self,
+        generation_id: GenerationId,
+    ) -> Result<Option<ObjectPayloadReclaimCommand>, StorageNodeObjectPayloadReclaimRouteError>
+    {
+        self.route
+            .require_valid_now_response()
+            .map_err(StorageNodeObjectPayloadReclaimRouteError::Route)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::get_object_payload_reclaim(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            generation_id,
+        )
+        .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_object_payload_reclaim_claim(
+        &self,
+        bucket_incarnation_generation: u64,
+        generation_id: GenerationId,
+        reclaim_kind: ObjectPayloadReclaimKind,
+        claim_id: &str,
+        owner_token: &str,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, StorageNodeObjectPayloadReclaimRouteError>
+    {
+        self.route
+            .require_valid_now_response()
+            .map_err(StorageNodeObjectPayloadReclaimRouteError::Route)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::acquire_object_payload_reclaim_claim(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            bucket_incarnation_generation,
+            self.route.key,
+            generation_id,
+            reclaim_kind,
+            claim_id,
+            owner_token,
+            self.route.fence.cluster_epoch,
+            claimed_at,
+            lease_deadline,
+            now,
+        )
+        .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)
+    }
+
     fn require_create_stream_upload_subject(
         &self,
         request: &CreateStreamUploadReq,
@@ -5406,9 +5501,39 @@ impl StorageNodeRetainedLifecycleSweepClaimRoute<'_> {
     }
 }
 
+impl StorageNodeRetainedObjectPayloadReclaimClaimRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
+        self.handler
+            .validate_retained_object_payload_reclaim_claim_route(
+                self.route_permit,
+                self.node_id,
+                self.route_cluster_epoch,
+                self.raw_pg_id,
+                self.claim,
+                "object payload reclaim claim release",
+            )?;
+        Ok(())
+    }
+
+    fn release(self) -> Result<(), StorageNodeObjectPayloadReclaimRouteError> {
+        self.require_valid_now()
+            .map_err(StorageNodeObjectPayloadReclaimRouteError::Route)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
+            &local_client,
+            self.pg_id,
+            self.claim,
+        )
+        .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)
+    }
+}
+
 impl StorageNodeRetainedStreamAbortRoute<'_> {
     fn require_valid_now(&self, operation: &'static str) -> Result<(), StorageRpcErrorResponse> {
-        self.handler.validate_retained_stream_abort_object_route(
+        self.handler.validate_retained_object_route(
             self.route_permit,
             &StorageRpcObjectRequest {
                 node_id: self.node_id,
@@ -5425,20 +5550,18 @@ impl StorageNodeRetainedStreamAbortRoute<'_> {
 
 impl StorageNodeRetainedPrimaryStreamAbortRoute<'_> {
     fn require_valid_now(&self, operation: &'static str) -> Result<(), StorageRpcErrorResponse> {
-        self.route
-            .handler
-            .validate_retained_stream_abort_object_route(
-                self.route.route_permit,
-                &StorageRpcObjectRequest {
-                    node_id: self.route.node_id,
-                    cluster_epoch: self.route.route_cluster_epoch,
-                    pg_id: self.route.raw_pg_id,
-                    bucket: self.route.bucket.clone(),
-                    key: self.route.key.clone(),
-                },
-                true,
-                operation,
-            )
+        self.route.handler.validate_retained_object_route(
+            self.route.route_permit,
+            &StorageRpcObjectRequest {
+                node_id: self.route.node_id,
+                cluster_epoch: self.route.route_cluster_epoch,
+                pg_id: self.route.raw_pg_id,
+                bucket: self.route.bucket.clone(),
+                key: self.route.key.clone(),
+            },
+            true,
+            operation,
+        )
     }
 }
 
@@ -5722,6 +5845,7 @@ impl StorageNodeConnectionHandler {
                     | StorageRpcMessageKind::BucketWriteDrainClear
                     | StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease
                     | StorageRpcMessageKind::LifecycleSweepClaimRelease
+                    | StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease
                     | StorageRpcMessageKind::ShardDelete
                     | StorageRpcMessageKind::ShardAckDelete
                     | StorageRpcMessageKind::ObjectStreamUploadRetainedAbortPrepare
@@ -6356,7 +6480,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectPayloadReclaimExists => {
                 match decode_object_payload_reclaim_exists_request(&frame.payload) {
-                    Ok(request) => self.object_payload_reclaim_exists_response(request),
+                    Ok(request) => {
+                        self.object_payload_reclaim_exists_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6374,7 +6500,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectPayloadReclaimLoad => {
                 match decode_object_payload_reclaim_exists_request(&frame.payload) {
-                    Ok(request) => self.object_payload_reclaim_load_response(request),
+                    Ok(request) => self.object_payload_reclaim_load_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6383,7 +6509,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectPayloadReclaimClaimAcquire => {
                 match decode_object_payload_reclaim_claim_acquire_request(&frame.payload) {
-                    Ok(request) => self.object_payload_reclaim_claim_acquire_response(request),
+                    Ok(request) => {
+                        self.object_payload_reclaim_claim_acquire_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6401,7 +6529,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease => {
                 match decode_object_payload_reclaim_claim_record_request(&frame.payload) {
-                    Ok(request) => self.object_payload_reclaim_claim_release_response(request),
+                    Ok(request) => {
+                        self.object_payload_reclaim_claim_release_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -9178,33 +9308,23 @@ impl StorageNodeConnectionHandler {
 
     fn object_payload_reclaim_exists_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectPayloadReclaimExistsRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "object payload reclaim exists",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let exists = match ObjectMutationMetadataNodeClient::payload_reclaim_exists(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
-            request.generation_id,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let exists = match route.payload_reclaim_exists(request.generation_id) {
             Ok(exists) => exists,
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error));
             }
         };
@@ -9254,33 +9374,23 @@ impl StorageNodeConnectionHandler {
 
     fn object_payload_reclaim_load_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectPayloadReclaimExistsRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "object payload reclaim load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let reclaim = match ObjectMutationMetadataNodeClient::get_object_payload_reclaim(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
-            request.generation_id,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let reclaim = match route.load_object_payload_reclaim(request.generation_id) {
             Ok(reclaim) => reclaim,
-            Err(error) => {
+            Err(StorageNodeObjectPayloadReclaimRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectPayloadReclaimRouteError::Reclaim(error)) => {
                 return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
             }
         };
@@ -9293,35 +9403,23 @@ impl StorageNodeConnectionHandler {
 
     fn object_payload_reclaim_claim_acquire_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectPayloadReclaimClaimAcquireRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "object payload reclaim claim acquire",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match ObjectMutationMetadataNodeClient::acquire_object_payload_reclaim_claim(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.acquire_object_payload_reclaim_claim(
             request.bucket_incarnation_generation,
-            &request.object.key,
             request.generation_id,
             request.reclaim_kind,
             &request.claim_id,
             &request.owner_token,
-            request.object.cluster_epoch,
             request.claimed_at,
             request.lease_deadline,
             request.now,
@@ -9332,7 +9430,12 @@ impl StorageNodeConnectionHandler {
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeObjectPayloadReclaimRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectPayloadReclaimRouteError::Reclaim(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
@@ -9377,31 +9480,28 @@ impl StorageNodeConnectionHandler {
 
     fn object_payload_reclaim_claim_release_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectPayloadReclaimClaimRecordRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_cleanup(
+        let route = match self.retained_object_payload_reclaim_claim_route(
+            route_permit,
             request.node_id,
             request.cluster_epoch,
             request.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.pg_id,
-            &request.record.bucket,
-            &request.record.key,
+            &request.record,
             "object payload reclaim claim release",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match ObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
-            &local_client,
-            self.validated_object_metadata_pg(&request.record.bucket, &request.record.key),
-            &request.record,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.release() {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeObjectPayloadReclaimRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectPayloadReclaimRouteError::Reclaim(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
@@ -14466,14 +14566,6 @@ impl StorageNodeConnectionHandler {
             .expect("validated bucket metadata PG must belong to the installed topology")
     }
 
-    fn validated_object_metadata_pg(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> ObjectMetadataPgId {
-        self.node.object_metadata_pg_for(bucket, key)
-    }
-
     fn validated_object_metadata_scan_pg(&self, pg_id: PgId) -> ObjectMetadataScanPgId {
         self.node
             .object_metadata_scan_pg(pg_id)
@@ -14892,6 +14984,71 @@ impl StorageNodeConnectionHandler {
         })
     }
 
+    fn retained_object_payload_reclaim_claim_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        claim: &'a ObjectPayloadReclaimClaimRecord,
+        operation: &'static str,
+    ) -> Result<StorageNodeRetainedObjectPayloadReclaimClaimRoute<'a>, StorageRpcErrorResponse>
+    {
+        self.validate_retained_object_payload_reclaim_claim_route(
+            route_permit,
+            node_id,
+            route_cluster_epoch,
+            pg_id,
+            claim,
+            operation,
+        )?;
+        Ok(StorageNodeRetainedObjectPayloadReclaimClaimRoute {
+            handler: self,
+            route_permit,
+            node_id,
+            route_cluster_epoch,
+            raw_pg_id: pg_id,
+            pg_id: self.node.object_metadata_pg_for(&claim.bucket, &claim.key),
+            claim,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_retained_object_payload_reclaim_claim_route(
+        &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        claim: &ObjectPayloadReclaimClaimRecord,
+        operation: &'static str,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        if route_cluster_epoch != claim.cluster_epoch || pg_id.get() != claim.pg_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: format!(
+                    "{operation} route epoch/PG ({}, {}) does not match claim ({}, {})",
+                    route_cluster_epoch.get(),
+                    pg_id.get(),
+                    claim.cluster_epoch.get(),
+                    claim.pg_id
+                ),
+            });
+        }
+        self.validate_retained_object_route(
+            route_permit,
+            &StorageRpcObjectRequest {
+                node_id,
+                cluster_epoch: route_cluster_epoch,
+                pg_id,
+                bucket: claim.bucket.clone(),
+                key: claim.key.clone(),
+            },
+            true,
+            operation,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn validate_retained_bucket_write_route(
         &self,
@@ -14945,7 +15102,7 @@ impl StorageNodeConnectionHandler {
         Ok(expected_pg_id)
     }
 
-    fn validate_retained_stream_abort_admission(
+    fn validate_retained_object_admission(
         &self,
         route_permit: &StorageNodeRouteAdmissionPermit,
         operation: &'static str,
@@ -14970,20 +15127,20 @@ impl StorageNodeConnectionHandler {
         Ok(())
     }
 
-    fn validate_retained_stream_abort_object_route(
+    fn validate_retained_object_route(
         &self,
         route_permit: &StorageNodeRouteAdmissionPermit,
         object: &StorageRpcObjectRequest,
         require_primary: bool,
         operation: &'static str,
     ) -> Result<(), StorageRpcErrorResponse> {
-        self.validate_retained_stream_abort_admission(route_permit, operation)?;
+        self.validate_retained_object_admission(route_permit, operation)?;
         let route = self.cleanup_pg_route(object.node_id, object.cluster_epoch, object.pg_id)?;
         if route.state != PgState::Active {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::InactivePgRoute,
                 message: format!(
-                    "retained stream cleanup PG {} route is {}",
+                    "retained object cleanup PG {} route is {}",
                     object.pg_id.get(),
                     route.state
                 ),
@@ -15009,7 +15166,7 @@ impl StorageNodeConnectionHandler {
         require_primary: bool,
         operation: &'static str,
     ) -> Result<StorageNodeRetainedStreamAbortRoute<'a>, StorageRpcErrorResponse> {
-        self.validate_retained_stream_abort_object_route(
+        self.validate_retained_object_route(
             route_permit,
             &StorageRpcObjectRequest {
                 node_id: subject.node_id,
@@ -18698,6 +18855,7 @@ mod tests {
                 oldest_live_placement_epoch: Some(retained_epoch),
                 oldest_durable_backfill_epoch: None,
                 oldest_pending_metadata_command_epoch: None,
+                oldest_object_payload_reclaim_claim_epoch: None,
             },
         )
         .unwrap();
@@ -18870,6 +19028,7 @@ mod tests {
                 oldest_live_placement_epoch: Some(ClusterEpoch::new(5).unwrap()),
                 oldest_durable_backfill_epoch: None,
                 oldest_pending_metadata_command_epoch: None,
+                oldest_object_payload_reclaim_claim_epoch: None,
             },
         )
         .unwrap();
@@ -20128,6 +20287,253 @@ mod tests {
         );
         drop(admitted);
         installer.join().unwrap();
+    }
+
+    #[test]
+    fn object_payload_reclaim_capabilities_capture_deadline_and_retain_exact_claim_cleanup() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("reclaim-capability-bucket");
+        let key = crate::tests::object_key("reclaim-capability-key");
+        let generation_id = GenerationId::new(91).unwrap();
+        let reclaim = ObjectPayloadReclaimCommand::Segments(crate::ObjectSegmentsReclaimRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at: 1_000,
+            segments: Vec::new(),
+        });
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            let ObjectPayloadReclaimCommand::Segments(reclaim) = &reclaim else {
+                unreachable!("test reclaim is an object-segments record")
+            };
+            PgMetadataStore::put_object_segments_reclaim(&*pg, reclaim).unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+
+        let handler = server.connection_handler();
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let request = StorageRpcObjectRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            bucket: bucket.clone(),
+            key: key.clone(),
+        };
+        let route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_primary_object_route(
+                    &active_permit,
+                    &request,
+                    "test object payload reclaim",
+                )
+                .unwrap()
+        });
+        let claim = crate::clock::with_time_override(1_000, || {
+            assert!(route.payload_reclaim_exists(generation_id).unwrap());
+            assert_eq!(
+                route.load_object_payload_reclaim(generation_id).unwrap(),
+                Some(reclaim.clone())
+            );
+            route
+                .acquire_object_payload_reclaim_claim(
+                    1,
+                    generation_id,
+                    ObjectPayloadReclaimKind::ObjectSegments,
+                    "reclaim-capability-claim",
+                    "reclaim-capability-owner",
+                    1_000,
+                    Some(4_000),
+                    1_000,
+                )
+                .unwrap()
+                .expect("active reclaim route must acquire the exact claim")
+        });
+
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.retained_object_payload_reclaim_claim_route(
+            &active_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &claim,
+            "test object payload reclaim claim release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires retained-cleanup"));
+            }
+            Ok(_) => panic!("active admission created retained reclaim cleanup authority"),
+        }
+        let mut wrong_pg_claim = claim.clone();
+        wrong_pg_claim.pg_id = 1;
+        match handler.retained_object_payload_reclaim_claim_route(
+            &retained_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &wrong_pg_claim,
+            "test object payload reclaim claim release",
+        ) {
+            Err(error) => assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode),
+            Ok(_) => panic!("mismatched claim PG created retained reclaim cleanup authority"),
+        }
+
+        let mut extended = config.clone();
+        extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        crate::clock::with_time_override(1_000, || {
+            server
+                .install_control_plane_runtime_config(extended)
+                .unwrap();
+        });
+        crate::clock::with_time_override(6_000, || {
+            match route.payload_reclaim_exists(generation_id) {
+                Err(StorageNodeObjectRouteError::Route(error)) => {
+                    assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                }
+                Err(StorageNodeObjectRouteError::Object(error)) => {
+                    panic!("captured route should expire before reclaim existence read: {error}")
+                }
+                Ok(exists) => panic!("expired captured route returned reclaim existence {exists}"),
+            }
+            match route.load_object_payload_reclaim(generation_id) {
+                Err(StorageNodeObjectPayloadReclaimRouteError::Route(error)) => {
+                    assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                }
+                Err(StorageNodeObjectPayloadReclaimRouteError::Reclaim(error)) => {
+                    panic!("captured route should expire before reclaim load: {error}")
+                }
+                Ok(loaded) => panic!("expired captured route loaded reclaim {loaded:?}"),
+            }
+            match route.acquire_object_payload_reclaim_claim(
+                1,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "expired-reclaim-capability-claim",
+                "reclaim-capability-owner",
+                6_000,
+                Some(9_000),
+                6_000,
+            ) {
+                Err(StorageNodeObjectPayloadReclaimRouteError::Route(error)) => {
+                    assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                }
+                Err(StorageNodeObjectPayloadReclaimRouteError::Reclaim(error)) => {
+                    panic!("captured route should expire before reclaim claim mutation: {error}")
+                }
+                Ok(record) => panic!("expired captured route returned reclaim claim {record:?}"),
+            }
+        });
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            assert_eq!(
+                PgMetadataStore::object_payload_reclaim_claim(&*pg).unwrap(),
+                Some(claim.clone()),
+                "expired active route must leave the durable reclaim claim exact"
+            );
+        }
+        drop(active_permit);
+        drop(retained_permit);
+
+        let history_summary = server
+            ._node
+            .cluster_map_history_reference_summary()
+            .unwrap();
+        assert_eq!(
+            history_summary.oldest_object_payload_reclaim_claim_epoch,
+            Some(config.cluster_epoch),
+            "the durable claim must retain its acquisition route epoch"
+        );
+        let epoch_one_route = server.config_snapshot().pg_routes[0].clone();
+        let mut epoch_two = server.config_snapshot();
+        epoch_two.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        epoch_two.route_map_validity = RouteMapValidity::until_ms(20_000).unwrap();
+        epoch_two.pg_routes[0].cluster_epoch = epoch_two.cluster_epoch;
+        epoch_two.historical_pg_routes = prune_refresh_historical_pg_routes(
+            BTreeMap::from([(
+                (epoch_one_route.cluster_epoch, epoch_one_route.pg_id),
+                epoch_one_route.clone(),
+            )]),
+            config.cluster_epoch,
+            history_summary,
+            &BTreeSet::new(),
+        );
+        crate::clock::with_time_override(6_000, || {
+            server
+                .install_control_plane_runtime_config(epoch_two.clone())
+                .unwrap();
+        });
+
+        let epoch_two_route = epoch_two.pg_routes[0].clone();
+        let mut epoch_three = epoch_two.clone();
+        epoch_three.cluster_epoch = ClusterEpoch::new(3).unwrap();
+        epoch_three.pg_routes[0].cluster_epoch = epoch_three.cluster_epoch;
+        let historical_candidates = epoch_two
+            .historical_pg_routes
+            .iter()
+            .cloned()
+            .chain(std::iter::once(epoch_two_route))
+            .map(|route| ((route.cluster_epoch, route.pg_id), route))
+            .collect();
+        epoch_three.historical_pg_routes = prune_refresh_historical_pg_routes(
+            historical_candidates,
+            epoch_two.cluster_epoch,
+            history_summary,
+            &BTreeSet::new(),
+        );
+        assert!(epoch_three.historical_pg_routes.iter().any(|route| {
+            route.cluster_epoch == config.cluster_epoch && route.pg_id == PgId::new(0).get()
+        }));
+        crate::clock::with_time_override(6_000, || {
+            server
+                .install_control_plane_runtime_config(epoch_three)
+                .unwrap();
+        });
+
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        crate::clock::with_time_override(6_000, || {
+            handler
+                .retained_object_payload_reclaim_claim_route(
+                    &retained_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    &claim,
+                    "test object payload reclaim claim release",
+                )
+                .unwrap()
+                .release()
+                .unwrap();
+        });
+        let pg = server._node.get_pg(0).unwrap();
+        assert!(
+            PgMetadataStore::object_payload_reclaim_claim(&*pg)
+                .unwrap()
+                .is_none(),
+            "retained cleanup must release the exact expired-route reclaim claim"
+        );
+        drop(pg);
+        assert_eq!(
+            server
+                ._node
+                .cluster_map_history_reference_summary()
+                .unwrap()
+                .oldest_object_payload_reclaim_claim_epoch,
+            None,
+            "exact claim release must also release its historical-route reference"
+        );
     }
 
     #[test]

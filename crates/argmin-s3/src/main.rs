@@ -1833,7 +1833,7 @@ fn format_control_plane_runtime_map_diagnostics_parts(
             .and_then(|lease| lease.lease_deadline_ms());
         output.push('\n');
         output.push_str(&format!(
-            "node_id={} incarnation={} endpoint={} lease_deadline_ms={} storage_history_floor_epoch={} history_report_observed_epoch={} history_report_validation_epoch={} history_report_accepted_at_ms={} history_live_payload_epoch={} history_durable_backfill_epoch={} history_pending_metadata_command_epoch={}",
+            "node_id={} incarnation={} endpoint={} lease_deadline_ms={} storage_history_floor_epoch={} history_report_observed_epoch={} history_report_validation_epoch={} history_report_accepted_at_ms={} history_live_payload_epoch={} history_durable_backfill_epoch={} history_pending_metadata_command_epoch={} history_object_payload_reclaim_claim_epoch={}",
             node.node_id().as_u32(),
             node.node_incarnation(),
             node.endpoint(),
@@ -1851,6 +1851,10 @@ fn format_control_plane_runtime_map_diagnostics_parts(
             format_optional_u64(
                 history_references
                     .and_then(|sample| sample.oldest_pending_metadata_command_epoch)
+            ),
+            format_optional_u64(
+                history_references
+                    .and_then(|sample| sample.oldest_object_payload_reclaim_claim_epoch)
             ),
         ));
     }
@@ -8384,7 +8388,7 @@ mod tests {
         let budget = Arc::new(ControlPlaneRpcPreAuthByteBudget::new(0));
         let mut frame = Vec::new();
         frame.extend_from_slice(b"argmin-control-plane-rpc");
-        frame.extend_from_slice(&8_u16.to_be_bytes());
+        frame.extend_from_slice(&9_u16.to_be_bytes());
         frame.extend_from_slice(&12_u16.to_be_bytes());
         frame.extend_from_slice(&1_u32.to_be_bytes());
         frame.extend_from_slice(&0_u64.to_be_bytes());
@@ -17249,6 +17253,7 @@ mod tests {
                 oldest_live_placement_epoch: Some(floor_epoch.get()),
                 oldest_durable_backfill_epoch: Some(floor_epoch.get() + 1),
                 oldest_pending_metadata_command_epoch: None,
+                oldest_object_payload_reclaim_claim_epoch: Some(floor_epoch.get()),
             }],
         );
 

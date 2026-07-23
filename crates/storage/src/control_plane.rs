@@ -51,7 +51,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 8;
+const CONTROL_PLANE_RPC_VERSION: u16 = 9;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -63,7 +63,7 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 25;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 26;
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
 pub const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN: usize = 32;
 const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_DOMAIN: &[u8] =
@@ -14978,6 +14978,9 @@ where
         oldest_pending_metadata_command_epoch: history_reference_summary
             .oldest_pending_metadata_command_epoch
             .map(ClusterEpoch::get),
+        oldest_object_payload_reclaim_claim_epoch: history_reference_summary
+            .oldest_object_payload_reclaim_claim_epoch
+            .map(ClusterEpoch::get),
     };
     let refresh = match lease_horizon_authority {
         Some(lease_horizon_authority) => control_plane
@@ -15487,6 +15490,7 @@ const fn cluster_map_history_route_reference_kind_code(
         PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource => 2,
         PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired => 3,
         PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand => 4,
+        PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim => 5,
     }
 }
 
@@ -15498,6 +15502,7 @@ fn read_cluster_map_history_route_reference_kind(
         2 => Ok(PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource),
         3 => Ok(PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired),
         4 => Ok(PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand),
+        5 => Ok(PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim),
         value => Err(ControlPlaneError::RpcProtocol {
             message: format!("invalid cluster-map history route reference kind {value}"),
         }),
@@ -15829,6 +15834,7 @@ fn write_control_plane_runtime_map_diagnostics(
         write_option_u64(out, sample.oldest_live_placement_epoch);
         write_option_u64(out, sample.oldest_durable_backfill_epoch);
         write_option_u64(out, sample.oldest_pending_metadata_command_epoch);
+        write_option_u64(out, sample.oldest_object_payload_reclaim_claim_epoch);
     }
     write_u32(
         out,
@@ -16015,6 +16021,10 @@ fn read_control_plane_runtime_map_diagnostics(
             read_option_cluster_epoch(reader, "history reference durable backfill epoch")?;
         let oldest_pending_metadata_command_epoch =
             read_option_cluster_epoch(reader, "history reference pending metadata command epoch")?;
+        let oldest_object_payload_reclaim_claim_epoch = read_option_cluster_epoch(
+            reader,
+            "history reference object payload reclaim claim epoch",
+        )?;
         if observed_epoch > validation_epoch {
             return Err(ControlPlaneError::RpcProtocol {
                 message: format!(
@@ -16037,6 +16047,10 @@ fn read_control_plane_runtime_map_diagnostics(
                 "pending metadata command",
                 oldest_pending_metadata_command_epoch,
             ),
+            (
+                "object payload reclaim claim",
+                oldest_object_payload_reclaim_claim_epoch,
+            ),
         ] {
             let Some(component_epoch) = component_epoch else {
                 continue;
@@ -16057,6 +16071,8 @@ fn read_control_plane_runtime_map_diagnostics(
             oldest_live_placement_epoch: oldest_live_placement_epoch.map(ClusterEpoch::get),
             oldest_durable_backfill_epoch: oldest_durable_backfill_epoch.map(ClusterEpoch::get),
             oldest_pending_metadata_command_epoch: oldest_pending_metadata_command_epoch
+                .map(ClusterEpoch::get),
+            oldest_object_payload_reclaim_claim_epoch: oldest_object_payload_reclaim_claim_epoch
                 .map(ClusterEpoch::get),
         });
     }
@@ -18129,6 +18145,9 @@ const fn cluster_map_history_route_reference_kind_as_str(
         PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource => "backfill-source",
         PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired => "backfill-desired",
         PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand => "pending-command",
+        PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim => {
+            "object-payload-reclaim-claim"
+        }
     }
 }
 
@@ -19109,6 +19128,9 @@ fn parse_node_history_route_reference(
         "backfill-source" => PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
         "backfill-desired" => PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired,
         "pending-command" => PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+        "object-payload-reclaim-claim" => {
+            PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim
+        }
         _ => {
             return Err(parse_error(
                 line,
@@ -31237,6 +31259,11 @@ mod tests {
                 history_epoch,
                 PgId::new(1),
             ),
+            PgClusterMapHistoryRouteReference::new(
+                PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
+                history_epoch,
+                PgId::new(1),
+            ),
         ]);
         let mut heartbeat_payload = Vec::new();
         write_node_heartbeat(&mut heartbeat_payload, &heartbeat).unwrap();
@@ -31261,6 +31288,7 @@ mod tests {
             oldest_live_placement_epoch: Some(history_epoch.get()),
             oldest_durable_backfill_epoch: None,
             oldest_pending_metadata_command_epoch: Some(history_epoch.get()),
+            oldest_object_payload_reclaim_claim_epoch: Some(history_epoch.get()),
         };
         assert_eq!(
             observability::control_plane_history_reference_samples()
@@ -31332,6 +31360,11 @@ mod tests {
             ),
             PgClusterMapHistoryRouteReference::new(
                 PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+                history_epoch,
+                PgId::new(1),
+            ),
+            PgClusterMapHistoryRouteReference::new(
+                PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
                 history_epoch,
                 PgId::new(1),
             ),
@@ -31548,6 +31581,22 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_rpc_rejects_version_eight_fixture() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        writer.write_all(CONTROL_PLANE_RPC_MAGIC).unwrap();
+        write_u16_to_stream(&mut writer, 8);
+        writer.write_all(&[0; 14]).unwrap();
+
+        let error = read_control_plane_unix_request(&mut reader).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message == "unsupported control-plane RPC version 8"
+        ));
+    }
+
+    #[test]
     fn control_plane_rpc_rejects_corrupted_header_checksum() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         let payload = b"";
@@ -31636,6 +31685,11 @@ mod tests {
                 PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
                 ClusterEpoch::new(2).unwrap(),
                 PgId::new(8),
+            ),
+            PgClusterMapHistoryRouteReference::new(
+                PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(7),
             ),
         ])
         .unwrap();
@@ -32585,12 +32639,29 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_authority_rejects_current_state_missing_timestamp_high_water() {
+    fn file_backed_authority_rejects_version_twenty_five_state() {
         let tmp = test_util::tempdir();
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
             "version=25\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            FileControlPlaneStore::new(path).load(),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "missing or unsupported control-plane state version"
+        ));
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_current_state_missing_timestamp_high_water() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            "version=26\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -33277,6 +33348,11 @@ mod tests {
                 current_epoch,
                 PgId::new(2),
             ),
+            PgClusterMapHistoryRouteReference::new(
+                PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
+                current_epoch,
+                PgId::new(1),
+            ),
         ])
         .unwrap();
         let mut heartbeat = heartbeat_from_record(&authority, 1, current_epoch, 10_000);
@@ -33941,7 +34017,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=25\ninitial_topology=-\n",
+                "version=26\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=1\n",
@@ -33964,7 +34040,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=25\ninitial_topology=-\n",
+                "version=26\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -33988,7 +34064,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=25\ninitial_topology=-\n",
+                "version=26\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -34013,7 +34089,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=25\ninitial_topology=-\n",
+                "version=26\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -34056,7 +34132,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=25\ninitial_topology=-\n",
+                "version=26\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -34079,7 +34155,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=25\ninitial_topology=-\n",
+                "version=26\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
@@ -34104,7 +34180,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=25\ninitial_topology=-\n",
+                "version=26\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
@@ -34134,7 +34210,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=25\ninitial_topology=-\n",
+                "version=26\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=4\n",
@@ -34170,7 +34246,7 @@ mod tests {
             let tmp = test_util::tempdir();
             let path = tmp.path().join(format!("control-plane-{index}.state"));
             let contents = format!(
-                "version=25\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\nhistory=2,1\nhistory_node=2,1\n{history_pg}"
+                "version=26\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\nhistory=2,1\nhistory_node=2,1\n{history_pg}"
             );
             std::fs::write(&path, contents).unwrap();
 
@@ -34238,7 +34314,7 @@ mod tests {
             let tmp = test_util::tempdir();
             let path = tmp.path().join(format!("control-plane-{name}.state"));
             let contents = format!(
-                "version=25\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\n{history}"
+                "version=26\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\n{history}"
             );
             std::fs::write(&path, contents).unwrap();
 
@@ -34306,7 +34382,7 @@ mod tests {
             std::fs::write(
                 &path,
                 format!(
-                    "version=25\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\n{history}{current_node}{current_pg}"
+                    "version=26\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\n{history}{current_node}{current_pg}"
                 ),
             )
             .unwrap();
@@ -34330,7 +34406,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=25\ninitial_topology=-\n",
+                "version=26\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -34382,7 +34458,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=25\ninitial_topology=-\n",
+                "version=26\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -34408,7 +34484,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=25\ninitial_topology=-\n",
+                "version=26\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
@@ -34433,7 +34509,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=25\ninitial_topology=-\n",
+                "version=26\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -34459,7 +34535,7 @@ mod tests {
         let store = FileControlPlaneStore::new(&path);
         let initial = SingleAuthorityControlPlane::open(store.clone()).unwrap();
         let snapshot = parse_snapshot(concat!(
-            "version=25\n",
+            "version=26\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
             "initial_topology=-\n",
@@ -35567,7 +35643,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=25\ninitial_topology=-\n",
+                "version=26\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",

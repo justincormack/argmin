@@ -2142,6 +2142,46 @@ Forty-first Phase 3 slice:
   storage tests, workspace-wide strict Clippy, and the full parallel workspace
   suite (7,485 tests).
 
+Forty-second Phase 3 slice:
+
+- subject-specific payload-reclaim existence checks, reclaim-record loading,
+  and durable claim acquisition now consume the exact
+  `StorageNodeActivePrimaryObjectRoute` established from the admitted frame.
+  The capability derives the trusted object PG, bucket, key, and cluster epoch
+  from that route and revalidates its immutable captured deadline immediately
+  before each local metadata read or claim mutation.
+- object-payload reclaim claim release is now explicitly retained-cleanup work,
+  rather than an active frame that happened to use a cleanup route lookup. A
+  retained claim capability binds the decoded node, historical route epoch,
+  object PG, bucket, key, and complete durable claim, requires the retained
+  primary route, and repeats those checks immediately before exact release.
+  The shared retained object-route validator now serves both stream abort and
+  reclaim cleanup without stream-specific naming.
+- the server no longer exposes its raw object-PG construction helper for these
+  request handlers. The existing equivalent-state two-PG Unix matrix still
+  proves positive correctly routed operations and exact `PayloadDecode` for
+  every wrong-PG subject-specific reclaim operation. A deterministic
+  server-local capability regression extends the raw same-epoch route, proves
+  the captured existence/load/claim authority expires at its original
+  deadline without mutating the exact durable claim, carries the claim's exact
+  `(cluster_epoch, pg_id)` through two route transitions, and then releases
+  that claim through retained authority. Durable history-reference collection,
+  its coarse retention summary, storage/control-plane codecs, persisted
+  control-plane state, and diagnostics now have a distinct object-payload
+  reclaim-claim reference class. The control-plane command, control-plane RPC,
+  persisted control-plane state, and storage-RPC versions advance to 13, 9,
+  26, and 4 respectively so older binaries fail closed. Exact release removes
+  that history reference. A Unix regression independently proves exact claim
+  release succeeds after active route expiry.
+- PG-wide reclaim-root and claim discovery remain grouped with the open
+  object-metadata scan capability work. Payload lease/fence control, data-shard
+  deletion, remaining data operations, frontend capability migration, and
+  capability requirements on node-client traits also remain open in Phase 3.
+- focused payload-reclaim capability and Unix transport regressions, formatting,
+  the storage boundary checker, all 2,230 storage tests, and workspace-wide
+  strict Clippy pass. The full parallel workspace suite also passes (7,508
+  tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

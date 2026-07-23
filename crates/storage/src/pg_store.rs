@@ -114,6 +114,7 @@ pub struct PgClusterMapHistoryReferenceSummary {
     pub oldest_live_placement_epoch: Option<ClusterEpoch>,
     pub oldest_durable_backfill_epoch: Option<ClusterEpoch>,
     pub oldest_pending_metadata_command_epoch: Option<ClusterEpoch>,
+    pub oldest_object_payload_reclaim_claim_epoch: Option<ClusterEpoch>,
 }
 
 pub const MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES: usize = 4096;
@@ -156,6 +157,7 @@ pub enum PgClusterMapHistoryRouteReferenceKind {
     DurableBackfillSource,
     DurableBackfillDesired,
     PendingMetadataCommand,
+    ObjectPayloadReclaimClaim,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -270,6 +272,9 @@ impl PgClusterMapHistoryRouteReferences {
                 PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand => {
                     &mut summary.oldest_pending_metadata_command_epoch
                 }
+                PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim => {
+                    &mut summary.oldest_object_payload_reclaim_claim_epoch
+                }
             };
             *target = min_optional_epoch(*target, Some(reference.cluster_epoch()));
         }
@@ -284,6 +289,7 @@ impl PgClusterMapHistoryReferenceSummary {
             self.oldest_live_placement_epoch,
             self.oldest_durable_backfill_epoch,
             self.oldest_pending_metadata_command_epoch,
+            self.oldest_object_payload_reclaim_claim_epoch,
         ]
         .into_iter()
         .flatten()
@@ -302,6 +308,10 @@ impl PgClusterMapHistoryReferenceSummary {
         self.oldest_pending_metadata_command_epoch = min_optional_epoch(
             self.oldest_pending_metadata_command_epoch,
             other.oldest_pending_metadata_command_epoch,
+        );
+        self.oldest_object_payload_reclaim_claim_epoch = min_optional_epoch(
+            self.oldest_object_payload_reclaim_claim_epoch,
+            other.oldest_object_payload_reclaim_claim_epoch,
         );
     }
 }
@@ -953,6 +963,8 @@ impl PgStore {
             oldest_live_placement_epoch: self.oldest_live_payload_placement_epoch()?,
             oldest_durable_backfill_epoch: self.oldest_durable_backfill_epoch()?,
             oldest_pending_metadata_command_epoch: self.oldest_pending_metadata_command_epoch()?,
+            oldest_object_payload_reclaim_claim_epoch: self
+                .oldest_object_payload_reclaim_claim_epoch()?,
         })
     }
 
@@ -992,6 +1004,12 @@ impl PgStore {
             "SELECT DISTINCT pg_id, cluster_epoch FROM metadata_command_pending_slot",
             PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
             "list pending metadata command cluster-map history route references",
+        )?;
+        self.extend_direct_cluster_map_history_route_references(
+            &mut references,
+            "SELECT DISTINCT pg_id, cluster_epoch FROM object_payload_reclaim_claims",
+            PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
+            "list object payload reclaim claim cluster-map history route references",
         )?;
         Ok(references)
     }
@@ -1107,6 +1125,18 @@ impl PgStore {
             |row| row.get::<_, Option<i64>>(0),
         )?;
         parse_optional_cluster_epoch(raw_epoch, "oldest pending metadata command epoch")
+    }
+
+    fn oldest_object_payload_reclaim_claim_epoch(
+        &self,
+    ) -> Result<Option<ClusterEpoch>, StoreError> {
+        let raw_epoch = self.query_row_cached(
+            "SELECT MIN(cluster_epoch) FROM object_payload_reclaim_claims",
+            [],
+            "compute oldest object payload reclaim claim epoch",
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        parse_optional_cluster_epoch(raw_epoch, "oldest object payload reclaim claim epoch")
     }
 
     fn query_row_cached<T, P, F>(

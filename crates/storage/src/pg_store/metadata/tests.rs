@@ -4437,6 +4437,34 @@ fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_co
     store
         .try_insert_pending_metadata_command_slot(0, &pending, Some(&pending_bucket))
         .unwrap();
+    let reclaim_bucket = trusted_bucket_name("history-floor-reclaim-claim");
+    let reclaim_key = trusted_object_key("reclaim-object");
+    let reclaim_generation = GenerationId::new(31).unwrap();
+    store
+        .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
+            bucket: reclaim_bucket.clone(),
+            key: reclaim_key.clone(),
+            generation_id: reclaim_generation,
+            created_at: 1,
+            segments: Vec::new(),
+        })
+        .unwrap();
+    store
+        .acquire_object_payload_reclaim_claim(
+            &reclaim_bucket,
+            1,
+            &reclaim_key,
+            reclaim_generation,
+            ObjectPayloadReclaimKind::ObjectSegments,
+            "history-floor-reclaim-claim",
+            "history-floor-reclaim-owner",
+            ClusterEpoch::new(1).unwrap(),
+            1,
+            None,
+            1,
+        )
+        .unwrap()
+        .expect("durable reclaim root must be claimable");
 
     let summary = store.cluster_map_history_reference_summary().unwrap();
     assert_eq!(
@@ -4452,8 +4480,12 @@ fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_co
         Some(ClusterEpoch::new(2).unwrap())
     );
     assert_eq!(
+        summary.oldest_object_payload_reclaim_claim_epoch,
+        Some(ClusterEpoch::new(1).unwrap())
+    );
+    assert_eq!(
         summary.oldest_required_epoch(),
-        Some(ClusterEpoch::new(2).unwrap())
+        Some(ClusterEpoch::new(1).unwrap())
     );
 
     let topology = PgTopology::new(&[7, 8, 9]).unwrap();
@@ -4492,6 +4524,11 @@ fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_co
         PgClusterMapHistoryRouteReference::new(
             PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
             ClusterEpoch::new(2).unwrap(),
+            PgId::new(7),
+        ),
+        PgClusterMapHistoryRouteReference::new(
+            PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
+            ClusterEpoch::new(1).unwrap(),
             PgId::new(7),
         ),
         PgClusterMapHistoryRouteReference::new(

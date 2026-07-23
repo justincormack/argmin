@@ -76,7 +76,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU32;
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 3;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 4;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -9471,6 +9471,7 @@ pub(crate) fn encode_cluster_map_history_reference_summary_response(
             PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource => 2,
             PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired => 3,
             PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand => 4,
+            PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim => 5,
         });
         put_u64(&mut out, reference.cluster_epoch().get());
         put_u32(&mut out, reference.pg_id().get());
@@ -9498,6 +9499,7 @@ pub(crate) fn decode_cluster_map_history_reference_summary_response(
             2 => PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
             3 => PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired,
             4 => PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+            5 => PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
             _ => {
                 return Err(
                     StorageRpcPayloadError::InvalidClusterMapHistoryRouteReference(
@@ -17325,7 +17327,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&3u16.to_le_bytes());
+        expected.extend_from_slice(&4u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -17336,15 +17338,15 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_rejects_version_two_fixture() {
+    fn storage_rpc_frame_rejects_version_three_fixture() {
         let mut bytes =
             encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
         let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&2_u16.to_le_bytes());
+        bytes[version_offset..version_offset + 2].copy_from_slice(&3_u16.to_le_bytes());
 
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnsupportedVersion(2))
+            Err(StorageRpcFrameError::UnsupportedVersion(3))
         );
     }
 
@@ -18172,6 +18174,11 @@ mod tests {
                 PgClusterMapHistoryRouteReference::new(
                     PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
                     ClusterEpoch::new(3).unwrap(),
+                    PgId::new(9),
+                ),
+                PgClusterMapHistoryRouteReference::new(
+                    PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
+                    ClusterEpoch::new(4).unwrap(),
                     PgId::new(9),
                 ),
             ])

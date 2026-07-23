@@ -1036,6 +1036,7 @@ pub struct ControlPlaneHistoryReferenceSample {
     pub oldest_live_placement_epoch: Option<u64>,
     pub oldest_durable_backfill_epoch: Option<u64>,
     pub oldest_pending_metadata_command_epoch: Option<u64>,
+    pub oldest_object_payload_reclaim_claim_epoch: Option<u64>,
 }
 
 pub fn record_control_plane_history_reference_sample(sample: ControlPlaneHistoryReferenceSample) {
