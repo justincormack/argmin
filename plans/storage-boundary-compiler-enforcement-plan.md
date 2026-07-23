@@ -2182,6 +2182,39 @@ Forty-second Phase 3 slice:
   strict Clippy pass. The full parallel workspace suite also passes (7,508
   tests).
 
+Forty-third Phase 3 slice:
+
+- every remaining PG-wide object-metadata scan now consumes one
+  `StorageNodeActivePrimaryObjectScanRoute` established from the admitted RPC
+  frame. This includes object, object-version, multipart-upload, bucket stream,
+  PG stream, bucket reclaim-root, PG reclaim-root, reclaim-claim, and shard
+  scavenger payload-reference scans. The capability is non-cloneable and
+  borrows active admission, derives its trusted `ObjectMetadataScanPgId` only
+  after current route and primary validation, and revalidates its immutable
+  captured deadline immediately before each local metadata read.
+- returned roots are bound back to the capability's scan PG through installed
+  object placement. Bucket-scoped discovery additionally requires the returned
+  bucket to equal the request, while claim discovery requires the durable
+  claim's recorded PG and object placement to match the scan route. This keeps
+  response validation inside the server-local effect boundary rather than
+  relying only on the Unix client validator.
+- the RPC wire shapes, allocation bounds, admission classes, and each
+  operation's existing frontend or maintenance role policy are unchanged. The
+  installed/unknown scan-PG Unix matrix now covers all scan interfaces.
+  Existing equivalent-state two-PG regressions retain positive routed roots
+  and claims and exact `PayloadDecode` when a row stored on another scan PG
+  names an object placed elsewhere. The deterministic server-local reclaim
+  regression rejects foreign and retained-cleanup admission, positively invokes
+  every scan method, extends the raw same-epoch route, and proves each read
+  fails at the capability's original deadline before node access.
+- payload lease/fence control, data-shard deletion, remaining data operations,
+  frontend capability migration, and capability requirements on node-client
+  traits remain open in Phase 3.
+- focused active-scan capability and Unix installed/unknown/equivalent-state
+  regressions, formatting, the storage boundary checker, all 2,230 storage
+  tests, workspace-wide strict Clippy, and the full parallel workspace suite
+  pass (7,508 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

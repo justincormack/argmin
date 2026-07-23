@@ -534,7 +534,7 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
     });
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..10)
+    let server_threads: Vec<_> = (0..18)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -713,6 +713,66 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
             code: StorageRpcErrorCode::UnknownPg,
             ..
         })
+    ));
+
+    assert!(
+        ObjectMutationMetadataNodeClient::get_bucket_payload_reclaim_root(
+            &client,
+            installed_scan_pg,
+            &bucket,
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        ObjectMutationMetadataNodeClient::get_payload_reclaim_root(&client, installed_scan_pg)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(&client, installed_scan_pg,)
+            .unwrap()
+            .is_none()
+    );
+
+    for error in [
+        ObjectMutationMetadataNodeClient::get_bucket_payload_reclaim_root(
+            &client,
+            unknown_scan_pg,
+            &bucket,
+        )
+        .unwrap_err(),
+        ObjectMutationMetadataNodeClient::get_payload_reclaim_root(&client, unknown_scan_pg)
+            .unwrap_err(),
+        ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(&client, unknown_scan_pg)
+            .unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                code: StorageRpcErrorCode::UnknownPg,
+                ..
+            })
+        ));
+    }
+    assert!(
+        ShardScavengerNodeClient::list_shard_scavenger_payload_references(
+            &client,
+            installed_scan_pg,
+        )
+        .unwrap()
+        .is_empty()
+    );
+    assert!(matches!(
+        ShardScavengerNodeClient::list_shard_scavenger_payload_references(
+            &client,
+            unknown_scan_pg,
+        )
+        .unwrap_err(),
+        StoreError::StorageRpc {
+            code: StorageRpcErrorCode::UnknownPg,
+            ..
+        }
     ));
 
     for thread in server_threads {
