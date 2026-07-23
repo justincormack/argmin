@@ -1,15 +1,18 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketLocationConstraint, CreateBucketConfiguration, VersioningConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket, delete_all_and_bucket, err_status,
-    expected_raw_bucket_location_constraint, raw_bucket, retrying_operation_aborted,
-    retrying_operation_aborted_result, send_signed_request,
+    assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket,
+    create_account_regional_bucket_with_credentials, delete_all_and_bucket, err_status,
+    expected_raw_bucket_location_constraint, raw_alt_credentials, raw_bucket,
+    retrying_operation_aborted, retrying_operation_aborted_result, send_signed_request,
     shape::{assert_shape, error_response_headers, shape, xml_response_headers},
-    unique_bucket, RawResponse, SendRetryingOperationAborted, CTX,
+    unique_alt_account_regional_bucket, unique_bucket, RawResponse, SendRetryingOperationAborted,
+    CTX,
 };
 use s3_types::{is_legacy_create_bucket_region, BucketNamespace};
 
@@ -121,6 +124,38 @@ fn assert_bucket_was_not_created(bucket: &str) {
         response.status, 404,
         "rejected CreateBucket unexpectedly created {bucket}: {response:#?}"
     );
+}
+
+async fn wait_for_account_regional_namespace_visibility(
+    bucket: &str,
+    credentials: s3_tests::SignedRequestCredentials<'_>,
+) {
+    const REQUIRED_CONSECUTIVE_MATCHES: usize = 3;
+    const MAX_ATTEMPTS: usize = 40;
+
+    let mut consecutive_matches = 0;
+    let mut last_response = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let response = create_account_regional_bucket_with_credentials(bucket, credentials);
+        if response.status == 409
+            && response
+                .body
+                .contains("<Code>BucketAlreadyOwnedByYou</Code>")
+        {
+            consecutive_matches += 1;
+            if consecutive_matches == REQUIRED_CONSECUTIVE_MATCHES {
+                return;
+            }
+        } else {
+            consecutive_matches = 0;
+        }
+        last_response = Some(response);
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    panic!("account-regional namespace did not converge: {last_response:#?}");
 }
 
 // ── CreateBucket ─────────────────────────────────────────────────────
@@ -341,6 +376,53 @@ fn test_account_regional_bucket_rejects_mismatched_account_suffix() {
                 ),
         );
         assert_bucket_was_not_created(&bucket);
+    });
+}
+
+#[test]
+fn test_cross_account_create_account_regional_bucket_does_not_reveal_existence() {
+    s3_tests::run(async {
+        let existing_bucket = unique_alt_account_regional_bucket();
+        let missing_bucket = unique_alt_account_regional_bucket();
+        let created = create_account_regional_bucket_with_credentials(
+            &existing_bucket,
+            raw_alt_credentials(),
+        );
+        assert_eq!(
+            created.status, 200,
+            "failed to create alternate-account bucket: {created:#?}"
+        );
+        wait_for_account_regional_namespace_visibility(&existing_bucket, raw_alt_credentials())
+            .await;
+
+        let existing =
+            create_bucket_in_namespace(&existing_bucket, BucketNamespace::AccountRegional);
+        let missing = create_bucket_in_namespace(&missing_bucket, BucketNamespace::AccountRegional);
+        s3_tests::delete_bucket_retrying_operation_aborted(CTX.alt_client(), &existing_bucket)
+            .await;
+
+        for (label, bucket, response) in [
+            ("existing", existing_bucket.as_str(), &existing),
+            ("missing", missing_bucket.as_str(), &missing),
+        ] {
+            assert_shape(
+                &format!("cross-account CreateBucket for {label} account-regional bucket"),
+                response,
+                &shape()
+                    .status(400)
+                    .headers(error_response_headers())
+                    .sub("bucket", bucket)
+                    .sub("requested_account", CTX.alt_account_id())
+                    .sub("caller_account", CTX.account_id())
+                    .body(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                         <Error><Code>InvalidBucketNamespace</Code>\
+                         <Message>The requested bucket is an account-regional namespace bucket, but the requested AWS Account ID '{requested_account}' does not match the caller's AWS Account ID '{caller_account}'. Specify the caller's AWS Account ID in the bucket name.</Message>\
+                         <BucketNamespace>{bucket}</BucketNamespace>\
+                         <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+                    ),
+            );
+        }
     });
 }
 

@@ -283,6 +283,7 @@ The repository now uses role-based test configuration names in `.env`:
 - `TEST_S3_TIMEOUT_SECS`
 - optional `TEST_S3_ENDPOINT`
 - optional `TEST_S3_CONTROL_ENDPOINT`
+- optional `TEST_S3_CONTROL_ALT_ENDPOINT`
 
 `PRIMARY` is the main AWS test user, `ALT` is a user from a different AWS
 account, `OWNER_ROOT` is the root credential for the primary account, and
@@ -384,6 +385,11 @@ The external `s3-tests` harness hard-fails if any of these are missing:
     `./scripts/uat-s3-tests` uses the standalone local server endpoint.
   - Embedded local `cargo test` runs set it to the embedded server endpoint
     automatically.
+- `S3_CONTROL_ALT_TEST_ENDPOINT`
+  - Endpoint used for S3 Control requests scoped to the alternate AWS account.
+  - `./scripts/aws-tests` derives it from the alternate account ID by default;
+    `./scripts/uat-s3-tests` and embedded local runs use the same standalone
+    server endpoint as the primary S3 Control endpoint.
 - `AWS_TEST_ACCESS_KEY`
 - `AWS_TEST_SECRET_KEY`
 - `AWS_TEST_ACCOUNT_ID`

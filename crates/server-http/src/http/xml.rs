@@ -92,6 +92,26 @@ pub fn error_xml_with_host_id(
     )
 }
 
+/// Format an S3 CORS preflight error response.
+#[must_use]
+pub fn cors_preflight_error_xml(
+    message: &str,
+    method: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error><Code>AccessForbidden</Code><Message>{}</Message>\
+         <Method>{}</Method><ResourceType>BUCKET</ResourceType>\
+         <RequestId>{}</RequestId><HostId>{}</HostId></Error>",
+        xml_escape_text(message),
+        xml_escape(method),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
 /// Format an S3 `InvalidArgument` error response naming the offending
 /// argument, optionally echoing its value.
 #[must_use]

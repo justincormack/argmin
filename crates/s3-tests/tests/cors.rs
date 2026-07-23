@@ -1,9 +1,11 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CorsConfiguration, CorsRule};
 use s3_tests::{
-    content_md5_header, raw_bucket, send_signed_request,
-    shape::{assert_shape, id_headers, shape},
-    unique_bucket, SendRetryingOperationAborted, CTX,
+    content_md5_header, create_account_regional_bucket_with_credentials, raw_alt_credentials,
+    raw_bucket, send_signed_request,
+    shape::{assert_shape, error_response_headers, id_headers, shape, ShapeSpec},
+    unique_alt_account_regional_bucket, unique_bucket, RawResponse, SendRetryingOperationAborted,
+    CTX,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -52,12 +54,128 @@ fn preflight_snapshot(
     PreflightSnapshot { status, headers }
 }
 
+fn raw_bucket_preflight(bucket: &str, origin: &str, request_method: &str) -> RawResponse {
+    let url = format!("{}/{bucket}", CTX.endpoint());
+    let mut response = agent()
+        .options(&url)
+        .header("Origin", origin)
+        .header("Access-Control-Request-Method", request_method)
+        .call()
+        .expect("CORS preflight transport error");
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .expect("response header is valid UTF-8")
+                    .to_string(),
+            )
+        })
+        .collect();
+    let (body, body_read_error) = match response.body_mut().read_to_string() {
+        Ok(body) => (body, None),
+        Err(error) => (String::new(), Some(error.to_string())),
+    };
+    RawResponse {
+        status: response.status().as_u16(),
+        headers,
+        body,
+        body_read_error,
+    }
+}
+
+async fn wait_for_alt_bucket(bucket: &str) {
+    const REQUIRED_CONSECUTIVE_SUCCESSES: usize = 3;
+    const MAX_ATTEMPTS: usize = 40;
+
+    let mut consecutive_successes = 0;
+    let mut last_error = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match CTX.alt_client().head_bucket().bucket(bucket).send().await {
+            Ok(_) => {
+                consecutive_successes += 1;
+                if consecutive_successes == REQUIRED_CONSECUTIVE_SUCCESSES {
+                    return;
+                }
+            }
+            Err(error) => {
+                consecutive_successes = 0;
+                last_error = Some(error);
+            }
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    panic!("alternate-account bucket did not converge: {last_error:?}");
+}
+
 fn assert_error_code(body: &str, code: &str) {
     let expected = format!("<Code>{code}</Code>");
     assert!(
         body.contains(&expected),
         "expected {expected} in body: {body}"
     );
+}
+
+fn cors_preflight_error_shape(message: &str) -> ShapeSpec {
+    shape()
+        .status(403)
+        .headers(error_response_headers())
+        .body(format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <Error><Code>AccessForbidden</Code><Message>{message}</Message>\
+             <Method>GET</Method><ResourceType>BUCKET</ResourceType>\
+             <RequestId>{{request_id}}</RequestId><HostId>{{host_id}}</HostId></Error>"
+        ))
+}
+
+fn assert_cors_preflight_error(label: &str, response: &RawResponse, message: &str) {
+    assert!(
+        response.body.contains(&format!(
+            "<Code>AccessForbidden</Code><Message>{message}</Message>"
+        )),
+        "{label}: unexpected CORS preflight response: {response:#?}"
+    );
+    assert_shape(label, response, &cors_preflight_error_shape(message));
+}
+
+async fn cors_preflight_error_eventually(
+    bucket: &str,
+    origin: &str,
+    request_method: &str,
+    message: &str,
+    description: &str,
+) {
+    const REQUIRED_CONSECUTIVE_MATCHES: usize = 3;
+    const MAX_ATTEMPTS: usize = 40;
+
+    let expected_body_fragment =
+        format!("<Code>AccessForbidden</Code><Message>{message}</Message>");
+    let mut consecutive_matches = 0;
+    let mut last_response = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let response = raw_bucket_preflight(bucket, origin, request_method);
+        if response.status == 403 && response.body.contains(&expected_body_fragment) {
+            consecutive_matches += 1;
+            if consecutive_matches == REQUIRED_CONSECUTIVE_MATCHES {
+                assert_cors_preflight_error(description, &response, message);
+                return;
+            }
+        } else {
+            consecutive_matches = 0;
+        }
+        last_response = Some(response);
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    panic!("{description} did not converge to the expected response: {last_response:#?}");
 }
 
 fn cors_config_xml_with_rules(rule_count: usize) -> String {
@@ -466,6 +584,39 @@ fn test_cors_delete_no_config() {
 // ── Preflight (OPTIONS) tests ───────────────────────────────────────────
 
 #[test]
+fn test_cross_account_regional_bucket_cors_preflight_reveals_existence() {
+    s3_tests::run(async {
+        let existing_bucket = unique_alt_account_regional_bucket();
+        let missing_bucket = unique_alt_account_regional_bucket();
+        let created = create_account_regional_bucket_with_credentials(
+            &existing_bucket,
+            raw_alt_credentials(),
+        );
+        assert_eq!(
+            created.status, 200,
+            "failed to create alternate-account bucket: {created:#?}"
+        );
+        wait_for_alt_bucket(&existing_bucket).await;
+
+        let existing = raw_bucket_preflight(&existing_bucket, "https://example.com", "GET");
+        let missing = raw_bucket_preflight(&missing_bucket, "https://example.com", "GET");
+        s3_tests::delete_bucket_retrying_operation_aborted(CTX.alt_client(), &existing_bucket)
+            .await;
+
+        assert_cors_preflight_error(
+            "CORS preflight for existing foreign account-regional bucket",
+            &existing,
+            "CORSResponse: CORS is not enabled for this bucket.",
+        );
+        assert_cors_preflight_error(
+            "CORS preflight for missing foreign account-regional bucket",
+            &missing,
+            "CORSResponse: Bucket not found",
+        );
+    });
+}
+
+#[test]
 fn test_cors_preflight_basic() {
     s3_tests::run(async {
         let rule = simple_rule("http://example.com", &["GET", "PUT"]);
@@ -526,18 +677,14 @@ fn test_cors_preflight_no_match() {
         let rule = simple_rule("http://example.com", &["GET"]);
         let bucket = setup_cors_bucket(vec![rule]).await;
 
-        let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let resp = preflight_status_eventually(
-            &url,
-            Some("http://other.com"),
-            Some("GET"),
-            None,
-            403,
+        cors_preflight_error_eventually(
+            &bucket,
+            "http://other.com",
+            "GET",
+            "CORSResponse: This CORS request is not allowed. This is usually because the evalution of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted by the resource's CORS spec.",
             "non-matching CORS preflight",
         )
         .await;
-
-        assert_eq!(resp.status, 403);
 
         cleanup(&bucket, &[]).await;
     });

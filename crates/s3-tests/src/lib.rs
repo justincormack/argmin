@@ -9,10 +9,11 @@ pub use aws_sdk_s3;
 pub use helpers::{
     assert_raw_bucket_location, assert_s3_err_code, bucket_location_url, bucket_prefix,
     cleanup_versioned_bucket, content_md5_header, copy_source_with_version,
-    create_acl_enabled_bucket, create_boe_bucket, create_bucket_with_ownership,
-    create_bucket_with_sse_c_enabled, create_objects, create_objects_with_keys,
-    create_public_bucket, create_public_write_bucket, delete_all_and_bucket,
-    delete_bucket_retrying_operation_aborted, delete_object_retrying_operation_aborted,
+    create_account_regional_bucket_with_credentials, create_acl_enabled_bucket, create_boe_bucket,
+    create_bucket_with_ownership, create_bucket_with_sse_c_enabled, create_objects,
+    create_objects_with_keys, create_public_bucket, create_public_write_bucket,
+    delete_all_and_bucket, delete_bucket_retrying_operation_aborted,
+    delete_object_retrying_operation_aborted,
     delete_objects_retrying_exact_operation_aborted_result,
     delete_objects_retrying_operation_aborted, delete_objects_with_md5,
     disable_bucket_public_access_block, enable_bucket_sse_c, enable_bucket_versioning, err_status,
@@ -34,9 +35,10 @@ pub use helpers::{
     send_signed_request_without_host_signed_header, sign_aws_chunked_request_with_credentials,
     sign_request_headers_for_service_with_checked_credentials,
     sign_request_headers_with_credentials, sse_c_header_values, test_sse_c_key,
-    unique_account_regional_bucket, unique_bucket, wait_for_versioned_writes_visible,
-    PresignedRequest, RawAltObjectRequest, RawResponse, SendRetryingOperationAborted,
-    SignedAwsChunkedRequest, SignedRequestCredentials, SignedRequestHeaders, SigningService,
+    unique_account_regional_bucket, unique_alt_account_regional_bucket, unique_bucket,
+    wait_for_versioned_writes_visible, PresignedRequest, RawAltObjectRequest, RawResponse,
+    SendRetryingOperationAborted, SignedAwsChunkedRequest, SignedRequestCredentials,
+    SignedRequestHeaders, SigningService,
 };
 pub use post_form::{
     build_post_object_multipart_body, post_object_raw_to_test_endpoint_with_headers,
@@ -94,6 +96,7 @@ pub struct TestContext {
     alt_client: Client,
     endpoint: String,
     s3_control_endpoint: String,
+    alt_s3_control_endpoint: String,
     access_key: String,
     secret_key: String,
     alt_access_key: String,
@@ -113,6 +116,7 @@ impl TestContext {
     ///
     /// - `S3_TEST_ENDPOINT`: external endpoint URL
     /// - `S3_CONTROL_TEST_ENDPOINT`: external S3 Control endpoint URL
+    /// - `S3_CONTROL_ALT_TEST_ENDPOINT`: alternate-account external S3 Control endpoint URL
     /// - `AWS_TEST_ACCESS_KEY`: primary access key
     /// - `AWS_TEST_SECRET_KEY`: primary secret key
     /// - `AWS_TEST_ACCOUNT_ID`: primary AWS account ID
@@ -150,6 +154,14 @@ impl TestContext {
                 s3_control_endpoint.starts_with("https://")
                     || s3_control_endpoint.starts_with("http://"),
                 "S3_CONTROL_TEST_ENDPOINT must use http:// or https://; got {s3_control_endpoint}"
+            );
+            let alt_s3_control_endpoint = std::env::var("S3_CONTROL_ALT_TEST_ENDPOINT").expect(
+                "S3_CONTROL_ALT_TEST_ENDPOINT required with S3_TEST_ENDPOINT; set it to the alternate account's S3 Control endpoint",
+            );
+            assert!(
+                alt_s3_control_endpoint.starts_with("https://")
+                    || alt_s3_control_endpoint.starts_with("http://"),
+                "S3_CONTROL_ALT_TEST_ENDPOINT must use http:// or https://; got {alt_s3_control_endpoint}"
             );
             let access_key = std::env::var("AWS_TEST_ACCESS_KEY")
                 .expect("AWS_TEST_ACCESS_KEY required with S3_TEST_ENDPOINT");
@@ -258,6 +270,7 @@ impl TestContext {
                 alt_client,
                 endpoint,
                 s3_control_endpoint,
+                alt_s3_control_endpoint,
                 access_key,
                 secret_key,
                 alt_access_key,
@@ -273,6 +286,7 @@ impl TestContext {
             let server = TestServer::start().await;
             let endpoint = server.endpoint().to_string();
             let s3_control_endpoint = endpoint.clone();
+            let alt_s3_control_endpoint = endpoint.clone();
             let client = build_client_with_ca(
                 &endpoint,
                 server::TEST_ACCESS_KEY,
@@ -308,6 +322,7 @@ impl TestContext {
                 alt_client,
                 endpoint,
                 s3_control_endpoint,
+                alt_s3_control_endpoint,
                 access_key: server::TEST_ACCESS_KEY.to_string(),
                 secret_key: server::TEST_SECRET_KEY.to_string(),
                 alt_access_key: server::ALT_ACCESS_KEY.to_string(),
@@ -367,6 +382,11 @@ impl TestContext {
     /// The endpoint URL for S3 Control requests.
     pub fn s3_control_endpoint(&self) -> &str {
         &self.s3_control_endpoint
+    }
+
+    /// The endpoint URL for alternate-account S3 Control requests.
+    pub fn alt_s3_control_endpoint(&self) -> &str {
+        &self.alt_s3_control_endpoint
     }
 
     /// The local test server CA, if running against the embedded HTTPS server.

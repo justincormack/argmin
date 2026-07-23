@@ -1307,7 +1307,11 @@ impl HttpFrontend {
             .load_bucket_cors_config(storage_route_admission, bucket)
         {
             Ok(Some(xml)) => xml,
-            _ => return S3Response::forbidden_with_ids(wire_ids),
+            Ok(None) => return S3Response::cors_not_enabled(request_method, wire_ids),
+            Err(ServerError::BucketNotFound { .. }) => {
+                return S3Response::cors_bucket_not_found(request_method, wire_ids);
+            }
+            Err(err) => return S3Response::error_with_ids(&err, req.path(), wire_ids),
         };
         let config = match crate::http::xml::parse_cors_config_xml(cors_config_xml.as_bytes()) {
             Ok(c) => c,
@@ -1328,7 +1332,7 @@ impl HttpFrontend {
                 }
                 resp
             }
-            None => S3Response::forbidden_with_ids(wire_ids),
+            None => S3Response::cors_request_not_allowed(request_method, wire_ids),
         }
     }
 

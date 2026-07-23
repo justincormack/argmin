@@ -2798,6 +2798,42 @@ impl S3Response {
         Self::new(200)
     }
 
+    fn cors_preflight_error(message: &str, method: &str, wire_ids: &WireResponseIds) -> Self {
+        let body = xml::cors_preflight_error_xml(
+            message,
+            method,
+            wire_ids.request_id(),
+            wire_ids.host_id(),
+        );
+        Self::new(403).chunked_xml_body(body)
+    }
+
+    /// Build the CORS response used when the target bucket does not exist.
+    #[must_use]
+    pub fn cors_bucket_not_found(method: &str, wire_ids: &WireResponseIds) -> Self {
+        Self::cors_preflight_error("CORSResponse: Bucket not found", method, wire_ids)
+    }
+
+    /// Build the CORS response used when the bucket has no CORS configuration.
+    #[must_use]
+    pub fn cors_not_enabled(method: &str, wire_ids: &WireResponseIds) -> Self {
+        Self::cors_preflight_error(
+            "CORSResponse: CORS is not enabled for this bucket.",
+            method,
+            wire_ids,
+        )
+    }
+
+    /// Build the CORS response used when no configured rule matches.
+    #[must_use]
+    pub fn cors_request_not_allowed(method: &str, wire_ids: &WireResponseIds) -> Self {
+        Self::cors_preflight_error(
+            "CORSResponse: This CORS request is not allowed. This is usually because the evalution of Origin, request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted by the resource's CORS spec.",
+            method,
+            wire_ids,
+        )
+    }
+
     /// Build a 403 Forbidden response.
     #[must_use]
     pub fn forbidden(host_id: &str) -> Self {

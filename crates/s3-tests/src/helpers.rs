@@ -33,6 +33,7 @@ use aws_smithy_runtime_api::client::identity::Identity;
 use base64::Engine;
 use md5_legacy::Digest;
 use ring::hmac;
+use s3_types::is_legacy_create_bucket_region;
 
 use crate::{configured_test_timeout, CTX};
 
@@ -88,13 +89,9 @@ pub fn unique_bucket() -> String {
     format!("{}{pid}-{:016x}-{n}", bucket_prefix(), *BUCKET_NAMESPACE)
 }
 
-/// Generate a unique account-regional bucket name for this account and region.
-///
-/// The bucket is not created. Tests use this for AWS-facing missing-bucket
-/// probes where a global namespace collision would make the oracle flaky.
-pub fn unique_account_regional_bucket() -> String {
+fn unique_account_regional_bucket_for(account_id: &str) -> String {
     let n = BUCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let suffix = format!("-{}-{}-an", CTX.account_id(), CTX.region());
+    let suffix = format!("-{account_id}-{}-an", CTX.region());
     let max_prefix_len = 63usize
         .checked_sub(suffix.len())
         .expect("account-regional bucket suffix must fit in S3 bucket name length");
@@ -104,6 +101,50 @@ pub fn unique_account_regional_bucket() -> String {
         "S3_TEST_BUCKET_PREFIX is too long for account-regional test bucket names: prefix {prefix:?}, suffix {suffix:?}"
     );
     format!("{prefix}{suffix}")
+}
+
+/// Generate a unique account-regional bucket name for this account and region.
+///
+/// The bucket is not created. Tests use this for AWS-facing missing-bucket
+/// probes where a global namespace collision would make the oracle flaky.
+pub fn unique_account_regional_bucket() -> String {
+    unique_account_regional_bucket_for(CTX.account_id())
+}
+
+/// Generate a unique account-regional bucket name for the alternate account.
+///
+/// The bucket is not created. Cross-account namespace and routing tests use
+/// this to compare existing and missing names within the same foreign
+/// account-regional namespace.
+pub fn unique_alt_account_regional_bucket() -> String {
+    unique_account_regional_bucket_for(CTX.alt_account_id())
+}
+
+/// Create an account-regional bucket using the supplied credentials.
+///
+/// The AWS SDK version used by the endpoint-neutral test harness does not yet
+/// expose the namespace request member, so account-regional tests use this raw
+/// SigV4 helper.
+pub fn create_account_regional_bucket_with_credentials(
+    bucket: &str,
+    credentials: SignedRequestCredentials<'_>,
+) -> RawResponse {
+    let body = if is_legacy_create_bucket_region(CTX.region()) {
+        Vec::new()
+    } else {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LocationConstraint>{}</LocationConstraint></CreateBucketConfiguration>"#,
+            CTX.region()
+        )
+        .into_bytes()
+    };
+    send_signed_request_with_credentials(
+        "PUT",
+        &format!("{}/{bucket}", CTX.endpoint()),
+        &body,
+        [("x-amz-bucket-namespace", "account-regional")],
+        credentials,
+    )
 }
 
 /// Configure bucket-level Public Access Block to allow public ACL and policy tests.
