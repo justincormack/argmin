@@ -94,11 +94,17 @@ fn trace_multipart_reclaim(
     }
 }
 
-fn seed_deleting_bucket(runtime: &ReadRuntime) {
+fn seed_deleting_bucket(runtime: &ReadRuntime) -> storage::BucketDeleteFinalizeRoot {
+    let bucket = trusted_bucket_name(TRACE_BUCKET);
     runtime
         .storage_node
-        .test_create_deleting_bucket(&trusted_bucket_name(TRACE_BUCKET))
+        .test_create_deleting_bucket(&bucket)
         .unwrap();
+    let info = runtime.storage_node.test_head_bucket_raw(&bucket).unwrap();
+    storage::BucketDeleteFinalizeRoot {
+        bucket,
+        bucket_incarnation_generation: info.bucket_incarnation_generation,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1333,13 +1339,10 @@ impl TwoGenerationReclaimTraceHarness {
         use TwoGenerationReclaimTraceOp::*;
         match op {
             SeedBucketDelete => {
-                seed_deleting_bucket(&self.runtime);
-                self.runtime.storage_node.enqueue_bucket_delete_finalize(
-                    storage::BucketDeleteFinalizeRoot {
-                        bucket: trusted_bucket_name(TRACE_BUCKET),
-                        bucket_incarnation_generation: 1,
-                    },
-                );
+                let root = seed_deleting_bucket(&self.runtime);
+                self.runtime
+                    .storage_node
+                    .enqueue_bucket_delete_finalize(root);
             }
             SeedOldMetadata => self.seed_metadata_for(TraceGeneration::Old)?,
             SeedNewMetadata => self.seed_metadata_for(TraceGeneration::New)?,
@@ -1372,9 +1375,12 @@ impl TwoGenerationReclaimTraceHarness {
             WorkerObjectStep => unreachable!("use execute_worker_object_step with model head"),
             WorkerBucketDeleteStep => {
                 let work = self.take_next_work()?;
-                match work {
+                let root = match work {
                     Some(ReclaimWorkItem::BucketDelete(root))
-                        if root.bucket == trusted_bucket_name(TRACE_BUCKET) => {}
+                        if root.bucket == trusted_bucket_name(TRACE_BUCKET) =>
+                    {
+                        root
+                    }
                     Some(ReclaimWorkItem::ObjectPayload(_)) => {
                         return Err(TestCaseError::fail(
                             "expected bucket delete finalize work item, got object reclaim",
@@ -1395,12 +1401,12 @@ impl TwoGenerationReclaimTraceHarness {
                             "expected bucket delete finalize work item for the trace bucket",
                         ))
                     }
-                }
+                };
                 self.runtime
-                    .try_finalize_bucket_delete_for(&trusted_bucket_name(TRACE_BUCKET))
+                    .try_finalize_bucket_delete_for_with_outcome(&root)
                     .map_err(|err| {
                         TestCaseError::fail(format!(
-                            "try_finalize_bucket_delete_for failed unexpectedly: {err:?}"
+                            "try_finalize_bucket_delete_for_with_outcome failed unexpectedly: {err:?}"
                         ))
                     })?;
             }
@@ -1563,13 +1569,10 @@ impl TwoKeyReclaimTraceHarness {
         use TwoKeyReclaimTraceOp::*;
         match op {
             SeedBucketDelete => {
-                seed_deleting_bucket(&self.runtime);
-                self.runtime.storage_node.enqueue_bucket_delete_finalize(
-                    storage::BucketDeleteFinalizeRoot {
-                        bucket: trusted_bucket_name(TRACE_BUCKET),
-                        bucket_incarnation_generation: 1,
-                    },
-                );
+                let root = seed_deleting_bucket(&self.runtime);
+                self.runtime
+                    .storage_node
+                    .enqueue_bucket_delete_finalize(root);
             }
             SeedKeyAMetadata => self.seed_metadata_for(TraceKey::A)?,
             SeedKeyBMetadata => self.seed_metadata_for(TraceKey::B)?,
@@ -1602,9 +1605,12 @@ impl TwoKeyReclaimTraceHarness {
             WorkerObjectStep => unreachable!("use execute_worker_object_step with model head"),
             WorkerBucketDeleteStep => {
                 let work = self.take_next_work()?;
-                match work {
+                let root = match work {
                     Some(ReclaimWorkItem::BucketDelete(root))
-                        if root.bucket == trusted_bucket_name(TRACE_BUCKET) => {}
+                        if root.bucket == trusted_bucket_name(TRACE_BUCKET) =>
+                    {
+                        root
+                    }
                     Some(ReclaimWorkItem::ObjectPayload(_)) => {
                         return Err(TestCaseError::fail(
                             "expected bucket delete finalize work item, got object reclaim",
@@ -1625,12 +1631,12 @@ impl TwoKeyReclaimTraceHarness {
                             "expected bucket delete finalize work item for the trace bucket",
                         ))
                     }
-                }
+                };
                 self.runtime
-                    .try_finalize_bucket_delete_for(&trusted_bucket_name(TRACE_BUCKET))
+                    .try_finalize_bucket_delete_for_with_outcome(&root)
                     .map_err(|err| {
                         TestCaseError::fail(format!(
-                            "try_finalize_bucket_delete_for failed unexpectedly: {err:?}"
+                            "try_finalize_bucket_delete_for_with_outcome failed unexpectedly: {err:?}"
                         ))
                     })?;
             }
