@@ -89,7 +89,8 @@ pub use identity::{
     AssumedRoleId, AssumedRoleSessionArn, AssumedRoleSessionIdentity, AuthenticatedIdentity,
     AwsAccountId, ConfiguredPrincipalIdentity, IamPath, IamRoleArn, IamRoleIdentity, IamUserArn,
     IdentityError, LiveRoleIdentity, PrincipalIdentity, RoleName, RoleSessionName,
-    SessionAuthorizationContext, SessionLifetime, SourceIdentity, StableRoleId,
+    RoleSessionNameError, SessionAuthorizationContext, SessionLifetime, SourceIdentity,
+    StableRoleId,
 };
 pub use post::{
     authenticate_post_sigv4, prepare_post_policy, validate_post_policy,

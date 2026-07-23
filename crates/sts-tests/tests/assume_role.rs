@@ -61,17 +61,184 @@ fn assume_role_uses_first_scalar_parameter_values() {
     );
 }
 
+#[test]
+fn assume_role_validates_role_session_name() {
+    let long_session_name = "a".repeat(65);
+    let short_invalid_session_name = "!";
+    let long_invalid_session_name = "/".repeat(65);
+    let multibyte_short_invalid_session_name = "é";
+    let supplementary_short_invalid_session_name = "😀";
+    let long_session_message = format!(
+        "1 validation error detected: Value '{long_session_name}' at 'roleSessionName' failed to satisfy constraint: Member must have length less than or equal to 64"
+    );
+    let short_invalid_session_message = format!(
+        "2 validation errors detected: Value '{short_invalid_session_name}' at 'roleSessionName' failed to satisfy constraint: Member must satisfy regular expression pattern: [\\w+=,.@-]*; Value '{short_invalid_session_name}' at 'roleSessionName' failed to satisfy constraint: Member must have length greater than or equal to 2"
+    );
+    let long_invalid_session_message = format!(
+        "2 validation errors detected: Value '{long_invalid_session_name}' at 'roleSessionName' failed to satisfy constraint: Member must satisfy regular expression pattern: [\\w+=,.@-]*; Value '{long_invalid_session_name}' at 'roleSessionName' failed to satisfy constraint: Member must have length less than or equal to 64"
+    );
+    let multibyte_short_invalid_session_message = format!(
+        "2 validation errors detected: Value '{multibyte_short_invalid_session_name}' at 'roleSessionName' failed to satisfy constraint: Member must satisfy regular expression pattern: [\\w+=,.@-]*; Value '{multibyte_short_invalid_session_name}' at 'roleSessionName' failed to satisfy constraint: Member must have length greater than or equal to 2"
+    );
+    let supplementary_short_invalid_session_message = format!(
+        "2 validation errors detected: Value '{supplementary_short_invalid_session_name}' at 'roleSessionName' failed to satisfy constraint: Member must satisfy regular expression pattern: [\\w+=,.@-]*; Value '{supplementary_short_invalid_session_name}' at 'roleSessionName' failed to satisfy constraint: Member must have length greater than or equal to 2"
+    );
+    let cases = [
+        (
+            "missing RoleSessionName",
+            None,
+            "1 validation error detected: Value null at 'roleSessionName' failed to satisfy constraint: Member must not be null",
+        ),
+        (
+            "empty RoleSessionName",
+            Some(""),
+            "1 validation error detected: Value '' at 'roleSessionName' failed to satisfy constraint: Member must have length greater than or equal to 2",
+        ),
+        (
+            "one-character RoleSessionName",
+            Some("a"),
+            "1 validation error detected: Value 'a' at 'roleSessionName' failed to satisfy constraint: Member must have length greater than or equal to 2",
+        ),
+        (
+            "invalid-character RoleSessionName",
+            Some("bad/name"),
+            r"1 validation error detected: Value 'bad/name' at 'roleSessionName' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@-]*",
+        ),
+        (
+            "overlong RoleSessionName",
+            Some(long_session_name.as_str()),
+            long_session_message.as_str(),
+        ),
+        (
+            "short invalid-character RoleSessionName",
+            Some(short_invalid_session_name),
+            short_invalid_session_message.as_str(),
+        ),
+        (
+            "overlong invalid-character RoleSessionName",
+            Some(long_invalid_session_name.as_str()),
+            long_invalid_session_message.as_str(),
+        ),
+        (
+            "multibyte short invalid-character RoleSessionName",
+            Some(multibyte_short_invalid_session_name),
+            multibyte_short_invalid_session_message.as_str(),
+        ),
+        (
+            "supplementary short invalid-character RoleSessionName",
+            Some(supplementary_short_invalid_session_name),
+            supplementary_short_invalid_session_message.as_str(),
+        ),
+    ];
+
+    for (label, role_session_name, message) in cases {
+        let mut parameters = vec![
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", CTX.role_arn()),
+        ];
+        if let Some(role_session_name) = role_session_name {
+            parameters.push(("RoleSessionName", role_session_name));
+        }
+        assert_assume_role_error(label, &parameters, 400, "ValidationError", message);
+    }
+}
+
+#[test]
+fn assume_role_validates_role_session_name_before_role_resolution_and_trust() {
+    let message = r"1 validation error detected: Value 'bad/name' at 'roleSessionName' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@-]*";
+    let missing_role_arn = format!("{}-missing", CTX.role_arn());
+    for (label, role_arn) in [
+        (
+            "invalid RoleSessionName with trust-denied role",
+            CTX.denied_role_arn(),
+        ),
+        (
+            "invalid RoleSessionName with unknown role",
+            missing_role_arn.as_str(),
+        ),
+    ] {
+        assert_assume_role_error(
+            label,
+            &[
+                ("Action", "AssumeRole"),
+                ("Version", "2011-06-15"),
+                ("RoleArn", role_arn),
+                ("RoleSessionName", "bad/name"),
+            ],
+            400,
+            "ValidationError",
+            message,
+        );
+    }
+}
+
+#[test]
+fn assume_role_accepts_role_session_name_boundaries() {
+    for role_session_name in ["aa".to_string(), "b".repeat(64)] {
+        assert_assume_role_success(
+            &role_session_name,
+            &[
+                ("Action", "AssumeRole"),
+                ("Version", "2011-06-15"),
+                ("RoleArn", CTX.role_arn()),
+                ("RoleSessionName", &role_session_name),
+            ],
+            3_600,
+        );
+    }
+}
+
 fn assert_assume_role_success(
     role_session_name: &str,
     parameters: &[(&str, &str)],
     expected_duration_seconds: i64,
 ) {
+    let response = send_assume_role(parameters);
+
+    let label = format!("AssumeRole {role_session_name}");
+    assert_issued_credential_shapes(&label, &response);
+    assert_expiration(&label, &response, expected_duration_seconds);
+    assert_success_wire_shape(&label, response, role_session_name);
+}
+
+fn assert_assume_role_error(
+    label: &str,
+    parameters: &[(&str, &str)],
+    status: u16,
+    code: &str,
+    message: &str,
+) {
+    let response = send_assume_role(parameters);
+    let request_id = required_response_header(&response, "x-amzn-requestid", label);
+    let extended_request_id =
+        required_response_header(&response, "x-amz-sts-extended-request-id", label);
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(status)
+            .header("content-type", "text/xml")
+            .header("x-amzn-requestid", "{sts_request_id}")
+            .header("x-amz-sts-extended-request-id", "{sts_extended_request_id}")
+            .body(format!(
+                "<ErrorResponse xmlns=\"{STS_XMLNS}\">\n  <Error>\n    \
+                 <Type>Sender</Type>\n    <Code>{code}</Code>\n    \
+                 <Message>{message}</Message>\n  </Error>\n  \
+                 <RequestId>{{sts_request_id}}</RequestId>\n</ErrorResponse>\n"
+            ))
+            .sub("sts_request_id", request_id)
+            .sub("sts_extended_request_id", extended_request_id),
+    );
+}
+
+fn send_assume_role(parameters: &[(&str, &str)]) -> RawResponse {
     let mut form = url::form_urlencoded::Serializer::new(String::new());
     for (name, value) in parameters {
         form.append_pair(name, value);
     }
     let body = form.finish();
-    let response = send_checked_signed_request_for_service_with_credentials(
+    send_checked_signed_request_for_service_with_credentials(
         "POST",
         &format!("{}/", CTX.endpoint()),
         body.as_bytes(),
@@ -79,12 +246,7 @@ fn assert_assume_role_success(
         SigningService::Sts,
         "sts",
         CTX.credentials(),
-    );
-
-    let label = format!("AssumeRole {role_session_name}");
-    assert_issued_credential_shapes(&label, &response);
-    assert_expiration(&label, &response, expected_duration_seconds);
-    assert_success_wire_shape(&label, response, role_session_name);
+    )
 }
 
 fn required_xml_text(response: &RawResponse, tag: &str, label: &str) -> String {

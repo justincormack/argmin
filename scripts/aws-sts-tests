@@ -10,8 +10,9 @@ usage() {
     cat <<'EOF'
 Usage: ./scripts/aws-sts-tests [options] [cargo test args...]
 
-Run the shared STS integration tests against AWS. The script creates one
-self-cleaning role trusted directly to the primary test principal. Extra
+Run the shared STS integration tests against AWS. The script creates two
+self-cleaning roles: one trusted directly to the primary test principal and
+one changed from that trust to an explicit denial after convergence. Extra
 arguments are passed to cargo test.
 
 Options:
@@ -105,9 +106,12 @@ aws_primary() {
 
 tmpdir="$(mktemp -d)"
 role_name="path-shape-shared-${BASHPID}-${RANDOM}"
+denied_role_name="denied-shared-${BASHPID}-${RANDOM}"
 role_path="/argmin-sts-oracle/same-account/"
 role_created=false
+denied_role_created=false
 trust_policy="$tmpdir/trust-policy.json"
+denied_trust_policy="$tmpdir/denied-trust-policy.json"
 convergence_stdout="$tmpdir/assume-role-convergence.out"
 convergence_stderr="$tmpdir/assume-role-convergence.err"
 
@@ -115,13 +119,19 @@ cleanup() {
     local status=$?
     set +e
     trap - EXIT
+    if [[ "$denied_role_created" == true ]]; then
+        if ! aws_primary iam delete-role --role-name "$denied_role_name"; then
+            echo "error: failed to delete temporary shared STS denied role $denied_role_name" >&2
+            ((status != 0)) || status=1
+        fi
+    fi
     if [[ "$role_created" == true ]]; then
         if ! aws_primary iam delete-role --role-name "$role_name"; then
             echo "error: failed to delete temporary shared STS test role $role_name" >&2
             ((status != 0)) || status=1
         fi
     fi
-    rm -f "$trust_policy" "$convergence_stdout" "$convergence_stderr"
+    rm -f "$trust_policy" "$denied_trust_policy" "$convergence_stdout" "$convergence_stderr"
     rmdir "$tmpdir"
     exit "$status"
 }
@@ -136,6 +146,14 @@ jq -n --arg caller_arn "$caller_arn" '{
         Action: "sts:AssumeRole"
     }]
 }' >"$trust_policy"
+jq -n --arg caller_arn "$caller_arn" '{
+    Version: "2012-10-17",
+    Statement: [{
+        Effect: "Deny",
+        Principal: {AWS: $caller_arn},
+        Action: "sts:AssumeRole"
+    }]
+}' >"$denied_trust_policy"
 
 role_arn="$(aws_primary iam create-role \
     --role-name "$role_name" \
@@ -147,26 +165,17 @@ role_arn="$(aws_primary iam create-role \
 role_created=true
 aws_primary iam wait role-exists --role-name "$role_name"
 
-ready=false
-consecutive_successes=0
-for ((attempt = 1; attempt <= 30; attempt++)); do
-    if aws_primary sts assume-role \
-        --role-arn "$role_arn" \
-        --role-session-name shared-test-convergence \
-        --query 'AssumedRoleUser.Arn' \
-        --output text \
-        >"$convergence_stdout" 2>"$convergence_stderr"; then
-        ((consecutive_successes += 1))
-        if ((consecutive_successes == 3)); then
-            ready=true
-            break
-        fi
-    else
-        consecutive_successes=0
-    fi
-    sleep 2
-done
-if [[ "$ready" != true ]]; then
+denied_role_arn="$(aws_primary iam create-role \
+    --role-name "$denied_role_name" \
+    --path "$role_path" \
+    --assume-role-policy-document "file://${trust_policy}" \
+    --max-session-duration 3600 \
+    --query 'Role.Arn' \
+    --output text)"
+denied_role_created=true
+aws_primary iam wait role-exists --role-name "$denied_role_name"
+
+print_convergence_diagnostics() {
     if [[ -s "$convergence_stdout" ]]; then
         echo "last AssumeRole convergence stdout:" >&2
         cat "$convergence_stdout" >&2
@@ -175,11 +184,76 @@ if [[ "$ready" != true ]]; then
         echo "last AssumeRole convergence stderr:" >&2
         cat "$convergence_stderr" >&2
     fi
-    external_s3_test_die "shared STS test role did not converge to three consecutive successes"
-fi
+}
+
+wait_for_assume_role_success() {
+    local target_role_arn="$1"
+    local label="$2"
+    local consecutive_successes=0
+    local ready=false
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+        if aws_primary sts assume-role \
+            --role-arn "$target_role_arn" \
+            --role-session-name shared-test-convergence \
+            --query 'AssumedRoleUser.Arn' \
+            --output text \
+            >"$convergence_stdout" 2>"$convergence_stderr"; then
+            consecutive_successes=$((consecutive_successes + 1))
+            if ((consecutive_successes == 3)); then
+                ready=true
+                break
+            fi
+        else
+            consecutive_successes=0
+        fi
+        sleep 2
+    done
+    if [[ "$ready" != true ]]; then
+        print_convergence_diagnostics
+        external_s3_test_die "$label did not converge to three consecutive AssumeRole successes"
+    fi
+}
+
+wait_for_assume_role_denial() {
+    local target_role_arn="$1"
+    local label="$2"
+    local consecutive_denials=0
+    local ready=false
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+        if aws_primary sts assume-role \
+            --role-arn "$target_role_arn" \
+            --role-session-name shared-test-convergence \
+            --query 'AssumedRoleUser.Arn' \
+            --output text \
+            >"$convergence_stdout" 2>"$convergence_stderr"; then
+            consecutive_denials=0
+        elif grep -Fq "(AccessDenied)" "$convergence_stderr"; then
+            consecutive_denials=$((consecutive_denials + 1))
+            if ((consecutive_denials == 3)); then
+                ready=true
+                break
+            fi
+        else
+            consecutive_denials=0
+        fi
+        sleep 2
+    done
+    if [[ "$ready" != true ]]; then
+        print_convergence_diagnostics
+        external_s3_test_die "$label did not converge to three consecutive STS AccessDenied responses"
+    fi
+}
+
+wait_for_assume_role_success "$role_arn" "shared STS test role"
+wait_for_assume_role_success "$denied_role_arn" "shared STS denied-role control"
+aws_primary iam update-assume-role-policy \
+    --role-name "$denied_role_name" \
+    --policy-document "file://${denied_trust_policy}"
+wait_for_assume_role_denial "$denied_role_arn" "shared STS denied role"
 
 export STS_TEST_ROLE_ARN="$role_arn"
 export STS_TEST_ROLE_NAME="$role_name"
+export STS_TEST_DENIED_ROLE_ARN="$denied_role_arn"
 
 sts_cmd=(cargo test -p sts-tests --test assume_role --no-fail-fast)
 sts_cmd+=("${cargo_args[@]}")

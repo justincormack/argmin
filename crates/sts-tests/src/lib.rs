@@ -16,6 +16,7 @@ pub struct TestContext {
     account_id: String,
     role_arn: String,
     role_name: String,
+    denied_role_arn: String,
     region: String,
     tls_ca_pem: Option<Vec<u8>>,
     _server: Option<TestServer>,
@@ -42,6 +43,7 @@ impl TestContext {
                 account_id: required_env("AWS_TEST_ACCOUNT_ID"),
                 role_arn: required_env("STS_TEST_ROLE_ARN"),
                 role_name: required_env("STS_TEST_ROLE_NAME"),
+                denied_role_arn: required_env("STS_TEST_DENIED_ROLE_ARN"),
                 region: std::env::var("AWS_TEST_REGION")
                     .unwrap_or_else(|_| "us-east-1".to_string()),
                 tls_ca_pem,
@@ -61,6 +63,7 @@ impl TestContext {
             account_id: s3_tests::server::TEST_ACCOUNT_ID.to_string(),
             role_arn: s3_tests::server::TEST_STS_ROLE_ARN.to_string(),
             role_name: s3_tests::server::TEST_STS_ROLE_NAME.to_string(),
+            denied_role_arn: s3_tests::server::TEST_STS_DENIED_ROLE_ARN.to_string(),
             region: s3_tests::server::TEST_REGION.to_string(),
             tls_ca_pem: server.tls_ca_pem().map(<[u8]>::to_vec),
             _server: Some(server),
@@ -85,6 +88,11 @@ impl TestContext {
     #[must_use]
     pub fn role_name(&self) -> &str {
         &self.role_name
+    }
+
+    #[must_use]
+    pub fn denied_role_arn(&self) -> &str {
+        &self.denied_role_arn
     }
 
     #[must_use]

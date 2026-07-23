@@ -1,6 +1,6 @@
 use auth::{
     authenticate_request, generate_session_credential_material, IamRoleArn, PolicyEvaluation,
-    ResolvedPrincipalAuthorization, RoleSessionName, SessionLifetime,
+    ResolvedPrincipalAuthorization, RoleSessionName, RoleSessionNameError, SessionLifetime,
 };
 
 use super::request::{percent_decode_strict, S3Request};
@@ -119,6 +119,43 @@ fn optional_parameter<'a>(parameters: &'a [(String, String)], name: &str) -> Opt
         .find_map(|(parameter_name, value)| (parameter_name == name).then_some(value.as_str()))
 }
 
+fn parse_role_session_name(
+    parameters: &[(String, String)],
+) -> Result<RoleSessionName, StsRequestError> {
+    const TOO_SHORT: &str = "Member must have length greater than or equal to 2";
+    const TOO_LONG: &str = "Member must have length less than or equal to 64";
+    const INVALID_CHARACTER: &str = r"Member must satisfy regular expression pattern: [\w+=,.@-]*";
+
+    let value = required_parameter(parameters, "RoleSessionName", "roleSessionName")?;
+    RoleSessionName::new(value.to_string()).map_err(|error| {
+        let constraints: &[&str] = match error {
+            RoleSessionNameError::TooShort => &[TOO_SHORT],
+            RoleSessionNameError::TooLong => &[TOO_LONG],
+            RoleSessionNameError::InvalidCharacter => &[INVALID_CHARACTER],
+            RoleSessionNameError::TooShortAndInvalidCharacter => {
+                &[INVALID_CHARACTER, TOO_SHORT]
+            }
+            RoleSessionNameError::TooLongAndInvalidCharacter => {
+                &[INVALID_CHARACTER, TOO_LONG]
+            }
+        };
+        let clauses = constraints
+            .iter()
+            .map(|constraint| {
+                format!(
+                    "Value '{value}' at 'roleSessionName' failed to satisfy constraint: {constraint}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let plural = if constraints.len() == 1 { "" } else { "s" };
+        StsRequestError::validation(format!(
+            "{} validation error{plural} detected: {clauses}",
+            constraints.len()
+        ))
+    })
+}
+
 fn validate_request_envelope(req: &S3Request) -> Result<Vec<(String, String)>, StsRequestError> {
     if req.method != http::Method::POST || req.path() != "/" {
         return Err(StsRequestError::Sender {
@@ -195,6 +232,7 @@ impl HttpFrontend {
         let role_arn_value = required_parameter(&parameters, "RoleArn", "roleArn")?;
         let role_arn = IamRoleArn::new(role_arn_value.to_string())
             .map_err(|_| StsRequestError::validation(format!("{role_arn_value} is invalid")))?;
+        let session_name = parse_role_session_name(&parameters)?;
         let target = self
             .identity_provider
             .lookup_role_authorization_by_arn(&role_arn)
@@ -217,13 +255,6 @@ impl HttpFrontend {
             )));
         }
 
-        let session_name_value =
-            required_parameter(&parameters, "RoleSessionName", "roleSessionName")?;
-        let session_name = RoleSessionName::new(session_name_value.to_string()).map_err(|_| {
-            StsRequestError::validation(format!(
-                "1 validation error detected: Value '{session_name_value}' at 'roleSessionName' failed to satisfy constraint"
-            ))
-        })?;
         let duration_seconds = optional_parameter(&parameters, "DurationSeconds")
             .map(|value| {
                 value.parse::<u32>().map_err(|_| StsRequestError::Sender {

@@ -114,6 +114,7 @@ cleanup_stale_sts_oracle_roles() {
     '.Roles[] | select(
         (.Path == "/argmin-sts-oracle/same-account/" and
             ((.RoleName | startswith("path-shape-")) or
+             (.RoleName | startswith("denied-shared-")) or
              (.RoleName | startswith("wildcard-trust-")) or
              (.RoleName | startswith("default-max-")) or
              (.RoleName | startswith("external-id-")) or
@@ -145,6 +146,7 @@ cleanup_stale_sts_oracle_roles() {
 
     case "$role_path:$role_name" in
       /argmin-sts-oracle/same-account/:path-shape-* | \
+        /argmin-sts-oracle/same-account/:denied-shared-* | \
         /argmin-sts-oracle/same-account/:wildcard-trust-* | \
         /argmin-sts-oracle/same-account/:default-max-* | \
         /argmin-sts-oracle/same-account/:external-id-* | \

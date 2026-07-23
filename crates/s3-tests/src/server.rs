@@ -22,6 +22,9 @@ pub const TEST_STS_CALLER_ARN: &str = "arn:aws:iam::111122223333:user/argmin-sts
 pub const TEST_STS_ROLE_NAME: &str = "argmin-sts-test-role";
 pub const TEST_STS_ROLE_ARN: &str =
     "arn:aws:iam::111122223333:role/argmin-sts-tests/argmin-sts-test-role";
+pub const TEST_STS_DENIED_ROLE_NAME: &str = "argmin-sts-denied-role";
+pub const TEST_STS_DENIED_ROLE_ARN: &str =
+    "arn:aws:iam::111122223333:role/argmin-sts-tests/argmin-sts-denied-role";
 pub const TEST_REGION: &str = "us-east-1";
 
 /// Alternate test credentials (non-owner user).
@@ -269,8 +272,17 @@ impl TestServer {
             auth::IamPath::new("/argmin-sts-tests/").unwrap(),
         );
         let live_sts_role = auth::LiveRoleIdentity::new(sts_account.clone(), sts_role).unwrap();
+        let denied_sts_role = auth::IamRoleIdentity::new(
+            auth::AwsAccountId::new(TEST_ACCOUNT_ID).unwrap(),
+            auth::StableRoleId::new("ARGRJIHGFEDCBA9876543210").unwrap(),
+            auth::RoleName::new(TEST_STS_DENIED_ROLE_NAME).unwrap(),
+            auth::IamPath::new("/argmin-sts-tests/").unwrap(),
+        );
+        let live_denied_sts_role =
+            auth::LiveRoleIdentity::new(sts_account.clone(), denied_sts_role).unwrap();
         let mut roles = auth::RoleIdentityStore::new();
         roles.add(live_sts_role.clone()).unwrap();
+        roles.add(live_denied_sts_role.clone()).unwrap();
         let mut authorization = auth::AuthorizationRecordStore::new();
         authorization
             .add_role(
@@ -283,6 +295,28 @@ impl TestServer {
                             Some(auth::PolicyVersion::V2012_10_17),
                             vec![auth::RoleTrustPolicyStatement::new(
                                 auth::PolicyEffect::Allow,
+                                vec![auth::RoleTrustPrincipal::new(TEST_STS_CALLER_ARN).unwrap()],
+                            )
+                            .unwrap()],
+                        )
+                        .unwrap(),
+                    ),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        authorization
+            .add_role(
+                auth::RoleAuthorizationRecord::new(
+                    Arc::new(live_denied_sts_role),
+                    auth::RoleRecordTimestamps::new(1, 1).unwrap(),
+                    auth::RoleMaximumSessionDuration::new(3_600).unwrap(),
+                    Arc::new(
+                        auth::RoleTrustPolicy::new(
+                            Some(auth::PolicyVersion::V2012_10_17),
+                            vec![auth::RoleTrustPolicyStatement::new(
+                                auth::PolicyEffect::Deny,
                                 vec![auth::RoleTrustPrincipal::new(TEST_STS_CALLER_ARN).unwrap()],
                             )
                             .unwrap()],

@@ -36,13 +36,19 @@ server.
 
 ### 1. RoleSessionName validation
 
+_Implemented with shared AWS/local coverage; pending external review._
+
 Add shared `AssumeRole` tests for:
 
 - missing, empty, and one-character values
 - an invalid character such as `/`
+- combined length-and-character failures, including BMP and supplementary
+  Unicode inputs, with every AWS-observed validation clause
 - the accepted two-character minimum
 - the accepted 64-character maximum
 - a rejected 65-character value
+- precedence against an unknown role and a known role whose trust policy
+  denies the caller
 
 Rejected cases must lock the complete AWS error response. Accepted boundaries
 must use the existing credential and success-envelope assertions.

@@ -24,14 +24,27 @@ pub enum IdentityError {
     InvalidRoleArn,
     #[error("invalid IAM path")]
     InvalidIamPath,
-    #[error("invalid role session name")]
-    InvalidRoleSessionName,
     #[error("invalid source identity")]
     InvalidSourceIdentity,
     #[error("session expiry must be later than its issue time")]
     InvalidSessionLifetime,
     #[error("the account identity and principal belong to different accounts")]
     AccountMismatch,
+}
+
+/// Reason an STS role session name cannot be represented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RoleSessionNameError {
+    #[error("role session name is shorter than two characters")]
+    TooShort,
+    #[error("role session name is longer than 64 characters")]
+    TooLong,
+    #[error("role session name contains a character outside the IAM name grammar")]
+    InvalidCharacter,
+    #[error("role session name is too short and contains an invalid character")]
+    TooShortAndInvalidCharacter,
+    #[error("role session name is too long and contains an invalid character")]
+    TooLongAndInvalidCharacter,
 }
 
 macro_rules! string_identity {
@@ -207,12 +220,29 @@ impl IamRoleArn {
 }
 
 impl RoleSessionName {
-    pub fn new(value: impl Into<String>) -> Result<Self, IdentityError> {
+    pub fn new(value: impl Into<String>) -> Result<Self, RoleSessionNameError> {
         let value = value.into();
-        if !(ROLE_SESSION_NAME_MIN_LEN..=ROLE_SESSION_NAME_MAX_LEN).contains(&value.len())
-            || !value.bytes().all(is_iam_name_byte)
-        {
-            return Err(IdentityError::InvalidRoleSessionName);
+        let length = value.chars().count();
+        let invalid_character = !value.bytes().all(is_iam_name_byte);
+        let error = if length < ROLE_SESSION_NAME_MIN_LEN {
+            Some(if invalid_character {
+                RoleSessionNameError::TooShortAndInvalidCharacter
+            } else {
+                RoleSessionNameError::TooShort
+            })
+        } else if length > ROLE_SESSION_NAME_MAX_LEN {
+            Some(if invalid_character {
+                RoleSessionNameError::TooLongAndInvalidCharacter
+            } else {
+                RoleSessionNameError::TooLong
+            })
+        } else if invalid_character {
+            Some(RoleSessionNameError::InvalidCharacter)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(error);
         }
         Ok(Self(value))
     }
@@ -757,15 +787,31 @@ mod tests {
         assert!(RoleSessionName::new("a".repeat(ROLE_SESSION_NAME_MAX_LEN)).is_ok());
         assert_eq!(
             RoleSessionName::new("a"),
-            Err(IdentityError::InvalidRoleSessionName)
+            Err(RoleSessionNameError::TooShort)
         );
         assert_eq!(
             RoleSessionName::new("a".repeat(ROLE_SESSION_NAME_MAX_LEN + 1)),
-            Err(IdentityError::InvalidRoleSessionName)
+            Err(RoleSessionNameError::TooLong)
         );
         assert_eq!(
             RoleSessionName::new("bad/name"),
-            Err(IdentityError::InvalidRoleSessionName)
+            Err(RoleSessionNameError::InvalidCharacter)
+        );
+        assert_eq!(
+            RoleSessionName::new("!"),
+            Err(RoleSessionNameError::TooShortAndInvalidCharacter)
+        );
+        assert_eq!(
+            RoleSessionName::new("/".repeat(ROLE_SESSION_NAME_MAX_LEN + 1)),
+            Err(RoleSessionNameError::TooLongAndInvalidCharacter)
+        );
+        assert_eq!(
+            RoleSessionName::new("é"),
+            Err(RoleSessionNameError::TooShortAndInvalidCharacter)
+        );
+        assert_eq!(
+            RoleSessionName::new("😀"),
+            Err(RoleSessionNameError::TooShortAndInvalidCharacter)
         );
     }
 

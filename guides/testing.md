@@ -364,9 +364,10 @@ This repo keeps the shared compatibility tests separate from discovery probes:
 
 `./scripts/aws-tests` runs the same `s3-tests` corpus against AWS that is run
 against the local endpoint. `./scripts/aws-sts-tests` does the same for the
-shared STS corpus and creates the one self-cleaning role required by the
-current issuance tests. Neither command invokes the STS oracle. The live STS
-oracle is an explicitly selected discovery tool, run with
+shared STS corpus and creates two self-cleaning roles required by the current
+issuance tests: one directly trusted role and one role changed to explicit
+denial after successful STS convergence. Neither command invokes the STS
+oracle. The live STS oracle is an explicitly selected discovery tool, run with
 `./scripts/aws-sts-oracle`; `--assume-role` enables its larger self-cleaning
 same-account fixture.
 
