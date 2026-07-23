@@ -105,7 +105,7 @@ pub use provider::{
 };
 pub use request::{
     authenticate_request, AuthContext, AuthMode, ConfiguredOrAnonymousAuth, ExpectedSigningRegion,
-    HeaderSource, StreamingSigningContext, UnsupportedAuthorizationIdentity,
+    HeaderSource, SigningService, StreamingSigningContext, UnsupportedAuthorizationIdentity,
 };
 pub use session_token::{
     SessionTokenKeyRingInitError, SessionTokenKeyRingStatus, SessionTokenOpenError,

@@ -20,12 +20,14 @@ pub use helpers::{
     eventually_raw_alt_object_status, expected_raw_bucket_location_constraint,
     get_object_body_retrying_operation_aborted, is_sdk_stream_disconnect,
     is_sdk_stream_disconnect_or_status, object_url, presign_url,
-    presign_url_for_service_with_credentials, presign_url_with_credentials,
-    presign_url_without_host_signed_header, put_bucket_lifecycle_with_md5,
-    put_object_retrying_operation_aborted, raw_alt_credentials, raw_alt_object_request,
-    raw_anonymous, raw_anonymous_put, raw_bucket, raw_fetch_url, raw_object, raw_object_query,
-    raw_object_with, raw_response_header, retrying_exact_operation_aborted_result,
-    retrying_operation_aborted, retrying_operation_aborted_result, sdk_checksum_headers,
+    presign_url_for_service_with_aws_signer_credentials, presign_url_for_service_with_credentials,
+    presign_url_with_credentials, presign_url_without_host_signed_header,
+    put_bucket_lifecycle_with_md5, put_object_retrying_operation_aborted, raw_alt_credentials,
+    raw_alt_object_request, raw_anonymous, raw_anonymous_put, raw_bucket, raw_fetch_url,
+    raw_object, raw_object_query, raw_object_with, raw_response_header,
+    retrying_exact_operation_aborted_result, retrying_operation_aborted,
+    retrying_operation_aborted_result, sdk_checksum_headers,
+    send_checked_signed_payload_request_for_service_with_credentials,
     send_checked_signed_request_for_service_with_credentials,
     send_checked_signed_request_to_endpoint_for_service_with_credentials, send_signed_request,
     send_signed_request_allow_response_body_error,
@@ -38,7 +40,7 @@ pub use helpers::{
     unique_account_regional_bucket, unique_alt_account_regional_bucket, unique_bucket,
     wait_for_versioned_writes_visible, PresignedRequest, RawAltObjectRequest, RawResponse,
     SendRetryingOperationAborted, SignedAwsChunkedRequest, SignedRequestCredentials,
-    SignedRequestHeaders, SigningService,
+    SignedRequestHeaders, SigningPayload, SigningService,
 };
 pub use post_form::{
     build_post_object_multipart_body, post_object_raw_to_test_endpoint_with_headers,
@@ -758,4 +760,9 @@ pub fn build_test_agent(
     timeout: std::time::Duration,
 ) -> Agent {
     Agent::new(endpoint, tls_ca_pem, timeout)
+}
+
+/// Build a raw test client using the suite's configured request timeout.
+pub fn build_configured_test_agent(endpoint: &str, tls_ca_pem: Option<&[u8]>) -> Agent {
+    build_test_agent(endpoint, tls_ca_pem, configured_test_timeout())
 }

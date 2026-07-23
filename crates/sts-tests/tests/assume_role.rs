@@ -1,13 +1,18 @@
+use std::time::Duration;
+
 use aws_smithy_types::{date_time::Format as DateTimeFormat, DateTime};
 use s3_tests::{
+    build_configured_test_agent, presign_url_for_service_with_aws_signer_credentials,
+    send_checked_signed_payload_request_for_service_with_credentials,
     send_checked_signed_request_for_service_with_credentials,
     shape::{assert_shape, response_header_value, shape, xml_tag_text},
-    RawResponse, SigningService,
+    RawResponse, SigningPayload, SigningService,
 };
 use sts_tests::CTX;
 
 const STS_XMLNS: &str = "https://sts.amazonaws.com/doc/2011-06-15/";
 const QUERY_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
+const SIGNATURE_MISMATCH_MESSAGE: &str = "The request signature we calculated does not match the signature you provided. Check your AWS Secret Access Key and signing method. Consult the service documentation for details.";
 
 #[test]
 fn assume_role_uses_default_duration() {
@@ -189,6 +194,115 @@ fn assume_role_accepts_role_session_name_boundaries() {
     }
 }
 
+#[test]
+fn assume_role_requires_sigv4_payload_binding() {
+    let original_session_name = "argmin-payload-original";
+    let altered_session_name = "argmin-payload-altered";
+    let original_body = assume_role_body(original_session_name);
+    let altered_body = assume_role_body(altered_session_name);
+    let original_hash = auth::canonical::sha256_hex(original_body.as_bytes());
+    let endpoint = format!("{}/", CTX.endpoint());
+
+    let explicit_hash = send_checked_signed_payload_request_for_service_with_credentials(
+        "POST",
+        &endpoint,
+        original_body.as_bytes(),
+        SigningPayload::Precomputed(&original_hash),
+        [("content-type", QUERY_CONTENT_TYPE)],
+        SigningService::Sts,
+        "sts",
+        CTX.credentials(),
+    );
+    assert_assume_role_success_response(
+        "AssumeRole with explicit payload hash",
+        explicit_hash,
+        original_session_name,
+        3_600,
+    );
+
+    for (label, signing_payload, transmitted_body) in [
+        (
+            "AssumeRole with UNSIGNED-PAYLOAD",
+            SigningPayload::Unsigned,
+            original_body.as_bytes(),
+        ),
+        (
+            "AssumeRole with mismatched explicit payload hash",
+            SigningPayload::Precomputed(&original_hash),
+            altered_body.as_bytes(),
+        ),
+    ] {
+        let response = send_checked_signed_payload_request_for_service_with_credentials(
+            "POST",
+            &endpoint,
+            transmitted_body,
+            signing_payload,
+            [("content-type", QUERY_CONTENT_TYPE)],
+            SigningService::Sts,
+            "sts",
+            CTX.credentials(),
+        );
+        assert_assume_role_response_error(
+            label,
+            &response,
+            403,
+            "SignatureDoesNotMatch",
+            SIGNATURE_MISMATCH_MESSAGE,
+        );
+    }
+
+    let presigned_explicit_hash = presign_url_for_service_with_aws_signer_credentials(
+        "POST",
+        &endpoint,
+        Duration::from_secs(900),
+        [
+            ("content-type", QUERY_CONTENT_TYPE),
+            ("x-amz-content-sha256", original_hash.as_str()),
+        ],
+        SigningPayload::Precomputed(&original_hash),
+        "sts",
+        CTX.credentials(),
+    );
+    let response = send_presigned_assume_role(&presigned_explicit_hash, &original_body);
+    assert_assume_role_success_response(
+        "presigned AssumeRole with explicit payload hash",
+        response,
+        original_session_name,
+        3_600,
+    );
+
+    let presigned_unsigned = presign_url_for_service_with_aws_signer_credentials(
+        "POST",
+        &endpoint,
+        Duration::from_secs(900),
+        [("content-type", QUERY_CONTENT_TYPE)],
+        SigningPayload::Unsigned,
+        "sts",
+        CTX.credentials(),
+    );
+    for (label, presigned, transmitted_body) in [
+        (
+            "presigned AssumeRole with unsigned payload",
+            &presigned_unsigned,
+            original_body.as_str(),
+        ),
+        (
+            "presigned AssumeRole with mismatched explicit payload hash",
+            &presigned_explicit_hash,
+            altered_body.as_str(),
+        ),
+    ] {
+        let response = send_presigned_assume_role(presigned, transmitted_body);
+        assert_assume_role_response_error(
+            label,
+            &response,
+            403,
+            "SignatureDoesNotMatch",
+            SIGNATURE_MISMATCH_MESSAGE,
+        );
+    }
+}
+
 fn assert_assume_role_success(
     role_session_name: &str,
     parameters: &[(&str, &str)],
@@ -196,10 +310,23 @@ fn assert_assume_role_success(
 ) {
     let response = send_assume_role(parameters);
 
-    let label = format!("AssumeRole {role_session_name}");
-    assert_issued_credential_shapes(&label, &response);
-    assert_expiration(&label, &response, expected_duration_seconds);
-    assert_success_wire_shape(&label, response, role_session_name);
+    assert_assume_role_success_response(
+        &format!("AssumeRole {role_session_name}"),
+        response,
+        role_session_name,
+        expected_duration_seconds,
+    );
+}
+
+fn assert_assume_role_success_response(
+    label: &str,
+    response: RawResponse,
+    role_session_name: &str,
+    expected_duration_seconds: i64,
+) {
+    assert_issued_credential_shapes(label, &response);
+    assert_expiration(label, &response, expected_duration_seconds);
+    assert_success_wire_shape(label, response, role_session_name);
 }
 
 fn assert_assume_role_error(
@@ -210,12 +337,22 @@ fn assert_assume_role_error(
     message: &str,
 ) {
     let response = send_assume_role(parameters);
-    let request_id = required_response_header(&response, "x-amzn-requestid", label);
+    assert_assume_role_response_error(label, &response, status, code, message);
+}
+
+fn assert_assume_role_response_error(
+    label: &str,
+    response: &RawResponse,
+    status: u16,
+    code: &str,
+    message: &str,
+) {
+    let request_id = required_response_header(response, "x-amzn-requestid", label);
     let extended_request_id =
-        required_response_header(&response, "x-amz-sts-extended-request-id", label);
+        required_response_header(response, "x-amz-sts-extended-request-id", label);
     assert_shape(
         label,
-        &response,
+        response,
         &shape()
             .status(status)
             .header("content-type", "text/xml")
@@ -230,6 +367,52 @@ fn assert_assume_role_error(
             .sub("sts_request_id", request_id)
             .sub("sts_extended_request_id", extended_request_id),
     );
+}
+
+fn assume_role_body(role_session_name: &str) -> String {
+    let mut form = url::form_urlencoded::Serializer::new(String::new());
+    for (name, value) in [
+        ("Action", "AssumeRole"),
+        ("Version", "2011-06-15"),
+        ("RoleArn", CTX.role_arn()),
+        ("RoleSessionName", role_session_name),
+    ] {
+        form.append_pair(name, value);
+    }
+    form.finish()
+}
+
+fn send_presigned_assume_role(presigned: &s3_tests::PresignedRequest, body: &str) -> RawResponse {
+    let agent = build_configured_test_agent(CTX.endpoint(), CTX.credentials().tls_ca_pem);
+    let mut request = agent.post(presigned.uri());
+    for (name, value) in presigned.headers() {
+        request = request.header(name, value);
+    }
+    let mut response = request
+        .send(body.as_bytes())
+        .expect("presigned STS transport error");
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .expect("presigned STS response header is valid UTF-8")
+                    .to_string(),
+            )
+        })
+        .collect();
+    let body_read_error = response.body_read_error().map(ToOwned::to_owned);
+    let body = response.body_mut().read_to_string().unwrap_or_default();
+    RawResponse {
+        status,
+        headers,
+        body,
+        body_read_error,
+    }
 }
 
 fn send_assume_role(parameters: &[(&str, &str)]) -> RawResponse {

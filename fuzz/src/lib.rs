@@ -1,4 +1,4 @@
-use auth::{CredentialStore, SecretKey};
+use auth::{CredentialStore, IdentityProvider, SecretKey};
 
 pub fn split_input(data: &[u8], parts: usize) -> Vec<&[u8]> {
     let mut slices = Vec::with_capacity(parts);
@@ -45,11 +45,12 @@ pub fn chunk_by_controls<'a>(data: &'a [u8], controls: &[u8]) -> Vec<&'a [u8]> {
     chunks
 }
 
-pub fn seeded_store() -> CredentialStore {
+pub fn seeded_store() -> IdentityProvider {
     let mut store = CredentialStore::new();
     store.add(
         "testAccessKey123".to_string(),
         SecretKey::new("testSecretKey1234567890".to_string()),
-    );
-    store
+    )
+    .expect("fuzz credential store contains one unique key");
+    IdentityProvider::in_memory(store).expect("build fuzz identity provider")
 }

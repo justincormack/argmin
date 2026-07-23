@@ -1304,6 +1304,36 @@ pub enum SigningService {
     Sts,
 }
 
+/// The payload representation incorporated into a SigV4 canonical request.
+///
+/// `Body` is the normal mode. The other variants are useful for permanently
+/// pinning service-specific handling of the explicit SigV4 payload modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigningPayload<'a> {
+    Body(&'a [u8]),
+    BodyWithoutHeader(&'a [u8]),
+    Unsigned,
+    Precomputed(&'a str),
+}
+
+impl SigningPayload<'_> {
+    fn canonical_hash(self) -> String {
+        match self {
+            Self::Body(body) | Self::BodyWithoutHeader(body) => auth::canonical::sha256_hex(body),
+            Self::Unsigned => "UNSIGNED-PAYLOAD".to_string(),
+            Self::Precomputed(hash) => hash.to_string(),
+        }
+    }
+
+    fn includes_content_sha256_header(self, service: SigningService) -> bool {
+        match self {
+            Self::Body(_) => service.includes_content_sha256_header(),
+            Self::BodyWithoutHeader(_) => false,
+            Self::Unsigned | Self::Precomputed(_) => true,
+        }
+    }
+}
+
 impl SigningService {
     fn credential_scope_name(self) -> &'static str {
         match self {
@@ -1528,6 +1558,107 @@ where
             preserve_base_query_order: true,
         },
     )
+}
+
+/// Build a presigned request with the AWS SDK SigV4 signer.
+///
+/// Unlike the historical S3 test presigner, this accepts an explicit payload
+/// representation and is suitable for service-behavior oracle tests where the
+/// payload mode itself is under test.
+pub fn presign_url_for_service_with_aws_signer_credentials<K, V, I>(
+    method: &str,
+    url_str: &str,
+    expires: Duration,
+    extra_headers: I,
+    signing_payload: SigningPayload<'_>,
+    service: &str,
+    credentials: SignedRequestCredentials<'_>,
+) -> PresignedRequest
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    let mut parsed = url::Url::parse(url_str).expect("parse AWS-presigned URL");
+    let host = parsed
+        .host_str()
+        .map(|host| {
+            if let Some(port) = parsed.port() {
+                format!("{host}:{port}")
+            } else {
+                host.to_string()
+            }
+        })
+        .expect("AWS-presigned URL host");
+    let mut request_headers = vec![("host".to_string(), host)];
+    request_headers.extend(extra_headers.into_iter().map(|(name, value)| {
+        (
+            name.as_ref().to_ascii_lowercase(),
+            value.as_ref().to_string(),
+        )
+    }));
+
+    let identity: Identity = Credentials::new(
+        credentials.access_key,
+        credentials.secret_key,
+        None,
+        None,
+        "argmin-aws-oracle",
+    )
+    .into();
+    let mut settings = SigningSettings::default();
+    settings.percent_encoding_mode = PercentEncodingMode::Single;
+    settings.payload_checksum_kind = PayloadChecksumKind::NoHeader;
+    settings.signature_location = SignatureLocation::QueryParams;
+    settings.expires_in = Some(expires);
+    settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    let signing_time = SystemTime::now();
+    let params = v4::SigningParams::builder()
+        .identity(&identity)
+        .region(credentials.region)
+        .name(service)
+        .time(signing_time)
+        .settings(settings)
+        .build()
+        .expect("build AWS presigned SigV4 signing parameters")
+        .into();
+    let header_refs = request_headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let signable_body = match signing_payload {
+        SigningPayload::Body(body) | SigningPayload::BodyWithoutHeader(body) => {
+            SignableBody::Bytes(body)
+        }
+        SigningPayload::Unsigned => SignableBody::UnsignedPayload,
+        SigningPayload::Precomputed(hash) => SignableBody::Precomputed(hash.to_string()),
+    };
+    let signable_request =
+        SignableRequest::new(method, url_str, header_refs.into_iter(), signable_body)
+            .expect("build AWS presigned SigV4 request");
+    let (instructions, _signature) = sign(signable_request, &params)
+        .expect("presign AWS oracle request")
+        .into_parts();
+    let (signing_headers, signing_params) = instructions.into_parts();
+    assert!(
+        signing_headers.is_empty(),
+        "query signing must not produce headers"
+    );
+    {
+        let mut query = parsed.query_pairs_mut();
+        for (name, value) in signing_params {
+            query.append_pair(name, &value);
+        }
+    }
+    let headers = request_headers
+        .into_iter()
+        .filter(|(name, _)| name != "host")
+        .collect();
+
+    PresignedRequest {
+        uri: parsed.into(),
+        headers,
+    }
 }
 
 pub fn presign_url_without_host_signed_header<K, V, I>(
@@ -1877,6 +2008,36 @@ where
     V: AsRef<str>,
     I: IntoIterator<Item = (K, V)>,
 {
+    sign_request_headers_for_service_with_payload_credentials_at_time(
+        method,
+        url_str,
+        SigningPayload::Body(body),
+        extra_headers,
+        signing_service,
+        credential_service,
+        credentials,
+        include_host_signed_header,
+        signing_time,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_request_headers_for_service_with_payload_credentials_at_time<K, V, I>(
+    method: &str,
+    url_str: &str,
+    signing_payload: SigningPayload<'_>,
+    extra_headers: I,
+    signing_service: SigningService,
+    credential_service: &str,
+    credentials: SignedRequestCredentials<'_>,
+    include_host_signed_header: bool,
+    signing_time: SystemTime,
+) -> SignedRequestHeaders
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
     let parsed = url::Url::parse(url_str).expect("parse signed URL");
     let path = parsed.path();
     let query = normalize_query(parsed.query().unwrap_or(""));
@@ -1893,13 +2054,13 @@ where
             }
         })
         .expect("URL host");
-    let payload_hash = auth::canonical::sha256_hex(body);
+    let payload_hash = signing_payload.canonical_hash();
 
     let mut request_headers: Vec<(String, String)> = vec![("x-amz-date".to_string(), amz_date)];
-    if signing_service.includes_content_sha256_header() {
+    if signing_payload.includes_content_sha256_header(signing_service) {
         // S3 and S3 Control require the payload hash on the wire. STS still
-        // incorporates the payload hash into the canonical request but does
-        // not emit this header.
+        // incorporates the normal body hash into the canonical request without
+        // emitting the header, while explicit payload modes require it.
         request_headers.push(("x-amz-content-sha256".to_string(), payload_hash.clone()));
     }
     if include_host_signed_header {
@@ -1966,15 +2127,42 @@ where
     V: AsRef<str>,
     I: IntoIterator<Item = (K, V)>,
 {
+    sign_request_headers_for_service_with_checked_payload_credentials(
+        method,
+        url_str,
+        SigningPayload::Body(body),
+        extra_headers,
+        signing_service,
+        credential_service,
+        credentials,
+    )
+}
+
+/// Sign a request with an explicit SigV4 payload representation after
+/// independently checking the hand-built result against the AWS SDK signer.
+pub fn sign_request_headers_for_service_with_checked_payload_credentials<K, V, I>(
+    method: &str,
+    url_str: &str,
+    signing_payload: SigningPayload<'_>,
+    extra_headers: I,
+    signing_service: SigningService,
+    credential_service: &str,
+    credentials: SignedRequestCredentials<'_>,
+) -> SignedRequestHeaders
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
     let signing_time = SystemTime::now();
     let extra_headers = extra_headers
         .into_iter()
         .map(|(name, value)| (name.as_ref().to_string(), value.as_ref().to_string()))
         .collect::<Vec<_>>();
-    let hand_rolled = sign_request_headers_for_service_with_credentials_at_time(
+    let hand_rolled = sign_request_headers_for_service_with_payload_credentials_at_time(
         method,
         url_str,
-        body,
+        signing_payload,
         extra_headers
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str())),
@@ -1984,10 +2172,10 @@ where
         true,
         signing_time,
     );
-    let aws = sign_request_headers_for_service_with_aws_signer_at_time(
+    let aws = sign_request_headers_for_service_with_aws_signer_payload_at_time(
         method,
         url_str,
-        body,
+        signing_payload,
         extra_headers
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str())),
@@ -2030,10 +2218,39 @@ fn assert_reference_signing_headers_match(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn sign_request_headers_for_service_with_aws_signer_at_time<K, V, I>(
     method: &str,
     url_str: &str,
     body: &[u8],
+    extra_headers: I,
+    signing_service: SigningService,
+    credential_service: &str,
+    credentials: SignedRequestCredentials<'_>,
+    signing_time: SystemTime,
+) -> SignedRequestHeaders
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    sign_request_headers_for_service_with_aws_signer_payload_at_time(
+        method,
+        url_str,
+        SigningPayload::Body(body),
+        extra_headers,
+        signing_service,
+        credential_service,
+        credentials,
+        signing_time,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_request_headers_for_service_with_aws_signer_payload_at_time<K, V, I>(
+    method: &str,
+    url_str: &str,
+    signing_payload: SigningPayload<'_>,
     extra_headers: I,
     signing_service: SigningService,
     credential_service: &str,
@@ -2074,11 +2291,12 @@ where
     .into();
     let mut settings = SigningSettings::default();
     settings.percent_encoding_mode = PercentEncodingMode::Single;
-    settings.payload_checksum_kind = if signing_service.includes_content_sha256_header() {
-        PayloadChecksumKind::XAmzSha256
-    } else {
-        PayloadChecksumKind::NoHeader
-    };
+    settings.payload_checksum_kind =
+        if signing_payload.includes_content_sha256_header(signing_service) {
+            PayloadChecksumKind::XAmzSha256
+        } else {
+            PayloadChecksumKind::NoHeader
+        };
     settings.signature_location = SignatureLocation::Headers;
     settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
     let params = v4::SigningParams::builder()
@@ -2094,13 +2312,16 @@ where
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect::<Vec<_>>();
-    let signable_request = SignableRequest::new(
-        method,
-        url_str,
-        header_refs.into_iter(),
-        SignableBody::Bytes(body),
-    )
-    .expect("build AWS SigV4 signable request");
+    let signable_body = match signing_payload {
+        SigningPayload::Body(body) | SigningPayload::BodyWithoutHeader(body) => {
+            SignableBody::Bytes(body)
+        }
+        SigningPayload::Unsigned => SignableBody::UnsignedPayload,
+        SigningPayload::Precomputed(hash) => SignableBody::Precomputed(hash.to_string()),
+    };
+    let signable_request =
+        SignableRequest::new(method, url_str, header_refs.into_iter(), signable_body)
+            .expect("build AWS SigV4 signable request");
     let (instructions, _signature) = sign(signable_request, &params)
         .expect("sign AWS oracle request")
         .into_parts();
@@ -2567,6 +2788,41 @@ where
     )
 }
 
+/// Send a request whose transmitted body may differ from the payload
+/// representation covered by SigV4. The signature is checked against the AWS
+/// SDK signer before the request is sent.
+#[allow(clippy::too_many_arguments)]
+pub fn send_checked_signed_payload_request_for_service_with_credentials<K, V, I>(
+    method: &str,
+    url_str: &str,
+    transmitted_body: &[u8],
+    signing_payload: SigningPayload<'_>,
+    extra_headers: I,
+    signing_service: SigningService,
+    credential_service: &str,
+    credentials: SignedRequestCredentials<'_>,
+) -> RawResponse
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    send_signed_request_to_endpoint_for_service_with_credentials_inner(
+        method,
+        url_str,
+        url_str,
+        transmitted_body,
+        extra_headers,
+        signing_service,
+        credential_service,
+        credentials,
+        false,
+        Vec::new(),
+        true,
+        HeaderSigner::CustomChecked(signing_payload),
+    )
+}
+
 /// Send a raw signed request to one endpoint while signing and sending a
 /// distinct `Host` header.
 pub fn send_signed_request_to_endpoint_for_service_with_credentials<K, V, I>(
@@ -2629,14 +2885,14 @@ where
         false,
         Vec::new(),
         true,
-        HeaderSigner::CustomChecked,
+        HeaderSigner::CustomChecked(SigningPayload::Body(body)),
     )
 }
 
 #[derive(Clone, Copy)]
-enum HeaderSigner {
+enum HeaderSigner<'a> {
     Custom,
-    CustomChecked,
+    CustomChecked(SigningPayload<'a>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2652,7 +2908,7 @@ fn send_signed_request_to_endpoint_for_service_with_credentials_inner<K, V, I>(
     allow_response_body_error: bool,
     unsigned_headers: Vec<(String, String)>,
     include_host_signed_header: bool,
-    signer: HeaderSigner,
+    signer: HeaderSigner<'_>,
 ) -> RawResponse
 where
     K: AsRef<str>,
@@ -2688,15 +2944,15 @@ where
             credentials,
             include_host_signed_header,
         ),
-        HeaderSigner::CustomChecked => {
+        HeaderSigner::CustomChecked(signing_payload) => {
             assert!(
                 include_host_signed_header,
                 "checked signer requires the host header"
             );
-            sign_request_headers_for_service_with_checked_credentials(
+            sign_request_headers_for_service_with_checked_payload_credentials(
                 method,
                 signed_url_str,
-                body,
+                signing_payload,
                 extra_headers,
                 signing_service,
                 credential_service,

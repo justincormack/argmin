@@ -40,6 +40,56 @@ pub enum ExpectedSigningRegion<'a> {
     DeferredToBucketRouting,
 }
 
+/// AWS service selected by the trusted endpoint before SigV4 verification.
+///
+/// S3 Control deliberately remains distinct from S3 even though both use the
+/// `s3` credential-scope name: they have different endpoints and may have
+/// different request-signing rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningService {
+    S3,
+    S3Control,
+    Sts,
+}
+
+impl SigningService {
+    const fn credential_scope_name(self) -> &'static str {
+        match self {
+            Self::S3 | Self::S3Control => "s3",
+            Self::Sts => "sts",
+        }
+    }
+
+    fn header_payload_hash<'a, H: HeaderSource + ?Sized>(
+        self,
+        headers: &'a H,
+        body: &[u8],
+    ) -> Cow<'a, str> {
+        match self {
+            Self::S3 | Self::S3Control => match headers.first_value("x-amz-content-sha256") {
+                Some(hash) => Cow::Borrowed(hash),
+                None => Cow::Owned(sha256_hex(body)),
+            },
+            Self::Sts => Cow::Owned(sha256_hex(body)),
+        }
+    }
+
+    fn presigned_payload_hash<'a, H: HeaderSource + ?Sized>(
+        self,
+        headers: &'a H,
+        body: &[u8],
+    ) -> Cow<'a, str> {
+        match self {
+            Self::S3 | Self::S3Control => Cow::Borrowed(
+                headers
+                    .first_value("x-amz-content-sha256")
+                    .unwrap_or("UNSIGNED-PAYLOAD"),
+            ),
+            Self::Sts => Cow::Owned(sha256_hex(body)),
+        }
+    }
+}
+
 impl<'a> ExpectedSigningRegion<'a> {
     pub(crate) fn exact(self) -> Option<&'a str> {
         match self {
@@ -272,7 +322,7 @@ pub fn authenticate_request<H: HeaderSource + ?Sized>(
     body: &[u8],
     provider: &crate::IdentityProvider,
     expected_region: ExpectedSigningRegion<'_>,
-    expected_service: &str,
+    expected_service: SigningService,
     now_epoch_secs: u64,
 ) -> Result<AuthContext, AuthError> {
     let query = observability::query_summary(query_string);
@@ -366,7 +416,7 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
     body: &[u8],
     provider: &crate::IdentityProvider,
     expected_region: ExpectedSigningRegion<'_>,
-    expected_service: &str,
+    expected_service: SigningService,
     now_epoch_secs: u64,
     auth_header: &str,
 ) -> Result<AuthContext, AuthError> {
@@ -404,17 +454,13 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
             });
         }
     }
-    if parsed.credential.service != expected_service {
+    if parsed.credential.service != expected_service.credential_scope_name() {
         return Err(AuthError::InvalidHeaderCredentialService {
             provided_service: parsed.credential.service.to_string(),
-            expected_service: expected_service.to_string(),
+            expected_service: expected_service.credential_scope_name().to_string(),
         });
     }
-    let body_hash = match headers.first_value("x-amz-content-sha256") {
-        Some("UNSIGNED-PAYLOAD") => Cow::Borrowed("UNSIGNED-PAYLOAD"),
-        Some(hash) => Cow::Borrowed(hash),
-        None => Cow::Owned(sha256_hex(body)),
-    };
+    let body_hash = expected_service.header_payload_hash(headers, body);
     let credential = resolve_header_credential(&parsed, headers, provider, now_epoch_secs)?;
     let seed_canonical_request = verify_request_credential(
         VerifyRequestCredentialInput {
@@ -627,10 +673,10 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     path: &str,
     query_string: &str,
     headers: &H,
-    _body: &[u8],
+    body: &[u8],
     provider: &crate::IdentityProvider,
     expected_region: ExpectedSigningRegion<'_>,
-    expected_service: &str,
+    expected_service: SigningService,
     now_epoch_secs: u64,
 ) -> Result<AuthContext, AuthError> {
     let algorithm =
@@ -662,11 +708,11 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
             });
         }
     }
-    if credential.service != expected_service {
+    if credential.service != expected_service.credential_scope_name() {
         return Err(AuthError::InvalidQueryCredentialService {
             param: "X-Amz-Credential",
             provided_service: credential.service.to_string(),
-            expected_service: expected_service.to_string(),
+            expected_service: expected_service.credential_scope_name().to_string(),
         });
     }
 
@@ -762,14 +808,10 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     let canonical_hdrs = canonical_headers(&signed_header_pair_refs);
     let signed_headers_joined = signed_headers.join(";");
     let canonical_qs = canonical_query_string(&query_without_signature(query_string));
-    // AWS treats x-amz-content-sha256 as a presigned payload-hash override
-    // even when it is not listed in X-Amz-SignedHeaders: UNSIGNED-PAYLOAD is
-    // accepted, while another value participates in signature verification.
-    // Other unsigned x-amz-* headers are rejected before this point.
-    let body_hash = match headers.first_value("x-amz-content-sha256") {
-        Some(hash) => Cow::Borrowed(hash),
-        None => Cow::Borrowed("UNSIGNED-PAYLOAD"),
-    };
+    // S3 and S3 Control permit their AWS-pinned presigned UNSIGNED-PAYLOAD
+    // modes. STS binds the canonical request to the received body, whether or
+    // not x-amz-content-sha256 was supplied.
+    let body_hash = expected_service.presigned_payload_hash(headers, body);
     let canonical_req = canonical_request(
         method,
         path,
@@ -993,6 +1035,39 @@ mod tests {
     use crate::credential::{CredentialStore, SecretKey, StoredCredential};
     use s3_types::AccountIdentity;
     use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn signing_service_payload_policy_is_exhaustive() {
+        let body = b"received body";
+        let body_hash = sha256_hex(body);
+        let unsigned_headers = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD")];
+        let no_headers: [(&str, &str); 0] = [];
+
+        assert_eq!(
+            SigningService::S3.header_payload_hash(&unsigned_headers, body),
+            "UNSIGNED-PAYLOAD"
+        );
+        assert_eq!(
+            SigningService::S3.presigned_payload_hash(&no_headers, body),
+            "UNSIGNED-PAYLOAD"
+        );
+        assert_eq!(
+            SigningService::S3Control.header_payload_hash(&unsigned_headers, body),
+            "UNSIGNED-PAYLOAD"
+        );
+        assert_eq!(
+            SigningService::S3Control.presigned_payload_hash(&no_headers, body),
+            "UNSIGNED-PAYLOAD"
+        );
+        assert_eq!(
+            SigningService::Sts.header_payload_hash(&unsigned_headers, body),
+            body_hash
+        );
+        assert_eq!(
+            SigningService::Sts.presigned_payload_hash(&no_headers, body),
+            body_hash
+        );
+    }
 
     struct FailingIdentityProvider(crate::IdentityProviderError);
 
@@ -1546,7 +1621,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap();
@@ -1568,7 +1643,7 @@ mod tests {
             b"",
             &fixture.provider,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             fixture.now_epoch_secs,
         )
     }
@@ -1585,7 +1660,7 @@ mod tests {
             b"",
             &fixture.provider,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             fixture.now_epoch_secs,
         )
     }
@@ -1603,7 +1678,7 @@ mod tests {
             b"",
             &fixture.provider,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             fixture.now_epoch_secs,
         )
     }
@@ -2705,7 +2780,7 @@ mod tests {
             &[],
             &provider,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap_err();
@@ -2730,7 +2805,7 @@ mod tests {
             &[],
             &provider,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap_err();
@@ -2752,7 +2827,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time() + crate::SIGV4_CLOCK_SKEW_SECS + 1,
         )
         .unwrap_err();
@@ -2771,7 +2846,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             0,
         )
         .unwrap_err();
@@ -2790,7 +2865,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time() - crate::SIGV4_CLOCK_SKEW_SECS - 1,
         )
         .unwrap_err();
@@ -2809,7 +2884,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time() + crate::SIGV4_CLOCK_SKEW_SECS,
         )
         .unwrap();
@@ -2827,7 +2902,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap_err();
@@ -2849,7 +2924,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap_err();
@@ -2896,7 +2971,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             parse_amz_date("20240201T120500Z").unwrap(),
         )
         .unwrap();
@@ -2920,7 +2995,7 @@ mod tests {
             &[],
             &provider,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -2946,7 +3021,7 @@ mod tests {
             &[],
             &provider,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -3003,7 +3078,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             parse_amz_date("20240201T120500Z").unwrap(),
         )
         .unwrap();
@@ -3050,7 +3125,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             parse_amz_date("20240201T120500Z").unwrap(),
         )
         .unwrap_err();
@@ -3097,7 +3172,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             parse_amz_date("20240201T120500Z").unwrap(),
         )
         .unwrap_err();
@@ -3116,7 +3191,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap_err();
@@ -3141,7 +3216,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             parse_amz_date("20240201T120500Z").unwrap(),
         )
         .unwrap_err();
@@ -3168,7 +3243,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap_err();
@@ -3203,7 +3278,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap_err();
@@ -3238,7 +3313,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap_err();
@@ -3259,7 +3334,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap_err();
@@ -3281,7 +3356,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap_err();
@@ -3308,7 +3383,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -3333,7 +3408,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -3358,7 +3433,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -3383,7 +3458,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -3410,7 +3485,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             0,
         )
         .unwrap_err();
@@ -3439,7 +3514,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             0,
         )
         .unwrap_err();
@@ -3468,7 +3543,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             0,
         )
         .unwrap_err();
@@ -3495,7 +3570,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             0,
         )
         .unwrap_err();
@@ -3522,7 +3597,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             0,
         )
         .unwrap_err();
@@ -3549,7 +3624,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             0,
         )
         .unwrap_err();
@@ -3576,7 +3651,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -3598,7 +3673,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -3623,7 +3698,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -3648,7 +3723,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             0,
         )
         .unwrap_err();
@@ -3673,7 +3748,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -3710,7 +3785,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -3732,7 +3807,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -3944,7 +4019,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap();
@@ -4010,7 +4085,7 @@ mod tests {
             body,
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap();
@@ -4043,7 +4118,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -4063,7 +4138,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -4100,7 +4175,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -4130,7 +4205,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -4153,7 +4228,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -4179,7 +4254,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -4202,7 +4277,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -4225,7 +4300,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -4254,7 +4329,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -4274,7 +4349,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -4294,7 +4369,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -4319,7 +4394,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             0,
         )
         .unwrap_err();
@@ -4339,7 +4414,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             presigned_example_time(),
         )
         .unwrap_err();
@@ -4368,7 +4443,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap_err();
@@ -4399,7 +4474,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             0,
         )
         .unwrap_err();
@@ -4424,7 +4499,7 @@ mod tests {
             b"",
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
         .unwrap_err();

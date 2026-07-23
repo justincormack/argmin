@@ -36,7 +36,7 @@ fuzz_target!(|data: &[u8]| {
         data,
         &store,
         auth::ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-        "s3",
+        auth::SigningService::S3,
         1_700_000_000,
     );
 
@@ -57,7 +57,7 @@ fuzz_target!(|data: &[u8]| {
         data,
         &store,
         auth::ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-        "s3",
+        auth::SigningService::S3,
         1_700_000_000,
     );
 });

@@ -3548,12 +3548,15 @@ impl HttpFrontend {
         bucket: Option<&str>,
         service: ServiceKind,
     ) -> Result<AuthContext, ServerError> {
+        if service == ServiceKind::S3Control {
+            Self::require_content_sha256_for_sigv4_header_auth(req)?;
+        }
         let canonical_path = service.canonical_signing_path(req.path());
         self.authenticate_with_payload_check_for_service(
             req,
             true,
             bucket,
-            service.credential_scope_name(),
+            service.signing_service(),
             &canonical_path,
         )
     }
@@ -3574,7 +3577,7 @@ impl HttpFrontend {
             req,
             verify_payload_hash,
             bucket,
-            "s3",
+            auth::SigningService::S3,
             req.path(),
         )
     }
@@ -3584,7 +3587,7 @@ impl HttpFrontend {
         req: &S3Request,
         verify_payload_hash: bool,
         bucket: Option<&str>,
-        expected_service: &str,
+        expected_service: auth::SigningService,
         canonical_path: &str,
     ) -> Result<AuthContext, ServerError> {
         let now = current_auth_epoch_secs()?;

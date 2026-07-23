@@ -2464,6 +2464,21 @@ impl S3Response {
                     wire_ids,
                 )
             }
+            ServerError::XAmzContentSHA256Mismatch {
+                client_hash,
+                server_hash,
+            } => Self::s3_control_error(
+                400,
+                "XAmzContentSHA256Mismatch",
+                &client_error_message(err),
+                &format!(
+                    "<ClientComputedContentSHA256>{}</ClientComputedContentSHA256>\
+                     <S3ComputedContentSHA256>{}</S3ComputedContentSHA256>",
+                    xml::xml_escape(client_hash),
+                    xml::xml_escape(server_hash)
+                ),
+                wire_ids,
+            ),
             _ => Self::s3_control_error(
                 err.http_status(),
                 err.s3_error_code(),

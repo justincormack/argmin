@@ -11,6 +11,7 @@ const STS_QUERY_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 pub(crate) const MAX_STS_QUERY_BODY_SIZE: usize = 10_000_000;
 const DEFAULT_SESSION_DURATION_SECONDS: u32 = 3_600;
 const MIN_SESSION_DURATION_SECONDS: u32 = 900;
+const SIGNATURE_MISMATCH_MESSAGE: &str = "The request signature we calculated does not match the signature you provided. Check your AWS Secret Access Key and signing method. Consult the service documentation for details.";
 
 enum StsRequestError {
     Sender {
@@ -35,6 +36,17 @@ impl StsRequestError {
             status: 403,
             code: "AccessDenied",
             message: message.into(),
+        }
+    }
+
+    fn authentication(error: auth::AuthError) -> Self {
+        match error {
+            auth::AuthError::SignatureMismatch { .. } => Self::Sender {
+                status: 403,
+                code: "SignatureDoesNotMatch",
+                message: SIGNATURE_MISMATCH_MESSAGE.to_string(),
+            },
+            _ => Self::access_denied("Access denied"),
         }
     }
 
@@ -209,10 +221,10 @@ impl HttpFrontend {
             &req.body,
             &self.identity_provider,
             auth::ExpectedSigningRegion::ExactEndpointRegion(self.coordinator.region()),
-            "sts",
+            auth::SigningService::Sts,
             req.request_epoch_seconds(),
         )
-        .map_err(|_| StsRequestError::access_denied("Access denied"))?;
+        .map_err(StsRequestError::authentication)?;
         let caller = auth
             .identity
             .as_ref()

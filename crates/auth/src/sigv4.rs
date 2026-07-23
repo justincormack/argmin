@@ -301,7 +301,9 @@ mod tests {
     use super::*;
     use crate::canonical::parse_amz_date;
     use crate::credential::CredentialStore;
-    use crate::request::{authenticate_request, AuthContext, AuthMode, ExpectedSigningRegion};
+    use crate::request::{
+        authenticate_request, AuthContext, AuthMode, ExpectedSigningRegion, SigningService,
+    };
 
     fn example_store() -> crate::IdentityProvider {
         let mut store = CredentialStore::new();
@@ -344,7 +346,7 @@ mod tests {
             body,
             provider,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
-            "s3",
+            SigningService::S3,
             aws_example_time(),
         )
     }

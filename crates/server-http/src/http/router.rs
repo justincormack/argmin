@@ -327,9 +327,10 @@ pub(crate) enum ServiceKind {
 
 impl ServiceKind {
     #[must_use]
-    pub const fn credential_scope_name(self) -> &'static str {
+    pub const fn signing_service(self) -> auth::SigningService {
         match self {
-            Self::S3 | Self::S3Control => "s3",
+            Self::S3 => auth::SigningService::S3,
+            Self::S3Control => auth::SigningService::S3Control,
         }
     }
 
