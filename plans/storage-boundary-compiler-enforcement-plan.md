@@ -2215,6 +2215,34 @@ Forty-third Phase 3 slice:
   tests, workspace-wide strict Clippy, and the full parallel workspace suite
   pass (7,508 tests).
 
+Forty-fourth Phase 3 slice:
+
+- shard-payload deletion and primary shard-acknowledgement deletion now consume
+  distinct non-cloneable retained-cleanup capabilities established from the
+  admitted RPC frame. Both capabilities require the server's admission domain,
+  reject active admission, validate the exact node/epoch/PG against the current
+  or retained cleanup route, and construct `DataPgId` only after that route is
+  trusted. Acknowledgement deletion additionally binds the retained primary.
+- the payload-delete capability binds the complete `ShardLocation` and
+  `ShardKey`, rejects a location whose shard index does not match the key, and
+  revalidates the retained route and subject immediately before acquiring the
+  read/delete exclusion fence and deleting the shard file. The acknowledgement
+  capability likewise revalidates immediately before deleting its exact
+  durable row. The old handler-local cleanup conversion is removed; RPC wire
+  shapes and terminal idempotence remain unchanged.
+- deterministic capability coverage rejects active and foreign admission,
+  rejects a crossed location/key subject while preserving the exact payload,
+  and positively deletes both the payload and acknowledgement row. The Unix
+  handler matrix retains correct-route and idempotent positive canaries,
+  primary enforcement, exact `UnknownPg` failures, read-handle exclusion, and
+  now verifies invalid-route requests cannot delete an existing payload.
+- payload lease/fence control, remaining active and historical data operations,
+  frontend capability migration, and capability requirements on node-client
+  traits remain open in Phase 3.
+- focused retained data-delete regressions, formatting, the storage boundary
+  checker, all 2,236 storage tests, workspace-wide strict Clippy, and the full
+  parallel workspace suite pass (7,494 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

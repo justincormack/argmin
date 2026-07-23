@@ -3156,6 +3156,12 @@ enum StorageNodeObjectScanStoreError {
     Store(StoreError),
 }
 
+#[derive(Debug)]
+enum StorageNodeDataRouteError {
+    Route(StorageRpcErrorResponse),
+    Store(StoreError),
+}
+
 enum StorageNodeRetainedStreamAbortApplyError {
     Route(StorageRpcErrorResponse),
     Apply(BucketSnapshotLoadError),
@@ -3257,6 +3263,26 @@ struct StorageNodeRetainedObjectPayloadReclaimClaimRoute<'a> {
     raw_pg_id: PgId,
     pg_id: ObjectMetadataPgId,
     claim: &'a ObjectPayloadReclaimClaimRecord,
+}
+
+struct StorageNodeRetainedShardPayloadDeleteRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    route_permit: &'a StorageNodeRouteAdmissionPermit,
+    node_id: NodeId,
+    route_cluster_epoch: ClusterEpoch,
+    raw_pg_id: PgId,
+    location: ShardLocation,
+    shard_key: &'a ShardKey,
+}
+
+struct StorageNodeRetainedShardAckDeleteRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    route_permit: &'a StorageNodeRouteAdmissionPermit,
+    node_id: NodeId,
+    route_cluster_epoch: ClusterEpoch,
+    raw_pg_id: PgId,
+    pg_id: DataPgId,
+    shard_key: &'a ShardKey,
 }
 
 struct StorageNodeRetainedStreamAbortRoute<'a> {
@@ -5781,6 +5807,71 @@ impl StorageNodeRetainedObjectPayloadReclaimClaimRoute<'_> {
     }
 }
 
+impl StorageNodeRetainedShardPayloadDeleteRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
+        let pg_id = self.handler.validate_retained_shard_payload_delete_route(
+            self.route_permit,
+            self.node_id,
+            self.route_cluster_epoch,
+            self.raw_pg_id,
+            self.location.shard_index(),
+            self.shard_key,
+            "shard payload delete",
+        )?;
+        if pg_id != self.location.data_pg_id() {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: "shard payload delete capability changed its validated data PG"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn delete(self) -> Result<(), StorageNodeDataRouteError> {
+        self.require_valid_now()
+            .map_err(StorageNodeDataRouteError::Route)?;
+        let _delete_fence = self
+            .handler
+            .try_begin_shard_delete(self.location, self.shard_key)
+            .map_err(StorageNodeDataRouteError::Route)?;
+        self.handler
+            .node
+            .delete_shard_file(self.location.data_pg_id().get(), self.shard_key)
+            .map_err(StorageNodeDataRouteError::Store)
+    }
+}
+
+impl StorageNodeRetainedShardAckDeleteRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
+        let pg_id = self.handler.validate_retained_data_route(
+            self.route_permit,
+            self.node_id,
+            self.route_cluster_epoch,
+            self.raw_pg_id,
+            true,
+            "shard ack delete",
+        )?;
+        if pg_id != self.pg_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: "shard ack delete capability changed its validated data PG".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn delete(self) -> Result<(), StorageNodeDataRouteError> {
+        self.require_valid_now()
+            .map_err(StorageNodeDataRouteError::Route)?;
+        self.handler
+            .node
+            .get_pg(self.pg_id.get())
+            .and_then(|pg| pg.delete_shard_record(self.shard_key))
+            .map_err(StorageNodeDataRouteError::Store)
+    }
+}
+
 impl StorageNodeRetainedStreamAbortRoute<'_> {
     fn require_valid_now(&self, operation: &'static str) -> Result<(), StorageRpcErrorResponse> {
         self.handler.validate_retained_object_route(
@@ -7040,7 +7131,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ShardDelete => {
                 match decode_shard_delete_request(&frame.payload) {
-                    Ok(request) => self.shard_delete_response(request),
+                    Ok(request) => self.shard_delete_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -7085,7 +7176,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ShardAckDelete => {
                 match decode_shard_ack_item_request(&frame.payload) {
-                    Ok(request) => self.shard_ack_delete_response(request),
+                    Ok(request) => self.shard_ack_delete_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -11242,22 +11333,25 @@ impl StorageNodeConnectionHandler {
 
     fn shard_delete_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcShardDeleteRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let location = match self.validate_shard_location_for_cleanup(request.location) {
-            Ok(location) => location,
+        let route = match self.retained_shard_payload_delete_route(
+            route_permit,
+            &request,
+            "shard payload delete",
+        ) {
+            Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        let _delete_fence = match self.try_begin_shard_delete(location, &request.shard_key) {
-            Ok(delete_fence) => delete_fence,
-            Err(error) => return encode_storage_rpc_error_response(&error),
-        };
-        let response = match self
-            .node
-            .delete_shard_file(location.data_pg_id().get(), &request.shard_key)
-        {
+        let response = match route.delete() {
             Ok(()) => encode_storage_rpc_success_response(&[]),
-            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+            Err(StorageNodeDataRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)?
+            }
+            Err(StorageNodeDataRouteError::Store(error)) => {
+                encode_storage_rpc_error_response(&store_error_response(error))?
+            }
         };
         Ok(response)
     }
@@ -11386,31 +11480,25 @@ impl StorageNodeConnectionHandler {
 
     fn shard_ack_delete_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcShardAckItemRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route =
-            match self.cleanup_pg_route(request.node_id, request.cluster_epoch, request.pg_id) {
-                Ok(route) => route,
-                Err(error) => return encode_storage_rpc_error_response(&error),
-            };
-        if route.primary_node_id != self.config.node_id {
-            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::NonActingSetAccess,
-                message: format!(
-                    "storage node {} is not primary for shard ack delete on PG {}",
-                    self.config.node_id.as_u32(),
-                    request.pg_id.get()
-                ),
-            });
-        }
-        let data_pg_id = self.validated_data_pg(request.pg_id);
-        let response = match self
-            .node
-            .get_pg(data_pg_id.get())
-            .and_then(|pg| pg.delete_shard_record(&request.shard_key))
-        {
+        let route = match self.retained_shard_ack_delete_route(
+            route_permit,
+            &request,
+            "shard ack delete",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let response = match route.delete() {
             Ok(()) => encode_storage_rpc_success_response(&[]),
-            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+            Err(StorageNodeDataRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)?
+            }
+            Err(StorageNodeDataRouteError::Store(error)) => {
+                encode_storage_rpc_error_response(&store_error_response(error))?
+            }
         };
         Ok(response)
     }
@@ -14033,18 +14121,6 @@ impl StorageNodeConnectionHandler {
         Ok(self.validated_shard_location(location))
     }
 
-    fn validate_shard_location_for_cleanup(
-        &self,
-        location: StorageRpcShardLocation,
-    ) -> Result<ShardLocation, StorageRpcErrorResponse> {
-        self.validate_pg_route_for_cleanup(
-            location.node_id,
-            location.cluster_epoch,
-            location.pg_id,
-        )?;
-        Ok(self.validated_shard_location(location))
-    }
-
     fn validate_shard_location_for_historical_inspection(
         &self,
         location: StorageRpcShardLocation,
@@ -15082,6 +15158,62 @@ impl StorageNodeConnectionHandler {
         self.active_primary_object_route(route_permit, request, operation)
     }
 
+    fn retained_shard_payload_delete_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcShardDeleteRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeRetainedShardPayloadDeleteRoute<'a>, StorageRpcErrorResponse> {
+        let pg_id = self.validate_retained_shard_payload_delete_route(
+            route_permit,
+            request.location.node_id,
+            request.location.cluster_epoch,
+            request.location.pg_id,
+            request.location.shard_index,
+            &request.shard_key,
+            operation,
+        )?;
+        Ok(StorageNodeRetainedShardPayloadDeleteRoute {
+            handler: self,
+            route_permit,
+            node_id: request.location.node_id,
+            route_cluster_epoch: request.location.cluster_epoch,
+            raw_pg_id: request.location.pg_id,
+            location: ShardLocation::new(
+                request.location.cluster_epoch,
+                pg_id,
+                request.location.shard_index,
+                request.location.node_id,
+            ),
+            shard_key: &request.shard_key,
+        })
+    }
+
+    fn retained_shard_ack_delete_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcShardAckItemRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeRetainedShardAckDeleteRoute<'a>, StorageRpcErrorResponse> {
+        let pg_id = self.validate_retained_data_route(
+            route_permit,
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+            true,
+            operation,
+        )?;
+        Ok(StorageNodeRetainedShardAckDeleteRoute {
+            handler: self,
+            route_permit,
+            node_id: request.node_id,
+            route_cluster_epoch: request.cluster_epoch,
+            raw_pg_id: request.pg_id,
+            pg_id,
+            shard_key: &request.shard_key,
+        })
+    }
+
     fn retained_bucket_write_reservation_route<'a>(
         &'a self,
         route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -15354,7 +15486,7 @@ impl StorageNodeConnectionHandler {
         Ok(expected_pg_id)
     }
 
-    fn validate_retained_object_admission(
+    fn validate_retained_cleanup_admission(
         &self,
         route_permit: &StorageNodeRouteAdmissionPermit,
         operation: &'static str,
@@ -15379,6 +15511,66 @@ impl StorageNodeConnectionHandler {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn validate_retained_shard_payload_delete_route(
+        &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        shard_index: crate::ShardIndex,
+        shard_key: &ShardKey,
+        operation: &'static str,
+    ) -> Result<DataPgId, StorageRpcErrorResponse> {
+        let pg_id = self.validate_retained_data_route(
+            route_permit,
+            node_id,
+            route_cluster_epoch,
+            pg_id,
+            false,
+            operation,
+        )?;
+        if shard_index != shard_key.shard_index() {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: format!(
+                    "{operation} location shard index {} does not match shard key index {}",
+                    shard_index.get(),
+                    shard_key.shard_index().get()
+                ),
+            });
+        }
+        Ok(pg_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_retained_data_route(
+        &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        require_primary: bool,
+        operation: &'static str,
+    ) -> Result<DataPgId, StorageRpcErrorResponse> {
+        self.validate_retained_cleanup_admission(route_permit, operation)?;
+        let route = self.cleanup_pg_route(node_id, route_cluster_epoch, pg_id)?;
+        if require_primary && route.primary_node_id != self.config.node_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::NonActingSetAccess,
+                message: format!(
+                    "storage node {} is not primary for {operation} on retained PG {} route",
+                    self.config.node_id.as_u32(),
+                    pg_id.get()
+                ),
+            });
+        }
+        Ok(self
+            .node
+            .data_pg(pg_id)
+            .expect("validated retained data PG must belong to installed topology"))
+    }
+
     fn validate_retained_object_route(
         &self,
         route_permit: &StorageNodeRouteAdmissionPermit,
@@ -15386,7 +15578,7 @@ impl StorageNodeConnectionHandler {
         require_primary: bool,
         operation: &'static str,
     ) -> Result<(), StorageRpcErrorResponse> {
-        self.validate_retained_object_admission(route_permit, operation)?;
+        self.validate_retained_cleanup_admission(route_permit, operation)?;
         let route = self.cleanup_pg_route(object.node_id, object.cluster_epoch, object.pg_id)?;
         if route.state != PgState::Active {
             return Err(StorageRpcErrorResponse {
@@ -24607,6 +24799,10 @@ mod tests {
             (test_location(1, 9, 7), StorageRpcErrorCode::UnknownPg),
         ];
         let server = StorageNodeServer::bind(config.clone()).unwrap();
+        server
+            ._node
+            .write_shard_file_if_absent(0, &shard_key, b"retained delete canary")
+            .unwrap();
         let socket_path = config.socket_path.clone();
         let join = thread::spawn(move || server.accept_one().unwrap());
 
@@ -24629,6 +24825,141 @@ mod tests {
         }
         drop(client);
         join.join().unwrap();
+
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.read_shard_file(0, &shard_key).unwrap(),
+            b"retained delete canary"
+        );
+    }
+
+    #[test]
+    fn retained_data_delete_capabilities_bind_admission_route_and_subject() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let shard_key = test_shard_key(0);
+        let payload = b"retained data capability payload";
+        let ack = WriteAck {
+            stored_size: payload.len() as u64,
+            crc64: checksum::crc64::checksum(payload),
+        };
+        server
+            ._node
+            .write_shard_file_if_absent(0, &shard_key, payload)
+            .unwrap();
+        server
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .register_written_shards_batch_exact(&[(&shard_key, ack)])
+            .unwrap();
+
+        let handler = server.connection_handler();
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let foreign_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let payload_request = StorageRpcShardDeleteRequest {
+            location: test_location(1, 0, 7).into(),
+            shard_key: shard_key.clone(),
+        };
+        let mismatched_payload_request = StorageRpcShardDeleteRequest {
+            location: test_location_with_shard(1, 0, 7, 1).into(),
+            shard_key: shard_key.clone(),
+        };
+        let ack_request = StorageRpcShardAckItemRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            shard_key: shard_key.clone(),
+        };
+
+        for result in [
+            handler.retained_shard_payload_delete_route(
+                &active_permit,
+                &payload_request,
+                "test shard payload delete",
+            ),
+            handler.retained_shard_payload_delete_route(
+                &foreign_permit,
+                &payload_request,
+                "test shard payload delete",
+            ),
+        ] {
+            match result {
+                Err(error) => assert_eq!(error.code, StorageRpcErrorCode::Internal),
+                Ok(_) => panic!("invalid admission created a retained payload-delete route"),
+            }
+        }
+        let mismatch = match handler.retained_shard_payload_delete_route(
+            &retained_permit,
+            &mismatched_payload_request,
+            "test shard payload delete",
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("mismatched shard index created a retained payload-delete route"),
+        };
+        assert_eq!(mismatch.code, StorageRpcErrorCode::PayloadDecode);
+        assert_eq!(
+            server._node.read_shard_file(0, &shard_key).unwrap(),
+            payload
+        );
+
+        for result in [
+            handler.retained_shard_ack_delete_route(
+                &active_permit,
+                &ack_request,
+                "test shard ack delete",
+            ),
+            handler.retained_shard_ack_delete_route(
+                &foreign_permit,
+                &ack_request,
+                "test shard ack delete",
+            ),
+        ] {
+            match result {
+                Err(error) => assert_eq!(error.code, StorageRpcErrorCode::Internal),
+                Ok(_) => panic!("invalid admission created a retained ack-delete route"),
+            }
+        }
+
+        handler
+            .retained_shard_payload_delete_route(
+                &retained_permit,
+                &payload_request,
+                "test shard payload delete",
+            )
+            .unwrap()
+            .delete()
+            .unwrap();
+        handler
+            .retained_shard_ack_delete_route(
+                &retained_permit,
+                &ack_request,
+                "test shard ack delete",
+            )
+            .unwrap()
+            .delete()
+            .unwrap();
+        assert!(matches!(
+            server._node.read_shard_file(0, &shard_key),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            server._node.get_pg(0).unwrap().stat_shard(&shard_key),
+            Err(StoreError::NotFound)
+        ));
     }
 
     #[test]
