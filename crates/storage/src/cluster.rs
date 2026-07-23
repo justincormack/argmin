@@ -21,7 +21,9 @@ pub use local::{
 use local::{
     LocalClusterRuntimeState, LocalRouteMapLeaseSnapshot, MetadataCommandRecoveryAdmission,
 };
-pub use request_ops::{BucketIdentityGenerations, DurableReclaimScanOutcome};
+pub use request_ops::{
+    BucketIdentityGenerations, DurableReclaimScanBatch, DurableReclaimScanOutcome,
+};
 
 use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneRuntimeMapSource,

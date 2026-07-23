@@ -299,6 +299,8 @@ const STORAGE_RPC_BUCKET_DELETE_ATTEMPT_OUTCOME_RECORD_MAX_LEN: usize =
         + BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN
         + 1
         + 4
+        + 1
+        + 4
         + 8;
 const STORAGE_RPC_MAX_BUCKET_OWNER_PRINCIPAL_LEN: usize = 1024;
 const STORAGE_RPC_MAX_BUCKET_OWNER_CANONICAL_ID_LEN: usize = 1024;
@@ -13143,6 +13145,7 @@ impl<'a> StorageRpcDecoder<'a> {
             ),
         )?;
         let post_reservation_next_object_pg_id = self.read_optional_u32()?;
+        let finalizer_next_object_pg_id = self.read_optional_u32()?;
         let updated_at = self.read_u64()?;
         Ok(BucketDeleteAttemptOutcomeRecord {
             bucket,
@@ -13153,6 +13156,7 @@ impl<'a> StorageRpcDecoder<'a> {
             phase,
             detail,
             post_reservation_next_object_pg_id,
+            finalizer_next_object_pg_id,
             updated_at,
         })
     }
@@ -15705,6 +15709,7 @@ fn put_bucket_delete_attempt_outcome_record(
     put_u8(out, record.phase as u8);
     put_string(out, &record.detail);
     put_optional_u32(out, record.post_reservation_next_object_pg_id);
+    put_optional_u32(out, record.finalizer_next_object_pg_id);
     put_u64(out, record.updated_at);
 }
 
@@ -20193,6 +20198,7 @@ mod tests {
                     phase: BucketDeleteAttemptPhase::FinalVisibilityProven,
                     detail: "e".repeat(BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN),
                     post_reservation_next_object_pg_id: Some(7),
+                    finalizer_next_object_pg_id: Some(9),
                     updated_at: 6,
                 },
             },

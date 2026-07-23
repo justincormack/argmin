@@ -69,17 +69,18 @@ mod traits {
 }
 
 pub use cluster::{
-    ActiveBucketRoute, ActiveBucketRoutePair, BucketWriteSnapshotAction, DurableReclaimScanOutcome,
-    LeasedObjectReadSnapshotOutcome, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute,
-    LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
-    LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig,
-    ObjectPayloadLease, PgMetadataTransferArtifact, PlacedSegmentShardBackfillCopyTarget,
-    PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth, PlacedSegmentShardSetHealth,
-    PlacedSegmentShardSetRisk, PlacedSegmentShardValidation, ReleasedObjectPayloadLease,
-    RetainedStreamUploadCleanup, ShardLocation, StorageCluster, StorageClusterRouteAdmission,
-    StorageClusterRuntimeMapHandle, StorageClusterRuntimeMapRefreshLoop,
-    StorageClusterRuntimeMapRefreshLoopFailure, StorageClusterRuntimeMapRefreshLoopStatus,
-    StorageClusterRuntimeMapRefreshLoopStatusHandle, StorageClusterRuntimeMapRefreshLoopSuccess,
+    ActiveBucketRoute, ActiveBucketRoutePair, BucketWriteSnapshotAction, DurableReclaimScanBatch,
+    DurableReclaimScanOutcome, LeasedObjectReadSnapshotOutcome, LocalClusterMap,
+    LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
+    LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
+    LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PgMetadataTransferArtifact,
+    PlacedSegmentShardBackfillCopyTarget, PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth,
+    PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk, PlacedSegmentShardValidation,
+    ReleasedObjectPayloadLease, RetainedStreamUploadCleanup, ShardLocation, StorageCluster,
+    StorageClusterRouteAdmission, StorageClusterRuntimeMapHandle,
+    StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopFailure,
+    StorageClusterRuntimeMapRefreshLoopStatus, StorageClusterRuntimeMapRefreshLoopStatusHandle,
+    StorageClusterRuntimeMapRefreshLoopSuccess,
 };
 #[cfg(feature = "test-hooks")]
 pub use cluster::{

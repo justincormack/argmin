@@ -11,7 +11,6 @@ pub(super) struct ReclamationTestHooks {
     pub(super) target_reclaim_worker_registry_key: Option<usize>,
     pub(super) probe_multipart_complete_auth_lookup: bool,
     pub(super) reclaim_worker_durable_scan_delay_override: Option<Duration>,
-    pub(super) force_reclaim_worker_durable_scan_after_idle_return: bool,
     pub(super) after_reclaim_worker_idle_return: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_reclaim_work_dequeued: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) before_reclaim_work_execute: Option<Arc<dyn Fn(Arc<StorageCluster>) + Send + Sync>>,
@@ -341,7 +340,7 @@ pub(super) fn reclaim_worker_durable_scan_delay_override(registry_key: usize) ->
     hooks.reclaim_worker_durable_scan_delay_override
 }
 
-pub(super) fn maybe_run_reclaim_worker_idle_return_hook(registry_key: usize) -> bool {
+pub(super) fn maybe_run_reclaim_worker_idle_return_hook(registry_key: usize) {
     let hooks = RECLAMATION_TEST_HOOKS
         .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
         .lock()
@@ -351,12 +350,11 @@ pub(super) fn maybe_run_reclaim_worker_idle_return_hook(registry_key: usize) -> 
         .target_reclaim_worker_registry_key
         .is_some_and(|target| target != registry_key)
     {
-        return false;
+        return;
     }
     if let Some(hook) = hooks.after_reclaim_worker_idle_return {
         hook();
     }
-    hooks.force_reclaim_worker_durable_scan_after_idle_return
 }
 
 pub(super) fn maybe_run_after_reclaim_work_dequeued_hook(registry_key: usize) {

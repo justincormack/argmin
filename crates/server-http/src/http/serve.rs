@@ -1546,13 +1546,14 @@ fn local_debug_bucket_delete_attempt_body(snapshot: &BucketDeleteDebugSnapshot) 
         Some(record) => {
             writeln!(
                 &mut body,
-                "attempt_outcome=present present=1 drain_id={:?} cluster_epoch={} bucket_execution_generation={} outcome={} phase={} post_reservation_next_object_pg_id={} updated_at={} detail={}",
+                "attempt_outcome=present present=1 drain_id={:?} cluster_epoch={} bucket_execution_generation={} outcome={} phase={} post_reservation_next_object_pg_id={} finalizer_next_object_pg_id={} updated_at={} detail={}",
                 record.drain_id,
                 record.cluster_epoch.get(),
                 record.bucket_execution_generation,
                 local_debug_bucket_delete_attempt_outcome(record.outcome),
                 local_debug_bucket_delete_attempt_phase(record.phase),
                 local_debug_optional_u32(record.post_reservation_next_object_pg_id),
+                local_debug_optional_u32(record.finalizer_next_object_pg_id),
                 record.updated_at,
                 observability::escaped(&record.detail),
             )
@@ -6810,6 +6811,7 @@ Connection: close\r\n\r\n",
                 phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
                 detail: "line1\nline2\t\x1b[31m".to_string(),
                 post_reservation_next_object_pg_id: Some(17),
+                finalizer_next_object_pg_id: Some(19),
                 updated_at: 12345,
             }),
         };
@@ -6915,6 +6917,7 @@ Connection: close\r\n\r\n",
             body.contains("post_reservation_next_object_pg_id=17"),
             "{body}"
         );
+        assert!(body.contains("finalizer_next_object_pg_id=19"), "{body}");
         assert!(body.contains("updated_at=12345"), "{body}");
         assert!(
             body.contains(r#"detail="line1\nline2\t\u{1b}[31m""#),

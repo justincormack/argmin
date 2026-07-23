@@ -2115,11 +2115,20 @@ fn frontend_unix_durable_reclaim_scan_stops_after_first_stale_route() {
     let scan = cluster.enqueue_durable_object_payload_reclaim_roots_excluding(&HashSet::new());
     assert_eq!(scan.errors, 1, "one stale response must end the PG scan");
     assert!(scan.route_refresh_required);
-    assert_eq!(
-        cluster.enqueue_durable_reclaim_work(),
-        crate::DurableReclaimScanOutcome::RouteRefreshRequired,
-        "the aggregate scan must skip subsequent bucket scans after the stale response"
+    let batch = cluster.enqueue_durable_reclaim_work_batch_excluding(
+        None,
+        1,
+        &HashSet::new(),
+        &HashSet::new(),
+        &HashSet::new(),
     );
+    assert_eq!(
+        batch.outcome,
+        crate::DurableReclaimScanOutcome::RouteRefreshRequired,
+        "the batch scan must skip subsequent bucket scans after the stale response"
+    );
+    assert_eq!(batch.next_pg_id, Some(pg_ids[0]));
+    assert_eq!(batch.scanned_pgs, 0);
 }
 
 #[test]

@@ -615,6 +615,123 @@ fn durable_reclaim_scan_recovers_lost_local_queue_after_reopen() {
 }
 
 #[test]
+fn durable_reclaim_scan_retries_same_pg_until_all_reopened_roots_are_discovered() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let pg_ids = [0, 1, 2, 3];
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+
+    let expected_roots = {
+        let map =
+            Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap());
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let key_a = key_for_object_pg(topology, &bucket, 1, "reopened-root-a-");
+        let key_b = key_for_object_pg(topology, &bucket, 1, "reopened-root-b-");
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let committed_a = write_committed_direct_segment_for_with_okh(
+            &cluster,
+            &bucket,
+            &key_a,
+            [41; 16],
+            b"first reopened root",
+        );
+        let committed_b = write_committed_direct_segment_for_with_okh(
+            &cluster,
+            &bucket,
+            &key_b,
+            [42; 16],
+            b"second reopened root",
+        );
+        for key in [&key_a, &key_b] {
+            cluster
+                .delete_current_object_if(&bucket, key, |_| Ok::<(), ()>(()))
+                .unwrap()
+                .unwrap();
+        }
+        [
+            (key_a, committed_a.generation_id),
+            (key_b, committed_b.generation_id),
+        ]
+    };
+
+    let reopened_map =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap());
+    let reopened_cluster = crate::StorageCluster::from_local_map(reopened_map).unwrap();
+    let mut discovered = Vec::new();
+    for expected_remaining in [2, 1] {
+        let batch = reopened_cluster.enqueue_durable_reclaim_work_batch_excluding(
+            None,
+            pg_ids.len(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(batch.outcome, crate::DurableReclaimScanOutcome::Complete);
+        assert_eq!(batch.next_pg_id, None);
+        assert!(
+            batch.retry_pass_required,
+            "a returned single-row root cannot prove the PG is exhausted"
+        );
+        let (queued_bucket, key, generation_id) = loop {
+            match reopened_cluster.try_take_reclaim_work() {
+                Some(crate::ReclaimWorkItem::ObjectPayload(root)) => break root,
+                Some(crate::ReclaimWorkItem::BucketDelete(root)) => {
+                    reopened_cluster.finish_bucket_delete_finalize_work(&root);
+                }
+                Some(other) => panic!("unexpected startup reclaim work: {other:?}"),
+                None => panic!("startup pass should queue one reopened durable root"),
+            }
+        };
+        assert_eq!(queued_bucket, bucket);
+        assert!(
+            expected_roots.contains(&(key.clone(), generation_id)),
+            "startup pass queued an unexpected durable root"
+        );
+        assert!(
+            reopened_cluster
+                .reclaim_object_payload_if_unleased(&bucket, &key, generation_id)
+                .unwrap(),
+            "discovered root should be reclaimable"
+        );
+        discovered.push((key, generation_id));
+        assert_eq!(
+            expected_roots
+                .iter()
+                .filter(|(key, generation_id)| reopened_cluster
+                    .payload_reclaim_exists(&bucket, key, *generation_id)
+                    .unwrap())
+                .count(),
+            expected_remaining - 1
+        );
+    }
+    assert_ne!(discovered[0], discovered[1]);
+    while let Some(work) = reopened_cluster.try_take_reclaim_work() {
+        match work {
+            crate::ReclaimWorkItem::BucketDelete(root) => {
+                reopened_cluster.finish_bucket_delete_finalize_work(&root);
+            }
+            other => panic!("unexpected trailing reclaim work: {other:?}"),
+        }
+    }
+
+    let clean = reopened_cluster.enqueue_durable_reclaim_work_batch_excluding(
+        None,
+        pg_ids.len(),
+        &HashSet::new(),
+        &HashSet::new(),
+        &HashSet::new(),
+    );
+    assert_eq!(clean.outcome, crate::DurableReclaimScanOutcome::Complete);
+    assert!(!clean.retry_pass_required);
+    assert!(reopened_cluster.try_take_reclaim_work().is_none());
+}
+
+#[test]
 fn durable_reclaim_scan_continues_after_unavailable_pg() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -657,6 +774,10 @@ fn durable_reclaim_scan_continues_after_unavailable_pg() {
         scan.queued, 0,
         "healthy PG root was already outstanding from the original delete enqueue"
     );
+    assert!(
+        scan.retry_required,
+        "an unavailable PG must require a short complete-pass retry"
+    );
     assert!(matches!(
         cluster.try_take_reclaim_work(),
         Some(crate::ReclaimWorkItem::ObjectPayload((
@@ -679,10 +800,20 @@ fn durable_reclaim_scan_defers_before_pg_walk_when_route_map_expired() {
     let cluster = crate::StorageCluster::from_local_map(map).unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(0).unwrap());
 
+    let batch = cluster.enqueue_durable_reclaim_work_batch_excluding(
+        Some(2),
+        1,
+        &HashSet::new(),
+        &HashSet::new(),
+        &HashSet::new(),
+    );
     assert_eq!(
-        cluster.enqueue_durable_reclaim_work(),
+        batch.outcome,
         crate::DurableReclaimScanOutcome::RouteRefreshRequired
     );
+    assert_eq!(batch.next_pg_id, Some(2));
+    assert_eq!(batch.scanned_pgs, 0);
+    assert!(!batch.retry_pass_required);
 }
 
 #[test]

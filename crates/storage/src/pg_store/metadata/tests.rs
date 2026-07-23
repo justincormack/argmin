@@ -523,6 +523,7 @@ fn bucket_delete_attempt_outcome_records_last_state() {
         phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
         detail: "route expired".to_string(),
         post_reservation_next_object_pg_id: Some(7),
+        finalizer_next_object_pg_id: Some(9),
         updated_at: 11,
     };
     store.record_bucket_delete_attempt_outcome(&first).unwrap();

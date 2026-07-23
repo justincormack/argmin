@@ -58,8 +58,10 @@ const OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN: Duration = Duration::from_millis
 const BUCKET_DELETE_BEGIN_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
 const BUCKET_DELETE_FINALIZE_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
 const BUCKET_DELETE_FINALIZE_ERROR_RETRY_COOLDOWN: Duration = Duration::from_secs(1);
-const RECLAIM_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const RECLAIM_DURABLE_SCAN_BATCH_PGS: usize = 8;
+const RECLAIM_DURABLE_SCAN_SAFETY_INTERVAL: Duration = Duration::from_secs(60);
 const RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF: Duration = Duration::from_secs(1);
+const RECLAIM_DURABLE_SCAN_INCOMPLETE_RETRY: Duration = Duration::from_secs(1);
 const SHARD_REPAIR_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 const SHARD_REPAIR_CLAIM_LEASE_MILLIS: u64 = 30_000;
 const SHARD_REPAIR_ERROR_BACKOFF_MILLIS: u64 = 1_000;
@@ -588,53 +590,96 @@ fn shortest_retry_sleep(left: Option<Duration>, right: Option<Duration>) -> Opti
     }
 }
 
+struct DurableReclaimScanSchedule {
+    next_scan_at: Instant,
+    next_pg_id: Option<u32>,
+    pass_in_progress: bool,
+    retry_pass_required: bool,
+}
+
+impl DurableReclaimScanSchedule {
+    fn immediate() -> Self {
+        Self {
+            next_scan_at: Instant::now(),
+            next_pg_id: None,
+            pass_in_progress: true,
+            retry_pass_required: false,
+        }
+    }
+
+    fn record_batch(
+        &mut self,
+        batch: storage::DurableReclaimScanBatch,
+        scan_completed_at: Instant,
+        clean_pass_delay: Duration,
+    ) {
+        self.next_pg_id = batch.next_pg_id;
+        self.retry_pass_required |= batch.retry_pass_required;
+        match batch.outcome {
+            storage::DurableReclaimScanOutcome::RouteRefreshRequired => {
+                self.next_scan_at = scan_completed_at + RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF;
+            }
+            storage::DurableReclaimScanOutcome::Complete if batch.next_pg_id.is_some() => {
+                self.next_scan_at = scan_completed_at;
+            }
+            storage::DurableReclaimScanOutcome::Complete => {
+                self.pass_in_progress = false;
+                self.next_scan_at = scan_completed_at
+                    + if self.retry_pass_required {
+                        RECLAIM_DURABLE_SCAN_INCOMPLETE_RETRY
+                    } else {
+                        clean_pass_delay
+                    };
+                self.retry_pass_required = false;
+            }
+        }
+    }
+}
+
 fn enqueue_durable_reclaim_work_if_due(
-    storage_node: &StorageCluster,
+    storage_node: &Arc<StorageCluster>,
     excluded_object_payload_roots: &HashSet<ObjectPayloadReclaimRoot>,
     excluded_bucket_delete_begin_roots: &HashSet<BucketDeleteBeginRoot>,
     excluded_bucket_delete_finalize_roots: &HashSet<BucketDeleteFinalizeRoot>,
-    next_scan_at: &mut Instant,
+    schedule: &mut DurableReclaimScanSchedule,
 ) {
-    if Instant::now() < *next_scan_at {
+    if Instant::now() < schedule.next_scan_at {
         return;
+    }
+    if !schedule.pass_in_progress {
+        schedule.pass_in_progress = true;
+        schedule.next_pg_id = None;
+        schedule.retry_pass_required = false;
     }
     let excluded_bucket_names = excluded_bucket_delete_finalize_roots
         .iter()
         .map(|root| root.bucket.clone())
         .collect();
-    let outcome = storage_node.enqueue_durable_reclaim_work_excluding(
+    let admission = background_work_admission_for(storage_node);
+    let Some(_scan_permit) = admission.try_acquire(BackgroundWorkClass::ReclaimCleanup) else {
+        schedule.next_scan_at = Instant::now() + OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN;
+        return;
+    };
+    let batch = storage_node.enqueue_durable_reclaim_work_batch_excluding(
+        schedule.next_pg_id,
+        RECLAIM_DURABLE_SCAN_BATCH_PGS,
         excluded_object_payload_roots,
         excluded_bucket_delete_begin_roots,
         &excluded_bucket_names,
     );
     let scan_completed_at = Instant::now();
-    #[cfg(not(test))]
-    {
-        *next_scan_at = next_reclaim_durable_scan_at(scan_completed_at, outcome);
-    }
-    #[cfg(test)]
-    {
-        let scan_delay =
+    let clean_pass_delay = {
+        #[cfg(test)]
+        {
             reclaim_worker_durable_scan_delay_override(storage_node.process_local_registry_key())
-                .unwrap_or_else(|| reclaim_durable_scan_delay(outcome));
-        *next_scan_at = scan_completed_at + scan_delay;
-    }
-}
-
-fn reclaim_durable_scan_delay(outcome: storage::DurableReclaimScanOutcome) -> Duration {
-    match outcome {
-        storage::DurableReclaimScanOutcome::Complete => RECLAIM_DURABLE_SCAN_INTERVAL,
-        storage::DurableReclaimScanOutcome::RouteRefreshRequired => {
-            RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF
+                .unwrap_or(RECLAIM_DURABLE_SCAN_SAFETY_INTERVAL)
         }
-    }
-}
-
-fn next_reclaim_durable_scan_at(
-    scan_completed_at: Instant,
-    outcome: storage::DurableReclaimScanOutcome,
-) -> Instant {
-    scan_completed_at + reclaim_durable_scan_delay(outcome)
+        #[cfg(not(test))]
+        {
+            RECLAIM_DURABLE_SCAN_SAFETY_INTERVAL
+        }
+    };
+    schedule.record_batch(batch, scan_completed_at, clean_pass_delay);
 }
 
 /// The coordinator ties together EC, storage, and metadata.
@@ -754,7 +799,7 @@ impl ReclaimSweeper {
                     VecDeque::new();
                 let mut deferred_bucket_delete_finalize_roots: HashSet<BucketDeleteFinalizeRoot> =
                     HashSet::new();
-                let mut next_durable_scan_at = Instant::now();
+                let mut durable_scan_schedule = DurableReclaimScanSchedule::immediate();
                 let mut pending_work: Option<(Arc<StorageCluster>, ReclaimWorkItem)> = None;
                 while !worker_stop.load(Ordering::SeqCst) {
                     let current_worker_node = storage_handle.current();
@@ -763,7 +808,7 @@ impl ReclaimSweeper {
                         &deferred_object_payload_reclaim_roots,
                         &deferred_bucket_delete_begin_roots,
                         &deferred_bucket_delete_finalize_roots,
-                        &mut next_durable_scan_at,
+                        &mut durable_scan_schedule,
                     );
                     let Some((queue_owner, work)) = pending_work
                         .take()
@@ -784,7 +829,7 @@ impl ReclaimSweeper {
                                 &deferred_object_payload_reclaim_roots,
                                 &deferred_bucket_delete_begin_roots,
                                 &deferred_bucket_delete_finalize_roots,
-                                &mut next_durable_scan_at,
+                                &mut durable_scan_schedule,
                             );
                             current_worker_node
                                 .try_take_reclaim_work()
@@ -825,12 +870,10 @@ impl ReclaimSweeper {
                             let work =
                                 wait_for_runtime_map_reclaim_work(&storage_handle, &worker_stop);
                             #[cfg(test)]
-                            if work.is_none()
-                                && maybe_run_reclaim_worker_idle_return_hook(
+                            if work.is_none() {
+                                maybe_run_reclaim_worker_idle_return_hook(
                                     current_worker_node.process_local_registry_key(),
-                                )
-                            {
-                                next_durable_scan_at = Instant::now();
+                                );
                             }
                             work
                         })
@@ -1043,7 +1086,7 @@ impl ReclaimSweeper {
                             &deferred_object_payload_reclaim_roots,
                             &deferred_bucket_delete_begin_roots,
                             &deferred_bucket_delete_finalize_roots,
-                            &mut next_durable_scan_at,
+                            &mut durable_scan_schedule,
                         );
                         if let Some(work) = execution_node.try_take_reclaim_work() {
                             pending_work = Some((Arc::clone(&execution_node), work));
@@ -3220,26 +3263,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reclaim_durable_scan_backs_off_while_route_refresh_is_required() {
-        assert_eq!(
-            reclaim_durable_scan_delay(storage::DurableReclaimScanOutcome::Complete),
-            RECLAIM_DURABLE_SCAN_INTERVAL
+    fn reclaim_durable_scan_schedule_preserves_cursor_and_uses_bounded_delays() {
+        let completed_at = Instant::now();
+        let mut schedule = DurableReclaimScanSchedule::immediate();
+        schedule.record_batch(
+            storage::DurableReclaimScanBatch {
+                outcome: storage::DurableReclaimScanOutcome::Complete,
+                next_pg_id: Some(8),
+                scanned_pgs: 8,
+                retry_pass_required: true,
+            },
+            completed_at,
+            RECLAIM_DURABLE_SCAN_SAFETY_INTERVAL,
         );
-        assert_eq!(
-            reclaim_durable_scan_delay(storage::DurableReclaimScanOutcome::RouteRefreshRequired),
-            RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF
-        );
-        assert!(RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF > RECLAIM_DURABLE_SCAN_INTERVAL);
+        assert_eq!(schedule.next_pg_id, Some(8));
+        assert_eq!(schedule.next_scan_at, completed_at);
+        assert!(schedule.pass_in_progress);
+        assert!(schedule.retry_pass_required);
 
-        let scan_started_at = Instant::now();
-        let scan_completed_at = scan_started_at + Duration::from_secs(2);
+        schedule.record_batch(
+            storage::DurableReclaimScanBatch {
+                outcome: storage::DurableReclaimScanOutcome::RouteRefreshRequired,
+                next_pg_id: Some(8),
+                scanned_pgs: 0,
+                retry_pass_required: false,
+            },
+            completed_at,
+            RECLAIM_DURABLE_SCAN_SAFETY_INTERVAL,
+        );
+        assert_eq!(schedule.next_pg_id, Some(8));
         assert_eq!(
-            next_reclaim_durable_scan_at(
-                scan_completed_at,
-                storage::DurableReclaimScanOutcome::RouteRefreshRequired,
-            ),
-            scan_completed_at + RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF,
-            "route-refresh backoff must start after a potentially slow scan completes"
+            schedule.next_scan_at,
+            completed_at + RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF
+        );
+        assert!(schedule.pass_in_progress);
+        assert!(schedule.retry_pass_required);
+
+        schedule.record_batch(
+            storage::DurableReclaimScanBatch {
+                outcome: storage::DurableReclaimScanOutcome::Complete,
+                next_pg_id: None,
+                scanned_pgs: 4,
+                retry_pass_required: false,
+            },
+            completed_at,
+            RECLAIM_DURABLE_SCAN_SAFETY_INTERVAL,
+        );
+        assert_eq!(schedule.next_pg_id, None);
+        assert_eq!(
+            schedule.next_scan_at,
+            completed_at + RECLAIM_DURABLE_SCAN_INCOMPLETE_RETRY
+        );
+        assert!(!schedule.pass_in_progress);
+        assert!(!schedule.retry_pass_required);
+
+        schedule.pass_in_progress = true;
+        schedule.record_batch(
+            storage::DurableReclaimScanBatch {
+                outcome: storage::DurableReclaimScanOutcome::Complete,
+                next_pg_id: None,
+                scanned_pgs: 20,
+                retry_pass_required: false,
+            },
+            completed_at,
+            RECLAIM_DURABLE_SCAN_SAFETY_INTERVAL,
+        );
+        assert_eq!(
+            schedule.next_scan_at,
+            completed_at + RECLAIM_DURABLE_SCAN_SAFETY_INTERVAL
         );
     }
 

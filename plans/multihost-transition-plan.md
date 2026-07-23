@@ -9316,6 +9316,27 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
       5. status: open. Revisit reservation classification only after attempts are resumable;
          it should be an optimization on top of a convergent state machine, not
          the convergence mechanism itself.
+19. status: completed 2026-07-23. Bound cleanup discovery and
+    post-`Deleting` finalization work. Durable reclaim discovery now runs one
+    prompt recovery pass at worker startup in eight-PG batches, interleaved with
+    queued cleanup, then waits 60 seconds between clean safety passes. A route
+    refresh failure retains the current PG cursor. PG IDs are traversed in one
+    canonical sorted order regardless of manifest/local-map ordering, so the
+    ID cursor cannot skip a suffix. Non-route PG errors, local queue-capacity
+    deferral, and any returned single-row payload-reclaim result latch an
+    incomplete-pass result while still advancing past the PG; the single-row
+    query is not treated as proof that the PG is exhausted. Reaching the end
+    schedules a one-second full follow-up pass rather than the 60-second clean
+    interval. Normal mutation paths remain responsible for promptly enqueueing
+    committed work; the scan is only the crash/lost-notification backstop.
+    Bucket finalization persists a separate eight-PG scan cursor in the bucket
+    attempt record, fenced by bucket incarnation/execution identity. It drains
+    unleased roots within the current PG under the existing work budget, keeps
+    the cursor on blocked/error PGs, and advances only after the PG is proven
+    clear. Final row deletion requires the terminal cursor. The 200-PG selector
+    invariant proves exactly 25 nonoverlapping batches, while integration
+    regressions prove bounded durable discovery, restart resume, and cursor
+    retention across route expiry.
 
 Status update:
 
@@ -9408,14 +9429,9 @@ Status update:
   until command construction. The storage regression advances logical time
   during an adopted pre-mark proof and verifies the original drain identity is
   preserved while its lease is extended before the bucket reaches `Deleting`.
-- Bucket-delete finalization now records completed-MPU cleanup progress on the
-  Deleting bucket row. After a metadata PG has been fully scanned and its
-  completed multipart tombstones are removed or drained, the finalizer advances
-  `bucket_delete_finalize_completed_multipart_next_pg_index`; retrying after route
-  expiry or work-budget exhaustion resumes at that cursor over the canonical
-  sorted metadata-PG list instead of re-scanning already-proven-clear metadata
-  PGs. The cursor is fenced by bucket incarnation and disappears with the bucket
-  row when finalization commits.
+- The earlier status text incorrectly described a completed-MPU-only cursor.
+  Item 19 implements the actual post-`Deleting` cursor across all visible-data
+  and payload-reclaim checks for each metadata PG.
 - Remaining close-out work is concentrated in deterministic interleaving tests,
   cleanup/runtime-state diagnostics, process-local state continuity across
   refresh/restart, and checking whether any foreground loops still need an

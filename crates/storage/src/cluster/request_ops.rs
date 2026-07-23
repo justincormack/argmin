@@ -49,6 +49,7 @@ use crate::*;
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
 const ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION: u64 = 0;
 const BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG: usize = 16;
+const BUCKET_DELETE_FINALIZE_SCAN_PG_BATCH: usize = 8;
 const BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG: usize = 16;
 const BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_DELETE_FINALIZE_WORK_BUDGET_MILLIS: u64 = 10_000;
@@ -75,6 +76,7 @@ pub(crate) struct DurableObjectPayloadReclaimScan {
     pub queued: usize,
     pub errors: usize,
     pub route_refresh_required: bool,
+    pub retry_required: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -82,6 +84,7 @@ pub(crate) struct DurableBucketDeleteFinalizeScan {
     pub queued: usize,
     pub errors: usize,
     pub route_refresh_required: bool,
+    pub retry_required: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -89,6 +92,7 @@ pub(crate) struct DurableBucketDeleteBeginScan {
     pub queued: usize,
     pub errors: usize,
     pub route_refresh_required: bool,
+    pub retry_required: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +100,38 @@ pub(crate) struct DurableBucketDeleteBeginScan {
 pub enum DurableReclaimScanOutcome {
     Complete,
     RouteRefreshRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub struct DurableReclaimScanBatch {
+    pub outcome: DurableReclaimScanOutcome,
+    pub next_pg_id: Option<u32>,
+    pub scanned_pgs: usize,
+    pub retry_pass_required: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundedPgScanWindow {
+    start: usize,
+    end: usize,
+    next_pg_id: Option<u32>,
+}
+
+fn bounded_pg_scan_window(
+    pg_ids: &[u32],
+    next_pg_id: Option<u32>,
+    max_pgs: usize,
+) -> BoundedPgScanWindow {
+    let start = next_pg_id.map_or(0, |next_pg_id| {
+        pg_ids.partition_point(|pg_id| *pg_id < next_pg_id)
+    });
+    let end = start.saturating_add(max_pgs.max(1)).min(pg_ids.len());
+    BoundedPgScanWindow {
+        start,
+        end,
+        next_pg_id: pg_ids.get(end).copied(),
+    }
 }
 
 fn durable_reclaim_scan_requires_route_refresh(error: &StoreError) -> bool {
@@ -1303,7 +1339,9 @@ impl super::StorageCluster {
     }
 
     fn metadata_pg_ids(&self) -> Vec<u32> {
-        self.local_map.pg_ids().to_vec()
+        let mut pg_ids = self.local_map.pg_ids().to_vec();
+        pg_ids.sort_unstable();
+        pg_ids
     }
 
     fn terminal_bucket_delete_post_reservation_next_object_pg_id(&self) -> u32 {
@@ -3440,6 +3478,7 @@ impl super::StorageCluster {
             phase,
             detail,
             post_reservation_next_object_pg_id,
+            finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         };
         node.bucket_write_reservation_client()
@@ -3709,32 +3748,34 @@ impl super::StorageCluster {
         detail: String,
     ) {
         let detail = Self::bounded_bucket_delete_attempt_detail(detail);
-        let post_reservation_next_object_pg_id =
-            match client.bucket_delete_attempt_outcome(pg_id, &record.bucket) {
-                Ok(existing) => existing
-                    .filter(|existing| {
-                        existing.drain_id == record.drain_id
-                            && existing.cluster_epoch == record.cluster_epoch
-                            && existing.bucket_execution_generation
-                                == record.bucket_execution_generation
-                    })
-                    .and_then(|existing| existing.post_reservation_next_object_pg_id),
-                Err(error) => {
-                    let _ = observability::event(
-                        super::TRACE_TARGET,
-                        "bucket_delete_attempt_outcome_progress_load_failed",
-                        Some(format_args!(
-                            "bucket={:?} pg_id={} drain_id={} outcome={:?} error={:?}",
-                            record.bucket,
-                            pg_id.get(),
-                            record.drain_id,
-                            outcome,
-                            error
-                        )),
-                    );
-                    None
-                }
-            };
+        let existing = match client.bucket_delete_attempt_outcome(pg_id, &record.bucket) {
+            Ok(existing) => existing.filter(|existing| {
+                existing.drain_id == record.drain_id
+                    && existing.cluster_epoch == record.cluster_epoch
+                    && existing.bucket_execution_generation == record.bucket_execution_generation
+            }),
+            Err(error) => {
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_attempt_outcome_progress_load_failed",
+                    Some(format_args!(
+                        "bucket={:?} pg_id={} drain_id={} outcome={:?} error={:?}",
+                        record.bucket,
+                        pg_id.get(),
+                        record.drain_id,
+                        outcome,
+                        error
+                    )),
+                );
+                None
+            }
+        };
+        let post_reservation_next_object_pg_id = existing
+            .as_ref()
+            .and_then(|existing| existing.post_reservation_next_object_pg_id);
+        let finalizer_next_object_pg_id = existing
+            .as_ref()
+            .and_then(|existing| existing.finalizer_next_object_pg_id);
         let outcome_record = BucketDeleteAttemptOutcomeRecord {
             bucket: record.bucket.clone(),
             drain_id: record.drain_id.clone(),
@@ -3744,6 +3785,7 @@ impl super::StorageCluster {
             phase,
             detail,
             post_reservation_next_object_pg_id,
+            finalizer_next_object_pg_id,
             updated_at: crate::clock::current_time_millis(),
         };
         if let Err(error) = client.record_bucket_delete_attempt_outcome(pg_id, &outcome_record) {
@@ -4488,13 +4530,16 @@ impl super::StorageCluster {
                 return Err(bucket_snapshot_error_to_bucket_write_drain_error(error));
             }
         };
+        let existing = existing.filter(|record| {
+            record.drain_id == progress.drain.record.drain_id
+                && record.cluster_epoch == progress.drain.record.cluster_epoch
+                && record.bucket_execution_generation
+                    == progress.drain.record.bucket_execution_generation
+        });
+        let finalizer_next_object_pg_id = existing
+            .as_ref()
+            .and_then(|record| record.finalizer_next_object_pg_id);
         let (outcome, phase, detail) = existing
-            .filter(|record| {
-                record.drain_id == progress.drain.record.drain_id
-                    && record.cluster_epoch == progress.drain.record.cluster_epoch
-                    && record.bucket_execution_generation
-                        == progress.drain.record.bucket_execution_generation
-            })
             .map(|record| (record.outcome, record.phase, record.detail))
             .unwrap_or_else(|| {
                 (
@@ -4516,6 +4561,7 @@ impl super::StorageCluster {
             phase,
             detail,
             post_reservation_next_object_pg_id: Some(next_object_pg_id),
+            finalizer_next_object_pg_id,
             updated_at: crate::clock::current_time_millis(),
         };
         if let Err(error) = progress.client.record_bucket_delete_attempt_outcome(
@@ -6527,17 +6573,59 @@ impl super::StorageCluster {
         bucket_incarnation_generation: u64,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
-        loop {
+        self.require_route_map_valid_now()?;
+        work_budget.check("bucket delete finalize work budget exhausted")?;
+        let bucket_pg_id = PgId::new(bucket_pg_id);
+        let bucket_store = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), bucket_pg_id)?;
+        let progress_client = bucket_store.bucket_write_reservation_client();
+        let bucket_info = bucket_store
+            .bucket_metadata_client()
+            .head_bucket_raw(self.validated_bucket_metadata_pg(bucket_pg_id), bucket)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        if bucket_info.bucket_incarnation_generation != bucket_incarnation_generation
+            || bucket_info.state != BucketState::Deleting
+        {
+            return Ok(BucketDeleteFinalizeOutcome::StaleIncarnation);
+        }
+        let existing_progress = progress_client
+            .bucket_delete_attempt_outcome(self.validated_bucket_metadata_pg(bucket_pg_id), bucket)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        let trusted_progress = existing_progress.as_ref().filter(|record| {
+            record.bucket_execution_generation == bucket_info.bucket_execution_generation
+                && record.outcome == BucketDeleteAttemptOutcomeKind::MarkDeleting
+                && record.phase == BucketDeleteAttemptPhase::MarkDeleting
+        });
+        let pg_ids = self.metadata_pg_ids();
+        let next_pg_id = trusted_progress
+            .and_then(|record| record.finalizer_next_object_pg_id)
+            .unwrap_or_else(|| pg_ids.first().copied().unwrap_or(0));
+        let window = bounded_pg_scan_window(
+            &pg_ids,
+            Some(next_pg_id),
+            BUCKET_DELETE_FINALIZE_SCAN_PG_BATCH,
+        );
+
+        for &raw_pg_id in &pg_ids[window.start..window.end] {
             self.require_route_map_valid_now()?;
             work_budget.check("bucket delete finalize work budget exhausted")?;
-            if let Some(source) = self.bucket_visible_data_source(bucket, false)? {
+            let pg_id = PgId::new(raw_pg_id);
+            if let Some(source) = self.bucket_visible_data_source_for_pg(bucket, pg_id, false)? {
+                self.record_bucket_delete_finalizer_next_object_pg_id(
+                    progress_client.as_ref(),
+                    bucket_pg_id,
+                    &bucket_info,
+                    existing_progress.as_ref(),
+                    raw_pg_id,
+                )?;
                 let _ = observability::event(
                     super::TRACE_TARGET,
                     "bucket_finalize_pending_visible_data",
                     Some(format_args!(
                         "bucket={:?} pg_id={} source={} source_pg_id={}",
                         bucket,
-                        bucket_pg_id,
+                        bucket_pg_id.get(),
                         source.label(),
                         source.pg_id().get()
                     )),
@@ -6552,63 +6640,75 @@ impl super::StorageCluster {
                 return Ok(BucketDeleteFinalizeOutcome::Pending);
             }
 
-            let reclaim_roots = self.bucket_payload_reclaim_roots(bucket)?;
-            if reclaim_roots.is_empty() {
-                break;
-            }
-
-            let mut reclaimed_any = false;
-            for root in &reclaim_roots {
-                if self.local_map.object_payload_lease_count(
+            loop {
+                work_budget.check("bucket delete finalize work budget exhausted")?;
+                let Some(root) = self.bucket_payload_reclaim_root_for_pg(bucket, pg_id)? else {
+                    break;
+                };
+                let lease_count = self.local_map.object_payload_lease_count(
                     &root.bucket,
                     &root.key,
                     root.generation_id,
-                )? != 0
+                )?;
+                if lease_count == 0
+                    && self
+                        .reclaim_object_payload_if_unleased(
+                            &root.bucket,
+                            &root.key,
+                            root.generation_id,
+                        )
+                        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+                        .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                 {
                     continue;
                 }
-                if self
-                    .reclaim_object_payload_if_unleased(&root.bucket, &root.key, root.generation_id)
-                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
-                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
-                {
-                    reclaimed_any = true;
-                }
-            }
-
-            if reclaimed_any {
-                continue;
-            }
-
-            for root in &reclaim_roots {
-                if self.local_map.object_payload_lease_count(
-                    &root.bucket,
-                    &root.key,
-                    root.generation_id,
-                )? == 0
-                {
+                if lease_count == 0 {
                     self.enqueue_object_payload_reclaim(
                         &root.bucket,
                         &root.key,
                         root.generation_id,
                     );
                 }
-            }
-            let _ = observability::event(
-                super::TRACE_TARGET,
-                "bucket_finalize_pending_reclaim",
-                Some(format_args!(
-                    "bucket={:?} pg_id={} reclaim_roots={}",
-                    bucket,
+                self.record_bucket_delete_finalizer_next_object_pg_id(
+                    progress_client.as_ref(),
                     bucket_pg_id,
-                    reclaim_roots.len()
-                )),
-            );
+                    &bucket_info,
+                    existing_progress.as_ref(),
+                    raw_pg_id,
+                )?;
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_finalize_pending_reclaim",
+                    Some(format_args!(
+                        "bucket={:?} bucket_pg_id={} object_pg_id={}",
+                        bucket,
+                        bucket_pg_id.get(),
+                        raw_pg_id
+                    )),
+                );
+                return Ok(BucketDeleteFinalizeOutcome::Pending);
+            }
+        }
+
+        let next_pg_id = window.next_pg_id.unwrap_or_else(|| {
+            pg_ids
+                .last()
+                .copied()
+                .map_or(0, |pg_id| pg_id.saturating_add(1))
+        });
+        self.record_bucket_delete_finalizer_next_object_pg_id(
+            progress_client.as_ref(),
+            bucket_pg_id,
+            &bucket_info,
+            existing_progress.as_ref(),
+            next_pg_id,
+        )?;
+        if window.next_pg_id.is_some() {
             return Ok(BucketDeleteFinalizeOutcome::Pending);
         }
 
         self.delete_bucket_from_acting_set(
-            PgId::new(bucket_pg_id),
+            bucket_pg_id,
             &BucketDeleteFinalizeRoot {
                 bucket: bucket.clone(),
                 bucket_incarnation_generation,
@@ -6616,95 +6716,143 @@ impl super::StorageCluster {
         )
     }
 
+    fn record_bucket_delete_finalizer_next_object_pg_id(
+        &self,
+        client: &dyn BucketWriteReservationNodeClient,
+        bucket_pg_id: PgId,
+        bucket_info: &BucketInfo,
+        existing: Option<&BucketDeleteAttemptOutcomeRecord>,
+        next_object_pg_id: u32,
+    ) -> Result<(), BucketWriteDrainError> {
+        let matching = existing.filter(|record| {
+            record.bucket_execution_generation == bucket_info.bucket_execution_generation
+                && record.outcome == BucketDeleteAttemptOutcomeKind::MarkDeleting
+                && record.phase == BucketDeleteAttemptPhase::MarkDeleting
+        });
+        if matching.and_then(|record| record.finalizer_next_object_pg_id) == Some(next_object_pg_id)
+        {
+            return Ok(());
+        }
+        let record = BucketDeleteAttemptOutcomeRecord {
+            bucket: bucket_info.name.clone(),
+            drain_id: matching.map_or_else(
+                || {
+                    format!(
+                        "finalizer-{}-{}",
+                        bucket_info.bucket_execution_generation,
+                        bucket_info.bucket_incarnation_generation
+                    )
+                },
+                |record| record.drain_id.clone(),
+            ),
+            cluster_epoch: matching.map_or(self.operation_epoch(), |record| record.cluster_epoch),
+            bucket_execution_generation: bucket_info.bucket_execution_generation,
+            outcome: BucketDeleteAttemptOutcomeKind::MarkDeleting,
+            phase: BucketDeleteAttemptPhase::MarkDeleting,
+            detail: format!("bucket finalizer advanced to object PG {next_object_pg_id}"),
+            post_reservation_next_object_pg_id: matching
+                .and_then(|record| record.post_reservation_next_object_pg_id),
+            finalizer_next_object_pg_id: Some(next_object_pg_id),
+            updated_at: crate::clock::current_time_millis(),
+        };
+        client
+            .record_bucket_delete_attempt_outcome(
+                self.validated_bucket_metadata_pg(bucket_pg_id),
+                &record,
+            )
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)
+    }
+
     fn bucket_visible_data_source(
         &self,
         bucket: &BucketName,
         include_stream_uploads: bool,
     ) -> Result<Option<BucketVisibleDataSource>, BucketWriteDrainError> {
-        for pg_id in self.metadata_pg_ids() {
-            {
-                let pg_id = PgId::new(pg_id);
-                let scan_pg_id = self.object_metadata_scan_pg(pg_id);
-                let listing_client = self.metadata_pg_primary_object_listing_client(pg_id)?;
-                let versions = listing_client
-                    .list_object_versions_page(
-                        scan_pg_id,
-                        &ListObjectVersionsReq {
-                            bucket: bucket.clone(),
-                            prefix: None,
-                            key_marker: None,
-                            version_id_marker: None,
-                            start_at: None,
-                            max_keys: 1,
-                        },
-                    )
-                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-                if !versions.versions.is_empty() {
-                    return Ok(Some(BucketVisibleDataSource::ObjectVersion { pg_id }));
-                }
-
-                let uploads = listing_client
-                    .list_multipart_uploads_page(
-                        scan_pg_id,
-                        &ListMultipartUploadsReq {
-                            bucket: bucket.clone(),
-                            prefix: None,
-                            page_start: None,
-                            max_uploads: 1,
-                        },
-                    )
-                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-                if !uploads.uploads.is_empty() {
-                    return Ok(Some(BucketVisibleDataSource::MultipartUpload { pg_id }));
-                }
-            }
-
-            if include_stream_uploads {
-                let pg_id = PgId::new(pg_id);
-                let scan_pg_id = self.object_metadata_scan_pg(pg_id);
-                let node = self
-                    .local_map
-                    .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-                let page = match node
-                    .object_mutation_metadata_client()
-                    .list_stream_uploads_for_bucket_page(scan_pg_id, bucket, None, 1)
-                {
-                    Ok(page) => page,
-                    Err(error) => {
-                        return Err(bucket_snapshot_error_to_bucket_write_drain_error(
-                            super::object_pg_action_error_to_bucket_snapshot_error(error),
-                        ));
-                    }
-                };
-                if !page.uploads.is_empty() {
-                    return Ok(Some(BucketVisibleDataSource::StreamUpload { pg_id }));
-                }
+        for raw_pg_id in self.metadata_pg_ids() {
+            if let Some(source) = self.bucket_visible_data_source_for_pg(
+                bucket,
+                PgId::new(raw_pg_id),
+                include_stream_uploads,
+            )? {
+                return Ok(Some(source));
             }
         }
         Ok(None)
     }
 
-    fn bucket_payload_reclaim_roots(
+    fn bucket_visible_data_source_for_pg(
         &self,
         bucket: &BucketName,
-    ) -> Result<Vec<PayloadReclaimRoot>, BucketWriteDrainError> {
-        let mut roots = Vec::new();
-        for pg_id in self.metadata_pg_ids() {
-            let pg_id = PgId::new(pg_id);
-            let scan_pg_id = self.object_metadata_scan_pg(pg_id);
+        pg_id: PgId,
+        include_stream_uploads: bool,
+    ) -> Result<Option<BucketVisibleDataSource>, BucketWriteDrainError> {
+        let scan_pg_id = self.object_metadata_scan_pg(pg_id);
+        let listing_client = self.metadata_pg_primary_object_listing_client(pg_id)?;
+        let versions = listing_client
+            .list_object_versions_page(
+                scan_pg_id,
+                &ListObjectVersionsReq {
+                    bucket: bucket.clone(),
+                    prefix: None,
+                    key_marker: None,
+                    version_id_marker: None,
+                    start_at: None,
+                    max_keys: 1,
+                },
+            )
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        if !versions.versions.is_empty() {
+            return Ok(Some(BucketVisibleDataSource::ObjectVersion { pg_id }));
+        }
+
+        let uploads = listing_client
+            .list_multipart_uploads_page(
+                scan_pg_id,
+                &ListMultipartUploadsReq {
+                    bucket: bucket.clone(),
+                    prefix: None,
+                    page_start: None,
+                    max_uploads: 1,
+                },
+            )
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        if !uploads.uploads.is_empty() {
+            return Ok(Some(BucketVisibleDataSource::MultipartUpload { pg_id }));
+        }
+
+        if include_stream_uploads {
             let node = self
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-            if let Some(root) = node
+            let page = node
                 .object_mutation_metadata_client()
-                .get_bucket_payload_reclaim_root(scan_pg_id, bucket)
-                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
-            {
-                self.validate_bucket_payload_reclaim_root_for_pg(pg_id, &root, node.node_id())?;
-                roots.push(root);
+                .list_stream_uploads_for_bucket_page(scan_pg_id, bucket, None, 1)
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+            if !page.uploads.is_empty() {
+                return Ok(Some(BucketVisibleDataSource::StreamUpload { pg_id }));
             }
         }
-        Ok(roots)
+        Ok(None)
+    }
+
+    fn bucket_payload_reclaim_root_for_pg(
+        &self,
+        bucket: &BucketName,
+        pg_id: PgId,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketWriteDrainError> {
+        let scan_pg_id = self.object_metadata_scan_pg(pg_id);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let root = node
+            .object_mutation_metadata_client()
+            .get_bucket_payload_reclaim_root(scan_pg_id, bucket)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        if let Some(root) = root.as_ref() {
+            self.validate_bucket_payload_reclaim_root_for_pg(pg_id, root, node.node_id())?;
+        }
+        Ok(root)
     }
 
     pub(crate) fn validate_bucket_payload_reclaim_root_for_pg(
@@ -10365,44 +10513,80 @@ impl super::StorageCluster {
         self.local_map.runtime_state().try_take_reclaim_work()
     }
 
-    pub fn enqueue_durable_reclaim_work(&self) -> DurableReclaimScanOutcome {
-        self.enqueue_durable_reclaim_work_excluding(
-            &HashSet::new(),
-            &HashSet::new(),
-            &HashSet::new(),
-        )
-    }
-
-    pub fn enqueue_durable_reclaim_work_excluding(
+    pub fn enqueue_durable_reclaim_work_batch_excluding(
         &self,
+        next_pg_id: Option<u32>,
+        max_pgs: usize,
         excluded_object_payload_roots: &HashSet<(BucketName, ObjectKey, GenerationId)>,
         excluded_bucket_delete_begin_roots: &HashSet<BucketDeleteBeginRoot>,
         excluded_bucket_delete_finalize_roots: &HashSet<BucketName>,
-    ) -> DurableReclaimScanOutcome {
+    ) -> DurableReclaimScanBatch {
         if self.operation_epoch() != self.cluster_epoch()
             || self.require_route_map_valid_now().is_err()
         {
-            return DurableReclaimScanOutcome::RouteRefreshRequired;
+            return DurableReclaimScanBatch {
+                outcome: DurableReclaimScanOutcome::RouteRefreshRequired,
+                next_pg_id,
+                scanned_pgs: 0,
+                retry_pass_required: false,
+            };
         }
 
-        let object_payload = self
-            .enqueue_durable_object_payload_reclaim_roots_excluding(excluded_object_payload_roots);
-        if object_payload.route_refresh_required {
-            return DurableReclaimScanOutcome::RouteRefreshRequired;
+        let pg_ids = self.metadata_pg_ids();
+        let window = bounded_pg_scan_window(&pg_ids, next_pg_id, max_pgs);
+        let mut scanned_pgs = 0usize;
+        let mut retry_pass_required = false;
+        for &raw_pg_id in &pg_ids[window.start..window.end] {
+            let pg_id = PgId::new(raw_pg_id);
+            let object_payload = self.enqueue_durable_object_payload_reclaim_root_for_pg_excluding(
+                pg_id,
+                excluded_object_payload_roots,
+            );
+            if object_payload.route_refresh_required {
+                return DurableReclaimScanBatch {
+                    outcome: DurableReclaimScanOutcome::RouteRefreshRequired,
+                    next_pg_id: Some(raw_pg_id),
+                    scanned_pgs,
+                    retry_pass_required,
+                };
+            }
+            retry_pass_required |= object_payload.retry_required;
+            let bucket_begin = self.enqueue_durable_bucket_delete_begin_roots_for_pg_excluding(
+                pg_id,
+                excluded_bucket_delete_begin_roots,
+            );
+            if bucket_begin.route_refresh_required {
+                return DurableReclaimScanBatch {
+                    outcome: DurableReclaimScanOutcome::RouteRefreshRequired,
+                    next_pg_id: Some(raw_pg_id),
+                    scanned_pgs,
+                    retry_pass_required,
+                };
+            }
+            retry_pass_required |= bucket_begin.retry_required;
+            let bucket_finalize = self
+                .enqueue_durable_bucket_delete_finalize_roots_for_pg_excluding(
+                    pg_id,
+                    excluded_bucket_delete_finalize_roots,
+                );
+            if bucket_finalize.route_refresh_required {
+                return DurableReclaimScanBatch {
+                    outcome: DurableReclaimScanOutcome::RouteRefreshRequired,
+                    next_pg_id: Some(raw_pg_id),
+                    scanned_pgs,
+                    retry_pass_required,
+                };
+            }
+            retry_pass_required |= bucket_finalize.retry_required;
+            scanned_pgs += 1;
         }
-        let bucket_begin = self.enqueue_durable_bucket_delete_begin_roots_excluding(
-            excluded_bucket_delete_begin_roots,
-        );
-        if bucket_begin.route_refresh_required {
-            return DurableReclaimScanOutcome::RouteRefreshRequired;
+
+        DurableReclaimScanBatch {
+            outcome: DurableReclaimScanOutcome::Complete,
+            next_pg_id: window.next_pg_id,
+            scanned_pgs,
+            retry_pass_required,
         }
-        let bucket_finalize = self.enqueue_durable_bucket_delete_finalize_roots_excluding(
-            excluded_bucket_delete_finalize_roots,
-        );
-        if bucket_finalize.route_refresh_required {
-            return DurableReclaimScanOutcome::RouteRefreshRequired;
-        }
-        DurableReclaimScanOutcome::Complete
     }
 
     /// Poll for work already present in the process-local reclaim queue.
@@ -10711,6 +10895,7 @@ impl super::StorageCluster {
         result
     }
 
+    #[cfg(test)]
     pub(crate) fn enqueue_durable_object_payload_reclaim_roots_excluding(
         &self,
         excluded_roots: &HashSet<(BucketName, ObjectKey, GenerationId)>,
@@ -10721,124 +10906,142 @@ impl super::StorageCluster {
 
         let mut scan = DurableObjectPayloadReclaimScan::default();
         for pg_id in self.metadata_pg_ids() {
-            let pg_id = PgId::new(pg_id);
-            let scan_pg_id = self.object_metadata_scan_pg(pg_id);
-            let emit_scan = |outcome: &'static str| {
-                let _ = observability::emit_object_payload_reclaim_durable_scan(
-                    super::TRACE_TARGET,
-                    observability::ObjectPayloadReclaimEventSummary {
-                        pg_id: pg_id.get(),
-                        event: outcome,
-                    },
-                );
-            };
-            let node = match self
-                .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), pg_id)
-            {
-                Ok(node) => node,
-                Err(error) => {
-                    scan.errors += 1;
-                    emit_scan("error");
-                    let _ = observability::event(
-                        super::TRACE_TARGET,
-                        "object_reclaim_durable_scan_pg_error",
-                        Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
-                    );
-                    if durable_reclaim_scan_requires_route_refresh(&error) {
-                        scan.route_refresh_required = true;
-                        return scan;
-                    }
-                    continue;
-                }
-            };
-            let root = match node
-                .object_mutation_metadata_client()
-                .get_payload_reclaim_root(scan_pg_id)
-            {
-                Ok(root) => root,
-                Err(error) => {
-                    scan.errors += 1;
-                    emit_scan("error");
-                    let _ = observability::event(
-                        super::TRACE_TARGET,
-                        "object_reclaim_durable_scan_pg_error",
-                        Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
-                    );
-                    if durable_reclaim_bucket_scan_requires_route_refresh(&error) {
-                        scan.route_refresh_required = true;
-                        return scan;
-                    }
-                    continue;
-                }
-            };
-            let Some(root) = root else {
-                continue;
-            };
-            if excluded_roots.contains(&(root.bucket.clone(), root.key.clone(), root.generation_id))
-            {
-                emit_scan("deferred_locally");
-                continue;
-            }
-            if self.object_metadata_pg_id(&root.bucket, &root.key) != pg_id.get() {
-                scan.errors += 1;
-                emit_scan("wrong_pg");
-                let _ = observability::event(
-                    super::TRACE_TARGET,
-                    "object_reclaim_durable_scan_wrong_pg_root",
-                    Some(format_args!(
-                        "pg_id={} root_bucket={} root_key={}",
-                        pg_id.get(),
-                        root.bucket,
-                        root.key
-                    )),
-                );
-                continue;
-            }
-            let lease_count = match self.local_map.object_payload_lease_count(
-                &root.bucket,
-                &root.key,
-                root.generation_id,
-            ) {
-                Ok(count) => count,
-                Err(error) => {
-                    scan.errors += 1;
-                    emit_scan("error");
-                    let _ = observability::event(
-                        super::TRACE_TARGET,
-                        "object_reclaim_durable_scan_lease_error",
-                        Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
-                    );
-                    if durable_reclaim_scan_requires_route_refresh(&error) {
-                        scan.route_refresh_required = true;
-                        return scan;
-                    }
-                    continue;
-                }
-            };
-            if lease_count != 0 {
-                emit_scan("leased");
-                continue;
-            }
-            match self.enqueue_object_payload_reclaim_for_pg(
-                &root.bucket,
-                &root.key,
-                root.generation_id,
-            ) {
-                Some(ReclaimQueueInsert::Queued) => {
-                    emit_scan("queued");
-                    scan.queued += 1;
-                }
-                Some(ReclaimQueueInsert::Deduplicated) => emit_scan("deduplicated"),
-                Some(ReclaimQueueInsert::PgCapacityDeferred) => {
-                    emit_scan("pg_capacity_deferred");
-                }
-                None => {}
+            let pg_scan = self.enqueue_durable_object_payload_reclaim_root_for_pg_excluding(
+                PgId::new(pg_id),
+                excluded_roots,
+            );
+            scan.queued += pg_scan.queued;
+            scan.errors += pg_scan.errors;
+            scan.retry_required |= pg_scan.retry_required;
+            if pg_scan.route_refresh_required {
+                scan.route_refresh_required = true;
+                break;
             }
         }
         scan
     }
 
+    fn enqueue_durable_object_payload_reclaim_root_for_pg_excluding(
+        &self,
+        pg_id: PgId,
+        excluded_roots: &HashSet<(BucketName, ObjectKey, GenerationId)>,
+    ) -> DurableObjectPayloadReclaimScan {
+        let mut scan = DurableObjectPayloadReclaimScan::default();
+        let scan_pg_id = self.object_metadata_scan_pg(pg_id);
+        let emit_scan = |outcome: &'static str| {
+            let _ = observability::emit_object_payload_reclaim_durable_scan(
+                super::TRACE_TARGET,
+                observability::ObjectPayloadReclaimEventSummary {
+                    pg_id: pg_id.get(),
+                    event: outcome,
+                },
+            );
+        };
+        let node = match self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+        {
+            Ok(node) => node,
+            Err(error) => {
+                scan.errors += 1;
+                emit_scan("error");
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "object_reclaim_durable_scan_pg_error",
+                    Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
+                );
+                scan.route_refresh_required = durable_reclaim_scan_requires_route_refresh(&error);
+                scan.retry_required = !scan.route_refresh_required;
+                return scan;
+            }
+        };
+        let root = match node
+            .object_mutation_metadata_client()
+            .get_payload_reclaim_root(scan_pg_id)
+        {
+            Ok(root) => root,
+            Err(error) => {
+                scan.errors += 1;
+                emit_scan("error");
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "object_reclaim_durable_scan_pg_error",
+                    Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
+                );
+                scan.route_refresh_required =
+                    durable_reclaim_bucket_scan_requires_route_refresh(&error);
+                scan.retry_required = !scan.route_refresh_required;
+                return scan;
+            }
+        };
+        let Some(root) = root else {
+            return scan;
+        };
+        // The metadata query returns one row, not an exhaustion proof. A
+        // follow-up pass is required even when this row is queued successfully.
+        scan.retry_required = true;
+        if excluded_roots.contains(&(root.bucket.clone(), root.key.clone(), root.generation_id)) {
+            emit_scan("deferred_locally");
+            return scan;
+        }
+        if self.object_metadata_pg_id(&root.bucket, &root.key) != pg_id.get() {
+            scan.errors += 1;
+            emit_scan("wrong_pg");
+            let _ = observability::event(
+                super::TRACE_TARGET,
+                "object_reclaim_durable_scan_wrong_pg_root",
+                Some(format_args!(
+                    "pg_id={} root_bucket={} root_key={}",
+                    pg_id.get(),
+                    root.bucket,
+                    root.key
+                )),
+            );
+            scan.retry_required = true;
+            return scan;
+        }
+        let lease_count = match self.local_map.object_payload_lease_count(
+            &root.bucket,
+            &root.key,
+            root.generation_id,
+        ) {
+            Ok(count) => count,
+            Err(error) => {
+                scan.errors += 1;
+                emit_scan("error");
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "object_reclaim_durable_scan_lease_error",
+                    Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
+                );
+                scan.route_refresh_required = durable_reclaim_scan_requires_route_refresh(&error);
+                scan.retry_required = !scan.route_refresh_required;
+                return scan;
+            }
+        };
+        if lease_count != 0 {
+            emit_scan("leased");
+            return scan;
+        }
+        match self.enqueue_object_payload_reclaim_for_pg(
+            &root.bucket,
+            &root.key,
+            root.generation_id,
+        ) {
+            Some(ReclaimQueueInsert::Queued) => {
+                emit_scan("queued");
+                scan.queued += 1;
+            }
+            Some(ReclaimQueueInsert::Deduplicated) => emit_scan("deduplicated"),
+            Some(ReclaimQueueInsert::PgCapacityDeferred) => {
+                emit_scan("pg_capacity_deferred");
+            }
+            None => {}
+        }
+        scan
+    }
+
+    #[cfg(test)]
     pub(crate) fn enqueue_durable_bucket_delete_begin_roots_excluding(
         &self,
         excluded_roots: &HashSet<BucketDeleteBeginRoot>,
@@ -10849,12 +11052,57 @@ impl super::StorageCluster {
 
         let mut scan = DurableBucketDeleteBeginScan::default();
         for pg_id in self.metadata_pg_ids() {
-            let pg_id = PgId::new(pg_id);
-            let node = match self
-                .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), pg_id)
-            {
-                Ok(node) => node,
+            let pg_scan = self.enqueue_durable_bucket_delete_begin_roots_for_pg_excluding(
+                PgId::new(pg_id),
+                excluded_roots,
+            );
+            scan.queued += pg_scan.queued;
+            scan.errors += pg_scan.errors;
+            scan.retry_required |= pg_scan.retry_required;
+            if pg_scan.route_refresh_required {
+                scan.route_refresh_required = true;
+                break;
+            }
+        }
+        scan
+    }
+
+    fn enqueue_durable_bucket_delete_begin_roots_for_pg_excluding(
+        &self,
+        pg_id: PgId,
+        excluded_roots: &HashSet<BucketDeleteBeginRoot>,
+    ) -> DurableBucketDeleteBeginScan {
+        let mut scan = DurableBucketDeleteBeginScan::default();
+        let node = match self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+        {
+            Ok(node) => node,
+            Err(error) => {
+                scan.errors += 1;
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_begin_durable_scan_pg_error",
+                    Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
+                );
+                scan.route_refresh_required = durable_reclaim_scan_requires_route_refresh(&error);
+                scan.retry_required = !scan.route_refresh_required;
+                return scan;
+            }
+        };
+        let now = crate::clock::current_time_millis();
+        let mut start_after_bucket = None;
+        let mut queued_for_pg = 0usize;
+        loop {
+            let roots = match node
+                .bucket_write_reservation_client()
+                .get_bucket_delete_begin_roots(
+                    self.validated_bucket_metadata_pg(pg_id),
+                    now,
+                    start_after_bucket.as_ref(),
+                    BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG,
+                ) {
+                Ok(roots) => roots,
                 Err(error) => {
                     scan.errors += 1;
                     let _ = observability::event(
@@ -10862,63 +11110,35 @@ impl super::StorageCluster {
                         "bucket_begin_durable_scan_pg_error",
                         Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
                     );
-                    if durable_reclaim_scan_requires_route_refresh(&error) {
-                        scan.route_refresh_required = true;
-                        return scan;
-                    }
-                    continue;
+                    scan.route_refresh_required =
+                        durable_reclaim_bucket_scan_requires_route_refresh(&error);
+                    scan.retry_required = !scan.route_refresh_required;
+                    return scan;
                 }
             };
-            let now = crate::clock::current_time_millis();
-            let mut start_after_bucket = None;
-            let mut queued_for_pg = 0usize;
-            loop {
-                let roots = match node
-                    .bucket_write_reservation_client()
-                    .get_bucket_delete_begin_roots(
-                        self.validated_bucket_metadata_pg(pg_id),
-                        now,
-                        start_after_bucket.as_ref(),
-                        BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG,
-                    ) {
-                    Ok(roots) => roots,
-                    Err(error) => {
-                        scan.errors += 1;
-                        let _ = observability::event(
-                            super::TRACE_TARGET,
-                            "bucket_begin_durable_scan_pg_error",
-                            Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
-                        );
-                        if durable_reclaim_bucket_scan_requires_route_refresh(&error) {
-                            scan.route_refresh_required = true;
-                            return scan;
-                        }
-                        break;
-                    }
-                };
-                if roots.is_empty() {
+            if roots.is_empty() {
+                break;
+            }
+            let page_len = roots.len();
+            for root in roots {
+                start_after_bucket = Some(root.bucket.clone());
+                if excluded_roots.contains(&root) {
+                    continue;
+                }
+                self.local_map
+                    .runtime_state()
+                    .enqueue_bucket_delete_begin(root);
+                scan.queued += 1;
+                queued_for_pg += 1;
+                if queued_for_pg >= BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG {
+                    scan.retry_required = true;
                     break;
                 }
-                let page_len = roots.len();
-                for root in roots {
-                    start_after_bucket = Some(root.bucket.clone());
-                    if excluded_roots.contains(&root) {
-                        continue;
-                    }
-                    self.local_map
-                        .runtime_state()
-                        .enqueue_bucket_delete_begin(root);
-                    scan.queued += 1;
-                    queued_for_pg += 1;
-                    if queued_for_pg >= BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG {
-                        break;
-                    }
-                }
-                if queued_for_pg >= BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG
-                    || page_len < BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG
-                {
-                    break;
-                }
+            }
+            if queued_for_pg >= BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG
+                || page_len < BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG
+            {
+                break;
             }
         }
         scan
@@ -10931,6 +11151,7 @@ impl super::StorageCluster {
         self.enqueue_durable_bucket_delete_finalize_roots_excluding(&HashSet::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn enqueue_durable_bucket_delete_finalize_roots_excluding(
         &self,
         excluded_bucket_delete_finalize_roots: &HashSet<BucketName>,
@@ -10941,54 +11162,74 @@ impl super::StorageCluster {
 
         let mut scan = DurableBucketDeleteFinalizeScan::default();
         for pg_id in self.metadata_pg_ids() {
-            let node = match self
-                .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))
-            {
-                Ok(node) => node,
-                Err(error) => {
-                    scan.errors += 1;
-                    let _ = observability::event(
-                        super::TRACE_TARGET,
-                        "bucket_finalize_durable_scan_pg_error",
-                        Some(format_args!("pg_id={} error={:?}", pg_id, error)),
-                    );
-                    if durable_reclaim_scan_requires_route_refresh(&error) {
-                        scan.route_refresh_required = true;
-                        return scan;
-                    }
-                    continue;
-                }
-            };
-            let roots = match node
-                .bucket_write_reservation_client()
-                .get_bucket_delete_finalize_roots(
-                    self.validated_bucket_metadata_pg(PgId::new(pg_id)),
-                    crate::clock::current_time_millis(),
-                    BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG,
-                ) {
-                Ok(roots) => roots,
-                Err(error) => {
-                    scan.errors += 1;
-                    let _ = observability::event(
-                        super::TRACE_TARGET,
-                        "bucket_finalize_durable_scan_pg_error",
-                        Some(format_args!("pg_id={} error={:?}", pg_id, error)),
-                    );
-                    if durable_reclaim_bucket_scan_requires_route_refresh(&error) {
-                        scan.route_refresh_required = true;
-                        return scan;
-                    }
-                    continue;
-                }
-            };
-            for root in roots {
-                if excluded_bucket_delete_finalize_roots.contains(&root.bucket) {
-                    continue;
-                }
-                self.enqueue_bucket_delete_finalize(root);
-                scan.queued += 1;
+            let pg_scan = self.enqueue_durable_bucket_delete_finalize_roots_for_pg_excluding(
+                PgId::new(pg_id),
+                excluded_bucket_delete_finalize_roots,
+            );
+            scan.queued += pg_scan.queued;
+            scan.errors += pg_scan.errors;
+            scan.retry_required |= pg_scan.retry_required;
+            if pg_scan.route_refresh_required {
+                scan.route_refresh_required = true;
+                break;
             }
+        }
+        scan
+    }
+
+    fn enqueue_durable_bucket_delete_finalize_roots_for_pg_excluding(
+        &self,
+        pg_id: PgId,
+        excluded_bucket_delete_finalize_roots: &HashSet<BucketName>,
+    ) -> DurableBucketDeleteFinalizeScan {
+        let mut scan = DurableBucketDeleteFinalizeScan::default();
+        let node = match self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+        {
+            Ok(node) => node,
+            Err(error) => {
+                scan.errors += 1;
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_finalize_durable_scan_pg_error",
+                    Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
+                );
+                scan.route_refresh_required = durable_reclaim_scan_requires_route_refresh(&error);
+                scan.retry_required = !scan.route_refresh_required;
+                return scan;
+            }
+        };
+        let roots = match node
+            .bucket_write_reservation_client()
+            .get_bucket_delete_finalize_roots(
+                self.validated_bucket_metadata_pg(pg_id),
+                crate::clock::current_time_millis(),
+                BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG,
+            ) {
+            Ok(roots) => roots,
+            Err(error) => {
+                scan.errors += 1;
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_finalize_durable_scan_pg_error",
+                    Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
+                );
+                scan.route_refresh_required =
+                    durable_reclaim_bucket_scan_requires_route_refresh(&error);
+                scan.retry_required = !scan.route_refresh_required;
+                return scan;
+            }
+        };
+        if roots.len() >= BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG {
+            scan.retry_required = true;
+        }
+        for root in roots {
+            if excluded_bucket_delete_finalize_roots.contains(&root.bucket) {
+                continue;
+            }
+            self.enqueue_bucket_delete_finalize(root);
+            scan.queued += 1;
         }
         scan
     }
@@ -14374,5 +14615,31 @@ impl super::StorageCluster {
     ) -> Result<crate::node::BucketPgTestGuard<'_>, StoreError> {
         self.metadata_primary_bridge_node()?
             .test_lock_bucket_pg(bucket)
+    }
+}
+
+#[cfg(test)]
+mod bounded_pg_scan_tests {
+    use super::bounded_pg_scan_window;
+
+    #[test]
+    fn bounded_pg_scan_visits_200_pgs_once_in_linear_batches() {
+        let pg_ids = (0..200).collect::<Vec<_>>();
+        let mut visited = Vec::new();
+        let mut next_pg_id = None;
+        let mut batches = 0usize;
+
+        loop {
+            let window = bounded_pg_scan_window(&pg_ids, next_pg_id, 8);
+            visited.extend_from_slice(&pg_ids[window.start..window.end]);
+            batches += 1;
+            next_pg_id = window.next_pg_id;
+            if next_pg_id.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(visited, pg_ids);
+        assert_eq!(batches, 25);
     }
 }

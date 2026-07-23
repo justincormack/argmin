@@ -314,6 +314,103 @@ fn finalized_bucket_delete_after_reopen_does_not_need_begin_waiter() {
 }
 
 #[test]
+fn bucket_delete_finalizer_resumes_bounded_pg_scan_after_reopen() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = vec![8, 0, 16, 4, 12, 2, 14, 6, 10, 1, 15, 3, 13, 5, 11, 7, 9];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let bucket = {
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        for pg_id in &pg_ids {
+            set_route_primary(&mut map, *pg_id, NodeId::new(1));
+        }
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 1, "bounded-finalizer-reopen-")
+        };
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        cluster
+            .test_begin_bucket_delete_if_current(&bucket)
+            .unwrap();
+
+        assert_eq!(
+            cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+            crate::BucketDeleteFinalizeOutcome::Pending
+        );
+        let bucket_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let progress = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+            .unwrap()
+            .expect("first finalizer batch should persist progress");
+        assert_eq!(progress.finalizer_next_object_pg_id, Some(8));
+        bucket
+    };
+
+    let mut reopened = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    for pg_id in &pg_ids {
+        set_route_primary(&mut reopened, *pg_id, NodeId::new(1));
+    }
+    let reopened = Arc::new(reopened);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+    assert_eq!(
+        cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+        crate::BucketDeleteFinalizeOutcome::Pending
+    );
+    {
+        let bucket_pg = reopened
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let progress = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+            .unwrap()
+            .expect("reopened finalizer should advance from persisted progress");
+        assert_eq!(progress.finalizer_next_object_pg_id, Some(16));
+    }
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(0).unwrap());
+    let error = cluster.try_finalize_bucket_delete(&bucket).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::BucketWriteDrainError::Store(StoreError::RouteMapExpired { .. })
+        ),
+        "route expiry should defer finalization without resetting progress, got {error:?}"
+    );
+    {
+        let bucket_pg = reopened
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let progress = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+            .unwrap()
+            .expect("route failure should retain finalizer progress");
+        assert_eq!(progress.finalizer_next_object_pg_id, Some(16));
+    }
+    cluster.test_store_route_map_validity(
+        RouteMapValidity::until_ms(crate::clock::current_time_millis().saturating_add(60_000))
+            .unwrap(),
+    );
+    assert_eq!(
+        cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+        crate::BucketDeleteFinalizeOutcome::Finalized
+    );
+}
+
+#[test]
 fn durable_bucket_finalize_scan_recovers_lost_local_queue_after_reopen() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -362,6 +459,88 @@ fn durable_bucket_finalize_scan_recovers_lost_local_queue_after_reopen() {
         crate::BucketDeleteFinalizeOutcome::Finalized
     );
     assert_clean_metadata_command_stream(&reopened, &[1]);
+}
+
+#[test]
+fn durable_reclaim_discovery_scans_bounded_pg_batches() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = vec![8, 0, 16, 4, 12, 2, 14, 6, 10, 1, 15, 3, 13, 5, 11, 7, 9];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let bucket = {
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+        for pg_id in &pg_ids {
+            set_route_primary(&mut map, *pg_id, NodeId::new(1));
+        }
+        let bucket = {
+            let topology = map
+                .nodes
+                .get(&NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology();
+            bucket_for_pg(topology, 16, "bounded-durable-discovery-")
+        };
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        cluster
+            .test_begin_bucket_delete_if_current(&bucket)
+            .unwrap();
+        bucket
+    };
+
+    let mut reopened = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    for pg_id in &pg_ids {
+        set_route_primary(&mut reopened, *pg_id, NodeId::new(1));
+    }
+    let reopened = Arc::new(reopened);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+    let excluded_payload = HashSet::new();
+    let excluded_begin = HashSet::new();
+    let excluded_finalize = HashSet::new();
+
+    let first = cluster.enqueue_durable_reclaim_work_batch_excluding(
+        None,
+        8,
+        &excluded_payload,
+        &excluded_begin,
+        &excluded_finalize,
+    );
+    assert_eq!(first.outcome, crate::DurableReclaimScanOutcome::Complete);
+    assert_eq!(first.scanned_pgs, 8);
+    assert_eq!(first.next_pg_id, Some(8));
+    assert!(!first.retry_pass_required);
+    assert!(cluster.try_take_reclaim_work().is_none());
+
+    let second = cluster.enqueue_durable_reclaim_work_batch_excluding(
+        first.next_pg_id,
+        8,
+        &excluded_payload,
+        &excluded_begin,
+        &excluded_finalize,
+    );
+    assert_eq!(second.outcome, crate::DurableReclaimScanOutcome::Complete);
+    assert_eq!(second.scanned_pgs, 8);
+    assert_eq!(second.next_pg_id, Some(16));
+    assert!(!second.retry_pass_required);
+    assert!(cluster.try_take_reclaim_work().is_none());
+
+    let third = cluster.enqueue_durable_reclaim_work_batch_excluding(
+        second.next_pg_id,
+        8,
+        &excluded_payload,
+        &excluded_begin,
+        &excluded_finalize,
+    );
+    assert_eq!(third.outcome, crate::DurableReclaimScanOutcome::Complete);
+    assert_eq!(third.scanned_pgs, 1);
+    assert_eq!(third.next_pg_id, None);
+    assert!(!third.retry_pass_required);
+    assert!(matches!(
+        cluster.try_take_reclaim_work(),
+        Some(crate::ReclaimWorkItem::BucketDelete(root)) if root.bucket == bucket
+    ));
 }
 
 #[test]
@@ -3273,6 +3452,7 @@ fn begin_bucket_delete_adopts_final_visibility_phase_without_repeating_post_rese
             phase: crate::BucketDeleteAttemptPhase::FinalVisibilityCheck,
             detail: "resume from final visibility".to_string(),
             post_reservation_next_object_pg_id: Some(0),
+            finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         },
     )
@@ -3366,6 +3546,7 @@ fn begin_bucket_delete_adopts_final_visibility_proven_without_repeating_visibili
             phase: crate::BucketDeleteAttemptPhase::FinalVisibilityProven,
             detail: "resume after final visibility proof".to_string(),
             post_reservation_next_object_pg_id: Some(0),
+            finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         },
     )
@@ -3940,6 +4121,7 @@ fn begin_bucket_delete_adopts_stream_cleanup_phase_and_revalidates_after_reserva
             phase: crate::BucketDeleteAttemptPhase::StreamCleanup,
             detail: "resume from stream cleanup".to_string(),
             post_reservation_next_object_pg_id: None,
+            finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         },
     )
@@ -4155,6 +4337,7 @@ fn begin_bucket_delete_adopts_reservation_wait_phase_without_repeating_initial_s
             phase: crate::BucketDeleteAttemptPhase::ReservationWait,
             detail: "resume from reservation wait".to_string(),
             post_reservation_next_object_pg_id: None,
+            finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         },
     )
@@ -4383,6 +4566,7 @@ fn begin_bucket_delete_adopted_attempt_clears_drain_on_bucket_not_empty() {
             phase: crate::BucketDeleteAttemptPhase::ReservationWait,
             detail: "resume from reservation wait before terminal not-empty".to_string(),
             post_reservation_next_object_pg_id: None,
+            finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         },
     )
@@ -4480,6 +4664,7 @@ fn post_reservation_exact_bucket_frontier_is_identity_fenced_and_resettable() {
             phase: crate::BucketDeleteAttemptPhase::PostReservationObjectDrain,
             detail: "stale progress must not be trusted".to_string(),
             post_reservation_next_object_pg_id: Some(pg_count),
+            finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         },
     )
@@ -4665,6 +4850,7 @@ fn begin_bucket_delete_adopts_completed_post_reservation_frontier_without_rescan
             phase: crate::BucketDeleteAttemptPhase::PostReservationObjectDrain,
             detail: "terminal post-reservation scan already completed".to_string(),
             post_reservation_next_object_pg_id: Some(terminal_post_reservation_next_object_pg_id),
+            finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         },
     )

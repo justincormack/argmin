@@ -6265,7 +6265,6 @@ fn reclaim_worker_rediscovers_capacity_deferred_root_while_idle() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target_reclaim_worker_registry_key: Some(storage_cluster.process_local_registry_key()),
         reclaim_worker_durable_scan_delay_override: Some(Duration::from_secs(3_600)),
-        force_reclaim_worker_durable_scan_after_idle_return: true,
         after_reclaim_worker_idle_return: Some(Arc::new(move || {
             gate_for_hook.wait_at(TOKEN);
         })),
