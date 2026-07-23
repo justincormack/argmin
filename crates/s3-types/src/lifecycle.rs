@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::num::NonZeroU32;
 
+use crate::{validate_tag_key_length, validate_tag_value_length};
+
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum LifecycleConfigError {
     #[error("malformed XML: {reason}")]
@@ -582,21 +584,15 @@ fn validate_prefix(prefix: &str) -> Result<(), LifecycleConfigError> {
 }
 
 fn validate_tag_key(key: &str) -> Result<(), LifecycleConfigError> {
-    if key.is_empty() || key.len() > 128 {
-        return Err(LifecycleConfigError::InvalidRequest {
-            reason: "A Tag's Key must be a length between 1 and 128.".to_string(),
-        });
-    }
-    Ok(())
+    validate_tag_key_length(key).map_err(|_| LifecycleConfigError::InvalidRequest {
+        reason: "A Tag's Key must be a length between 1 and 128.".to_string(),
+    })
 }
 
 fn validate_tag_value(value: &str) -> Result<(), LifecycleConfigError> {
-    if value.len() > 256 {
-        return Err(LifecycleConfigError::InvalidRequest {
-            reason: "A Tag's Value must be a length between 0 and 256.".to_string(),
-        });
-    }
-    Ok(())
+    validate_tag_value_length(value).map_err(|_| LifecycleConfigError::InvalidRequest {
+        reason: "A Tag's Value must be a length between 0 and 256.".to_string(),
+    })
 }
 
 fn validate_tag_filters(tags: &[LifecycleTag]) -> Result<(), LifecycleConfigError> {
@@ -1287,43 +1283,11 @@ fn normalize_tag_name(name: &str) -> &str {
 }
 
 fn xml_unescape(text: &str) -> Result<String, LifecycleConfigError> {
-    let mut output = String::with_capacity(text.len());
-    let mut chars = text.chars();
-
-    while let Some(character) = chars.next() {
-        if character != '&' {
-            output.push(character);
-            continue;
-        }
-
-        let mut entity = String::new();
-        loop {
-            let Some(next) = chars.next() else {
-                return Err(LifecycleConfigError::MalformedXml {
-                    reason: "unterminated XML entity".to_string(),
-                });
-            };
-            entity.push(next);
-            if next == ';' {
-                break;
-            }
-        }
-
-        match entity.as_str() {
-            "amp;" => output.push('&'),
-            "lt;" => output.push('<'),
-            "gt;" => output.push('>'),
-            "quot;" => output.push('"'),
-            "apos;" => output.push('\''),
-            _ => {
-                return Err(LifecycleConfigError::MalformedXml {
-                    reason: format!("unsupported XML entity &{entity}"),
-                });
-            }
-        }
-    }
-
-    Ok(output)
+    quick_xml::escape::unescape(text)
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|error| LifecycleConfigError::MalformedXml {
+            reason: format!("invalid XML entity: {error}"),
+        })
 }
 
 fn xml_escape(text: &str) -> String {
@@ -1420,6 +1384,21 @@ mod tests {
         );
         assert_eq!(rule.filter.object_size_greater_than, Some(10));
         assert!(rule.filter.explicit_filter);
+    }
+
+    #[test]
+    fn lifecycle_tag_parser_accepts_numeric_character_references() {
+        let config = parse_lifecycle_configuration_xml(
+            b"<LifecycleConfiguration><Rule><Filter><Tag><Key>&#x10400;</Key><Value>&#66560;</Value></Tag></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>",
+        )
+        .unwrap();
+        assert_eq!(
+            config.rules[0].filter.tags,
+            vec![LifecycleTag {
+                key: "\u{10400}".to_string(),
+                value: "\u{10400}".to_string(),
+            }]
+        );
     }
 
     #[test]

@@ -29,6 +29,21 @@ use storage::{
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 const BUCKET_FAST_PATH_WATCH_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[test]
+fn malformed_stored_tag_envelopes_fail_closed() {
+    for xml in [
+        "prefix<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+        "<TaggingX><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></TaggingX>",
+        "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet><Unrelated/></Tagging>",
+        "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>suffix",
+    ] {
+        assert!(matches!(
+            Coordinator::parse_serialized_tag_set(xml),
+            Err(ServerError::InternalError { .. })
+        ));
+    }
+}
+
 fn long_lived_test_route_map_validity() -> RouteMapValidity {
     RouteMapValidity::until_ms(storage::clock::current_time_millis().saturating_add(3_600_000))
         .unwrap()

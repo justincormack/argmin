@@ -34,7 +34,6 @@ http = "1"
 bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "io-util"] }
 quick-xml = "0.37"
-unicode-general-category = "1.1"
 md5_legacy = { package = "md-5", version = "0.10" }
 tokio-rustls = "0.26"
 

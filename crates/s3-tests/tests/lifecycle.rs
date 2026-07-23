@@ -494,7 +494,7 @@ async fn assert_invalid_lifecycle_put_rejected(body: &str, expected_code: &str) 
 
     assert_eq!(
         status, 400,
-        "expected lifecycle PUT to fail, got status {status} body {response_body}"
+        "expected lifecycle PUT to fail for request {body}, got status {status} body {response_body}"
     );
     assert_error_code(&response_body, expected_code);
 }
@@ -567,6 +567,65 @@ async fn assert_raw_lifecycle_put_round_trips(body: &[u8]) {
         get.body
     );
     assert_eq!(get.body, expected);
+}
+
+async fn assert_valid_lifecycle_put_accepted(body: &str) {
+    let bucket = unique_bucket();
+    create_bucket_in_test_region(&bucket).await;
+
+    let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
+    let put = send_signed_request(
+        "PUT",
+        &url,
+        body.as_bytes(),
+        [content_md5_header(body.as_bytes())],
+    );
+    assert_eq!(
+        put.status, 200,
+        "expected lifecycle PUT to succeed, got response {put:?}"
+    );
+
+    let parsed = s3_types::parse_lifecycle_configuration_xml(body.as_bytes())
+        .expect("accepted lifecycle test body should parse locally");
+    let expected = s3_types::render_lifecycle_configuration_xml(&parsed);
+    assert_lifecycle_configuration_eventually(&bucket, &expected, "accepted lifecycle PUT").await;
+    cleanup_bucket(&bucket).await;
+}
+
+async fn assert_lifecycle_configuration_eventually(
+    bucket: &str,
+    expected: &str,
+    description: &str,
+) {
+    const REQUIRED_CONSECUTIVE_SUCCESSES: usize = 3;
+    const MAX_ATTEMPTS: usize = 40;
+
+    let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
+    let expected_configuration = s3_types::parse_lifecycle_configuration_xml(expected.as_bytes())
+        .expect("expected lifecycle configuration should parse");
+    let mut consecutive_successes = 0;
+    let mut last_response = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let response =
+            send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>());
+        let matches = response.status == 200
+            && s3_types::parse_lifecycle_configuration_xml(response.body.as_bytes())
+                .is_ok_and(|configuration| configuration == expected_configuration);
+        if matches {
+            consecutive_successes += 1;
+            if consecutive_successes == REQUIRED_CONSECUTIVE_SUCCESSES {
+                return;
+            }
+        } else {
+            consecutive_successes = 0;
+        }
+        last_response = Some(response);
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    panic!("{description} did not converge for {bucket}: {last_response:?}");
 }
 
 #[test]
@@ -1607,6 +1666,93 @@ fn test_put_bucket_lifecycle_rejects_tag_value_over_256_chars() {
             "A Tag's Value must be a length between 0 and 256.",
         )
         .await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_tag_grammar_and_unicode_lengths_match_aws() {
+    s3_tests::run(async {
+        for (label, key, value) in [
+            ("space", "space key", "with space"),
+            ("punctuation", "punctuation+-=._:/@", "value+-=._:/@"),
+            ("unicode-letter", "環境", "本番"),
+            ("unicode-number", "number-Ⅷ-²", "digit-١"),
+            ("unicode-separator", "key inside", "value inside"),
+            ("astral-key-limit", &"𐐀".repeat(64), "value"),
+            ("astral-value-limit", "astral-value", &"𐐀".repeat(128)),
+            ("punctuation-key", "invalid!", "value"),
+            ("punctuation-value", "valid-key", "invalid!"),
+            ("combining-mark-key", "key-ͅ", "value"),
+            ("combining-mark-value", "valid-key", "value-ͅ"),
+            ("reserved-prefix-lowercase", "aws:reserved", "value"),
+            ("reserved-prefix-uppercase", "AWS:reserved", "value"),
+        ] {
+            let body = format!(
+                "<LifecycleConfiguration><Rule><ID>{label}</ID><Filter><Tag><Key>{key}</Key><Value>{value}</Value></Tag></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>"
+            );
+            assert_valid_lifecycle_put_accepted(&body).await;
+        }
+
+        let astral_key_over_limit = "𐐀".repeat(65);
+        let astral_value_over_limit = "𐐀".repeat(129);
+        let bucket = unique_bucket();
+        create_bucket_in_test_region(&bucket).await;
+        let baseline = "<LifecycleConfiguration><Rule><ID>preserved</ID><Filter><Tag><Key>baseline</Key><Value>unchanged</Value></Tag></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>";
+        let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
+        let baseline_put = send_signed_request(
+            "PUT",
+            &url,
+            baseline.as_bytes(),
+            [content_md5_header(baseline.as_bytes())],
+        );
+        assert_eq!(
+            baseline_put.status, 200,
+            "unexpected lifecycle baseline response: {baseline_put:?}"
+        );
+        let baseline_parsed = s3_types::parse_lifecycle_configuration_xml(baseline.as_bytes())
+            .expect("baseline lifecycle body should parse");
+        let expected_baseline = s3_types::render_lifecycle_configuration_xml(&baseline_parsed);
+        assert_lifecycle_configuration_eventually(
+            &bucket,
+            &expected_baseline,
+            "baseline lifecycle configuration",
+        )
+        .await;
+
+        for (label, key, value) in [
+            (
+                "astral-key-over-limit",
+                astral_key_over_limit.as_str(),
+                "value",
+            ),
+            (
+                "astral-value-over-limit",
+                "astral-value-over-limit",
+                astral_value_over_limit.as_str(),
+            ),
+        ] {
+            let body = format!(
+                "<LifecycleConfiguration><Rule><ID>{label}</ID><Filter><Tag><Key>{key}</Key><Value>{value}</Value></Tag></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>"
+            );
+            let response = send_signed_request(
+                "PUT",
+                &url,
+                body.as_bytes(),
+                [content_md5_header(body.as_bytes())],
+            );
+            assert_eq!(
+                response.status, 400,
+                "expected {label} lifecycle PUT to fail: {response:?}"
+            );
+            assert_error_code(&response.body, "InvalidRequest");
+            assert_lifecycle_configuration_eventually(
+                &bucket,
+                &expected_baseline,
+                &format!("rejected {label} lifecycle PUT preserving prior state"),
+            )
+            .await;
+        }
+        cleanup_bucket(&bucket).await;
     });
 }
 

@@ -326,6 +326,117 @@ fn put_bucket_tagging_raw(bucket: &str, body: &[u8]) -> s3_tests::RawResponse {
     })
 }
 
+async fn assert_single_bucket_tag_eventually(
+    bucket: &str,
+    expected_key: &str,
+    expected_value: &str,
+    description: &str,
+) {
+    const REQUIRED_CONSECUTIVE_SUCCESSES: usize = 3;
+    const MAX_ATTEMPTS: usize = 40;
+
+    let mut consecutive_successes = 0;
+    let mut last_result = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .client()
+            .get_bucket_tagging()
+            .bucket(bucket)
+            .send()
+            .await;
+        let matches = result.as_ref().is_ok_and(|output| {
+            output.tag_set().len() == 1
+                && output.tag_set()[0].key() == expected_key
+                && output.tag_set()[0].value() == expected_value
+        });
+        if matches {
+            consecutive_successes += 1;
+            if consecutive_successes == REQUIRED_CONSECUTIVE_SUCCESSES {
+                return;
+            }
+        } else {
+            consecutive_successes = 0;
+        }
+        last_result = Some(format!("{result:?}"));
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    panic!(
+        "{description} did not converge to {expected_key:?}={expected_value:?}: {}",
+        last_result.unwrap_or_else(|| "no response".to_string())
+    );
+}
+
+fn single_tagging_body(key: &str, value: &str) -> String {
+    format!("<Tagging><TagSet><Tag><Key>{key}</Key><Value>{value}</Value></Tag></TagSet></Tagging>")
+}
+
+fn assert_invalid_tag_response(
+    label: &str,
+    response: &s3_tests::RawResponse,
+    expected_message: &str,
+    key: &str,
+    expected_value: Option<&str>,
+) {
+    assert_eq!(
+        response.status, 400,
+        "unexpected {label} tag response: {response:?}"
+    );
+    assert!(
+        response.body.contains("<Code>InvalidTag</Code>"),
+        "unexpected {label} tag response: {response:?}"
+    );
+    for expected in [
+        format!("<Message>{expected_message}</Message>"),
+        format!("<TagKey>{key}</TagKey>"),
+    ] {
+        assert!(
+            response.body.contains(&expected),
+            "expected {expected:?} in {label} tag response: {response:?}"
+        );
+    }
+    match expected_value {
+        Some(value) => assert!(
+            response
+                .body
+                .contains(&format!("<TagValue>{value}</TagValue>")),
+            "expected TagValue in {label} tag response: {response:?}"
+        ),
+        None => assert!(
+            !response.body.contains("<TagValue>"),
+            "unexpected TagValue in {label} tag response: {response:?}"
+        ),
+    }
+}
+
+fn percent_encode_tag_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
+fn put_object_with_raw_tagging_header(
+    bucket: &str,
+    key: &str,
+    tagging: &str,
+) -> s3_tests::RawResponse {
+    let url = format!("{}/{bucket}/{key}", CTX.endpoint());
+    send_raw_retrying_operation_aborted("put object with raw tagging header", || {
+        send_signed_request("PUT", &url, b"body", [("x-amz-tagging", tagging)])
+    })
+}
+
 fn alt_policy_principal() -> serde_json::Value {
     json!({ "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) })
 }
@@ -354,7 +465,7 @@ fn test_bucket_tagging_raw_get_returns_canonical_xml() {
         "#;
 
         let parsed = server_http::http::xml::parse_tagging_xml(body, 50).unwrap();
-        let expected = server_http::http::xml::get_tagging_xml(&parsed);
+        let expected = server_http::http::xml::get_tagging_xml(&parsed).unwrap();
 
         let put = put_bucket_tagging_raw(&bucket, body);
         assert_eq!(put.status, 204, "unexpected body: {}", put.body);
@@ -403,6 +514,195 @@ fn bucket_policy_document_actions(
 }
 
 // ── Bucket tagging ──────────────────────────────────────────────────────
+
+#[test]
+fn test_bucket_tag_character_grammar_and_unicode_lengths_match_aws() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        for (label, key, value) in [
+            ("space", "space key", "with space"),
+            ("punctuation", "punctuation+-=._:/@", "value+-=._:/@"),
+            ("unicode-letter", "環境", "本番"),
+            ("unicode-number", "number-Ⅷ-²", "digit-١"),
+            ("unicode-separator", "key inside", "value inside"),
+            ("reserved-like", "not-aws:reserved", "value"),
+            ("astral-key-limit", &"𐐀".repeat(64), "value"),
+            ("astral-value-limit", "astral-value", &"𐐀".repeat(128)),
+        ] {
+            let body = single_tagging_body(key, value);
+            let response = put_bucket_tagging_raw(&bucket, body.as_bytes());
+            assert_eq!(
+                response.status, 204,
+                "unexpected accepted {label} tag response: {response:?}"
+            );
+            assert_single_bucket_tag_eventually(
+                &bucket,
+                key,
+                value,
+                &format!("accepted {label} bucket tag"),
+            )
+            .await;
+        }
+
+        let preserved_key = "astral-value";
+        let preserved_value = "𐐀".repeat(128);
+
+        for (label, key, value, message, expected_value) in [
+            (
+                "punctuation-key",
+                "invalid!",
+                "value",
+                "The TagKey you have provided is invalid",
+                None,
+            ),
+            (
+                "punctuation-value",
+                "valid-key",
+                "invalid!",
+                "The TagValue you have provided is invalid",
+                Some("invalid!"),
+            ),
+            (
+                "combining-mark-key",
+                "key-ͅ",
+                "value",
+                "The TagKey you have provided is invalid",
+                None,
+            ),
+            (
+                "combining-mark-value",
+                "valid-key",
+                "value-ͅ",
+                "The TagValue you have provided is invalid",
+                Some("value-ͅ"),
+            ),
+            (
+                "reserved-prefix-lowercase",
+                "aws:reserved",
+                "value",
+                "System tags cannot be added/updated by requester",
+                None,
+            ),
+            (
+                "reserved-prefix-uppercase",
+                "AWS:reserved",
+                "value",
+                "Invalid Tag. Tags cannot start with \"aws:\"(case insensitive) unless they are System Tags that start with \"aws:\"(case sensitive)",
+                None,
+            ),
+            (
+                "astral-key-over-limit",
+                &"𐐀".repeat(65),
+                "value",
+                "The TagKey you have provided is invalid",
+                None,
+            ),
+            (
+                "astral-value-over-limit",
+                "astral-value-over-limit",
+                &"𐐀".repeat(129),
+                "The TagValue you have provided is invalid",
+                Some(&"𐐀".repeat(129)),
+            ),
+        ] {
+            let body = single_tagging_body(key, value);
+            let response = put_bucket_tagging_raw(&bucket, body.as_bytes());
+            assert_invalid_tag_response(label, &response, message, key, expected_value);
+            assert_single_bucket_tag_eventually(
+                &bucket,
+                preserved_key,
+                &preserved_value,
+                &format!("rejected {label} bucket tag preserving prior state"),
+            )
+            .await;
+        }
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_inline_object_tag_uses_the_resource_tag_grammar_and_unicode_lengths() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let key_at_limit = "𐐀".repeat(64);
+        let value_at_limit = "𐐀".repeat(128);
+        let encoded = format!(
+            "{}={}",
+            percent_encode_tag_component(&key_at_limit),
+            percent_encode_tag_component(&value_at_limit)
+        );
+        let accepted = put_object_with_raw_tagging_header(&bucket, "accepted", &encoded);
+        assert_eq!(
+            accepted.status, 200,
+            "unexpected accepted inline tag response: {accepted:?}"
+        );
+        let stored = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key("accepted")
+            .send_retrying_operation_aborted("read accepted inline tags")
+            .await
+            .unwrap();
+        assert_eq!(stored.tag_set().len(), 1);
+        assert_eq!(stored.tag_set()[0].key(), key_at_limit);
+        assert_eq!(stored.tag_set()[0].value(), value_at_limit);
+
+        for (label, object, key, value, message, expected_value) in [
+            (
+                "inline-key-character",
+                "invalid-key",
+                "invalid!",
+                "value",
+                "The TagKey you have provided is invalid",
+                None,
+            ),
+            (
+                "inline-value-character",
+                "invalid-value",
+                "valid-key",
+                "invalid!",
+                "The TagValue you have provided is invalid",
+                Some("invalid!"),
+            ),
+            (
+                "inline-key-over-limit",
+                "overlong-key",
+                &"𐐀".repeat(65),
+                "value",
+                "The TagKey you have provided is invalid",
+                None,
+            ),
+        ] {
+            let encoded = format!(
+                "{}={}",
+                percent_encode_tag_component(key),
+                percent_encode_tag_component(value)
+            );
+            let response = put_object_with_raw_tagging_header(&bucket, object, &encoded);
+            assert_invalid_tag_response(label, &response, message, key, expected_value);
+            let head = client
+                .head_object()
+                .bucket(&bucket)
+                .key(object)
+                .send()
+                .await;
+            assert_eq!(
+                err_status(&head),
+                404,
+                "{label} unexpectedly stored an object"
+            );
+        }
+
+        cleanup(&bucket, &["accepted"]).await;
+    });
+}
 
 #[test]
 fn test_put_get_delete_bucket_tagging() {

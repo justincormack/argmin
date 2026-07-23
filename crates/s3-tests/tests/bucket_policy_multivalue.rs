@@ -182,6 +182,7 @@ fn raw_primary_credentials() -> SignedRequestCredentials<'static> {
 const S3_CONTROL_INVALID_TAG_MESSAGE: &str = "This request contains a tag key or value that isn't valid. Valid characters include the following: [a-zA-Z+-=._:/]. Tag keys can contain up to 128 characters. Tag values can contain up to 256 characters.";
 const S3_CONTROL_DUPLICATE_TAG_MESSAGE: &str =
     "There are duplicate tag keys in your request. Remove the duplicate tag keys and try again.";
+const S3_CONTROL_RESERVED_TAG_MESSAGE: &str = "User-defined tag keys can't start with \"aws:\". This prefix is reserved for system tags. Remove \"aws:\" from your tag keys and try again.";
 
 fn s3_control_error_shape(status: u16, code: &str, message: &str) -> ShapeSpec {
     shape()
@@ -299,6 +300,93 @@ fn untag_resource_query_with_credentials(
         s3_tests::SigningService::S3Control,
         credentials,
     )
+}
+
+fn list_tags_for_resource_with_credentials(
+    bucket: &str,
+    credentials: SignedRequestCredentials<'static>,
+) -> s3_tests::RawResponse {
+    let resource = percent_encode_path_segment(&bucket_resource(bucket));
+    let url = format!("{}/v20180820/tags/{resource}", CTX.s3_control_endpoint());
+    send_signed_request_for_service_with_credentials(
+        "GET",
+        &url,
+        &[],
+        [("x-amz-account-id", CTX.account_id())],
+        s3_tests::SigningService::S3Control,
+        credentials,
+    )
+}
+
+fn escape_test_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn escape_test_xml_with_astral_references(value: &str) -> String {
+    let mut escaped = String::new();
+    for character in value.chars() {
+        if u32::from(character) > 0xffff {
+            escaped.push_str(&format!("&#x{:X};", u32::from(character)));
+        } else {
+            escaped.push_str(&escape_test_xml(&character.to_string()));
+        }
+    }
+    escaped
+}
+
+fn s3_control_tag_set_matches(
+    response: &s3_tests::RawResponse,
+    expected: &[(String, String)],
+) -> bool {
+    response.status == 200
+        && response.body.matches("<Tag>").count() == expected.len()
+        && expected.iter().all(|(key, value)| {
+            let literal = format!(
+                "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+                escape_test_xml(key),
+                escape_test_xml(value)
+            );
+            let numeric = format!(
+                "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+                escape_test_xml_with_astral_references(key),
+                escape_test_xml_with_astral_references(value)
+            );
+            response.body.contains(&literal) || response.body.contains(&numeric)
+        })
+}
+
+async fn assert_s3_control_tag_set_eventually(
+    bucket: &str,
+    expected: &[(String, String)],
+    description: &str,
+) {
+    const REQUIRED_CONSECUTIVE_SUCCESSES: usize = 3;
+    const MAX_ATTEMPTS: usize = 40;
+
+    let mut consecutive_successes = 0;
+    let mut last_response = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let response = list_tags_for_resource_with_credentials(bucket, raw_primary_credentials());
+        if s3_control_tag_set_matches(&response, expected) {
+            consecutive_successes += 1;
+            if consecutive_successes == REQUIRED_CONSECUTIVE_SUCCESSES {
+                return;
+            }
+        } else {
+            consecutive_successes = 0;
+        }
+        last_response = Some(response);
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    panic!("{description} did not converge for {bucket}: {last_response:?}");
 }
 
 #[test]
@@ -2143,6 +2231,7 @@ fn test_tag_resource_character_grammar_matches_aws() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = create_bucket_allowing_policy(client).await;
+        let mut expected_tags = Vec::new();
 
         for (label, key, value) in [
             ("space-key", "space key", "value"),
@@ -2181,6 +2270,12 @@ fn test_tag_resource_character_grammar_matches_aws() {
             ),
             ("other-number-value", "other-number-value", "value-\u{00b2}"),
             ("punctuation-value", "punctuation-value", "value+-=._:/@"),
+            ("astral-key-limit", &"\u{10400}".repeat(64), "value"),
+            (
+                "astral-value-limit",
+                "astral-value",
+                &"\u{10400}".repeat(128),
+            ),
         ] {
             let response =
                 tag_resource_with_credentials(&bucket, &[(key, value)], raw_primary_credentials());
@@ -2189,17 +2284,184 @@ fn test_tag_resource_character_grammar_matches_aws() {
                 &response,
                 &shape().status(204).headers(id_headers()).body_empty(),
             );
+            expected_tags.push((key.to_string(), value.to_string()));
+            assert_s3_control_tag_set_eventually(
+                &bucket,
+                &expected_tags,
+                &format!("accepted {label} S3 Control tag"),
+            )
+            .await;
         }
 
-        for (label, key, value) in [
-            ("rejected-key", "invalid!", "value"),
-            ("rejected-value", "valid-key", "invalid!"),
-            ("combining-mark-key", "key-\u{0345}", "value"),
-            ("combining-mark-value", "valid-key", "value-\u{0345}"),
+        for (label, key, value, message) in [
+            (
+                "rejected-key",
+                "invalid!",
+                "value",
+                S3_CONTROL_INVALID_TAG_MESSAGE,
+            ),
+            (
+                "rejected-value",
+                "valid-key",
+                "invalid!",
+                S3_CONTROL_INVALID_TAG_MESSAGE,
+            ),
+            (
+                "combining-mark-key",
+                "key-\u{0345}",
+                "value",
+                S3_CONTROL_INVALID_TAG_MESSAGE,
+            ),
+            (
+                "combining-mark-value",
+                "valid-key",
+                "value-\u{0345}",
+                S3_CONTROL_INVALID_TAG_MESSAGE,
+            ),
+            (
+                "reserved-prefix-lowercase",
+                "aws:reserved",
+                "value",
+                S3_CONTROL_RESERVED_TAG_MESSAGE,
+            ),
+            (
+                "reserved-prefix-uppercase",
+                "AWS:reserved",
+                "value",
+                S3_CONTROL_INVALID_TAG_MESSAGE,
+            ),
+            (
+                "astral-key-over-limit",
+                &"\u{10400}".repeat(65),
+                "value",
+                S3_CONTROL_INVALID_TAG_MESSAGE,
+            ),
+            (
+                "astral-value-over-limit",
+                "astral-value-over-limit",
+                &"\u{10400}".repeat(129),
+                S3_CONTROL_INVALID_TAG_MESSAGE,
+            ),
         ] {
             let response =
                 tag_resource_with_credentials(&bucket, &[(key, value)], raw_primary_credentials());
-            assert_s3_control_invalid_tag(label, &response, S3_CONTROL_INVALID_TAG_MESSAGE);
+            assert_s3_control_invalid_tag(label, &response, message);
+            assert_s3_control_tag_set_eventually(
+                &bucket,
+                &expected_tags,
+                &format!("rejected {label} S3 Control tag preserving prior state"),
+            )
+            .await;
+        }
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_untag_resource_character_grammar_matches_aws() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_policy(client).await;
+        let accepted_keys = [
+            "space key",
+            "punctuation+-=._:/@",
+            "環境",
+            "number-\u{2167}-\u{00b2}",
+            "key\u{00a0}inside",
+            "key\u{2028}inside",
+        ];
+
+        let tags = accepted_keys
+            .iter()
+            .map(|key| (*key, "value"))
+            .collect::<Vec<_>>();
+        let seed = tag_resource_with_credentials(&bucket, &tags, raw_primary_credentials());
+        assert_eq!(
+            seed.status, 204,
+            "unexpected TagResource response: {seed:?}"
+        );
+        let mut expected_tags = tags
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect::<Vec<_>>();
+        assert_s3_control_tag_set_eventually(&bucket, &expected_tags, "seed accepted untag keys")
+            .await;
+
+        for key in accepted_keys {
+            let response =
+                untag_resource_with_credentials(&bucket, &[key], raw_primary_credentials());
+            assert_eq!(
+                response.status, 204,
+                "unexpected accepted {key:?} tagKeys response: {response:?}"
+            );
+            expected_tags.retain(|(existing, _)| existing != key);
+            assert_s3_control_tag_set_eventually(
+                &bucket,
+                &expected_tags,
+                &format!("accepted removal of S3 Control tag {key:?}"),
+            )
+            .await;
+        }
+
+        let seed = tag_resource_with_credentials(
+            &bucket,
+            &[("existing", "value")],
+            raw_primary_credentials(),
+        );
+        assert_eq!(
+            seed.status, 204,
+            "unexpected TagResource response: {seed:?}"
+        );
+        expected_tags.push(("existing".to_string(), "value".to_string()));
+        assert_s3_control_tag_set_eventually(
+            &bucket,
+            &expected_tags,
+            "seed preserved S3 Control tag",
+        )
+        .await;
+
+        let uppercase_reserved =
+            untag_resource_with_credentials(&bucket, &["AWS:reserved"], raw_primary_credentials());
+        assert_shape(
+            "uppercase reserved-like tag key",
+            &uppercase_reserved,
+            &shape().status(204).headers(id_headers()).body_empty(),
+        );
+        assert_s3_control_tag_set_eventually(
+            &bucket,
+            &expected_tags,
+            "uppercase reserved-like no-op preserving prior state",
+        )
+        .await;
+
+        for (label, key, message) in [
+            ("punctuation", "invalid!", S3_CONTROL_INVALID_TAG_MESSAGE),
+            (
+                "combining-mark",
+                "key-\u{0345}",
+                S3_CONTROL_INVALID_TAG_MESSAGE,
+            ),
+            (
+                "reserved-prefix-lowercase",
+                "aws:reserved",
+                S3_CONTROL_RESERVED_TAG_MESSAGE,
+            ),
+            (
+                "astral-over-limit",
+                &"\u{10400}".repeat(65),
+                S3_CONTROL_INVALID_TAG_MESSAGE,
+            ),
+        ] {
+            let response =
+                untag_resource_with_credentials(&bucket, &[key], raw_primary_credentials());
+            assert_s3_control_invalid_tag(label, &response, message);
+            assert_s3_control_tag_set_eventually(
+                &bucket,
+                &expected_tags,
+                &format!("rejected {label} S3 Control untag preserving prior state"),
+            )
+            .await;
         }
 
         cleanup(&bucket, &[]).await;

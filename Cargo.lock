@@ -2166,8 +2166,10 @@ dependencies = [
 name = "s3-types"
 version = "0.1.0"
 dependencies = [
+ "quick-xml",
  "ring",
  "thiserror",
+ "unicode-general-category",
 ]
 
 [[package]]
@@ -2316,7 +2318,6 @@ dependencies = [
  "test-util",
  "tokio",
  "tokio-rustls",
- "unicode-general-category",
 ]
 
 [[package]]

@@ -2084,93 +2084,11 @@ impl Coordinator {
     pub(super) fn parse_serialized_tag_set(
         tags_xml: &str,
     ) -> Result<Vec<(String, String)>, ServerError> {
-        let mut tags = Vec::new();
-        let mut remaining = tags_xml;
-
-        while let Some(tag_start) = remaining.find("<Tag>") {
-            remaining = &remaining[tag_start + "<Tag>".len()..];
-            let Some(tag_end) = remaining.find("</Tag>") else {
-                return Err(ServerError::InternalError {
-                    reason: "stored object tags missing </Tag> terminator".to_string(),
-                });
-            };
-            let tag_xml = &remaining[..tag_end];
-            let key = Self::xml_unescape(Self::extract_xml_text(
-                tag_xml,
-                "Key",
-                "stored object tags missing <Key>",
-            )?)?;
-            let value = Self::xml_unescape(Self::extract_xml_text(
-                tag_xml,
-                "Value",
-                "stored object tags missing <Value>",
-            )?)?;
-            tags.push((key, value));
-            remaining = &remaining[tag_end + "</Tag>".len()..];
-        }
-
-        Ok(tags)
-    }
-
-    pub(super) fn extract_xml_text<'a>(
-        xml: &'a str,
-        tag: &str,
-        missing_reason: &'static str,
-    ) -> Result<&'a str, ServerError> {
-        let open = format!("<{tag}>");
-        let close = format!("</{tag}>");
-        let Some(start) = xml.find(&open) else {
-            return Err(ServerError::InternalError {
-                reason: missing_reason.to_string(),
-            });
-        };
-        let content = &xml[start + open.len()..];
-        let Some(end) = content.find(&close) else {
-            return Err(ServerError::InternalError {
-                reason: format!("stored object tags missing closing </{tag}>"),
-            });
-        };
-        Ok(&content[..end])
-    }
-
-    pub(super) fn xml_unescape(value: &str) -> Result<String, ServerError> {
-        let mut out = String::with_capacity(value.len());
-        let mut chars = value.chars();
-
-        while let Some(ch) = chars.next() {
-            if ch != '&' {
-                out.push(ch);
-                continue;
-            }
-
-            let mut entity = String::new();
-            loop {
-                let Some(next) = chars.next() else {
-                    return Err(ServerError::InternalError {
-                        reason: "stored object tags ended mid-entity".to_string(),
-                    });
-                };
-                entity.push(next);
-                if next == ';' {
-                    break;
-                }
-            }
-
-            match entity.as_str() {
-                "amp;" => out.push('&'),
-                "lt;" => out.push('<'),
-                "gt;" => out.push('>'),
-                "quot;" => out.push('"'),
-                "apos;" => out.push('\''),
-                _ => {
-                    return Err(ServerError::InternalError {
-                        reason: format!("stored object tags contain unsupported entity &{entity}"),
-                    });
-                }
-            }
-        }
-
-        Ok(out)
+        s3_types::TagSet::parse_canonical_xml(tags_xml, usize::MAX)
+            .map(s3_types::TagSet::into_pairs)
+            .map_err(|error| ServerError::InternalError {
+                reason: error.to_string(),
+            })
     }
 
     pub(super) fn ensure_sse_c_allowed(

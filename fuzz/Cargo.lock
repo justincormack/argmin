@@ -975,6 +975,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -1014,6 +1015,7 @@ version = "0.1.0"
 dependencies = [
  "ring",
  "thiserror",
+ "unicode-general-category",
 ]
 
 [[package]]
@@ -1104,7 +1106,6 @@ dependencies = [
  "storage",
  "tokio",
  "tokio-rustls",
- "unicode-general-category",
 ]
 
 [[package]]
@@ -1155,6 +1156,7 @@ dependencies = [
  "rapidhash",
  "ring",
  "rusqlite",
+ "rustls",
  "s3-types",
  "thiserror",
  "tokio",

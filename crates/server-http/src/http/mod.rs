@@ -273,17 +273,18 @@ fn validate_untag_resource_tag_key_members(tag_keys: &[String]) -> Result<(), Se
     Ok(())
 }
 
-fn validate_untag_resource_tag_key_values(tag_keys: &[String]) -> Result<(), ServerError> {
-    if tag_keys.iter().any(|key| {
-        key.chars().count() > 128
-            || !key.chars().all(|character| {
-                character.is_ascii_alphanumeric()
-                    || matches!(character, '+' | '-' | '=' | '.' | '_' | ':' | '/')
-            })
-    }) {
-        return Err(xml::invalid_s3_control_tag());
-    }
-    Ok(())
+fn validate_untag_resource_tag_key_values(
+    tag_keys: Vec<String>,
+) -> Result<Vec<s3_types::TagKey>, ServerError> {
+    tag_keys
+        .into_iter()
+        .map(|key| {
+            if key.starts_with("aws:") {
+                return Err(xml::reserved_s3_control_tag());
+            }
+            s3_types::TagKey::new(key).map_err(|_| xml::invalid_s3_control_tag())
+        })
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn parse_object_key(key: &str) -> Result<ObjectKey, ServerError> {
@@ -1630,6 +1631,7 @@ impl HttpFrontend {
             }
             S3ControlOperation::TagResource { bucket } => {
                 let tags = xml::TagSet::parse_tag_resource_xml(&req.body)?;
+                let request_tags = tags.clone().into_vec();
                 let requester = self.requester_from_auth(auth, req)?;
                 let control = crate::coordinator::BucketTagControlRequest {
                     bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -1638,7 +1640,7 @@ impl HttpFrontend {
                     .coordinator
                     .get_bucket_tags_for_control_action(
                         &control,
-                        tags.as_slice(),
+                        request_tags.as_slice(),
                         crate::coordinator::BucketTagControlAction::TagResource,
                     )?
                     .map(|tagging_xml| xml::TagSet::parse_tagging_xml(tagging_xml.as_bytes(), 50))
@@ -1650,7 +1652,7 @@ impl HttpFrontend {
                     &crate::coordinator::PutBucketTagControlRequest {
                         control,
                         config: &merged_xml,
-                        request_tags: tags.as_slice(),
+                        request_tags: request_tags.as_slice(),
                     },
                 )?;
                 Ok(S3Response::tag_resource())
@@ -1686,7 +1688,7 @@ impl HttpFrontend {
                 if existing_tags.is_empty() {
                     return Ok(S3Response::untag_resource());
                 }
-                validate_untag_resource_tag_key_values(&tag_keys)?;
+                let tag_keys = validate_untag_resource_tag_key_values(tag_keys)?;
                 let remaining_tags = existing_tags.remove_keys(&tag_keys);
                 if remaining_tags.is_empty() {
                     self.coordinator.delete_bucket_tags_for_untag_resource(
@@ -1973,7 +1975,7 @@ impl HttpFrontend {
                             if tags.is_empty() {
                                 None
                             } else {
-                                Some(xml::get_tagging_xml(&tags))
+                                Some(xml::get_tagging_xml(&tags)?)
                             }
                         } else {
                             None
@@ -2044,7 +2046,7 @@ impl HttpFrontend {
                         if tags.is_empty() {
                             None
                         } else {
-                            Some(xml::get_tagging_xml(&tags))
+                            Some(xml::get_tagging_xml(&tags)?)
                         }
                     } else {
                         None
@@ -3145,7 +3147,7 @@ impl HttpFrontend {
                     if tags.is_empty() {
                         None
                     } else {
-                        Some(xml::get_tagging_xml(&tags))
+                        Some(xml::get_tagging_xml(&tags)?)
                     }
                 } else {
                     None
@@ -4000,7 +4002,7 @@ impl HttpFrontend {
             if tags.is_empty() {
                 None
             } else {
-                Some(xml::get_tagging_xml(&tags))
+                Some(xml::get_tagging_xml(&tags)?)
             }
         } else {
             None
@@ -4344,7 +4346,7 @@ impl HttpFrontend {
             if tags.is_empty() {
                 None
             } else {
-                Some(xml::get_tagging_xml(&tags))
+                Some(xml::get_tagging_xml(&tags)?)
             }
         } else {
             None

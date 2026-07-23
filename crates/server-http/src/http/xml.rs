@@ -14,7 +14,8 @@ use s3_types::{
     AclGrant, AclGrantee, AclGrants, AclPermission, BucketLifecycleConfiguration,
     BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, LegalHoldStatus,
     LifecycleConfigError, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention,
-    RetentionPeriod,
+    RetentionPeriod, Tag as AwsTag, TagKey, TagSet as AwsTagSet, TagSetValidationError,
+    TagValidationError,
 };
 use server_core::system_metadata::SystemMetadata;
 use storage::{
@@ -22,7 +23,6 @@ use storage::{
     EffectiveBucketEncryptionConfig, ManagedEncryptionAlgorithm, ObjectKey,
     PublicAccessBlockConfig,
 };
-use unicode_general_category::{get_general_category, GeneralCategory};
 
 use super::response::format_version_id;
 
@@ -3642,79 +3642,65 @@ fn decode_tagging_text(bytes: &[u8]) -> Result<String, ServerError> {
     )
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum TagSetValidationError {
-    KeyLength(usize),
-    ReservedKeyPrefix,
-    ValueLength(usize),
-    DuplicateKey(String),
-    TooMany { max: usize, actual: usize },
-}
-
-impl TagSetValidationError {
-    fn into_s3_error(self) -> ServerError {
-        let reason = match self {
-            Self::KeyLength(actual) => {
-                format!("tag key must be 1-128 characters, got {actual}")
+fn tag_set_error_into_s3(error: TagSetValidationError) -> ServerError {
+    match error {
+        TagSetValidationError::Tag { key, value, source } => {
+            let (reason, tag_value) = match source {
+                TagValidationError::ReservedKeyPrefix if key.starts_with("aws:") => (
+                    "System tags cannot be added/updated by requester".to_string(),
+                    None,
+                ),
+                TagValidationError::ReservedKeyPrefix => (
+                    "Invalid Tag. Tags cannot start with \"aws:\"(case insensitive) unless they are System Tags that start with \"aws:\"(case sensitive)".to_string(),
+                    None,
+                ),
+                TagValidationError::EmptyKey
+                | TagValidationError::KeyTooLong { .. }
+                | TagValidationError::InvalidKeyCharacter { .. } => (
+                    "The TagKey you have provided is invalid".to_string(),
+                    None,
+                ),
+                TagValidationError::ValueTooLong { .. }
+                | TagValidationError::InvalidValueCharacter { .. } => (
+                    "The TagValue you have provided is invalid".to_string(),
+                    Some(value),
+                ),
+            };
+            ServerError::InvalidTag {
+                reason,
+                tag_key: Some(key),
+                tag_value,
             }
-            Self::ReservedKeyPrefix => "tag key must not start with 'aws:'".to_string(),
-            Self::ValueLength(actual) => {
-                format!("tag value must be 0-256 characters, got {actual}")
-            }
-            Self::DuplicateKey(key) => format!("duplicate tag key: {key}"),
-            Self::TooMany { max, actual } => {
-                format!("tags cannot be greater than {max}, got {actual}")
-            }
-        };
-        ServerError::InvalidTag {
-            reason,
+        }
+        TagSetValidationError::DuplicateKey { key } => ServerError::InvalidTag {
+            reason: format!("duplicate tag key: {key}"),
             tag_key: None,
             tag_value: None,
-        }
+        },
+        TagSetValidationError::TooMany { maximum, actual } => ServerError::InvalidTag {
+            reason: format!("tags cannot be greater than {maximum}, got {actual}"),
+            tag_key: None,
+            tag_value: None,
+        },
     }
-}
-
-fn validate_tag_set_constraints(
-    tags: &[(String, String)],
-    max_tags: usize,
-) -> Result<(), TagSetValidationError> {
-    let mut seen_keys = std::collections::HashSet::new();
-    for (key, value) in tags {
-        let key_chars = key.chars().count();
-        if key_chars == 0 || key_chars > 128 {
-            return Err(TagSetValidationError::KeyLength(key_chars));
-        }
-        if key.starts_with("aws:") {
-            return Err(TagSetValidationError::ReservedKeyPrefix);
-        }
-        let value_chars = value.chars().count();
-        if value_chars > 256 {
-            return Err(TagSetValidationError::ValueLength(value_chars));
-        }
-        if !seen_keys.insert(key.clone()) {
-            return Err(TagSetValidationError::DuplicateKey(key.clone()));
-        }
-    }
-    if tags.len() > max_tags {
-        return Err(TagSetValidationError::TooMany {
-            max: max_tags,
-            actual: tags.len(),
-        });
-    }
-    Ok(())
-}
-
-fn validate_tag_set(tags: &[(String, String)], max_tags: usize) -> Result<(), ServerError> {
-    validate_tag_set_constraints(tags, max_tags).map_err(TagSetValidationError::into_s3_error)
 }
 
 const S3_CONTROL_INVALID_TAG_MESSAGE: &str = "This request contains a tag key or value that isn't valid. Valid characters include the following: [a-zA-Z+-=._:/]. Tag keys can contain up to 128 characters. Tag values can contain up to 256 characters.";
 const S3_CONTROL_DUPLICATE_TAG_MESSAGE: &str =
     "There are duplicate tag keys in your request. Remove the duplicate tag keys and try again.";
+const S3_CONTROL_RESERVED_TAG_MESSAGE: &str = "User-defined tag keys can't start with \"aws:\". This prefix is reserved for system tags. Remove \"aws:\" from your tag keys and try again.";
 
 pub(crate) fn invalid_s3_control_tag() -> ServerError {
     ServerError::InvalidTag {
         reason: S3_CONTROL_INVALID_TAG_MESSAGE.to_string(),
+        tag_key: None,
+        tag_value: None,
+    }
+}
+
+pub(crate) fn reserved_s3_control_tag() -> ServerError {
+    ServerError::InvalidTag {
+        reason: S3_CONTROL_RESERVED_TAG_MESSAGE.to_string(),
         tag_key: None,
         tag_value: None,
     }
@@ -3737,13 +3723,27 @@ enum TagCollectionSchema {
 impl TagCollectionSchema {
     fn validation_error(self, error: TagSetValidationError) -> ServerError {
         match (self, error) {
-            (Self::S3Control, TagSetValidationError::DuplicateKey(_)) => ServerError::InvalidTag {
-                reason: S3_CONTROL_DUPLICATE_TAG_MESSAGE.to_string(),
+            (Self::S3Control, TagSetValidationError::DuplicateKey { .. }) => {
+                ServerError::InvalidTag {
+                    reason: S3_CONTROL_DUPLICATE_TAG_MESSAGE.to_string(),
+                    tag_key: None,
+                    tag_value: None,
+                }
+            }
+            (
+                Self::S3Control,
+                TagSetValidationError::Tag {
+                    ref key,
+                    source: TagValidationError::ReservedKeyPrefix,
+                    ..
+                },
+            ) if key.starts_with("aws:") => ServerError::InvalidTag {
+                reason: S3_CONTROL_RESERVED_TAG_MESSAGE.to_string(),
                 tag_key: None,
                 tag_value: None,
             },
             (Self::S3Control, _) => invalid_s3_control_tag(),
-            (Self::S3Tagging, error) => error.into_s3_error(),
+            (Self::S3Tagging, error) => tag_set_error_into_s3(error),
         }
     }
 
@@ -3759,36 +3759,10 @@ impl TagCollectionSchema {
     }
 
     fn validate_tags(self, tags: &[(String, String)], max_tags: usize) -> Result<(), ServerError> {
-        validate_tag_set_constraints(tags, max_tags)
-            .map_err(|error| self.validation_error(error))?;
-        if self == Self::S3Control
-            && tags.iter().any(|(key, value)| {
-                key.chars()
-                    .chain(value.chars())
-                    .any(|character| !is_valid_s3_control_tag_character(character))
-            })
-        {
-            return Err(invalid_s3_control_tag());
-        }
-        Ok(())
+        AwsTagSet::from_pairs(tags.to_vec(), max_tags)
+            .map(|_| ())
+            .map_err(|error| self.validation_error(error))
     }
-}
-
-fn is_valid_s3_control_tag_character(character: char) -> bool {
-    matches!(
-        get_general_category(character),
-        GeneralCategory::UppercaseLetter
-            | GeneralCategory::LowercaseLetter
-            | GeneralCategory::TitlecaseLetter
-            | GeneralCategory::ModifierLetter
-            | GeneralCategory::OtherLetter
-            | GeneralCategory::DecimalNumber
-            | GeneralCategory::LetterNumber
-            | GeneralCategory::OtherNumber
-            | GeneralCategory::SpaceSeparator
-            | GeneralCategory::LineSeparator
-            | GeneralCategory::ParagraphSeparator
-    ) || matches!(character, '+' | '-' | '=' | '.' | '_' | ':' | '/' | '@')
 }
 
 fn parse_tag_collection_xml(
@@ -4076,20 +4050,19 @@ pub(crate) fn parse_object_lock_header_timestamp_secs(raw: &str) -> Result<u64, 
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TagSet {
-    tags: Vec<(String, String)>,
-    max_tags: usize,
+    inner: AwsTagSet,
 }
 
 impl TagSet {
     pub fn new(tags: Vec<(String, String)>, max_tags: usize) -> Result<Self, ServerError> {
-        validate_tag_set(&tags, max_tags)?;
-        Ok(Self { tags, max_tags })
+        AwsTagSet::from_pairs(tags, max_tags)
+            .map(|inner| Self { inner })
+            .map_err(tag_set_error_into_s3)
     }
 
     pub fn empty(max_tags: usize) -> Self {
         Self {
-            tags: Vec::new(),
-            max_tags,
+            inner: AwsTagSet::empty(max_tags),
         }
     }
 
@@ -4126,66 +4099,53 @@ impl TagSet {
         if tags.is_empty() {
             return Err(empty_s3_control_tag_set());
         }
-        Ok(Self { tags, max_tags: 50 })
+        Ok(Self {
+            inner: AwsTagSet::from_pairs(tags, 50)
+                .expect("S3 Control parser already validated every tag"),
+        })
     }
 
     #[must_use]
-    pub fn as_slice(&self) -> &[(String, String)] {
-        &self.tags
+    pub fn as_slice(&self) -> &[AwsTag] {
+        self.inner.as_slice()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.tags.is_empty()
+        self.inner.is_empty()
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.tags.len()
+        self.inner.len()
     }
 
     pub fn reverse(&mut self) {
-        self.tags.reverse();
+        self.inner.reverse();
     }
 
     #[must_use]
     pub fn into_vec(self) -> Vec<(String, String)> {
-        self.tags
+        self.inner.into_pairs()
     }
 
     pub fn merge(&self, updates: &Self) -> Result<Self, ServerError> {
-        let mut merged = self.tags.clone();
-        for (key, value) in &updates.tags {
-            if let Some((_, existing_value)) = merged
-                .iter_mut()
-                .find(|(existing_key, _)| existing_key == key)
-            {
-                *existing_value = value.clone();
-            } else {
-                merged.push((key.clone(), value.clone()));
-            }
-        }
-        Self::new(merged, self.max_tags)
+        self.inner
+            .merge(&updates.inner)
+            .map(|inner| Self { inner })
+            .map_err(tag_set_error_into_s3)
     }
 
     #[must_use]
-    pub fn remove_keys(&self, tag_keys: &[String]) -> Self {
-        let to_remove: std::collections::HashSet<&str> =
-            tag_keys.iter().map(String::as_str).collect();
+    pub fn remove_keys(&self, tag_keys: &[TagKey]) -> Self {
         Self {
-            tags: self
-                .tags
-                .iter()
-                .filter(|(key, _)| !to_remove.contains(key.as_str()))
-                .cloned()
-                .collect(),
-            max_tags: self.max_tags,
+            inner: self.inner.remove_keys(tag_keys),
         }
     }
 
     #[must_use]
     pub fn to_xml(&self) -> String {
-        serialize_tagging_xml(&self.tags)
+        self.inner.to_xml()
     }
 
     /// Serialize the distinct S3 Control `ListTagsForResource` response.
@@ -4195,16 +4155,16 @@ impl TagSet {
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <ListTagsForResourceResult xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\">",
         );
-        if self.tags.is_empty() {
+        if self.inner.is_empty() {
             xml.push_str("<Tags/></ListTagsForResourceResult>");
             return xml;
         }
         xml.push_str("<Tags>");
-        for (key, value) in &self.tags {
+        for tag in self.inner.as_slice() {
             xml.push_str("<Tag><Key>");
-            xml.push_str(&xml_escape(key));
+            xml.push_str(&xml_escape(tag.key().as_str()));
             xml.push_str("</Key><Value>");
-            xml.push_str(&xml_escape(value));
+            xml.push_str(&xml_escape(tag.value().as_str()));
             xml.push_str("</Value></Tag>");
         }
         xml.push_str("</Tags></ListTagsForResourceResult>");
@@ -4214,7 +4174,7 @@ impl TagSet {
 
 /// Parse a `<Tagging>` XML request body into a list of (key, value) pairs.
 ///
-/// Validates S3 constraints: key 1–128 chars, value 0–256 chars,
+/// Validates S3 constraints: key 1–128 UTF-16 units, value 0–256 UTF-16 units,
 /// unique keys, no `aws:` key prefix.
 ///
 /// `max_tags` sets the limit: 10 for object tags, 50 for bucket tags.
@@ -4230,25 +4190,14 @@ pub fn parse_tag_resource_xml(data: &[u8]) -> Result<Vec<(String, String)>, Serv
     TagSet::parse_tag_resource_xml(data).map(TagSet::into_vec)
 }
 
-fn serialize_tagging_xml(tags: &[(String, String)]) -> String {
-    let mut xml = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet>",
-    );
-    for (k, v) in tags {
-        xml.push_str("<Tag><Key>");
-        xml.push_str(&xml_escape(k));
-        xml.push_str("</Key><Value>");
-        xml.push_str(&xml_escape(v));
-        xml.push_str("</Value></Tag>");
-    }
-    xml.push_str("</TagSet></Tagging>");
-    xml
+fn serialize_tagging_xml(tags: &[(String, String)]) -> Result<String, ServerError> {
+    AwsTagSet::from_pairs(tags.to_vec(), usize::MAX)
+        .map(|tags| tags.to_xml())
+        .map_err(tag_set_error_into_s3)
 }
 
 /// Serialize a list of (key, value) tag pairs into S3 tagging XML.
-#[must_use]
-pub fn get_tagging_xml(tags: &[(String, String)]) -> String {
+pub fn get_tagging_xml(tags: &[(String, String)]) -> Result<String, ServerError> {
     serialize_tagging_xml(tags)
 }
 
@@ -4272,9 +4221,15 @@ pub fn remove_tag_keys(
     existing: &[(String, String)],
     tag_keys: &[String],
 ) -> Vec<(String, String)> {
+    let tag_keys = tag_keys
+        .iter()
+        .cloned()
+        .map(TagKey::new)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("removal keys should already be valid");
     TagSet::new(existing.to_vec(), usize::MAX)
         .expect("existing tag set should already be valid")
-        .remove_keys(tag_keys)
+        .remove_keys(&tag_keys)
         .into_vec()
 }
 
@@ -4288,7 +4243,6 @@ pub fn parse_url_encoded_tags(input: &str) -> Result<Vec<(String, String)>, Serv
     }
 
     let mut tags = Vec::new();
-    let mut seen_keys = std::collections::HashSet::new();
 
     for pair in input.split('&') {
         if pair.is_empty() {
@@ -4317,38 +4271,6 @@ pub fn parse_url_encoded_tags(input: &str) -> Result<Vec<(String, String)>, Serv
         let key = decode(raw_key, None)?;
         let value = decode(raw_value, Some(key.as_str()))?;
 
-        let key_chars = key.chars().count();
-        if key_chars == 0 || key_chars > 128 {
-            return Err(ServerError::InvalidTag {
-                reason: format!("tag key must be 1-128 characters, got {key_chars}"),
-                tag_key: None,
-                tag_value: None,
-            });
-        }
-        if key.starts_with("aws:") {
-            return Err(ServerError::InvalidTag {
-                reason: "tag key must not start with 'aws:'".to_string(),
-                tag_key: None,
-                tag_value: None,
-            });
-        }
-        let value_chars = value.chars().count();
-        if value_chars > 256 {
-            return Err(ServerError::InvalidTag {
-                reason: format!("tag value must be 0-256 characters, got {value_chars}"),
-                tag_key: None,
-                tag_value: None,
-            });
-        }
-
-        if !seen_keys.insert(key.clone()) {
-            return Err(ServerError::InvalidTag {
-                reason: format!("duplicate tag key: {key}"),
-                tag_key: None,
-                tag_value: None,
-            });
-        }
-
         tags.push((key, value));
     }
 
@@ -4360,7 +4282,7 @@ pub fn parse_url_encoded_tags(input: &str) -> Result<Vec<(String, String)>, Serv
         });
     }
 
-    Ok(tags)
+    TagSet::new(tags, 10).map(TagSet::into_vec)
 }
 
 /// Count tags in canonical stored tagging XML.
@@ -7200,7 +7122,6 @@ mod tests {
             "<Tag><Key>key</Key><Value>invalid!</Value></Tag>".to_string(),
             "<Tag><Key>key-\u{0345}</Key><Value>value</Value></Tag>".to_string(),
             "<Tag><Key>key</Key><Value>value-\u{0345}</Value></Tag>".to_string(),
-            "<Tag><Key>aws:reserved</Key></Tag>".to_string(),
         ] {
             let body = tag_resource_body(&members);
             assert!(matches!(
@@ -7209,6 +7130,13 @@ mod tests {
                 if reason == S3_CONTROL_INVALID_TAG_MESSAGE
             ));
         }
+
+        let reserved_body = tag_resource_body("<Tag><Key>aws:reserved</Key></Tag>");
+        assert!(matches!(
+            TagSet::parse_tag_resource_xml(reserved_body.as_bytes()),
+            Err(ServerError::InvalidTag { ref reason, .. })
+                if reason == S3_CONTROL_RESERVED_TAG_MESSAGE
+        ));
 
         let duplicate_body =
             tag_resource_body("<Tag><Key>duplicate</Key></Tag><Tag><Key>duplicate</Key></Tag>");
@@ -7250,15 +7178,20 @@ mod tests {
     }
 
     #[test]
-    fn s3_tagging_keeps_detailed_member_validation_errors() {
+    fn s3_tagging_maps_typed_key_validation_to_the_aws_error() {
+        let long_key = "x".repeat(129);
         let body = format!(
             "<Tagging><TagSet><Tag><Key>{}</Key><Value>value</Value></Tag></TagSet></Tagging>",
-            "x".repeat(129)
+            long_key
         );
         assert!(matches!(
             TagSet::parse_tagging_xml(body.as_bytes(), 10),
-            Err(ServerError::InvalidTag { ref reason, .. })
-                if reason == "tag key must be 1-128 characters, got 129"
+            Err(ServerError::InvalidTag {
+                ref reason,
+                ref tag_key,
+                tag_value: None,
+            }) if reason == "The TagKey you have provided is invalid"
+                && tag_key.as_deref() == Some(long_key.as_str())
         ));
     }
 
@@ -7336,27 +7269,26 @@ mod tests {
             ("env".to_string(), "prod".to_string()),
             ("team".to_string(), "platform".to_string()),
         ];
-        let xml = get_tagging_xml(&tags);
+        let xml = get_tagging_xml(&tags).unwrap();
         let parsed = parse_tagging_xml(xml.as_bytes(), 10).unwrap();
         assert_eq!(parsed, tags);
     }
 
     #[test]
     fn get_tagging_xml_empty() {
-        let xml = get_tagging_xml(&[]);
+        let xml = get_tagging_xml(&[]).unwrap();
         assert!(xml.contains("<TagSet></TagSet>"));
         let parsed = parse_tagging_xml(xml.as_bytes(), 10).unwrap();
         assert!(parsed.is_empty());
     }
 
     #[test]
-    fn get_tagging_xml_escapes_special_chars() {
+    fn get_tagging_xml_rejects_characters_outside_the_resource_tag_grammar() {
         let tags = vec![("k&1".to_string(), "v<2>".to_string())];
-        let xml = get_tagging_xml(&tags);
-        assert!(xml.contains("k&amp;1"));
-        assert!(xml.contains("v&lt;2&gt;"));
-        let parsed = parse_tagging_xml(xml.as_bytes(), 10).unwrap();
-        assert_eq!(parsed, tags);
+        assert!(matches!(
+            get_tagging_xml(&tags),
+            Err(ServerError::InvalidTag { .. })
+        ));
     }
 
     // ── URL-encoded tags ────────────────────────────────────────────
@@ -7423,14 +7355,15 @@ mod tests {
         let xml = get_tagging_xml(&[
             ("a".to_string(), "1".to_string()),
             ("b".to_string(), "2".to_string()),
-        ]);
+        ])
+        .unwrap();
         let tags = parse_tagging_xml(xml.as_bytes(), 10).unwrap();
         assert_eq!(tags.len(), 2);
     }
 
     #[test]
     fn count_tags_empty() {
-        let xml = get_tagging_xml(&[]);
+        let xml = get_tagging_xml(&[]).unwrap();
         let tags = parse_tagging_xml(xml.as_bytes(), 10).unwrap();
         assert_eq!(tags.len(), 0);
     }

@@ -5,8 +5,10 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::str::FromStr;
 
 pub mod lifecycle;
+pub mod tag;
 
 pub use lifecycle::*;
+pub use tag::*;
 
 /// Maximum supported principal string length stored in metadata.
 pub const MAX_PRINCIPAL_LEN: usize = 256;
