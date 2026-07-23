@@ -1,0 +1,361 @@
+Storage RPC responses are not bound to requests
+Link: https://chatgpt.com/codex/cloud/security/findings/3bf1107424188191b4e16eb64bf430c1?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 2afe069
+Author: justin@specialbusservice.com
+Created: 22/07/2026, 20:16:12
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed in commit [`4e2a8310ecb0a834bc65dc443ca4757b030f1546`](https://github.com/justincormack/argmin/commit/4e2a8310ecb0a834bc65dc443ca4757b030f1546) (`Bind storage RPC responses to request transcripts`).
+
+Storage RPC authentication version 2 computes a domain-separated SHA-256
+transcript over the exact encoded authenticated request envelope and includes
+that transcript in the response MAC-covered binding. A response can therefore
+verify only against the request envelope that caused it; matching target,
+topology, operation, request ID, and freshness metadata are no longer
+sufficient to substitute a response across different request payloads.
+
+The client request signer now returns an opaque `SignedStorageRpcRequest` and
+`StorageRpcRequestProof`. Response verification requires that proof rather
+than independently reconstructed request metadata. On the server, successful
+request verification produces an opaque `StorageRpcResponseSigningContext`,
+and only that context can authorize response signing. The ordinary and
+session Unix storage RPC paths carry these proofs and contexts through the
+complete request/response exchange. A transcript mismatch rejects with the
+typed `WrongRequest` reason.
+
+The deterministic regression derives its server response context through the
+production request-verification path, signs two requests with identical
+identity, operation, request ID, issue time, and expiry, and varies only the
+payload. It proves that the response signed for the first request is rejected
+against the second request's proof. Validation for the fixing commit passed
+all 7,493 workspace nextest tests and
+`cargo clippy --all-targets --all-features -- -D warnings`.
+
+# Summary
+Introduced exposure of an authentication protocol flaw by activating authenticated storage RPC transport. The response authenticator is not cryptographically bound to the specific request payload, and the newly wired client/server paths rely on that verifier for authenticated RPC responses.
+Authenticated storage RPC responses are signed over the response frame, target node, topology, kind, and request_id. The original request payload or a request digest is not included in the response authentication input or verification. The client verifies only the expected kind/request_id plus topology/target, so a previously observed valid response for the same node, topology, kind, and request_id can be replayed within the timestamp freshness window. This commit wires this protocol into the Unix storage RPC client and server. Because request IDs are predictable and reset for new clients/sessions, an attacker with local/on-path ability to observe and inject storage RPC traffic could cause a frontend or maintenance worker to accept stale or incorrect metadata/shard responses. Current activation is over private Unix sockets, so exploitation requires significant local/internal access, but the impact can include incorrect object metadata or payload reads.
+
+# Validation
+## Rubric
+- [x] Response signing input excludes the original request payload or a request digest.
+- [x] Response verification input and binding validation check only target, topology, kind, sequence/request_id, and timestamp freshness.
+- [x] The newly activated Unix client/server paths call the flawed authenticated response verify/sign functions.
+- [x] Unix request IDs are predictable/reset for fresh sessions, making same-kind/same-id replay plausible within the timestamp window.
+- [x] Dynamic PoC demonstrates that a signed response for request payload A is accepted for request payload B when kind/request_id match, while a changed request_id is rejected as a control.
+## Report
+Validated the suspected protocol flaw with a targeted Rust unit-test PoC and an LLDB trace. Code review confirmed that `StorageRpcAuthResponseInput` has no original request payload/digest field (`crates/storage/src/storage_rpc_auth.rs:854-861`), and `sign_storage_rpc_response` signs `encode_binding(..., input.frame)` plus kind/request_id sequence only (`storage_rpc_auth.rs:868-884`). `StorageRpcAuthResponseVerificationInput` likewise contains only expected target/topology/request_id/kind/time/envelope (`storage_rpc_auth.rs:889-899`), and verification only validates target/topology/kind/sequence plus request_id (`storage_rpc_auth.rs:938-947`, `storage_rpc_auth.rs:972-993`). The activated Unix client path passes the request frame to `auth.verify_response` (`crates/storage/src/node_client.rs:1267-1292`), but the verifier only consumes kind/request_id. The server signs authenticated responses on the new path (`crates/storage/src/storage_node_server.rs:5157-5190`). Fresh Unix sessions initialize `next_request_id: 1` (`crates/storage/src/node_client/unix_sessions.rs:60-88`) and then increment predictable IDs (`unix_sessions.rs:266-276`, `unix_sessions.rs:369-377`).
+
+PoC evidence: I added a focused unit test `storage_rpc_auth_response_accepts_replay_for_same_kind_id_different_request_payload` in `storage_rpc_auth.rs:2089-2160`. It signs a response for request payload `request-payload-object-a`, then verifies the same signed response through `StorageRpcClientAuthConfig::verify_response` against a different request payload `request-payload-object-b` with the same kind/request_id. Command output: `accepted stale response: observed request payload "request-payload-object-a", new request payload "request-payload-object-b", returned response payload "response-metadata-for-object-a"` and the test passed. As a control, the same signed response was rejected when the request_id changed to 18.
+
+Debugger evidence: LLDB breakpoint at `storage_rpc_auth.rs:943` showed verifier state `input.expected_request_id = 17`, `input.expected_kind = ObjectReadSnapshotLoad`, `binding.frame.request_id = 17`, `binding.frame.kind = ObjectReadSnapshotLoad`; the backtrace was `StorageRpcClientAuthConfig::verify_response -> StorageRpcClientSigner::verify_response -> verify_storage_rpc_response -> PoC test`. Frame 1 showed the caller request still had payload length 24, but that payload is not present in `StorageRpcAuthResponseVerificationInput` and is not bound by `validate_binding`.
+
+Crash/Valgrind/ASan attempts: this is a cryptographic/protocol replay flaw, so no target memory crash is expected. `valgrind` was not installed (`bash: command not found: valgrind`), and Rust ASan using `RUSTFLAGS='-Z sanitizer=address'` failed because the checked-out stable toolchain rejects nightly `-Z` options. LLDB tracing was therefore used as the strongest applicable validation method.
+
+# Evidence
+crates/storage/src/node_client.rs (L1267 to 1292)
+  Note: The newly activated authenticated client path reads an authenticated response and calls verify_response with the request frame, but the verifier only uses request kind and request_id.
+```
+fn read_unix_storage_rpc_response<R: Read>(
+    reader: &mut R,
+    node_id: NodeId,
+    auth: Option<&StorageRpcClientAuthConfig>,
+    request: &StorageRpcFrame,
+    operation: &'static str,
+) -> Result<StorageRpcFrame, StoreError> {
+    let Some(auth) = auth else {
+        return read_storage_rpc_frame_from(reader)
+            .map_err(|error| storage_rpc_stream_error(node_id, operation, error));
+    };
+    let envelope = read_storage_rpc_auth_transport_frame_with_limit(
+        reader,
+        auth.transport_limits().max_frame_bytes(),
+    )
+    .map_err(|error| {
+        storage_rpc_stream_error(node_id, operation, StorageRpcStreamError::Io(error))
+    })?;
+    auth.verify_response(
+        node_id,
+        crate::clock::current_time_millis(),
+        request,
+        &envelope,
+    )
+    .map(|verified| verified.into_frame())
+    .map_err(|error| storage_rpc_auth_store_error(node_id, operation, error))
+```
+
+crates/storage/src/node_client/unix_sessions.rs (L60 to 88)
+  Note: New Unix RPC sessions initialize request IDs to 1, making same-kind/same-request_id response replay feasible across fresh sessions within the freshness window.
+```
+        Ok(UnixStorageNodeReadHandleSession {
+            node_id: self.node_id,
+            stream,
+            next_request_id: 1,
+            rpc_auth: self.rpc_auth.clone(),
+            _rpc_permit: Some(rpc_permit),
+            _object_payload_lease_permit: None,
+        })
+    }
+
+    fn open_object_payload_lease_session(
+        &self,
+        kind: ObjectPayloadLeaseKind,
+    ) -> Result<UnixStorageNodeReadHandleSession, StoreError> {
+        let lease_permit = self.acquire_object_payload_lease_session_admission(kind)?;
+        let stream = UnixStream::connect(&self.socket_path).map_err(|source| StoreError::Io {
+            context: "connect storage-node object-payload lease RPC socket",
+            source,
+        })?;
+        configure_storage_rpc_stream_timeout(
+            &stream,
+            "configure storage-node object-payload lease RPC socket timeout",
+            self.rpc_auth.as_deref(),
+        )?;
+        Ok(UnixStorageNodeReadHandleSession {
+            node_id: self.node_id,
+            stream,
+            next_request_id: 1,
+            rpc_auth: self.rpc_auth.clone(),
+```
+
+crates/storage/src/storage_node_server.rs (L5157 to 5190)
+  Note: The newly activated server path signs every authenticated response using the flawed response authentication scheme.
+```
+    fn write_response_frame(
+        &self,
+        stream: &mut UnixStream,
+        request_credential: Option<&crate::control_plane_auth::ControlPlaneScopedCredential>,
+        response: &StorageRpcFrame,
+    ) -> Result<(), StorageRpcStreamError> {
+        let Some(auth) = self.rpc_auth.as_deref() else {
+            return write_storage_rpc_frame_to(stream, response);
+        };
+        let request_credential = request_credential.ok_or_else(|| {
+            StorageRpcStreamError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "authenticated storage RPC response has no request credential",
+            ))
+        })?;
+        let envelope = auth
+            .sign_response(
+                request_credential,
+                self.config.node_id,
+                crate::clock::current_time_millis(),
+                response,
+            )
+            .map_err(|error| {
+                StorageRpcStreamError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("storage RPC response authentication failed: {error}"),
+                ))
+            })?;
+        write_storage_rpc_auth_transport_frame_with_limit(
+            stream,
+            &envelope,
+            auth.transport_limits().max_frame_bytes(),
+        )
+        .map_err(StorageRpcStreamError::Io)
+```
+
+crates/storage/src/storage_rpc_auth.rs (L854 to 886)
+  Note: Response signing only includes the response frame binding and uses the response request_id as the envelope sequence; it does not include a digest of the original request payload.
+```
+pub(crate) struct StorageRpcAuthResponseInput<'a> {
+    pub(crate) request_credential: &'a ControlPlaneScopedCredential,
+    pub(crate) target_node_id: NodeId,
+    pub(crate) topology_generation: u64,
+    pub(crate) topology_digest: &'a str,
+    pub(crate) issued_at_ms: u64,
+    pub(crate) expires_at_ms: u64,
+    pub(crate) frame: &'a StorageRpcFrame,
+}
+
+pub(crate) fn sign_storage_rpc_response(
+    input: StorageRpcAuthResponseInput<'_>,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    let response_credential = input.request_credential.storage_rpc_response_credential()?;
+    let payload = encode_binding(
+        input.topology_generation,
+        input.topology_digest,
+        input.target_node_id,
+        input.frame,
+    )?;
+    response_credential
+        .sign_envelope(ControlPlaneAuthSignInput {
+            target: ControlPlaneAuthTarget::Principal(input.request_credential.principal().clone()),
+            operation: ControlPlaneAuthOperation::StorageRpcResponse {
+                message_kind: input.frame.kind as u16,
+            },
+            issued_at_ms: Some(input.issued_at_ms),
+            expires_at_ms: Some(input.expires_at_ms),
+            sequence: Some(input.frame.request_id),
+            nonce: Vec::new(),
+            payload,
+        })?
+        .encode_frame()
+```
+
+crates/storage/src/storage_rpc_auth.rs (L889 to 956)
+  Note: Response verification checks target, topology, kind, and request_id, but the verification input has no original request payload or request digest to prevent replay/substitution.
+```
+pub(crate) struct StorageRpcAuthResponseVerificationInput<'a> {
+    pub(crate) request_credential: &'a ControlPlaneScopedCredential,
+    pub(crate) expected_target_node_id: NodeId,
+    pub(crate) expected_topology_generation: u64,
+    pub(crate) expected_topology_digest: &'a str,
+    pub(crate) expected_request_id: u64,
+    pub(crate) expected_kind: StorageRpcMessageKind,
+    pub(crate) now_ms: u64,
+    pub(crate) max_replay_window_ms: u64,
+    pub(crate) allowed_future_skew_ms: u64,
+    pub(crate) envelope_bytes: &'a [u8],
+}
+
+pub(crate) fn verify_storage_rpc_response(
+    input: StorageRpcAuthResponseVerificationInput<'_>,
+) -> Result<VerifiedStorageRpcFrame, StorageRpcAuthRejectionReason> {
+    let response_credential = input
+        .request_credential
+        .storage_rpc_response_credential()
+        .map_err(|_| StorageRpcAuthRejectionReason::UnauthorizedRole)?;
+    let verifier = ControlPlaneScopedCredentialStore::new(vec![response_credential.clone()])
+        .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
+    let envelope = ControlPlaneAuthEnvelope::decode_frame(
+        input.envelope_bytes,
+        STORAGE_RPC_AUTH_MAX_BINDING_LEN,
+    )
+    .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
+    let operation = ControlPlaneAuthOperation::StorageRpcResponse {
+        message_kind: input.expected_kind as u16,
+    };
+    let source = ControlPlaneAuthPrincipal::Service {
+        service: ControlPlaneAuthService::StorageRpc,
+    };
+    let decision = verifier.verify_envelope(ControlPlaneAuthVerificationInput {
+        envelope: &envelope,
+        expected_cluster_id: input.request_credential.cluster_id(),
+        expected_source: &source,
+        expected_target: &ControlPlaneAuthTarget::Principal(
+            input.request_credential.principal().clone(),
+        ),
+        expected_operation: operation,
+        replay_policy: ControlPlaneAuthReplayPolicy::TimestampWindow {
+            now_ms: input.now_ms,
+            max_window_ms: input.max_replay_window_ms,
+            allowed_future_skew_ms: input.allowed_future_skew_ms,
+        },
+    });
+    let (credential_id, credential_version) = accepted_credential(decision)?;
+    let binding = decode_binding(envelope.payload())?;
+    validate_binding(
+        &binding,
+        input.expected_target_node_id,
+        input.expected_topology_generation,
+        input.expected_topology_digest,
+        input.expected_kind as u16,
+        envelope.header().sequence(),
+    )?;
+    if binding.frame.request_id != input.expected_request_id {
+        return Err(StorageRpcAuthRejectionReason::WrongOperation);
+    }
+    Ok(VerifiedStorageRpcFrame {
+        source,
+        credential_id,
+        credential_version,
+        credential: response_credential,
+        frame: binding.frame,
+    })
+}
+```
+
+crates/storage/src/storage_rpc_auth.rs (L972 to 993)
+  Note: The shared binding validation accepts a response based on target node, topology, message kind, and sequence/request_id only.
+```
+fn validate_binding(
+    binding: &StorageRpcAuthBinding,
+    expected_target_node_id: NodeId,
+    expected_topology_generation: u64,
+    expected_topology_digest: &str,
+    expected_message_kind: u16,
+    envelope_sequence: Option<u64>,
+) -> Result<(), StorageRpcAuthRejectionReason> {
+    if binding.target_node_id != expected_target_node_id {
+        return Err(StorageRpcAuthRejectionReason::WrongTarget);
+    }
+    if binding.topology_generation != expected_topology_generation
+        || binding.topology_digest != expected_topology_digest
+    {
+        return Err(StorageRpcAuthRejectionReason::WrongTopology);
+    }
+    if binding.frame.kind as u16 != expected_message_kind
+        || envelope_sequence != Some(binding.frame.request_id)
+    {
+        return Err(StorageRpcAuthRejectionReason::WrongOperation);
+    }
+    Ok(())
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Kept at medium. The cryptographic binding flaw is real and is in main runtime code: response signing and verification omit the original request payload/digest, the Unix client/server paths use this auth scheme, and predictable request IDs reset on fresh sessions. The validation PoC demonstrates that a signed response for one request payload can verify against a different request payload when kind/request_id match. However, severity is capped below high because the vulnerable RPC is an internal Unix-domain socket path with private directory controls, a 5 second freshness window, and a requirement for local/on-path observation plus injection. This is not directly reachable from the public S3 HTTP surface and does not amount to remote auth bypass or broad compromise.
+## Likelihood
+low - The public/default service is the S3 HTTP listener, while the vulnerable transport is local Unix-domain storage RPC with a required private 0700 socket directory. A remote HTTP attacker cannot exploit this directly. Exploitation requires local/internal access capable of observing and injecting or racing RPC frames, plus timing the replay within about 5 seconds.
+## Impact
+medium - Successful replay can make a frontend or maintenance/storage client accept stale or incorrect storage metadata or payload response data for a different logical request. This can affect object confidentiality/integrity at the application data layer, but it does not provide code execution, credential forgery, or a direct public auth bypass, and the replay is constrained to same node/topology/kind/request_id within a short freshness window.
+## Assumptions
+- Authenticated storage RPC is enabled through the static cluster/auth configuration path.
+- The attacker does not already have unrestricted read/write access to the storage data directory; otherwise the incremental impact of replaying RPC responses is reduced.
+- The attacker has local/internal ability to observe a valid signed storage RPC response and inject or race a replayed response on a Unix socket connection within the freshness window.
+- authenticated storage RPC client/server configuration
+- access to or control over the local Unix-domain storage RPC transport path
+- ability to observe a previously signed response envelope
+- ability to inject/replay that envelope before the legitimate response is accepted
+- same target node, topology generation/digest, message kind, and request_id
+- replay within the 5000 ms timestamp window
+## Path
+local attacker
+  -> observe signed response
+  -> replay within 5s for same node/topology/kind/request_id
+  -> verifier lacks request digest
+  -> client accepts stale storage RPC frame
+## Path evidence
+- `crates/storage/src/storage_rpc_auth.rs:34-35` - Defines a 5000 ms response freshness/replay window and 1000 ms future skew, limiting but not preventing short-window replay.
+- `crates/storage/src/storage_rpc_auth.rs:177-196` - Client verify_response passes only target node, topology, request_id, kind, time, and envelope to response verification; the request payload is not passed.
+- `crates/storage/src/storage_rpc_auth.rs:854-886` - Response signing input contains the response frame and topology/target metadata, but no original request frame or digest.
+- `crates/storage/src/storage_rpc_auth.rs:889-956` - Response verification input and checks cover source/target/operation/freshness/topology/request_id, but not the request payload that caused the response.
+- `crates/storage/src/storage_rpc_auth.rs:972-993` - Binding validation accepts a frame based on target node, topology digest/generation, message kind, and request_id sequence only.
+- `crates/storage/src/node_client.rs:1267-1292` - Authenticated Unix storage RPC client reads an auth transport frame and calls auth.verify_response for normal runtime responses.
+- `crates/storage/src/storage_node_server.rs:5134-5155` - Storage-node server verifies authenticated requests and obtains the request credential used for signing the response.
+- `crates/storage/src/storage_node_server.rs:5157-5189` - Storage-node server signs authenticated responses through the vulnerable response-auth scheme.
+- `crates/storage/src/node_client/unix_sessions.rs:60-88` - Fresh Unix read-handle/object-payload-lease sessions initialize next_request_id to 1.
+- `crates/storage/src/node_client/unix_sessions.rs:266-276` - Read-handle session request IDs increment predictably from the per-session counter.
+- `crates/storage/src/node_client/unix_sessions.rs:369-377` - Metadata command session request IDs increment predictably from the per-session counter.
+- `crates/argmin-s3/src/static_cluster_config.rs:2781-2810` - Static cluster configuration creates frontend or storage-node storage RPC client auth capabilities for runtime processes.
+- `crates/argmin-s3/src/static_cluster_config.rs:2841-2862` - Static cluster configuration creates storage RPC server auth config for local storage sockets.
+- `crates/argmin-s3/src/static_cluster_config.rs:2978-2981` - The generated server config stores storage RPC client/server auth settings used by the main process.
+- `crates/storage/src/storage_node_server.rs:2182-2197` - Storage-node server binds a UnixListener at the configured storage-node socket path, showing the affected RPC is Unix-domain local transport.
+- `crates/storage/src/storage_node_server.rs:15676-15700` - Storage-node socket path must be absolute and its parent directory must be private mode 0700, substantially limiting exposure.
+- `crates/argmin-s3/src/config.rs:513-518` - Main S3 service is configured by environment variables; default HTTP listen address is 127.0.0.1:9000.
+- `crates/argmin-s3/src/main.rs:8088-8115` - argmin-s3 binds the configured TCP listener for the public S3 HTTP service, separate from the local Unix storage RPC path.
+## Narrative
+The report is a real protocol flaw in the authenticated storage RPC runtime. Response signing serializes only the response frame plus target/topology metadata and uses request_id as the envelope sequence; the verifier receives only expected target/topology/kind/request_id/time/envelope and validates those fields without any original request payload or digest. The activated Unix client path calls this verifier for authenticated responses, and the storage-node server signs responses through the same scheme. Fresh sessions reset request IDs to 1 and increment predictably, making same-kind/same-id replay feasible if an attacker can observe and inject local RPC traffic within the 5 second freshness window. The finding is not remotely reachable through the public S3 HTTP surface by itself: storage RPC uses Unix-domain sockets whose parent directory must be private 0700. Therefore medium severity is appropriate: real confidentiality/integrity impact is plausible for local/internal compromise scenarios, but exploitation has significant preconditions and is not an internet-facing auth bypass.
+## Controls
+- Public S3 HTTP requests use application authentication/authorization outside this storage RPC path.
+- Authenticated storage RPC requests and responses use signed control-plane envelopes.
+- Storage RPC verifier enforces source, target, operation, topology, request_id, and timestamp freshness.
+- Storage RPC freshness window is 5000 ms with 1000 ms allowed future skew.
+- Storage-node RPC uses Unix-domain sockets, not a TCP listener.
+- Storage-node socket parent directory must be private mode 0700.
+- Storage RPC has transport frame size limits and admission/timeouts.
+## Blindspots
+- Static-only review cannot confirm actual production deployment topology, Unix socket ownership, or whether frontend/storage-node processes run under distinct users.
+- No repository IaC or Kubernetes manifests were found/used to confirm ingress, load balancer, or host filesystem permission deployment details.
+- The strongest validation evidence is a targeted unit-test PoC and debugger trace rather than a full end-to-end Unix-socket MITM exploit.
+- If an attacker already has same-UID or root access to the host, they may have more direct access to storage files, reducing the incremental security impact of this replay flaw.
