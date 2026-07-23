@@ -1032,17 +1032,8 @@ impl HttpFrontend {
             };
             return self.handle_options_request(s3req, &storage_route_admission, bucket, wire_ids);
         }
-        if let ServiceOperation::S3Control(S3ControlOperation::Options { bucket }) = &operation {
-            let storage_route_admission = match self.coordinator.admit_storage_route_for_request() {
-                Ok(admission) => admission,
-                Err(err) => return S3Response::s3_control_error_with_ids(&err, wire_ids),
-            };
-            return self.handle_s3_control_options(
-                s3req,
-                &storage_route_admission,
-                bucket,
-                wire_ids,
-            );
+        if let ServiceOperation::S3Control(S3ControlOperation::Options) = &operation {
+            return Self::handle_s3_control_options(s3req, wire_ids);
         }
         if let ServiceOperation::S3Control(S3ControlOperation::HeadBucketTags) = &operation {
             return S3Response::s3_control_head_method_not_allowed();
@@ -1267,13 +1258,7 @@ impl HttpFrontend {
         resp
     }
 
-    fn handle_s3_control_options(
-        &self,
-        req: &S3Request,
-        storage_route_admission: &storage::StorageClusterRouteAdmission,
-        bucket: &BucketName,
-        wire_ids: &WireResponseIds,
-    ) -> S3Response {
+    fn handle_s3_control_options(req: &S3Request, wire_ids: &WireResponseIds) -> S3Response {
         if req.header("origin").is_none() {
             return S3Response::s3_control_options_missing_origin(wire_ids);
         }
@@ -1281,14 +1266,7 @@ impl HttpFrontend {
             Some(method) => method,
             None => return S3Response::s3_control_options_missing_origin(wire_ids),
         };
-        match self
-            .coordinator
-            .bucket_exists_on_admitted_route(storage_route_admission, bucket)
-        {
-            Ok(false) => S3Response::s3_control_cors_bucket_not_found(requested_method, wire_ids),
-            Ok(true) => S3Response::s3_control_error_with_ids(&ServerError::AccessDenied, wire_ids),
-            Err(err) => S3Response::s3_control_error_with_ids(&err, wire_ids),
-        }
+        S3Response::s3_control_cors_bucket_not_found(requested_method, wire_ids)
     }
 
     /// Handle an OPTIONS (CORS preflight) request. No auth required.
@@ -1705,7 +1683,7 @@ impl HttpFrontend {
             }
             S3ControlOperation::HeadBucketTags
             | S3ControlOperation::MethodNotAllowed { .. }
-            | S3ControlOperation::Options { .. } => {
+            | S3ControlOperation::Options => {
                 unreachable!("S3 Control method-only operations are handled before authentication")
             }
         }

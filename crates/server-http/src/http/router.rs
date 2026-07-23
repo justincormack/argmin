@@ -350,7 +350,7 @@ pub enum S3ControlOperation {
     UntagResource { bucket: BucketName },
     HeadBucketTags,
     MethodNotAllowed { method: String },
-    Options { bucket: BucketName },
+    Options,
 }
 
 /// S3 Control routing failures selected before service authentication.
@@ -497,7 +497,7 @@ fn route_s3_control(method: &str, path: &str) -> Result<S3ControlOperation, S3Co
         "POST" => Ok(S3ControlOperation::TagResource { bucket }),
         "DELETE" => Ok(S3ControlOperation::UntagResource { bucket }),
         "HEAD" => Ok(S3ControlOperation::HeadBucketTags),
-        "OPTIONS" => Ok(S3ControlOperation::Options { bucket }),
+        "OPTIONS" => Ok(S3ControlOperation::Options),
         "PUT" | "PATCH" => Ok(S3ControlOperation::MethodNotAllowed {
             method: method.to_string(),
         }),

@@ -2018,7 +2018,7 @@ fn buffered_body_limit_for_request_parts(
             | S3ControlOperation::UntagResource { .. }
             | S3ControlOperation::HeadBucketTags
             | S3ControlOperation::MethodNotAllowed { .. }
-            | S3ControlOperation::Options { .. },
+            | S3ControlOperation::Options,
         ) => MAX_BUFFERED_CONTROL_BODY_SIZE,
     }
 }
