@@ -2273,6 +2273,35 @@ Forty-fifth Phase 3 slice:
   boundary checker, all 2,240 storage tests, workspace-wide strict Clippy, and
   the full parallel workspace suite pass (7,498 tests).
 
+Forty-sixth Phase 3 slice:
+
+- active shard write, repair-write, full-read, and range-read handlers now
+  consume a non-cloneable `StorageNodeActiveShardRoute` established from the
+  admitted RPC frame. The capability derives `ShardLocation` only after
+  current route validation, binds it to the exact `ShardKey`, rejects a
+  crossed location/key shard index, captures the immutable current-route
+  fence, and revalidates that fence immediately before every file effect.
+- primary shard-ack record, validate, and load handlers now use a distinct
+  `StorageNodeActivePrimaryDataRoute`. It constructs `DataPgId` only after
+  current route and primary validation, borrows active admission, and
+  revalidates the captured route deadline immediately before each durable ack
+  read or mutation. Wire shapes and existing exact-retry behavior are
+  unchanged.
+- deterministic server-local coverage positively exercises every capability
+  method, rejects retained and foreign admission, rejects a crossed
+  location/key subject, extends the same-epoch raw route, and proves the
+  captured capabilities still expire at their original deadline without
+  changing shard payload or acknowledgement canaries. The existing shard RPC
+  codec continues to reject crossed subjects at both encode and decode, while
+  installed Unix tests retain route, primary, integrity, exact-retry, and
+  non-mutation coverage.
+- historical shard/ack inspection, read-handle session control, remaining
+  frontend capability migration, and capability requirements on the
+  node-client traits remain open in Phase 3.
+- focused active-data capability and handler regressions, formatting, the
+  storage boundary checker, all 2,241 storage tests, workspace-wide strict
+  Clippy, and the full parallel workspace suite pass (7,506 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
