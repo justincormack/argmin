@@ -1323,6 +1323,8 @@ pub struct StorageCluster {
     operation_epoch: ClusterEpoch,
     runtime_map_content_digest: Option<RuntimeMapContentDigest>,
     rpc_auth: Option<crate::StorageRpcClientAuthConfig>,
+    rpc_endpoints:
+        Option<Arc<BTreeMap<NodeId, crate::storage_rpc_transport::StorageRpcClientEndpoint>>>,
     #[cfg(any(test, feature = "test-hooks"))]
     test_hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
@@ -2742,6 +2744,72 @@ mod runtime_map_refresh_invalidation_tests {
 
         assert!(refreshed.rpc_auth.is_some());
         assert_eq!(refreshed.local_node_count(), 2);
+    }
+
+    #[test]
+    fn content_changing_runtime_map_refresh_retains_tls_storage_rpc_endpoints() {
+        let tmp = test_util::tempdir();
+        let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+            crate::control_plane::FileControlPlaneStore::new(
+                tmp.path().join("control-plane.state"),
+            ),
+        )
+        .unwrap();
+        authority
+            .bootstrap_initial_cluster_map(
+                vec![(NodeId::new(1), "tcp://localhost:7701".to_string())],
+                vec![PgId::new(31)],
+            )
+            .unwrap();
+        let initial_runtime_map = authority.snapshot().runtime_map(1_000).unwrap();
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        tls.alpn_protocols = vec![crate::storage_rpc_transport::STORAGE_RPC_TLS_ALPN.to_vec()];
+        let endpoint = crate::storage_rpc_transport::StorageRpcClientEndpoint::tcp(
+            "tcp://localhost:7701",
+            vec!["127.0.0.1:7701".parse().unwrap()],
+            "localhost",
+            Arc::new(tls),
+        )
+        .unwrap();
+        let cluster = StorageCluster::from_runtime_map_with_storage_rpc_endpoints_and_auth(
+            NodeId::new(1),
+            &initial_runtime_map,
+            EcShape { k: 1, m: 0 },
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            [(NodeId::new(1), endpoint)],
+            frontend_storage_rpc_auth(),
+        )
+        .unwrap();
+        authority
+            .set_node_membership(
+                NodeId::new(2),
+                crate::control_plane::NodeMembershipState::Active,
+            )
+            .unwrap();
+        let changed_runtime_map = authority.snapshot().runtime_map(1_001).unwrap();
+
+        let refreshed = cluster
+            .refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
+                &FixedRuntimeMapSource(changed_runtime_map),
+                1_001,
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            refreshed
+                .rpc_endpoints
+                .as_ref()
+                .unwrap()
+                .get(&NodeId::new(1)),
+            Some(crate::storage_rpc_transport::StorageRpcClientEndpoint::Tcp { .. })
+        ));
     }
 
     #[test]
@@ -5930,6 +5998,100 @@ impl StorageCluster {
         )
     }
 
+    pub fn from_runtime_map_with_storage_rpc_endpoints_and_frontend_auth(
+        metadata_primary_node_id: NodeId,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+        default_ec_shape: EcShape,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+        endpoints: impl IntoIterator<
+            Item = (
+                NodeId,
+                crate::storage_rpc_transport::StorageRpcClientEndpoint,
+            ),
+        >,
+        capability: crate::FrontendStorageRpcClientCapability,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        Self::from_runtime_map_with_storage_rpc_endpoints_and_auth(
+            metadata_primary_node_id,
+            runtime_map,
+            default_ec_shape,
+            admission_settings,
+            endpoints,
+            capability.into(),
+        )
+    }
+
+    pub fn from_runtime_map_with_storage_rpc_endpoints_and_maintenance_auth(
+        metadata_primary_node_id: NodeId,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+        default_ec_shape: EcShape,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+        endpoints: impl IntoIterator<
+            Item = (
+                NodeId,
+                crate::storage_rpc_transport::StorageRpcClientEndpoint,
+            ),
+        >,
+        capability: crate::MaintenanceStorageRpcClientCapability,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        Self::from_runtime_map_with_storage_rpc_endpoints_and_auth(
+            metadata_primary_node_id,
+            runtime_map,
+            default_ec_shape,
+            admission_settings,
+            endpoints,
+            capability.into(),
+        )
+    }
+
+    fn from_runtime_map_with_storage_rpc_endpoints_and_auth(
+        metadata_primary_node_id: NodeId,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+        default_ec_shape: EcShape,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+        endpoints: impl IntoIterator<
+            Item = (
+                NodeId,
+                crate::storage_rpc_transport::StorageRpcClientEndpoint,
+            ),
+        >,
+        rpc_auth: crate::StorageRpcClientAuthConfig,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        let mut endpoint_map = BTreeMap::new();
+        for (node_id, endpoint) in endpoints {
+            if endpoint_map.insert(node_id, endpoint).is_some() {
+                return Err(ClusterBuildError::DuplicateRemoteStorageNodeClientNodeId {
+                    id: node_id.as_u32(),
+                });
+            }
+        }
+        let endpoints = Arc::new(endpoint_map);
+        let mut local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
+            metadata_primary_node_id,
+            runtime_map,
+            default_ec_shape,
+        )?;
+        let configs = endpoints.iter().map(|(&node_id, endpoint)| {
+            LocalUnixStorageNodeClientConfig::with_rpc_endpoint_and_admission_settings(
+                node_id,
+                endpoint.clone(),
+                admission_settings,
+            )
+            .with_optional_rpc_auth(Some(rpc_auth.clone()))
+        });
+        local_map.install_unix_storage_node_clients(configs)?;
+        let mut cluster = Self::from_local_map_with_epoch_and_digest_and_auth(
+            Arc::new(local_map),
+            runtime_map.cluster_epoch(),
+            Some(runtime_map.content_digest()),
+            Some(rpc_auth),
+        )?;
+        Arc::get_mut(&mut cluster)
+            .expect("new storage cluster has one owner")
+            .rpc_endpoints = Some(endpoints);
+        Ok(cluster)
+    }
+
     pub fn from_runtime_map_with_unix_storage_node_client_admission_settings_and_frontend_auth(
         metadata_primary_node_id: NodeId,
         runtime_map: &ClusterRuntimeMapSnapshot,
@@ -6009,19 +6171,37 @@ impl StorageCluster {
             self.default_payload_ec_shape(),
         )?;
         local_map.inherit_process_local_state_from(&self.local_map);
-        let storage_node_configs = Self::unix_storage_node_client_configs_from_runtime_map(
-            &runtime_map,
-            admission_settings,
-        )
-        .into_iter()
-        .map(|config| config.with_optional_rpc_auth(self.rpc_auth.clone()));
+        let storage_node_configs = match &self.rpc_endpoints {
+            Some(endpoints) => endpoints
+                .iter()
+                .map(|(&node_id, endpoint)| {
+                    LocalUnixStorageNodeClientConfig::with_rpc_endpoint_and_admission_settings(
+                        node_id,
+                        endpoint.clone(),
+                        admission_settings,
+                    )
+                    .with_optional_rpc_auth(self.rpc_auth.clone())
+                })
+                .collect::<Vec<_>>(),
+            None => Self::unix_storage_node_client_configs_from_runtime_map(
+                &runtime_map,
+                admission_settings,
+            )
+            .into_iter()
+            .map(|config| config.with_optional_rpc_auth(self.rpc_auth.clone()))
+            .collect(),
+        };
         local_map.install_unix_storage_node_clients(storage_node_configs)?;
-        Ok(Self::from_local_map_with_epoch_and_digest_and_auth(
+        let mut cluster = Self::from_local_map_with_epoch_and_digest_and_auth(
             Arc::new(local_map),
             runtime_map.cluster_epoch(),
             Some(runtime_map.content_digest()),
             self.rpc_auth.clone(),
-        )?)
+        )?;
+        Arc::get_mut(&mut cluster)
+            .expect("new storage cluster has one owner")
+            .rpc_endpoints = self.rpc_endpoints.clone();
+        Ok(cluster)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -6063,6 +6243,7 @@ impl StorageCluster {
             operation_epoch,
             runtime_map_content_digest,
             rpc_auth,
+            rpc_endpoints: None,
             #[cfg(any(test, feature = "test-hooks"))]
             test_hooks: Arc::new(Mutex::new(StorageClusterTestHooks::default())),
         }))

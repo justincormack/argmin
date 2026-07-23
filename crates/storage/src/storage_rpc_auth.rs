@@ -639,7 +639,8 @@ pub(crate) fn write_storage_rpc_auth_transport_frame<W: Write>(
     writer.write_all(&STORAGE_RPC_AUTH_TRANSPORT_VERSION.to_be_bytes())?;
     writer.write_all(&len.to_be_bytes())?;
     writer.write_all(&(!len).to_be_bytes())?;
-    writer.write_all(envelope)
+    writer.write_all(envelope)?;
+    writer.flush()
 }
 
 pub(crate) fn write_storage_rpc_auth_transport_frame_with_limit<W: Write>(
@@ -1530,6 +1531,21 @@ mod tests {
     use crate::control_plane_auth::ControlPlaneScopedCredentialInput;
     use std::io::Cursor;
 
+    struct FlushFailureWriter;
+
+    impl Write for FlushFailureWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected authenticated frame flush failure",
+            ))
+        }
+    }
+
     const TOPOLOGY_DIGEST: &str =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1666,6 +1682,17 @@ mod tests {
             read_storage_rpc_auth_transport_frame(&mut Cursor::new(encoded)).unwrap(),
             envelope
         );
+    }
+
+    #[test]
+    fn storage_rpc_auth_transport_frame_reports_flush_failure() {
+        let error = write_storage_rpc_auth_transport_frame(
+            &mut FlushFailureWriter,
+            b"authenticated-storage-rpc",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[test]

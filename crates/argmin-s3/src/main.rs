@@ -7514,6 +7514,9 @@ fn build_storage_node_process_config(
     if let Some(rpc_auth) = config.storage_rpc_server_auth.clone() {
         prepared = prepared.with_rpc_auth(rpc_auth);
     }
+    if !config.storage_rpc_listeners.is_empty() {
+        prepared = prepared.with_rpc_listeners(config.storage_rpc_listeners.clone());
+    }
     Ok(BuiltStorageNodeProcessConfig {
         prepared_server: prepared,
         control_plane_node_incarnation: None,
@@ -7625,6 +7628,9 @@ fn build_control_plane_storage_node_process_config(
         .map_err(|error| error.to_string())?;
     if let Some(rpc_auth) = config.storage_rpc_server_auth.clone() {
         prepared_server = prepared_server.with_rpc_auth(rpc_auth);
+    }
+    if !config.storage_rpc_listeners.is_empty() {
+        prepared_server = prepared_server.with_rpc_listeners(config.storage_rpc_listeners.clone());
     }
     Ok(BuiltStorageNodeProcessConfig {
         prepared_server,
@@ -7980,6 +7986,26 @@ fn build_frontend_storage_cluster_from_runtime_map(
         k: ec_config.data_shards(),
         m: ec_config.parity_shards(),
     };
+    if !config.storage_rpc_client_endpoints.is_empty() {
+        let capability = config
+            .storage_rpc_frontend_client_auth
+            .clone()
+            .ok_or_else(|| {
+                "configured storage RPC endpoints require frontend authentication".to_string()
+            })?;
+        return StorageCluster::from_runtime_map_with_storage_rpc_endpoints_and_frontend_auth(
+            metadata_primary_node_id,
+            runtime_map,
+            ec_shape,
+            unix_storage_node_client_admission_settings(config),
+            config
+                .storage_rpc_client_endpoints
+                .iter()
+                .map(|(node_id, endpoint)| (NodeId::new(*node_id), endpoint.clone())),
+            capability,
+        )
+        .map_err(|error| error.to_string());
+    }
     match config.storage_rpc_frontend_client_auth.clone() {
         Some(capability) => StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings_and_frontend_auth(
             metadata_primary_node_id,
@@ -8011,6 +8037,24 @@ fn build_maintenance_storage_cluster_from_runtime_map(
         .first()
         .map(|node| node.node_id())
         .ok_or_else(|| "control-plane runtime map has no routed nodes".to_string())?;
+    if !config.storage_rpc_client_endpoints.is_empty() {
+        return StorageCluster::from_runtime_map_with_storage_rpc_endpoints_and_maintenance_auth(
+            metadata_primary_node_id,
+            runtime_map,
+            EcShape {
+                k: ec_config.data_shards(),
+                m: ec_config.parity_shards(),
+            },
+            unix_storage_node_client_admission_settings(config),
+            config
+                .storage_rpc_client_endpoints
+                .iter()
+                .map(|(node_id, endpoint)| (NodeId::new(*node_id), endpoint.clone())),
+            capability,
+        )
+        .map(Some)
+        .map_err(|error| error.to_string());
+    }
     StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings_and_maintenance_auth(
         metadata_primary_node_id,
         runtime_map,
@@ -9299,6 +9343,8 @@ mod tests {
             static_initial_cluster_map: None,
             storage_node_socket_path: Some("/tmp/argmin-test/node-0002.sock".to_string()),
             storage_node_sockets: Vec::new(),
+            storage_rpc_client_endpoints: Vec::new(),
+            storage_rpc_listeners: Vec::new(),
             storage_node_rpc_admission_limit:
                 LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_LIMIT,
             storage_node_rpc_admission_wait_timeout:

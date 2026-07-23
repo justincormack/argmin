@@ -44,6 +44,7 @@ pub mod shard_key_hash;
 #[allow(dead_code)]
 pub(crate) mod storage_rpc;
 pub(crate) mod storage_rpc_auth;
+pub mod storage_rpc_transport;
 pub mod types;
 
 // Narrow facades preserve the crate's established module paths while the

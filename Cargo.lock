@@ -2443,6 +2443,7 @@ dependencies = [
  "rapidhash",
  "ring",
  "rusqlite",
+ "rustls",
  "s3-types",
  "test-util",
  "thiserror",

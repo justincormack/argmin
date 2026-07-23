@@ -42,6 +42,7 @@ use crate::node_client::{
 };
 use crate::pg_store::PgClusterMapHistoryReferenceSummary;
 use crate::pg_topology::PgTopology;
+use crate::storage_rpc_transport::StorageRpcClientEndpoint;
 use crate::{
     BucketDeleteFinalizeRoot, BucketName, BucketPgId, ClusterEpoch, DataPgId, EcShape,
     GenerationId, MetadataError, ObjectKey, ObjectMetadataPgId, ObjectMetadataScanPgId, PgId,
@@ -112,7 +113,7 @@ pub struct LocalUnixShardNodeClientConfig {
 #[derive(Debug, Clone)]
 pub struct LocalUnixStorageNodeClientConfig {
     node_id: NodeId,
-    socket_path: PathBuf,
+    endpoint: StorageRpcClientEndpoint,
     rpc_admission_limit: usize,
     rpc_admission_wait_timeout: Duration,
     rpc_control_admission_wait_timeout: Duration,
@@ -147,7 +148,7 @@ impl LocalUnixStorageNodeClientConfig {
     pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
         Self {
             node_id,
-            socket_path: socket_path.into(),
+            endpoint: StorageRpcClientEndpoint::unix(socket_path),
             rpc_admission_limit: Self::DEFAULT_RPC_ADMISSION_LIMIT,
             rpc_admission_wait_timeout: Self::DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
             rpc_control_admission_wait_timeout: Self::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
@@ -166,10 +167,25 @@ impl LocalUnixStorageNodeClientConfig {
     ) -> Self {
         Self {
             node_id,
-            socket_path: socket_path.into(),
+            endpoint: StorageRpcClientEndpoint::unix(socket_path),
             rpc_admission_limit,
             rpc_admission_wait_timeout: Self::DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
             rpc_control_admission_wait_timeout: Self::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
+            rpc_auth: None,
+        }
+    }
+
+    pub fn with_rpc_endpoint_and_admission_settings(
+        node_id: NodeId,
+        endpoint: StorageRpcClientEndpoint,
+        settings: LocalUnixStorageNodeClientAdmissionSettings,
+    ) -> Self {
+        Self {
+            node_id,
+            endpoint,
+            rpc_admission_limit: settings.rpc_admission_limit(),
+            rpc_admission_wait_timeout: settings.rpc_admission_wait_timeout(),
+            rpc_control_admission_wait_timeout: settings.rpc_control_admission_wait_timeout(),
             rpc_auth: None,
         }
     }
@@ -181,7 +197,7 @@ impl LocalUnixStorageNodeClientConfig {
     ) -> Self {
         Self {
             node_id,
-            socket_path: socket_path.into(),
+            endpoint: StorageRpcClientEndpoint::unix(socket_path),
             rpc_admission_limit: settings.rpc_admission_limit(),
             rpc_admission_wait_timeout: settings.rpc_admission_wait_timeout(),
             rpc_control_admission_wait_timeout: settings.rpc_control_admission_wait_timeout(),
@@ -246,8 +262,8 @@ impl LocalUnixStorageNodeClientConfig {
         self.node_id
     }
 
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
+    pub fn socket_path(&self) -> Option<&Path> {
+        self.endpoint.unix_socket_path()
     }
 
     pub fn rpc_admission_limit(&self) -> usize {
@@ -2244,17 +2260,21 @@ impl LocalClusterMap {
                 .nodes
                 .get_mut(&config.node_id)
                 .expect("validated remote storage-node client node must exist");
-            let client = Arc::new(UnixStorageNodeClient::with_rpc_admission_settings_and_auth(
-                config.node_id,
-                self.epoch,
-                config.socket_path.clone(),
-                LocalUnixStorageNodeClientAdmissionSettings {
-                    rpc_admission_limit: config.rpc_admission_limit,
-                    rpc_admission_wait_timeout: config.rpc_admission_wait_timeout,
-                    rpc_control_admission_wait_timeout: config.rpc_control_admission_wait_timeout,
-                },
-                config.rpc_auth,
-            ));
+            let unix_socket_path = config.endpoint.unix_socket_path().map(Path::to_path_buf);
+            let client = Arc::new(
+                UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+                    config.node_id,
+                    self.epoch,
+                    config.endpoint,
+                    LocalUnixStorageNodeClientAdmissionSettings {
+                        rpc_admission_limit: config.rpc_admission_limit,
+                        rpc_admission_wait_timeout: config.rpc_admission_wait_timeout,
+                        rpc_control_admission_wait_timeout: config
+                            .rpc_control_admission_wait_timeout,
+                    },
+                    config.rpc_auth,
+                ),
+            );
             let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = client.clone();
             let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> =
                 client.clone();
@@ -2276,9 +2296,9 @@ impl LocalClusterMap {
             let shard_scavenger_client: Arc<dyn ShardScavengerNodeClient> = client;
 
             node.bucket_metadata_client = bucket_metadata_client;
-            node.bucket_metadata_unix_socket_path = Some(config.socket_path.clone());
+            node.bucket_metadata_unix_socket_path = unix_socket_path.clone();
             node.bucket_write_reservation_client = bucket_write_reservation_client;
-            node.bucket_write_reservation_unix_socket_path = Some(config.socket_path);
+            node.bucket_write_reservation_unix_socket_path = unix_socket_path;
             node.metadata_command_client = metadata_command_client;
             node.object_generation_metadata_client = object_generation_metadata_client;
             node.object_version_metadata_client = object_version_metadata_client;
@@ -2306,12 +2326,14 @@ impl LocalClusterMap {
                     id: config.node_id.as_u32(),
                 });
             }
-            if !config.socket_path.is_absolute() {
-                return Err(
-                    ClusterBuildError::RemoteStorageNodeClientSocketPathNotAbsolute {
-                        path: config.socket_path.clone(),
-                    },
-                );
+            if let Some(socket_path) = config.endpoint.unix_socket_path() {
+                if !socket_path.is_absolute() {
+                    return Err(
+                        ClusterBuildError::RemoteStorageNodeClientSocketPathNotAbsolute {
+                            path: socket_path.to_path_buf(),
+                        },
+                    );
+                }
             }
             if !self.nodes.contains_key(&config.node_id) {
                 return Err(ClusterBuildError::RemoteStorageNodeClientNodeNotFound {

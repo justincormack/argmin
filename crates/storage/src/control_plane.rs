@@ -40985,7 +40985,7 @@ mod tests {
         assert_eq!(default_config.node_id(), NodeId::new(1));
         assert_eq!(
             default_config.socket_path(),
-            std::path::Path::new("node-1.sock")
+            Some(std::path::Path::new("node-1.sock"))
         );
         assert_eq!(
             default_config.rpc_admission_limit(),
@@ -41004,7 +41004,7 @@ mod tests {
         assert_eq!(configured.node_id(), NodeId::new(1));
         assert_eq!(
             configured.socket_path(),
-            std::path::Path::new("node-1.sock")
+            Some(std::path::Path::new("node-1.sock"))
         );
         assert_eq!(configured.rpc_admission_limit(), 17);
         assert_eq!(
@@ -41031,7 +41031,7 @@ mod tests {
         assert_eq!(refreshed_config.node_id(), NodeId::new(1));
         assert_eq!(
             refreshed_config.socket_path(),
-            std::path::Path::new("node-1.sock")
+            Some(std::path::Path::new("node-1.sock"))
         );
         assert_eq!(refreshed_config.rpc_admission_limit(), 23);
         assert_eq!(

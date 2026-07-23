@@ -3,8 +3,9 @@ use super::*;
 pub(crate) struct UnixStorageNodeReadHandleSession {
     node_id: NodeId,
     route_cluster_epoch: ClusterEpoch,
-    stream: UnixStream,
+    stream: BoxStorageRpcStream,
     next_request_id: u64,
+    io_timeout: Duration,
     rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
     _rpc_permit: Option<UnixStorageNodeRpcAdmissionPermit>,
     _object_payload_lease_permit: Option<UnixStorageNodeObjectPayloadLeaseAdmissionPermit>,
@@ -19,8 +20,9 @@ pub(crate) struct UnixStorageNodeMetadataCommandSession {
 }
 
 struct UnixStorageNodeMetadataCommandSessionInner {
-    stream: UnixStream,
+    stream: BoxStorageRpcStream,
     next_request_id: u64,
+    io_timeout: Duration,
     pg_id: PgId,
     released: bool,
 }
@@ -40,6 +42,26 @@ struct UnixObjectPayloadLease {
 }
 
 impl UnixStorageNodeClient {
+    fn connect_session_stream(
+        &self,
+        context: &'static str,
+    ) -> Result<(BoxStorageRpcStream, Duration), StoreError> {
+        let io_timeout = storage_rpc_io_timeout(self.rpc_auth.as_deref());
+        let deadline = Instant::now()
+            .checked_add(io_timeout)
+            .ok_or_else(|| StoreError::Io {
+                context,
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "storage-node RPC session deadline overflowed",
+                ),
+            })?;
+        self.endpoint
+            .connect(deadline)
+            .map(|stream| (stream, io_timeout))
+            .map_err(|source| StoreError::Io { context, source })
+    }
+
     #[cfg(test)]
     pub(crate) fn active_admitted_session_count_for_test(&self) -> usize {
         self.rpc_admission.active_session_count_for_test()
@@ -49,20 +71,14 @@ impl UnixStorageNodeClient {
         &self,
     ) -> Result<UnixStorageNodeReadHandleSession, StoreError> {
         let rpc_permit = self.acquire_rpc_admission(StorageRpcMessageKind::ReadHandlesAcquire)?;
-        let stream = UnixStream::connect(&self.socket_path).map_err(|source| StoreError::Io {
-            context: "connect storage-node read-handle RPC socket",
-            source,
-        })?;
-        configure_storage_rpc_stream_timeout(
-            &stream,
-            "configure storage-node read-handle RPC socket timeout",
-            self.rpc_auth.as_deref(),
-        )?;
+        let (stream, io_timeout) =
+            self.connect_session_stream("connect storage-node read-handle RPC endpoint")?;
         Ok(UnixStorageNodeReadHandleSession {
             node_id: self.node_id,
             route_cluster_epoch: self.cluster_epoch,
             stream,
             next_request_id: 1,
+            io_timeout,
             rpc_auth: self.rpc_auth.clone(),
             _rpc_permit: Some(rpc_permit),
             _object_payload_lease_permit: None,
@@ -74,20 +90,14 @@ impl UnixStorageNodeClient {
         kind: ObjectPayloadLeaseKind,
     ) -> Result<UnixStorageNodeReadHandleSession, StoreError> {
         let lease_permit = self.acquire_object_payload_lease_session_admission(kind)?;
-        let stream = UnixStream::connect(&self.socket_path).map_err(|source| StoreError::Io {
-            context: "connect storage-node object-payload lease RPC socket",
-            source,
-        })?;
-        configure_storage_rpc_stream_timeout(
-            &stream,
-            "configure storage-node object-payload lease RPC socket timeout",
-            self.rpc_auth.as_deref(),
-        )?;
+        let (stream, io_timeout) =
+            self.connect_session_stream("connect storage-node object-payload lease RPC endpoint")?;
         Ok(UnixStorageNodeReadHandleSession {
             node_id: self.node_id,
             route_cluster_epoch: self.cluster_epoch,
             stream,
             next_request_id: 1,
+            io_timeout,
             rpc_auth: self.rpc_auth.clone(),
             _rpc_permit: None,
             _object_payload_lease_permit: Some(lease_permit),
@@ -161,15 +171,8 @@ impl UnixStorageNodeClient {
     ) -> Result<UnixStorageNodeMetadataCommandSession, StoreError> {
         let rpc_permit =
             self.acquire_rpc_admission(StorageRpcMessageKind::MetadataCommandPgLockAcquire)?;
-        let stream = UnixStream::connect(&self.socket_path).map_err(|source| StoreError::Io {
-            context: "connect storage-node metadata command RPC socket",
-            source,
-        })?;
-        configure_storage_rpc_stream_timeout(
-            &stream,
-            "configure storage-node metadata command RPC socket timeout",
-            self.rpc_auth.as_deref(),
-        )?;
+        let (stream, io_timeout) =
+            self.connect_session_stream("connect storage-node metadata command RPC endpoint")?;
         let session = UnixStorageNodeMetadataCommandSession {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
@@ -178,6 +181,7 @@ impl UnixStorageNodeClient {
             inner: Mutex::new(UnixStorageNodeMetadataCommandSessionInner {
                 stream,
                 next_request_id: 1,
+                io_timeout,
                 pg_id,
                 released: false,
             }),
@@ -272,6 +276,18 @@ impl UnixStorageNodeReadHandleSession {
         kind: StorageRpcMessageKind,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, StoreError> {
+        let deadline = Instant::now().checked_add(self.io_timeout).ok_or_else(|| {
+            self.rpc_payload_error(
+                "set read-handle RPC deadline",
+                "storage-node read-handle RPC deadline overflowed".to_string(),
+            )
+        })?;
+        self.stream
+            .set_operation_deadline(deadline)
+            .map_err(|source| StoreError::Io {
+                context: "set storage-node read-handle RPC deadline",
+                source,
+            })?;
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.checked_add(1).ok_or_else(|| {
             self.rpc_payload_error(
@@ -375,6 +391,21 @@ impl UnixStorageNodeMetadataCommandSession {
         payload: Vec<u8>,
     ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = Instant::now()
+            .checked_add(inner.io_timeout)
+            .ok_or_else(|| {
+                self.rpc_payload_error(
+                    "set metadata command session RPC deadline",
+                    "storage-node metadata command session RPC deadline overflowed".to_string(),
+                )
+            })?;
+        inner
+            .stream
+            .set_operation_deadline(deadline)
+            .map_err(|source| StoreError::Io {
+                context: "set storage-node metadata command session RPC deadline",
+                source,
+            })?;
         let request_id = inner.next_request_id;
         inner.next_request_id = inner.next_request_id.checked_add(1).ok_or_else(|| {
             self.rpc_payload_error(
@@ -1948,6 +1979,8 @@ impl ShardReadHandleLease for UnixStorageNodeReadHandleLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_rpc_transport::accepted_unix_stream;
+    use std::os::unix::net::UnixStream;
 
     fn test_rpc_admission_permit() -> UnixStorageNodeRpcAdmissionPermit {
         Arc::new(UnixStorageNodeRpcAdmission::new(1))
@@ -1976,11 +2009,13 @@ mod tests {
         ));
 
         let (read_stream, _read_peer) = UnixStream::pair().unwrap();
+        let io_timeout = Duration::from_secs(1);
         let read_session = UnixStorageNodeReadHandleSession {
             node_id: NodeId::new(8),
             route_cluster_epoch: ClusterEpoch::new(1).unwrap(),
-            stream: read_stream,
+            stream: accepted_unix_stream(read_stream, Instant::now() + io_timeout).unwrap(),
             next_request_id: 1,
+            io_timeout,
             rpc_auth: None,
             _rpc_permit: Some(test_rpc_admission_permit()),
             _object_payload_lease_permit: None,
@@ -1999,14 +2034,16 @@ mod tests {
         ));
 
         let (metadata_stream, _metadata_peer) = UnixStream::pair().unwrap();
+        let io_timeout = Duration::from_secs(1);
         let metadata_session = UnixStorageNodeMetadataCommandSession {
             node_id: NodeId::new(9),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             rpc_auth: None,
             _rpc_permit: test_rpc_admission_permit(),
             inner: Mutex::new(UnixStorageNodeMetadataCommandSessionInner {
-                stream: metadata_stream,
+                stream: accepted_unix_stream(metadata_stream, Instant::now() + io_timeout).unwrap(),
                 next_request_id: 1,
+                io_timeout,
                 pg_id: PgId::new(3),
                 released: true,
             }),

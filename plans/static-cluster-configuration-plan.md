@@ -158,12 +158,13 @@ identity binding, syncing, and root identity publication, so ordinary startup
 cannot interleave with initialization. Both the production and static
 coordination locks are opened atomically without following symlinks and must be
 regular files before their pathnames are treated as coordination metadata.
-This prepares state only;
-ordinary replicated storage startup remains unavailable until mandatory
-storage-RPC authentication is enforced at the Unix dispatch boundary and every
-stateful handler reaches its server-local, capability-requiring effect
-boundary. Activation requires composed positive and adversarial tests crossing
-both layers; outer authentication alone is not a replicated-runtime gate.
+This prepares state only. Split-role replicated storage and frontend startup
+now enforce mandatory storage-RPC authentication at the shared Unix/TLS-TCP
+dispatch boundary. Replicated-mode release certification remains unavailable
+until every stateful handler reaches its server-local, capability-requiring
+effect boundary. Certification requires composed positive and adversarial
+tests crossing both layers; outer authentication alone is not the release
+gate.
 
 Replicated control-plane process identity is initialized through the same
 command, once per configured authority process id. This creates only the
@@ -1000,11 +1001,10 @@ Progress as of 2026-07-21:
   Canonical advertised addresses are unique per storage node so endpoint
   identity cannot disagree with target-bound storage authentication.
   A local Unix endpoint may remain preferred for host-local callers, but a
-  mixed-host topology certifies its globally reachable TCP fallback. This is
-  control-plane map construction only and does not activate the storage TCP
-  data plane.
-  Storage-node/frontend replicated process mapping and migration of remaining
-  process fixtures to shared manifest builders remain open.
+  mixed-host topology certifies its globally reachable TCP fallback. The same
+  certified endpoint map now drives split-role storage/frontend clients and
+  listeners over authenticated Unix or TLS/TCP transport. Migration of
+  remaining process fixtures to shared manifest builders remains open.
 - Slice 4's standalone storage sub-slice is implemented: file-mode
   `all-in-one` configuration carries the process identity into runtime,
   `initialize-cluster-state` durably publishes identity only after complete PG
@@ -1023,12 +1023,12 @@ Progress as of 2026-07-21:
   roots through the production storage-node engine, using the manifest's exact
   node id, complete PG set, EC shape, initial epoch, and process identity.
   Initialization is idempotent and crash-resumable under the same durable
-  marker/root/PG publication protocol. Replicated runtime activation remains
-  blocked on both mandatory Unix storage-RPC authentication and complete
-  server-local operation-capability enforcement rather than opening a listener
-  after only the outer auth layer lands. Composed workflow tests must cross the
+  marker/root/PG publication protocol. Split-role replicated runtime activation
+  now has mandatory transport-independent storage-RPC authentication over Unix
+  and TLS/TCP. Complete release certification remains blocked on server-local
+  operation-capability enforcement. Composed workflow tests must cross the
   authenticated principal-role check and the local route/subject capability
-  boundary before activation.
+  boundary before that gate closes.
 - Slice 5's material-resolution sub-slice is implemented: a selected process
   resolves bounded no-follow files into redacted binary credential material,
   rustls certified keys, and explicit root stores. Resolution is role/listener
@@ -1036,11 +1036,12 @@ Progress as of 2026-07-21:
   PEM section types, validates CA constraints and signing usage, bounds total
   selected-process material, verifies local listener
   certificate/key/trust/server-name consistency, and has a separate redacted
-  `validate-cluster-material` preflight command. Replicated Unix control-plane
+  `validate-cluster-material` preflight command. Replicated control-plane
   mapping consumes resolved binary credential bytes directly, keeps verifier
   credentials distinct from the manifest-selected signer during rotation, and
-  never converts secrets back into legacy env-style strings. Storage/frontend
-  activation and storage RPC TLS/TCP construction remain open.
+  never converts secrets back into legacy env-style strings. Split-role
+  storage/frontend mapping now consumes the same resolved material for
+  application-authenticated Unix and TLS/TCP storage RPCs.
 - Slice 6's Raft transport-planning and activation sub-slices are implemented:
   the validated
   manifest resolves the canonical globally reachable endpoint for every voter
@@ -1149,11 +1150,31 @@ Progress as of 2026-07-21:
   cannot authorize response substitution across requests. Legacy unframed
   traffic cannot interoperate with an authenticated listener. Focused coverage
   crosses the real Unix client/server boundary and rejects missing framing,
-  wrong target, and wrong topology before dispatch. Replicated `combined`
-  processes remain fail-closed until their embedded workflows receive the same
-  operation-scoped credential composition. Storage RPC TCP activation and its
-  composed cross-host workload also remain open, so this slice does not yet
-  claim a complete cross-host data plane.
+  wrong target, and wrong topology before dispatch. The authenticated storage
+  RPC TLS/TCP activation sub-slice is also implemented. Storage clients and
+  listeners share the existing application-authenticated frame and dispatch
+  boundary unchanged across transports; TCP requires application auth, TLS
+  1.3, the configured private or PKI trust roots and server name, and exact
+  `argmin-storage-rpc/1` ALPN negotiation. Connect, handshake, framed I/O, and
+  the first response use one absolute operation deadline, including deadline
+  checks on each underlying TLS socket read/write. Accepted TCP sockets enter
+  the bounded connection worker before TLS negotiation, so malformed or
+  stalled handshakes cannot terminate or serialize the listener loop. Complete
+  request and response frames are flushed under that same operation deadline
+  before publication is reported or a persistent session receives a fresh
+  deadline. Selected-process mapping
+  activates every owned Unix/TCP storage listener, resolves canonical remote
+  TCP addresses once at startup, applies the strictest selected transport
+  limits, and retains the exact transport endpoint and role-typed signer
+  through content-changing runtime-map refresh. Focused tests cover a composed
+  authenticated TLS request/response through the real storage server, reject a
+  TCP listener without application authentication, validate Unix and TCP
+  manifest mappings, and prove TLS endpoint retention after refresh.
+  Replicated `combined` processes remain fail-closed until their embedded
+  workflows receive the same operation-scoped credential composition. The
+  multi-process cross-host data-plane workload and complete server-local
+  operation-capability gate remain open, so this slice does not yet claim a
+  complete cross-host data plane.
 - Slice 4's initial Raft binding sub-slice is implemented. A two-phase,
   no-follow, fsync'd, SHA-256-protected process-identity sidecar is created only
   by explicit `initialize-cluster-state` while holding the same process state
@@ -1296,8 +1317,10 @@ Progress as of 2026-07-21:
      Unix maintenance-client test
      lands with the still-open Unix client/listener enforcement and manifest
      credential activation sub-slice;
-   - reuse it unchanged over TCP; and
-   - promote the cross-host workload to a complete data-plane release gate.
+   - reuse it unchanged over TCP (implemented for split-role storage and
+     frontend runtime activation); and
+   - complete the server-local operation-capability gate, then promote the
+     cross-host workload to a complete data-plane release gate.
 
 ## Required Tests
 

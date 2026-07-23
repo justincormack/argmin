@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
@@ -315,6 +316,9 @@ use crate::storage_rpc::{
 use crate::storage_rpc_auth::{
     write_storage_rpc_auth_transport_frame_with_limit, StorageRpcResponseSigningContext,
     StorageRpcServerAuthConfig,
+};
+use crate::storage_rpc_transport::{
+    accepted_tls_tcp_stream, accepted_unix_stream, BoxStorageRpcStream, STORAGE_RPC_TLS_ALPN,
 };
 use crate::types::{BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
 use crate::types::{
@@ -1651,6 +1655,17 @@ pub enum StorageNodeServerError {
         #[source]
         source: io::Error,
     },
+    #[error("storage-node RPC listener error during {context} for {endpoint}: {source}")]
+    RpcListenerIo {
+        context: &'static str,
+        endpoint: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("storage-node RPC listener set must not be empty")]
+    EmptyRpcListenerSet,
+    #[error("storage-node TCP RPC listener {bind_addr} requires storage RPC authentication")]
+    TcpRpcListenerRequiresAuthentication { bind_addr: SocketAddr },
     #[error("invalid storage-node incarnation {value:?} in {path:?}")]
     InvalidNodeIncarnation { path: PathBuf, value: String },
     #[error("storage-node incarnation counter overflowed in {path:?}")]
@@ -1746,6 +1761,95 @@ struct StorageNodeRuntimeRouteState {
     route_map_lease: Option<BoundRouteMapLease>,
 }
 
+#[derive(Clone)]
+pub enum StorageNodeRpcListenerConfig {
+    Unix {
+        socket_path: PathBuf,
+    },
+    Tcp {
+        bind_addr: SocketAddr,
+        tls_server_config: Arc<rustls::ServerConfig>,
+    },
+}
+
+impl std::fmt::Debug for StorageNodeRpcListenerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unix { socket_path } => formatter
+                .debug_struct("StorageNodeRpcListenerConfig::Unix")
+                .field("socket_path", socket_path)
+                .finish(),
+            Self::Tcp { bind_addr, .. } => formatter
+                .debug_struct("StorageNodeRpcListenerConfig::Tcp")
+                .field("bind_addr", bind_addr)
+                .field("tls", &true)
+                .finish(),
+        }
+    }
+}
+
+enum StorageNodeRpcListener {
+    Unix {
+        listener: UnixListener,
+        socket_path: PathBuf,
+    },
+    Tcp {
+        listener: TcpListener,
+        bind_addr: SocketAddr,
+        tls_server_config: Arc<rustls::ServerConfig>,
+    },
+}
+
+impl Drop for StorageNodeRpcListener {
+    fn drop(&mut self) {
+        if let Self::Unix { socket_path, .. } = self {
+            let _ = fs::remove_file(socket_path);
+        }
+    }
+}
+
+enum AcceptedStorageNodeRpcStream {
+    Unix(std::os::unix::net::UnixStream),
+    Tcp {
+        stream: TcpStream,
+        tls_server_config: Arc<rustls::ServerConfig>,
+    },
+}
+
+impl StorageNodeRpcListener {
+    fn raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Self::Unix { listener, .. } => listener.as_raw_fd(),
+            Self::Tcp { listener, .. } => listener.as_raw_fd(),
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        match self {
+            Self::Unix { socket_path, .. } => socket_path.to_string_lossy().into_owned(),
+            Self::Tcp { bind_addr, .. } => bind_addr.to_string(),
+        }
+    }
+
+    fn accept(&self) -> io::Result<AcceptedStorageNodeRpcStream> {
+        match self {
+            Self::Unix { listener, .. } => listener
+                .accept()
+                .map(|(stream, _)| AcceptedStorageNodeRpcStream::Unix(stream)),
+            Self::Tcp {
+                listener,
+                tls_server_config,
+                ..
+            } => listener
+                .accept()
+                .map(|(stream, _)| AcceptedStorageNodeRpcStream::Tcp {
+                    stream,
+                    tls_server_config: Arc::clone(tls_server_config),
+                }),
+        }
+    }
+}
+
 pub struct StorageNodeServer {
     runtime_route_state: Arc<RwLock<StorageNodeRuntimeRouteState>>,
     runtime_config_install_lock: Mutex<()>,
@@ -1753,7 +1857,7 @@ pub struct StorageNodeServer {
     _data_dir_lock: StorageNodeDataDirLock,
     control_plane_incarnation_lock: Mutex<()>,
     _node: Arc<SharedStorageNode>,
-    listener: UnixListener,
+    listeners: Vec<StorageNodeRpcListener>,
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     active_sessions: Arc<StorageNodeActiveSessions>,
     metadata_command_locks: StorageNodeMetadataCommandLocks,
@@ -1975,6 +2079,7 @@ pub struct PreparedStorageNodeServer {
     config: StorageNodeProcessConfig,
     data_dir_guard: Option<StorageNodeDataDirGuard>,
     rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
+    rpc_listeners: Option<Vec<StorageNodeRpcListenerConfig>>,
 }
 
 impl PreparedStorageNodeServer {
@@ -1984,6 +2089,7 @@ impl PreparedStorageNodeServer {
             config,
             data_dir_guard: None,
             rpc_auth: None,
+            rpc_listeners: None,
         }
     }
 
@@ -1995,12 +2101,19 @@ impl PreparedStorageNodeServer {
             config,
             data_dir_guard: Some(data_dir_guard),
             rpc_auth: None,
+            rpc_listeners: None,
         }
     }
 
     #[must_use]
     pub fn with_rpc_auth(mut self, rpc_auth: StorageRpcServerAuthConfig) -> Self {
         self.rpc_auth = Some(Arc::new(rpc_auth));
+        self
+    }
+
+    #[must_use]
+    pub fn with_rpc_listeners(mut self, listeners: Vec<StorageNodeRpcListenerConfig>) -> Self {
+        self.rpc_listeners = Some(listeners);
         self
     }
 
@@ -2015,8 +2128,13 @@ impl PreparedStorageNodeServer {
                 self.config,
                 data_dir_guard,
                 self.rpc_auth,
+                self.rpc_listeners,
             ),
-            None => StorageNodeServer::bind_with_rpc_auth(self.config, self.rpc_auth),
+            None => StorageNodeServer::bind_with_rpc_auth(
+                self.config,
+                self.rpc_auth,
+                self.rpc_listeners,
+            ),
         }
     }
 }
@@ -2167,42 +2285,110 @@ fn metadata_command_checkpoint_candidates_for_frame(
     Ok(checkpoints)
 }
 
+fn bind_storage_node_rpc_listeners(
+    configs: Vec<StorageNodeRpcListenerConfig>,
+    rpc_auth: Option<&StorageRpcServerAuthConfig>,
+) -> Result<Vec<StorageNodeRpcListener>, StorageNodeServerError> {
+    if configs.is_empty() {
+        return Err(StorageNodeServerError::EmptyRpcListenerSet);
+    }
+    let mut listeners = Vec::with_capacity(configs.len());
+    for config in configs {
+        match config {
+            StorageNodeRpcListenerConfig::Unix { socket_path } => {
+                validate_socket_directory(&socket_path)?;
+                cleanup_stale_socket_path(&socket_path)?;
+                let listener = UnixListener::bind(&socket_path).map_err(|source| {
+                    StorageNodeServerError::RpcListenerIo {
+                        context: "bind Unix storage-node RPC listener",
+                        endpoint: socket_path.to_string_lossy().into_owned(),
+                        source,
+                    }
+                })?;
+                listeners.push(StorageNodeRpcListener::Unix {
+                    listener,
+                    socket_path,
+                });
+            }
+            StorageNodeRpcListenerConfig::Tcp {
+                bind_addr,
+                tls_server_config,
+            } => {
+                if rpc_auth.is_none() {
+                    return Err(
+                        StorageNodeServerError::TcpRpcListenerRequiresAuthentication { bind_addr },
+                    );
+                }
+                if tls_server_config.alpn_protocols != [STORAGE_RPC_TLS_ALPN] {
+                    return Err(StorageNodeServerError::RpcListenerIo {
+                        context: "validate TLS storage-node RPC listener",
+                        endpoint: bind_addr.to_string(),
+                        source: io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "storage-node RPC TLS server must offer only argmin-storage-rpc/1 ALPN",
+                        ),
+                    });
+                }
+                let listener = TcpListener::bind(bind_addr).map_err(|source| {
+                    StorageNodeServerError::RpcListenerIo {
+                        context: "bind TCP storage-node RPC listener",
+                        endpoint: bind_addr.to_string(),
+                        source,
+                    }
+                })?;
+                let bind_addr = listener.local_addr().map_err(|source| {
+                    StorageNodeServerError::RpcListenerIo {
+                        context: "inspect TCP storage-node RPC listener",
+                        endpoint: bind_addr.to_string(),
+                        source,
+                    }
+                })?;
+                listeners.push(StorageNodeRpcListener::Tcp {
+                    listener,
+                    bind_addr,
+                    tls_server_config,
+                });
+            }
+        }
+    }
+    Ok(listeners)
+}
+
 impl StorageNodeServer {
     pub fn bind(config: StorageNodeProcessConfig) -> Result<Self, StorageNodeServerError> {
-        Self::bind_with_rpc_auth(config, None)
+        Self::bind_with_rpc_auth(config, None, None)
     }
 
     fn bind_with_rpc_auth(
         config: StorageNodeProcessConfig,
         rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
+        rpc_listeners: Option<Vec<StorageNodeRpcListenerConfig>>,
     ) -> Result<Self, StorageNodeServerError> {
         let data_dir_guard = StorageNodeDataDirGuard::acquire(&config.data_dir)?;
-        Self::bind_with_data_dir_guard(config, data_dir_guard, rpc_auth)
+        Self::bind_with_data_dir_guard(config, data_dir_guard, rpc_auth, rpc_listeners)
     }
 
     fn bind_with_data_dir_guard(
         config: StorageNodeProcessConfig,
         data_dir_guard: StorageNodeDataDirGuard,
         rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
+        rpc_listeners: Option<Vec<StorageNodeRpcListenerConfig>>,
     ) -> Result<Self, StorageNodeServerError> {
         validate_process_config_route_table(&config)?;
         let data_dir_lock = data_dir_guard.into_lock_for(&config.data_dir)?;
         validate_process_config_matches_persisted_runtime_config(&config)?;
-        validate_socket_directory(&config.socket_path)?;
-        cleanup_stale_socket_path(&config.socket_path)?;
         let node = SharedStorageNode::open_with_default_ec_shape(
             &config.data_dir,
             &config.pg_ids,
             config.default_ec_shape,
         )?;
         node.recover_pg_metadata_command_state(config.node_id)?;
-        let listener = UnixListener::bind(&config.socket_path).map_err(|source| {
-            StorageNodeServerError::Io {
-                context: "bind storage-node socket",
-                path: config.socket_path.clone(),
-                source,
-            }
-        })?;
+        let rpc_listeners = rpc_listeners.unwrap_or_else(|| {
+            vec![StorageNodeRpcListenerConfig::Unix {
+                socket_path: config.socket_path.clone(),
+            }]
+        });
+        let listeners = bind_storage_node_rpc_listeners(rpc_listeners, rpc_auth.as_deref())?;
         let route_map_lease = bind_storage_node_route_map_lease(config.route_map_validity)?;
         Ok(Self {
             runtime_route_state: Arc::new(RwLock::new(StorageNodeRuntimeRouteState {
@@ -2214,7 +2400,7 @@ impl StorageNodeServer {
             _data_dir_lock: data_dir_lock,
             control_plane_incarnation_lock: Mutex::new(()),
             _node: Arc::new(node),
-            listener,
+            listeners,
             read_handles: Arc::new(Mutex::new(StorageNodeReadHandleState::default())),
             active_sessions: Arc::new(StorageNodeActiveSessions::default()),
             metadata_command_locks: StorageNodeMetadataCommandLocks::default(),
@@ -2238,20 +2424,11 @@ impl StorageNodeServer {
 
     pub fn accept_one(&self) -> Result<(), StorageNodeServerError> {
         let session_guard = self.acquire_session();
-        let (mut stream, _) =
-            self.listener
-                .accept()
-                .map_err(|source| StorageNodeServerError::Io {
-                    context: "accept storage-node connection",
-                    path: self.config_snapshot().socket_path,
-                    source,
-                })?;
-        configure_storage_node_rpc_stream_timeout(&stream, self.rpc_auth.as_deref()).map_err(
-            |source| StorageNodeServerError::Io {
-                context: "configure storage-node accepted socket timeout",
-                path: self.config_snapshot().socket_path,
-                source,
-            },
+        let (accepted, endpoint) = self.accept_rpc_stream()?;
+        let mut stream = Self::prepare_accepted_rpc_stream(
+            accepted,
+            &endpoint,
+            storage_node_rpc_io_timeout(self.rpc_auth.as_deref()),
         )?;
         let mut handler = self.connection_handler();
         handler.handle_session(&mut stream, session_guard)
@@ -2260,6 +2437,17 @@ impl StorageNodeServer {
     #[cfg(test)]
     pub(crate) fn socket_path_for_test(&self) -> PathBuf {
         self.config_snapshot().socket_path
+    }
+
+    #[cfg(test)]
+    fn tcp_listener_addr_for_test(&self) -> SocketAddr {
+        self.listeners
+            .iter()
+            .find_map(|listener| match listener {
+                StorageNodeRpcListener::Tcp { bind_addr, .. } => Some(*bind_addr),
+                StorageNodeRpcListener::Unix { .. } => None,
+            })
+            .expect("test server has a TCP listener")
     }
 
     #[cfg(test)]
@@ -2530,28 +2718,113 @@ impl StorageNodeServer {
 
     fn accept_and_spawn(&self) -> Result<(), StorageNodeServerError> {
         let session_guard = self.acquire_session();
-        let (mut stream, _) =
-            self.listener
-                .accept()
-                .map_err(|source| StorageNodeServerError::Io {
-                    context: "accept storage-node connection",
-                    path: self.config_snapshot().socket_path,
-                    source,
-                })?;
-        configure_storage_node_rpc_stream_timeout(&stream, self.rpc_auth.as_deref()).map_err(
-            |source| StorageNodeServerError::Io {
-                context: "configure storage-node accepted socket timeout",
-                path: self.config_snapshot().socket_path,
-                source,
-            },
-        )?;
+        let (accepted, endpoint) = self.accept_rpc_stream()?;
         let mut handler = self.connection_handler();
+        let io_timeout = storage_node_rpc_io_timeout(self.rpc_auth.as_deref());
         thread::spawn(move || {
+            let mut stream =
+                match Self::prepare_accepted_rpc_stream(accepted, &endpoint, io_timeout) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        report_storage_node_connection_failure(&error);
+                        return;
+                    }
+                };
             if let Err(error) = handler.handle_session(&mut stream, session_guard) {
-                eprintln!("storage-node connection failed: {error}");
+                report_storage_node_connection_failure(&error);
             }
         });
         Ok(())
+    }
+
+    fn accept_rpc_stream(
+        &self,
+    ) -> Result<(AcceptedStorageNodeRpcStream, String), StorageNodeServerError> {
+        let listener_index = if self.listeners.len() == 1 {
+            0
+        } else {
+            let mut poll_fds = self
+                .listeners
+                .iter()
+                .map(|listener| libc::pollfd {
+                    fd: listener.raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                })
+                .collect::<Vec<_>>();
+            loop {
+                // SAFETY: `poll_fds` owns a valid contiguous array for the duration of the call.
+                let result = unsafe {
+                    libc::poll(
+                        poll_fds.as_mut_ptr(),
+                        poll_fds
+                            .len()
+                            .try_into()
+                            .expect("listener count fits nfds_t"),
+                        -1,
+                    )
+                };
+                if result > 0 {
+                    break poll_fds
+                        .iter()
+                        .position(|fd| fd.revents & libc::POLLIN != 0)
+                        .ok_or_else(|| StorageNodeServerError::RpcListenerIo {
+                            context: "poll storage-node RPC listeners",
+                            endpoint: "listener set".to_string(),
+                            source: io::Error::other(
+                                "storage-node RPC listener poll returned without a readable listener",
+                            ),
+                        })?;
+                }
+                let source = io::Error::last_os_error();
+                if source.kind() != io::ErrorKind::Interrupted {
+                    return Err(StorageNodeServerError::RpcListenerIo {
+                        context: "poll storage-node RPC listeners",
+                        endpoint: "listener set".to_string(),
+                        source,
+                    });
+                }
+            }
+        };
+        let listener = &self.listeners[listener_index];
+        let endpoint = listener.endpoint();
+        let stream = listener
+            .accept()
+            .map_err(|source| StorageNodeServerError::RpcListenerIo {
+                context: "accept storage-node RPC connection",
+                endpoint: endpoint.clone(),
+                source,
+            })?;
+        Ok((stream, endpoint))
+    }
+
+    fn prepare_accepted_rpc_stream(
+        stream: AcceptedStorageNodeRpcStream,
+        endpoint: &str,
+        io_timeout: Duration,
+    ) -> Result<BoxStorageRpcStream, StorageNodeServerError> {
+        let deadline = Instant::now().checked_add(io_timeout).ok_or_else(|| {
+            StorageNodeServerError::RpcListenerIo {
+                context: "set storage-node RPC connection deadline",
+                endpoint: endpoint.to_string(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "storage-node RPC connection deadline overflowed",
+                ),
+            }
+        })?;
+        match stream {
+            AcceptedStorageNodeRpcStream::Unix(stream) => accepted_unix_stream(stream, deadline),
+            AcceptedStorageNodeRpcStream::Tcp {
+                stream,
+                tls_server_config,
+            } => accepted_tls_tcp_stream(stream, tls_server_config, deadline),
+        }
+        .map_err(|source| StorageNodeServerError::RpcListenerIo {
+            context: "prepare storage-node RPC connection",
+            endpoint: endpoint.to_string(),
+            source,
+        })
     }
 
     fn connection_handler(&self) -> StorageNodeConnectionHandler {
@@ -6147,7 +6420,7 @@ macro_rules! metadata_mutation_route_guard_or_return {
 impl StorageNodeConnectionHandler {
     fn read_request_frame(
         &self,
-        stream: &mut UnixStream,
+        stream: &mut BoxStorageRpcStream,
     ) -> Result<(StorageRpcFrame, Option<StorageRpcResponseSigningContext>), StorageRpcStreamError>
     {
         let Some(auth) = self.rpc_auth.as_deref() else {
@@ -6176,7 +6449,7 @@ impl StorageNodeConnectionHandler {
 
     fn write_response_frame(
         &self,
-        stream: &mut UnixStream,
+        stream: &mut BoxStorageRpcStream,
         request_auth: Option<&StorageRpcResponseSigningContext>,
         response: &StorageRpcFrame,
     ) -> Result<(), StorageRpcStreamError> {
@@ -6302,12 +6575,26 @@ impl StorageNodeConnectionHandler {
 
     fn handle_session(
         &mut self,
-        stream: &mut UnixStream,
+        stream: &mut BoxStorageRpcStream,
         _session_guard: StorageNodeActiveSessionGuard,
     ) -> Result<(), StorageNodeServerError> {
         let mut session =
             StorageNodeSession::new(Arc::clone(&self.read_handles), Arc::clone(&self.node));
+        let mut set_request_deadline = false;
         loop {
+            if set_request_deadline {
+                let deadline = Instant::now()
+                    .checked_add(storage_node_rpc_io_timeout(self.rpc_auth.as_deref()))
+                    .ok_or_else(|| StorageNodeServerError::RpcStream {
+                        message: "storage-node RPC request deadline overflowed".to_string(),
+                    })?;
+                stream.set_operation_deadline(deadline).map_err(|error| {
+                    StorageNodeServerError::RpcStream {
+                        message: format!("set storage-node RPC request deadline: {error}"),
+                    }
+                })?;
+            }
+            set_request_deadline = true;
             let (frame, request_auth) = match self.read_request_frame(stream) {
                 Ok(frame) => frame,
                 Err(StorageRpcStreamError::Io(error))
@@ -16867,16 +17154,10 @@ struct SessionObjectPayloadLease {
     remaining_after_release: Option<usize>,
 }
 
-fn configure_storage_node_rpc_stream_timeout(
-    stream: &UnixStream,
-    rpc_auth: Option<&StorageRpcServerAuthConfig>,
-) -> io::Result<()> {
-    let io_timeout = rpc_auth
+fn storage_node_rpc_io_timeout(rpc_auth: Option<&StorageRpcServerAuthConfig>) -> Duration {
+    rpc_auth
         .map(|auth| auth.transport_limits().io_timeout())
-        .unwrap_or(STORAGE_RPC_SERVER_IDLE_TIMEOUT);
-    stream.set_read_timeout(Some(io_timeout))?;
-    stream.set_write_timeout(Some(io_timeout))?;
-    Ok(())
+        .unwrap_or(STORAGE_RPC_SERVER_IDLE_TIMEOUT)
 }
 
 fn rpc_stream_error(error: StorageRpcStreamError) -> StorageNodeServerError {
@@ -17108,10 +17389,11 @@ fn object_metadata_command_build_error_outcome(
     }
 }
 
-impl Drop for StorageNodeServer {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.config_snapshot().socket_path);
-    }
+fn report_storage_node_connection_failure(error: &StorageNodeServerError) {
+    #[cfg(not(test))]
+    eprintln!("storage-node connection failed: {error}");
+    #[cfg(test)]
+    let _ = error;
 }
 
 pub(crate) fn advance_storage_node_incarnation(
@@ -17517,7 +17799,10 @@ mod tests {
         ControlPlaneScopedCredentialStore,
     };
     use crate::node_client::{LocalUnixStorageNodeClientAdmissionSettings, UnixStorageNodeClient};
+    use crate::storage_rpc_transport::StorageRpcClientEndpoint;
     use crate::{BucketAclSummary, StorageRpcClientAuthConfig};
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -17755,6 +18040,51 @@ mod tests {
             .unwrap()
             .into(),
         )
+    }
+
+    fn storage_rpc_tls_server_config() -> Arc<rustls::ServerConfig> {
+        let certificates = CertificateDer::pem_slice_iter(include_bytes!(
+            "../../s3-tests/testdata/localhost-cert.pem"
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let private_key = PrivateKeyDer::from_pem_slice(include_bytes!(
+            "../../s3-tests/testdata/localhost-key.pem"
+        ))
+        .unwrap();
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .unwrap();
+        config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
+        Arc::new(config)
+    }
+
+    fn storage_rpc_tls_client_config() -> Arc<rustls::ClientConfig> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(
+                CertificateDer::pem_slice_iter(include_bytes!(
+                    "../../s3-tests/testdata/ca-cert.pem"
+                ))
+                .next()
+                .unwrap()
+                .unwrap(),
+            )
+            .unwrap();
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
+        Arc::new(config)
     }
 
     fn bounded_runtime_refresh_config(
@@ -21024,6 +21354,189 @@ mod tests {
         assert_eq!(health.node_id, config.node_id);
         assert_eq!(health.cluster_epoch, config.cluster_epoch);
         assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_tls_tcp_storage_rpc_crosses_real_server_boundary() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential))
+            .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::Tcp {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                tls_server_config: storage_rpc_tls_server_config(),
+            }])
+            .bind()
+            .unwrap();
+        let address = server.tcp_listener_addr_for_test();
+        let join = thread::spawn(move || server.accept_one());
+        let endpoint = StorageRpcClientEndpoint::tcp(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            storage_rpc_tls_client_config(),
+        )
+        .unwrap();
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+
+        let payload = client
+            .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+            .unwrap();
+        let health = decode_health_response(&payload).unwrap();
+
+        assert_eq!(health.node_id, config.node_id);
+        assert_eq!(health.cluster_epoch, config.cluster_epoch);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn stalled_tls_handshake_does_not_block_the_next_storage_rpc_connection() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = Arc::new(
+            PreparedStorageNodeServer::new(config.clone())
+                .with_rpc_auth(storage_rpc_server_auth(&credential))
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::Tcp {
+                    bind_addr: "127.0.0.1:0".parse().unwrap(),
+                    tls_server_config: storage_rpc_tls_server_config(),
+                }])
+                .bind()
+                .unwrap(),
+        );
+        let address = server.tcp_listener_addr_for_test();
+        let stalled = TcpStream::connect(address).unwrap();
+
+        server.accept_and_spawn().unwrap();
+
+        let serving = Arc::clone(&server);
+        let accept = thread::spawn(move || serving.accept_and_spawn().unwrap());
+        let endpoint = StorageRpcClientEndpoint::tcp(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            storage_rpc_tls_client_config(),
+        )
+        .unwrap();
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+
+        let payload = client
+            .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+            .unwrap();
+        let health = decode_health_response(&payload).unwrap();
+
+        assert_eq!(health.node_id, config.node_id);
+        accept.join().unwrap();
+        drop(stalled);
+    }
+
+    #[test]
+    fn malformed_tls_handshake_is_contained_to_its_storage_rpc_connection() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = Arc::new(
+            PreparedStorageNodeServer::new(config.clone())
+                .with_rpc_auth(storage_rpc_server_auth(&credential))
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::Tcp {
+                    bind_addr: "127.0.0.1:0".parse().unwrap(),
+                    tls_server_config: storage_rpc_tls_server_config(),
+                }])
+                .bind()
+                .unwrap(),
+        );
+        let address = server.tcp_listener_addr_for_test();
+        let mut malformed = TcpStream::connect(address).unwrap();
+        malformed.write_all(b"not a TLS handshake").unwrap();
+        malformed.shutdown(std::net::Shutdown::Write).unwrap();
+
+        server.accept_and_spawn().unwrap();
+
+        let serving = Arc::clone(&server);
+        let accept = thread::spawn(move || serving.accept_and_spawn().unwrap());
+        let endpoint = StorageRpcClientEndpoint::tcp(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            storage_rpc_tls_client_config(),
+        )
+        .unwrap();
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+
+        let payload = client
+            .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+            .unwrap();
+        let health = decode_health_response(&payload).unwrap();
+
+        assert_eq!(health.node_id, config.node_id);
+        accept.join().unwrap();
+    }
+
+    #[test]
+    fn tls_tcp_storage_rpc_listener_requires_rpc_authentication() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let result = PreparedStorageNodeServer::new(config)
+            .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::Tcp {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                tls_server_config: storage_rpc_tls_server_config(),
+            }])
+            .bind();
+
+        assert!(matches!(
+            result,
+            Err(StorageNodeServerError::TcpRpcListenerRequiresAuthentication { .. })
+        ));
+    }
+
+    #[test]
+    fn storage_rpc_listener_bind_failure_removes_previously_bound_unix_socket() {
+        let tmp = test_util::tempdir();
+        private_socket_dir(tmp.path());
+        let socket_path = tmp.path().join("partial-bind.sock");
+        let result = bind_storage_node_rpc_listeners(
+            vec![
+                StorageNodeRpcListenerConfig::Unix {
+                    socket_path: socket_path.clone(),
+                },
+                StorageNodeRpcListenerConfig::Tcp {
+                    bind_addr: "127.0.0.1:0".parse().unwrap(),
+                    tls_server_config: storage_rpc_tls_server_config(),
+                },
+            ],
+            None,
+        );
+
+        assert!(matches!(
+            result,
+            Err(StorageNodeServerError::TcpRpcListenerRequiresAuthentication { .. })
+        ));
+        assert!(!socket_path.exists());
     }
 
     #[test]

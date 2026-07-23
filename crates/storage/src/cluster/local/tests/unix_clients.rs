@@ -4498,7 +4498,7 @@ fn unix_shard_client_fails_closed_when_storage_node_is_unavailable() {
         write_err,
         ShardIoError::Store {
             source: StoreError::Io {
-                context: "connect storage-node RPC socket",
+                context: "connect storage-node RPC endpoint",
                 ..
             },
             ..
@@ -4520,7 +4520,7 @@ fn unix_shard_client_fails_closed_when_storage_node_is_unavailable() {
         read_err,
         ShardIoError::Store {
             source: StoreError::Io {
-                context: "connect storage-node read-handle RPC socket",
+                context: "connect storage-node read-handle RPC endpoint",
                 ..
             },
             ..

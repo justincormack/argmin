@@ -1292,10 +1292,26 @@ impl UnixStorageNodeClient {
         rpc_admission: Arc<UnixStorageNodeRpcAdmission>,
         rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
     ) -> Self {
+        Self::with_endpoint_and_rpc_admission(
+            node_id,
+            cluster_epoch,
+            StorageRpcClientEndpoint::unix(socket_path),
+            rpc_admission,
+            rpc_auth,
+        )
+    }
+
+    fn with_endpoint_and_rpc_admission(
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        endpoint: StorageRpcClientEndpoint,
+        rpc_admission: Arc<UnixStorageNodeRpcAdmission>,
+        rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
+    ) -> Self {
         Self {
             node_id,
             cluster_epoch,
-            socket_path,
+            endpoint,
             next_request_id: AtomicU64::new(1),
             rpc_admission,
             rpc_auth,
@@ -1328,6 +1344,24 @@ impl UnixStorageNodeClient {
             node_id,
             cluster_epoch,
             socket_path.into(),
+            Arc::new(UnixStorageNodeRpcAdmission::new_with_settings(
+                settings.into(),
+            )),
+            rpc_auth,
+        )
+    }
+
+    pub(crate) fn with_endpoint_rpc_admission_settings_and_auth(
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        endpoint: StorageRpcClientEndpoint,
+        settings: LocalUnixStorageNodeClientAdmissionSettings,
+        rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
+    ) -> Self {
+        Self::with_endpoint_and_rpc_admission(
+            node_id,
+            cluster_epoch,
+            endpoint,
             Arc::new(UnixStorageNodeRpcAdmission::new_with_settings(
                 settings.into(),
             )),
@@ -1425,7 +1459,16 @@ impl UnixStorageNodeClient {
                 ),
             );
         }
-        let mut stream = match UnixStream::connect(&self.socket_path) {
+        let deadline = started
+            .checked_add(storage_rpc_io_timeout(self.rpc_auth.as_deref()))
+            .ok_or_else(|| StoreError::Io {
+                context: "compute storage-node RPC deadline",
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "storage-node RPC deadline overflowed",
+                ),
+            })?;
+        let mut stream = match self.endpoint.connect(deadline) {
             Ok(stream) => {
                 if trace_rpc_lifecycle {
                     let _ = observability::emit_flight_event(
@@ -1458,16 +1501,11 @@ impl UnixStorageNodeClient {
                     );
                 }
                 return Err(StoreError::Io {
-                    context: "connect storage-node RPC socket",
+                    context: "connect storage-node RPC endpoint",
                     source,
                 });
             }
         };
-        configure_storage_rpc_stream_timeout(
-            &stream,
-            "configure storage-node RPC socket timeout",
-            self.rpc_auth.as_deref(),
-        )?;
         let request = StorageRpcFrame {
             request_id,
             kind,

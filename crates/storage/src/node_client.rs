@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -253,6 +252,7 @@ use crate::storage_rpc_auth::{
     write_storage_rpc_auth_transport_frame_with_limit, StorageRpcClientAuthConfig,
     StorageRpcRequestProof,
 };
+use crate::storage_rpc_transport::{BoxStorageRpcStream, StorageRpcClientEndpoint};
 #[cfg(test)]
 use crate::types::BucketSnapshotTagsRequest;
 use crate::types::{
@@ -362,21 +362,10 @@ impl From<LocalUnixStorageNodeClientAdmissionSettings> for UnixStorageNodeRpcAdm
     }
 }
 
-fn configure_storage_rpc_stream_timeout(
-    stream: &UnixStream,
-    context: &'static str,
-    rpc_auth: Option<&StorageRpcClientAuthConfig>,
-) -> Result<(), StoreError> {
-    let io_timeout = rpc_auth
+fn storage_rpc_io_timeout(rpc_auth: Option<&StorageRpcClientAuthConfig>) -> Duration {
+    rpc_auth
         .map(|auth| auth.transport_limits().io_timeout())
-        .unwrap_or(STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT);
-    stream
-        .set_read_timeout(Some(io_timeout))
-        .map_err(|source| StoreError::Io { context, source })?;
-    stream
-        .set_write_timeout(Some(io_timeout))
-        .map_err(|source| StoreError::Io { context, source })?;
-    Ok(())
+        .unwrap_or(STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT)
 }
 
 fn storage_rpc_response_error(
@@ -1237,7 +1226,7 @@ pub(in crate::node_runtime) struct LocalStorageNodeClient {
 pub(crate) struct UnixStorageNodeClient {
     node_id: NodeId,
     cluster_epoch: ClusterEpoch,
-    socket_path: PathBuf,
+    endpoint: StorageRpcClientEndpoint,
     next_request_id: AtomicU64,
     rpc_admission: Arc<UnixStorageNodeRpcAdmission>,
     rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,

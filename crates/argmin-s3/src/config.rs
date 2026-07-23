@@ -11,7 +11,9 @@ use storage::control_plane::{
 };
 use storage::control_plane_raft::ControlPlaneRaftPeerFrameTransport;
 use storage::control_plane_raft::ControlPlaneRaftPeerTransportLimits;
+use storage::storage_node_server::StorageNodeRpcListenerConfig;
 use storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS;
+use storage::storage_rpc_transport::StorageRpcClientEndpoint;
 use storage::LocalUnixStorageNodeClientConfig;
 use storage::{
     FrontendStorageRpcClientCapability, MaintenanceStorageRpcClientCapability, NodeId, PgId,
@@ -441,6 +443,8 @@ pub(crate) struct ServerConfig {
     pub(crate) static_initial_cluster_map: Option<ConfiguredStaticInitialClusterMap>,
     pub(crate) storage_node_socket_path: Option<String>,
     pub(crate) storage_node_sockets: Vec<ConfiguredStorageNodeSocket>,
+    pub(crate) storage_rpc_client_endpoints: Vec<(u32, StorageRpcClientEndpoint)>,
+    pub(crate) storage_rpc_listeners: Vec<StorageNodeRpcListenerConfig>,
     pub(crate) storage_node_rpc_admission_limit: usize,
     pub(crate) storage_node_rpc_admission_wait_timeout: Duration,
     pub(crate) storage_node_rpc_control_admission_wait_timeout: Duration,
@@ -1131,6 +1135,8 @@ impl ServerConfig {
             static_initial_cluster_map: None,
             storage_node_socket_path,
             storage_node_sockets,
+            storage_rpc_client_endpoints: Vec::new(),
+            storage_rpc_listeners: Vec::new(),
             storage_node_rpc_admission_limit,
             storage_node_rpc_admission_wait_timeout,
             storage_node_rpc_control_admission_wait_timeout,

@@ -24,7 +24,7 @@ use std::fs::OpenOptions;
 use std::future::Future;
 use std::io;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -49,6 +49,8 @@ use storage::control_plane_raft::{
     ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
     CONTROL_PLANE_RAFT_TLS_ALPN,
 };
+use storage::storage_node_server::StorageNodeRpcListenerConfig;
+use storage::storage_rpc_transport::{StorageRpcClientEndpoint, STORAGE_RPC_TLS_ALPN};
 use storage::{
     FrontendStorageRpcClientCapability, MaintenanceStorageRpcClientCapability, PgId,
     StorageNodeStorageRpcClientCapability, StorageRpcServerAuthConfig, StorageRpcTransportLimits,
@@ -2620,52 +2622,154 @@ impl ValidatedStaticClusterManifest {
             .cloned()
             .ok_or_else(|| "replicated data process has no control-plane route".to_string())?;
 
+        let provider = rustls::crypto::ring::default_provider();
         let mut storage_node_sockets = Vec::with_capacity(self.manifest.storage_nodes.len());
+        let mut storage_rpc_client_endpoints =
+            Vec::with_capacity(self.manifest.storage_nodes.len());
         for storage_node in &self.manifest.storage_nodes {
-            let endpoint = self
+            let canonical_endpoint = self
                 .canonical_storage_node_endpoints
                 .get(&storage_node.node_id)
                 .expect("validated storage-node endpoint map contains every node");
-            let EndpointAddress::Unix(path) = parse_endpoint_address(&endpoint.advertise, false)?
-            else {
-                return Err(
-                    "replicated storage RPC TCP activation is not implemented; every canonical storage endpoint must be Unix"
-                        .to_string(),
-                );
-            };
-            storage_node_sockets.push(ConfiguredStorageNodeSocket {
-                node_id: storage_node.node_id,
-                socket_path: path.to_string_lossy().into_owned(),
-            });
+            let endpoint = self
+                .manifest
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.id == canonical_endpoint.endpoint_id)
+                .expect("validated canonical storage endpoint exists in manifest");
+            let client_endpoint =
+                match parse_endpoint_address(&canonical_endpoint.advertise, false)? {
+                    EndpointAddress::Unix(path) => {
+                        storage_node_sockets.push(ConfiguredStorageNodeSocket {
+                            node_id: storage_node.node_id,
+                            socket_path: path.to_string_lossy().into_owned(),
+                        });
+                        StorageRpcClientEndpoint::unix(path)
+                    }
+                    EndpointAddress::Tcp { host, port } => {
+                        let trust_bundle_id = endpoint
+                            .tls_trust_bundle_id
+                            .as_deref()
+                            .expect("validated storage TCP endpoint has a TLS trust bundle");
+                        let roots =
+                            material
+                                .tls_trust_bundles
+                                .get(trust_bundle_id)
+                                .ok_or_else(|| {
+                                    format!(
+                            "selected process did not resolve storage endpoint {} trust bundle",
+                            endpoint.id
+                        )
+                                })?;
+                        let server_name = endpoint
+                            .tls_server_name
+                            .clone()
+                            .expect("validated storage TCP endpoint has a TLS server name");
+                        let mut tls_client_config =
+                            RustlsClientConfig::builder_with_provider(Arc::new(provider.clone()))
+                                .with_protocol_versions(&[&rustls::version::TLS13])
+                                .map_err(|_| {
+                                    "failed to select the static storage RPC TLS protocol"
+                                        .to_string()
+                                })?
+                                .with_root_certificates((*roots.roots).clone())
+                                .with_no_client_auth();
+                        tls_client_config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
+                        let mut addresses = (host.as_str(), port)
+                            .to_socket_addrs()
+                            .map_err(|error| {
+                                format!(
+                                    "failed to resolve storage endpoint {} address: {error}",
+                                    endpoint.id
+                                )
+                            })?
+                            .collect::<Vec<_>>();
+                        addresses.sort_unstable();
+                        addresses.dedup();
+                        storage_node_sockets.push(ConfiguredStorageNodeSocket {
+                            node_id: storage_node.node_id,
+                            socket_path: canonical_endpoint.advertise.clone(),
+                        });
+                        StorageRpcClientEndpoint::tcp(
+                            canonical_endpoint.advertise.clone(),
+                            addresses,
+                            server_name,
+                            Arc::new(tls_client_config),
+                        )
+                        .map_err(|error| {
+                            format!("invalid storage endpoint {}: {error}", endpoint.id)
+                        })?
+                    }
+                };
+            storage_rpc_client_endpoints.push((storage_node.node_id, client_endpoint));
         }
         storage_node_sockets.sort_by_key(|node| node.node_id);
+        storage_rpc_client_endpoints.sort_by_key(|(node_id, _)| *node_id);
 
-        let local_storage_socket = if let Some(storage_node) = selected_storage_node {
-            if self
+        let mut storage_rpc_listeners = Vec::new();
+        let local_storage_endpoint = if let Some(storage_node) = selected_storage_node {
+            let canonical_endpoint = self
+                .canonical_storage_node_endpoints
+                .get(&storage_node.node_id)
+                .expect("validated canonical storage endpoint exists");
+            let mut endpoints = self
                 .manifest
                 .endpoints
                 .iter()
                 .filter(|endpoint| endpoint.owner_process_id == selected.id)
                 .filter(|endpoint| endpoint.protocol == EndpointProtocol::StorageRpc)
-                .any(|endpoint| {
-                    !endpoint.listen.starts_with("unix://")
-                        || !endpoint.advertise.starts_with("unix://")
-                })
-            {
-                return Err(
-                    "replicated Unix storage-node activation cannot ignore a configured TCP storage RPC listener"
-                        .to_string(),
-                );
+                .collect::<Vec<_>>();
+            endpoints.sort_by_key(|endpoint| (endpoint.priority, endpoint.id.as_str()));
+            for endpoint in endpoints {
+                match parse_endpoint_address(&endpoint.listen, true)? {
+                    EndpointAddress::Unix(socket_path) => {
+                        storage_rpc_listeners
+                            .push(StorageNodeRpcListenerConfig::Unix { socket_path });
+                    }
+                    EndpointAddress::Tcp { host, port } => {
+                        let bind_ip = host.parse().map_err(|_| {
+                            format!(
+                                "storage TCP listener {} host must be a literal IP address",
+                                endpoint.id
+                            )
+                        })?;
+                        let identity_id = endpoint
+                            .tls_identity_id
+                            .as_deref()
+                            .expect("validated storage TCP endpoint has a TLS identity");
+                        let identity =
+                            material.tls_identities.get(identity_id).ok_or_else(|| {
+                                format!(
+                                "selected process did not resolve storage endpoint {} TLS identity",
+                                endpoint.id
+                            )
+                            })?;
+                        let resolver = StaticSingleCertificateResolver {
+                            certified_key: Arc::clone(&identity.certified_key),
+                        };
+                        let mut tls_server_config =
+                            rustls::ServerConfig::builder_with_provider(Arc::new(provider.clone()))
+                                .with_protocol_versions(&[&rustls::version::TLS13])
+                                .map_err(|_| {
+                                    "failed to select the static storage RPC TLS protocol"
+                                        .to_string()
+                                })?
+                                .with_no_client_auth()
+                                .with_cert_resolver(Arc::new(resolver));
+                        tls_server_config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
+                        storage_rpc_listeners.push(StorageNodeRpcListenerConfig::Tcp {
+                            bind_addr: SocketAddr::new(bind_ip, port),
+                            tls_server_config: Arc::new(tls_server_config),
+                        });
+                    }
+                }
             }
-            let endpoint = self.preferred_owned_endpoint(selected, EndpointProtocol::StorageRpc)?;
-            let EndpointAddress::Unix(path) = parse_endpoint_address(&endpoint.listen, true)?
-            else {
-                return Err(
-                    "replicated Unix storage-node activation requires a Unix storage RPC listener"
-                        .to_string(),
-                );
-            };
-            Some((storage_node, path.to_string_lossy().into_owned()))
+            let runtime_endpoint =
+                match parse_endpoint_address(&canonical_endpoint.advertise, false)? {
+                    EndpointAddress::Unix(path) => path.to_string_lossy().into_owned(),
+                    EndpointAddress::Tcp { .. } => canonical_endpoint.advertise.clone(),
+                };
+            Some((storage_node, runtime_endpoint))
         } else {
             None
         };
@@ -2716,14 +2820,28 @@ impl ValidatedStaticClusterManifest {
                 .expect("minimum validated storage transport limits remain valid")
             })
             .ok_or_else(|| "replicated data process has no storage transport limits".to_string())?;
-        let local_server_transport_limits = local_storage_socket
+        let local_server_transport_limits = local_storage_endpoint
             .as_ref()
-            .map(|(storage_node, _)| {
-                let endpoint = self
-                    .canonical_storage_node_endpoints
-                    .get(&storage_node.node_id)
-                    .expect("validated canonical storage endpoint exists");
-                storage_transport_limits(&endpoint.endpoint_id)
+            .map(|_| {
+                self.manifest
+                    .endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.owner_process_id == selected.id)
+                    .filter(|endpoint| endpoint.protocol == EndpointProtocol::StorageRpc)
+                    .map(|endpoint| storage_transport_limits(&endpoint.id))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .reduce(|left, right| {
+                        StorageRpcTransportLimits::new(
+                            left.max_frame_bytes().min(right.max_frame_bytes()),
+                            left.max_connections().min(right.max_connections()),
+                            left.io_timeout().min(right.io_timeout()),
+                        )
+                        .expect("minimum validated storage transport limits remain valid")
+                    })
+                    .ok_or_else(|| {
+                        "selected storage process has no storage RPC listener".to_string()
+                    })
             })
             .transpose()?;
 
@@ -2859,7 +2977,7 @@ impl ValidatedStaticClusterManifest {
                 .map_err(|error| format!("invalid maintenance storage RPC capability: {error}"))
             })
             .transpose()?;
-        let storage_rpc_server_auth = local_storage_socket
+        let storage_rpc_server_auth = local_storage_endpoint
             .as_ref()
             .map(|_| {
                 let verifier = ControlPlaneScopedCredentialStore::new(
@@ -2957,13 +3075,13 @@ impl ValidatedStaticClusterManifest {
         manifest_values.insert("ARGMIN_REGION", self.manifest.cluster.region.clone());
         manifest_values.insert("ARGMIN_HOST_ID", selected.host_id.clone());
         manifest_values.insert("ARGMIN_CONTROL_PLANE_SOCKET_PATH", control_plane_endpoint);
-        if let Some((storage_node, socket_path)) = &local_storage_socket {
+        if let Some((storage_node, endpoint)) = &local_storage_endpoint {
             manifest_values.insert("ARGMIN_STORAGE_NODE_ID", "0".to_string());
             manifest_values.insert(
                 "ARGMIN_STORAGE_NODE_DATA_DIR",
                 storage_node.data_dir.to_string_lossy().into_owned(),
             );
-            manifest_values.insert("ARGMIN_STORAGE_NODE_SOCKET_PATH", socket_path.clone());
+            manifest_values.insert("ARGMIN_STORAGE_NODE_SOCKET_PATH", endpoint.clone());
         }
         let mut config = ServerConfig::from_lookup(|key| {
             manifest_values.get(key).cloned().or_else(|| get(key))
@@ -2976,13 +3094,15 @@ impl ValidatedStaticClusterManifest {
             .collect();
         config.storage_node_ids.sort_unstable();
         config.storage_node_sockets = storage_node_sockets;
+        config.storage_rpc_client_endpoints = storage_rpc_client_endpoints;
+        config.storage_rpc_listeners = storage_rpc_listeners;
         config.storage_node_rpc_admission_limit = config
             .storage_node_rpc_admission_limit
             .min(client_transport_limits.max_connections());
         config.storage_node_id = selected_storage_node.map(|node| node.node_id);
         config.storage_node_data_dir =
             selected_storage_node.map(|node| node.data_dir.to_string_lossy().into_owned());
-        config.storage_node_socket_path = local_storage_socket.map(|(_, path)| path);
+        config.storage_node_socket_path = local_storage_endpoint.map(|(_, endpoint)| endpoint);
         config.control_plane_client_socket_paths = if control_plane_rpc_frame_transport.is_none() {
             control_plane_client_endpoints.clone()
         } else {
@@ -7228,6 +7348,49 @@ secret_ref = "file:/run/argmin-secrets/frontend-1-maintenance.key"
         manifest
     }
 
+    fn replicated_tcp_data_manifest() -> String {
+        let mut manifest = replicated_manifest();
+        manifest.push_str(
+            r#"
+[[processes]]
+id = "frontend-1"
+host_id = "host-1"
+kind = "frontend"
+frontend_instance_id = "frontend-1"
+admin_instance_id = "frontend-1-admin"
+maintenance_instance_id = "frontend-1-maintenance"
+
+[[auth_credentials]]
+principal = "frontend"
+instance_id = "frontend-1"
+credential_id = "frontend-1"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:/run/argmin-secrets/frontend-1.key"
+
+[[auth_credentials]]
+principal = "admin"
+instance_id = "frontend-1-admin"
+credential_id = "frontend-1-admin"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:/run/argmin-secrets/frontend-1-admin.key"
+
+[[auth_credentials]]
+principal = "maintenance"
+instance_id = "frontend-1-maintenance"
+credential_id = "frontend-1-maintenance"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:/run/argmin-secrets/frontend-1-maintenance.key"
+"#,
+        );
+        manifest
+    }
+
     fn replace_once(input: &str, from: &str, to: &str) -> String {
         assert_eq!(input.matches(from).count(), 1, "fixture replacement count");
         input.replacen(from, to, 1)
@@ -9754,6 +9917,64 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
         );
         assert!(frontend_config.storage_rpc_server_auth.is_none());
         assert!(frontend_config.control_plane_rpc_frame_transport.is_some());
+    }
+
+    #[test]
+    fn replicated_tcp_data_processes_map_authenticated_storage_rpc_transport() {
+        let manifest_text = replicated_tcp_data_manifest()
+            .replace("tcp://storage-2.internal:", "tcp://localhost:")
+            .replace("tcp://storage-3.internal:", "tcp://localhost:")
+            .replace(
+                "tls_server_name = \"storage-2.internal\"",
+                "tls_server_name = \"localhost\"",
+            )
+            .replace(
+                "tls_server_name = \"storage-3.internal\"",
+                "tls_server_name = \"localhost\"",
+            );
+        let (_storage_dir, storage_manifest) =
+            materialized_replicated_manifest_from("storage-1", manifest_text.clone());
+        let storage_material = storage_manifest
+            .resolve_selected_process_material_at(1)
+            .unwrap();
+        let storage_config = storage_manifest
+            .replicated_data_process_server_config(&storage_material, |_| None)
+            .unwrap();
+
+        assert_eq!(storage_config.storage_rpc_listeners.len(), 1);
+        assert!(matches!(
+            storage_config.storage_rpc_listeners[0],
+            StorageNodeRpcListenerConfig::Tcp { .. }
+        ));
+        assert_eq!(storage_config.storage_rpc_client_endpoints.len(), 3);
+        assert!(storage_config
+            .storage_rpc_client_endpoints
+            .iter()
+            .all(|(_, endpoint)| matches!(endpoint, StorageRpcClientEndpoint::Tcp { .. })));
+        assert_eq!(
+            storage_config.storage_node_socket_path.as_deref(),
+            Some("tcp://localhost:7701")
+        );
+        assert!(storage_config.storage_rpc_server_auth.is_some());
+
+        let (_frontend_dir, frontend_manifest) =
+            materialized_replicated_manifest_from("frontend-1", manifest_text);
+        let frontend_material = frontend_manifest
+            .resolve_selected_process_material_at(1)
+            .unwrap();
+        let environment = standalone_runtime_environment();
+        let frontend_config = frontend_manifest
+            .replicated_data_process_server_config(&frontend_material, |key| {
+                environment.get(key).cloned()
+            })
+            .unwrap();
+
+        assert!(frontend_config.storage_rpc_listeners.is_empty());
+        assert_eq!(frontend_config.storage_rpc_client_endpoints.len(), 3);
+        assert!(frontend_config.storage_rpc_frontend_client_auth.is_some());
+        assert!(frontend_config
+            .storage_rpc_maintenance_client_auth
+            .is_some());
     }
 
     #[test]

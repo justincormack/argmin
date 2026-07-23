@@ -3493,6 +3493,7 @@ pub(crate) fn write_storage_rpc_frame_to<W: Write>(
 ) -> Result<(), StorageRpcStreamError> {
     let bytes = encode_storage_rpc_frame(frame.request_id, frame.kind, &frame.payload)?;
     writer.write_all(&bytes)?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -17342,6 +17343,21 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    struct FlushFailureWriter;
+
+    impl Write for FlushFailureWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected frame flush failure",
+            ))
+        }
+    }
+
     use crate::{
         metadata_command::{
             AdvanceMultipartCompletionBarrierCommand, CreateBucketCommand,
@@ -17549,6 +17565,23 @@ mod tests {
         let decoded = read_storage_rpc_frame_from(&mut Cursor::new(bytes)).unwrap();
 
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn storage_rpc_stream_frame_reports_flush_failure() {
+        let frame = StorageRpcFrame {
+            request_id: 11,
+            kind: StorageRpcMessageKind::Health,
+            payload: Vec::new(),
+        };
+
+        let error = write_storage_rpc_frame_to(&mut FlushFailureWriter, &frame).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageRpcStreamError::Io(error)
+                if error.kind() == std::io::ErrorKind::BrokenPipe
+        ));
     }
 
     #[test]

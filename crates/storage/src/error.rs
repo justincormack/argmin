@@ -498,7 +498,12 @@ impl StoreError {
             Self::InvalidKeyLength { .. } => "invalid_key_length",
             Self::InvalidShardKeyHex => "invalid_shard_key_hex",
             Self::ShardScavengerScanIncomplete { .. } => "shard_scavenger_scan_incomplete",
-            Self::Io { context, .. } if *context == "connect storage-node RPC socket" => {
+            Self::Io { context, .. }
+                if matches!(
+                    *context,
+                    "connect storage-node RPC socket" | "connect storage-node RPC endpoint"
+                ) =>
+            {
                 "storage_rpc_socket_connect"
             }
             Self::Io { .. } => "io",
