@@ -1,0 +1,221 @@
+Unauthenticated S3 Control OPTIONS leaks bucket existence
+Link: https://chatgpt.com/codex/cloud/security/findings/4dc7fdff2cc48191bc6170519cb3855e?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: invalid
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 6fbdbb4
+Author: justin@specialbusservice.com
+Created: 22/07/2026, 22:35:07
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Invalid. Live AWS testing shows that the reported response differential is not
+AWS S3 Control behavior and does not represent a confidentiality boundary that
+Argmin should add. The original local S3 Control handler performed a bucket
+lookup that AWS does not perform for this request shape. Commit `86d3af85`
+removed that lookup: unauthenticated S3 Control `OPTIONS` now returns the same
+`403 AccessForbidden` response with `CORSResponse: Bucket not found` for an
+existing bucket and a missing bucket.
+
+The conclusion is locked by permanent AWS-facing and local integration tests:
+
+- `test_s3_control_unauthenticated_options_existing_and_missing_bucket_shapes`
+  verifies that ordinary global bucket names produce identical S3 Control
+  `OPTIONS` responses whether the bucket exists or is missing.
+- `test_s3_control_options_does_not_reveal_foreign_account_regional_bucket_existence`
+  creates an account-regional bucket in the primary account, waits for three
+  consecutive successful signed S3 Control tag requests to prove convergence,
+  and then sends unsigned `OPTIONS` requests through the explicit alternate
+  account's S3 Control endpoint. The existing foreign bucket and a missing
+  foreign bucket both return the exact same `403 AccessForbidden` / `CORSResponse:
+  Bucket not found` response.
+- `test_cross_account_create_account_regional_bucket_does_not_reveal_existence`
+  first proves namespace convergence with three consecutive owner-side
+  `BucketAlreadyOwnedByYou` responses, then verifies that cross-account creation
+  attempts for existing and missing account-regional names both return the exact
+  same `400 InvalidBucketNamespace` response.
+- `test_cross_account_regional_bucket_cors_preflight_reveals_existence` verifies
+  the separate ordinary S3 behavior: AWS does expose account-regional bucket
+  existence through unauthenticated CORS preflight. An existing bucket without
+  CORS returns `CORSResponse: CORS is not enabled for this bucket.`, while a
+  missing bucket returns `CORSResponse: Bucket not found`.
+- `test_cors_preflight_no_match` locks the third ordinary S3 branch for an
+  existing bucket whose configured CORS rules do not match the preflight.
+
+The AWS oracle cases were validated with:
+
+- `./scripts/aws-tests --test s3_control -- test_s3_control_unauthenticated_options_existing_and_missing_bucket_shapes --nocapture`
+- `./scripts/aws-tests --test s3_control -- test_s3_control_options_does_not_reveal_foreign_account_regional_bucket_existence --nocapture`
+- `./scripts/aws-tests --test bucket_crud -- test_cross_account_create_account_regional_bucket_does_not_reveal_existence --nocapture`
+- `./scripts/aws-tests --test cors -- test_cross_account_regional_bucket_cors_preflight_reveals_existence --nocapture`
+- `./scripts/aws-tests --test cors -- test_cors_preflight_no_match --nocapture`
+
+Commit `ff17a8cd` added the stronger global/account-regional oracle coverage and
+made ordinary local S3 CORS responses match those AWS branches. Local validation
+included all 61 affected integration tests, all 799 `server-http` tests, and the
+full workspace suite (`cargo nextest run`: 7,490 passed, 0 skipped), together
+with formatting and clippy with warnings denied.
+
+Account-regional namespaces restrict which account may create a name, but AWS
+does not make bucket existence confidential: ordinary S3 CORS still exposes the
+existing/missing distinction. S3 Control deliberately does not expose it for
+this request shape. The reported local differential was therefore an
+AWS-conformance bug, fixed in `86d3af85`, rather than a valid security finding.
+
+# Summary
+A security bug was introduced. The new S3 Control OPTIONS operation is intentionally routed before authentication, but it performs an existence check and emits distinguishable error codes/messages depending on the result.
+This commit introduces S3 Control routing and a special unauthenticated OPTIONS path. For S3 Control requests, OPTIONS is handled before SigV4 authentication. The handler calls an unchecked bucket-existence lookup and returns one response for missing buckets and a different AccessDenied response for existing buckets. An unauthenticated network attacker can send OPTIONS requests to /v20180820/tags/arn:aws:s3:::<candidate-bucket> with Origin and Access-Control-Request-Method headers and distinguish valid private bucket names from nonexistent ones. This does not expose object contents or tags, but it does disclose bucket metadata/existence across the network.
+
+# Validation
+## Rubric
+- [x] S3 Control shared-regional routing recognizes `/v20180820/tags/arn:aws:s3:::bucket` and maps OPTIONS to a bucket-scoped S3Control operation.
+- [x] The S3 Control OPTIONS operation is dispatched before SigV4 authentication.
+- [x] The OPTIONS handler accepts attacker-controlled Origin and Access-Control-Request-Method headers without Authorization.
+- [x] The unauthenticated handler performs an unchecked bucket-existence lookup.
+- [x] Existing and missing bucket candidates produce distinguishable responses over the same unauthenticated request shape.
+## Report
+Validated. Dynamic PoC test was injected and run against the real Rust HttpFrontend path. The test creates `existing-bucket`, installs a failing identity provider to prove authentication is not consulted, and sends unauthenticated S3 Control OPTIONS requests with Origin and Access-Control-Request-Method headers through `handle_service_request(EndpointKind::SharedRegional, ...)`. Command: `CARGO_INCREMENTAL=0 RUSTFLAGS='-C debuginfo=1' cargo test -p server-http poc_unauthenticated_s3_control_options_distinguishes_bucket_existence -- --nocapture`. Output showed missing bucket: `status=403 ... <Code>AccessForbidden</Code><Message>CORSResponse: Bucket not found</Message>...`; existing bucket: `status=403 ... <Code>AccessDenied</Code><Message>Access Denied</Message>...`. This confirms a distinguishable unauthenticated bucket-existence oracle. Code evidence: `crates/server-http/src/http/router.rs:494-500` routes S3 Control `OPTIONS` to `S3ControlOperation::Options { bucket }`; `crates/server-http/src/http/mod.rs:1025-1045` handles S3 and S3 Control OPTIONS before the SigV4 authentication block at `mod.rs:1098-1107`; `mod.rs:1277-1290` checks Origin/ACRM then calls `bucket_exists_on_admitted_route` and returns different responses for `Ok(false)` and `Ok(true)`; `crates/server-core/src/coordinator/bucket.rs:529-532` performs `unchecked_active_bucket_summary_for_admitted_route` and converts existence to bool; `crates/server-http/src/http/response.rs:2395-2405` builds the distinct missing-bucket `AccessForbidden` / `CORSResponse: Bucket not found` response. LLDB breakpoint at `bucket.rs:529` produced stack: `Coordinator::bucket_exists_on_admitted_route` -> `HttpFrontend::handle_s3_control_options` at `mod.rs:1286` -> `HttpFrontend::handle_service_request` at `mod.rs:1040` -> PoC test, confirming the unauthenticated OPTIONS path reaches the unchecked existence lookup. Direct crash was attempted via the PoC test but this is a logic/info-disclosure flaw and no crash is expected. Valgrind was unavailable (`bash: command not found: valgrind`); ASan build attempt failed because `-Z sanitizer=address` requires nightly Rust.
+
+# Evidence
+crates/server-core/src/coordinator/bucket.rs (L518 to 532)
+  Note: bucket_exists_on_admitted_route uses an unchecked active bucket lookup and converts existence into a boolean without authorization.
+```
+    pub fn bucket_exists_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        name: &BucketName,
+    ) -> Result<bool, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::bucket_exists_on_admitted_route",
+            "bucket={:?}",
+            name
+        );
+        match self.unchecked_active_bucket_summary_for_admitted_route(admission, name) {
+            Ok(_) => Ok(true),
+            Err(ServerError::BucketNotFound { .. }) => Ok(false),
+            Err(err) => Err(err),
+```
+
+crates/server-http/src/http/mod.rs (L1025 to 1045)
+  Note: OPTIONS requests, including S3 Control OPTIONS, bypass authentication and are dispatched before SigV4 checks.
+```
+        // OPTIONS (preflight CORS) bypasses authentication.
+        if let ServiceOperation::S3(S3Operation::OptionsRequest { ref bucket, .. }) = operation {
+            let storage_route_admission = match self.coordinator.admit_storage_route_for_request() {
+                Ok(admission) => admission,
+                Err(err) => {
+                    return S3Response::error_with_ids(&err, s3req.path(), wire_ids);
+                }
+            };
+            return self.handle_options_request(s3req, &storage_route_admission, bucket, wire_ids);
+        }
+        if let ServiceOperation::S3Control(S3ControlOperation::Options { bucket }) = &operation {
+            let storage_route_admission = match self.coordinator.admit_storage_route_for_request() {
+                Ok(admission) => admission,
+                Err(err) => return S3Response::s3_control_error_with_ids(&err, wire_ids),
+            };
+            return self.handle_s3_control_options(
+                s3req,
+                &storage_route_admission,
+                bucket,
+                wire_ids,
+            );
+```
+
+crates/server-http/src/http/mod.rs (L1277 to 1290)
+  Note: The unauthenticated S3 Control OPTIONS handler performs a bucket existence check and returns different responses for Ok(false) and Ok(true).
+```
+        if req.header("origin").is_none() {
+            return S3Response::s3_control_options_missing_origin(wire_ids);
+        }
+        let requested_method = match req.header("access-control-request-method") {
+            Some(method) => method,
+            None => return S3Response::s3_control_options_missing_origin(wire_ids),
+        };
+        match self
+            .coordinator
+            .bucket_exists_on_admitted_route(storage_route_admission, bucket)
+        {
+            Ok(false) => S3Response::s3_control_cors_bucket_not_found(requested_method, wire_ids),
+            Ok(true) => S3Response::s3_control_error_with_ids(&ServerError::AccessDenied, wire_ids),
+            Err(err) => S3Response::s3_control_error_with_ids(&err, wire_ids),
+```
+
+crates/server-http/src/http/response.rs (L2393 to 2406)
+  Note: Missing buckets produce a distinct AccessForbidden/CORSResponse: Bucket not found S3 Control response, distinguishable from the AccessDenied response used for existing buckets.
+```
+    /// Build the bounded S3 Control CORS missing-bucket response.
+    #[must_use]
+    pub fn s3_control_cors_bucket_not_found(method: &str, wire_ids: &WireResponseIds) -> Self {
+        Self::s3_control_error(
+            403,
+            "AccessForbidden",
+            "CORSResponse: Bucket not found",
+            &format!(
+                "<Method>{}</Method><ResourceType>BUCKET</ResourceType>",
+                xml::xml_escape(method)
+            ),
+            wire_ids,
+        )
+    }
+```
+
+crates/server-http/src/http/router.rs (L494 to 500)
+  Note: S3 Control routes OPTIONS requests on a parsed bucket ARN into the S3ControlOperation::Options operation.
+```
+    let bucket = parse_s3_control_bucket_resource(path, resource_path)?;
+    match method {
+        "GET" => Ok(S3ControlOperation::ListTagsForResource { bucket }),
+        "POST" => Ok(S3ControlOperation::TagResource { bucket }),
+        "DELETE" => Ok(S3ControlOperation::UntagResource { bucket }),
+        "HEAD" => Ok(S3ControlOperation::HeadBucketTags),
+        "OPTIONS" => Ok(S3ControlOperation::Options { bucket }),
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. Code and validation evidence show a real, reachable product-path auth-boundary bypass for S3 Control OPTIONS: routing at router.rs:494-500, pre-auth dispatch at mod.rs:1025-1045 before auth at mod.rs:1098-1107, unchecked existence lookup at bucket.rs:518-532, and distinguishable missing-bucket response at response.rs:2393-2406. However, the demonstrated impact is limited to bucket existence metadata; there is no object/tag read, data modification, credential exposure, or full SigV4 bypass. Reachability also depends on a configured TLS SharedRegional endpoint and network exposure, while the repository default listener is localhost. Probability times impact therefore supports medium, not high or critical.
+## Likelihood
+high - Exploitation is a simple unauthenticated network request once a TLS SharedRegional endpoint is reachable, but repository defaults bind to localhost and plain HTTP is S3Only; no deployment manifest proving public exposure was present. | Remote network vector
+## Impact
+medium - The attacker learns whether a private bucket name exists by comparing unauthenticated response bodies/codes. This is confidentiality-relevant metadata disclosure but does not expose object contents, tags, credentials, or write/delete capability.
+## Assumptions
+- The affected S3 Control route is deployed through the product argmin-s3 frontend, not only tests.
+- An attacker can reach a configured TLS SharedRegional listener; the default non-TLS listener is S3Only and defaults to 127.0.0.1:9000.
+- The attacker has candidate bucket names to probe.
+- No cloud or deployment APIs were queried; exposure is inferred only from repository code and configuration defaults.
+- S3 Control SharedRegional endpoint enabled via TLS listener
+- attacker network reachability to configured ARGMIN_LISTEN_ADDR
+- attacker sends OPTIONS to /v20180820/tags/arn:aws:s3:::<candidate-bucket>
+- Origin and Access-Control-Request-Method headers present
+## Path
+Attacker OPTIONS -> SharedRegional S3 Control route -> pre-auth OPTIONS handler -> unchecked bucket_exists_on_admitted_route -> distinguishable AccessForbidden vs AccessDenied
+## Path evidence
+- `crates/server-http/src/http/router.rs:512-524` - S3 Control routing is selected for EndpointKind::SharedRegional based on the request target.
+- `crates/server-http/src/http/router.rs:494-500` - OPTIONS on the S3 Control tags ARN path is routed to S3ControlOperation::Options with a parsed bucket.
+- `crates/server-http/src/http/mod.rs:1025-1045` - S3 and S3 Control OPTIONS requests are dispatched before the later authentication block.
+- `crates/server-http/src/http/mod.rs:1098-1107` - SigV4 authentication occurs after the pre-auth OPTIONS returns, confirming the bypass ordering.
+- `crates/server-http/src/http/mod.rs:1277-1290` - Unauthenticated S3 Control OPTIONS checks Origin/Access-Control-Request-Method, calls bucket_exists_on_admitted_route, and returns different responses for Ok(false) and Ok(true).
+- `crates/server-core/src/coordinator/bucket.rs:518-532` - bucket_exists_on_admitted_route uses unchecked_active_bucket_summary_for_admitted_route and converts existence to a boolean without authorization.
+- `crates/server-http/src/http/response.rs:2393-2406` - Missing buckets produce a distinct AccessForbidden / CORSResponse: Bucket not found S3 Control response.
+- `crates/server-http/src/http/serve.rs:536-553` - TLS serving uses EndpointKind::SharedRegional, the endpoint kind that enables S3 Control routing.
+- `crates/argmin-s3/src/config.rs:513-618` - Runtime configuration shows default localhost listener, optional TLS cert/key paths, and environment-based credentials/secrets.
+- `crates/argmin-s3/src/main.rs:8100-8172` - The argmin-s3 binary binds the configured TCP listener and starts either plain S3Only serving or TLS SharedRegional serving.
+## Narrative
+The finding is real and in scope. S3 Control OPTIONS is routed from the production HTTP frontend and explicitly handled before SigV4 authentication. The handler accepts attacker-supplied CORS preflight headers, calls an unchecked bucket-existence lookup, and emits different 403 error bodies for missing versus existing buckets. A prior executable validation PoC confirmed this through the real HttpFrontend path with authentication intentionally failing. The impact is limited to bucket existence/metadata disclosure, not object or tag contents, and S3 Control reachability depends on a TLS SharedRegional endpoint rather than the default localhost S3Only listener, so medium severity is appropriate.
+## Controls
+- SigV4 authentication normally enforced by authenticate_for_service for non-OPTIONS S3/S3 Control operations
+- Plain HTTP serve path uses EndpointKind::S3Only; S3 Control routing is tied to TLS SharedRegional serving
+- Bucket ARN and bucket name parsing validate S3 Control resource format before dispatch
+- Connection and in-flight request admission limits exist, but no specific anti-enumeration rate limit was identified
+- Configuration secrets are environment-driven and debug formatting redacts secret wrapper types
+## Blindspots
+- No Kubernetes, Terraform, container, or load-balancer manifests were found or queried to prove actual public exposure.
+- Static review did not rerun the supplied validation PoC; it relied on the provided executable validation report plus source inspection.
+- S3 Control is enabled only for TLS SharedRegional serving in the reviewed code; operators using only the default plain localhost S3Only listener would not expose this specific route remotely.
+- No runtime rate-limiting or monitoring configuration was available to assess practical enumeration throttling in deployments.
