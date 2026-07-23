@@ -24,7 +24,7 @@ This still does not cover:
 
 The new work for the last item, including the IAM identity-policy foundation it
 requires, is tracked in
-[in-memory-sts-and-iam-foundations.md](in-memory-sts-and-iam-foundations.md).
+[sts-assume-role-issuance.md](sts-assume-role-issuance.md).
 
 Important current bucket-policy note:
 - AWS-backed testing now shows that `PutBucketPolicy` acceptance is broader
@@ -215,7 +215,7 @@ Implementation note for the first step:
 - reject an expired stored credential when an expiry is configured
 - implement issued temporary credentials, mandatory token binding, and session
   expiry through
-  [in-memory-sts-and-iam-foundations.md](in-memory-sts-and-iam-foundations.md),
+  [sts-assume-role-issuance.md](sts-assume-role-issuance.md),
   not as completed work in this follow-up
 
 3. Enforce AWS-like header auth rules:
