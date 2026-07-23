@@ -1522,8 +1522,11 @@ impl StorageClusterRouteAdmission {
     }
 
     /// Revalidate this admission immediately before an effect through its
-    /// captured runtime-map generation. This rejects accidentally pairing an
-    /// admission with a renewable cluster handle from another generation.
+    /// captured runtime-map generation.
+    ///
+    /// Callers which own a [`StorageClusterRuntimeMapHandle`] must first use
+    /// [`StorageClusterRuntimeMapHandle::require_admission_valid_now`] so the
+    /// frontend publication-admission domain is validated as well.
     pub fn require_valid_now_for(
         &self,
         storage_cluster: &Arc<StorageCluster>,
@@ -1918,6 +1921,22 @@ impl StorageClusterRuntimeMapHandle {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Revalidate an admission against this exact frontend publication domain
+    /// and its currently installed runtime-map generation.
+    pub fn require_admission_valid_now(
+        &self,
+        admission: &StorageClusterRouteAdmission,
+    ) -> Result<(), StoreError> {
+        let cluster = self.current();
+        if !Arc::ptr_eq(&self.route_admission.inner, &admission._permit.gate.inner) {
+            return Err(StoreError::RouteAdmissionClusterMismatch {
+                admitted_epoch: admission.cluster.cluster_epoch(),
+                operation_epoch: cluster.cluster_epoch(),
+            });
+        }
+        admission.require_valid_now_for(&cluster)
     }
 
     /// Return whether both handles participate in the same frontend
@@ -2977,6 +2996,29 @@ mod runtime_map_refresh_invalidation_tests {
             admission.require_valid_now_for(&admitted_cluster).unwrap();
             assert!(matches!(
                 admission.require_valid_now_for(&unrelated_cluster),
+                Err(StoreError::RouteAdmissionClusterMismatch {
+                    admitted_epoch,
+                    operation_epoch,
+                }) if admitted_epoch == ClusterEpoch::INITIAL
+                    && operation_epoch == ClusterEpoch::INITIAL
+            ));
+        });
+    }
+
+    #[test]
+    fn admitted_frontend_route_rejects_a_different_publication_domain() {
+        crate::clock::with_time_override(1_000, || {
+            let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
+            cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+            let admitted_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+            let unrelated_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+            let admission = admitted_handle.admit_current_route().unwrap();
+
+            admitted_handle
+                .require_admission_valid_now(&admission)
+                .unwrap();
+            assert!(matches!(
+                unrelated_handle.require_admission_valid_now(&admission),
                 Err(StoreError::RouteAdmissionClusterMismatch {
                     admitted_epoch,
                     operation_epoch,

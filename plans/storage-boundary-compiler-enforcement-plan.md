@@ -2375,6 +2375,61 @@ Forty-eighth Phase 3 slice:
   formatting, the storage boundary checker, workspace-wide strict Clippy, and
   the full parallel workspace suite pass (7,512 tests).
 
+Forty-ninth Phase 3 slice:
+
+- ordinary buffered S3 dispatch now passes the already-authenticated request's
+  `StorageClusterRouteAdmission` into the routed-operation adapter. `HeadBucket`
+  is the first non-streaming coordinator workflow migrated through that
+  boundary: its bucket, policy, and conditional ABAC-tag view are loaded as one
+  snapshot through an `ActiveBucketRoute` derived from the request admission.
+- the production raw `Coordinator::head_bucket` entry point is removed, so the
+  HTTP workflow cannot silently resample the renewable runtime-map handle after
+  admission. Crate-local authorization tests retain a helper which acquires a
+  fresh admission before calling the same production path; direct authorization
+  tests remain test-only.
+- a deterministic regression captures a finite request admission, renews the
+  underlying same-generation route so the raw cluster remains usable, advances
+  beyond the captured deadline, and requires `HeadBucket` to fail as
+  `OperationAborted` before its bucket snapshot load. Existing active-bucket
+  route coverage continues to exercise the same snapshot operation through an
+  installed Unix storage-node client.
+- parsed bucket-policy cache reuse now compares the cached execution,
+  incarnation, and policy generations directly with the already-admitted
+  `LoadedBucketHandle`. It no longer performs a second raw fast-path identity
+  lookup through the renewable cluster handle. The admitted loader also binds
+  the admission to this coordinator's exact publication-admission gate and
+  runtime-map generation before deriving its bucket route, rejecting a
+  capability minted by another coordinator domain even when both handles
+  currently contain the same `Arc<StorageCluster>`.
+- a warm-policy-cache regression installs a failing raw-identity lookup hook,
+  proves `HeadBucket` succeeds without consuming that hook while its captured
+  admission is valid, then proves same-generation renewal cannot extend that
+  admission. A cache-unit matrix independently rejects mismatched execution,
+  incarnation, policy, and watcher-observed generations. A separate
+  positive/negative domain canary uses two independent runtime-map handles over
+  one cluster and rejects the foreign handle's otherwise usable admission
+  before loading its bucket. Storage-level coverage pins the same gate identity
+  independently of the coordinator workflow.
+- retained stream-cleanup capability construction now validates that the
+  admission belongs to the coordinator's exact publication gate before any
+  mutation authority escapes. A same-cluster/different-runtime-handle
+  regression creates a durable stream session, proves a foreign admission
+  cannot mint cleanup authority or remove the session, then uses the local
+  admission as a positive abort canary.
+- admitted bucket-existence and CORS enrichment reads now perform the same
+  coordinator publication-domain validation before deriving their active
+  bucket routes. Two same-cluster/different-runtime-handle regressions retain
+  an admission to the original store, publish a distinct replacement store
+  through only the local handle, and prove the foreign coordinator can still
+  observe the old bucket/CORS state while the local coordinator rejects that
+  admission and its own admission observes the replacement state.
+- the other buffered coordinator workflows, their production raw entry points,
+  and capability requirements on the node-client traits remain open in Phase 3.
+- focused HeadBucket policy/ABAC and captured-deadline regressions, installed
+  Unix bucket-metadata coverage, formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full parallel workspace suite pass
+  (7,534 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

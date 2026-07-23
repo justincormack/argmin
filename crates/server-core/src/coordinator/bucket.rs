@@ -490,15 +490,29 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn head_bucket(&self, req: &BucketRequest<'_>) -> Result<BucketSummary, ServerError> {
+    pub fn head_bucket_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<BucketSummary, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::head_bucket",
+            "Coordinator::head_bucket_on_admitted_route",
             "bucket={:?}",
             req.name
         );
-        let AuthorizedHeadBucket { bucket_info } = self.authorize_head_bucket(req)?;
+        let AuthorizedHeadBucket { bucket_info } =
+            self.authorize_head_bucket_on_admitted_route(admission, req)?;
         Ok(bucket_info)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn head_bucket(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<BucketSummary, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.head_bucket_on_admitted_route(&admission, req)
     }
 
     pub fn bucket_exists(&self, name: &BucketName) -> Result<bool, ServerError> {
@@ -526,6 +540,7 @@ impl Coordinator {
             "bucket={:?}",
             name
         );
+        self.require_storage_route_admission(admission)?;
         match self.unchecked_active_bucket_summary_for_admitted_route(admission, name) {
             Ok(_) => Ok(true),
             Err(ServerError::BucketNotFound { .. }) => Ok(false),
@@ -735,6 +750,7 @@ impl Coordinator {
             "bucket={:?}",
             name
         );
+        self.require_storage_route_admission(admission)?;
         let authorized = self.authorize_load_bucket_cors_config_for(name);
         admission
             .active_bucket_route(&authorized.bucket)

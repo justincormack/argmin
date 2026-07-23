@@ -25,6 +25,7 @@ impl Coordinator {
         admission: &storage::StorageClusterRouteAdmission,
         storage_node: &std::sync::Arc<storage::StorageCluster>,
     ) -> Result<(), ServerError> {
+        self.require_storage_route_admission(admission)?;
         admission
             .require_valid_now_for(storage_node)
             .map_err(super::map_store_error)
@@ -36,6 +37,7 @@ impl Coordinator {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<storage::RetainedStreamUploadCleanup, ServerError> {
+        self.require_storage_route_admission(admission)?;
         admission
             .retained_stream_upload_cleanup(bucket, key)
             .map_err(super::map_store_error)

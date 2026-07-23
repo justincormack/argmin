@@ -403,6 +403,7 @@ impl BucketFastPathCache {
             .map(BucketFastPathCacheEntry::is_fresh)
     }
 
+    #[cfg(test)]
     fn parsed_policy_if_fresh(
         &self,
         bucket: &BucketName,
@@ -422,6 +423,24 @@ impl BucketFastPathCache {
             entry.parsed_policy.as_ref().cloned()?,
             entry.info.identity(),
         ))
+    }
+
+    fn parsed_policy_for_identity_if_fresh(
+        &self,
+        bucket: &BucketName,
+        identity: storage::BucketFastPathIdentity,
+        bucket_policy_generation: u64,
+    ) -> Option<Arc<auth::BucketPolicy>> {
+        let entry = self.entries.get(bucket)?;
+        if !(entry.is_fresh()
+            && entry.info.identity() == identity
+            && entry.info.bucket_policy_present
+            && entry.info.bucket_policy_generation == bucket_policy_generation)
+        {
+            return None;
+        }
+        entry.record_hit(self.next_tick());
+        entry.parsed_policy.as_ref().cloned()
     }
 
     fn insert(&mut self, info: storage::BucketFastPathInfo) -> Result<(), ServerError> {
@@ -586,6 +605,7 @@ impl Coordinator {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn parsed_bucket_fast_path_policy_if_fresh(
         &self,
         bucket: &BucketName,
@@ -606,6 +626,16 @@ impl Coordinator {
                 None
             }
         }
+    }
+
+    pub(super) fn parsed_bucket_fast_path_policy_for_identity_if_fresh(
+        &self,
+        bucket: &BucketName,
+        identity: storage::BucketFastPathIdentity,
+        bucket_policy_generation: u64,
+    ) -> Option<Arc<auth::BucketPolicy>> {
+        read_rwlock_unpoisoned(&self.shared_caches.bucket_fast_path)
+            .parsed_policy_for_identity_if_fresh(bucket, identity, bucket_policy_generation)
     }
 
     pub(super) fn upsert_bucket_fast_path(
@@ -735,6 +765,58 @@ mod bucket_fast_path_cache_tests {
         assert_eq!(cache.is_fresh(&bucket), Some(false));
         let cached = cache.get(&bucket).expect("bucket should remain cached");
         assert_eq!(cached.bucket_execution_generation, 6);
+    }
+
+    #[test]
+    fn parsed_policy_cache_requires_exact_loaded_snapshot_generations() {
+        let mut cache = BucketFastPathCache::default();
+        let bucket = trusted_bucket_name("bucket");
+        let mut info = bucket_fast_path_info("bucket");
+        info.bucket_execution_generation = 11;
+        info.bucket_incarnation_generation = 13;
+        info.bucket_policy_present = true;
+        info.bucket_policy_generation = 17;
+        info.policy = storage::BucketFastPathPolicy::Loaded(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#
+                .to_string(),
+        );
+        cache.insert(info).unwrap();
+
+        let identity = storage::BucketFastPathIdentity {
+            bucket_execution_generation: 11,
+            bucket_incarnation_generation: 13,
+        };
+        assert!(cache
+            .parsed_policy_for_identity_if_fresh(&bucket, identity, 17)
+            .is_some());
+        assert!(cache
+            .parsed_policy_for_identity_if_fresh(
+                &bucket,
+                storage::BucketFastPathIdentity {
+                    bucket_execution_generation: 12,
+                    ..identity
+                },
+                17,
+            )
+            .is_none());
+        assert!(cache
+            .parsed_policy_for_identity_if_fresh(
+                &bucket,
+                storage::BucketFastPathIdentity {
+                    bucket_incarnation_generation: 14,
+                    ..identity
+                },
+                17,
+            )
+            .is_none());
+        assert!(cache
+            .parsed_policy_for_identity_if_fresh(&bucket, identity, 18)
+            .is_none());
+
+        cache.observe_known_generation(&bucket, 12);
+        assert!(cache
+            .parsed_policy_for_identity_if_fresh(&bucket, identity, 17)
+            .is_none());
     }
 }
 

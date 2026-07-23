@@ -40,11 +40,30 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_head_bucket(
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedHeadBucket, ServerError> {
         let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        self.authorize_head_bucket_with_loaded_handle(req, bucket)
+    }
+
+    pub(in crate::coordinator) fn authorize_head_bucket_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedHeadBucket, ServerError> {
+        let bucket =
+            self.load_bucket_handle_for_bucket_policy_read_on_admitted_route(admission, req)?;
+        self.authorize_head_bucket_with_loaded_handle(req, bucket)
+    }
+
+    fn authorize_head_bucket_with_loaded_handle(
+        &self,
+        req: &BucketRequest<'_>,
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedHeadBucket, ServerError> {
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let bucket_read_fallback = || {
             Self::requester_can_read_bucket(

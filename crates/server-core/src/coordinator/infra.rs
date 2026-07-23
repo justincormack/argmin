@@ -754,6 +754,15 @@ impl Coordinator {
             .map_err(map_store_error)
     }
 
+    pub(super) fn require_storage_route_admission(
+        &self,
+        admission: &StorageClusterRouteAdmission,
+    ) -> Result<(), ServerError> {
+        self.storage_node
+            .require_admission_valid_now(admission)
+            .map_err(map_store_error)
+    }
+
     pub fn shares_storage_route_admission_with(&self, other: &Self) -> bool {
         self.storage_node
             .shares_route_admission_with(&other.storage_node)

@@ -154,7 +154,7 @@ pub enum StoreError {
     },
 
     #[error(
-        "route admission for cluster epoch {admitted_epoch} was used with a different runtime-map generation at epoch {operation_epoch}"
+        "route admission for cluster epoch {admitted_epoch} was used with a different publication domain or runtime-map generation at epoch {operation_epoch}"
     )]
     RouteAdmissionClusterMismatch {
         admitted_epoch: ClusterEpoch,

@@ -1126,17 +1126,17 @@ impl HttpFrontend {
                             } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
                                 Err(err)
                             } else {
-                                self.dispatch_service(s3req, &auth, operation)
+                                self.dispatch_service(s3req, &auth, &admission, operation)
                             }
                         } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
                             Err(err)
                         } else {
-                            self.dispatch_service(s3req, &auth, operation)
+                            self.dispatch_service(s3req, &auth, &admission, operation)
                         }
                     } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
                         Err(err)
                     } else {
-                        self.dispatch_service(s3req, &auth, operation)
+                        self.dispatch_service(s3req, &auth, &admission, operation)
                     };
                     (result, Some(admission))
                 }
@@ -1576,10 +1576,16 @@ impl HttpFrontend {
         &self,
         req: &S3Request,
         auth: &AuthContext,
+        storage_route_admission: &storage::StorageClusterRouteAdmission,
         operation: ServiceOperation,
     ) -> Result<S3Response, ServerError> {
         match operation {
-            ServiceOperation::S3(operation) => self.dispatch_routed(req, auth, operation),
+            ServiceOperation::S3(operation) => self.dispatch_routed_on_admitted_route(
+                req,
+                auth,
+                storage_route_admission,
+                operation,
+            ),
             ServiceOperation::S3Control(operation) => {
                 self.dispatch_s3_control(req, auth, operation)
             }
@@ -1709,10 +1715,22 @@ impl HttpFrontend {
         }
     }
 
+    #[cfg(test)]
     fn dispatch_routed(
         &self,
         req: &S3Request,
         auth: &AuthContext,
+        operation: S3Operation,
+    ) -> Result<S3Response, ServerError> {
+        let storage_route_admission = self.coordinator.admit_storage_route_for_request()?;
+        self.dispatch_routed_on_admitted_route(req, auth, &storage_route_admission, operation)
+    }
+
+    fn dispatch_routed_on_admitted_route(
+        &self,
+        req: &S3Request,
+        auth: &AuthContext,
+        storage_route_admission: &storage::StorageClusterRouteAdmission,
         operation: S3Operation,
     ) -> Result<S3Response, ServerError> {
         observability::trace_scope!(
@@ -1774,11 +1792,10 @@ impl HttpFrontend {
             }
             S3Operation::HeadBucket { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                let info = self.coordinator.head_bucket(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)?;
+                let info = self.coordinator.head_bucket_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )?;
                 Ok(S3Response::head_bucket(&info, self.coordinator.region()))
             }
             S3Operation::GetBucketLocation { bucket } => {
@@ -7627,13 +7644,17 @@ mod tests {
             })
             .unwrap();
 
+        let admission = fe.coordinator.admit_storage_route_for_request().unwrap();
         let bucket = fe
             .coordinator
-            .head_bucket(&crate::coordinator::BucketRequest::new(
-                parse_bucket_name("mybucket").unwrap(),
-                crate::coordinator::Requester::authenticated(account.clone()),
-                None,
-            ))
+            .head_bucket_on_admitted_route(
+                &admission,
+                &crate::coordinator::BucketRequest::new(
+                    parse_bucket_name("mybucket").unwrap(),
+                    crate::coordinator::Requester::authenticated(account.clone()),
+                    None,
+                ),
+            )
             .unwrap();
         assert_eq!(bucket.owner_canonical_id, owner_canonical_id);
 

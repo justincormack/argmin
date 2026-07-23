@@ -1068,7 +1068,11 @@ impl Coordinator {
             return Ok(None);
         }
 
-        if let Some(cached) = self.cached_bucket_policy_if_fresh(bucket_summary) {
+        if let Some(cached) = self.parsed_bucket_fast_path_policy_for_identity_if_fresh(
+            &bucket_summary.name,
+            bucket.fast_path_identity(),
+            bucket_summary.bucket_policy_generation,
+        ) {
             return Ok(Some(cached));
         }
 
@@ -1089,6 +1093,7 @@ impl Coordinator {
         Ok(Some(parsed_policy))
     }
 
+    #[cfg(test)]
     pub(super) fn cached_bucket_policy_if_fresh(
         &self,
         bucket: &BucketSummary,
@@ -1656,6 +1661,22 @@ impl Coordinator {
         req: &BucketRequest<'_>,
     ) -> Result<LoadedBucketHandle, ServerError> {
         self.load_bucket_handle_for_bucket_policy_read_with_storage_node(&self.storage_node(), req)
+    }
+
+    pub(super) fn load_bucket_handle_for_bucket_policy_read_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+        self.bucket_handle_loader().load_bucket_on_admitted_route(
+            admission,
+            req.name_typed(),
+            req.expected_bucket_owner(),
+            request,
+        )
     }
 
     pub(super) fn load_bucket_handle_for_bucket_policy_read_with_storage_node(

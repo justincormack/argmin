@@ -4,7 +4,7 @@ use s3_types::VersionId;
 use std::sync::Arc;
 use storage::{
     BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
-    BucketSnapshotTagsRequest, ObjectKey, StorageCluster,
+    BucketSnapshotTagsRequest, ObjectKey, StorageCluster, StorageClusterRouteAdmission,
 };
 
 use super::{BucketSummary, Coordinator};
@@ -196,6 +196,13 @@ impl LoadedBucketHandle {
         self.bucket_incarnation_generation
     }
 
+    pub(super) const fn fast_path_identity(&self) -> storage::BucketFastPathIdentity {
+        storage::BucketFastPathIdentity {
+            bucket_execution_generation: self.bucket_execution_generation,
+            bucket_incarnation_generation: self.bucket_incarnation_generation,
+        }
+    }
+
     pub(super) const fn request(&self) -> BucketHandleRequest {
         self.request
     }
@@ -344,6 +351,23 @@ impl<'a> BucketHandleLoader<'a> {
     ) -> Result<LoadedBucketHandle, ServerError> {
         let snapshot = storage_node
             .load_bucket_snapshot(name, request.resolve_to_storage_request())
+            .map_err(Self::map_bucket_snapshot_error)?;
+        self.load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)
+    }
+
+    pub(super) fn load_bucket_on_admitted_route(
+        self,
+        admission: &StorageClusterRouteAdmission,
+        name: &BucketName,
+        expected_bucket_owner: Option<&str>,
+        request: BucketHandleRequest,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        self.coordinator
+            .require_storage_route_admission(admission)?;
+        let snapshot = admission
+            .active_bucket_route(name)
+            .map_err(super::map_store_error)?
+            .load_bucket_snapshot(request.resolve_to_storage_request())
             .map_err(Self::map_bucket_snapshot_error)?;
         self.load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)
     }

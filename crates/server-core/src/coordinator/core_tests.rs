@@ -213,6 +213,373 @@ fn coordinator_storage_node_tracks_runtime_map_handle_install() {
 }
 
 #[test]
+fn head_bucket_rechecks_the_request_admission_deadline_before_snapshot_load() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let (cluster, coord, admission) = storage::clock::with_time_override(1_000, || {
+        let cluster = same_store_cluster_with_route_map_validity(
+            &initial,
+            tmp.path(),
+            RouteMapValidity::until_ms(5_000).unwrap(),
+        );
+        let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&cluster),
+        );
+        let admission = coord.admit_storage_route_for_request().unwrap();
+        (cluster, coord, admission)
+    });
+
+    storage::clock::with_time_override(1_000, || {
+        cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    });
+    storage::clock::with_time_override(6_000, || {
+        // The renewable raw cluster remains live, but authority already handed
+        // to this request must not be extended by that renewal.
+        cluster
+            .head_bucket_info(&trusted_bucket_name("bucket"))
+            .unwrap();
+        let error = coord
+            .head_bucket_on_admitted_route(
+                &admission,
+                &bucket_request_with_expected_owner("bucket", test_requester(), None),
+            )
+            .unwrap_err();
+        assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    });
+}
+
+#[test]
+fn head_bucket_warm_policy_cache_uses_loaded_identity_and_captured_deadline() {
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&cluster));
+    let bucket = "head-bucket-admitted-policy-cache";
+    let requester = test_requester();
+
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &coord,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        requester.clone(),
+        None,
+    )
+    .unwrap();
+    put_bucket_policy_test(
+        &coord,
+        bucket,
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::head-bucket-admitted-policy-cache"}]}"#,
+        requester.clone(),
+        None,
+    )
+    .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, "key", requester.clone(), None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    coord
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                requester.clone(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+
+    let bucket_name = trusted_bucket_name(bucket);
+    let cached = coord
+        .get_bucket_fast_path(&bucket_name)
+        .expect("HeadObject should warm the parsed bucket-policy cache");
+    assert!(matches!(
+        cached.policy,
+        storage::BucketFastPathPolicy::Loaded(_)
+    ));
+    assert_eq!(
+        coord.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true)
+    );
+
+    let admission = storage::clock::with_time_override(1_000, || {
+        cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+        coord.admit_storage_route_for_request().unwrap()
+    });
+    storage::clock::with_time_override(1_000, || {
+        cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    });
+
+    let _identity_load_error_guard =
+        install_bucket_fast_path_identity_load_error_test_hook(bucket.to_string());
+    storage::clock::with_time_override(4_000, || {
+        coord
+            .head_bucket_on_admitted_route(
+                &admission,
+                &bucket_request_with_expected_owner(bucket, requester.clone(), None),
+            )
+            .unwrap();
+    });
+    assert_eq!(
+        coord.bucket_fast_path_is_fresh_for_test(&bucket_name),
+        Some(true),
+        "request-scoped policy-cache validation must not perform the raw identity lookup"
+    );
+
+    storage::clock::with_time_override(6_000, || {
+        cluster.head_bucket_info(&bucket_name).unwrap();
+        let error = coord
+            .head_bucket_on_admitted_route(
+                &admission,
+                &bucket_request_with_expected_owner(bucket, requester, None),
+            )
+            .unwrap_err();
+        assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    });
+}
+
+#[test]
+fn head_bucket_rejects_admission_from_an_unrelated_coordinator() {
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let foreign_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        local_handle,
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+        BackgroundWorkerMode::none(),
+    )
+    .unwrap();
+    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        foreign_handle,
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+        BackgroundWorkerMode::none(),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&local.storage_node(), &foreign.storage_node()));
+    assert!(!local.shares_storage_route_admission_with(&foreign));
+
+    foreign
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let foreign_admission = foreign.admit_storage_route_for_request().unwrap();
+    let request = bucket_request_with_expected_owner("bucket", test_requester(), None);
+    foreign
+        .head_bucket_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+
+    let error = local
+        .head_bucket_on_admitted_route(&foreign_admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+}
+
+#[test]
+fn retained_stream_cleanup_rejects_admission_from_an_unrelated_coordinator() {
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let foreign_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        local_handle,
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+        BackgroundWorkerMode::none(),
+    )
+    .unwrap();
+    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        foreign_handle,
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+        BackgroundWorkerMode::none(),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&local.storage_node(), &foreign.storage_node()));
+    assert!(!local.shares_storage_route_admission_with(&foreign));
+
+    local
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let session_id = begin_stream_put_test(&local, "bucket", "key").unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+
+    let foreign_admission = foreign.admit_storage_route_for_request().unwrap();
+    let Err(error) = local.retained_stream_upload_cleanup(&foreign_admission, &bucket, &key) else {
+        panic!("foreign admission unexpectedly minted retained cleanup authority");
+    };
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    cluster
+        .load_stream_upload_session(&bucket, &key, &session_id)
+        .expect("foreign admission must not abort the durable stream session");
+
+    let local_admission = local.admit_storage_route_for_request().unwrap();
+    let cleanup = local
+        .retained_stream_upload_cleanup(&local_admission, &bucket, &key)
+        .unwrap();
+    local
+        .abort_stream_upload_with_retained_cleanup(&cleanup, &session_id)
+        .unwrap();
+    assert!(matches!(
+        cluster.load_stream_upload_session(&bucket, &key, &session_id),
+        Err(storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::StreamSessionNotFound { .. }
+        ))
+    ));
+}
+
+#[test]
+fn bucket_exists_rejects_stale_admission_from_an_unrelated_coordinator() {
+    let initial_tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(initial_tmp.path(), &[0]);
+    let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let foreign_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        local_handle.clone(),
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+        BackgroundWorkerMode::none(),
+    )
+    .unwrap();
+    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        foreign_handle,
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+        BackgroundWorkerMode::none(),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&local.storage_node(), &foreign.storage_node()));
+    assert!(!local.shares_storage_route_admission_with(&foreign));
+
+    local
+        .create_bucket_for_owner("default-owner", "old-bucket", false)
+        .unwrap();
+    let bucket = trusted_bucket_name("old-bucket");
+    let foreign_admission = foreign.admit_storage_route_for_request().unwrap();
+
+    let replacement_tmp = test_util::tempdir();
+    let replacement =
+        make_dynamic_runtime_map_candidate(open_test_storage_cluster(replacement_tmp.path(), &[0]));
+    local_handle.install(Arc::clone(&replacement)).unwrap();
+    assert!(Arc::ptr_eq(&local.storage_node(), &replacement));
+    assert!(foreign
+        .bucket_exists_on_admitted_route(&foreign_admission, &bucket)
+        .unwrap());
+
+    let error = local
+        .bucket_exists_on_admitted_route(&foreign_admission, &bucket)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+
+    let local_admission = local.admit_storage_route_for_request().unwrap();
+    assert!(!local
+        .bucket_exists_on_admitted_route(&local_admission, &bucket)
+        .unwrap());
+}
+
+#[test]
+fn bucket_cors_read_rejects_stale_admission_from_an_unrelated_coordinator() {
+    let initial_tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(initial_tmp.path(), &[0]);
+    let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let foreign_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        local_handle.clone(),
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+        BackgroundWorkerMode::none(),
+    )
+    .unwrap();
+    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        foreign_handle,
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+        BackgroundWorkerMode::none(),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&local.storage_node(), &foreign.storage_node()));
+    assert!(!local.shares_storage_route_admission_with(&foreign));
+
+    local
+        .create_bucket_for_owner("default-owner", "cors-bucket", false)
+        .unwrap();
+    let old_cors = "<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>https://old.example</AllowedOrigin></CORSRule></CORSConfiguration>";
+    local
+        .put_bucket_cors(&put_bucket_config_request_with_expected_owner(
+            "cors-bucket",
+            old_cors,
+            test_requester(),
+            None,
+        ))
+        .unwrap();
+    let bucket = trusted_bucket_name("cors-bucket");
+    let foreign_admission = foreign.admit_storage_route_for_request().unwrap();
+
+    let replacement_tmp = test_util::tempdir();
+    let replacement =
+        make_dynamic_runtime_map_candidate(open_test_storage_cluster(replacement_tmp.path(), &[0]));
+    local_handle.install(Arc::clone(&replacement)).unwrap();
+    local
+        .create_bucket_for_owner("default-owner", "cors-bucket", false)
+        .unwrap();
+    assert_eq!(
+        foreign
+            .load_bucket_cors_config(&foreign_admission, &bucket)
+            .unwrap()
+            .as_deref(),
+        Some(old_cors)
+    );
+
+    let error = local
+        .load_bucket_cors_config(&foreign_admission, &bucket)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+
+    let local_admission = local.admit_storage_route_for_request().unwrap();
+    assert_eq!(
+        local
+            .load_bucket_cors_config(&local_admission, &bucket)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
 fn maintenance_worker_operations_sample_epoch_refreshed_runtime_map() {
     let tmp = test_util::tempdir();
     let initial = open_test_storage_cluster(tmp.path(), &[0]);
@@ -11967,7 +12334,7 @@ fn get_object_validates_independent_fast_path_before_stale_public_access_block()
 }
 
 #[test]
-fn head_object_bypasses_fast_path_when_identity_validation_fails() {
+fn head_object_reloads_snapshot_when_fast_path_identity_validation_fails() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-fast-path-identity-load-failure";
     let pg_ids: Vec<u32> = (0..4).collect();
@@ -12069,8 +12436,8 @@ fn head_object_bypasses_fast_path_when_identity_validation_fails() {
     ));
     assert_eq!(
         coord.bucket_fast_path_is_fresh_for_test(&bucket_name),
-        None,
-        "failed identity validation should remove the cached fast-path entry"
+        Some(true),
+        "the authoritative snapshot reload should replace the rejected fast-path entry"
     );
 }
 
