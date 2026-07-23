@@ -13565,7 +13565,11 @@ impl StorageCluster {
                 cluster_epoch: route.cluster_epoch(),
             })?;
         node.shard_ack_client()
-            .load_written_shard_ack_for_historical_inspection(data_pg_id, shard_key)
+            .load_written_shard_ack_for_historical_inspection(
+                route.cluster_epoch(),
+                data_pg_id,
+                shard_key,
+            )
     }
 
     fn segment_payload_locations(

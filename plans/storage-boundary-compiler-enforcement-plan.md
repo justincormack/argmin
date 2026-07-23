@@ -2302,6 +2302,42 @@ Forty-sixth Phase 3 slice:
   storage boundary checker, all 2,241 storage tests, workspace-wide strict
   Clippy, and the full parallel workspace suite pass (7,506 tests).
 
+Forty-seventh Phase 3 slice:
+
+- historical shard payload and acknowledgement inspection now run in the
+  retained-cleanup admission domain rather than holding active publication
+  admission. Separate non-cloneable server-local capabilities validate the
+  exact retained node/epoch/PG route immediately before each read. Payload
+  inspection additionally binds the complete `ShardLocation` to the exact
+  `ShardKey`; acknowledgement inspection requires the node to be the primary
+  recorded by that retained route.
+- the historical acknowledgement node-client method now requires the retained
+  route epoch. Unix requests carry that epoch instead of substituting the
+  client's current epoch, allowing the server to distinguish the historical
+  primary from the current primary. The wire shape and encoding version are
+  unchanged because the epoch field was already present.
+- the former configured-PG-only historical validation path is removed. A node
+  that merely retains local PG files but is absent from the exact current or
+  historical acting set can no longer inspect them through RPC; an
+  unretained route likewise fails closed. Retained inspection remains
+  available after current route-map expiry so repair and backfill can finish
+  from durable historical authority. It can run during draining and must
+  complete before route-map publication proceeds.
+- deterministic capability coverage rejects active and foreign admission,
+  crossed shard subjects, unretained epochs, and a non-primary historical ack
+  route while preserving positive payload and ack reads after current-route
+  expiry. Installed Unix regressions cover exact historical payload routing,
+  cross-epoch acknowledgement loading, and reconstruction through retained
+  routes. The remote backfill workflow now installs the same retained source
+  route on the frontend and storage nodes, proving historical acknowledgement
+  loading through the production cross-epoch topology rather than relying on
+  configured-PG fallback.
+- read-handle session control, remaining frontend capability migration, and
+  capability requirements on the node-client traits remain open in Phase 3.
+- focused retained-inspection and installed Unix regressions, the boundary
+  checker, formatting, the full storage suite (2,242 tests), workspace-wide
+  strict Clippy, and the full parallel workspace suite (7,510 tests) pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

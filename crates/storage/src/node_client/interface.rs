@@ -1054,6 +1054,7 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
 
     fn load_written_shard_ack_for_historical_inspection(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<WriteAck, StoreError>;

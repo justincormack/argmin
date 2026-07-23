@@ -506,7 +506,7 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
             pg_ids: vec![pg_id.get()],
             socket_path: socket_path.clone(),
             pg_routes: vec![StorageNodePgRoute::from(&desired_route)],
-            historical_pg_routes: Vec::new(),
+            historical_pg_routes: vec![StorageNodePgRoute::from(&source_route)],
             pending_metadata_command_recoveries: Vec::new(),
         })
         .unwrap();

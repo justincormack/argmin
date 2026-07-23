@@ -293,6 +293,7 @@ impl ShardAckNodeClient for LocalStorageNodeClient {
 
     fn load_written_shard_ack_for_historical_inspection(
         &self,
+        _route_cluster_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<WriteAck, StoreError> {

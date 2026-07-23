@@ -180,10 +180,16 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn load_written_shard_ack_for_historical_inspection(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<WriteAck, StoreError> {
-        let payload = self.encode_shard_ack_item(data_pg_id, key);
+        let payload = encode_shard_ack_item_request(&StorageRpcShardAckItemRequest {
+            node_id: self.node_id,
+            cluster_epoch: route_cluster_epoch,
+            pg_id: data_pg_id.pg_id(),
+            shard_key: key.clone(),
+        });
         let response = self.rpc_request(StorageRpcMessageKind::ShardAckHistoricalLoad, payload)?;
         let item = decode_shard_ack_item_response(&response).map_err(|error| {
             self.rpc_payload_error(
@@ -974,11 +980,15 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
 
     fn load_written_shard_ack_for_historical_inspection(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<WriteAck, StoreError> {
         UnixStorageNodeClient::load_written_shard_ack_for_historical_inspection(
-            self, data_pg_id, key,
+            self,
+            route_cluster_epoch,
+            data_pg_id,
+            key,
         )
     }
 

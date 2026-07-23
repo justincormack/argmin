@@ -3576,7 +3576,27 @@ struct StorageNodeRetainedShardPayloadDeleteRoute<'a> {
     shard_key: &'a ShardKey,
 }
 
+struct StorageNodeRetainedShardInspectionRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    route_permit: &'a StorageNodeRouteAdmissionPermit,
+    node_id: NodeId,
+    route_cluster_epoch: ClusterEpoch,
+    raw_pg_id: PgId,
+    location: ShardLocation,
+    shard_key: &'a ShardKey,
+}
+
 struct StorageNodeRetainedShardAckDeleteRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    route_permit: &'a StorageNodeRouteAdmissionPermit,
+    node_id: NodeId,
+    route_cluster_epoch: ClusterEpoch,
+    raw_pg_id: PgId,
+    pg_id: DataPgId,
+    shard_key: &'a ShardKey,
+}
+
+struct StorageNodeRetainedShardAckInspectionRoute<'a> {
     handler: &'a StorageNodeConnectionHandler,
     route_permit: &'a StorageNodeRouteAdmissionPermit,
     node_id: NodeId,
@@ -6241,7 +6261,7 @@ impl StorageNodeRetainedObjectPayloadLeaseControl<'_> {
 
 impl StorageNodeRetainedShardPayloadDeleteRoute<'_> {
     fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
-        let pg_id = self.handler.validate_retained_shard_payload_delete_route(
+        let pg_id = self.handler.validate_retained_shard_route(
             self.route_permit,
             self.node_id,
             self.route_cluster_epoch,
@@ -6274,6 +6294,37 @@ impl StorageNodeRetainedShardPayloadDeleteRoute<'_> {
     }
 }
 
+impl StorageNodeRetainedShardInspectionRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
+        let pg_id = self.handler.validate_retained_shard_route(
+            self.route_permit,
+            self.node_id,
+            self.route_cluster_epoch,
+            self.raw_pg_id,
+            self.location.shard_index(),
+            self.shard_key,
+            "historical shard inspection",
+        )?;
+        if pg_id != self.location.data_pg_id() {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: "historical shard inspection capability changed its validated data PG"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn read(&self) -> Result<Vec<u8>, StorageNodeDataRouteError> {
+        self.require_valid_now()
+            .map_err(StorageNodeDataRouteError::Route)?;
+        self.handler
+            .node
+            .read_shard_file(self.location.data_pg_id().get(), self.shard_key)
+            .map_err(StorageNodeDataRouteError::Store)
+    }
+}
+
 impl StorageNodeRetainedShardAckDeleteRoute<'_> {
     fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
         let pg_id = self.handler.validate_retained_data_route(
@@ -6300,6 +6351,43 @@ impl StorageNodeRetainedShardAckDeleteRoute<'_> {
             .node
             .get_pg(self.pg_id.get())
             .and_then(|pg| pg.delete_shard_record(self.shard_key))
+            .map_err(StorageNodeDataRouteError::Store)
+    }
+}
+
+impl StorageNodeRetainedShardAckInspectionRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
+        let pg_id = self.handler.validate_retained_data_route(
+            self.route_permit,
+            self.node_id,
+            self.route_cluster_epoch,
+            self.raw_pg_id,
+            true,
+            "historical shard ack inspection",
+        )?;
+        if pg_id != self.pg_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: "historical shard ack inspection capability changed its validated data PG"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn load(&self) -> Result<WriteAck, StorageNodeDataRouteError> {
+        self.require_valid_now()
+            .map_err(StorageNodeDataRouteError::Route)?;
+        self.handler
+            .node
+            .get_pg(self.pg_id.get())
+            .and_then(|pg| {
+                let stat = pg.stat_shard(self.shard_key)?;
+                Ok(WriteAck {
+                    crc64: stat.crc64,
+                    stored_size: stat.size,
+                })
+            })
             .map_err(StorageNodeDataRouteError::Store)
     }
 }
@@ -6642,7 +6730,9 @@ impl StorageNodeConnectionHandler {
                         | StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease
                         | StorageRpcMessageKind::LifecycleSweepClaimRelease
                         | StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease
+                        | StorageRpcMessageKind::ShardHistoricalRead
                         | StorageRpcMessageKind::ShardDelete
+                        | StorageRpcMessageKind::ShardAckHistoricalLoad
                         | StorageRpcMessageKind::ShardAckDelete
                         | StorageRpcMessageKind::ObjectStreamUploadRetainedAbortPrepare
                         | StorageRpcMessageKind::MetadataCommandRetainedAbortApply
@@ -7574,7 +7664,7 @@ impl StorageNodeConnectionHandler {
             },
             StorageRpcMessageKind::ShardHistoricalRead => {
                 match decode_shard_read_request(&frame.payload) {
-                    Ok(request) => self.shard_historical_read_response(request),
+                    Ok(request) => self.shard_historical_read_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -7628,7 +7718,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ShardAckHistoricalLoad => {
                 match decode_shard_ack_item_request(&frame.payload) {
-                    Ok(request) => self.shard_ack_historical_load_response(request),
+                    Ok(request) => self.shard_ack_historical_load_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -11841,19 +11931,18 @@ impl StorageNodeConnectionHandler {
 
     fn shard_historical_read_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcShardReadRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let location =
-            match self.validate_shard_location_for_historical_inspection(request.location) {
-                Ok(location) => location,
-                Err(error) => return encode_storage_rpc_error_response(&error),
-            };
-        self.shard_read_file_response(
-            self.node
-                .read_shard_file(location.data_pg_id().get(), &request.shard_key)
-                .map_err(StorageNodeDataRouteError::Store),
-            request,
-        )
+        let route = match self.retained_shard_inspection_route(
+            route_permit,
+            &request,
+            "historical shard inspection",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        self.shard_read_file_response(route.read(), request)
     }
 
     fn shard_read_file_response(
@@ -12052,42 +12141,30 @@ impl StorageNodeConnectionHandler {
 
     fn shard_ack_historical_load_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcShardAckItemRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if request.node_id != self.config.node_id {
-            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::UnknownNode,
-                message: format!(
-                    "request targets node {}, but this storage node is {}",
-                    request.node_id.as_u32(),
-                    self.config.node_id.as_u32()
-                ),
-            });
-        }
-        if !self.config.pg_ids.contains(&request.pg_id.get()) {
-            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::UnknownPg,
-                message: format!(
-                    "PG {} is not configured on this storage node",
-                    request.pg_id.get()
-                ),
-            });
-        }
-        let data_pg_id = self.validated_data_pg(request.pg_id);
-        let response = match self.node.get_pg(data_pg_id.get()).and_then(|pg| {
-            let stat = pg.stat_shard(&request.shard_key)?;
-            Ok(WriteAck {
-                crc64: stat.crc64,
-                stored_size: stat.size,
-            })
-        }) {
+        let route = match self.retained_shard_ack_inspection_route(
+            route_permit,
+            &request,
+            "historical shard ack inspection",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let response = match route.load() {
             Ok(ack) => encode_storage_rpc_success_response(&encode_shard_ack_item_response(
                 &StorageRpcShardAckItem {
                     shard_key: request.shard_key,
                     ack,
                 },
             )),
-            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+            Err(StorageNodeDataRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)?
+            }
+            Err(StorageNodeDataRouteError::Store(error)) => {
+                encode_storage_rpc_error_response(&store_error_response(error))?
+            }
         };
         Ok(response)
     }
@@ -14735,30 +14812,6 @@ impl StorageNodeConnectionHandler {
         Ok(self.validated_shard_location(location))
     }
 
-    fn validate_shard_location_for_historical_inspection(
-        &self,
-        location: StorageRpcShardLocation,
-    ) -> Result<ShardLocation, StorageRpcErrorResponse> {
-        if location.node_id != self.config.node_id {
-            return Err(StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::UnknownNode,
-                message: format!(
-                    "request targets node {}, but this storage node is {}",
-                    location.node_id.as_u32(),
-                    self.config.node_id.as_u32()
-                ),
-            });
-        }
-        let pg_id = location.pg_id.get();
-        if !self.config.pg_ids.contains(&pg_id) {
-            return Err(StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::UnknownPg,
-                message: format!("PG {pg_id} is not configured on this storage node"),
-            });
-        }
-        Ok(self.validated_shard_location(location))
-    }
-
     fn validated_shard_location(&self, location: StorageRpcShardLocation) -> ShardLocation {
         let data_pg_id = self
             .node
@@ -15973,7 +16026,7 @@ impl StorageNodeConnectionHandler {
         request: &'a StorageRpcShardDeleteRequest,
         operation: &'static str,
     ) -> Result<StorageNodeRetainedShardPayloadDeleteRoute<'a>, StorageRpcErrorResponse> {
-        let pg_id = self.validate_retained_shard_payload_delete_route(
+        let pg_id = self.validate_retained_shard_route(
             route_permit,
             request.location.node_id,
             request.location.cluster_epoch,
@@ -15983,6 +16036,37 @@ impl StorageNodeConnectionHandler {
             operation,
         )?;
         Ok(StorageNodeRetainedShardPayloadDeleteRoute {
+            handler: self,
+            route_permit,
+            node_id: request.location.node_id,
+            route_cluster_epoch: request.location.cluster_epoch,
+            raw_pg_id: request.location.pg_id,
+            location: ShardLocation::new(
+                request.location.cluster_epoch,
+                pg_id,
+                request.location.shard_index,
+                request.location.node_id,
+            ),
+            shard_key: &request.shard_key,
+        })
+    }
+
+    fn retained_shard_inspection_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcShardReadRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeRetainedShardInspectionRoute<'a>, StorageRpcErrorResponse> {
+        let pg_id = self.validate_retained_shard_route(
+            route_permit,
+            request.location.node_id,
+            request.location.cluster_epoch,
+            request.location.pg_id,
+            request.location.shard_index,
+            &request.shard_key,
+            operation,
+        )?;
+        Ok(StorageNodeRetainedShardInspectionRoute {
             handler: self,
             route_permit,
             node_id: request.location.node_id,
@@ -16013,6 +16097,31 @@ impl StorageNodeConnectionHandler {
             operation,
         )?;
         Ok(StorageNodeRetainedShardAckDeleteRoute {
+            handler: self,
+            route_permit,
+            node_id: request.node_id,
+            route_cluster_epoch: request.cluster_epoch,
+            raw_pg_id: request.pg_id,
+            pg_id,
+            shard_key: &request.shard_key,
+        })
+    }
+
+    fn retained_shard_ack_inspection_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcShardAckItemRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeRetainedShardAckInspectionRoute<'a>, StorageRpcErrorResponse> {
+        let pg_id = self.validate_retained_data_route(
+            route_permit,
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+            true,
+            operation,
+        )?;
+        Ok(StorageNodeRetainedShardAckInspectionRoute {
             handler: self,
             route_permit,
             node_id: request.node_id,
@@ -16346,7 +16455,7 @@ impl StorageNodeConnectionHandler {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn validate_retained_shard_payload_delete_route(
+    fn validate_retained_shard_route(
         &self,
         route_permit: &StorageNodeRouteAdmissionPermit,
         node_id: NodeId,
@@ -19916,18 +20025,32 @@ mod tests {
             live_error.code,
             StorageRpcErrorCode::InactivePgRoute | StorageRpcErrorCode::NonActingSetAccess
         ));
-        server
-            .connection_handler()
-            .validate_shard_location_for_historical_inspection(
-                ShardLocation::new(
-                    runtime_map.cluster_epoch(),
-                    DataPgId::new_for_test(pg_id),
-                    ShardIndex::new(0),
-                    node_id,
-                )
-                .into(),
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let request = StorageRpcShardReadRequest {
+            location: ShardLocation::new(
+                runtime_map.cluster_epoch(),
+                DataPgId::new_for_test(pg_id),
+                ShardIndex::new(0),
+                node_id,
             )
-            .unwrap();
+            .into(),
+            shard_key: test_shard_key(0),
+            expected_ack: WriteAck {
+                stored_size: 1,
+                crc64: 1,
+            },
+        };
+        let error = match server.connection_handler().retained_shard_inspection_route(
+            &retained_permit,
+            &request,
+            "test historical shard inspection",
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("non-acting current route created historical inspection authority"),
+        };
+        assert_eq!(error.code, StorageRpcErrorCode::NonActingSetAccess);
     }
 
     #[test]
@@ -26065,6 +26188,185 @@ mod tests {
     }
 
     #[test]
+    fn retained_data_inspection_capabilities_bind_exact_route_primary_and_subject() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.cluster_epoch = ClusterEpoch::new(4).unwrap();
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        config.pg_routes[0].cluster_epoch = config.cluster_epoch;
+        config.historical_pg_routes = vec![
+            StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                state: PgState::Active,
+                primary_node_id: config.node_id,
+                acting_set: vec![config.node_id],
+            },
+            StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                state: PgState::Active,
+                primary_node_id: NodeId::new(8),
+                acting_set: vec![config.node_id, NodeId::new(8)],
+            },
+        ];
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let shard_key = test_shard_key(0);
+        let payload = b"retained historical data inspection";
+        let ack = server
+            ._node
+            .write_shard_file_if_absent(0, &shard_key, payload)
+            .unwrap();
+        server
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .register_written_shards_batch_exact(&[(&shard_key, ack)])
+            .unwrap();
+
+        let handler = server.connection_handler();
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let foreign_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let location = test_location(3, 0, config.node_id.as_u32());
+        let payload_request = StorageRpcShardReadRequest {
+            location: location.into(),
+            shard_key: shard_key.clone(),
+            expected_ack: ack,
+        };
+        let ack_request = StorageRpcShardAckItemRequest {
+            node_id: config.node_id,
+            cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            pg_id: PgId::new(0),
+            shard_key: shard_key.clone(),
+        };
+
+        crate::clock::with_time_override(6_000, || {
+            assert_eq!(
+                handler
+                    .retained_shard_inspection_route(
+                        &retained_permit,
+                        &payload_request,
+                        "test historical shard inspection",
+                    )
+                    .unwrap()
+                    .read()
+                    .unwrap(),
+                payload
+            );
+            assert_eq!(
+                handler
+                    .retained_shard_ack_inspection_route(
+                        &retained_permit,
+                        &ack_request,
+                        "test historical shard ack inspection",
+                    )
+                    .unwrap()
+                    .load()
+                    .unwrap(),
+                ack
+            );
+        });
+
+        for result in [
+            handler.retained_shard_inspection_route(
+                &active_permit,
+                &payload_request,
+                "test historical shard inspection",
+            ),
+            handler.retained_shard_inspection_route(
+                &foreign_permit,
+                &payload_request,
+                "test historical shard inspection",
+            ),
+        ] {
+            match result {
+                Err(error) => assert_eq!(error.code, StorageRpcErrorCode::Internal),
+                Ok(_) => panic!("invalid admission created historical shard authority"),
+            }
+        }
+        for result in [
+            handler.retained_shard_ack_inspection_route(
+                &active_permit,
+                &ack_request,
+                "test historical shard ack inspection",
+            ),
+            handler.retained_shard_ack_inspection_route(
+                &foreign_permit,
+                &ack_request,
+                "test historical shard ack inspection",
+            ),
+        ] {
+            match result {
+                Err(error) => assert_eq!(error.code, StorageRpcErrorCode::Internal),
+                Ok(_) => panic!("invalid admission created historical shard-ack authority"),
+            }
+        }
+        let crossed_payload_request = StorageRpcShardReadRequest {
+            location: test_location_with_shard(3, 0, config.node_id.as_u32(), 1).into(),
+            ..payload_request.clone()
+        };
+        let crossed = match handler.retained_shard_inspection_route(
+            &retained_permit,
+            &crossed_payload_request,
+            "test historical shard inspection",
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("crossed shard subject created historical inspection authority"),
+        };
+        assert_eq!(crossed.code, StorageRpcErrorCode::PayloadDecode);
+
+        let unretained_payload_request = StorageRpcShardReadRequest {
+            location: test_location(2, 0, config.node_id.as_u32()).into(),
+            ..payload_request.clone()
+        };
+        let unretained = match handler.retained_shard_inspection_route(
+            &retained_permit,
+            &unretained_payload_request,
+            "test historical shard inspection",
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("unretained route created historical shard authority"),
+        };
+        assert_eq!(unretained.code, StorageRpcErrorCode::StaleShardLocation);
+        let unretained_ack_request = StorageRpcShardAckItemRequest {
+            cluster_epoch: ClusterEpoch::new(2).unwrap(),
+            ..ack_request.clone()
+        };
+        let unretained_ack = match handler.retained_shard_ack_inspection_route(
+            &retained_permit,
+            &unretained_ack_request,
+            "test historical shard ack inspection",
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("unretained route created historical shard-ack authority"),
+        };
+        assert_eq!(unretained_ack.code, StorageRpcErrorCode::StaleShardLocation);
+
+        let wrong_primary_request = StorageRpcShardAckItemRequest {
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            ..ack_request.clone()
+        };
+        let wrong_primary = match handler.retained_shard_ack_inspection_route(
+            &retained_permit,
+            &wrong_primary_request,
+            "test historical shard ack inspection",
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("non-primary node created historical ack inspection authority"),
+        };
+        assert_eq!(wrong_primary.code, StorageRpcErrorCode::NonActingSetAccess);
+    }
+
+    #[test]
     fn active_data_capabilities_bind_admission_subject_and_captured_deadline() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
@@ -26476,8 +26778,17 @@ mod tests {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
         config.node_id = NodeId::new(8);
+        config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        config.pg_routes[0].cluster_epoch = config.cluster_epoch;
         config.pg_routes[0].primary_node_id = NodeId::new(7);
         config.pg_routes[0].acting_set = vec![NodeId::new(7), NodeId::new(8)];
+        config.historical_pg_routes = vec![StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            state: PgState::Active,
+            primary_node_id: NodeId::new(8),
+            acting_set: vec![NodeId::new(7), NodeId::new(8)],
+        }];
         private_socket_dir(config.socket_path.parent().unwrap());
         let existing_key = test_shard_key(0);
         let new_key = test_shard_key(1);
@@ -26493,7 +26804,7 @@ mod tests {
         }
         let record = StorageRpcShardAckBatchRequest {
             node_id: NodeId::new(8),
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            cluster_epoch: config.cluster_epoch,
             pg_id: PgId::new(0),
             items: vec![StorageRpcShardAckItem {
                 shard_key: new_key.clone(),
@@ -26509,7 +26820,7 @@ mod tests {
         };
         let existing_item = StorageRpcShardAckItemRequest {
             node_id: NodeId::new(8),
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            cluster_epoch: config.cluster_epoch,
             pg_id: PgId::new(0),
             shard_key: existing_key.clone(),
         };
@@ -26546,7 +26857,10 @@ mod tests {
             &mut client,
             5,
             StorageRpcMessageKind::ShardAckHistoricalLoad,
-            encode_shard_ack_item_request(&existing_item),
+            encode_shard_ack_item_request(&StorageRpcShardAckItemRequest {
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                ..existing_item.clone()
+            }),
         );
         let historical_payload = decode_storage_rpc_response_payload(&historical_load.payload)
             .unwrap()
