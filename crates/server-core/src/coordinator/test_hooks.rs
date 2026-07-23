@@ -1,7 +1,7 @@
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
-use storage::SessionId;
+use storage::{SessionId, StorageCluster};
 
 use super::Coordinator;
 
@@ -13,6 +13,8 @@ pub(super) struct ReclamationTestHooks {
     pub(super) reclaim_worker_durable_scan_delay_override: Option<Duration>,
     pub(super) force_reclaim_worker_durable_scan_after_idle_return: bool,
     pub(super) after_reclaim_worker_idle_return: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(super) after_reclaim_work_dequeued: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(super) before_reclaim_work_execute: Option<Arc<dyn Fn(Arc<StorageCluster>) + Send + Sync>>,
     pub(super) after_multipart_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_multipart_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_abort_multipart_bucket_summary: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -355,6 +357,43 @@ pub(super) fn maybe_run_reclaim_worker_idle_return_hook(registry_key: usize) -> 
         hook();
     }
     hooks.force_reclaim_worker_durable_scan_after_idle_return
+}
+
+pub(super) fn maybe_run_after_reclaim_work_dequeued_hook(registry_key: usize) {
+    let hooks = RECLAMATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target_reclaim_worker_registry_key
+        .is_some_and(|target| target != registry_key)
+    {
+        return;
+    }
+    if let Some(hook) = hooks.after_reclaim_work_dequeued {
+        hook();
+    }
+}
+
+pub(super) fn maybe_run_before_reclaim_work_execute_hook(
+    registry_key: usize,
+    storage_cluster: Arc<StorageCluster>,
+) {
+    let hooks = RECLAMATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target_reclaim_worker_registry_key
+        .is_some_and(|target| target != registry_key)
+    {
+        return;
+    }
+    if let Some(hook) = hooks.before_reclaim_work_execute {
+        hook(storage_cluster);
+    }
 }
 
 pub(super) fn maybe_run_multipart_snapshot_hook(bucket: &str, key: &str) {

@@ -1005,6 +1005,59 @@ fn reclaim_worker_follows_runtime_map_refresh_for_bucket_finalize() {
 }
 
 #[test]
+fn reclaim_worker_resamples_runtime_map_after_dequeue() {
+    const TOKEN: DeterministicFaultToken =
+        DeterministicFaultToken::new("reclaim-work-dequeued-before-route-execution");
+
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let root = storage::BucketDeleteFinalizeRoot {
+        bucket: trusted_bucket_name("reclaim-refresh-after-dequeue"),
+        bucket_incarnation_generation: 1,
+    };
+    initial.enqueue_bucket_delete_finalize(root);
+
+    let gate = DeterministicFaultGate::new(TOKEN);
+    let gate_for_hook = Arc::clone(&gate);
+    let (observed_cluster_tx, observed_cluster_rx) = mpsc::channel();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target_reclaim_worker_registry_key: Some(initial.process_local_registry_key()),
+        after_reclaim_work_dequeued: Some(Arc::new(move || {
+            gate_for_hook.wait_at(TOKEN);
+        })),
+        before_reclaim_work_execute: Some(Arc::new(move |storage_cluster| {
+            let _ = observed_cluster_tx.send(storage_cluster);
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    let _worker = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&initial));
+    let _gate_release_guard = gate.release_on_drop();
+    gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
+
+    install_same_store_same_epoch_runtime_map_with_primary(
+        &handle,
+        &initial,
+        tmp.path(),
+        NodeId::new(1),
+    );
+    let expected_cluster = handle.current();
+    gate.release();
+
+    let observed_cluster = observed_cluster_rx
+        .recv_timeout(TEST_EVENT_TIMEOUT)
+        .unwrap();
+    assert!(
+        Arc::ptr_eq(&observed_cluster, &expected_cluster),
+        "reclaim execution must use the runtime map published after work was dequeued"
+    );
+}
+
+#[test]
 fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
     let tmp = test_util::tempdir();
     let initial = open_test_storage_cluster(tmp.path(), &[0]);
@@ -2009,27 +2062,34 @@ fn install_same_store_same_epoch_runtime_map(
     initial: &Arc<StorageCluster>,
     node_root: &std::path::Path,
 ) {
+    install_same_store_same_epoch_runtime_map_with_primary(
+        handle,
+        initial,
+        node_root,
+        NodeId::new(0),
+    );
+}
+
+fn install_same_store_same_epoch_runtime_map_with_primary(
+    handle: &StorageClusterRuntimeMapHandle,
+    initial: &Arc<StorageCluster>,
+    _node_root: &std::path::Path,
+    primary_node_id: NodeId,
+) {
     let node_count = u32::from(initial.default_payload_ec_shape().k)
         + u32::from(initial.default_payload_ec_shape().m);
-    let configs = (0..node_count)
-        .map(|node_id| {
-            LocalNodeStoreConfig::new(
-                NodeId::new(node_id),
-                node_root.join(format!("node-{node_id:04}")),
-            )
-        })
-        .collect::<Vec<_>>();
+    let acting_set = (0..node_count).map(NodeId::new).collect::<Vec<_>>();
     let routes = initial
-        .local_pg_routes()
-        .map(|route| {
-            let route = storage::control_plane::PgRouteSnapshot::reconstructed(
-                route.cluster_epoch(),
-                route.pg_id(),
-                route.primary_node_id(),
-                route.acting_set().to_vec(),
-                route.state(),
-            );
-            LocalPgRoute::from(&route)
+        .test_pg_ids()
+        .iter()
+        .map(|pg_id| {
+            storage::control_plane::PgRouteSnapshot::reconstructed(
+                initial.cluster_epoch(),
+                PgId::new(*pg_id),
+                primary_node_id,
+                acting_set.clone(),
+                PgState::Active,
+            )
         })
         .collect::<Vec<_>>();
     let historical_routes = initial
@@ -2044,18 +2104,10 @@ fn install_same_store_same_epoch_runtime_map(
             )
         })
         .collect::<Vec<_>>();
-    let mut candidate_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
-        NodeId::new(0),
-        configs,
-        initial.test_pg_ids(),
-        initial.default_payload_ec_shape(),
-        initial.cluster_epoch(),
-        routes,
-    )
-    .unwrap();
-    candidate_map.test_install_historical_pg_routes(historical_routes);
-    candidate_map.test_set_route_map_validity(long_lived_test_route_map_validity());
-    let candidate = StorageCluster::from_local_map(Arc::new(candidate_map)).unwrap();
+    let candidate = initial
+        .test_clone_with_pg_routes(initial.cluster_epoch(), routes, historical_routes)
+        .unwrap();
+    candidate.test_store_route_map_validity(long_lived_test_route_map_validity());
     handle.install(candidate).unwrap();
 }
 

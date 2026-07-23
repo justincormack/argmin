@@ -2091,6 +2091,13 @@ pub struct ControlPlaneRaftAuthority {
             RuntimeMapContentCertificate,
         )>,
     >,
+    runtime_map_overlay_content_certificate: Mutex<
+        Option<(
+            ControlPlaneRaftTerm,
+            LogIdOf<ControlPlaneRaftTypeConfig>,
+            RuntimeMapContentCertificate,
+        )>,
+    >,
     checkpoint_instance: Arc<()>,
     checkpoint_publication: Mutex<Option<ControlPlaneRaftCheckpointPosition>>,
     checkpoint_metrics: Arc<ControlPlaneRaftCheckpointMetrics>,
@@ -4283,6 +4290,7 @@ impl ControlPlaneRaftAuthority {
             volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
+            runtime_map_overlay_content_certificate: Mutex::new(None),
             checkpoint_instance: Arc::new(()),
             checkpoint_publication: Mutex::new(None),
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
@@ -4307,6 +4315,7 @@ impl ControlPlaneRaftAuthority {
             volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
+            runtime_map_overlay_content_certificate: Mutex::new(None),
             checkpoint_instance: Arc::new(()),
             checkpoint_publication: Mutex::new(None),
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
@@ -5011,12 +5020,6 @@ impl ControlPlaneRaftAuthority {
         else {
             return Ok(durable_status);
         };
-        let overlay = self.lock_volatile_heartbeat_overlay()?;
-        let Some(overlay) = overlay.as_ref().filter(|overlay| {
-            overlay.authority_term == authority_term && overlay.base_applied == base_applied
-        }) else {
-            return Ok(durable_status);
-        };
         let read_index = control_plane_log_id_from_raft(base_applied).ok_or_else(|| {
             ControlPlaneError::CommandDecode {
                 message: format!(
@@ -5024,17 +5027,54 @@ impl ControlPlaneRaftAuthority {
                 ),
             }
         })?;
+        let overlay_certificate = self
+            .runtime_map_overlay_content_certificate
+            .lock()
+            .map_err(|_| ControlPlaneError::RpcProtocol {
+                message:
+                    "control-plane OpenRaft overlay runtime-map content certificate lock poisoned"
+                        .to_owned(),
+            })?
+            .as_ref()
+            .filter(|(term, applied, _)| *term == authority_term && *applied == base_applied)
+            .map(|(_, _, certificate)| *certificate)
+            .unwrap_or(certificate);
+        let mut overlay = self.lock_volatile_heartbeat_overlay()?;
+        let Some(overlay) = overlay.as_mut().filter(|overlay| {
+            overlay.authority_term == authority_term && overlay.base_applied == base_applied
+        }) else {
+            return Ok(durable_status);
+        };
         let freshness_proof = RuntimeMapFreshnessProof::ReadIndex {
             authority_incarnation: overlay.snapshot.authority_incarnation(),
             read_index,
             issued_at_ms,
         };
-        ControlPlaneRuntimeMapStatus::from_snapshot_with_content_certificate(
+        if let Some(status) = ControlPlaneRuntimeMapStatus::from_snapshot_with_content_certificate(
             &overlay.snapshot,
             issued_at_ms,
             freshness_proof,
-            certificate,
-        )
+            overlay_certificate,
+        )? {
+            return Ok(status);
+        }
+        let runtime_map = overlay
+            .snapshot
+            .runtime_map_with_freshness_proof(issued_at_ms, freshness_proof)?;
+        let status = ControlPlaneRuntimeMapStatus::from_runtime_map(&runtime_map);
+        let overlay_certificate = RuntimeMapContentCertificate::from_snapshot_and_runtime_map(
+            &overlay.snapshot,
+            &runtime_map,
+        );
+        *self
+            .runtime_map_overlay_content_certificate
+            .lock()
+            .map_err(|_| ControlPlaneError::RpcProtocol {
+                message:
+                    "control-plane OpenRaft overlay runtime-map content certificate lock poisoned"
+                        .to_owned(),
+            })? = Some((authority_term, base_applied, overlay_certificate));
+        Ok(status)
     }
 
     pub async fn current_control_plane_snapshot(
@@ -5956,19 +5996,22 @@ async fn control_plane_runtime_map_status_via_openraft_read_index(
             };
             if let Some((cached_applied, certificate)) = cached_certificate {
                 if cached_applied == last_applied {
-                    let status =
+                    if let Some(status) =
                         ControlPlaneRuntimeMapStatus::from_snapshot_with_content_certificate(
                             snapshot,
                             issued_at_ms,
                             freshness_proof,
                             certificate,
-                        )?;
-                    return Ok((status, last_applied, certificate));
+                        )?
+                    {
+                        return Ok((status, last_applied, certificate));
+                    }
                 }
             }
             let runtime_map =
                 snapshot.runtime_map_with_freshness_proof(issued_at_ms, freshness_proof)?;
-            let certificate = RuntimeMapContentCertificate::from_runtime_map(&runtime_map);
+            let certificate =
+                RuntimeMapContentCertificate::from_snapshot_and_runtime_map(snapshot, &runtime_map);
             Ok((
                 ControlPlaneRuntimeMapStatus::from_runtime_map(&runtime_map),
                 last_applied,

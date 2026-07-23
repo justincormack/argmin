@@ -4953,6 +4953,7 @@ pub struct ClusterRuntimeMapSnapshot {
 
 const RUNTIME_MAP_CONTENT_DIGEST_LEN: usize = 32;
 const RUNTIME_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-content/v1";
+const RUNTIME_MAP_CURRENT_STATE_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-current-state/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeMapContentDigest([u8; RUNTIME_MAP_CONTENT_DIGEST_LEN]);
@@ -4971,14 +4972,22 @@ impl RuntimeMapContentDigest {
 pub(crate) struct RuntimeMapContentCertificate {
     cluster_epoch: ClusterEpoch,
     pg_routes: usize,
+    current_state_digest: RuntimeMapContentDigest,
     content_digest: RuntimeMapContentDigest,
 }
 
 impl RuntimeMapContentCertificate {
-    pub(crate) fn from_runtime_map(runtime_map: &ClusterRuntimeMapSnapshot) -> Self {
+    pub(crate) fn from_snapshot_and_runtime_map(
+        snapshot: &ClusterControlSnapshot,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+    ) -> Self {
         Self {
             cluster_epoch: runtime_map.cluster_epoch(),
             pg_routes: runtime_map.pg_routes().len(),
+            current_state_digest: runtime_map_current_state_digest(
+                snapshot,
+                runtime_map.pg_routes(),
+            ),
             content_digest: runtime_map.content_digest(),
         }
     }
@@ -5178,6 +5187,34 @@ fn runtime_map_content_digest(snapshot: &ClusterRuntimeMapSnapshot) -> RuntimeMa
             .bytes()
             .try_into()
             .expect("SHA-256 runtime-map digest must contain 32 bytes"),
+    )
+}
+
+fn runtime_map_current_state_digest(
+    snapshot: &ClusterControlSnapshot,
+    pg_routes: &[PgRouteSnapshot],
+) -> RuntimeMapContentDigest {
+    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+    digest_bytes(&mut hasher, RUNTIME_MAP_CURRENT_STATE_DIGEST_DOMAIN);
+    digest_u64(&mut hasher, snapshot.cluster_epoch().get());
+    digest_len(&mut hasher, snapshot.nodes.len());
+    for node in snapshot.nodes() {
+        digest_u32(&mut hasher, node.node_id().as_u32());
+        digest_u64(&mut hasher, node.node_incarnation());
+        digest_bytes(&mut hasher, node.endpoint().as_bytes());
+        digest_option_u64(
+            &mut hasher,
+            node.cluster_map_history_floor_epoch()
+                .map(ClusterEpoch::get),
+        );
+    }
+    digest_pg_routes(&mut hasher, pg_routes);
+    let checksum = hasher.finalize();
+    RuntimeMapContentDigest::from_bytes(
+        checksum
+            .bytes()
+            .try_into()
+            .expect("SHA-256 current runtime-map digest must contain 32 bytes"),
     )
 }
 
@@ -6710,17 +6747,14 @@ impl ControlPlaneRuntimeMapStatus {
         authority_now_ms: u64,
         freshness_proof: RuntimeMapFreshnessProof,
         certificate: RuntimeMapContentCertificate,
-    ) -> Result<Self, ControlPlaneError> {
+    ) -> Result<Option<Self>, ControlPlaneError> {
         let pg_routes = snapshot.pg_routes(authority_now_ms)?;
         if certificate.cluster_epoch != snapshot.cluster_epoch()
             || certificate.pg_routes != pg_routes.len()
+            || certificate.current_state_digest
+                != runtime_map_current_state_digest(snapshot, &pg_routes)
         {
-            return Err(ControlPlaneError::SnapshotInvariantViolation {
-                context: "runtime-map content certificate reuse",
-                message:
-                    "runtime-map content certificate does not match control-plane snapshot shape"
-                        .to_owned(),
-            });
+            return Ok(None);
         }
         let validity = pg_routes
             .iter()
@@ -6745,12 +6779,12 @@ impl ControlPlaneRuntimeMapStatus {
                 freshness_proof,
             )
         });
-        Ok(Self {
+        Ok(Some(Self {
             cluster_epoch: certificate.cluster_epoch,
             pg_routes: certificate.pg_routes,
             active_serving_pg_routes,
             lease_renewal,
-        })
+        }))
     }
 
     #[must_use]
@@ -9671,18 +9705,25 @@ impl<S: ControlPlaneStore> ControlPlaneRuntimeMapSource for SingleAuthorityContr
             }
         })?;
         if let Some(certificate) = *cached {
-            return ControlPlaneRuntimeMapStatus::from_snapshot_with_content_certificate(
-                &self.snapshot,
-                authority_now_ms,
-                RuntimeMapFreshnessProof::SingleAuthority {
-                    authority_incarnation: self.snapshot.authority_incarnation(),
-                    issued_at_ms: authority_now_ms,
-                },
-                certificate,
-            );
+            if let Some(status) =
+                ControlPlaneRuntimeMapStatus::from_snapshot_with_content_certificate(
+                    &self.snapshot,
+                    authority_now_ms,
+                    RuntimeMapFreshnessProof::SingleAuthority {
+                        authority_incarnation: self.snapshot.authority_incarnation(),
+                        issued_at_ms: authority_now_ms,
+                    },
+                    certificate,
+                )?
+            {
+                return Ok(status);
+            }
         }
         let runtime_map = self.snapshot.runtime_map(authority_now_ms)?;
-        *cached = Some(RuntimeMapContentCertificate::from_runtime_map(&runtime_map));
+        *cached = Some(RuntimeMapContentCertificate::from_snapshot_and_runtime_map(
+            &self.snapshot,
+            &runtime_map,
+        ));
         Ok(ControlPlaneRuntimeMapStatus::from_runtime_map(&runtime_map))
     }
 
@@ -39604,7 +39645,10 @@ mod tests {
         heartbeat_with_pg_observation(&mut authority, 1, 127, PgState::Active, 2_002);
 
         let runtime_map = authority.snapshot().runtime_map(2_003).unwrap();
-        let certificate = RuntimeMapContentCertificate::from_runtime_map(&runtime_map);
+        let certificate = RuntimeMapContentCertificate::from_snapshot_and_runtime_map(
+            authority.snapshot(),
+            &runtime_map,
+        );
         let mut renewed_snapshot = authority.snapshot().clone();
         renewed_snapshot
             .nodes
@@ -39623,7 +39667,8 @@ mod tests {
             *renewed_runtime_map.freshness_proof(),
             certificate,
         )
-        .unwrap();
+        .unwrap()
+        .expect("lease-only changes should preserve certificate reuse");
         assert_eq!(
             cached_status,
             ControlPlaneRuntimeMapStatus::from_runtime_map(&renewed_runtime_map)
@@ -39631,6 +39676,77 @@ mod tests {
         assert_eq!(
             cached_status.lease_renewal().unwrap().validity(),
             renewed_runtime_map.validity()
+        );
+    }
+
+    #[test]
+    fn runtime_map_content_certificate_rejects_same_epoch_route_change() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(127), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 127, PgState::Peering, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(127),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 127, PgState::Active, 2_002);
+
+        let runtime_map = authority.snapshot().runtime_map(2_003).unwrap();
+        let certificate = RuntimeMapContentCertificate::from_snapshot_and_runtime_map(
+            authority.snapshot(),
+            &runtime_map,
+        );
+        let mut changed_snapshot = authority.snapshot().clone();
+        let changed_pg = changed_snapshot.pgs.get_mut(&PgId::new(127)).unwrap();
+        changed_pg.state = PgState::Peering;
+        changed_pg.active_primary = None;
+        let changed_runtime_map = changed_snapshot.runtime_map(2_003).unwrap();
+        assert_eq!(
+            changed_runtime_map.cluster_epoch(),
+            runtime_map.cluster_epoch()
+        );
+        assert_eq!(
+            changed_runtime_map.pg_routes().len(),
+            runtime_map.pg_routes().len()
+        );
+        assert_ne!(
+            changed_runtime_map.content_digest(),
+            runtime_map.content_digest()
+        );
+
+        assert!(
+            ControlPlaneRuntimeMapStatus::from_snapshot_with_content_certificate(
+                &changed_snapshot,
+                2_003,
+                *changed_runtime_map.freshness_proof(),
+                certificate,
+            )
+            .unwrap()
+            .is_none(),
+            "same-epoch route changes must force a full runtime-map refresh"
+        );
+
+        *authority.runtime_map_content_certificate.lock().unwrap() = Some(certificate);
+        authority.snapshot = changed_snapshot;
+        let rebuilt_status = authority.runtime_map_status(2_003).unwrap();
+        assert_eq!(
+            rebuilt_status
+                .lease_renewal()
+                .expect("single-authority status should retain a bounded validity proof")
+                .content_digest(),
+            changed_runtime_map.content_digest(),
+            "the status source must rebuild rather than renew stale same-epoch content"
         );
     }
 

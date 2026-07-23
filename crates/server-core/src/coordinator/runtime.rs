@@ -19,6 +19,7 @@ use super::payload::SharedPayloadBuffer;
 use super::read_core::{PayloadLease, ReadRuntime, SegmentPayloadRecord};
 #[cfg(test)]
 use super::test_hooks::{
+    maybe_run_after_reclaim_work_dequeued_hook, maybe_run_before_reclaim_work_execute_hook,
     maybe_run_reclaim_worker_idle_return_hook, maybe_run_shard_repair_worker_idle_timeout_hook,
     reclaim_worker_durable_scan_delay_override,
 };
@@ -756,20 +757,20 @@ impl ReclaimSweeper {
                 let mut next_durable_scan_at = Instant::now();
                 let mut pending_work: Option<(Arc<StorageCluster>, ReclaimWorkItem)> = None;
                 while !worker_stop.load(Ordering::SeqCst) {
-                    let worker_node = storage_handle.current();
+                    let current_worker_node = storage_handle.current();
                     enqueue_durable_reclaim_work_if_due(
-                        &worker_node,
+                        &current_worker_node,
                         &deferred_object_payload_reclaim_roots,
                         &deferred_bucket_delete_begin_roots,
                         &deferred_bucket_delete_finalize_roots,
                         &mut next_durable_scan_at,
                     );
-                    let Some((worker_node, work)) = pending_work
+                    let Some((queue_owner, work)) = pending_work
                         .take()
                         .or_else(|| {
-                            worker_node
+                            current_worker_node
                                 .try_take_reclaim_work()
-                                .map(|work| (Arc::clone(&worker_node), work))
+                                .map(|work| (Arc::clone(&current_worker_node), work))
                         })
                         .or_else(|| {
                             if deferred_object_payload_reclaim.is_empty()
@@ -779,21 +780,21 @@ impl ReclaimSweeper {
                                 return None;
                             }
                             enqueue_durable_reclaim_work_if_due(
-                                &worker_node,
+                                &current_worker_node,
                                 &deferred_object_payload_reclaim_roots,
                                 &deferred_bucket_delete_begin_roots,
                                 &deferred_bucket_delete_finalize_roots,
                                 &mut next_durable_scan_at,
                             );
-                            worker_node
+                            current_worker_node
                                 .try_take_reclaim_work()
-                                .map(|work| (Arc::clone(&worker_node), work))
+                                .map(|work| (Arc::clone(&current_worker_node), work))
                                 .or_else(|| {
                                     if let Some(root) = deferred_object_payload_reclaim.pop_front()
                                     {
                                         deferred_object_payload_reclaim_roots.remove(&root);
                                         return Some((
-                                            Arc::clone(&worker_node),
+                                            Arc::clone(&current_worker_node),
                                             ReclaimWorkItem::ObjectPayload(root),
                                         ));
                                     }
@@ -802,7 +803,7 @@ impl ReclaimSweeper {
                                         .map(|root| {
                                             deferred_bucket_delete_begin_roots.remove(&root);
                                             (
-                                                Arc::clone(&worker_node),
+                                                Arc::clone(&current_worker_node),
                                                 ReclaimWorkItem::BucketDeleteBegin(root),
                                             )
                                         })
@@ -812,7 +813,7 @@ impl ReclaimSweeper {
                                                     deferred_bucket_delete_finalize_roots
                                                         .remove(&root);
                                                     (
-                                                        Arc::clone(&worker_node),
+                                                        Arc::clone(&current_worker_node),
                                                         ReclaimWorkItem::BucketDelete(root),
                                                     )
                                                 },
@@ -826,7 +827,7 @@ impl ReclaimSweeper {
                             #[cfg(test)]
                             if work.is_none()
                                 && maybe_run_reclaim_worker_idle_return_hook(
-                                    worker_node.process_local_registry_key(),
+                                    current_worker_node.process_local_registry_key(),
                                 )
                             {
                                 next_durable_scan_at = Instant::now();
@@ -839,12 +840,22 @@ impl ReclaimSweeper {
                         }
                         continue;
                     };
-                    let current_runtime = runtime.with_storage_node(Arc::clone(&worker_node));
-                    let admission = background_work_admission_for(&worker_node);
+                    #[cfg(test)]
+                    maybe_run_after_reclaim_work_dequeued_hook(
+                        queue_owner.process_local_registry_key(),
+                    );
+                    let execution_node = storage_handle.current();
+                    #[cfg(test)]
+                    maybe_run_before_reclaim_work_execute_hook(
+                        queue_owner.process_local_registry_key(),
+                        Arc::clone(&execution_node),
+                    );
+                    let current_runtime = runtime.with_storage_node(Arc::clone(&execution_node));
+                    let admission = background_work_admission_for(&execution_node);
                     let Some(_cleanup_permit) =
                         admission.try_acquire(BackgroundWorkClass::ReclaimCleanup)
                     else {
-                        pending_work = Some((worker_node, work));
+                        pending_work = Some((queue_owner, work));
                         std::thread::sleep(OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN);
                         continue;
                     };
@@ -855,7 +866,7 @@ impl ReclaimSweeper {
                                 continue;
                             }
                             let (bucket, key, generation_id) = root;
-                            let pg_id = worker_node.object_payload_reclaim_pg_id(&bucket, &key);
+                            let pg_id = execution_node.object_payload_reclaim_pg_id(&bucket, &key);
                             let is_pg_cooled = if let Some(retry_after) =
                                 object_payload_reclaim_pg_retry_after.get(&pg_id)
                             {
@@ -892,7 +903,7 @@ impl ReclaimSweeper {
                                         (bucket, key, generation_id),
                                     );
                                 } else {
-                                    worker_node.finish_object_payload_reclaim_work(
+                                    queue_owner.finish_object_payload_reclaim_work(
                                         &bucket,
                                         &key,
                                         generation_id,
@@ -924,7 +935,7 @@ impl ReclaimSweeper {
                                 );
                                 match bucket_delete_finalize_worker_disposition(&result) {
                                     BucketDeleteFinalizeWorkerDisposition::Finish => {
-                                        worker_node.finish_bucket_delete_finalize_work(&root);
+                                        queue_owner.finish_bucket_delete_finalize_work(&root);
                                         bucket_delete_finalize_retry_after.remove(&root);
                                         bucket_delete_begin_retry_after.retain(|begin, _| {
                                             begin.bucket != root.bucket
@@ -983,7 +994,7 @@ impl ReclaimSweeper {
                                 ) {
                                     Ok(()) => {
                                         bucket_delete_begin_retry_after.remove(&root);
-                                        worker_node.enqueue_bucket_delete_finalize(
+                                        queue_owner.enqueue_bucket_delete_finalize(
                                             BucketDeleteFinalizeRoot {
                                                 bucket: root.bucket.clone(),
                                                 bucket_incarnation_generation: root
@@ -1028,18 +1039,18 @@ impl ReclaimSweeper {
                             || !deferred_bucket_delete_finalize.is_empty())
                     {
                         enqueue_durable_reclaim_work_if_due(
-                            &worker_node,
+                            &execution_node,
                             &deferred_object_payload_reclaim_roots,
                             &deferred_bucket_delete_begin_roots,
                             &deferred_bucket_delete_finalize_roots,
                             &mut next_durable_scan_at,
                         );
-                        if let Some(work) = worker_node.try_take_reclaim_work() {
-                            pending_work = Some((Arc::clone(&worker_node), work));
+                        if let Some(work) = execution_node.try_take_reclaim_work() {
+                            pending_work = Some((Arc::clone(&execution_node), work));
                         } else if let Some(sleep_for) = shortest_retry_sleep(
                             shortest_retry_sleep(
                                 earliest_object_payload_reclaim_retry_sleep(
-                                    &worker_node,
+                                    &execution_node,
                                     &deferred_object_payload_reclaim,
                                     &object_payload_reclaim_pg_retry_after,
                                 ),
