@@ -1142,8 +1142,11 @@ Progress as of 2026-07-21:
   frame, connection, and I/O-timeout limits are enforced by both Unix clients
   and listeners; client admission uses the strictest selected endpoint limit.
   Request identity, topology, target,
-  freshness, operation, role, payload limits, and response binding are checked
-  before route admission or local capability construction. Legacy unframed
+  freshness, operation, role, payload limits, and exact request-transcript
+  response binding are checked before route admission or local capability
+  construction. Responses authenticate a domain-separated SHA-256 digest of
+  the exact signed request envelope, so request IDs are correlation values and
+  cannot authorize response substitution across requests. Legacy unframed
   traffic cannot interoperate with an authenticated listener. Focused coverage
   crosses the real Unix client/server boundary and rejects missing framing,
   wrong target, and wrong topology before dispatch. Replicated `combined`
@@ -1271,6 +1274,11 @@ Progress as of 2026-07-21:
      complete existing storage frame, and additionally binds topology
      generation/digest, source principal, target storage node, operation kind,
      request/response direction, request id, and a mandatory freshness window.
+     Every response additionally binds a domain-separated SHA-256 digest of the
+     exact authenticated request envelope. The server can obtain the opaque
+     response-signing context only from successful request verification, and
+     the client verifies it against the exact envelope it sent; matching kind
+     and request id alone cannot authorize a response.
      The complete nested frame binding covers its PG/shard route, epoch,
      command identity, and payload without a second partial parser. Explicit
      frontend, storage-node repair/peering, admin, and maintenance roles are

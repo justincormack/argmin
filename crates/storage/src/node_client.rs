@@ -251,6 +251,7 @@ use crate::storage_rpc::{
 use crate::storage_rpc_auth::{
     read_storage_rpc_auth_transport_frame_with_limit,
     write_storage_rpc_auth_transport_frame_with_limit, StorageRpcClientAuthConfig,
+    StorageRpcRequestProof,
 };
 #[cfg(test)]
 use crate::types::BucketSnapshotTagsRequest;
@@ -1248,33 +1249,45 @@ fn write_unix_storage_rpc_request<W: Write>(
     auth: Option<&StorageRpcClientAuthConfig>,
     frame: &StorageRpcFrame,
     operation: &'static str,
-) -> Result<(), StoreError> {
+) -> Result<Option<StorageRpcRequestProof>, StoreError> {
     let Some(auth) = auth else {
-        return write_storage_rpc_frame_to(writer, frame)
-            .map_err(|error| storage_rpc_stream_error(node_id, operation, error));
+        write_storage_rpc_frame_to(writer, frame)
+            .map_err(|error| storage_rpc_stream_error(node_id, operation, error))?;
+        return Ok(None);
     };
-    let envelope = auth
+    let signed_request = auth
         .sign_request(node_id, crate::clock::current_time_millis(), frame)
         .map_err(|error| storage_rpc_auth_store_error(node_id, operation, error))?;
+    let (envelope, request_proof) = signed_request.into_parts();
     write_storage_rpc_auth_transport_frame_with_limit(
         writer,
         &envelope,
         auth.transport_limits().max_frame_bytes(),
     )
-    .map_err(|error| storage_rpc_stream_error(node_id, operation, StorageRpcStreamError::Io(error)))
+    .map_err(|error| {
+        storage_rpc_stream_error(node_id, operation, StorageRpcStreamError::Io(error))
+    })?;
+    Ok(Some(request_proof))
 }
 
 fn read_unix_storage_rpc_response<R: Read>(
     reader: &mut R,
     node_id: NodeId,
     auth: Option<&StorageRpcClientAuthConfig>,
-    request: &StorageRpcFrame,
+    request_proof: Option<&StorageRpcRequestProof>,
     operation: &'static str,
 ) -> Result<StorageRpcFrame, StoreError> {
     let Some(auth) = auth else {
         return read_storage_rpc_frame_from(reader)
             .map_err(|error| storage_rpc_stream_error(node_id, operation, error));
     };
+    let request_proof = request_proof.ok_or_else(|| {
+        storage_rpc_auth_store_error(
+            node_id,
+            operation,
+            "authenticated storage RPC request transcript is missing",
+        )
+    })?;
     let envelope = read_storage_rpc_auth_transport_frame_with_limit(
         reader,
         auth.transport_limits().max_frame_bytes(),
@@ -1285,7 +1298,7 @@ fn read_unix_storage_rpc_response<R: Read>(
     auth.verify_response(
         node_id,
         crate::clock::current_time_millis(),
-        request,
+        request_proof,
         &envelope,
     )
     .map(|verified| verified.into_frame())

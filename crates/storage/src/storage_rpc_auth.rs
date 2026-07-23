@@ -18,10 +18,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const STORAGE_RPC_AUTH_BINDING_MAGIC: &[u8; 8] = b"ARGSRPCB";
-const STORAGE_RPC_AUTH_BINDING_VERSION: u16 = 1;
+const STORAGE_RPC_AUTH_BINDING_VERSION: u16 = 2;
 const STORAGE_RPC_AUTH_TOPOLOGY_DIGEST_LEN: usize = 64;
-const STORAGE_RPC_AUTH_BINDING_FIXED_LEN: usize =
-    STORAGE_RPC_AUTH_BINDING_MAGIC.len() + 2 + 8 + 4 + STORAGE_RPC_AUTH_TOPOLOGY_DIGEST_LEN + 4 + 4;
+const STORAGE_RPC_AUTH_REQUEST_TRANSCRIPT_LEN: usize = 32;
+const STORAGE_RPC_AUTH_REQUEST_TRANSCRIPT_DOMAIN: &[u8] =
+    b"argmin/storage-rpc/request-transcript/v1\0";
+const STORAGE_RPC_AUTH_BINDING_FIXED_LEN: usize = STORAGE_RPC_AUTH_BINDING_MAGIC.len()
+    + 2
+    + 8
+    + 4
+    + STORAGE_RPC_AUTH_TOPOLOGY_DIGEST_LEN
+    + 4
+    + 1
+    + STORAGE_RPC_AUTH_REQUEST_TRANSCRIPT_LEN
+    + 4;
 const STORAGE_RPC_AUTH_MAX_BINDING_LEN: usize =
     STORAGE_RPC_AUTH_BINDING_FIXED_LEN + STORAGE_RPC_MAX_FRAME_LEN;
 const STORAGE_RPC_AUTH_TRANSPORT_MAGIC: &[u8; 8] = b"ARGSRPCA";
@@ -158,12 +168,12 @@ impl StorageRpcClientSigner {
         target_node_id: NodeId,
         now_ms: u64,
         frame: &StorageRpcFrame,
-    ) -> Result<Vec<u8>, ControlPlaneError> {
+    ) -> Result<SignedStorageRpcRequest, ControlPlaneError> {
         self.require_operation(frame.kind)?;
         let expires_at_ms = now_ms
             .checked_add(STORAGE_RPC_AUTH_REPLAY_WINDOW_MS)
             .ok_or_else(|| storage_rpc_auth_protocol_error("storage RPC auth expiry overflowed"))?;
-        sign_storage_rpc_request(StorageRpcAuthRequestInput {
+        let envelope = sign_storage_rpc_request(StorageRpcAuthRequestInput {
             credential: &self.credential,
             target_node_id,
             topology_generation: self.topology_generation,
@@ -171,14 +181,20 @@ impl StorageRpcClientSigner {
             issued_at_ms: now_ms,
             expires_at_ms,
             frame,
-        })
+        })?;
+        let proof = StorageRpcRequestProof {
+            request_id: frame.request_id,
+            kind: frame.kind,
+            transcript: storage_rpc_request_transcript(&envelope),
+        };
+        Ok(SignedStorageRpcRequest { envelope, proof })
     }
 
     pub(crate) fn verify_response(
         &self,
         target_node_id: NodeId,
         now_ms: u64,
-        request: &StorageRpcFrame,
+        request: &StorageRpcRequestProof,
         envelope: &[u8],
     ) -> Result<VerifiedStorageRpcFrame, StorageRpcAuthRejectionReason> {
         self.require_operation(request.kind)
@@ -190,6 +206,7 @@ impl StorageRpcClientSigner {
             expected_topology_digest: &self.topology_digest,
             expected_request_id: request.request_id,
             expected_kind: request.kind,
+            expected_request_transcript: &request.transcript,
             now_ms,
             max_replay_window_ms: STORAGE_RPC_AUTH_REPLAY_WINDOW_MS,
             allowed_future_skew_ms: STORAGE_RPC_AUTH_ALLOWED_FUTURE_SKEW_MS,
@@ -304,7 +321,7 @@ impl StorageRpcClientAuthConfig {
         target_node_id: NodeId,
         now_ms: u64,
         frame: &StorageRpcFrame,
-    ) -> Result<Vec<u8>, ControlPlaneError> {
+    ) -> Result<SignedStorageRpcRequest, ControlPlaneError> {
         self.signer().sign_request(target_node_id, now_ms, frame)
     }
 
@@ -312,7 +329,7 @@ impl StorageRpcClientAuthConfig {
         &self,
         target_node_id: NodeId,
         now_ms: u64,
-        request: &StorageRpcFrame,
+        request: &StorageRpcRequestProof,
         envelope: &[u8],
     ) -> Result<VerifiedStorageRpcFrame, StorageRpcAuthRejectionReason> {
         self.signer()
@@ -444,7 +461,7 @@ impl StorageRpcServerAuthConfig {
 
     pub(crate) fn sign_response(
         &self,
-        request_credential: &ControlPlaneScopedCredential,
+        request: &StorageRpcResponseSigningContext,
         target_node_id: NodeId,
         now_ms: u64,
         frame: &StorageRpcFrame,
@@ -453,7 +470,8 @@ impl StorageRpcServerAuthConfig {
             .checked_add(STORAGE_RPC_AUTH_REPLAY_WINDOW_MS)
             .ok_or_else(|| storage_rpc_auth_protocol_error("storage RPC auth expiry overflowed"))?;
         sign_storage_rpc_response(StorageRpcAuthResponseInput {
-            request_credential,
+            request_credential: &request.credential,
+            request_transcript: &request.request_transcript,
             target_node_id,
             topology_generation: self.topology_generation,
             topology_digest: &self.topology_digest,
@@ -470,6 +488,7 @@ pub(crate) enum StorageRpcAuthRejectionReason {
     WrongTopology,
     WrongTarget,
     WrongOperation,
+    WrongRequest,
     UnauthorizedRole,
     Envelope(ControlPlaneAuthRejectionReason),
 }
@@ -480,6 +499,7 @@ pub(crate) struct VerifiedStorageRpcFrame {
     credential_id: String,
     credential_version: u64,
     credential: ControlPlaneScopedCredential,
+    request_transcript: StorageRpcRequestTranscript,
     frame: StorageRpcFrame,
 }
 
@@ -488,6 +508,7 @@ impl PartialEq for VerifiedStorageRpcFrame {
         self.source == other.source
             && self.credential_id == other.credential_id
             && self.credential_version == other.credential_version
+            && self.request_transcript == other.request_transcript
             && self.frame == other.frame
     }
 }
@@ -527,11 +548,75 @@ impl VerifiedStorageRpcFrame {
         self.frame
     }
 
-    pub(crate) fn into_frame_and_credential(
+    pub(crate) fn into_frame_and_response_signing_context(
         self,
-    ) -> (StorageRpcFrame, ControlPlaneScopedCredential) {
-        (self.frame, self.credential)
+    ) -> (StorageRpcFrame, StorageRpcResponseSigningContext) {
+        (
+            self.frame,
+            StorageRpcResponseSigningContext {
+                credential: self.credential,
+                request_transcript: self.request_transcript,
+            },
+        )
     }
+}
+
+pub(crate) struct StorageRpcResponseSigningContext {
+    credential: ControlPlaneScopedCredential,
+    request_transcript: StorageRpcRequestTranscript,
+}
+
+pub(crate) struct SignedStorageRpcRequest {
+    envelope: Vec<u8>,
+    proof: StorageRpcRequestProof,
+}
+
+impl SignedStorageRpcRequest {
+    #[cfg(test)]
+    pub(crate) fn envelope(&self) -> &[u8] {
+        &self.envelope
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<u8>, StorageRpcRequestProof) {
+        (self.envelope, self.proof)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcRequestProof {
+    request_id: u64,
+    kind: StorageRpcMessageKind,
+    transcript: StorageRpcRequestTranscript,
+}
+
+impl fmt::Debug for StorageRpcRequestProof {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StorageRpcRequestProof")
+            .field("request_id", &self.request_id)
+            .field("operation", &self.kind.operation_name())
+            .field("transcript", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct StorageRpcRequestTranscript([u8; STORAGE_RPC_AUTH_REQUEST_TRANSCRIPT_LEN]);
+
+impl fmt::Debug for StorageRpcRequestTranscript {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("StorageRpcRequestTranscript([REDACTED])")
+    }
+}
+
+fn storage_rpc_request_transcript(envelope_bytes: &[u8]) -> StorageRpcRequestTranscript {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(STORAGE_RPC_AUTH_REQUEST_TRANSCRIPT_DOMAIN);
+    context.update(&(envelope_bytes.len() as u64).to_be_bytes());
+    context.update(envelope_bytes);
+    let digest = context.finish();
+    let mut bytes = [0_u8; STORAGE_RPC_AUTH_REQUEST_TRANSCRIPT_LEN];
+    bytes.copy_from_slice(digest.as_ref());
+    StorageRpcRequestTranscript(bytes)
 }
 
 pub(crate) fn write_storage_rpc_auth_transport_frame<W: Write>(
@@ -731,6 +816,7 @@ struct StorageRpcAuthBinding {
     topology_generation: u64,
     topology_digest: String,
     target_node_id: NodeId,
+    request_transcript: Option<StorageRpcRequestTranscript>,
     frame: StorageRpcFrame,
 }
 
@@ -758,6 +844,7 @@ pub(crate) fn sign_storage_rpc_request(
         input.topology_generation,
         input.topology_digest,
         input.target_node_id,
+        None,
         input.frame,
     )?;
     input
@@ -836,6 +923,7 @@ pub(crate) fn verify_storage_rpc_request(
         input.expected_topology_digest,
         message_kind,
         envelope.header().sequence(),
+        None,
     )?;
     validate_storage_rpc_request_frame_payload_limit(&binding.frame)
         .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
@@ -847,21 +935,23 @@ pub(crate) fn verify_storage_rpc_request(
         credential_id,
         credential_version,
         credential,
+        request_transcript: storage_rpc_request_transcript(input.envelope_bytes),
         frame: binding.frame,
     })
 }
 
-pub(crate) struct StorageRpcAuthResponseInput<'a> {
-    pub(crate) request_credential: &'a ControlPlaneScopedCredential,
-    pub(crate) target_node_id: NodeId,
-    pub(crate) topology_generation: u64,
-    pub(crate) topology_digest: &'a str,
-    pub(crate) issued_at_ms: u64,
-    pub(crate) expires_at_ms: u64,
-    pub(crate) frame: &'a StorageRpcFrame,
+struct StorageRpcAuthResponseInput<'a> {
+    request_credential: &'a ControlPlaneScopedCredential,
+    request_transcript: &'a StorageRpcRequestTranscript,
+    target_node_id: NodeId,
+    topology_generation: u64,
+    topology_digest: &'a str,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+    frame: &'a StorageRpcFrame,
 }
 
-pub(crate) fn sign_storage_rpc_response(
+fn sign_storage_rpc_response(
     input: StorageRpcAuthResponseInput<'_>,
 ) -> Result<Vec<u8>, ControlPlaneError> {
     let response_credential = input.request_credential.storage_rpc_response_credential()?;
@@ -869,6 +959,7 @@ pub(crate) fn sign_storage_rpc_response(
         input.topology_generation,
         input.topology_digest,
         input.target_node_id,
+        Some(input.request_transcript),
         input.frame,
     )?;
     response_credential
@@ -886,20 +977,21 @@ pub(crate) fn sign_storage_rpc_response(
         .encode_frame()
 }
 
-pub(crate) struct StorageRpcAuthResponseVerificationInput<'a> {
-    pub(crate) request_credential: &'a ControlPlaneScopedCredential,
-    pub(crate) expected_target_node_id: NodeId,
-    pub(crate) expected_topology_generation: u64,
-    pub(crate) expected_topology_digest: &'a str,
-    pub(crate) expected_request_id: u64,
-    pub(crate) expected_kind: StorageRpcMessageKind,
-    pub(crate) now_ms: u64,
-    pub(crate) max_replay_window_ms: u64,
-    pub(crate) allowed_future_skew_ms: u64,
-    pub(crate) envelope_bytes: &'a [u8],
+struct StorageRpcAuthResponseVerificationInput<'a> {
+    request_credential: &'a ControlPlaneScopedCredential,
+    expected_target_node_id: NodeId,
+    expected_topology_generation: u64,
+    expected_topology_digest: &'a str,
+    expected_request_id: u64,
+    expected_kind: StorageRpcMessageKind,
+    expected_request_transcript: &'a StorageRpcRequestTranscript,
+    now_ms: u64,
+    max_replay_window_ms: u64,
+    allowed_future_skew_ms: u64,
+    envelope_bytes: &'a [u8],
 }
 
-pub(crate) fn verify_storage_rpc_response(
+fn verify_storage_rpc_response(
     input: StorageRpcAuthResponseVerificationInput<'_>,
 ) -> Result<VerifiedStorageRpcFrame, StorageRpcAuthRejectionReason> {
     let response_credential = input
@@ -942,6 +1034,7 @@ pub(crate) fn verify_storage_rpc_response(
         input.expected_topology_digest,
         input.expected_kind as u16,
         envelope.header().sequence(),
+        Some(input.expected_request_transcript),
     )?;
     if binding.frame.request_id != input.expected_request_id {
         return Err(StorageRpcAuthRejectionReason::WrongOperation);
@@ -951,6 +1044,9 @@ pub(crate) fn verify_storage_rpc_response(
         credential_id,
         credential_version,
         credential: response_credential,
+        request_transcript: binding
+            .request_transcript
+            .ok_or(StorageRpcAuthRejectionReason::Malformed)?,
         frame: binding.frame,
     })
 }
@@ -976,6 +1072,7 @@ fn validate_binding(
     expected_topology_digest: &str,
     expected_message_kind: u16,
     envelope_sequence: Option<u64>,
+    expected_request_transcript: Option<&StorageRpcRequestTranscript>,
 ) -> Result<(), StorageRpcAuthRejectionReason> {
     if binding.target_node_id != expected_target_node_id {
         return Err(StorageRpcAuthRejectionReason::WrongTarget);
@@ -989,6 +1086,9 @@ fn validate_binding(
         || envelope_sequence != Some(binding.frame.request_id)
     {
         return Err(StorageRpcAuthRejectionReason::WrongOperation);
+    }
+    if binding.request_transcript.as_ref() != expected_request_transcript {
+        return Err(StorageRpcAuthRejectionReason::WrongRequest);
     }
     Ok(())
 }
@@ -1255,6 +1355,7 @@ fn encode_binding(
     topology_generation: u64,
     topology_digest: &str,
     target_node_id: NodeId,
+    request_transcript: Option<&StorageRpcRequestTranscript>,
     frame: &StorageRpcFrame,
 ) -> Result<Vec<u8>, ControlPlaneError> {
     validate_topology(topology_generation, topology_digest)?;
@@ -1270,6 +1371,13 @@ fn encode_binding(
     out.extend_from_slice(&(STORAGE_RPC_AUTH_TOPOLOGY_DIGEST_LEN as u32).to_be_bytes());
     out.extend_from_slice(topology_digest.as_bytes());
     out.extend_from_slice(&target_node_id.as_u32().to_be_bytes());
+    match request_transcript {
+        None => out.push(0),
+        Some(request_transcript) => {
+            out.push(1);
+            out.extend_from_slice(&request_transcript.0);
+        }
+    }
     out.extend_from_slice(&frame_len.to_be_bytes());
     out.extend_from_slice(&frame);
     Ok(out)
@@ -1298,6 +1406,17 @@ fn decode_binding(bytes: &[u8]) -> Result<StorageRpcAuthBinding, StorageRpcAuthR
         return Err(StorageRpcAuthRejectionReason::Malformed);
     }
     let target_node_id = NodeId::new(reader.read_u32()?);
+    let request_transcript = match reader.read_u8()? {
+        0 => None,
+        1 => {
+            let bytes = reader
+                .read_exact(STORAGE_RPC_AUTH_REQUEST_TRANSCRIPT_LEN)?
+                .try_into()
+                .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
+            Some(StorageRpcRequestTranscript(bytes))
+        }
+        _ => return Err(StorageRpcAuthRejectionReason::Malformed),
+    };
     let frame_len = reader.read_u32()? as usize;
     if frame_len > STORAGE_RPC_MAX_FRAME_LEN {
         return Err(StorageRpcAuthRejectionReason::Malformed);
@@ -1309,6 +1428,7 @@ fn decode_binding(bytes: &[u8]) -> Result<StorageRpcAuthBinding, StorageRpcAuthR
         topology_generation,
         topology_digest,
         target_node_id,
+        request_transcript,
         frame,
     })
 }
@@ -1373,6 +1493,10 @@ impl<'a> BindingReader<'a> {
             .try_into()
             .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
         Ok(u16::from_be_bytes(bytes))
+    }
+
+    fn read_u8(&mut self) -> Result<u8, StorageRpcAuthRejectionReason> {
+        Ok(self.read_exact(1)?[0])
     }
 
     fn read_u32(&mut self) -> Result<u32, StorageRpcAuthRejectionReason> {
@@ -1650,7 +1774,7 @@ mod tests {
 
         assert!(matches!(
             ControlPlaneAuthEnvelope::decode_frame(
-                &frontend_envelope,
+                frontend_envelope.envelope(),
                 STORAGE_RPC_AUTH_MAX_BINDING_LEN
             )
             .unwrap()
@@ -1660,7 +1784,7 @@ mod tests {
         ));
         assert!(matches!(
             ControlPlaneAuthEnvelope::decode_frame(
-                &maintenance_envelope,
+                maintenance_envelope.envelope(),
                 STORAGE_RPC_AUTH_MAX_BINDING_LEN
             )
             .unwrap()
@@ -1998,7 +2122,7 @@ mod tests {
         ] {
             let credential = credential(principal);
             let frame = frame(kind);
-            let payload = encode_binding(9, TOPOLOGY_DIGEST, NodeId::new(7), &frame).unwrap();
+            let payload = encode_binding(9, TOPOLOGY_DIGEST, NodeId::new(7), None, &frame).unwrap();
             let signed = credential
                 .sign_envelope(ControlPlaneAuthSignInput {
                     target: ControlPlaneAuthTarget::Service(ControlPlaneAuthService::StorageRpc),
@@ -2036,54 +2160,108 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_auth_response_round_trip_is_direction_and_caller_bound() {
+    fn storage_rpc_auth_response_is_bound_to_exact_request_direction_and_caller() {
         let caller_credential = credential(ControlPlaneAuthPrincipal::Frontend {
             instance_id: "frontend-1".to_owned(),
         });
+        let client_auth = StorageRpcClientAuthConfig::from(
+            FrontendStorageRpcClientCapability::new(caller_credential.clone(), 9, TOPOLOGY_DIGEST)
+                .unwrap(),
+        );
+        let server_auth = StorageRpcServerAuthConfig::new(
+            caller_credential.cluster_id(),
+            ControlPlaneScopedCredentialStore::new(vec![caller_credential.clone()]).unwrap(),
+            9,
+            TOPOLOGY_DIGEST,
+        )
+        .unwrap();
+        let request = frame(StorageRpcMessageKind::ObjectReadSnapshotLoad);
+        let (request_envelope, request_proof) = client_auth
+            .sign_request(NodeId::new(7), 1_000, &request)
+            .unwrap()
+            .into_parts();
+        let verified_request = server_auth
+            .verify_request(NodeId::new(7), 1_500, &request_envelope)
+            .unwrap();
+        let (verified_request_frame, response_signing_context) =
+            verified_request.into_frame_and_response_signing_context();
+        assert_eq!(verified_request_frame, request);
+
         let response = frame(StorageRpcMessageKind::ObjectReadSnapshotLoad);
-        let signed = sign_storage_rpc_response(StorageRpcAuthResponseInput {
-            request_credential: &caller_credential,
-            target_node_id: NodeId::new(7),
-            topology_generation: 9,
-            topology_digest: TOPOLOGY_DIGEST,
-            issued_at_ms: 1_500,
-            expires_at_ms: 2_500,
-            frame: &response,
-        })
-        .unwrap();
-        let verified = verify_storage_rpc_response(StorageRpcAuthResponseVerificationInput {
-            request_credential: &caller_credential,
-            expected_target_node_id: NodeId::new(7),
-            expected_topology_generation: 9,
-            expected_topology_digest: TOPOLOGY_DIGEST,
-            expected_request_id: response.request_id,
-            expected_kind: response.kind,
-            now_ms: 2_000,
-            max_replay_window_ms: 1_000,
-            allowed_future_skew_ms: 0,
-            envelope_bytes: &signed,
-        })
-        .unwrap();
+        let signed = server_auth
+            .sign_response(&response_signing_context, NodeId::new(7), 1_500, &response)
+            .unwrap();
+        let verified = client_auth
+            .verify_response(NodeId::new(7), 2_000, &request_proof, &signed)
+            .unwrap();
         assert_eq!(verified.into_frame(), response);
 
         let wrong_caller = credential(ControlPlaneAuthPrincipal::Frontend {
             instance_id: "frontend-2".to_owned(),
         });
+        let wrong_client_auth = StorageRpcClientAuthConfig::from(
+            FrontendStorageRpcClientCapability::new(wrong_caller, 9, TOPOLOGY_DIGEST).unwrap(),
+        );
         assert!(matches!(
-            verify_storage_rpc_response(StorageRpcAuthResponseVerificationInput {
-                request_credential: &wrong_caller,
-                expected_target_node_id: NodeId::new(7),
-                expected_topology_generation: 9,
-                expected_topology_digest: TOPOLOGY_DIGEST,
-                expected_request_id: 17,
-                expected_kind: StorageRpcMessageKind::ObjectReadSnapshotLoad,
-                now_ms: 2_000,
-                max_replay_window_ms: 1_000,
-                allowed_future_skew_ms: 0,
-                envelope_bytes: &signed,
-            }),
+            wrong_client_auth.verify_response(NodeId::new(7), 2_000, &request_proof, &signed),
             Err(StorageRpcAuthRejectionReason::Envelope(_))
         ));
+
+        let mut different_request = request;
+        different_request.payload = b"different-object".to_vec();
+        let (different_request_envelope, different_request_proof) = client_auth
+            .sign_request(NodeId::new(7), 1_000, &different_request)
+            .unwrap()
+            .into_parts();
+        let decoded_request = ControlPlaneAuthEnvelope::decode_frame(
+            &request_envelope,
+            STORAGE_RPC_AUTH_MAX_BINDING_LEN,
+        )
+        .unwrap();
+        let decoded_different_request = ControlPlaneAuthEnvelope::decode_frame(
+            &different_request_envelope,
+            STORAGE_RPC_AUTH_MAX_BINDING_LEN,
+        )
+        .unwrap();
+        assert_eq!(decoded_request.header(), decoded_different_request.header());
+        let request_binding = decode_binding(decoded_request.payload()).unwrap();
+        let different_request_binding =
+            decode_binding(decoded_different_request.payload()).unwrap();
+        assert_eq!(request_binding.topology_generation, 9);
+        assert_eq!(
+            request_binding.topology_generation,
+            different_request_binding.topology_generation
+        );
+        assert_eq!(
+            request_binding.topology_digest,
+            different_request_binding.topology_digest
+        );
+        assert_eq!(
+            request_binding.target_node_id,
+            different_request_binding.target_node_id
+        );
+        assert!(request_binding.request_transcript.is_none());
+        assert!(different_request_binding.request_transcript.is_none());
+        assert_eq!(
+            request_binding.frame.request_id,
+            different_request_binding.frame.request_id
+        );
+        assert_eq!(
+            request_binding.frame.kind,
+            different_request_binding.frame.kind
+        );
+        assert_ne!(
+            request_binding.frame.payload,
+            different_request_binding.frame.payload
+        );
+        assert_eq!(
+            different_request_binding.frame.payload,
+            different_request.payload
+        );
+        assert_eq!(
+            client_auth.verify_response(NodeId::new(7), 2_000, &different_request_proof, &signed),
+            Err(StorageRpcAuthRejectionReason::WrongRequest)
+        );
     }
 
     #[test]
@@ -2110,5 +2288,9 @@ mod tests {
         assert!(!debug.contains("\"payload\""));
         assert!(!debug.contains("storage-auth-secret"));
         assert!(!debug.contains("authenticator"));
+        assert_eq!(
+            format!("{:?}", verified.request_transcript),
+            "StorageRpcRequestTranscript([REDACTED])"
+        );
     }
 }

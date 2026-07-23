@@ -313,7 +313,8 @@ use crate::storage_rpc::{
     STORAGE_RPC_SERVER_IDLE_TIMEOUT,
 };
 use crate::storage_rpc_auth::{
-    write_storage_rpc_auth_transport_frame_with_limit, StorageRpcServerAuthConfig,
+    write_storage_rpc_auth_transport_frame_with_limit, StorageRpcResponseSigningContext,
+    StorageRpcServerAuthConfig,
 };
 use crate::types::{BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
 use crate::types::{
@@ -5897,13 +5898,8 @@ impl StorageNodeConnectionHandler {
     fn read_request_frame(
         &self,
         stream: &mut UnixStream,
-    ) -> Result<
-        (
-            StorageRpcFrame,
-            Option<crate::control_plane_auth::ControlPlaneScopedCredential>,
-        ),
-        StorageRpcStreamError,
-    > {
+    ) -> Result<(StorageRpcFrame, Option<StorageRpcResponseSigningContext>), StorageRpcStreamError>
+    {
         let Some(auth) = self.rpc_auth.as_deref() else {
             return read_storage_rpc_request_frame_from(stream).map(|frame| (frame, None));
         };
@@ -5916,8 +5912,9 @@ impl StorageNodeConnectionHandler {
             &envelope,
         )
         .map(|verified| {
-            let (frame, credential) = verified.into_frame_and_credential();
-            (frame, Some(credential))
+            let (frame, response_signing_context) =
+                verified.into_frame_and_response_signing_context();
+            (frame, Some(response_signing_context))
         })
         .map_err(|error| {
             StorageRpcStreamError::Io(io::Error::new(
@@ -5930,13 +5927,13 @@ impl StorageNodeConnectionHandler {
     fn write_response_frame(
         &self,
         stream: &mut UnixStream,
-        request_credential: Option<&crate::control_plane_auth::ControlPlaneScopedCredential>,
+        request_auth: Option<&StorageRpcResponseSigningContext>,
         response: &StorageRpcFrame,
     ) -> Result<(), StorageRpcStreamError> {
         let Some(auth) = self.rpc_auth.as_deref() else {
             return write_storage_rpc_frame_to(stream, response);
         };
-        let request_credential = request_credential.ok_or_else(|| {
+        let request_auth = request_auth.ok_or_else(|| {
             StorageRpcStreamError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "authenticated storage RPC response has no request credential",
@@ -5944,7 +5941,7 @@ impl StorageNodeConnectionHandler {
         })?;
         let envelope = auth
             .sign_response(
-                request_credential,
+                request_auth,
                 self.config.node_id,
                 crate::clock::current_time_millis(),
                 response,
@@ -6061,7 +6058,7 @@ impl StorageNodeConnectionHandler {
         let mut session =
             StorageNodeSession::new(Arc::clone(&self.read_handles), Arc::clone(&self.node));
         loop {
-            let (frame, request_credential) = match self.read_request_frame(stream) {
+            let (frame, request_auth) = match self.read_request_frame(stream) {
                 Ok(frame) => frame,
                 Err(StorageRpcStreamError::Io(error))
                     if matches!(
@@ -6150,8 +6147,7 @@ impl StorageNodeConnectionHandler {
                     ),
                 );
             }
-            if let Err(error) =
-                self.write_response_frame(stream, request_credential.as_ref(), &response)
+            if let Err(error) = self.write_response_frame(stream, request_auth.as_ref(), &response)
             {
                 session.clear_metadata_command_lock_context(&self.metadata_command_locks);
                 return Err(rpc_stream_error(error));

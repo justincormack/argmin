@@ -275,7 +275,7 @@ impl UnixStorageNodeReadHandleSession {
             kind,
             payload,
         };
-        write_unix_storage_rpc_request(
+        let request_proof = write_unix_storage_rpc_request(
             &mut self.stream,
             self.node_id,
             self.rpc_auth.as_deref(),
@@ -286,7 +286,7 @@ impl UnixStorageNodeReadHandleSession {
             &mut self.stream,
             self.node_id,
             self.rpc_auth.as_deref(),
-            &request,
+            request_proof.as_ref(),
             "read read-handle RPC response",
         )?;
         if response.request_id != request_id || response.kind != kind {
@@ -378,7 +378,7 @@ impl UnixStorageNodeMetadataCommandSession {
             kind,
             payload,
         };
-        write_unix_storage_rpc_request(
+        let request_proof = write_unix_storage_rpc_request(
             &mut inner.stream,
             self.node_id,
             self.rpc_auth.as_deref(),
@@ -389,7 +389,7 @@ impl UnixStorageNodeMetadataCommandSession {
             &mut inner.stream,
             self.node_id,
             self.rpc_auth.as_deref(),
-            &request,
+            request_proof.as_ref(),
             "read metadata command session RPC response",
         )?;
         if response.request_id != request_id || response.kind != kind {

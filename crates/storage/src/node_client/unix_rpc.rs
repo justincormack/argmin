@@ -1473,29 +1473,32 @@ impl UnixStorageNodeClient {
             kind,
             payload,
         };
-        if let Err(error) = write_unix_storage_rpc_request(
+        let request_proof = match write_unix_storage_rpc_request(
             &mut stream,
             self.node_id,
             self.rpc_auth.as_deref(),
             &request,
             "write storage RPC request",
         ) {
-            if trace_rpc_lifecycle {
-                let _ = observability::emit_flight_event(
-                    "storage_rpc_client",
-                    "storage_rpc_client_write_failed",
-                    format!(
-                        "node_id={} rpc_request_id={} kind={} elapsed_us={} error={}",
-                        self.node_id.as_u32(),
-                        request_id,
-                        kind.operation_name(),
-                        started.elapsed().as_micros(),
-                        error
-                    ),
-                );
+            Ok(request_proof) => request_proof,
+            Err(error) => {
+                if trace_rpc_lifecycle {
+                    let _ = observability::emit_flight_event(
+                        "storage_rpc_client",
+                        "storage_rpc_client_write_failed",
+                        format!(
+                            "node_id={} rpc_request_id={} kind={} elapsed_us={} error={}",
+                            self.node_id.as_u32(),
+                            request_id,
+                            kind.operation_name(),
+                            started.elapsed().as_micros(),
+                            error
+                        ),
+                    );
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         if trace_rpc_lifecycle {
             let _ = observability::emit_flight_event(
                 "storage_rpc_client",
@@ -1513,7 +1516,7 @@ impl UnixStorageNodeClient {
             &mut stream,
             self.node_id,
             self.rpc_auth.as_deref(),
-            &request,
+            request_proof.as_ref(),
             "read storage RPC response",
         ) {
             Ok(response) => {
