@@ -10657,6 +10657,12 @@ impl super::StorageCluster {
                     if delete.matches_request(bucket, key, generation_id)
             );
             if matching_reclaim_delete {
+                let reclaim_authority = match command.payload() {
+                    MetadataCommandPayload::DeleteObjectPayloadReclaim(delete) => {
+                        &delete.reclaim_claim
+                    }
+                    _ => unreachable!("matching payload reclaim command was already selected"),
+                };
                 match self.finish_exact_pending_object_metadata_command(
                     pg_id,
                     super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
@@ -10666,6 +10672,7 @@ impl super::StorageCluster {
                             bucket,
                             key,
                             generation_id,
+                            reclaim_authority,
                         )?;
                         emit_outcome("completed_existing_pending");
                         return Ok(super::ObjectPayloadReclaimAttempt::Completed);
@@ -10745,6 +10752,7 @@ impl super::StorageCluster {
             emit_outcome("deferred_claim_busy");
             return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
         };
+        let reclaim_authority = ObjectPayloadReclaimClaimProof::from(&claim);
 
         let release_reclaim_claim = || -> Result<(), ObjectPgActionError> {
             mutation_client
@@ -10752,10 +10760,12 @@ impl super::StorageCluster {
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
         };
 
-        if !self
-            .local_map
-            .try_begin_object_payload_reclaim(bucket, key, generation_id)?
-        {
+        if !self.local_map.try_begin_object_payload_reclaim(
+            bucket,
+            key,
+            generation_id,
+            &reclaim_authority,
+        )? {
             release_reclaim_claim()?;
             emit_outcome("deferred_active");
             return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
@@ -10854,13 +10864,7 @@ impl super::StorageCluster {
                             key.clone(),
                             generation_id,
                             reclaim.clone(),
-                            ObjectPayloadReclaimClaimProof {
-                                bucket_incarnation_generation,
-                                reclaim_kind,
-                                claim_id: claim.claim_id.clone(),
-                                owner_token: claim.owner_token.clone(),
-                                cluster_epoch: claim.cluster_epoch,
-                            },
+                            reclaim_authority.clone(),
                         ),
                     )),
                 );
@@ -10890,6 +10894,7 @@ impl super::StorageCluster {
             bucket,
             key,
             generation_id,
+            &reclaim_authority,
             keep_reclaim_fence,
         )?;
         result

@@ -23,10 +23,10 @@ use crate::metadata_command::{
     MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
     MetadataCommandId, MetadataCommandLogHashRangeEntry, MetadataCommandLogIndex,
     MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind, MetadataCommandPayload,
-    MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimCommand,
-    PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
-    PutBucketVersioningCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
-    COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+    MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimClaimProof,
+    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+    PutObjectMetadataMutation, COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::node_runtime::pg_store::{
     MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus, PgStore, ScavengerShardFileScan,

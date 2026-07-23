@@ -860,6 +860,9 @@ fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
         StoreError::IntegrityError { .. } => "store_integrity_error",
         StoreError::ShardAckMismatch { .. } => "shard_ack_mismatch",
         StoreError::PayloadShardSetMismatch { .. } => "payload_shard_set_mismatch",
+        StoreError::ObjectPayloadReclaimFenceAuthorityMismatch => {
+            "object_payload_reclaim_fence_authority_mismatch"
+        }
         StoreError::PgDurableIdentityInvalid { .. } => "pg_durable_identity_invalid",
         StoreError::ClusterMapHistoryReferenceLimitExceeded { .. } => {
             "cluster_map_history_reference_limit_exceeded"

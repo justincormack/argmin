@@ -5,8 +5,9 @@ use crate::{
         BucketWriteReservationProof, CreateMultipartUploadCommand, CreateStreamUploadCommand,
         DeleteObjectVersionTarget, MetadataCommandAcceptance, MetadataCommandLogHashRangeEntry,
         MetadataCommandLogIndex, MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind,
-        MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimCommand,
-        PutObjectMetadataMutation, COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+        MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimClaimProof,
+        ObjectPayloadReclaimCommand, PutObjectMetadataMutation,
+        COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     },
     pg_store::{
         MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
@@ -76,7 +77,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU32;
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 4;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 5;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -355,8 +356,21 @@ const STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_EXISTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 8;
-const STORAGE_RPC_MAX_OBJECT_PAYLOAD_LEASE_CONTROL_REQUEST_PAYLOAD_LEN: usize =
-    4 + STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN + 4 + STORAGE_RPC_MAX_OBJECT_KEY_LEN + 8 + 1;
+const STORAGE_RPC_MAX_OBJECT_PAYLOAD_LEASE_CONTROL_REQUEST_PAYLOAD_LEN: usize = 4
+    + 8
+    + STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN
+    + 4
+    + STORAGE_RPC_MAX_OBJECT_KEY_LEN
+    + 8
+    + 1
+    + 1
+    + 8
+    + 1
+    + 4
+    + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+    + 4
+    + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+    + 8;
 const STORAGE_RPC_OBJECT_PAYLOAD_RECLAIM_CLAIM_RECORD_MAX_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN
         + 8
@@ -1550,10 +1564,12 @@ pub(crate) enum StorageRpcObjectPayloadLeaseControlOperation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcObjectPayloadLeaseControlRequest {
     pub(crate) node_id: NodeId,
+    pub(crate) route_cluster_epoch: ClusterEpoch,
     pub(crate) bucket: BucketName,
     pub(crate) key: ObjectKey,
     pub(crate) generation_id: GenerationId,
     pub(crate) operation: StorageRpcObjectPayloadLeaseControlOperation,
+    pub(crate) reclaim_authority: Option<ObjectPayloadReclaimClaimProof>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4566,10 +4582,22 @@ pub(crate) fn encode_object_payload_lease_control_request(
 ) -> Vec<u8> {
     let mut out = Vec::new();
     put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.route_cluster_epoch.get());
     put_string(&mut out, request.bucket.as_str());
     put_string(&mut out, request.key.as_str());
     put_u64(&mut out, request.generation_id.get());
     out.push(request.operation as u8);
+    match request.reclaim_authority.as_ref() {
+        Some(authority) => {
+            out.push(1);
+            put_u64(&mut out, authority.bucket_incarnation_generation);
+            out.push(authority.reclaim_kind as u8);
+            put_string(&mut out, &authority.claim_id);
+            put_string(&mut out, &authority.owner_token);
+            put_u64(&mut out, authority.cluster_epoch.get());
+        }
+        None => out.push(0),
+    }
     out
 }
 
@@ -4578,6 +4606,7 @@ pub(crate) fn decode_object_payload_lease_control_request(
 ) -> Result<StorageRpcObjectPayloadLeaseControlRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let node_id = NodeId::new(decoder.read_u32()?);
+    let route_cluster_epoch = decoder.read_cluster_epoch()?;
     let bucket = decoder.read_bucket_name()?;
     let key = decoder.read_object_key()?;
     let generation_id = decoder.read_generation_id()?;
@@ -4595,13 +4624,40 @@ pub(crate) fn decode_object_payload_lease_control_request(
             ));
         }
     };
+    let reclaim_authority = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(ObjectPayloadReclaimClaimProof {
+            bucket_incarnation_generation: decoder.read_u64()?,
+            reclaim_kind: decoder.read_object_payload_reclaim_kind()?,
+            claim_id: decoder.read_string_with_limit(
+                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN,
+                StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "object payload reclaim claim id is too large",
+                ),
+            )?,
+            owner_token: decoder.read_string_with_limit(
+                STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN,
+                StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "object payload reclaim owner token is too large",
+                ),
+            )?,
+            cluster_epoch: decoder.read_cluster_epoch()?,
+        }),
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional object payload reclaim authority tag",
+            ));
+        }
+    };
     decoder.finish()?;
     Ok(StorageRpcObjectPayloadLeaseControlRequest {
         node_id,
+        route_cluster_epoch,
         bucket,
         key,
         generation_id,
         operation,
+        reclaim_authority,
     })
 }
 
@@ -17332,7 +17388,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&4u16.to_le_bytes());
+        expected.extend_from_slice(&5u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -17343,15 +17399,15 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_rejects_version_three_fixture() {
+    fn storage_rpc_frame_rejects_version_four_fixture() {
         let mut bytes =
             encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
         let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&3_u16.to_le_bytes());
+        bytes[version_offset..version_offset + 2].copy_from_slice(&4_u16.to_le_bytes());
 
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnsupportedVersion(3))
+            Err(StorageRpcFrameError::UnsupportedVersion(4))
         );
     }
 
@@ -19522,12 +19578,28 @@ mod tests {
             StorageRpcObjectPayloadLeaseControlOperation::Count,
         ];
         for operation in operations {
+            let reclaim_authority = matches!(
+                operation,
+                StorageRpcObjectPayloadLeaseControlOperation::ReclaimBegin
+                    | StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinish
+                    | StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinishKeepFence
+                    | StorageRpcObjectPayloadLeaseControlOperation::ReclaimFenceClear
+            )
+            .then(|| ObjectPayloadReclaimClaimProof {
+                bucket_incarnation_generation: 13,
+                reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+                claim_id: "claim-1".to_string(),
+                owner_token: "owner-1".to_string(),
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            });
             let request = StorageRpcObjectPayloadLeaseControlRequest {
                 node_id: NodeId::new(7),
+                route_cluster_epoch: ClusterEpoch::new(3).unwrap(),
                 bucket: BucketName::new("lease-bucket").unwrap(),
                 key: ObjectKey::new("lease-key").unwrap(),
                 generation_id: GenerationId::new(11).unwrap(),
                 operation,
+                reclaim_authority,
             };
             let encoded = encode_object_payload_lease_control_request(&request);
             assert!(
@@ -19550,10 +19622,12 @@ mod tests {
 
         let request = StorageRpcObjectPayloadLeaseControlRequest {
             node_id: NodeId::new(7),
+            route_cluster_epoch: ClusterEpoch::new(3).unwrap(),
             bucket: BucketName::new("lease-bucket").unwrap(),
             key: ObjectKey::new("lease-key").unwrap(),
             generation_id: GenerationId::new(11).unwrap(),
             operation: StorageRpcObjectPayloadLeaseControlOperation::Acquire,
+            reclaim_authority: None,
         };
         let mut corrupt = encode_object_payload_lease_control_request(&request);
         *corrupt.last_mut().unwrap() = u8::MAX;

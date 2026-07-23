@@ -20,6 +20,7 @@ use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 use crate::metadata_command::MetadataCommandLogIndex;
 use crate::metadata_command::{
     MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
+    ObjectPayloadReclaimClaimProof,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
@@ -2993,6 +2994,7 @@ impl LocalClusterMap {
             match node
                 .object_payload_lease_client()
                 .acquire_object_payload_lease(
+                    self.epoch,
                     bucket,
                     key,
                     generation_id,
@@ -3066,6 +3068,7 @@ impl LocalClusterMap {
         let mut acquired = Vec::with_capacity(lease_clients.len());
         for lease_client in lease_clients {
             match lease_client.acquire_object_payload_lease(
+                self.epoch,
                 bucket,
                 key,
                 generation_id,
@@ -3083,27 +3086,54 @@ impl LocalClusterMap {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+        authority: &ObjectPayloadReclaimClaimProof,
     ) -> Result<bool, StoreError> {
         let mut acquired = Vec::with_capacity(self.nodes.len());
         for node in self.nodes.values() {
             let client = Arc::clone(node.object_payload_lease_client());
-            match client.try_begin_object_payload_reclaim(bucket, key, generation_id) {
+            match client.try_begin_object_payload_reclaim(
+                self.epoch,
+                bucket,
+                key,
+                generation_id,
+                authority,
+            ) {
                 Ok(true) => {
                     acquired.push(client);
                     continue;
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    let _ = client.finish_object_payload_reclaim(bucket, key, generation_id, false);
+                    let _ = client.finish_object_payload_reclaim(
+                        self.epoch,
+                        bucket,
+                        key,
+                        generation_id,
+                        authority,
+                        false,
+                    );
                     for client in acquired {
-                        let _ =
-                            client.finish_object_payload_reclaim(bucket, key, generation_id, false);
+                        let _ = client.finish_object_payload_reclaim(
+                            self.epoch,
+                            bucket,
+                            key,
+                            generation_id,
+                            authority,
+                            false,
+                        );
                     }
                     return Err(error);
                 }
             }
             for client in acquired {
-                let _ = client.finish_object_payload_reclaim(bucket, key, generation_id, false);
+                let _ = client.finish_object_payload_reclaim(
+                    self.epoch,
+                    bucket,
+                    key,
+                    generation_id,
+                    authority,
+                    false,
+                );
             }
             return Ok(false);
         }
@@ -3115,13 +3145,21 @@ impl LocalClusterMap {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+        authority: &ObjectPayloadReclaimClaimProof,
         keep_fence: bool,
     ) -> Result<(), StoreError> {
         let mut first_error = None;
         for node in self.nodes.values() {
             if let Err(error) = node
                 .object_payload_lease_client()
-                .finish_object_payload_reclaim(bucket, key, generation_id, keep_fence)
+                .finish_object_payload_reclaim(
+                    self.epoch,
+                    bucket,
+                    key,
+                    generation_id,
+                    authority,
+                    keep_fence,
+                )
             {
                 first_error.get_or_insert(error);
             }
@@ -3134,12 +3172,19 @@ impl LocalClusterMap {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+        authority: &ObjectPayloadReclaimClaimProof,
     ) -> Result<(), StoreError> {
         let mut first_error = None;
         for node in self.nodes.values() {
             if let Err(error) = node
                 .object_payload_lease_client()
-                .clear_object_payload_reclaim_fence(bucket, key, generation_id)
+                .clear_object_payload_reclaim_fence(
+                    self.epoch,
+                    bucket,
+                    key,
+                    generation_id,
+                    authority,
+                )
             {
                 first_error.get_or_insert(error);
             }
@@ -3157,7 +3202,7 @@ impl LocalClusterMap {
         for node in self.nodes.values() {
             max_count = max_count.max(
                 node.object_payload_lease_client()
-                    .object_payload_lease_count(bucket, key, generation_id)?,
+                    .object_payload_lease_count(self.epoch, bucket, key, generation_id)?,
             );
         }
         Ok(max_count)
@@ -3174,7 +3219,7 @@ impl LocalClusterMap {
             .values()
             .filter(|node| {
                 node.object_payload_lease_client()
-                    .object_payload_lease_count(bucket, key, generation_id)
+                    .object_payload_lease_count(self.epoch, bucket, key, generation_id)
                     .unwrap_or(0)
                     != 0
             })

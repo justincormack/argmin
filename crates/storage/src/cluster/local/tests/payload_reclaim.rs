@@ -1,4 +1,5 @@
 use super::*;
+use crate::ObjectPayloadReclaimKind;
 
 #[test]
 fn object_payload_reclaim_capacity_counts_dequeued_work_until_finished() {
@@ -962,7 +963,19 @@ fn payload_lease_for_shard_locations_releases_partial_acquire_on_fence() {
         .find(|location| location.node_id() != first.node_id())
         .expect("EC placement should use at least two storage nodes");
     let fenced_node = map.node(fenced.node_id()).unwrap().storage_node();
-    assert!(fenced_node.try_begin_object_payload_reclaim(&bucket, &key, committed.generation_id));
+    let reclaim_authority = ObjectPayloadReclaimClaimProof {
+        bucket_incarnation_generation: 1,
+        reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+        claim_id: "partial-acquire-claim".to_string(),
+        owner_token: "partial-acquire-owner".to_string(),
+        cluster_epoch: map.epoch,
+    };
+    assert!(fenced_node.try_begin_object_payload_reclaim(
+        &bucket,
+        &key,
+        committed.generation_id,
+        &reclaim_authority,
+    ));
 
     match cluster.acquire_object_payload_lease_for_shard_locations(
         &bucket,
@@ -981,7 +994,13 @@ fn payload_lease_for_shard_locations_releases_partial_acquire_on_fence() {
             "failed all-or-release acquisition leaked a lease on node {node_id:?}"
         );
     }
-    fenced_node.finish_object_payload_reclaim(&bucket, &key, committed.generation_id, false);
+    assert!(fenced_node.finish_object_payload_reclaim(
+        &bucket,
+        &key,
+        committed.generation_id,
+        &reclaim_authority,
+        false,
+    ));
 }
 
 #[test]

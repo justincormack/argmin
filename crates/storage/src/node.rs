@@ -33,6 +33,7 @@ use crate::data_dir::prepare_private_data_dir;
 #[cfg(test)]
 use crate::error::BucketWriteDrainError;
 use crate::error::{BucketSnapshotLoadError, ObjectPgActionError, StoreError};
+use crate::metadata_command::ObjectPayloadReclaimClaimProof;
 #[cfg(test)]
 use crate::metadata_command::{
     CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
@@ -548,8 +549,8 @@ pub struct BucketDeleteBeginRoot {
 #[derive(Debug, Default)]
 struct ObjectPayloadLeaseState {
     leases: HashMap<ReclaimRoot, usize>,
-    reclaim_fences: HashSet<ReclaimRoot>,
-    active_reclaims: HashSet<ReclaimRoot>,
+    reclaim_fences: HashMap<ReclaimRoot, ObjectPayloadReclaimClaimProof>,
+    active_reclaims: HashMap<ReclaimRoot, ObjectPayloadReclaimClaimProof>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1633,7 +1634,7 @@ impl SharedStorageNode {
             .object_payload_leases
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if state.reclaim_fences.contains(&root) {
+        if state.reclaim_fences.contains_key(&root) {
             return false;
         }
         *state.leases.entry(root).or_insert(0) += 1;
@@ -1674,19 +1675,23 @@ impl SharedStorageNode {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+        authority: &ObjectPayloadReclaimClaimProof,
     ) -> bool {
         let root = (bucket.clone(), key.clone(), generation_id);
         let mut state = self
             .object_payload_leases
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if state.leases.get(&root).copied().unwrap_or(0) != 0
-            || state.active_reclaims.contains(&root)
-        {
+        if state.leases.get(&root).copied().unwrap_or(0) != 0 {
             return false;
         }
-        state.active_reclaims.insert(root.clone());
-        state.reclaim_fences.insert(root);
+        if let Some(active) = state.active_reclaims.get(&root) {
+            return active == authority;
+        }
+        state
+            .active_reclaims
+            .insert(root.clone(), authority.clone());
+        state.reclaim_fences.insert(root, authority.clone());
         true
     }
 
@@ -1696,17 +1701,30 @@ impl SharedStorageNode {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+        authority: &ObjectPayloadReclaimClaimProof,
         keep_fence: bool,
-    ) {
+    ) -> bool {
         let root = (bucket.clone(), key.clone(), generation_id);
         let mut state = self
             .object_payload_leases
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if state
+            .active_reclaims
+            .get(&root)
+            .is_some_and(|active| active != authority)
+            || state
+                .reclaim_fences
+                .get(&root)
+                .is_some_and(|fence| fence != authority)
+        {
+            return false;
+        }
         state.active_reclaims.remove(&root);
         if !keep_fence {
             state.reclaim_fences.remove(&root);
         }
+        true
     }
 
     /// Clear a reclaim fence after a matching terminal reclaim command has converged.
@@ -1715,12 +1733,22 @@ impl SharedStorageNode {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) {
-        self.object_payload_leases
+        authority: &ObjectPayloadReclaimClaimProof,
+    ) -> bool {
+        let mut state = self
+            .object_payload_leases
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|e| e.into_inner());
+        let root = (bucket.clone(), key.clone(), generation_id);
+        if state
             .reclaim_fences
-            .remove(&(bucket.clone(), key.clone(), generation_id));
+            .get(&root)
+            .is_some_and(|fence| fence != authority)
+        {
+            return false;
+        }
+        state.reclaim_fences.remove(&root);
+        true
     }
 
     /// Return the number of active object-payload leases for a generation.

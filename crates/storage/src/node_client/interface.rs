@@ -988,6 +988,7 @@ pub(crate) enum ObjectPayloadLeaseKind {
 pub(crate) trait ObjectPayloadLeaseNodeClient: Send + Sync {
     fn acquire_object_payload_lease(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
@@ -996,28 +997,35 @@ pub(crate) trait ObjectPayloadLeaseNodeClient: Send + Sync {
 
     fn try_begin_object_payload_reclaim(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+        authority: &ObjectPayloadReclaimClaimProof,
     ) -> Result<bool, StoreError>;
 
     fn finish_object_payload_reclaim(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+        authority: &ObjectPayloadReclaimClaimProof,
         keep_fence: bool,
     ) -> Result<(), StoreError>;
 
     fn clear_object_payload_reclaim_fence(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+        authority: &ObjectPayloadReclaimClaimProof,
     ) -> Result<(), StoreError>;
 
     fn object_payload_lease_count(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,

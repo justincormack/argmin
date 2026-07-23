@@ -2,6 +2,7 @@ use super::*;
 
 pub(crate) struct UnixStorageNodeReadHandleSession {
     node_id: NodeId,
+    route_cluster_epoch: ClusterEpoch,
     stream: UnixStream,
     next_request_id: u64,
     rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
@@ -59,6 +60,7 @@ impl UnixStorageNodeClient {
         )?;
         Ok(UnixStorageNodeReadHandleSession {
             node_id: self.node_id,
+            route_cluster_epoch: self.cluster_epoch,
             stream,
             next_request_id: 1,
             rpc_auth: self.rpc_auth.clone(),
@@ -83,6 +85,7 @@ impl UnixStorageNodeClient {
         )?;
         Ok(UnixStorageNodeReadHandleSession {
             node_id: self.node_id,
+            route_cluster_epoch: self.cluster_epoch,
             stream,
             next_request_id: 1,
             rpc_auth: self.rpc_auth.clone(),
@@ -128,13 +131,16 @@ impl UnixStorageNodeClient {
         key: &ObjectKey,
         generation_id: GenerationId,
         operation: StorageRpcObjectPayloadLeaseControlOperation,
+        reclaim_authority: Option<&ObjectPayloadReclaimClaimProof>,
     ) -> Result<u64, StoreError> {
         let request = StorageRpcObjectPayloadLeaseControlRequest {
             node_id: self.node_id,
+            route_cluster_epoch: self.cluster_epoch,
             bucket: bucket.clone(),
             key: key.clone(),
             generation_id,
             operation,
+            reclaim_authority: reclaim_authority.cloned(),
         };
         let payload = encode_object_payload_lease_control_request(&request);
         let response =
@@ -237,13 +243,16 @@ impl UnixStorageNodeReadHandleSession {
         key: &ObjectKey,
         generation_id: GenerationId,
         operation: StorageRpcObjectPayloadLeaseControlOperation,
+        reclaim_authority: Option<&ObjectPayloadReclaimClaimProof>,
     ) -> Result<u64, StoreError> {
         let request = StorageRpcObjectPayloadLeaseControlRequest {
             node_id: self.node_id,
+            route_cluster_epoch: self.route_cluster_epoch,
             bucket: bucket.clone(),
             key: key.clone(),
             generation_id,
             operation,
+            reclaim_authority: reclaim_authority.cloned(),
         };
         let payload = encode_object_payload_lease_control_request(&request);
         let response =
@@ -1734,17 +1743,25 @@ impl ShardReadHandleNodeClient for UnixStorageNodeClient {
 impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
     fn acquire_object_payload_lease(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
         kind: ObjectPayloadLeaseKind,
     ) -> Result<Option<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::RouteAdmissionClusterMismatch {
+                admitted_epoch: route_cluster_epoch,
+                operation_epoch: self.cluster_epoch,
+            });
+        }
         let mut session = self.open_object_payload_lease_session(kind)?;
         let acquired = session.object_payload_lease_control(
             bucket,
             key,
             generation_id,
             StorageRpcObjectPayloadLeaseControlOperation::Acquire,
+            None,
         )?;
         match acquired {
             0 => Ok(None),
@@ -1764,15 +1781,24 @@ impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
 
     fn try_begin_object_payload_reclaim(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+        authority: &ObjectPayloadReclaimClaimProof,
     ) -> Result<bool, StoreError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::RouteAdmissionClusterMismatch {
+                admitted_epoch: route_cluster_epoch,
+                operation_epoch: self.cluster_epoch,
+            });
+        }
         match self.object_payload_lease_control_request(
             bucket,
             key,
             generation_id,
             StorageRpcObjectPayloadLeaseControlOperation::ReclaimBegin,
+            Some(authority),
         )? {
             0 => Ok(false),
             1 => Ok(true),
@@ -1785,11 +1811,19 @@ impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
 
     fn finish_object_payload_reclaim(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+        authority: &ObjectPayloadReclaimClaimProof,
         keep_fence: bool,
     ) -> Result<(), StoreError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::RouteAdmissionClusterMismatch {
+                admitted_epoch: route_cluster_epoch,
+                operation_epoch: self.cluster_epoch,
+            });
+        }
         let operation = if keep_fence {
             StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinishKeepFence
         } else {
@@ -1798,7 +1832,13 @@ impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
         let mut last_error = None;
         for _ in 0..2 {
             let result = self
-                .object_payload_lease_control_request(bucket, key, generation_id, operation)
+                .object_payload_lease_control_request(
+                    bucket,
+                    key,
+                    generation_id,
+                    operation,
+                    Some(authority),
+                )
                 .map(|_| ());
             match result {
                 Ok(()) => return Ok(()),
@@ -1810,10 +1850,18 @@ impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
 
     fn clear_object_payload_reclaim_fence(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+        authority: &ObjectPayloadReclaimClaimProof,
     ) -> Result<(), StoreError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::RouteAdmissionClusterMismatch {
+                admitted_epoch: route_cluster_epoch,
+                operation_epoch: self.cluster_epoch,
+            });
+        }
         let mut last_error = None;
         for _ in 0..2 {
             let result = self
@@ -1822,6 +1870,7 @@ impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
                     key,
                     generation_id,
                     StorageRpcObjectPayloadLeaseControlOperation::ReclaimFenceClear,
+                    Some(authority),
                 )
                 .map(|_| ());
             match result {
@@ -1834,15 +1883,23 @@ impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
 
     fn object_payload_lease_count(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<usize, StoreError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::RouteAdmissionClusterMismatch {
+                admitted_epoch: route_cluster_epoch,
+                operation_epoch: self.cluster_epoch,
+            });
+        }
         let count = self.object_payload_lease_control_request(
             bucket,
             key,
             generation_id,
             StorageRpcObjectPayloadLeaseControlOperation::Count,
+            None,
         )?;
         usize::try_from(count).map_err(|_| StoreError::Io {
             context: "validate storage-node object-payload lease count response",
@@ -1861,6 +1918,7 @@ impl ObjectPayloadLeaseNodeLease for UnixObjectPayloadLease {
             &self.key,
             self.generation_id,
             StorageRpcObjectPayloadLeaseControlOperation::Release,
+            None,
         )?;
         self.released = true;
         usize::try_from(remaining).map_err(|_| StoreError::Io {
@@ -1920,6 +1978,7 @@ mod tests {
         let (read_stream, _read_peer) = UnixStream::pair().unwrap();
         let read_session = UnixStorageNodeReadHandleSession {
             node_id: NodeId::new(8),
+            route_cluster_epoch: ClusterEpoch::new(1).unwrap(),
             stream: read_stream,
             next_request_id: 1,
             rpc_auth: None,

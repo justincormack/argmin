@@ -173,6 +173,7 @@ impl ShardReadHandleNodeClient for LocalStorageNodeClient {
 impl ObjectPayloadLeaseNodeClient for LocalStorageNodeClient {
     fn acquire_object_payload_lease(
         &self,
+        _route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
@@ -195,40 +196,52 @@ impl ObjectPayloadLeaseNodeClient for LocalStorageNodeClient {
 
     fn try_begin_object_payload_reclaim(
         &self,
+        _route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+        authority: &ObjectPayloadReclaimClaimProof,
     ) -> Result<bool, StoreError> {
-        Ok(self
-            .storage_node
-            .try_begin_object_payload_reclaim(bucket, key, generation_id))
+        Ok(self.storage_node.try_begin_object_payload_reclaim(
+            bucket,
+            key,
+            generation_id,
+            authority,
+        ))
     }
 
     fn finish_object_payload_reclaim(
         &self,
+        _route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+        authority: &ObjectPayloadReclaimClaimProof,
         keep_fence: bool,
     ) -> Result<(), StoreError> {
         self.storage_node
-            .finish_object_payload_reclaim(bucket, key, generation_id, keep_fence);
-        Ok(())
+            .finish_object_payload_reclaim(bucket, key, generation_id, authority, keep_fence)
+            .then_some(())
+            .ok_or(StoreError::ObjectPayloadReclaimFenceAuthorityMismatch)
     }
 
     fn clear_object_payload_reclaim_fence(
         &self,
+        _route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+        authority: &ObjectPayloadReclaimClaimProof,
     ) -> Result<(), StoreError> {
         self.storage_node
-            .clear_object_payload_reclaim_fence(bucket, key, generation_id);
-        Ok(())
+            .clear_object_payload_reclaim_fence(bucket, key, generation_id, authority)
+            .then_some(())
+            .ok_or(StoreError::ObjectPayloadReclaimFenceAuthorityMismatch)
     }
 
     fn object_payload_lease_count(
         &self,
+        _route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,

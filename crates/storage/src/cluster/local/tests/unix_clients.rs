@@ -1,10 +1,11 @@
 use super::*;
 use crate::node_client::ObjectPayloadLeaseKind;
+use crate::storage_rpc::StorageRpcErrorCode;
 use crate::{
-    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
-    PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
-    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
-    PlacedSegmentShardRepairRecord,
+    ObjectPayloadReclaimKind, PlacedSegmentShardBackfillClaimAcquire,
+    PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
+    PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
+    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
 };
 
 struct RecordingPlacedShardClient {
@@ -291,6 +292,7 @@ fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() 
         broad_leases.push(
             client
                 .acquire_object_payload_lease(
+                    epoch,
                     &bucket,
                     &object_key,
                     generation_id,
@@ -306,6 +308,7 @@ fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() 
     }
     assert!(matches!(
         client.acquire_object_payload_lease(
+            epoch,
             &bucket,
             &object_key,
             generation_id,
@@ -324,6 +327,7 @@ fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() 
     while let Some(broad_lease) = broad_leases.pop() {
         let narrow_lease = client
             .acquire_object_payload_lease(
+                epoch,
                 &bucket,
                 &object_key,
                 generation_id,
@@ -339,6 +343,7 @@ fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() 
         narrow_leases.push(narrow_lease);
         assert!(matches!(
             client.acquire_object_payload_lease(
+                epoch,
                 &bucket,
                 &object_key,
                 generation_id,
@@ -358,6 +363,7 @@ fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() 
     narrow_leases.push(
         client
             .acquire_object_payload_lease(
+                epoch,
                 &bucket,
                 &object_key,
                 generation_id,
@@ -368,6 +374,7 @@ fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() 
     );
     assert!(matches!(
         client.acquire_object_payload_lease(
+            epoch,
             &bucket,
             &object_key,
             generation_id,
@@ -391,14 +398,26 @@ fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() 
     );
     assert_eq!(
         client
-            .object_payload_lease_count(&bucket, &object_key, generation_id)
+            .object_payload_lease_count(epoch, &bucket, &object_key, generation_id)
             .expect("short lease-control RPC must retain reserved admission"),
         lease_limit
     );
     assert!(client.active_admitted_session_count_for_test() <= admission_limit);
     assert!(
         !client
-            .try_begin_object_payload_reclaim(&bucket, &object_key, generation_id)
+            .try_begin_object_payload_reclaim(
+                epoch,
+                &bucket,
+                &object_key,
+                generation_id,
+                &ObjectPayloadReclaimClaimProof {
+                    bucket_incarnation_generation: 1,
+                    reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+                    claim_id: "lease-admission-claim".to_string(),
+                    owner_token: "lease-admission-owner".to_string(),
+                    cluster_epoch: epoch,
+                },
+            )
             .expect("reclaim control must retain reserved admission"),
         "storage node must still observe every narrow lease"
     );
@@ -409,10 +428,113 @@ fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() 
     assert_eq!(client.active_admitted_session_count_for_test(), 0);
     assert_eq!(
         client
-            .object_payload_lease_count(&bucket, &object_key, generation_id)
+            .object_payload_lease_count(epoch, &bucket, &object_key, generation_id)
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn unix_object_payload_reclaim_fence_rejects_crossed_claim_authority() {
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_id = NodeId::new(0);
+    let pg_id = PgId::new(0);
+    let epoch = ClusterEpoch::INITIAL;
+    let ec_shape = EcShape { k: 1, m: 0 };
+    let socket_path = tmp.path().join("sockets").join("reclaim-authority.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let _server = spawn_storage_node_server(
+        StorageNodeServer::bind(StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: epoch,
+            route_map_validity: RouteMapValidity::Forever,
+            data_dir: tmp.path().join("reclaim-authority-node"),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![pg_id.get()],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: pg_id.get(),
+                cluster_epoch: epoch,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            }],
+            pending_metadata_command_recoveries: Vec::new(),
+            historical_pg_routes: Vec::new(),
+        })
+        .unwrap(),
+    );
+    let client = UnixStorageNodeClient::new(node_id, epoch, socket_path);
+    let bucket = BucketName::new("reclaim-authority-bucket").unwrap();
+    let key = ObjectKey::new("source").unwrap();
+    let generation_id = GenerationId::new(1).unwrap();
+    let first = ObjectPayloadReclaimClaimProof {
+        bucket_incarnation_generation: 1,
+        reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+        claim_id: "claim-a".to_string(),
+        owner_token: "owner-a".to_string(),
+        cluster_epoch: epoch,
+    };
+    let second = ObjectPayloadReclaimClaimProof {
+        claim_id: "claim-b".to_string(),
+        owner_token: "owner-b".to_string(),
+        ..first.clone()
+    };
+
+    assert!(client
+        .try_begin_object_payload_reclaim(epoch, &bucket, &key, generation_id, &first)
+        .unwrap());
+    let error = client
+        .finish_object_payload_reclaim(epoch, &bucket, &key, generation_id, &second, false)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        }
+    ));
+    assert!(client
+        .acquire_object_payload_lease(
+            epoch,
+            &bucket,
+            &key,
+            generation_id,
+            ObjectPayloadLeaseKind::ShardLocations,
+        )
+        .unwrap()
+        .is_none());
+
+    client
+        .finish_object_payload_reclaim(epoch, &bucket, &key, generation_id, &first, true)
+        .unwrap();
+    assert!(client
+        .try_begin_object_payload_reclaim(epoch, &bucket, &key, generation_id, &second)
+        .unwrap());
+    let error = client
+        .clear_object_payload_reclaim_fence(epoch, &bucket, &key, generation_id, &first)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        }
+    ));
+    client
+        .finish_object_payload_reclaim(epoch, &bucket, &key, generation_id, &second, false)
+        .unwrap();
+    let mut lease = client
+        .acquire_object_payload_lease(
+            epoch,
+            &bucket,
+            &key,
+            generation_id,
+            ObjectPayloadLeaseKind::ShardLocations,
+        )
+        .unwrap()
+        .expect("matching reclaim finish must remove the fence");
+    assert_eq!(lease.release().unwrap(), 0);
 }
 
 fn assert_historical_pending_command_recovery_over_unix(

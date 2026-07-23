@@ -16,9 +16,9 @@ use crate::types::{
     MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
     MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadIdKey,
     MultipartUploadRecord, ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey,
-    ObjectLayout, ObjectPartRecord, ObjectPayloadReclaimKind, ObjectSegmentRecord,
-    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PgId,
-    PublicAccessBlockConfig, PutLiveObjectReq, SerializedMetadataBlob,
+    ObjectLayout, ObjectPartRecord, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind,
+    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
+    OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq, SerializedMetadataBlob,
     SerializedSystemMetadataBlob, SerializedTagSet, SessionId, StorageClass,
     StreamUploadCommandRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
     TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, MULTIPART_UPLOAD_ID_KEY_LEN,
@@ -1051,6 +1051,18 @@ pub(crate) struct ObjectPayloadReclaimClaimProof {
     pub(crate) claim_id: String,
     pub(crate) owner_token: String,
     pub(crate) cluster_epoch: ClusterEpoch,
+}
+
+impl From<&ObjectPayloadReclaimClaimRecord> for ObjectPayloadReclaimClaimProof {
+    fn from(claim: &ObjectPayloadReclaimClaimRecord) -> Self {
+        Self {
+            bucket_incarnation_generation: claim.bucket_incarnation_generation,
+            reclaim_kind: claim.reclaim_kind,
+            claim_id: claim.claim_id.clone(),
+            owner_token: claim.owner_token.clone(),
+            cluster_epoch: claim.cluster_epoch,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

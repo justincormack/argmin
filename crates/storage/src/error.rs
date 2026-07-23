@@ -27,6 +27,9 @@ pub enum StoreError {
     #[error("payload shard set mismatch: {reason}")]
     PayloadShardSetMismatch { reason: String },
 
+    #[error("object payload reclaim fence authority does not match the active reclaim")]
+    ObjectPayloadReclaimFenceAuthorityMismatch,
+
     #[error("PG {pg_id} durable identity is invalid: {reason}")]
     PgDurableIdentityInvalid { pg_id: u32, reason: String },
 
@@ -433,6 +436,9 @@ impl StoreError {
             Self::IntegrityError { .. } => "integrity_error",
             Self::ShardAckMismatch { .. } => "shard_ack_mismatch",
             Self::PayloadShardSetMismatch { .. } => "payload_shard_set_mismatch",
+            Self::ObjectPayloadReclaimFenceAuthorityMismatch => {
+                "object_payload_reclaim_fence_authority_mismatch"
+            }
             Self::PgDurableIdentityInvalid { .. } => "pg_durable_identity_invalid",
             Self::ClusterMapHistoryReferenceLimitExceeded { .. } => {
                 "cluster_map_history_reference_limit_exceeded"

@@ -2243,6 +2243,36 @@ Forty-fourth Phase 3 slice:
   checker, all 2,236 storage tests, workspace-wide strict Clippy, and the full
   parallel workspace suite pass (7,494 tests).
 
+Forty-fifth Phase 3 slice:
+
+- object-payload lease control now carries the route epoch on every node-client
+  call and Unix RPC. Acquire, count, and reclaim-begin require active route
+  admission and an immutable current-route fence revalidated immediately
+  before touching node state. Release, reclaim-finish, retained-fence finish,
+  and fence clear are decoded before admission and use the retained-cleanup
+  domain, so runtime-map draining cannot strand cleanup behind publication.
+- each Unix lease session is now bound to one epoch and exact
+  bucket/key/generation subject. A crossed or unacquired release fails before
+  mutation, an exact retry after response loss returns the recorded terminal
+  count, and disconnect cleanup releases only a lease the session still owns.
+- reclaim begin, finish, and clear carry the exact durable reclaim-claim proof.
+  Node state stores that proof with both its active reclaim and fence; cleanup
+  from a different claim cannot clear either. A later durable worker can adopt
+  a retained fence only after the prior active worker has finished, preventing
+  late cleanup from the prior worker from clearing the replacement fence.
+- the incompatible lease-control wire extension advances the storage RPC frame
+  encoding to version 5 and explicitly rejects version 4. Codec coverage spans
+  every control operation and its optional authority. Deterministic local,
+  capability, session, and installed Unix regressions cover admission-domain
+  crossing, foreign admission, crossed release subjects, crossed reclaim
+  claims, retained-fence handoff, and exact terminal retry.
+- remaining active and historical data operations, frontend capability
+  migration, and capability requirements on the node-client traits remain open
+  in Phase 3.
+- focused lease/fence capability and codec regressions, formatting, the storage
+  boundary checker, all 2,240 storage tests, workspace-wide strict Clippy, and
+  the full parallel workspace suite pass (7,498 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

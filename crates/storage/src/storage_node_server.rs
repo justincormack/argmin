@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
@@ -3205,6 +3205,19 @@ struct StorageNodeActivePrimaryObjectScanRoute<'a> {
     pg_id: ObjectMetadataScanPgId,
 }
 
+struct StorageNodeActiveObjectPayloadLeaseControl<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    route_permit: &'a StorageNodeRouteAdmissionPermit,
+    fence: StorageNodeRouteFence,
+    request: &'a StorageRpcObjectPayloadLeaseControlRequest,
+}
+
+struct StorageNodeRetainedObjectPayloadLeaseControl<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    route_permit: &'a StorageNodeRouteAdmissionPermit,
+    request: &'a StorageRpcObjectPayloadLeaseControlRequest,
+}
+
 struct StorageNodeRetainedBucketWriteReservationRoute<'a> {
     handler: &'a StorageNodeConnectionHandler,
     route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -5807,6 +5820,48 @@ impl StorageNodeRetainedObjectPayloadReclaimClaimRoute<'_> {
     }
 }
 
+impl StorageNodeActiveObjectPayloadLeaseControl<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
+        self.handler
+            .validate_object_payload_lease_control_admission(
+                self.route_permit,
+                StorageNodeRouteAdmissionClass::Active,
+                self.request,
+            )?;
+        self.handler
+            .validate_node_epoch(self.request.node_id, self.request.route_cluster_epoch)?;
+        Self::validate_fence(self.fence)
+    }
+
+    fn validate_fence(fence: StorageNodeRouteFence) -> Result<(), StorageRpcErrorResponse> {
+        fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )
+    }
+}
+
+impl StorageNodeRetainedObjectPayloadLeaseControl<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
+        self.handler
+            .validate_object_payload_lease_control_admission(
+                self.route_permit,
+                StorageNodeRouteAdmissionClass::RetainedCleanup,
+                self.request,
+            )?;
+        if self.request.node_id != self.handler.config.node_id
+            || self.request.route_cluster_epoch > self.handler.config.cluster_epoch
+        {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "object-payload lease cleanup route changed after capability validation"
+                    .to_string(),
+            });
+        }
+        StorageNodeConnectionHandler::validate_object_payload_reclaim_authority(self.request)
+    }
+}
+
 impl StorageNodeRetainedShardPayloadDeleteRoute<'_> {
     fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
         let pg_id = self.handler.validate_retained_shard_payload_delete_route(
@@ -6174,21 +6229,34 @@ impl StorageNodeConnectionHandler {
                 }
                 Err(error) => return Err(rpc_stream_error(error)),
             };
-            let admission_class = if matches!(
-                frame.kind,
-                StorageRpcMessageKind::MetadataCommandPgLockRelease
-                    | StorageRpcMessageKind::ProofRelease
-                    | StorageRpcMessageKind::BucketWriteReservationRelease
-                    | StorageRpcMessageKind::BucketWriteDrainClear
-                    | StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease
-                    | StorageRpcMessageKind::LifecycleSweepClaimRelease
-                    | StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease
-                    | StorageRpcMessageKind::ShardDelete
-                    | StorageRpcMessageKind::ShardAckDelete
-                    | StorageRpcMessageKind::ObjectStreamUploadRetainedAbortPrepare
-                    | StorageRpcMessageKind::MetadataCommandRetainedAbortApply
-                    | StorageRpcMessageKind::MetadataCommandRetainedAbortFinish
-            ) {
+            let object_payload_lease_cleanup = frame.kind
+                == StorageRpcMessageKind::ObjectPayloadLeaseControl
+                && decode_object_payload_lease_control_request(&frame.payload)
+                    .is_ok_and(|request| {
+                        matches!(
+                            request.operation,
+                            StorageRpcObjectPayloadLeaseControlOperation::Release
+                                | StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinish
+                                | StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinishKeepFence
+                                | StorageRpcObjectPayloadLeaseControlOperation::ReclaimFenceClear
+                        )
+                    });
+            let admission_class = if object_payload_lease_cleanup
+                || matches!(
+                    frame.kind,
+                    StorageRpcMessageKind::MetadataCommandPgLockRelease
+                        | StorageRpcMessageKind::ProofRelease
+                        | StorageRpcMessageKind::BucketWriteReservationRelease
+                        | StorageRpcMessageKind::BucketWriteDrainClear
+                        | StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease
+                        | StorageRpcMessageKind::LifecycleSweepClaimRelease
+                        | StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease
+                        | StorageRpcMessageKind::ShardDelete
+                        | StorageRpcMessageKind::ShardAckDelete
+                        | StorageRpcMessageKind::ObjectStreamUploadRetainedAbortPrepare
+                        | StorageRpcMessageKind::MetadataCommandRetainedAbortApply
+                        | StorageRpcMessageKind::MetadataCommandRetainedAbortFinish
+                ) {
                 StorageNodeRouteAdmissionClass::RetainedCleanup
             } else {
                 StorageNodeRouteAdmissionClass::Active
@@ -6312,7 +6380,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectPayloadLeaseControl => {
                 match decode_object_payload_lease_control_request(&frame.payload) {
-                    Ok(request) => self.object_payload_lease_control_response(session, request),
+                    Ok(request) => {
+                        self.object_payload_lease_control_response(session, route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -7890,66 +7960,178 @@ impl StorageNodeConnectionHandler {
     fn object_payload_lease_control_response(
         &self,
         session: &mut StorageNodeSession,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectPayloadLeaseControlRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if request.node_id != self.config.node_id {
-            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::UnknownNode,
-                message: format!(
-                    "object-payload lease request targets node {}, server is node {}",
-                    request.node_id.as_u32(),
-                    self.config.node_id.as_u32()
-                ),
-            });
+        let active = matches!(
+            request.operation,
+            StorageRpcObjectPayloadLeaseControlOperation::Acquire
+                | StorageRpcObjectPayloadLeaseControlOperation::ReclaimBegin
+                | StorageRpcObjectPayloadLeaseControlOperation::Count
+        );
+        let active_control;
+        let retained_control;
+        if active {
+            active_control = match self.active_object_payload_lease_control(route_permit, &request)
+            {
+                Ok(control) => Some(control),
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            };
+            retained_control = None;
+        } else {
+            retained_control =
+                match self.retained_object_payload_lease_control(route_permit, &request) {
+                    Ok(control) => Some(control),
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                };
+            active_control = None;
         }
         let value = match request.operation {
             StorageRpcObjectPayloadLeaseControlOperation::Acquire => {
-                u64::from(session.acquire_object_payload_lease(
+                if let Err(error) = active_control
+                    .as_ref()
+                    .expect("active operation has active capability")
+                    .require_valid_now()
+                {
+                    return encode_storage_rpc_error_response(&error);
+                }
+                match session.acquire_object_payload_lease(
+                    request.route_cluster_epoch,
                     &request.bucket,
                     &request.key,
                     request.generation_id,
-                ))
+                ) {
+                    Ok(acquired) => u64::from(acquired),
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                }
             }
-            StorageRpcObjectPayloadLeaseControlOperation::Release => session
-                .release_object_payload_lease(&request.bucket, &request.key, request.generation_id)
-                as u64,
-            StorageRpcObjectPayloadLeaseControlOperation::ReclaimBegin => {
-                u64::from(self.node.try_begin_object_payload_reclaim(
+            StorageRpcObjectPayloadLeaseControlOperation::Release => {
+                if let Err(error) = retained_control
+                    .as_ref()
+                    .expect("retained operation has retained capability")
+                    .require_valid_now()
+                {
+                    return encode_storage_rpc_error_response(&error);
+                }
+                match session.release_object_payload_lease(
+                    request.route_cluster_epoch,
                     &request.bucket,
                     &request.key,
                     request.generation_id,
-                ))
+                ) {
+                    Ok(remaining) => remaining as u64,
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                }
+            }
+            StorageRpcObjectPayloadLeaseControlOperation::ReclaimBegin => {
+                if let Err(error) = active_control
+                    .as_ref()
+                    .expect("active operation has active capability")
+                    .require_valid_now()
+                {
+                    return encode_storage_rpc_error_response(&error);
+                }
+                u64::from(
+                    self.node.try_begin_object_payload_reclaim(
+                        &request.bucket,
+                        &request.key,
+                        request.generation_id,
+                        request
+                            .reclaim_authority
+                            .as_ref()
+                            .expect("validated reclaim begin authority"),
+                    ),
+                )
             }
             StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinish => {
-                self.node.finish_object_payload_reclaim(
+                if let Err(error) = retained_control
+                    .as_ref()
+                    .expect("retained operation has retained capability")
+                    .require_valid_now()
+                {
+                    return encode_storage_rpc_error_response(&error);
+                }
+                if !self.node.finish_object_payload_reclaim(
                     &request.bucket,
                     &request.key,
                     request.generation_id,
+                    request
+                        .reclaim_authority
+                        .as_ref()
+                        .expect("validated reclaim finish authority"),
                     false,
-                );
+                ) {
+                    return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: "object-payload reclaim finish authority mismatch".to_string(),
+                    });
+                }
                 0
             }
             StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinishKeepFence => {
-                self.node.finish_object_payload_reclaim(
+                if let Err(error) = retained_control
+                    .as_ref()
+                    .expect("retained operation has retained capability")
+                    .require_valid_now()
+                {
+                    return encode_storage_rpc_error_response(&error);
+                }
+                if !self.node.finish_object_payload_reclaim(
                     &request.bucket,
                     &request.key,
                     request.generation_id,
+                    request
+                        .reclaim_authority
+                        .as_ref()
+                        .expect("validated reclaim finish authority"),
                     true,
-                );
+                ) {
+                    return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: "object-payload reclaim finish authority mismatch".to_string(),
+                    });
+                }
                 0
             }
             StorageRpcObjectPayloadLeaseControlOperation::ReclaimFenceClear => {
-                self.node.clear_object_payload_reclaim_fence(
+                if let Err(error) = retained_control
+                    .as_ref()
+                    .expect("retained operation has retained capability")
+                    .require_valid_now()
+                {
+                    return encode_storage_rpc_error_response(&error);
+                }
+                if !self.node.clear_object_payload_reclaim_fence(
                     &request.bucket,
                     &request.key,
                     request.generation_id,
-                );
+                    request
+                        .reclaim_authority
+                        .as_ref()
+                        .expect("validated reclaim clear authority"),
+                ) {
+                    return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: "object-payload reclaim fence-clear authority mismatch"
+                            .to_string(),
+                    });
+                }
                 0
             }
-            StorageRpcObjectPayloadLeaseControlOperation::Count => self
-                .node
-                .object_payload_lease_count(&request.bucket, &request.key, request.generation_id)
-                as u64,
+            StorageRpcObjectPayloadLeaseControlOperation::Count => {
+                if let Err(error) = active_control
+                    .as_ref()
+                    .expect("active operation has active capability")
+                    .require_valid_now()
+                {
+                    return encode_storage_rpc_error_response(&error);
+                }
+                self.node.object_payload_lease_count(
+                    &request.bucket,
+                    &request.key,
+                    request.generation_id,
+                ) as u64
+            }
         };
         let payload = encode_object_payload_lease_control_response(
             StorageRpcObjectPayloadLeaseControlResponse { value },
@@ -15158,6 +15340,144 @@ impl StorageNodeConnectionHandler {
         self.active_primary_object_route(route_permit, request, operation)
     }
 
+    fn active_object_payload_lease_control<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcObjectPayloadLeaseControlRequest,
+    ) -> Result<StorageNodeActiveObjectPayloadLeaseControl<'a>, StorageRpcErrorResponse> {
+        self.validate_object_payload_lease_control_admission(
+            route_permit,
+            StorageNodeRouteAdmissionClass::Active,
+            request,
+        )?;
+        self.validate_node_epoch(request.node_id, request.route_cluster_epoch)?;
+        self.require_current_route_map_valid_rpc()?;
+        if !matches!(
+            request.operation,
+            StorageRpcObjectPayloadLeaseControlOperation::Acquire
+                | StorageRpcObjectPayloadLeaseControlOperation::ReclaimBegin
+                | StorageRpcObjectPayloadLeaseControlOperation::Count
+        ) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "object-payload lease operation requires retained cleanup admission"
+                    .to_string(),
+            });
+        }
+        Self::validate_object_payload_reclaim_authority(request)?;
+        Ok(StorageNodeActiveObjectPayloadLeaseControl {
+            handler: self,
+            route_permit,
+            fence: StorageNodeRouteFence::current(&self.config, self.current_route_map_lease()),
+            request,
+        })
+    }
+
+    fn retained_object_payload_lease_control<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcObjectPayloadLeaseControlRequest,
+    ) -> Result<StorageNodeRetainedObjectPayloadLeaseControl<'a>, StorageRpcErrorResponse> {
+        self.validate_object_payload_lease_control_admission(
+            route_permit,
+            StorageNodeRouteAdmissionClass::RetainedCleanup,
+            request,
+        )?;
+        if request.node_id != self.config.node_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownNode,
+                message: format!(
+                    "object-payload lease request targets node {}, server is node {}",
+                    request.node_id.as_u32(),
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        if request.route_cluster_epoch > self.config.cluster_epoch {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::InactivePgRoute,
+                message: "object-payload lease cleanup cannot target a future cluster epoch"
+                    .to_string(),
+            });
+        }
+        if !matches!(
+            request.operation,
+            StorageRpcObjectPayloadLeaseControlOperation::Release
+                | StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinish
+                | StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinishKeepFence
+                | StorageRpcObjectPayloadLeaseControlOperation::ReclaimFenceClear
+        ) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "object-payload lease operation requires active route admission"
+                    .to_string(),
+            });
+        }
+        Self::validate_object_payload_reclaim_authority(request)?;
+        Ok(StorageNodeRetainedObjectPayloadLeaseControl {
+            handler: self,
+            route_permit,
+            request,
+        })
+    }
+
+    fn validate_object_payload_lease_control_admission(
+        &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
+        expected: StorageNodeRouteAdmissionClass,
+        request: &StorageRpcObjectPayloadLeaseControlRequest,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        if !Arc::ptr_eq(&route_permit.gate.inner, &self.route_admission.inner) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message:
+                    "object-payload lease route permit belongs to a different admission domain"
+                        .to_string(),
+            });
+        }
+        if route_permit.class != expected {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: format!(
+                    "object-payload lease operation {:?} requires {expected:?} admission, got {:?}",
+                    request.operation, route_permit.class
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_object_payload_reclaim_authority(
+        request: &StorageRpcObjectPayloadLeaseControlRequest,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        let requires_authority = matches!(
+            request.operation,
+            StorageRpcObjectPayloadLeaseControlOperation::ReclaimBegin
+                | StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinish
+                | StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinishKeepFence
+                | StorageRpcObjectPayloadLeaseControlOperation::ReclaimFenceClear
+        );
+        match request.reclaim_authority.as_ref() {
+            Some(authority)
+                if requires_authority && authority.cluster_epoch == request.route_cluster_epoch =>
+            {
+                Ok(())
+            }
+            None if !requires_authority => Ok(()),
+            Some(_) if !requires_authority => Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "object-payload lease operation must not carry reclaim authority"
+                    .to_string(),
+            }),
+            _ => Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message:
+                    "object-payload reclaim operation requires authority from the same route epoch"
+                        .to_string(),
+            }),
+        }
+    }
+
     fn retained_shard_payload_delete_route<'a>(
         &'a self,
         route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -16068,7 +16388,7 @@ struct StorageNodeSession {
     shared_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     node: Arc<SharedStorageNode>,
     read_operations: BTreeMap<String, SessionReadHandle>,
-    object_payload_leases: HashSet<(BucketName, ObjectKey, GenerationId)>,
+    object_payload_lease: Option<SessionObjectPayloadLease>,
     metadata_command_guards: BTreeMap<PgId, StorageNodeMetadataCommandGuard>,
     current_rpc_context: Option<StorageNodeMetadataCommandLockContext>,
 }
@@ -16088,7 +16408,7 @@ impl StorageNodeSession {
             shared_handles,
             node,
             read_operations: BTreeMap::new(),
-            object_payload_leases: HashSet::new(),
+            object_payload_lease: None,
             metadata_command_guards: BTreeMap::new(),
             current_rpc_context: None,
         }
@@ -16144,7 +16464,9 @@ impl StorageNodeSession {
     }
 
     fn has_active_read_state(&self) -> bool {
-        !self.object_payload_leases.is_empty()
+        self.object_payload_lease
+            .as_ref()
+            .is_some_and(|lease| lease.is_acquired)
             || self
                 .read_operations
                 .values()
@@ -16216,40 +16538,70 @@ impl StorageNodeSession {
 
     fn acquire_object_payload_lease(
         &mut self,
+        route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) -> bool {
+    ) -> Result<bool, StorageRpcErrorResponse> {
         let root = (bucket.clone(), key.clone(), generation_id);
-        if self.object_payload_leases.contains(&root) {
-            return true;
+        if let Some(existing) = self.object_payload_lease.as_ref() {
+            if existing.route_cluster_epoch == route_cluster_epoch && existing.root == root {
+                return Ok(existing.is_acquired);
+            }
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message:
+                    "object-payload lease session is already bound to a different route or subject"
+                        .to_string(),
+            });
         }
         if !self
             .node
             .try_acquire_object_payload_lease(bucket, key, generation_id)
         {
-            return false;
+            return Ok(false);
         }
-        self.object_payload_leases.insert(root);
-        true
+        self.object_payload_lease = Some(SessionObjectPayloadLease {
+            route_cluster_epoch,
+            root,
+            is_acquired: true,
+            remaining_after_release: None,
+        });
+        Ok(true)
     }
 
     fn release_object_payload_lease(
         &mut self,
+        route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) -> usize {
-        if !self
-            .object_payload_leases
-            .remove(&(bucket.clone(), key.clone(), generation_id))
-        {
-            return self
-                .node
-                .object_payload_lease_count(bucket, key, generation_id);
+    ) -> Result<usize, StorageRpcErrorResponse> {
+        let root = (bucket.clone(), key.clone(), generation_id);
+        let Some(existing) = self.object_payload_lease.as_mut() else {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "object-payload lease release has no session-bound acquisition"
+                    .to_string(),
+            });
+        };
+        if existing.route_cluster_epoch != route_cluster_epoch || existing.root != root {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message:
+                    "object-payload lease release does not match its session-bound acquisition"
+                        .to_string(),
+            });
         }
-        self.node
-            .release_object_payload_lease(bucket, key, generation_id)
+        if !existing.is_acquired {
+            return Ok(existing.remaining_after_release.unwrap_or(0));
+        }
+        let remaining = self
+            .node
+            .release_object_payload_lease(bucket, key, generation_id);
+        existing.is_acquired = false;
+        existing.remaining_after_release = Some(remaining);
+        Ok(remaining)
     }
 }
 
@@ -16265,9 +16617,12 @@ impl Drop for StorageNodeSession {
                 existing.is_acquired = false;
             }
         }
-        for (bucket, key, generation_id) in std::mem::take(&mut self.object_payload_leases) {
-            self.node
-                .release_object_payload_lease(&bucket, &key, generation_id);
+        if let Some(existing) = self.object_payload_lease.take() {
+            if existing.is_acquired {
+                let (bucket, key, generation_id) = existing.root;
+                self.node
+                    .release_object_payload_lease(&bucket, &key, generation_id);
+            }
         }
     }
 }
@@ -16276,6 +16631,13 @@ impl Drop for StorageNodeSession {
 struct SessionReadHandle {
     entries: Vec<(ShardLocation, ShardKey)>,
     is_acquired: bool,
+}
+
+struct SessionObjectPayloadLease {
+    route_cluster_epoch: ClusterEpoch,
+    root: (BucketName, ObjectKey, GenerationId),
+    is_acquired: bool,
+    remaining_after_release: Option<usize>,
 }
 
 fn configure_storage_node_rpc_stream_timeout(
@@ -24963,6 +25325,88 @@ mod tests {
     }
 
     #[test]
+    fn object_payload_lease_capabilities_separate_active_and_retained_controls() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let handler = server.connection_handler();
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let foreign_active = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let bucket = BucketName::new("lease-capability").unwrap();
+        let key = ObjectKey::new("source").unwrap();
+        let generation_id = GenerationId::new(1).unwrap();
+        let active_request = StorageRpcObjectPayloadLeaseControlRequest {
+            node_id: config.node_id,
+            route_cluster_epoch: config.cluster_epoch,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            operation: StorageRpcObjectPayloadLeaseControlOperation::Acquire,
+            reclaim_authority: None,
+        };
+        let retained_request = StorageRpcObjectPayloadLeaseControlRequest {
+            operation: StorageRpcObjectPayloadLeaseControlOperation::Release,
+            ..active_request.clone()
+        };
+        let reclaim_request = StorageRpcObjectPayloadLeaseControlRequest {
+            operation: StorageRpcObjectPayloadLeaseControlOperation::ReclaimBegin,
+            reclaim_authority: Some(crate::metadata_command::ObjectPayloadReclaimClaimProof {
+                bucket_incarnation_generation: 1,
+                reclaim_kind: crate::ObjectPayloadReclaimKind::ObjectSegments,
+                claim_id: "claim".to_string(),
+                owner_token: "owner".to_string(),
+                cluster_epoch: config.cluster_epoch,
+            }),
+            ..active_request.clone()
+        };
+
+        handler
+            .active_object_payload_lease_control(&active_permit, &active_request)
+            .unwrap()
+            .require_valid_now()
+            .unwrap();
+        handler
+            .active_object_payload_lease_control(&active_permit, &reclaim_request)
+            .unwrap()
+            .require_valid_now()
+            .unwrap();
+        handler
+            .retained_object_payload_lease_control(&retained_permit, &retained_request)
+            .unwrap()
+            .require_valid_now()
+            .unwrap();
+
+        for result in [
+            handler.active_object_payload_lease_control(&retained_permit, &active_request),
+            handler.active_object_payload_lease_control(&foreign_active, &active_request),
+        ] {
+            match result {
+                Err(error) => assert_eq!(error.code, StorageRpcErrorCode::Internal),
+                Ok(_) => panic!("invalid admission created an active lease capability"),
+            }
+        }
+        match handler.retained_object_payload_lease_control(&active_permit, &retained_request) {
+            Err(error) => assert_eq!(error.code, StorageRpcErrorCode::Internal),
+            Ok(_) => panic!("active admission created a retained lease capability"),
+        }
+        let missing_authority = StorageRpcObjectPayloadLeaseControlRequest {
+            reclaim_authority: None,
+            ..reclaim_request
+        };
+        match handler.active_object_payload_lease_control(&active_permit, &missing_authority) {
+            Err(error) => assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode),
+            Ok(_) => panic!("reclaim begin without authority created a capability"),
+        }
+    }
+
+    #[test]
     fn storage_node_server_retries_lost_shard_ack_record_exactly() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
@@ -28958,7 +29402,14 @@ mod tests {
         {
             let mut session =
                 StorageNodeSession::new(Arc::clone(&shared_handles), Arc::clone(&node));
-            assert!(session.acquire_object_payload_lease(&bucket, &key, generation_id));
+            assert!(session
+                .acquire_object_payload_lease(
+                    ClusterEpoch::new(1).unwrap(),
+                    &bucket,
+                    &key,
+                    generation_id,
+                )
+                .unwrap());
             assert!(session.has_active_read_state());
             assert_eq!(
                 node.object_payload_lease_count(&bucket, &key, generation_id),
@@ -28968,6 +29419,85 @@ mod tests {
 
         assert_eq!(
             node.object_payload_lease_count(&bucket, &key, generation_id),
+            0
+        );
+    }
+
+    #[test]
+    fn storage_node_session_binds_object_payload_lease_release_to_acquisition() {
+        let shared_handles = Arc::new(Mutex::new(StorageNodeReadHandleState::default()));
+        let node =
+            Arc::new(SharedStorageNode::topology_only(&[0], EcShape { k: 1, m: 0 }).unwrap());
+        let bucket = BucketName::new("lease-subject").unwrap();
+        let other_bucket = BucketName::new("other-lease-subject").unwrap();
+        let key = ObjectKey::new("source").unwrap();
+        let generation_id = GenerationId::new(1).unwrap();
+        let epoch = ClusterEpoch::new(3).unwrap();
+        let mut session = StorageNodeSession::new(shared_handles, Arc::clone(&node));
+
+        assert!(session
+            .acquire_object_payload_lease(epoch, &bucket, &key, generation_id)
+            .unwrap());
+        for (release_epoch, release_bucket) in [
+            (ClusterEpoch::new(2).unwrap(), &bucket),
+            (epoch, &other_bucket),
+        ] {
+            let error = session
+                .release_object_payload_lease(release_epoch, release_bucket, &key, generation_id)
+                .unwrap_err();
+            assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+            assert_eq!(
+                node.object_payload_lease_count(&bucket, &key, generation_id),
+                1
+            );
+        }
+
+        assert_eq!(
+            session
+                .release_object_payload_lease(epoch, &bucket, &key, generation_id)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            session
+                .release_object_payload_lease(epoch, &bucket, &key, generation_id)
+                .unwrap(),
+            0,
+            "lost release responses must be retryable without releasing another lease"
+        );
+    }
+
+    #[test]
+    fn object_payload_reclaim_fence_is_bound_to_exact_claim_authority() {
+        let node = SharedStorageNode::topology_only(&[0], EcShape { k: 1, m: 0 }).unwrap();
+        let bucket = BucketName::new("reclaim-authority").unwrap();
+        let key = ObjectKey::new("source").unwrap();
+        let generation_id = GenerationId::new(1).unwrap();
+        let first = crate::metadata_command::ObjectPayloadReclaimClaimProof {
+            bucket_incarnation_generation: 1,
+            reclaim_kind: crate::ObjectPayloadReclaimKind::ObjectSegments,
+            claim_id: "claim-a".to_string(),
+            owner_token: "owner-a".to_string(),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+        };
+        let second = crate::metadata_command::ObjectPayloadReclaimClaimProof {
+            claim_id: "claim-b".to_string(),
+            owner_token: "owner-b".to_string(),
+            ..first.clone()
+        };
+
+        assert!(node.try_begin_object_payload_reclaim(&bucket, &key, generation_id, &first));
+        assert!(!node.finish_object_payload_reclaim(&bucket, &key, generation_id, &second, false,));
+        assert!(!node.try_acquire_object_payload_lease(&bucket, &key, generation_id));
+
+        assert!(node.finish_object_payload_reclaim(&bucket, &key, generation_id, &first, true,));
+        assert!(node.try_begin_object_payload_reclaim(&bucket, &key, generation_id, &second));
+        assert!(!node.clear_object_payload_reclaim_fence(&bucket, &key, generation_id, &first,));
+        assert!(!node.try_acquire_object_payload_lease(&bucket, &key, generation_id));
+        assert!(node.finish_object_payload_reclaim(&bucket, &key, generation_id, &second, false,));
+        assert!(node.try_acquire_object_payload_lease(&bucket, &key, generation_id));
+        assert_eq!(
+            node.release_object_payload_lease(&bucket, &key, generation_id),
             0
         );
     }
