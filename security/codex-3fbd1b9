@@ -1,0 +1,203 @@
+STS AssumeRole accepts unbound request bodies
+Link: https://chatgpt.com/codex/cloud/security/findings/1550f8787f808191a13449f494ffcb1d?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: high
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 3fbd1b9
+Author: justin@specialbusservice.com
+Created: 23/07/2026, 15:55:00
+Assignee: Unassigned
+Signals: Security, Validated
+
+# Resolution
+Fixed by commit `a81e0245` (`Enforce service-specific SigV4 payload handling`).
+
+The fix makes payload binding a property of the trusted service selected by
+endpoint routing, rather than an optional follow-up check owned by individual
+HTTP handlers. The commit:
+
+- replaces stringly typed signing-service selection with the exhaustive
+  `auth::SigningService::{S3, S3Control, Sts}` enum;
+- passes that trusted service through header and presigned SigV4 verification;
+- makes STS canonicalize the SHA-256 of the actual request body for both header
+  and presigned authentication, regardless of an absent or attacker-supplied
+  `x-amz-content-sha256` value;
+- therefore rejects explicit `UNSIGNED-PAYLOAD`, altered bodies covered by a
+  different fixed hash, and presigned requests whose form body is not bound to
+  the signature before any AssumeRole parameters can authorize issuance;
+- keeps S3 Control distinct from S3 while implementing its separately
+  AWS-pinned payload rules and nested error responses;
+- extends the shared AWS/local signing helpers with independently checked AWS
+  SDK SigV4 signing for explicit, unsigned, omitted-header, and mismatched-body
+  payload modes; and
+- updates the authentication fuzz target for the typed provider and signing
+  service interfaces.
+
+Permanent shared AWS/local coverage in
+`crates/sts-tests/tests/assume_role.rs` proves that header-signed and presigned
+AssumeRole requests with a correct explicit body hash succeed, while explicit
+`UNSIGNED-PAYLOAD` and fixed-hash body substitution both return the exact AWS
+`403 SignatureDoesNotMatch` response without issuing or rendering credentials.
+The companion S3 Control matrix in
+`crates/s3-tests/tests/s3_control.rs` prevents the STS rule from being
+incorrectly generalized: it pins correct hashes, required-header precedence,
+AWS-supported unsigned modes, and fixed-hash mismatches. Each accepted S3
+Control request writes a distinct tag value and waits for three consecutive
+reads of that value; every rejected request verifies that the previous value
+remains, so the tests cover mutation as well as response shape.
+
+The AWS-backed tests additionally establish that a missing S3 Control
+`x-amz-content-sha256` header wins over both a wrong credential-scope service
+and a bad HMAC. This preserves AWS error precedence while closing the STS body
+substitution path.
+
+Verification completed for the fix:
+
+- the focused shared STS payload-binding matrix passed against AWS and locally;
+- the focused shared S3 Control payload matrix passed against AWS and locally;
+- `cargo +nightly fuzz check auth_request` passed;
+- Clippy with all targets and features and warnings denied passed;
+- formatting checks passed; and
+- `cargo nextest run` passed all 7,512 workspace tests with no failures or
+  skips.
+
+# Summary
+Introduced: the new STS AssumeRole issuance path uses the generic SigV4 authenticator without enforcing payload binding for STS form parameters. The existing S3 path contains a separate payload hash verification step, but the new STS path bypasses it.
+The STS handler parses the Query API form body and then calls auth::authenticate_request directly. Unlike the normal S3 service path, it does not perform the follow-up x-amz-content-sha256 payload verification and does not reject PresignedSigV4 or UNSIGNED-PAYLOAD for an operation whose authorization target is in the body. In the auth layer, presigned requests default to UNSIGNED-PAYLOAD when x-amz-content-sha256 is absent, so the signature covers the URL and headers but not the POST form parameters. Because AssumeRole reads RoleArn, RoleSessionName, and DurationSeconds from that unsigned body after authentication, a bearer of a valid presigned STS request can alter the target role/session parameters and receive credentials for any role that the signing principal is otherwise allowed to assume. Similarly, explicit UNSIGNED-PAYLOAD or a mismatched fixed x-amz-content-sha256 header is not rejected by this STS path.
+
+# Validation
+## Rubric
+- [x] Confirm STS parses Query API form parameters before/independently of authentication and later uses those parameters for credential issuance.
+- [x] Confirm presigned SigV4 authentication does not hash or otherwise consume the POST body and defaults to UNSIGNED-PAYLOAD when x-amz-content-sha256 is absent.
+- [x] Dynamically prove a presigned STS POST without payload binding accepts attacker-chosen AssumeRole body parameters and issues credentials.
+- [x] Dynamically prove a signed, fixed x-amz-content-sha256 header is not recomputed/compared by the STS path by sending a different body and still receiving credentials.
+- [x] Compare against the S3 request path to verify the missing STS follow-up payload hash verification is specific to this new path.
+## Report
+Validated. I added a targeted STS integration-test PoC at crates/sts-tests/tests/presigned_body_tamper.rs and ran it against the real embedded HTTPS test server. The PoC creates a presigned STS POST URL for service sts with signed content-type but no payload binding, then sends attacker-chosen AssumeRole form parameters. It also signs an x-amz-content-sha256 value for an innocent body and sends a different body with that signed hash header unchanged. Command output: `unsigned-payload tamper status=200 contains_tampered=true`; `mismatched-hash tamper status=200 contains_tampered=true`; `test result: ok. 2 passed`. This demonstrates both UNSIGNED-PAYLOAD acceptance and missing fixed-hash verification on STS. Code evidence: crates/server-http/src/http/sts.rs:166-178 parses parameters then calls authenticate_request directly; sts.rs:195-235 later uses RoleArn, RoleSessionName, and DurationSeconds from those parsed body parameters to authorize and issue credentials. crates/auth/src/request.rs:625-630 names the presigned body parameter `_body`, confirming it is unused in presigned auth; request.rs:769-772 defaults absent x-amz-content-sha256 to UNSIGNED-PAYLOAD. The normal S3 path has a separate payload hash comparison at crates/server-http/src/http/mod.rs:3647-3662, but STS does not call it. Direct crash reproduction is not applicable because this is an authorization/signature-binding bug, not memory corruption; the direct PoC returns 200 rather than crashing. Valgrind and gdb were attempted but unavailable in the container (`command not found`). LLDB was available; a non-interactive breakpoint at sts.rs:221 produced a backtrace through `handle_sts_request_inner` while processing the tampered request body, confirming the vulnerable STS handler path was reached.
+
+# Evidence
+crates/auth/src/request.rs (L769 to 772)
+  Note: For presigned SigV4 requests, the authenticator uses UNSIGNED-PAYLOAD by default when x-amz-content-sha256 is absent, leaving the STS POST body outside the signature.
+```
+    let body_hash = match headers.first_value("x-amz-content-sha256") {
+        Some(hash) => Cow::Borrowed(hash),
+        None => Cow::Borrowed("UNSIGNED-PAYLOAD"),
+    };
+```
+
+crates/server-http/src/http/mod.rs (L3647 to 3662)
+  Note: The normal S3 service path performs a separate payload hash verification for buffered requests; the new STS handler does not use this protection.
+```
+        // Verify payload integrity: if the client provided an actual content hash
+        // (not UNSIGNED-PAYLOAD and not STREAMING-*), recompute and compare to
+        // detect transit corruption. STREAMING-* bodies are verified by the
+        // chunked decoder.
+        if verify_payload_hash {
+            if let Some(claimed) = req.header("x-amz-content-sha256") {
+                if claimed != "UNSIGNED-PAYLOAD" && !claimed.starts_with("STREAMING-") {
+                    let actual = auth::canonical::sha256_hex(&req.body);
+                    if actual != claimed {
+                        return Err(ServerError::XAmzContentSHA256Mismatch {
+                            client_hash: claimed.to_string(),
+                            server_hash: actual,
+                        });
+                    }
+                }
+            }
+```
+
+crates/server-http/src/http/sts.rs (L166 to 178)
+  Note: The new STS handler calls authenticate_request directly for service "sts" and accepts the returned auth context without checking the auth mode or enforcing that the body was signed.
+```
+        let parameters = validate_request_envelope(req)?;
+        let auth = authenticate_request(
+            req.method.as_str(),
+            req.path(),
+            req.query_string(),
+            &req.header_source(),
+            &req.body,
+            &self.identity_provider,
+            auth::ExpectedSigningRegion::ExactEndpointRegion(self.coordinator.region()),
+            "sts",
+            req.request_epoch_seconds(),
+        )
+        .map_err(|_| StsRequestError::access_denied("Access denied"))?;
+```
+
+crates/server-http/src/http/sts.rs (L195 to 263)
+  Note: Security-sensitive AssumeRole parameters and credential issuance are driven entirely by the parsed POST form body after authentication.
+```
+        let role_arn_value = required_parameter(&parameters, "RoleArn", "roleArn")?;
+        let role_arn = IamRoleArn::new(role_arn_value.to_string())
+            .map_err(|_| StsRequestError::validation(format!("{role_arn_value} is invalid")))?;
+        let target = self
+            .identity_provider
+            .lookup_role_authorization_by_arn(&role_arn)
+            .map_err(|_| StsRequestError::Internal)?
+            .ok_or_else(|| {
+                StsRequestError::access_denied(format!(
+                    "User: {} is not authorized to perform: sts:AssumeRole on resource: {role_arn_value}",
+                    caller_authorization.record().key().principal().principal()
+                ))
+            })?;
+        if target
+            .record()
+            .evaluate_configured_caller_assume_role(caller_authorization.record())
+            .map_err(|_| StsRequestError::access_denied("Access denied"))?
+            != PolicyEvaluation::ExplicitAllow
+        {
+            return Err(StsRequestError::access_denied(format!(
+                "User: {} is not authorized to perform: sts:AssumeRole on resource: {role_arn_value}",
+                caller_authorization.record().key().principal().principal()
+            )));
+        }
+
+        let session_name_value =
+            required_parameter(&parameters, "RoleSessionName", "roleSessionName")?;
+        let session_name = RoleSessionName::new(session_name_value.to_string()).map_err(|_| {
+            StsRequestError::validation(format!(
+                "1 validation error detected: Value '{session_name_value}' at 'roleSessionName' failed to satisfy constraint"
+            ))
+        })?;
+        let duration_seconds = optional_parameter(&parameters, "DurationSeconds")
+            .map(|value| {
+                value.parse::<u32>().map_err(|_| StsRequestError::Sender {
+                    status: 400,
+                    code: "MalformedInput",
+                    message: "malformed input".to_string(),
+                })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_SESSION_DURATION_SECONDS);
+        if duration_seconds < MIN_SESSION_DURATION_SECONDS
+            || duration_seconds > target.record().maximum_session_duration().seconds()
+        {
+            return Err(StsRequestError::validation(format!(
+                "Value '{duration_seconds}' at 'durationSeconds' is outside the permitted range"
+            )));
+        }
+
+        let issued_at =
+            i64::try_from(req.request_epoch_seconds()).map_err(|_| StsRequestError::Internal)?;
+        let expires_at = issued_at
+            .checked_add(i64::from(duration_seconds))
+            .ok_or(StsRequestError::Internal)?;
+        let lifetime =
+            SessionLifetime::new(issued_at, expires_at).map_err(|_| StsRequestError::Internal)?;
+        let issuer = self
+            .identity_provider
+            .resolve_authorized_role_identity(&target)
+            .map_err(|_| StsRequestError::Internal)?
+            .ok_or(StsRequestError::Internal)?;
+        let material =
+            generate_session_credential_material().map_err(|_| StsRequestError::Internal)?;
+        let access_key_id = material.access_key_id().to_string();
+        let secret_access_key = material.secret_key().as_str().to_string();
+        let session_token = self
+            .identity_provider
+            .seal_session_credential_v1(material, &issuer, session_name.clone(), lifetime, None)
+```
+
+Proposed patch: (no diff available)
