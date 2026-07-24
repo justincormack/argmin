@@ -2589,3 +2589,78 @@ fn test_object_raw_get_x_amz_expires_not_expired_tenant() {
         assert_object_raw_get_x_amz_expires_not_expired(CTX.alt_client(), alt_credentials()).await;
     });
 }
+
+#[test]
+fn test_presigned_invalid_utf8_query_value_matches_replacement_character() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        // The official Rust AWS signer normalizes invalid UTF-8 to U+FFFD
+        // before signing and emitting a presigned URL.
+        let normalized_by_signer = presign_object(
+            "GET",
+            &bucket,
+            "obj",
+            Some("lossy=%FF"),
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
+        assert!(
+            normalized_by_signer.uri().contains("lossy=%EF%BF%BD"),
+            "official signer did not normalize invalid UTF-8: {}",
+            normalized_by_signer.uri()
+        );
+
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "obj",
+            Some("lossy=%EF%BF%BD"),
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
+        let replacement = raw_fetch_url(presigned.uri(), &[]);
+
+        let invalid_utf8_url = presigned.uri().replace("%EF%BF%BD", "%FF");
+        assert_ne!(invalid_utf8_url, presigned.uri());
+        let invalid_utf8 = raw_fetch_url(&invalid_utf8_url, &[]);
+
+        let changed_value_url = presigned.uri().replace("%EF%BF%BD", "text%2Fplain");
+        assert_ne!(changed_value_url, presigned.uri());
+        let changed_value = raw_fetch_url(&changed_value_url, &[]);
+
+        // AWS canonicalizes a percent-decoded invalid UTF-8 sequence through
+        // U+FFFD, so it remains equivalent to the signed replacement
+        // character. A different valid value proves the otherwise-unused
+        // parameter is still bound by the signature rather than ignored.
+        for (case, response) in [
+            ("replacement character", &replacement),
+            ("invalid UTF-8", &invalid_utf8),
+        ] {
+            assert_eq!(response.status, 200, "{case}: {}", response.body);
+            assert_eq!(response.body, "data", "{case}");
+            assert_eq!(response.body_read_error, None, "{case}");
+        }
+        assert_eq!(changed_value.status, 403, "{}", changed_value.body);
+        assert!(
+            changed_value
+                .body
+                .contains("<Code>SignatureDoesNotMatch</Code>"),
+            "unexpected changed-value response: {}",
+            changed_value.body
+        );
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}

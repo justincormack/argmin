@@ -175,6 +175,12 @@ pub fn canonical_query_string(query: &str) -> String {
 }
 
 /// Percent-decode a string (RFC 3986). Does NOT treat + as space.
+///
+/// AWS S3 canonicalizes percent-decoded invalid UTF-8 through U+FFFD rather
+/// than rejecting it or preserving the invalid bytes. This lossy conversion
+/// is therefore intentional: changing it would alter SigV4 verification.
+/// `test_presigned_invalid_utf8_query_value_matches_replacement_character`
+/// pins the behavior against both AWS and the local server.
 fn percent_decode(s: &str) -> String {
     percent_decode_lossy(s).into_owned()
 }

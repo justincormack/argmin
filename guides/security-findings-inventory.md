@@ -28,6 +28,7 @@ for the current local security suite.
 
 | Finding | Status | Local deterministic path | Notes |
 | --- | --- | --- | --- |
+| `security/LOSSYSTR-001.md` SigV4 query canonicalization uses lossy UTF-8 substitution | invalid | `cargo nextest run -p s3-tests --test presigned test_presigned_invalid_utf8_query_value_matches_replacement_character`; `./scripts/aws-tests --test presigned test_presigned_invalid_utf8_query_value_matches_replacement_character` | Invalid finding; live AWS treats a query value containing `%FF` as equivalent to one signed as the UTF-8 encoding of U+FFFD, while still rejecting an ordinary changed value with `SignatureDoesNotMatch`. Argmin keeps authentication and downstream query consumers on that shared AWS-compatible normalization. The locked Rust signer and Botocore's non-CRT Python presigner also normalize this way; Botocore's CRT path remains unverified. |
 | `security/codex-0bd370b` BlockPublicPolicy bypass via full-range SourceIp CIDR | fixed | `./scripts/security-tests authz` | Covered by bucket-policy authz regressions. |
 | `security/codex-154e45d` Bucket policy denies skipped for PrincipalArn/SourceVpc clauses | fixed | `./scripts/security-tests authz` | Covered by bucket-policy differential and authz model tests. |
 | `security/codex-172cf0a` PutObjectAcl bucket policy ignores ACL/grant conditions | fixed | `./scripts/security-tests authz` | Covered by authz matrix and bucket-policy ACL-condition regressions. |
