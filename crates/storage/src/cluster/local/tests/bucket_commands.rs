@@ -403,28 +403,26 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
     let cluster = Arc::new(crate::StorageCluster::from_local_map(map).unwrap());
     let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
-
-    let install_expiry_hook = || {
-        cluster.test_store_route_map_validity(RouteMapValidity::until_ms_saturating(
-            crate::clock::current_time_millis().saturating_add(60_000),
-        ));
-        let weak_cluster = Arc::downgrade(&cluster);
-        cluster.test_install_after_metadata_listing_pg_complete_hook(Arc::new(move |pg_id| {
-            if pg_id == 0 {
-                weak_cluster
-                    .upgrade()
-                    .unwrap()
-                    .test_store_route_map_validity(RouteMapValidity::until_ms_saturating(
-                        crate::clock::current_time_millis(),
-                    ));
-            }
-        }))
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let time = Arc::new(crate::clock::test_time_override_guard(1_000));
+    let prepare_scan = || {
+        time.set(1_000);
+        cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+        let admission = handle.admit_current_route().unwrap();
+        // Renew the underlying same-generation route after admission. Every
+        // scan must still stop at the immutable deadline captured above.
+        cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+        let hook_time = Arc::clone(&time);
+        let hook =
+            cluster.test_install_after_metadata_listing_pg_complete_hook(Arc::new(move |pg_id| {
+                if pg_id == 0 {
+                    hook_time.set(6_000);
+                }
+            }));
+        (admission, hook)
     };
 
-    let bucket_admission = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster))
-        .admit_current_route()
-        .unwrap();
-    let bucket_hook = install_expiry_hook();
+    let (bucket_admission, bucket_hook) = prepare_scan();
     let owner = crate::CanonicalUserId::from_principal("owner");
     let bucket_error = bucket_admission
         .active_bucket_metadata_scan(&owner)
@@ -438,25 +436,44 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
     drop(bucket_hook);
     drop(bucket_admission);
 
-    let object_hook = install_expiry_hook();
-    let object_error = cluster
-        .list_objects_for_bucket(&bucket, None, None, None, 100)
+    let (object_admission, object_hook) = prepare_scan();
+    let object_error = object_admission
+        .active_object_metadata_scan(&bucket)
+        .unwrap()
+        .list_objects(None, None, None, 100)
         .unwrap_err();
     assert!(matches!(
         object_error,
         crate::ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
     ));
     drop(object_hook);
+    drop(object_admission);
 
-    let multipart_hook = install_expiry_hook();
-    let multipart_error = cluster
-        .list_multipart_uploads_for_bucket(&bucket, None, None, None, None, 100)
+    let (version_admission, version_hook) = prepare_scan();
+    let version_error = version_admission
+        .active_object_metadata_scan(&bucket)
+        .unwrap()
+        .list_object_versions(None, None, None, None, 100)
+        .unwrap_err();
+    assert!(matches!(
+        version_error,
+        crate::ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
+    ));
+    drop(version_hook);
+    drop(version_admission);
+
+    let (multipart_admission, multipart_hook) = prepare_scan();
+    let multipart_error = multipart_admission
+        .active_object_metadata_scan(&bucket)
+        .unwrap()
+        .list_multipart_uploads(None, None, None, None, 100)
         .unwrap_err();
     assert!(matches!(
         multipart_error,
         crate::ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
     ));
     drop(multipart_hook);
+    drop(multipart_admission);
 }
 
 #[test]

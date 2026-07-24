@@ -2590,6 +2590,37 @@ Fifty-fifth Phase 3 slice:
   boundary checker, and workspace-wide strict Clippy pass. The full parallel
   workspace suite passes (7,557 tests).
 
+Fifty-sixth Phase 3 slice:
+
+- `ListObjects` V1/V2, `ListObjectVersions`, and `ListMultipartUploads` now
+  consume the buffered request's existing `StorageClusterRouteAdmission` for
+  both bucket-policy authorization and object-metadata fan-out. Their
+  production coordinator entry points can no longer resample the renewable
+  runtime-map handle; crate tests and the `test-utils` feature retain wrappers
+  which acquire admission before entering the same production paths.
+- `ActiveObjectMetadataScan` is a non-cloneable capability fixed to one bucket
+  and the admitted runtime-map generation. Its API accepts only listing
+  parameters, not another bucket or PG, and revalidates the admission's
+  immutable captured deadline immediately before every object-metadata page
+  read, including delimiter-driven cursor refills. The former raw cluster
+  listing methods are now available only to tests and explicit test-hook
+  builds.
+- a deterministic three-PG regression captures a short request deadline,
+  renews the same underlying route generation to a later deadline, advances
+  time after the first PG response, and requires bucket, object, version, and
+  multipart scans all to stop before the second PG access. The coordinator
+  deadline and same-cluster/different-publication-domain matrices cover all
+  three object listing families. The existing epoch-transition regression now
+  starts publication asynchronously, proves it enters draining behind the
+  admitted listing, and joins it after the request releases admission.
+- object reads and mutations, the remaining buffered coordinator workflows,
+  and capability requirements on the node-client traits remain open in Phase
+  3.
+- the focused boundary matrix passes (4 tests), as does the 151-test
+  coordinator/HTTP/endpoint-neutral listing suite. Formatting, the storage
+  boundary checker, and workspace-wide strict Clippy pass. The full parallel
+  workspace suite passes (7,562 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

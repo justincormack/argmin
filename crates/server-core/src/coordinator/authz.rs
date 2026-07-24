@@ -1656,6 +1656,7 @@ impl Coordinator {
         ))
     }
 
+    #[cfg(test)]
     fn load_bucket_handle_for_bucket_policy_read(
         &self,
         req: &BucketRequest<'_>,
@@ -1679,6 +1680,7 @@ impl Coordinator {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn load_bucket_handle_for_bucket_policy_read_with_storage_node(
         &self,
         storage_node: &Arc<StorageCluster>,

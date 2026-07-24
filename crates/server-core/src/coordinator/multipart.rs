@@ -1172,8 +1172,9 @@ impl Coordinator {
     ///
     /// Fans out across all PGs, merges results sorted by
     /// (key, initiated_at, upload_id), and applies pagination.
-    pub fn list_multipart_uploads(
+    pub fn list_multipart_uploads_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &ListMultipartUploadsRequest,
     ) -> Result<ListMultipartUploadsResult, ServerError> {
         observability::trace_scope!(
@@ -1189,7 +1190,7 @@ impl Coordinator {
         let upload_id_marker = req.upload_id_marker.as_ref();
         let max_uploads = req.max_uploads;
         let AuthorizedListMultipartUploads { bucket } =
-            self.authorize_list_multipart_uploads(req)?;
+            self.authorize_list_multipart_uploads_on_admitted_route(admission, req)?;
 
         if max_uploads == 0 {
             return Ok(ListMultipartUploadsResult {
@@ -1200,10 +1201,10 @@ impl Coordinator {
             });
         }
 
-        let listed = self
-            .storage_node()
-            .list_multipart_uploads_for_bucket(
-                &bucket,
+        let listed = admission
+            .active_object_metadata_scan(&bucket)
+            .map_err(super::map_store_error)?
+            .list_multipart_uploads(
                 optional_list_object_key(prefix)?.as_ref(),
                 delimiter,
                 optional_list_object_key(key_marker)?.as_ref(),
@@ -1250,6 +1251,15 @@ impl Coordinator {
             is_truncated: listed.is_truncated,
             next_marker,
         })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn list_multipart_uploads(
+        &self,
+        req: &ListMultipartUploadsRequest,
+    ) -> Result<ListMultipartUploadsResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.list_multipart_uploads_on_admitted_route(&admission, req)
     }
 
     /// Finalize a streaming UploadPart session.

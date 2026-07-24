@@ -10,8 +10,9 @@ use super::{
 use crate::error::ServerError;
 
 impl Coordinator {
-    pub fn list_objects_v2(
+    pub fn list_objects_v2_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &ListObjectsV2Request,
     ) -> Result<ListObjectsResult, ServerError> {
         observability::trace_scope!(
@@ -26,9 +27,8 @@ impl Coordinator {
         let delimiter = req.delimiter;
         let continuation_token = req.continuation_token;
         let max_keys = req.max_keys.min(S3_MAX_LIST_KEYS);
-        let storage_node = self.storage_node();
         let AuthorizedListObjectsV2 { bucket_info } =
-            self.authorize_list_objects_v2_with_storage_node(&storage_node, req)?;
+            self.authorize_list_objects_v2_on_admitted_route(admission, req)?;
         let owner_principal = bucket_info.owner_principal.clone();
         let owner_canonical_id = bucket_info.owner_canonical_id.clone();
 
@@ -49,9 +49,10 @@ impl Coordinator {
         #[cfg(test)]
         maybe_run_list_objects_before_storage_hook(bucket.as_str());
 
-        let listed = storage_node
-            .list_objects_for_bucket(
-                bucket,
+        let listed = admission
+            .active_object_metadata_scan(bucket)
+            .map_err(super::map_store_error)?
+            .list_objects(
                 list_prefix.as_ref(),
                 delimiter,
                 list_start_after.as_ref(),
@@ -97,8 +98,18 @@ impl Coordinator {
         })
     }
 
-    pub fn list_object_versions(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn list_objects_v2(
         &self,
+        req: &ListObjectsV2Request,
+    ) -> Result<ListObjectsResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.list_objects_v2_on_admitted_route(&admission, req)
+    }
+
+    pub fn list_object_versions_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &ListObjectVersionsRequest,
     ) -> Result<ListObjectVersionsResult, ServerError> {
         let max_keys = req.max_keys.min(S3_MAX_LIST_KEYS);
@@ -115,7 +126,7 @@ impl Coordinator {
         let key_marker = req.key_marker;
         let version_id_marker = req.version_id_marker;
         let AuthorizedListObjectVersions { bucket_info } =
-            self.authorize_list_object_versions(req)?;
+            self.authorize_list_object_versions_on_admitted_route(admission, req)?;
         let owner_principal = bucket_info.owner_principal.clone();
         let owner_canonical_id = bucket_info.owner_canonical_id.clone();
 
@@ -133,10 +144,10 @@ impl Coordinator {
 
         let list_prefix = optional_list_object_key(prefix)?;
         let list_key_marker = optional_list_object_key(key_marker)?;
-        let listed = self
-            .storage_node()
-            .list_object_versions_for_bucket(
-                bucket,
+        let listed = admission
+            .active_object_metadata_scan(bucket)
+            .map_err(super::map_store_error)?
+            .list_object_versions(
                 list_prefix.as_ref(),
                 delimiter,
                 list_key_marker.as_ref(),
@@ -198,5 +209,14 @@ impl Coordinator {
             owner_principal,
             owner_canonical_id,
         })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn list_object_versions(
+        &self,
+        req: &ListObjectVersionsRequest,
+    ) -> Result<ListObjectVersionsResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.list_object_versions_on_admitted_route(&admission, req)
     }
 }

@@ -77,6 +77,7 @@ use crate::types::{
     BucketSubresourceKind, BucketWriteDrainRecord, BucketWriteReservationRecord, CanonicalUserId,
     ClusterEpoch, CommitDirectPutObjectReq, CreateStreamUploadReq, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
+    ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
     MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot,
     ObjectSegmentRecord, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
     PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
@@ -1733,6 +1734,19 @@ impl StorageClusterRouteAdmission {
         })
     }
 
+    /// Derive active authority for a bucket-scoped scan across every object
+    /// metadata PG in this request's admitted runtime-map generation.
+    pub fn active_object_metadata_scan(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<ActiveObjectMetadataScan<'_>, StoreError> {
+        self.require_valid_now()?;
+        Ok(ActiveObjectMetadataScan {
+            admission: self,
+            bucket: bucket.clone(),
+        })
+    }
+
     /// Narrow this admitted request to cleanup authority for one stream-upload
     /// object. The returned capability can only remove an abandoned session
     /// and its staged state from this admitted route generation; it cannot
@@ -1838,6 +1852,111 @@ impl ActiveBucketMetadataScan<'_> {
             .list_buckets_for_owner_with_route_validation(self.owner_canonical_id.as_str(), || {
                 self.admission.require_valid_now()
             })
+    }
+}
+
+/// Non-cloneable active authority for a bucket-scoped object metadata scan.
+///
+/// The bucket and runtime-map generation are fixed at construction. Every
+/// object-metadata page read rechecks the request admission's captured
+/// deadline, so pagination or fan-out cannot continue under a later renewal.
+///
+/// ```compile_fail
+/// use storage::ActiveObjectMetadataScan;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn cache_scan(scan: &ActiveObjectMetadataScan<'_>) {
+///     require_clone(scan);
+/// }
+/// ```
+pub struct ActiveObjectMetadataScan<'admission> {
+    admission: &'admission StorageClusterRouteAdmission,
+    bucket: BucketName,
+}
+
+struct ObjectMetadataScanRoute<'a> {
+    bucket: &'a BucketName,
+    require_valid_route: &'a dyn Fn() -> Result<(), StoreError>,
+}
+
+impl ObjectMetadataScanRoute<'_> {
+    fn require_valid(&self) -> Result<(), StoreError> {
+        (self.require_valid_route)()
+    }
+}
+
+impl ActiveObjectMetadataScan<'_> {
+    pub fn list_objects(
+        &self,
+        prefix: Option<&ObjectKey>,
+        delimiter: Option<&str>,
+        continuation_token: Option<&ObjectKey>,
+        max_keys: u32,
+    ) -> Result<ListedBucketObjects, ObjectPgActionError> {
+        let require_valid_route = || self.admission.require_valid_now();
+        let scan = ObjectMetadataScanRoute {
+            bucket: &self.bucket,
+            require_valid_route: &require_valid_route,
+        };
+        self.admission
+            .cluster
+            .list_objects_for_bucket_with_route_validation(
+                &scan,
+                prefix,
+                delimiter,
+                continuation_token,
+                max_keys,
+            )
+    }
+
+    pub fn list_object_versions(
+        &self,
+        prefix: Option<&ObjectKey>,
+        delimiter: Option<&str>,
+        key_marker: Option<&ObjectKey>,
+        version_id_marker: Option<VersionId>,
+        max_keys: u32,
+    ) -> Result<ListedBucketObjectVersions, ObjectPgActionError> {
+        let require_valid_route = || self.admission.require_valid_now();
+        let scan = ObjectMetadataScanRoute {
+            bucket: &self.bucket,
+            require_valid_route: &require_valid_route,
+        };
+        self.admission
+            .cluster
+            .list_object_versions_for_bucket_with_route_validation(
+                &scan,
+                prefix,
+                delimiter,
+                key_marker,
+                version_id_marker,
+                max_keys,
+            )
+    }
+
+    pub fn list_multipart_uploads(
+        &self,
+        prefix: Option<&ObjectKey>,
+        delimiter: Option<&str>,
+        key_marker: Option<&ObjectKey>,
+        upload_id_marker: Option<&crate::UploadId>,
+        max_uploads: u32,
+    ) -> Result<ListedBucketMultipartUploads, ObjectPgActionError> {
+        let require_valid_route = || self.admission.require_valid_now();
+        let scan = ObjectMetadataScanRoute {
+            bucket: &self.bucket,
+            require_valid_route: &require_valid_route,
+        };
+        self.admission
+            .cluster
+            .list_multipart_uploads_for_bucket_with_route_validation(
+                &scan,
+                prefix,
+                delimiter,
+                key_marker,
+                upload_id_marker,
+                max_uploads,
+            )
     }
 }
 

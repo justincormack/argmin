@@ -7836,14 +7836,15 @@ impl super::StorageCluster {
         Ok(uploads)
     }
 
-    pub fn list_objects_for_bucket(
+    pub(super) fn list_objects_for_bucket_with_route_validation(
         &self,
-        bucket: &BucketName,
+        scan: &super::ObjectMetadataScanRoute<'_>,
         prefix: Option<&ObjectKey>,
         delimiter: Option<&str>,
         continuation_token: Option<&ObjectKey>,
         max_keys: u32,
     ) -> Result<ListedBucketObjects, ObjectPgActionError> {
+        let bucket = scan.bucket;
         if max_keys == 0 {
             return Ok(ListedBucketObjects {
                 objects: Vec::new(),
@@ -7861,6 +7862,7 @@ impl super::StorageCluster {
             let max = max_keys as usize;
             let mut smallest = BoundedSmallestRecords::new(max.saturating_add(1));
             for pg_id in self.metadata_pg_ids() {
+                scan.require_valid().map_err(ObjectPgActionError::Store)?;
                 let resp = self.list_objects_page(
                     pg_id,
                     &ListObjectsReq {
@@ -7922,6 +7924,7 @@ impl super::StorageCluster {
                 Some(ListObjectsPageStart::At(key)) => (None, Some(key)),
                 None => (None, None),
             };
+            scan.require_valid().map_err(ObjectPgActionError::Store)?;
             let resp = self.list_objects_page(
                 cursor.pg_id,
                 &ListObjectsReq {
@@ -7932,6 +7935,8 @@ impl super::StorageCluster {
                     max_keys: fetch_limit,
                 },
             )?;
+            #[cfg(any(test, feature = "test-hooks"))]
+            self.maybe_run_after_metadata_listing_pg_complete_hook(cursor.pg_id);
             cursor.objects = resp.objects;
             cursor.next_index = 0;
             cursor.next_page_start = resp.next_start_after.map(ListObjectsPageStart::After);
@@ -8058,15 +8063,39 @@ impl super::StorageCluster {
         })
     }
 
-    pub fn list_object_versions_for_bucket(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn list_objects_for_bucket(
         &self,
         bucket: &BucketName,
+        prefix: Option<&ObjectKey>,
+        delimiter: Option<&str>,
+        continuation_token: Option<&ObjectKey>,
+        max_keys: u32,
+    ) -> Result<ListedBucketObjects, ObjectPgActionError> {
+        let require_valid_route = || Ok(());
+        let scan = super::ObjectMetadataScanRoute {
+            bucket,
+            require_valid_route: &require_valid_route,
+        };
+        self.list_objects_for_bucket_with_route_validation(
+            &scan,
+            prefix,
+            delimiter,
+            continuation_token,
+            max_keys,
+        )
+    }
+
+    pub(super) fn list_object_versions_for_bucket_with_route_validation(
+        &self,
+        scan: &super::ObjectMetadataScanRoute<'_>,
         prefix: Option<&ObjectKey>,
         delimiter: Option<&str>,
         key_marker: Option<&ObjectKey>,
         version_id_marker: Option<VersionId>,
         max_keys: u32,
     ) -> Result<ListedBucketObjectVersions, ObjectPgActionError> {
+        let bucket = scan.bucket;
         if max_keys == 0 {
             return Ok(ListedBucketObjectVersions {
                 versions: Vec::new(),
@@ -8093,6 +8122,7 @@ impl super::StorageCluster {
                 Some(ListVersionsPageStart::At(key)) => (None, None, Some(key)),
                 None => (None, None, None),
             };
+            scan.require_valid().map_err(ObjectPgActionError::Store)?;
             let resp = self.list_object_versions_page(
                 cursor.pg_id,
                 &ListObjectVersionsReq {
@@ -8104,6 +8134,8 @@ impl super::StorageCluster {
                     max_keys: fetch_limit,
                 },
             )?;
+            #[cfg(any(test, feature = "test-hooks"))]
+            self.maybe_run_after_metadata_listing_pg_complete_hook(cursor.pg_id);
             cursor.versions = resp.versions;
             cursor.next_index = 0;
             cursor.next_page_start =
@@ -8268,6 +8300,31 @@ impl super::StorageCluster {
                 None
             },
         })
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn list_object_versions_for_bucket(
+        &self,
+        bucket: &BucketName,
+        prefix: Option<&ObjectKey>,
+        delimiter: Option<&str>,
+        key_marker: Option<&ObjectKey>,
+        version_id_marker: Option<VersionId>,
+        max_keys: u32,
+    ) -> Result<ListedBucketObjectVersions, ObjectPgActionError> {
+        let require_valid_route = || Ok(());
+        let scan = super::ObjectMetadataScanRoute {
+            bucket,
+            require_valid_route: &require_valid_route,
+        };
+        self.list_object_versions_for_bucket_with_route_validation(
+            &scan,
+            prefix,
+            delimiter,
+            key_marker,
+            version_id_marker,
+            max_keys,
+        )
     }
 
     pub fn load_object_if<T, E>(
@@ -13191,15 +13248,16 @@ impl super::StorageCluster {
         }
     }
 
-    pub fn list_multipart_uploads_for_bucket(
+    pub(super) fn list_multipart_uploads_for_bucket_with_route_validation(
         &self,
-        bucket: &BucketName,
+        scan: &super::ObjectMetadataScanRoute<'_>,
         prefix: Option<&ObjectKey>,
         delimiter: Option<&str>,
         key_marker: Option<&ObjectKey>,
         upload_id_marker: Option<&UploadId>,
         max_uploads: u32,
     ) -> Result<ListedBucketMultipartUploads, ObjectPgActionError> {
+        let bucket = scan.bucket;
         if max_uploads == 0 {
             return Ok(ListedBucketMultipartUploads {
                 uploads: Vec::new(),
@@ -13219,6 +13277,7 @@ impl super::StorageCluster {
             let max = max_uploads as usize;
             let mut smallest = BoundedSmallestRecords::new(max.saturating_add(1));
             for pg_id in self.metadata_pg_ids() {
+                scan.require_valid().map_err(ObjectPgActionError::Store)?;
                 let resp = self.list_multipart_uploads_page(
                     pg_id,
                     &ListMultipartUploadsReq {
@@ -13266,6 +13325,7 @@ impl super::StorageCluster {
         let fetch_uploads_page = |cursor: &mut MultipartUploadCursor,
                                   start: Option<ListMultipartUploadsPageStart>|
          -> Result<(), ObjectPgActionError> {
+            scan.require_valid().map_err(ObjectPgActionError::Store)?;
             let resp = self.list_multipart_uploads_page(
                 cursor.pg_id,
                 &ListMultipartUploadsReq {
@@ -13275,6 +13335,8 @@ impl super::StorageCluster {
                     max_uploads: fetch_limit,
                 },
             )?;
+            #[cfg(any(test, feature = "test-hooks"))]
+            self.maybe_run_after_metadata_listing_pg_complete_hook(cursor.pg_id);
             cursor.uploads = resp.uploads;
             cursor.next_index = 0;
             cursor.next_page_start = if resp.is_truncated {
@@ -13443,6 +13505,31 @@ impl super::StorageCluster {
             is_truncated,
             next_marker,
         })
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn list_multipart_uploads_for_bucket(
+        &self,
+        bucket: &BucketName,
+        prefix: Option<&ObjectKey>,
+        delimiter: Option<&str>,
+        key_marker: Option<&ObjectKey>,
+        upload_id_marker: Option<&UploadId>,
+        max_uploads: u32,
+    ) -> Result<ListedBucketMultipartUploads, ObjectPgActionError> {
+        let require_valid_route = || Ok(());
+        let scan = super::ObjectMetadataScanRoute {
+            bucket,
+            require_valid_route: &require_valid_route,
+        };
+        self.list_multipart_uploads_for_bucket_with_route_validation(
+            &scan,
+            prefix,
+            delimiter,
+            key_marker,
+            upload_id_marker,
+            max_uploads,
+        )
     }
 
     pub fn list_multipart_parts_for_authorized_upload(

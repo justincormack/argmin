@@ -1092,18 +1092,25 @@ impl Coordinator {
         &self,
         req: &ListObjectsV2Request<'_>,
     ) -> Result<AuthorizedListObjectsV2, ServerError> {
-        self.authorize_list_objects_v2_with_storage_node(&self.storage_node(), req)
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(&req.bucket)?;
+        self.authorize_list_objects_v2_with_loaded_handle(req, bucket)
     }
 
-    pub(in crate::coordinator) fn authorize_list_objects_v2_with_storage_node(
+    pub(in crate::coordinator) fn authorize_list_objects_v2_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &ListObjectsV2Request<'_>,
     ) -> Result<AuthorizedListObjectsV2, ServerError> {
-        let bucket = self.load_bucket_handle_for_bucket_policy_read_with_storage_node(
-            storage_node,
-            &req.bucket,
-        )?;
+        let bucket = self
+            .load_bucket_handle_for_bucket_policy_read_on_admitted_route(admission, &req.bucket)?;
+        self.authorize_list_objects_v2_with_loaded_handle(req, bucket)
+    }
+
+    fn authorize_list_objects_v2_with_loaded_handle(
+        &self,
+        req: &ListObjectsV2Request<'_>,
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedListObjectsV2, ServerError> {
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let policy_decision = self.bucket_policy_decision_for_loaded_handle_with_context(
             &req.bucket.requester,
@@ -1149,11 +1156,30 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_list_object_versions(
         &self,
         req: &ListObjectVersionsRequest<'_>,
     ) -> Result<AuthorizedListObjectVersions, ServerError> {
         let bucket = self.load_bucket_handle_for_bucket_policy_read(&req.bucket)?;
+        self.authorize_list_object_versions_with_loaded_handle(req, bucket)
+    }
+
+    pub(in crate::coordinator) fn authorize_list_object_versions_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &ListObjectVersionsRequest<'_>,
+    ) -> Result<AuthorizedListObjectVersions, ServerError> {
+        let bucket = self
+            .load_bucket_handle_for_bucket_policy_read_on_admitted_route(admission, &req.bucket)?;
+        self.authorize_list_object_versions_with_loaded_handle(req, bucket)
+    }
+
+    fn authorize_list_object_versions_with_loaded_handle(
+        &self,
+        req: &ListObjectVersionsRequest<'_>,
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedListObjectVersions, ServerError> {
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let policy_decision = self.bucket_policy_decision_for_loaded_handle_with_context(
             &req.bucket.requester,
@@ -1186,11 +1212,30 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_list_multipart_uploads(
         &self,
         req: &ListMultipartUploadsRequest<'_>,
     ) -> Result<AuthorizedListMultipartUploads, ServerError> {
         let bucket = self.load_bucket_handle_for_bucket_policy_read(&req.bucket)?;
+        self.authorize_list_multipart_uploads_with_loaded_handle(req, bucket)
+    }
+
+    pub(in crate::coordinator) fn authorize_list_multipart_uploads_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &ListMultipartUploadsRequest<'_>,
+    ) -> Result<AuthorizedListMultipartUploads, ServerError> {
+        let bucket = self
+            .load_bucket_handle_for_bucket_policy_read_on_admitted_route(admission, &req.bucket)?;
+        self.authorize_list_multipart_uploads_with_loaded_handle(req, bucket)
+    }
+
+    fn authorize_list_multipart_uploads_with_loaded_handle(
+        &self,
+        req: &ListMultipartUploadsRequest<'_>,
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedListMultipartUploads, ServerError> {
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let policy_decision = self.bucket_policy_decision_for_loaded_handle(
             &req.bucket.requester,

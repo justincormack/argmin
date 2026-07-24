@@ -1828,7 +1828,8 @@ impl HttpFrontend {
                     .transpose()?;
                 let requester = self.requester_from_auth(auth, req)?;
 
-                let result = self.coordinator.list_objects_v2(
+                let result = self.coordinator.list_objects_v2_on_admitted_route(
+                    storage_route_admission,
                     &crate::coordinator::ListObjectsV2Request {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                         prefix: prefix.as_deref(),
@@ -1885,7 +1886,8 @@ impl HttpFrontend {
                     .transpose()?;
                 let requester = self.requester_from_auth(auth, req)?;
 
-                let result = self.coordinator.list_objects_v2(
+                let result = self.coordinator.list_objects_v2_on_admitted_route(
+                    storage_route_admission,
                     &crate::coordinator::ListObjectsV2Request {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                         prefix: prefix.as_deref(),
@@ -3414,7 +3416,8 @@ impl HttpFrontend {
                 let parsed_upload_id_marker =
                     parse_optional_upload_id_marker(effective_upload_id_marker)?;
                 let requester = self.requester_from_auth(auth, req)?;
-                let result = self.coordinator.list_multipart_uploads(
+                let result = self.coordinator.list_multipart_uploads_on_admitted_route(
+                    storage_route_admission,
                     &crate::coordinator::ListMultipartUploadsRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                         prefix: prefix.as_deref(),
@@ -3509,7 +3512,8 @@ impl HttpFrontend {
                     .transpose()?;
                 let requester = self.requester_from_auth(auth, req)?;
 
-                let result = self.coordinator.list_object_versions(
+                let result = self.coordinator.list_object_versions_on_admitted_route(
+                    storage_route_admission,
                     &crate::coordinator::ListObjectVersionsRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                         prefix: prefix.as_deref(),

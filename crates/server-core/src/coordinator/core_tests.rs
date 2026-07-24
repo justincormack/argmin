@@ -360,6 +360,67 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
                     .get_bucket_policy_status_on_admitted_route(&admission, &request)
                     .map(|_| ()),
             ),
+            (
+                "ListObjectsV2",
+                coord
+                    .list_objects_v2_on_admitted_route(
+                        &admission,
+                        &ListObjectsV2Request {
+                            bucket: bucket_request_with_expected_owner(
+                                "bucket",
+                                test_requester(),
+                                None,
+                            ),
+                            prefix: None,
+                            delimiter: None,
+                            continuation_token: None,
+                            max_keys: 100,
+                            requested_max_keys: Some(100),
+                        },
+                    )
+                    .map(|_| ()),
+            ),
+            (
+                "ListObjectVersions",
+                coord
+                    .list_object_versions_on_admitted_route(
+                        &admission,
+                        &ListObjectVersionsRequest {
+                            bucket: bucket_request_with_expected_owner(
+                                "bucket",
+                                test_requester(),
+                                None,
+                            ),
+                            prefix: None,
+                            delimiter: None,
+                            key_marker: None,
+                            version_id_marker: None,
+                            max_keys: 100,
+                            requested_max_keys: Some(100),
+                        },
+                    )
+                    .map(|_| ()),
+            ),
+            (
+                "ListMultipartUploads",
+                coord
+                    .list_multipart_uploads_on_admitted_route(
+                        &admission,
+                        &ListMultipartUploadsRequest {
+                            bucket: bucket_request_with_expected_owner(
+                                "bucket",
+                                test_requester(),
+                                None,
+                            ),
+                            prefix: None,
+                            delimiter: None,
+                            key_marker: None,
+                            upload_id_marker: None,
+                            max_uploads: 100,
+                        },
+                    )
+                    .map(|_| ()),
+            ),
         ] {
             let error = result.expect_err(operation);
             assert!(
@@ -575,6 +636,46 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
     foreign
         .get_bucket_policy_status_on_admitted_route(&foreign_admission, &request)
         .unwrap();
+    foreign
+        .list_objects_v2_on_admitted_route(
+            &foreign_admission,
+            &ListObjectsV2Request {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 100,
+                requested_max_keys: Some(100),
+            },
+        )
+        .unwrap();
+    foreign
+        .list_object_versions_on_admitted_route(
+            &foreign_admission,
+            &ListObjectVersionsRequest {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                delimiter: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 100,
+                requested_max_keys: Some(100),
+            },
+        )
+        .unwrap();
+    foreign
+        .list_multipart_uploads_on_admitted_route(
+            &foreign_admission,
+            &ListMultipartUploadsRequest {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                delimiter: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 100,
+            },
+        )
+        .unwrap();
 
     for (operation, result) in [
         (
@@ -671,6 +772,67 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
             "GetBucketPolicyStatus",
             local
                 .get_bucket_policy_status_on_admitted_route(&foreign_admission, &request)
+                .map(|_| ()),
+        ),
+        (
+            "ListObjectsV2",
+            local
+                .list_objects_v2_on_admitted_route(
+                    &foreign_admission,
+                    &ListObjectsV2Request {
+                        bucket: bucket_request_with_expected_owner(
+                            "bucket",
+                            test_requester(),
+                            None,
+                        ),
+                        prefix: None,
+                        delimiter: None,
+                        continuation_token: None,
+                        max_keys: 100,
+                        requested_max_keys: Some(100),
+                    },
+                )
+                .map(|_| ()),
+        ),
+        (
+            "ListObjectVersions",
+            local
+                .list_object_versions_on_admitted_route(
+                    &foreign_admission,
+                    &ListObjectVersionsRequest {
+                        bucket: bucket_request_with_expected_owner(
+                            "bucket",
+                            test_requester(),
+                            None,
+                        ),
+                        prefix: None,
+                        delimiter: None,
+                        key_marker: None,
+                        version_id_marker: None,
+                        max_keys: 100,
+                        requested_max_keys: Some(100),
+                    },
+                )
+                .map(|_| ()),
+        ),
+        (
+            "ListMultipartUploads",
+            local
+                .list_multipart_uploads_on_admitted_route(
+                    &foreign_admission,
+                    &ListMultipartUploadsRequest {
+                        bucket: bucket_request_with_expected_owner(
+                            "bucket",
+                            test_requester(),
+                            None,
+                        ),
+                        prefix: None,
+                        delimiter: None,
+                        key_marker: None,
+                        upload_id_marker: None,
+                        max_uploads: 100,
+                    },
+                )
                 .map(|_| ()),
         ),
     ] {
@@ -5116,6 +5278,8 @@ fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
     let hook_handle = handle.clone();
     let hook_initial = Arc::clone(&initial);
     let hook_node_root = candidate_tmp.path().to_path_buf();
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
     let _serial = LIST_OBJECTS_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -5123,11 +5287,18 @@ fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
     let _hook_guard = install_list_objects_test_hooks(ListObjectsTestHooks {
         bucket: Some(bucket.to_string()),
         before_storage_list: Some(Arc::new(move || {
-            install_next_epoch_runtime_map_with_historical_routes(
-                &hook_handle,
-                &hook_initial,
-                &hook_node_root,
-            );
+            let publishing_handle = hook_handle.clone();
+            let publishing_initial = Arc::clone(&hook_initial);
+            let publishing_node_root = hook_node_root.clone();
+            let thread = thread::spawn(move || {
+                install_next_epoch_runtime_map_with_historical_routes(
+                    &publishing_handle,
+                    &publishing_initial,
+                    &publishing_node_root,
+                );
+            });
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
         })),
     });
 
@@ -5140,6 +5311,13 @@ fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
             max_keys: 1000,
             requested_max_keys: Some(1000),
         })
+        .unwrap();
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("listing hook should start route publication")
+        .join()
         .unwrap();
     let keys = result
         .objects
