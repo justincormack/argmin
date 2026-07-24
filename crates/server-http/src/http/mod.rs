@@ -2984,11 +2984,10 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketPolicy { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                match self.coordinator.get_bucket_policy(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)? {
+                match self.coordinator.get_bucket_policy_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )? {
                     Some(policy) => Ok(S3Response::get_bucket_policy(&policy)),
                     None => Err(ServerError::NoSuchBucketPolicy {
                         bucket: bucket.to_string(),
@@ -2997,11 +2996,12 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketPolicyStatus { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                let is_public = self.coordinator.get_bucket_policy_status(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)?;
+                let is_public = self
+                    .coordinator
+                    .get_bucket_policy_status_on_admitted_route(
+                        storage_route_admission,
+                        &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                    )?;
                 Ok(S3Response::get_bucket_policy_status(is_public))
             }
             S3Operation::DeleteBucketPolicy { bucket } => {

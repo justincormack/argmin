@@ -2067,13 +2067,30 @@ impl Coordinator {
         )
     }
 
-    fn authorize_loaded_bucket_policy_action_for(
+    fn authorize_loaded_bucket_policy_action_for_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
         action: auth::PolicyAction,
         default_allowed: impl FnOnce(&Requester, &BucketSummary) -> bool,
     ) -> Result<LoadedBucketHandle, ServerError> {
-        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        let bucket =
+            self.load_bucket_handle_for_bucket_policy_read_on_admitted_route(admission, req)?;
+        self.authorize_loaded_bucket_policy_action_for_loaded_handle(
+            req,
+            bucket,
+            action,
+            default_allowed,
+        )
+    }
+
+    fn authorize_loaded_bucket_policy_action_for_loaded_handle(
+        &self,
+        req: &BucketRequest<'_>,
+        bucket: LoadedBucketHandle,
+        action: auth::PolicyAction,
+        default_allowed: impl FnOnce(&Requester, &BucketSummary) -> bool,
+    ) -> Result<LoadedBucketHandle, ServerError> {
         let default_allowed = default_allowed(&req.requester, bucket.bucket());
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let decision = self.bucket_policy_decision_for_loaded_handle(

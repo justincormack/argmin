@@ -627,15 +627,23 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_get_bucket_policy(
+    pub(in crate::coordinator) fn authorize_get_bucket_policy_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketPolicy, ServerError> {
-        let bucket = self.authorize_loaded_bucket_policy_action_for(
+        let bucket = self.authorize_loaded_bucket_policy_action_for_on_admitted_route(
+            admission,
             req,
             auth::PolicyAction::GetBucketPolicy,
             Self::requester_can_bucket_owner_account_admin,
         )?;
+        Self::authorize_get_bucket_policy_with_loaded_handle(bucket)
+    }
+
+    fn authorize_get_bucket_policy_with_loaded_handle(
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedGetBucketPolicy, ServerError> {
         Ok(AuthorizedGetBucketPolicy {
             body: Self::loaded_bucket_subresource_body(bucket.policy())?,
         })
@@ -1346,11 +1354,30 @@ impl Coordinator {
         Self::authorize_get_bucket_object_lock_configuration_with_loaded_handle(req, bucket)
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_get_bucket_policy_status(
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketPolicyStatus, ServerError> {
         let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        self.authorize_get_bucket_policy_status_with_loaded_handle(req, bucket)
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_policy_status_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketPolicyStatus, ServerError> {
+        let bucket =
+            self.load_bucket_handle_for_bucket_policy_read_on_admitted_route(admission, req)?;
+        self.authorize_get_bucket_policy_status_with_loaded_handle(req, bucket)
+    }
+
+    fn authorize_get_bucket_policy_status_with_loaded_handle(
+        &self,
+        req: &BucketRequest<'_>,
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedGetBucketPolicyStatus, ServerError> {
         if !bucket.bucket().bucket_policy_present {
             if !Self::requester_can_bucket_admin(&req.requester, &bucket.bucket().owner_principal) {
                 return Err(ServerError::AccessDenied);

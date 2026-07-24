@@ -337,6 +337,18 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
                     .get_bucket_acl_on_admitted_route(&admission, &request)
                     .map(|_| ()),
             ),
+            (
+                "GetBucketPolicy",
+                coord
+                    .get_bucket_policy_on_admitted_route(&admission, &request)
+                    .map(|_| ()),
+            ),
+            (
+                "GetBucketPolicyStatus",
+                coord
+                    .get_bucket_policy_status_on_admitted_route(&admission, &request)
+                    .map(|_| ()),
+            ),
         ] {
             let error = result.expect_err(operation);
             assert!(
@@ -492,6 +504,14 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         true,
     )
     .unwrap();
+    put_bucket_policy_test(
+        &foreign,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"default-owner"},"Action":["s3:GetBucketPolicy","s3:GetBucketPolicyStatus"],"Resource":"arn:aws:s3:::bucket"}]}"#,
+        test_requester(),
+        None,
+    )
+    .unwrap();
     let foreign_admission = foreign.admit_storage_route_for_request().unwrap();
     let request = bucket_request_with_expected_owner("bucket", test_requester(), None);
     foreign
@@ -529,6 +549,12 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         .unwrap();
     foreign
         .get_bucket_acl_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    foreign
+        .get_bucket_policy_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    foreign
+        .get_bucket_policy_status_on_admitted_route(&foreign_admission, &request)
         .unwrap();
 
     for (operation, result) in [
@@ -603,6 +629,18 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
             "GetBucketAcl",
             local
                 .get_bucket_acl_on_admitted_route(&foreign_admission, &request)
+                .map(|_| ()),
+        ),
+        (
+            "GetBucketPolicy",
+            local
+                .get_bucket_policy_on_admitted_route(&foreign_admission, &request)
+                .map(|_| ()),
+        ),
+        (
+            "GetBucketPolicyStatus",
+            local
+                .get_bucket_policy_status_on_admitted_route(&foreign_admission, &request)
                 .map(|_| ()),
         ),
     ] {

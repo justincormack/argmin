@@ -2539,6 +2539,30 @@ Fifty-third Phase 3 slice:
   Formatting, the storage boundary checker, and workspace-wide strict Clippy
   pass. The full parallel workspace suite passes (7,549 tests).
 
+Fifty-fourth Phase 3 slice:
+
+- `GetBucketPolicy` and `GetBucketPolicyStatus` now consume the buffered
+  request's existing `StorageClusterRouteAdmission`. Their policy and
+  conditional-ABAC views load through the admitted route, and their production
+  coordinator entry points can no longer resample the renewable runtime-map
+  handle. Crate-local tests retain helpers which acquire fresh admission before
+  entering the same production paths.
+- policy-document authorization now separates admitted handle loading from the
+  unchanged policy evaluation and root-principal bypass. Policy-status
+  authorization similarly evaluates the admitted handle while preserving its
+  distinct lack of a root carve-out and its owner-versus-non-owner precedence
+  when no policy is present.
+- the shared bucket-metadata regressions now cover fourteen operations. A
+  policy-present positive canary and negative same-cluster/different-
+  publication-domain cases cover both endpoints, while the captured-deadline
+  matrix proves same-generation renewal cannot extend either request.
+- the other buffered coordinator workflows and capability requirements on the
+  node-client traits remain open in Phase 3.
+- focused coordinator, endpoint-neutral policy/status, expected-owner, root-
+  carve-out, missing-policy, explicit-deny, and conditional-ABAC tests pass (35
+  tests). Formatting, the storage boundary checker, and workspace-wide strict
+  Clippy pass. The full parallel workspace suite passes (7,549 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

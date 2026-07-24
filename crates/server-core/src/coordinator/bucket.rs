@@ -1071,29 +1071,50 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_policy(
+    pub fn get_bucket_policy_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_policy",
+            "Coordinator::get_bucket_policy_on_admitted_route",
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_get_bucket_policy(req)?;
+        let authorized = self.authorize_get_bucket_policy_on_admitted_route(admission, req)?;
         Ok(authorized.body)
     }
 
-    pub fn get_bucket_policy_status(&self, req: &BucketRequest<'_>) -> Result<bool, ServerError> {
+    #[cfg(test)]
+    pub fn get_bucket_policy(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_bucket_policy_on_admitted_route(&admission, req)
+    }
+
+    pub fn get_bucket_policy_status_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<bool, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_policy_status",
+            "Coordinator::get_bucket_policy_status_on_admitted_route",
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_get_bucket_policy_status(req)?;
+        let authorized =
+            self.authorize_get_bucket_policy_status_on_admitted_route(admission, req)?;
         Ok(authorized.is_public)
+    }
+
+    #[cfg(test)]
+    pub fn get_bucket_policy_status(&self, req: &BucketRequest<'_>) -> Result<bool, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_bucket_policy_status_on_admitted_route(&admission, req)
     }
 
     pub fn delete_bucket_policy(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
