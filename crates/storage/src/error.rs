@@ -641,6 +641,9 @@ pub enum ClusterBuildError {
     #[error("cluster map must contain at least one local node")]
     EmptyCluster,
 
+    #[error("failed to generate opaque storage-cluster runtime identity")]
+    RuntimeIdentityGeneration,
+
     #[error("runtime route-map lease could not bind to the process clock: {message}")]
     RouteMapLeaseBinding { message: String },
 

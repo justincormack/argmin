@@ -287,6 +287,21 @@ fn jittered_metadata_contention_backoff_delay(cap: Duration) -> Duration {
     Duration::from_nanos((u64::from_le_bytes(bytes) % max_nanos.saturating_add(1)).max(1))
 }
 
+fn random_hex_identifier(prefix: &str) -> Result<String, ring::error::Unspecified> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut id_bytes = [0u8; 16];
+    ring::rand::SystemRandom::new().fill(&mut id_bytes)?;
+
+    let mut encoded = String::with_capacity(prefix.len() + id_bytes.len() * 2);
+    encoded.push_str(prefix);
+    for byte in id_bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(encoded)
+}
+
 fn metadata_contention_backoff_cap(contention_retries: usize) -> Duration {
     let multiplier = 1u32 << contention_retries.saturating_sub(1).min(8);
     METADATA_CONTENTION_BACKOFF_INITIAL
@@ -1322,6 +1337,7 @@ pub struct StorageCluster {
     local_map: Arc<LocalClusterMap>,
     operation_epoch: ClusterEpoch,
     runtime_map_content_digest: Option<RuntimeMapContentDigest>,
+    bucket_write_owner_token: Arc<str>,
     rpc_auth: Option<crate::StorageRpcClientAuthConfig>,
     rpc_endpoints:
         Option<Arc<BTreeMap<NodeId, crate::storage_rpc_transport::StorageRpcClientEndpoint>>>,
@@ -2697,6 +2713,21 @@ mod runtime_map_refresh_invalidation_tests {
     }
 
     #[test]
+    fn bucket_write_owner_token_is_opaque() {
+        let cluster = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
+        let owner_token = cluster.bucket_write_owner_token();
+        let owner_identity = owner_token
+            .strip_prefix("bucket-write-owner-")
+            .expect("bucket-write owner token should have an opaque type prefix");
+
+        assert_eq!(owner_identity.len(), 32);
+        assert!(owner_identity
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+        assert!(!owner_token.contains(&format!("{:p}", Arc::as_ptr(&cluster.local_map))));
+    }
+
+    #[test]
     fn authoritative_pending_metadata_refresh_failure_expires_same_epoch_generations() {
         let pinned = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
         let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned));
@@ -2744,6 +2775,7 @@ mod runtime_map_refresh_invalidation_tests {
             Some(frontend_storage_rpc_auth()),
         )
         .unwrap();
+        let owner_token = cluster.bucket_write_owner_token();
         authority
             .set_pg_acting_set(PgId::new(31), vec![NodeId::new(2)])
             .unwrap();
@@ -2763,6 +2795,7 @@ mod runtime_map_refresh_invalidation_tests {
 
         assert!(refreshed.rpc_auth.is_some());
         assert_eq!(refreshed.local_node_count(), 2);
+        assert_eq!(refreshed.bucket_write_owner_token(), owner_token);
     }
 
     #[test]
@@ -6192,12 +6225,15 @@ impl StorageCluster {
             &self.local_map,
             &runtime_map,
         )?;
-        Ok(Self::from_local_map_with_epoch_and_digest_and_auth(
-            Arc::new(local_map),
-            runtime_map.cluster_epoch(),
-            Some(runtime_map.content_digest()),
-            self.rpc_auth.clone(),
-        )?)
+        Ok(
+            Self::from_local_map_with_epoch_and_digest_auth_and_owner_token(
+                Arc::new(local_map),
+                runtime_map.cluster_epoch(),
+                Some(runtime_map.content_digest()),
+                self.rpc_auth.clone(),
+                Some(Arc::clone(&self.bucket_write_owner_token)),
+            )?,
+        )
     }
 
     pub fn refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
@@ -6234,11 +6270,12 @@ impl StorageCluster {
             .collect(),
         };
         local_map.install_unix_storage_node_clients(storage_node_configs)?;
-        let mut cluster = Self::from_local_map_with_epoch_and_digest_and_auth(
+        let mut cluster = Self::from_local_map_with_epoch_and_digest_auth_and_owner_token(
             Arc::new(local_map),
             runtime_map.cluster_epoch(),
             Some(runtime_map.content_digest()),
             self.rpc_auth.clone(),
+            Some(Arc::clone(&self.bucket_write_owner_token)),
         )?;
         Arc::get_mut(&mut cluster)
             .expect("new storage cluster has one owner")
@@ -6280,10 +6317,33 @@ impl StorageCluster {
         runtime_map_content_digest: Option<RuntimeMapContentDigest>,
         rpc_auth: Option<crate::StorageRpcClientAuthConfig>,
     ) -> Result<Arc<Self>, ClusterBuildError> {
+        Self::from_local_map_with_epoch_and_digest_auth_and_owner_token(
+            local_map,
+            operation_epoch,
+            runtime_map_content_digest,
+            rpc_auth,
+            None,
+        )
+    }
+
+    fn from_local_map_with_epoch_and_digest_auth_and_owner_token(
+        local_map: Arc<LocalClusterMap>,
+        operation_epoch: ClusterEpoch,
+        runtime_map_content_digest: Option<RuntimeMapContentDigest>,
+        rpc_auth: Option<crate::StorageRpcClientAuthConfig>,
+        bucket_write_owner_token: Option<Arc<str>>,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        let bucket_write_owner_token = match bucket_write_owner_token {
+            Some(token) => token,
+            None => random_hex_identifier("bucket-write-owner-")
+                .map(Arc::from)
+                .map_err(|_| ClusterBuildError::RuntimeIdentityGeneration)?,
+        };
         Ok(Arc::new(Self {
             local_map,
             operation_epoch,
             runtime_map_content_digest,
+            bucket_write_owner_token,
             rpc_auth,
             rpc_endpoints: None,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -7325,30 +7385,14 @@ impl StorageCluster {
         prefix: &'static str,
         context: &'static str,
     ) -> Result<String, StoreError> {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-
-        let rng = ring::rand::SystemRandom::new();
-        let mut id_bytes = [0u8; 16];
-        rng.fill(&mut id_bytes).map_err(|_| StoreError::Io {
+        random_hex_identifier(prefix).map_err(|_| StoreError::Io {
             context,
             source: std::io::Error::other("failed to generate random reservation id"),
-        })?;
-
-        let mut encoded = String::with_capacity(prefix.len() + id_bytes.len() * 2);
-        encoded.push_str(prefix);
-        for byte in id_bytes {
-            encoded.push(HEX[(byte >> 4) as usize] as char);
-            encoded.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        Ok(encoded)
+        })
     }
 
     fn bucket_write_owner_token(&self) -> String {
-        format!(
-            "process:{}:cluster:{:p}",
-            std::process::id(),
-            Arc::as_ptr(&self.local_map)
-        )
+        self.bucket_write_owner_token.to_string()
     }
 
     fn object_mutation_metadata_primary_client(

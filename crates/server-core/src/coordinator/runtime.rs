@@ -4,6 +4,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use ring::rand::SecureRandom;
 use s3_types::BucketLifecycleConfiguration;
 #[cfg(test)]
 use storage::PgTopology;
@@ -83,6 +84,24 @@ const BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_
 const BACKGROUND_FOREGROUND_PRESSURE_MAX_SAMPLE_GAP: Duration = Duration::from_millis(1_250);
 
 type ObjectPayloadReclaimRoot = (BucketName, ObjectKey, GenerationId);
+
+fn random_background_worker_identity(context: &'static str) -> Result<String, ServerError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut bytes = [0u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| ServerError::InternalError {
+            reason: format!("failed to generate opaque {context} identity"),
+        })?;
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(encoded)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackgroundWorkClass {
@@ -1512,9 +1531,11 @@ impl ShardRepairSweeper {
 
     fn spawn(
         storage_handle: StorageClusterRuntimeMapHandle,
-        registry_key: usize,
+        _registry_key: usize,
         admission: Arc<BackgroundWorkAdmission>,
     ) -> Result<Arc<Self>, ServerError> {
+        let worker_identity = random_background_worker_identity("shard-repair worker")?;
+        let owner_token = format!("shard-repair-worker-{worker_identity}");
         let stop = Arc::new(AtomicBool::new(false));
         let sweeper = Arc::new(Self {
             storage_handle: storage_handle.clone(),
@@ -1524,7 +1545,6 @@ impl ShardRepairSweeper {
         let handle = std::thread::Builder::new()
             .name("argmin-shard-repair".to_string())
             .spawn(move || {
-                let owner_token = format!("shard-repair-worker-{}", registry_key);
                 let mut next_durable_scan_at = Instant::now();
                 while !stop.load(Ordering::SeqCst) {
                     let storage_cluster = shard_repair_cluster_for_work(&storage_handle);
@@ -1599,7 +1619,7 @@ impl ShardRepairSweeper {
                             break;
                         }
                         #[cfg(test)]
-                        maybe_run_shard_repair_worker_idle_timeout_hook(registry_key);
+                        maybe_run_shard_repair_worker_idle_timeout_hook(_registry_key);
                         continue;
                     };
                     if stop.load(Ordering::SeqCst) {
@@ -1609,7 +1629,7 @@ impl ShardRepairSweeper {
                     let now_ms = Coordinator::now_millis();
                     let claim_id = format!(
                         "shard-repair-{}-{}-{}-{}",
-                        registry_key,
+                        worker_identity,
                         work_item.request.data_pg_id,
                         work_item.shard_index.get(),
                         SHARD_REPAIR_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -1890,6 +1910,8 @@ impl ShardBackfillSweeper {
     }
 
     fn spawn(storage_handle: StorageClusterRuntimeMapHandle) -> Result<Arc<Self>, ServerError> {
+        let worker_identity = random_background_worker_identity("shard-backfill worker")?;
+        let owner_token = format!("shard-backfill-worker-{worker_identity}");
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(false), Condvar::new()));
         let sweeper = Arc::new(Self {
@@ -1903,13 +1925,10 @@ impl ShardBackfillSweeper {
                 while !stop.load(Ordering::SeqCst) {
                     let storage_cluster = storage_handle.current();
                     let admission = background_work_admission_for(&storage_cluster);
-                    let owner_token = format!(
-                        "shard-backfill-worker-{}",
-                        storage_cluster.process_local_registry_key()
-                    );
                     admission.observe_pressure();
                     run_one_placed_segment_shard_backfill(
                         &storage_cluster,
+                        &worker_identity,
                         &owner_token,
                         &admission,
                     );
@@ -1946,13 +1965,14 @@ impl ShardBackfillSweeper {
 
 fn run_one_placed_segment_shard_backfill(
     storage_cluster: &StorageCluster,
+    worker_identity: &str,
     owner_token: &str,
     admission: &Arc<BackgroundWorkAdmission>,
 ) {
     let now_ms = Coordinator::now_millis();
     let claim_id = format!(
         "shard-backfill-{}-{}",
-        storage_cluster.process_local_registry_key(),
+        worker_identity,
         SHARD_BACKFILL_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
     let queue_depth = shard_backfill_queue_depth(storage_cluster);
@@ -2146,7 +2166,7 @@ pub(super) fn run_one_placed_segment_shard_backfill_for_test(
     owner_token: &str,
 ) {
     let admission = Arc::new(BackgroundWorkAdmission::new());
-    run_one_placed_segment_shard_backfill(storage_cluster, owner_token, &admission);
+    run_one_placed_segment_shard_backfill(storage_cluster, "test-worker", owner_token, &admission);
 }
 
 fn shard_backfill_admission_class(remaining_tolerance: u8, ec_m: u8) -> BackgroundWorkClass {
@@ -3304,6 +3324,16 @@ mod tests {
 
     use super::super::payload::PayloadBufferPool;
     use super::*;
+
+    #[test]
+    fn background_worker_identity_is_opaque_fixed_width_hex() {
+        let identity = random_background_worker_identity("test worker").unwrap();
+
+        assert_eq!(identity.len(), 32);
+        assert!(identity
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+    }
 
     #[test]
     fn reclaim_durable_scan_schedule_preserves_cursor_and_uses_bounded_delays() {
