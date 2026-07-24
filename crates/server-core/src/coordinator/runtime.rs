@@ -12,8 +12,8 @@ use storage::{
     AuthorizedMultipartUploadRecord, BucketDeleteBeginRoot, BucketDeleteFinalizeRoot, BucketInfo,
     BucketName, EcShape, GenerationId, ObjectEncryption, ObjectKey,
     PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardRepairClaimAcquireParams,
-    ReclaimWorkItem, SegmentStoredBytesRequest, StorageCluster, StorageClusterRuntimeMapHandle,
-    StoreError, UploadId, UploadState, VersionId,
+    ProcessLocalRegistryKey, ReclaimWorkItem, SegmentStoredBytesRequest, StorageCluster,
+    StorageClusterRuntimeMapHandle, StoreError, UploadId, UploadState, VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -34,23 +34,26 @@ use crate::sse::{
     SseCustomerSegmentScope,
 };
 
-static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<LifecycleSweeper>>>> =
-    OnceLock::new();
-static RECLAIM_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<ReclaimSweeper>>>> =
-    OnceLock::new();
-static SHARD_SCAVENGER_SWEEPER_REGISTRY: OnceLock<
-    Mutex<HashMap<usize, Weak<ShardScavengerSweeper>>>,
+static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<
+    Mutex<HashMap<ProcessLocalRegistryKey, Weak<LifecycleSweeper>>>,
 > = OnceLock::new();
-static SHARD_REPAIR_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<ShardRepairSweeper>>>> =
-    OnceLock::new();
+static RECLAIM_SWEEPER_REGISTRY: OnceLock<
+    Mutex<HashMap<ProcessLocalRegistryKey, Weak<ReclaimSweeper>>>,
+> = OnceLock::new();
+static SHARD_SCAVENGER_SWEEPER_REGISTRY: OnceLock<
+    Mutex<HashMap<ProcessLocalRegistryKey, Weak<ShardScavengerSweeper>>>,
+> = OnceLock::new();
+static SHARD_REPAIR_SWEEPER_REGISTRY: OnceLock<
+    Mutex<HashMap<ProcessLocalRegistryKey, Weak<ShardRepairSweeper>>>,
+> = OnceLock::new();
 static SHARD_BACKFILL_SWEEPER_REGISTRY: OnceLock<
-    Mutex<HashMap<usize, Weak<ShardBackfillSweeper>>>,
+    Mutex<HashMap<ProcessLocalRegistryKey, Weak<ShardBackfillSweeper>>>,
 > = OnceLock::new();
 static STREAM_SESSION_SWEEPER_REGISTRY: OnceLock<
-    Mutex<HashMap<usize, Weak<StreamSessionSweeper>>>,
+    Mutex<HashMap<ProcessLocalRegistryKey, Weak<StreamSessionSweeper>>>,
 > = OnceLock::new();
 static BACKGROUND_WORK_ADMISSION_REGISTRY: OnceLock<
-    Mutex<HashMap<usize, Weak<BackgroundWorkAdmission>>>,
+    Mutex<HashMap<ProcessLocalRegistryKey, Weak<BackgroundWorkAdmission>>>,
 > = OnceLock::new();
 static SHARD_REPAIR_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SHARD_BACKFILL_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -447,8 +450,10 @@ fn background_work_admission_for(
     storage_cluster: &Arc<StorageCluster>,
 ) -> Arc<BackgroundWorkAdmission> {
     let registry = BACKGROUND_WORK_ADMISSION_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<BackgroundWorkAdmission>>> =
-        lock_mutex_unpoisoned(registry);
+    let mut registry: std::sync::MutexGuard<
+        '_,
+        HashMap<ProcessLocalRegistryKey, Weak<BackgroundWorkAdmission>>,
+    > = lock_mutex_unpoisoned(registry);
     registry.retain(|_, admission| admission.upgrade().is_some());
 
     let key = storage_cluster.process_local_registry_key();
@@ -778,8 +783,10 @@ impl ReclaimSweeper {
         runtime: ReadRuntime,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = RECLAIM_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<ReclaimSweeper>>> =
-            lock_mutex_unpoisoned(registry);
+        let mut registry: std::sync::MutexGuard<
+            '_,
+            HashMap<ProcessLocalRegistryKey, Weak<ReclaimSweeper>>,
+        > = lock_mutex_unpoisoned(registry);
         registry.retain(|_, sweeper| sweeper.upgrade().is_some());
 
         let storage_cluster = storage_handle.current();
@@ -1264,8 +1271,10 @@ impl LifecycleSweeper {
         runtime: ReadRuntime,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = LIFECYCLE_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<LifecycleSweeper>>> =
-            lock_mutex_unpoisoned(registry);
+        let mut registry: std::sync::MutexGuard<
+            '_,
+            HashMap<ProcessLocalRegistryKey, Weak<LifecycleSweeper>>,
+        > = lock_mutex_unpoisoned(registry);
         registry.retain(|_, sweeper| sweeper.upgrade().is_some());
 
         let storage_cluster = storage_handle.current();
@@ -1348,8 +1357,10 @@ impl ShardScavengerSweeper {
         storage_handle: &StorageClusterRuntimeMapHandle,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = SHARD_SCAVENGER_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<ShardScavengerSweeper>>> =
-            lock_mutex_unpoisoned(registry);
+        let mut registry: std::sync::MutexGuard<
+            '_,
+            HashMap<ProcessLocalRegistryKey, Weak<ShardScavengerSweeper>>,
+        > = lock_mutex_unpoisoned(registry);
         registry.retain(|_, sweeper| sweeper.upgrade().is_some());
 
         let storage_cluster = storage_handle.current();
@@ -1513,8 +1524,10 @@ impl ShardRepairSweeper {
         storage_handle: &StorageClusterRuntimeMapHandle,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = SHARD_REPAIR_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<ShardRepairSweeper>>> =
-            lock_mutex_unpoisoned(registry);
+        let mut registry: std::sync::MutexGuard<
+            '_,
+            HashMap<ProcessLocalRegistryKey, Weak<ShardRepairSweeper>>,
+        > = lock_mutex_unpoisoned(registry);
         registry.retain(|_, sweeper| sweeper.upgrade().is_some());
 
         let storage_cluster = storage_handle.current();
@@ -1531,7 +1544,7 @@ impl ShardRepairSweeper {
 
     fn spawn(
         storage_handle: StorageClusterRuntimeMapHandle,
-        _registry_key: usize,
+        _registry_key: ProcessLocalRegistryKey,
         admission: Arc<BackgroundWorkAdmission>,
     ) -> Result<Arc<Self>, ServerError> {
         let worker_identity = random_background_worker_identity("shard-repair worker")?;
@@ -1894,8 +1907,10 @@ impl ShardBackfillSweeper {
         storage_handle: &StorageClusterRuntimeMapHandle,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = SHARD_BACKFILL_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<ShardBackfillSweeper>>> =
-            lock_mutex_unpoisoned(registry);
+        let mut registry: std::sync::MutexGuard<
+            '_,
+            HashMap<ProcessLocalRegistryKey, Weak<ShardBackfillSweeper>>,
+        > = lock_mutex_unpoisoned(registry);
         registry.retain(|_, sweeper| sweeper.upgrade().is_some());
 
         let storage_cluster = storage_handle.current();
@@ -2254,8 +2269,10 @@ impl StreamSessionSweeper {
         storage_handle: &StorageClusterRuntimeMapHandle,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = STREAM_SESSION_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<StreamSessionSweeper>>> =
-            lock_mutex_unpoisoned(registry);
+        let mut registry: std::sync::MutexGuard<
+            '_,
+            HashMap<ProcessLocalRegistryKey, Weak<StreamSessionSweeper>>,
+        > = lock_mutex_unpoisoned(registry);
         registry.retain(|_, sweeper| sweeper.upgrade().is_some());
 
         let key = storage_handle.current().process_local_registry_key();

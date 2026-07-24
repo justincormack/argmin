@@ -1,14 +1,14 @@
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
-use storage::{SessionId, StorageCluster};
+use storage::{ProcessLocalRegistryKey, SessionId, StorageCluster};
 
 use super::Coordinator;
 
 #[derive(Default, Clone)]
 pub(super) struct ReclamationTestHooks {
     pub(super) target: Option<(String, String)>,
-    pub(super) target_reclaim_worker_registry_key: Option<usize>,
+    pub(super) target_reclaim_worker_registry_key: Option<ProcessLocalRegistryKey>,
     pub(super) probe_multipart_complete_auth_lookup: bool,
     pub(super) reclaim_worker_durable_scan_delay_override: Option<Duration>,
     pub(super) after_reclaim_worker_idle_return: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -160,7 +160,7 @@ pub(super) static STREAM_APPEND_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new
 
 #[derive(Default, Clone)]
 pub(super) struct ShardRepairWorkerTestHooks {
-    pub(super) target_registry_key: Option<usize>,
+    pub(super) target_registry_key: Option<ProcessLocalRegistryKey>,
     pub(super) after_idle_timeout: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -308,7 +308,9 @@ pub(super) fn install_shard_repair_worker_test_hooks(
     ShardRepairWorkerTestHookGuard
 }
 
-pub(super) fn maybe_run_shard_repair_worker_idle_timeout_hook(registry_key: usize) {
+pub(super) fn maybe_run_shard_repair_worker_idle_timeout_hook(
+    registry_key: ProcessLocalRegistryKey,
+) {
     let hooks = SHARD_REPAIR_WORKER_TEST_HOOKS
         .get_or_init(|| Mutex::new(ShardRepairWorkerTestHooks::default()))
         .lock()
@@ -325,7 +327,9 @@ pub(super) fn maybe_run_shard_repair_worker_idle_timeout_hook(registry_key: usiz
     }
 }
 
-pub(super) fn reclaim_worker_durable_scan_delay_override(registry_key: usize) -> Option<Duration> {
+pub(super) fn reclaim_worker_durable_scan_delay_override(
+    registry_key: ProcessLocalRegistryKey,
+) -> Option<Duration> {
     let hooks = RECLAMATION_TEST_HOOKS
         .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
         .lock()
@@ -340,7 +344,7 @@ pub(super) fn reclaim_worker_durable_scan_delay_override(registry_key: usize) ->
     hooks.reclaim_worker_durable_scan_delay_override
 }
 
-pub(super) fn maybe_run_reclaim_worker_idle_return_hook(registry_key: usize) {
+pub(super) fn maybe_run_reclaim_worker_idle_return_hook(registry_key: ProcessLocalRegistryKey) {
     let hooks = RECLAMATION_TEST_HOOKS
         .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
         .lock()
@@ -357,7 +361,7 @@ pub(super) fn maybe_run_reclaim_worker_idle_return_hook(registry_key: usize) {
     }
 }
 
-pub(super) fn maybe_run_after_reclaim_work_dequeued_hook(registry_key: usize) {
+pub(super) fn maybe_run_after_reclaim_work_dequeued_hook(registry_key: ProcessLocalRegistryKey) {
     let hooks = RECLAMATION_TEST_HOOKS
         .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
         .lock()
@@ -375,7 +379,7 @@ pub(super) fn maybe_run_after_reclaim_work_dequeued_hook(registry_key: usize) {
 }
 
 pub(super) fn maybe_run_before_reclaim_work_execute_hook(
-    registry_key: usize,
+    registry_key: ProcessLocalRegistryKey,
     storage_cluster: Arc<StorageCluster>,
 ) {
     let hooks = RECLAMATION_TEST_HOOKS

@@ -26,7 +26,9 @@ use storage::ObjectLockState;
 use storage::ShardKey;
 #[cfg(test)]
 use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig, ObjectLayout};
-use storage::{BucketName, ObjectKey, StorageCluster, StorageClusterRuntimeMapHandle};
+use storage::{
+    BucketName, ObjectKey, ProcessLocalRegistryKey, StorageCluster, StorageClusterRuntimeMapHandle,
+};
 #[cfg(test)]
 use storage::{
     BucketObjectLockConfig, BucketOwnershipControls, BucketState, EcShape, GenerationId,
@@ -507,7 +509,7 @@ fn shared_caches_for_storage_cluster(
     storage_cluster: &Arc<StorageCluster>,
 ) -> Arc<CoordinatorSharedCaches> {
     static SHARED_COORDINATOR_CACHES: OnceLock<
-        Mutex<HashMap<usize, Weak<CoordinatorSharedCaches>>>,
+        Mutex<HashMap<ProcessLocalRegistryKey, Weak<CoordinatorSharedCaches>>>,
     > = OnceLock::new();
 
     let key = storage_cluster.process_local_registry_key();

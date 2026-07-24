@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
-use super::ShardLocation;
+use super::{ProcessLocalRegistryKey, ShardLocation};
 use crate::control_plane::{
     reconstruct_sparse_pg_route_at_epoch, ClusterRuntimeMapSnapshot, NodeRouteSnapshot,
     PgRouteSnapshot,
@@ -1429,7 +1429,7 @@ pub struct LocalClusterMap {
     historical_pg_routes: BTreeMap<(PgId, ClusterEpoch), PgRouteSnapshot>,
     historical_cluster_epochs: BTreeSet<ClusterEpoch>,
     runtime_state: Arc<LocalClusterRuntimeState>,
-    process_local_registry_key: usize,
+    process_local_registry_key: ProcessLocalRegistryKey,
 }
 
 impl LocalClusterMap {
@@ -2951,7 +2951,7 @@ impl LocalClusterMap {
         });
     }
 
-    pub fn process_local_registry_key(&self) -> usize {
+    pub fn process_local_registry_key(&self) -> ProcessLocalRegistryKey {
         self.process_local_registry_key
     }
 

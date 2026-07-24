@@ -26,6 +26,7 @@ use super::clients::{
     PlacedShardNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient,
 };
 use super::{BucketPgId, DataPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
+use crate::cluster::ProcessLocalRegistryKey;
 use crate::control_plane::{
     NodeHeartbeat, NodePgHeartbeatObservation, PendingMetadataCommandObservation, PgMetadataProof,
 };
@@ -374,6 +375,7 @@ impl StorageNode for LocalStorageNode {
 /// is wrapped in a `std::sync::Mutex`, serializing all operations within
 /// a PG while allowing parallelism across PGs.
 pub struct SharedStorageNode {
+    process_local_registry_key: ProcessLocalRegistryKey,
     stores: HashMap<u32, Mutex<PgStore>>,
     pg_paths: HashMap<u32, PgDataPaths>,
     pg_id_list: Vec<u32>,
@@ -414,6 +416,13 @@ pub(crate) struct LocalNodeClients {
     pub(crate) shard_ack: Arc<dyn ShardAckNodeClient>,
     pub(crate) shard_read_handle: Arc<dyn ShardReadHandleNodeClient>,
     pub(crate) shard_scavenger: Arc<dyn ShardScavengerNodeClient>,
+}
+
+fn allocate_process_local_registry_key() -> Result<ProcessLocalRegistryKey, StoreError> {
+    ProcessLocalRegistryKey::allocate().ok_or_else(|| StoreError::Io {
+        context: "allocate process-local storage registry key",
+        source: std::io::Error::other("process-local storage registry key space exhausted"),
+    })
 }
 
 impl LocalNodeRuntime {
@@ -468,8 +477,8 @@ impl LocalNodeRuntime {
         }
     }
 
-    pub(crate) fn process_local_registry_key(&self) -> usize {
-        Arc::as_ptr(&self.node) as usize
+    pub(crate) fn process_local_registry_key(&self) -> ProcessLocalRegistryKey {
+        self.node.process_local_registry_key
     }
 
     pub(crate) fn prepare_metadata_command_recovery(
@@ -619,6 +628,7 @@ impl SharedStorageNode {
             PgTopology::new(pg_ids).map_err(|source| StoreError::InvalidPgTopology { source })?;
 
         Ok(Self {
+            process_local_registry_key: allocate_process_local_registry_key()?,
             stores: HashMap::new(),
             pg_paths: HashMap::new(),
             pg_id_list,
@@ -702,6 +712,7 @@ impl SharedStorageNode {
             PgTopology::new(pg_ids).map_err(|source| StoreError::InvalidPgTopology { source })?;
 
         Ok(Self {
+            process_local_registry_key: allocate_process_local_registry_key()?,
             stores,
             pg_paths,
             pg_id_list,

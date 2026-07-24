@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::io;
-use std::sync::atomic::AtomicBool;
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::thread;
 use std::thread::JoinHandle;
@@ -100,6 +102,34 @@ use crate::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError};
 
 mod local;
 mod request_ops;
+
+static NEXT_PROCESS_LOCAL_REGISTRY_KEY: AtomicU64 = AtomicU64::new(1);
+
+/// Opaque identity used only to share process-local state for one storage node.
+///
+/// The key intentionally exposes neither its value nor `Display` or
+/// serialization support; its `Debug` output is redacted. It must never cross
+/// an RPC or durable boundary.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProcessLocalRegistryKey(NonZeroU64);
+
+impl ProcessLocalRegistryKey {
+    pub(crate) fn allocate() -> Option<Self> {
+        NEXT_PROCESS_LOCAL_REGISTRY_KEY
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .ok()
+            .and_then(NonZeroU64::new)
+            .map(Self)
+    }
+}
+
+impl fmt::Debug for ProcessLocalRegistryKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProcessLocalRegistryKey([redacted])")
+    }
+}
 
 const DIRECT_PUT_STALE_COMMIT_RETRY_BUDGET: Duration = Duration::from_secs(1);
 const STREAM_PUT_STALE_COMMIT_RETRY_BUDGET: Duration = Duration::from_secs(1);
@@ -2725,6 +2755,17 @@ mod runtime_map_refresh_invalidation_tests {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
         assert!(!owner_token.contains(&format!("{:p}", Arc::as_ptr(&cluster.local_map))));
+    }
+
+    #[test]
+    fn process_local_registry_keys_are_unique_and_debug_redacted() {
+        let first = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap())
+            .process_local_registry_key();
+        let second = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap())
+            .process_local_registry_key();
+
+        assert_ne!(first, second);
+        assert_eq!(format!("{first:?}"), "ProcessLocalRegistryKey([redacted])");
     }
 
     #[test]
@@ -6879,7 +6920,7 @@ impl StorageCluster {
     ///
     /// Multiple `StorageCluster` handles backed by the same local node keep
     /// sharing process-local workers until a real cluster identity exists.
-    pub fn process_local_registry_key(&self) -> usize {
+    pub fn process_local_registry_key(&self) -> ProcessLocalRegistryKey {
         self.local_map.process_local_registry_key()
     }
 
