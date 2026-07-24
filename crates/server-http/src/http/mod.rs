@@ -1802,11 +1802,10 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketLocation { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator.get_bucket_location(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)?;
+                self.coordinator.get_bucket_location_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )?;
                 Ok(S3Response::get_bucket_location(self.coordinator.region()))
             }
             S3Operation::ListObjectsV1 { bucket } => {
@@ -2489,11 +2488,10 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketVersioning { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                let state = self.coordinator.get_bucket_versioning(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)?;
+                let state = self.coordinator.get_bucket_versioning_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )?;
                 Ok(S3Response::get_bucket_versioning(state))
             }
             S3Operation::PutBucketObjectLockConfiguration { bucket } => {
@@ -9695,9 +9693,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(resp.status_code, 200);
+        let storage_route_admission = fe.coordinator.admit_storage_route_for_request().unwrap();
         assert_eq!(
             fe.coordinator
-                .get_bucket_versioning(&test_bucket_request("mybucket"))
+                .get_bucket_versioning_on_admitted_route(
+                    &storage_route_admission,
+                    &test_bucket_request("mybucket"),
+                )
                 .unwrap(),
             s3_types::BucketVersioningState::Enabled
         );

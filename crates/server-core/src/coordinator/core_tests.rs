@@ -228,7 +228,7 @@ fn coordinator_storage_node_tracks_runtime_map_handle_install() {
 }
 
 #[test]
-fn head_bucket_rechecks_the_request_admission_deadline_before_snapshot_load() {
+fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_load() {
     let tmp = test_util::tempdir();
     let initial = open_test_storage_cluster(tmp.path(), &[0]);
     let initial_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
@@ -258,13 +258,31 @@ fn head_bucket_rechecks_the_request_admission_deadline_before_snapshot_load() {
         cluster
             .head_bucket_info(&trusted_bucket_name("bucket"))
             .unwrap();
-        let error = coord
-            .head_bucket_on_admitted_route(
-                &admission,
-                &bucket_request_with_expected_owner("bucket", test_requester(), None),
-            )
-            .unwrap_err();
-        assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+        let request = bucket_request_with_expected_owner("bucket", test_requester(), None);
+        for (operation, result) in [
+            (
+                "HeadBucket",
+                coord
+                    .head_bucket_on_admitted_route(&admission, &request)
+                    .map(|_| ()),
+            ),
+            (
+                "GetBucketLocation",
+                coord.get_bucket_location_on_admitted_route(&admission, &request),
+            ),
+            (
+                "GetBucketVersioning",
+                coord
+                    .get_bucket_versioning_on_admitted_route(&admission, &request)
+                    .map(|_| ()),
+            ),
+        ] {
+            let error = result.expect_err(operation);
+            assert!(
+                matches!(error, ServerError::OperationAborted),
+                "{operation}: {error:?}"
+            );
+        }
     });
 }
 
@@ -379,7 +397,7 @@ fn head_bucket_warm_policy_cache_uses_loaded_identity_and_captured_deadline() {
 }
 
 #[test]
-fn head_bucket_rejects_admission_from_an_unrelated_coordinator() {
+fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
     let tmp = test_util::tempdir();
     let cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
@@ -411,11 +429,37 @@ fn head_bucket_rejects_admission_from_an_unrelated_coordinator() {
     foreign
         .head_bucket_on_admitted_route(&foreign_admission, &request)
         .unwrap();
+    foreign
+        .get_bucket_location_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    foreign
+        .get_bucket_versioning_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
 
-    let error = local
-        .head_bucket_on_admitted_route(&foreign_admission, &request)
-        .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    for (operation, result) in [
+        (
+            "HeadBucket",
+            local
+                .head_bucket_on_admitted_route(&foreign_admission, &request)
+                .map(|_| ()),
+        ),
+        (
+            "GetBucketLocation",
+            local.get_bucket_location_on_admitted_route(&foreign_admission, &request),
+        ),
+        (
+            "GetBucketVersioning",
+            local
+                .get_bucket_versioning_on_admitted_route(&foreign_admission, &request)
+                .map(|_| ()),
+        ),
+    ] {
+        let error = result.expect_err(operation);
+        assert!(
+            matches!(error, ServerError::OperationAborted),
+            "{operation}: {error:?}"
+        );
+    }
 }
 
 #[test]

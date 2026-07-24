@@ -2430,6 +2430,32 @@ Forty-ninth Phase 3 slice:
   workspace-wide strict Clippy, and the full parallel workspace suite pass
   (7,534 tests).
 
+Fiftieth Phase 3 slice:
+
+- `GetBucketLocation` and `GetBucketVersioning` now consume the buffered
+  request's existing `StorageClusterRouteAdmission` and load their complete
+  policy/conditional-ABAC bucket view through its `ActiveBucketRoute`. Their
+  production raw-route coordinator entry points are removed; crate-local test
+  callers retain helpers which acquire fresh admission before entering the
+  same production methods.
+- both authorization paths now separate admitted bucket loading from policy
+  evaluation on a `LoadedBucketHandle`. This keeps the existing AWS-compatible
+  policy, ownership, expected-owner, and bucket-tag semantics while preventing
+  either operation from resampling the renewable runtime-map handle after HTTP
+  request admission.
+- the shared bucket-metadata deadline regression now proves that HeadBucket,
+  GetBucketLocation, and GetBucketVersioning all reject an expired captured
+  admission after a same-generation renewal leaves the raw cluster usable. A
+  same-cluster/different-runtime-handle regression supplies positive foreign
+  canaries and proves all three operations reject that foreign publication
+  domain before bucket access.
+- the other buffered coordinator workflows, their production raw entry points,
+  and capability requirements on the node-client traits remain open in Phase
+  3.
+- focused coordinator, HTTP-dispatch, bucket-policy, and bucket-tag ABAC tests,
+  formatting, the storage boundary checker, and workspace-wide strict Clippy
+  pass. The full parallel workspace suite passes (7,549 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

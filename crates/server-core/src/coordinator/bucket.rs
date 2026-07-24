@@ -589,29 +589,49 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_versioning(
+    pub fn get_bucket_versioning_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<BucketVersioningState, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_versioning",
+            "Coordinator::get_bucket_versioning_on_admitted_route",
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_get_bucket_versioning(req)?;
+        let authorized = self.authorize_get_bucket_versioning_on_admitted_route(admission, req)?;
         Ok(authorized.state)
     }
 
-    pub fn get_bucket_location(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+    #[cfg(test)]
+    pub fn get_bucket_versioning(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<BucketVersioningState, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_bucket_versioning_on_admitted_route(&admission, req)
+    }
+
+    pub fn get_bucket_location_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_location",
+            "Coordinator::get_bucket_location_on_admitted_route",
             "bucket={:?}",
             req.name
         );
-        let _authorized = self.authorize_get_bucket_location(req)?;
+        let _authorized = self.authorize_get_bucket_location_on_admitted_route(admission, req)?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn get_bucket_location(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_bucket_location_on_admitted_route(&admission, req)
     }
 
     pub fn put_bucket_object_lock_configuration(
