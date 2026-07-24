@@ -2511,6 +2511,34 @@ Fifty-second Phase 3 slice:
   the storage boundary checker and workspace-wide strict Clippy pass. The full
   parallel workspace suite passes (7,549 tests).
 
+Fifty-third Phase 3 slice:
+
+- `GetBucketPublicAccessBlock`, `GetBucketOwnershipControls`, and
+  `GetBucketAcl` now consume the buffered request's existing
+  `StorageClusterRouteAdmission`. Their policy and conditional-ABAC views load
+  through the admitted route, and their production coordinator entry points no
+  longer resample the renewable runtime-map handle. Crate-local tests retain
+  helpers which acquire fresh admission before entering the production paths.
+- public-access-block and ownership-control authorization now factor the
+  unchanged policy result from the admitted `LoadedBucketHandle`. Bucket ACL
+  authorization does the same while preserving its separate ACL-read fallback
+  and BOE synthetic owner-only ACL rendering. Existing expected-owner,
+  cross-account policy, conditional bucket-tag ABAC, missing-configuration,
+  and ACL grant semantics are unchanged.
+- the shared bucket-metadata regressions now cover twelve operations. Positive
+  canaries and negative same-cluster/different-publication-domain cases cover
+  the two optional summary fields and ACL rendering, while the captured-
+  deadline matrix proves same-generation renewal cannot extend any of these
+  requests.
+- bucket-policy document and policy-status reads remain a separate buffered
+  slice because they have missing-policy and owner-root precedence rules. The
+  other buffered coordinator workflows and capability requirements on the
+  node-client traits also remain open in Phase 3.
+- focused coordinator, bucket-ACL, ownership-controls, public-access-block,
+  expected-owner, bucket-policy, and conditional-ABAC tests pass (102 tests).
+  Formatting, the storage boundary checker, and workspace-wide strict Clippy
+  pass. The full parallel workspace suite passes (7,549 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

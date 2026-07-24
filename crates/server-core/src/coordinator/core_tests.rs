@@ -319,6 +319,24 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
                     .get_bucket_lifecycle_on_admitted_route(&admission, &request)
                     .map(|_| ()),
             ),
+            (
+                "GetBucketPublicAccessBlock",
+                coord
+                    .get_bucket_public_access_block_on_admitted_route(&admission, &request)
+                    .map(|_| ()),
+            ),
+            (
+                "GetBucketOwnershipControls",
+                coord
+                    .get_bucket_ownership_controls_on_admitted_route(&admission, &request)
+                    .map(|_| ()),
+            ),
+            (
+                "GetBucketAcl",
+                coord
+                    .get_bucket_acl_on_admitted_route(&admission, &request)
+                    .map(|_| ()),
+            ),
         ] {
             let error = result.expect_err(operation);
             assert!(
@@ -503,6 +521,15 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
     foreign
         .get_bucket_lifecycle_on_admitted_route(&foreign_admission, &request)
         .unwrap();
+    foreign
+        .get_bucket_public_access_block_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    foreign
+        .get_bucket_ownership_controls_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    foreign
+        .get_bucket_acl_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
 
     for (operation, result) in [
         (
@@ -558,6 +585,24 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
             "GetBucketLifecycle",
             local
                 .get_bucket_lifecycle_on_admitted_route(&foreign_admission, &request)
+                .map(|_| ()),
+        ),
+        (
+            "GetBucketPublicAccessBlock",
+            local
+                .get_bucket_public_access_block_on_admitted_route(&foreign_admission, &request)
+                .map(|_| ()),
+        ),
+        (
+            "GetBucketOwnershipControls",
+            local
+                .get_bucket_ownership_controls_on_admitted_route(&foreign_admission, &request)
+                .map(|_| ()),
+        ),
+        (
+            "GetBucketAcl",
+            local
+                .get_bucket_acl_on_admitted_route(&foreign_admission, &request)
                 .map(|_| ()),
         ),
     ] {

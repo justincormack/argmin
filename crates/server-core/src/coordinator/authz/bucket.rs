@@ -674,6 +674,7 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_get_bucket_public_access_block(
         &self,
         req: &BucketRequest<'_>,
@@ -683,6 +684,26 @@ impl Coordinator {
             auth::PolicyAction::GetBucketPublicAccessBlock,
             Self::requester_can_bucket_owner_account_admin,
         )?;
+        Self::authorize_get_bucket_public_access_block_with_loaded_handle(bucket)
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_public_access_block_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketPublicAccessBlock, ServerError> {
+        let bucket = self.authorize_loaded_bucket_action_for_on_admitted_route(
+            admission,
+            req,
+            auth::PolicyAction::GetBucketPublicAccessBlock,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Self::authorize_get_bucket_public_access_block_with_loaded_handle(bucket)
+    }
+
+    fn authorize_get_bucket_public_access_block_with_loaded_handle(
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedGetBucketPublicAccessBlock, ServerError> {
         Ok(AuthorizedGetBucketPublicAccessBlock {
             config: bucket.bucket().public_access_block,
         })
@@ -763,6 +784,7 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_get_bucket_ownership_controls(
         &self,
         req: &BucketRequest<'_>,
@@ -772,6 +794,26 @@ impl Coordinator {
             auth::PolicyAction::GetBucketOwnershipControls,
             Self::requester_can_bucket_owner_account_admin,
         )?;
+        Self::authorize_get_bucket_ownership_controls_with_loaded_handle(bucket)
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_ownership_controls_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketOwnershipControls, ServerError> {
+        let bucket = self.authorize_loaded_bucket_action_for_on_admitted_route(
+            admission,
+            req,
+            auth::PolicyAction::GetBucketOwnershipControls,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Self::authorize_get_bucket_ownership_controls_with_loaded_handle(bucket)
+    }
+
+    fn authorize_get_bucket_ownership_controls_with_loaded_handle(
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedGetBucketOwnershipControls, ServerError> {
         Ok(AuthorizedGetBucketOwnershipControls {
             config: bucket.bucket().ownership_controls,
         })
@@ -1337,11 +1379,30 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_get_bucket_acl(
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketAcl, ServerError> {
         let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        self.authorize_get_bucket_acl_with_loaded_handle(req, bucket)
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_acl_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketAcl, ServerError> {
+        let bucket =
+            self.load_bucket_handle_for_bucket_policy_read_on_admitted_route(admission, req)?;
+        self.authorize_get_bucket_acl_with_loaded_handle(req, bucket)
+    }
+
+    fn authorize_get_bucket_acl_with_loaded_handle(
+        &self,
+        req: &BucketRequest<'_>,
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedGetBucketAcl, ServerError> {
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let policy_decision = self.bucket_policy_decision_for_loaded_handle(
             &req.requester,

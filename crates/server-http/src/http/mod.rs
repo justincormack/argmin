@@ -2898,11 +2898,10 @@ impl HttpFrontend {
                 let requester = self.requester_from_auth(auth, req)?;
                 match self
                     .coordinator
-                    .get_bucket_public_access_block(&bucket_request(
-                        &bucket,
-                        requester,
-                        expected_bucket_owner,
-                    )?)? {
+                    .get_bucket_public_access_block_on_admitted_route(
+                        storage_route_admission,
+                        &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                    )? {
                     Some(config) => Ok(S3Response::get_bucket_public_access_block(
                         &xml::get_public_access_block_xml(&config),
                     )),
@@ -2937,11 +2936,10 @@ impl HttpFrontend {
                 let requester = self.requester_from_auth(auth, req)?;
                 match self
                     .coordinator
-                    .get_bucket_ownership_controls(&bucket_request(
-                        &bucket,
-                        requester,
-                        expected_bucket_owner,
-                    )?)? {
+                    .get_bucket_ownership_controls_on_admitted_route(
+                        storage_route_admission,
+                        &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                    )? {
                     Some(config) => Ok(S3Response::get_bucket_ownership_controls(
                         &xml::get_ownership_controls_xml(&config),
                     )),
@@ -3017,11 +3015,10 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketAcl { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                let result = self.coordinator.get_bucket_acl(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)?;
+                let result = self.coordinator.get_bucket_acl_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )?;
                 let (owner_display_name, grants) = self.render_acl_grants(
                     &result.owner_principal,
                     &result.owner_canonical_id,

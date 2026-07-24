@@ -1222,18 +1222,29 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_public_access_block(
+    pub fn get_bucket_public_access_block_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<Option<PublicAccessBlockConfig>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_public_access_block",
+            "Coordinator::get_bucket_public_access_block_on_admitted_route",
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_get_bucket_public_access_block(req)?;
+        let authorized =
+            self.authorize_get_bucket_public_access_block_on_admitted_route(admission, req)?;
         Ok(authorized.config)
+    }
+
+    #[cfg(test)]
+    pub fn get_bucket_public_access_block(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<PublicAccessBlockConfig>, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_bucket_public_access_block_on_admitted_route(&admission, req)
     }
 
     pub fn delete_bucket_public_access_block(
@@ -1277,18 +1288,29 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_ownership_controls(
+    pub fn get_bucket_ownership_controls_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<Option<BucketOwnershipControls>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_ownership_controls",
+            "Coordinator::get_bucket_ownership_controls_on_admitted_route",
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_get_bucket_ownership_controls(req)?;
+        let authorized =
+            self.authorize_get_bucket_ownership_controls_on_admitted_route(admission, req)?;
         Ok(authorized.config)
+    }
+
+    #[cfg(test)]
+    pub fn get_bucket_ownership_controls(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<BucketOwnershipControls>, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_bucket_ownership_controls_on_admitted_route(&admission, req)
     }
 
     pub fn delete_bucket_ownership_controls(
@@ -1311,18 +1333,28 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_acl(
+    pub fn get_bucket_acl_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<GetBucketAclResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_acl",
+            "Coordinator::get_bucket_acl_on_admitted_route",
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_get_bucket_acl(req)?;
+        let authorized = self.authorize_get_bucket_acl_on_admitted_route(admission, req)?;
         Ok(authorized.result)
+    }
+
+    #[cfg(test)]
+    pub fn get_bucket_acl(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<GetBucketAclResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_bucket_acl_on_admitted_route(&admission, req)
     }
 
     pub fn put_bucket_acl(&self, req: &PutBucketAclRequest<'_>) -> Result<(), ServerError> {

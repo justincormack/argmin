@@ -1925,6 +1925,7 @@ impl Coordinator {
         }
     }
 
+    #[cfg(test)]
     fn authorize_loaded_bucket_action_for(
         &self,
         req: &BucketRequest<'_>,
