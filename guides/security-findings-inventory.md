@@ -8,6 +8,7 @@ for the current local security suite.
 
 | Finding | Status | Local deterministic path | Notes |
 | --- | --- | --- | --- |
+| `security/RECURSEDROP-001.md` Unbounded lifecycle XML nesting causes recursive-drop stack overflow | fixed in `d121bc86` | `cargo nextest run -p server-http parse_lifecycle_configuration_rejects_deep_nesting_without_recursive_drop`; `./scripts/security-tests parser` | Lifecycle XML now uses a bounded `quick-xml` event parser which builds typed configuration state directly and never materializes a recursive XML tree. The endpoint-neutral nested-element regression also passes against live AWS S3. |
 | `security/codex-058e075` POST SigV4 auth panics on malformed UTF-8 date input | fixed | `./scripts/security-tests parser authn` | Covered by shared auth/parser hardening regressions. |
 | `security/codex-14d95e1` Malformed x-amz-date can panic time-skew parsing | fixed | `./scripts/security-tests parser authn` | Covered by SigV4 date parsing regressions. |
 | `security/codex-23ffb1b` Copy-source header can crash PG hashing via length assert | fixed | `./scripts/security-tests parser` | Covered by copy-source and query-validation tests. |
