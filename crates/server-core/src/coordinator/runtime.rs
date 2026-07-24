@@ -444,12 +444,13 @@ fn background_work_admission_for(
 
 fn earliest_object_payload_reclaim_retry_sleep(
     storage_node: &StorageCluster,
-    deferred_work: &VecDeque<ObjectPayloadReclaimRoot>,
+    deferred_work: &VecDeque<DeferredReclaimWork<ObjectPayloadReclaimRoot>>,
     retry_after_by_pg: &HashMap<u32, Instant>,
 ) -> Option<Duration> {
     let now = Instant::now();
     let mut earliest_retry: Option<Instant> = None;
-    for (bucket, key, _) in deferred_work {
+    for deferred in deferred_work {
+        let (bucket, key, _) = &deferred.root;
         let pg_id = storage_node.object_payload_reclaim_pg_id(bucket, key);
         let retry_after = retry_after_by_pg.get(&pg_id)?;
         if *retry_after <= now {
@@ -468,12 +469,13 @@ fn earliest_object_payload_reclaim_retry_sleep(
 }
 
 fn defer_object_payload_reclaim(
-    deferred_work: &mut VecDeque<ObjectPayloadReclaimRoot>,
+    deferred_work: &mut VecDeque<DeferredReclaimWork<ObjectPayloadReclaimRoot>>,
     deferred_roots: &mut HashSet<ObjectPayloadReclaimRoot>,
+    queue_owner: Arc<StorageCluster>,
     root: ObjectPayloadReclaimRoot,
 ) {
     if deferred_roots.insert(root.clone()) {
-        deferred_work.push_back(root);
+        deferred_work.push_back(DeferredReclaimWork { queue_owner, root });
     }
 }
 
@@ -510,13 +512,13 @@ fn defer_bucket_delete_begin(
     }
 }
 
-fn earliest_bucket_delete_finalize_retry_sleep(
-    deferred_work: &VecDeque<BucketDeleteFinalizeRoot>,
+fn earliest_bucket_delete_finalize_retry_sleep<'a>(
+    deferred_roots: impl IntoIterator<Item = &'a BucketDeleteFinalizeRoot>,
     retry_after_by_root: &HashMap<BucketDeleteFinalizeRoot, Instant>,
 ) -> Option<Duration> {
     let now = Instant::now();
     let mut earliest_retry: Option<Instant> = None;
-    for root in deferred_work {
+    for root in deferred_roots {
         let retry_after = retry_after_by_root.get(root)?;
         if *retry_after <= now {
             return None;
@@ -534,13 +536,19 @@ fn earliest_bucket_delete_finalize_retry_sleep(
 }
 
 fn defer_bucket_delete_finalize(
-    deferred_work: &mut VecDeque<BucketDeleteFinalizeRoot>,
+    deferred_work: &mut VecDeque<DeferredReclaimWork<BucketDeleteFinalizeRoot>>,
     deferred_roots: &mut HashSet<BucketDeleteFinalizeRoot>,
+    queue_owner: Arc<StorageCluster>,
     root: BucketDeleteFinalizeRoot,
 ) {
     if deferred_roots.insert(root.clone()) {
-        deferred_work.push_back(root);
+        deferred_work.push_back(DeferredReclaimWork { queue_owner, root });
     }
+}
+
+struct DeferredReclaimWork<T> {
+    queue_owner: Arc<StorageCluster>,
+    root: T,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -783,7 +791,9 @@ impl ReclaimSweeper {
             .spawn(move || {
                 let mut object_payload_reclaim_pg_retry_after: HashMap<u32, Instant> =
                     HashMap::new();
-                let mut deferred_object_payload_reclaim = VecDeque::new();
+                let mut deferred_object_payload_reclaim: VecDeque<
+                    DeferredReclaimWork<ObjectPayloadReclaimRoot>,
+                > = VecDeque::new();
                 let mut deferred_object_payload_reclaim_roots = HashSet::new();
                 let mut bucket_delete_begin_retry_after: HashMap<BucketDeleteBeginRoot, Instant> =
                     HashMap::new();
@@ -795,8 +805,9 @@ impl ReclaimSweeper {
                     BucketDeleteFinalizeRoot,
                     Instant,
                 > = HashMap::new();
-                let mut deferred_bucket_delete_finalize: VecDeque<BucketDeleteFinalizeRoot> =
-                    VecDeque::new();
+                let mut deferred_bucket_delete_finalize: VecDeque<
+                    DeferredReclaimWork<BucketDeleteFinalizeRoot>,
+                > = VecDeque::new();
                 let mut deferred_bucket_delete_finalize_roots: HashSet<BucketDeleteFinalizeRoot> =
                     HashSet::new();
                 let mut durable_scan_schedule = DurableReclaimScanSchedule::immediate();
@@ -835,12 +846,14 @@ impl ReclaimSweeper {
                                 .try_take_reclaim_work()
                                 .map(|work| (Arc::clone(&current_worker_node), work))
                                 .or_else(|| {
-                                    if let Some(root) = deferred_object_payload_reclaim.pop_front()
+                                    if let Some(deferred) =
+                                        deferred_object_payload_reclaim.pop_front()
                                     {
-                                        deferred_object_payload_reclaim_roots.remove(&root);
+                                        deferred_object_payload_reclaim_roots
+                                            .remove(&deferred.root);
                                         return Some((
-                                            Arc::clone(&current_worker_node),
-                                            ReclaimWorkItem::ObjectPayload(root),
+                                            deferred.queue_owner,
+                                            ReclaimWorkItem::ObjectPayload(deferred.root),
                                         ));
                                     }
                                     deferred_bucket_delete_begin
@@ -854,12 +867,14 @@ impl ReclaimSweeper {
                                         })
                                         .or_else(|| {
                                             deferred_bucket_delete_finalize.pop_front().map(
-                                                |root| {
+                                                |deferred| {
                                                     deferred_bucket_delete_finalize_roots
-                                                        .remove(&root);
+                                                        .remove(&deferred.root);
                                                     (
-                                                        Arc::clone(&current_worker_node),
-                                                        ReclaimWorkItem::BucketDelete(root),
+                                                        deferred.queue_owner,
+                                                        ReclaimWorkItem::BucketDelete(
+                                                            deferred.root,
+                                                        ),
                                                     )
                                                 },
                                             )
@@ -906,6 +921,18 @@ impl ReclaimSweeper {
                         ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)) => {
                             let root = (bucket, key, generation_id);
                             if deferred_object_payload_reclaim_roots.contains(&root) {
+                                let deferred_owner = deferred_object_payload_reclaim
+                                    .iter()
+                                    .find(|deferred| deferred.root == root)
+                                    .map(|deferred| &deferred.queue_owner);
+                                if deferred_owner.is_some_and(|deferred_owner| {
+                                    deferred_owner.process_local_registry_key()
+                                        != queue_owner.process_local_registry_key()
+                                }) {
+                                    queue_owner.finish_object_payload_reclaim_work(
+                                        &root.0, &root.1, root.2,
+                                    );
+                                }
                                 continue;
                             }
                             let (bucket, key, generation_id) = root;
@@ -922,6 +949,7 @@ impl ReclaimSweeper {
                                 defer_object_payload_reclaim(
                                     &mut deferred_object_payload_reclaim,
                                     &mut deferred_object_payload_reclaim_roots,
+                                    Arc::clone(&queue_owner),
                                     (bucket, key, generation_id),
                                 );
                             } else {
@@ -943,6 +971,7 @@ impl ReclaimSweeper {
                                     defer_object_payload_reclaim(
                                         &mut deferred_object_payload_reclaim,
                                         &mut deferred_object_payload_reclaim_roots,
+                                        Arc::clone(&queue_owner),
                                         (bucket, key, generation_id),
                                     );
                                 } else {
@@ -957,6 +986,16 @@ impl ReclaimSweeper {
                         }
                         ReclaimWorkItem::BucketDelete(root) => {
                             if deferred_bucket_delete_finalize_roots.contains(&root) {
+                                let deferred_owner = deferred_bucket_delete_finalize
+                                    .iter()
+                                    .find(|deferred| deferred.root == root)
+                                    .map(|deferred| &deferred.queue_owner);
+                                if deferred_owner.is_some_and(|deferred_owner| {
+                                    deferred_owner.process_local_registry_key()
+                                        != queue_owner.process_local_registry_key()
+                                }) {
+                                    queue_owner.finish_bucket_delete_finalize_work(&root);
+                                }
                                 continue;
                             }
                             let is_cooled = bucket_delete_finalize_retry_after
@@ -966,6 +1005,7 @@ impl ReclaimSweeper {
                                 defer_bucket_delete_finalize(
                                     &mut deferred_bucket_delete_finalize,
                                     &mut deferred_bucket_delete_finalize_roots,
+                                    Arc::clone(&queue_owner),
                                     root,
                                 );
                             } else {
@@ -1002,6 +1042,7 @@ impl ReclaimSweeper {
                                         defer_bucket_delete_finalize(
                                             &mut deferred_bucket_delete_finalize,
                                             &mut deferred_bucket_delete_finalize_roots,
+                                            Arc::clone(&queue_owner),
                                             root,
                                         );
                                     }
@@ -1103,7 +1144,9 @@ impl ReclaimSweeper {
                                 ),
                             ),
                             earliest_bucket_delete_finalize_retry_sleep(
-                                &deferred_bucket_delete_finalize,
+                                deferred_bucket_delete_finalize
+                                    .iter()
+                                    .map(|deferred| &deferred.root),
                                 &bucket_delete_finalize_retry_after,
                             ),
                         ) {

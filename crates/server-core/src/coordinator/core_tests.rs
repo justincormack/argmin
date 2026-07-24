@@ -1440,6 +1440,213 @@ fn reclaim_worker_resamples_runtime_map_after_dequeue() {
 }
 
 #[test]
+fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let pg_ids = (0..32).collect::<Vec<_>>();
+    let initial = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let bucket = trusted_bucket_name("deferred-finalize-runtime-refresh");
+    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    direct_coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    let bucket_info = initial.test_head_bucket_raw(&bucket).unwrap();
+    drop(direct_coord);
+    initial
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
+    let replacement = open_test_storage_cluster(tmp.path(), &pg_ids);
+    replacement.test_store_route_map_validity(long_lived_test_route_map_validity());
+    let root = storage::BucketDeleteFinalizeRoot {
+        bucket,
+        bucket_incarnation_generation: bucket_info.bucket_incarnation_generation,
+    };
+    initial.enqueue_bucket_delete_finalize(root.clone());
+
+    assert_ne!(
+        initial.process_local_registry_key(),
+        replacement.process_local_registry_key(),
+        "the replacement must own an independent reclaim queue"
+    );
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_hook = Arc::clone(&attempts);
+    let handle_for_hook = handle.clone();
+    let replacement_for_hook = Arc::clone(&replacement);
+    let duplicate_root = root.clone();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target_reclaim_worker_registry_key: Some(initial.process_local_registry_key()),
+        before_reclaim_work_execute: Some(Arc::new(move |_execution_cluster| {
+            if attempts_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                handle_for_hook
+                    .install(Arc::clone(&replacement_for_hook))
+                    .unwrap();
+                replacement_for_hook.enqueue_bucket_delete_finalize(duplicate_root.clone());
+            }
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    let _worker = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    while initial.test_bucket_delete_finalize_outstanding_depth() != 0 && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 2,
+        "the finalizer must retry against the refreshed runtime map"
+    );
+    assert_eq!(
+        initial.test_bucket_delete_finalize_outstanding_depth(),
+        0,
+        "terminal deferred work must clear the generation that originally owned the queue item"
+    );
+    assert_eq!(
+        replacement.test_bucket_delete_finalize_outstanding_depth(),
+        0,
+        "duplicate work must acknowledge the replacement generation's outstanding root"
+    );
+}
+
+#[test]
+fn deferred_object_reclaim_clears_original_and_duplicate_runtime_map_queue_owners() {
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", "deferred-object-reclaim-refresh", false)
+        .unwrap();
+    let bucket = trusted_bucket_name("deferred-object-reclaim-refresh");
+    let key = trusted_object_key("key");
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                bucket.as_str(),
+                key.as_str(),
+                test_requester(),
+                None,
+            ),
+            data: b"first payload",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let generation_id = initial
+        .test_get_object_meta(&bucket, &key)
+        .unwrap()
+        .into_live()
+        .expect("first put should create a live object")
+        .generation_id;
+    let payload_lease = initial
+        .acquire_object_payload_lease(&bucket, &key, generation_id)
+        .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                bucket.as_str(),
+                key.as_str(),
+                test_requester(),
+                None,
+            ),
+            data: b"replacement payload",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    drop(coord);
+
+    let replacement = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    replacement.test_store_route_map_validity(long_lived_test_route_map_validity());
+    assert_ne!(
+        initial.process_local_registry_key(),
+        replacement.process_local_registry_key(),
+        "the replacement must own an independent reclaim queue"
+    );
+    assert_eq!(initial.test_object_payload_reclaim_outstanding_depth(), 1);
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_hook = Arc::clone(&attempts);
+    let handle_for_hook = handle.clone();
+    let replacement_for_hook = Arc::clone(&replacement);
+    let duplicate_bucket = bucket.clone();
+    let duplicate_key = key.clone();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target_reclaim_worker_registry_key: Some(initial.process_local_registry_key()),
+        before_reclaim_work_execute: Some(Arc::new(move |_execution_cluster| {
+            if attempts_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                handle_for_hook
+                    .install(Arc::clone(&replacement_for_hook))
+                    .unwrap();
+                replacement_for_hook.enqueue_object_payload_reclaim(
+                    &duplicate_bucket,
+                    &duplicate_key,
+                    generation_id,
+                );
+            }
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    let _worker = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    while (initial.test_object_payload_reclaim_outstanding_depth() != 0
+        || replacement.test_object_payload_reclaim_outstanding_depth() != 0)
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(payload_lease);
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 2,
+        "the object reclaim must retry against the refreshed runtime map"
+    );
+    assert_eq!(
+        initial.test_object_payload_reclaim_outstanding_depth(),
+        0,
+        "terminal deferred reclaim must clear its original generation"
+    );
+    assert_eq!(
+        replacement.test_object_payload_reclaim_outstanding_depth(),
+        0,
+        "duplicate reclaim must acknowledge the replacement generation"
+    );
+}
+
+#[test]
 fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
     let tmp = test_util::tempdir();
     let initial = open_test_storage_cluster(tmp.path(), &[0]);

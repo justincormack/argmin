@@ -1236,6 +1236,26 @@ impl LocalClusterRuntimeState {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_bucket_delete_finalize_outstanding_depth(&self) -> usize {
+        self.reclaim_queue
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .outstanding_bucket_deletes
+            .len()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_object_payload_reclaim_outstanding_depth(&self) -> usize {
+        self.reclaim_queue
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .outstanding_objects
+            .len()
+    }
+
     pub(crate) fn enqueue_placed_segment_shard_repair(
         &self,
         work_item: PlacedSegmentShardRepairWorkItem,

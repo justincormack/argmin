@@ -6312,6 +6312,20 @@ impl StorageCluster {
         self.local_map.test_store_route_map_validity(validity);
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_bucket_delete_finalize_outstanding_depth(&self) -> usize {
+        self.local_map
+            .runtime_state()
+            .test_bucket_delete_finalize_outstanding_depth()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_payload_reclaim_outstanding_depth(&self) -> usize {
+        self.local_map
+            .runtime_state()
+            .test_object_payload_reclaim_outstanding_depth()
+    }
+
     fn replace_route_map_lease(
         &self,
         validity: RouteMapValidity,
