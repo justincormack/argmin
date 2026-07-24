@@ -758,6 +758,23 @@ fn test_put_bucket_lifecycle_rejects_duplicate_rule_ids() {
 }
 
 #[test]
+fn test_put_bucket_lifecycle_rejects_nested_unknown_elements_as_malformed_xml() {
+    s3_tests::run(async {
+        const DEPTH: usize = 64;
+        let mut body = String::from("<LifecycleConfiguration><Rule>");
+        for _ in 0..DEPTH {
+            body.push_str("<a>");
+        }
+        for _ in 0..DEPTH {
+            body.push_str("</a>");
+        }
+        body.push_str("</Rule></LifecycleConfiguration>");
+
+        assert_invalid_lifecycle_put_rejected(&body, "MalformedXML").await;
+    });
+}
+
+#[test]
 fn test_put_bucket_lifecycle_rejects_invalid_status() {
     s3_tests::run(async {
         let body = "<LifecycleConfiguration>\

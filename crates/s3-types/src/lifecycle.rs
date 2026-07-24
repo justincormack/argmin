@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 use std::num::NonZeroU32;
 
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::Reader;
+
 use crate::{validate_tag_key_length, validate_tag_value_length};
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -288,24 +291,7 @@ impl LifecycleDate {
 pub fn parse_lifecycle_configuration_xml(
     data: &[u8],
 ) -> Result<BucketLifecycleConfiguration, LifecycleConfigError> {
-    let root = parse_xml_document(data)?;
-    if root.name != "LifecycleConfiguration" {
-        return Err(LifecycleConfigError::MalformedXml {
-            reason: "missing LifecycleConfiguration element".to_string(),
-        });
-    }
-    root.ensure_no_text()?;
-
-    let mut rules = Vec::new();
-    for child in &root.children {
-        if child.name != "Rule" {
-            return Err(LifecycleConfigError::MalformedXml {
-                reason: format!("unexpected <{}> in LifecycleConfiguration", child.name),
-            });
-        }
-        rules.push(parse_rule(child)?);
-    }
-
+    let rules = LifecycleXmlParser::parse(data)?;
     validate_configuration(&rules)?;
     Ok(BucketLifecycleConfiguration { rules })
 }
@@ -609,23 +595,434 @@ fn validate_tag_filters(tags: &[LifecycleTag]) -> Result<(), LifecycleConfigErro
     Ok(())
 }
 
-fn parse_rule(element: &XmlElement) -> Result<LifecycleRule, LifecycleConfigError> {
-    element.ensure_no_text()?;
-    let mut id = None;
-    let mut status = None;
-    let mut legacy_prefix = None;
-    let mut filter = LifecycleRuleFilter::default();
-    let mut expiration = None;
-    let mut noncurrent_version_expiration = None;
-    let mut abort_incomplete_multipart_upload = None;
+const MAX_LIFECYCLE_XML_DEPTH: usize = 32;
 
-    for child in &element.children {
-        match child.name.as_str() {
-            "ID" => {
-                set_once(&mut id, child.trimmed_text()?.to_string(), "ID")?;
+struct LifecycleXmlParser {
+    frames: Vec<LifecycleXmlFrame>,
+    rules: Option<Vec<LifecycleRule>>,
+}
+
+enum LifecycleXmlFrame {
+    Configuration { rules: Vec<LifecycleRule> },
+    Rule(RuleBuilder),
+    Filter(FilterBuilder),
+    And(AndBuilder),
+    Tag(TagBuilder),
+    Expiration(ExpirationBuilder),
+    NoncurrentVersionExpiration(NoncurrentVersionExpirationBuilder),
+    AbortIncompleteMultipartUpload(AbortIncompleteMultipartUploadBuilder),
+    Text { target: TextTarget, value: String },
+}
+
+#[derive(Default)]
+struct RuleBuilder {
+    id: Option<String>,
+    status: Option<LifecycleRuleStatus>,
+    legacy_prefix: Option<String>,
+    filter: LifecycleRuleFilter,
+    expiration: Option<LifecycleExpiration>,
+    noncurrent_version_expiration: Option<NoncurrentVersionExpiration>,
+    abort_incomplete_multipart_upload: Option<AbortIncompleteMultipartUpload>,
+}
+
+struct FilterBuilder {
+    filter: LifecycleRuleFilter,
+    predicate: Option<&'static str>,
+}
+
+#[derive(Default)]
+struct AndBuilder {
+    filter: LifecycleRuleFilter,
+}
+
+#[derive(Default)]
+struct TagBuilder {
+    key: Option<String>,
+    value: Option<String>,
+}
+
+#[derive(Default)]
+struct ExpirationBuilder {
+    days: Option<NonZeroU32>,
+    date: Option<LifecycleDate>,
+    delete_marker: Option<bool>,
+}
+
+#[derive(Default)]
+struct NoncurrentVersionExpirationBuilder {
+    noncurrent_days: Option<NonZeroU32>,
+    newer_noncurrent_versions: Option<NonZeroU32>,
+}
+
+#[derive(Default)]
+struct AbortIncompleteMultipartUploadBuilder {
+    days: Option<NonZeroU32>,
+}
+
+#[derive(Clone, Copy)]
+enum TextTarget {
+    RuleId,
+    RuleStatus,
+    RuleLegacyPrefix,
+    FilterPrefix,
+    FilterObjectSizeGreaterThan,
+    FilterObjectSizeLessThan,
+    AndPrefix,
+    AndObjectSizeGreaterThan,
+    AndObjectSizeLessThan,
+    TagKey,
+    TagValue,
+    ExpirationDays,
+    ExpirationDate,
+    ExpirationDeleteMarker,
+    NoncurrentDays,
+    NewerNoncurrentVersions,
+    DaysAfterInitiation,
+}
+
+enum CompletedLifecycleElement {
+    Configuration(Vec<LifecycleRule>),
+    Rule(LifecycleRule),
+    Filter(LifecycleRuleFilter),
+    And(LifecycleRuleFilter),
+    Tag(LifecycleTag),
+    Expiration(LifecycleExpiration),
+    NoncurrentVersionExpiration(NoncurrentVersionExpiration),
+    AbortIncompleteMultipartUpload(AbortIncompleteMultipartUpload),
+    Text(TextTarget, String),
+}
+
+impl LifecycleXmlParser {
+    fn parse(data: &[u8]) -> Result<Vec<LifecycleRule>, LifecycleConfigError> {
+        std::str::from_utf8(data).map_err(|_| LifecycleConfigError::MalformedXml {
+            reason: "XML body is not valid UTF-8".to_string(),
+        })?;
+
+        let mut parser = Self {
+            frames: Vec::new(),
+            rules: None,
+        };
+        let mut reader = Reader::from_reader(data);
+        let mut buffer = Vec::new();
+
+        loop {
+            match reader.read_event_into(&mut buffer) {
+                Ok(Event::Start(element)) => parser.open(&element)?,
+                Ok(Event::Empty(element)) => {
+                    parser.open(&element)?;
+                    parser.close(local_element_name(element.local_name().as_ref())?)?;
+                }
+                Ok(Event::End(element)) => {
+                    parser.close(local_element_name(element.local_name().as_ref())?)?;
+                }
+                Ok(Event::Text(text)) => parser.text(text.as_ref())?,
+                Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_)) => {}
+                Ok(Event::CData(_) | Event::DocType(_)) => {
+                    return Err(LifecycleConfigError::MalformedXml {
+                        reason: "unsupported XML declaration".to_string(),
+                    });
+                }
+                Ok(Event::Eof) => break,
+                Err(error) => {
+                    return Err(LifecycleConfigError::MalformedXml {
+                        reason: format!("invalid lifecycle XML: {error}"),
+                    });
+                }
             }
-            "Status" => {
-                let parsed = match child.trimmed_text()? {
+            buffer.clear();
+        }
+
+        if let Some(unclosed) = parser.frames.last() {
+            return Err(LifecycleConfigError::MalformedXml {
+                reason: format!("unclosed <{}> element", unclosed.element_name()),
+            });
+        }
+        parser
+            .rules
+            .ok_or_else(|| LifecycleConfigError::MalformedXml {
+                reason: "missing root XML element".to_string(),
+            })
+    }
+
+    fn open(&mut self, element: &BytesStart<'_>) -> Result<(), LifecycleConfigError> {
+        validate_lifecycle_xml_attributes(element)?;
+        if self.frames.len() >= MAX_LIFECYCLE_XML_DEPTH {
+            return Err(LifecycleConfigError::MalformedXml {
+                reason: format!(
+                    "lifecycle XML nesting depth exceeds {MAX_LIFECYCLE_XML_DEPTH} elements"
+                ),
+            });
+        }
+
+        let local_name = element.local_name();
+        let name = local_element_name(local_name.as_ref())?;
+        let frame = match self.frames.last_mut() {
+            None if self.rules.is_some() => {
+                return Err(LifecycleConfigError::MalformedXml {
+                    reason: "multiple root XML elements are not allowed".to_string(),
+                });
+            }
+            None if name == "LifecycleConfiguration" => {
+                LifecycleXmlFrame::Configuration { rules: Vec::new() }
+            }
+            None => {
+                return Err(LifecycleConfigError::MalformedXml {
+                    reason: "missing LifecycleConfiguration element".to_string(),
+                });
+            }
+            Some(LifecycleXmlFrame::Configuration { .. }) if name == "Rule" => {
+                LifecycleXmlFrame::Rule(RuleBuilder::default())
+            }
+            Some(LifecycleXmlFrame::Configuration { .. }) => {
+                return Err(LifecycleConfigError::MalformedXml {
+                    reason: format!("unexpected <{name}> in LifecycleConfiguration"),
+                });
+            }
+            Some(LifecycleXmlFrame::Rule(builder)) => builder.open_child(name)?,
+            Some(LifecycleXmlFrame::Filter(builder)) => builder.open_child(name)?,
+            Some(LifecycleXmlFrame::And(builder)) => builder.open_child(name)?,
+            Some(LifecycleXmlFrame::Tag(_)) => match name {
+                "Key" => LifecycleXmlFrame::text(TextTarget::TagKey),
+                "Value" => LifecycleXmlFrame::text(TextTarget::TagValue),
+                _ => return Err(unexpected_element(name, "lifecycle Tag")),
+            },
+            Some(LifecycleXmlFrame::Expiration(_)) => match name {
+                "Days" => LifecycleXmlFrame::text(TextTarget::ExpirationDays),
+                "Date" => LifecycleXmlFrame::text(TextTarget::ExpirationDate),
+                "ExpiredObjectDeleteMarker" => {
+                    LifecycleXmlFrame::text(TextTarget::ExpirationDeleteMarker)
+                }
+                _ => return Err(unexpected_element(name, "Expiration")),
+            },
+            Some(LifecycleXmlFrame::NoncurrentVersionExpiration(_)) => match name {
+                "NoncurrentDays" => LifecycleXmlFrame::text(TextTarget::NoncurrentDays),
+                "NewerNoncurrentVersions" => {
+                    LifecycleXmlFrame::text(TextTarget::NewerNoncurrentVersions)
+                }
+                _ => return Err(unexpected_element(name, "NoncurrentVersionExpiration")),
+            },
+            Some(LifecycleXmlFrame::AbortIncompleteMultipartUpload(_)) => match name {
+                "DaysAfterInitiation" => LifecycleXmlFrame::text(TextTarget::DaysAfterInitiation),
+                _ => return Err(unexpected_element(name, "AbortIncompleteMultipartUpload")),
+            },
+            Some(LifecycleXmlFrame::Text { .. }) => {
+                return Err(LifecycleConfigError::MalformedXml {
+                    reason: format!(
+                        "<{}> must not contain child elements",
+                        self.frames
+                            .last()
+                            .map_or("text", LifecycleXmlFrame::element_name)
+                    ),
+                });
+            }
+        };
+        self.frames.push(frame);
+        Ok(())
+    }
+
+    fn close(&mut self, name: &str) -> Result<(), LifecycleConfigError> {
+        let frame = self
+            .frames
+            .pop()
+            .ok_or_else(|| LifecycleConfigError::MalformedXml {
+                reason: format!("unexpected closing </{name}>"),
+            })?;
+        if frame.element_name() != name {
+            return Err(LifecycleConfigError::MalformedXml {
+                reason: format!(
+                    "closing tag </{name}> does not match <{}>",
+                    frame.element_name()
+                ),
+            });
+        }
+        let completed = frame.finish()?;
+        if let Some(parent) = self.frames.last_mut() {
+            parent.accept(completed)
+        } else {
+            let CompletedLifecycleElement::Configuration(rules) = completed else {
+                return Err(LifecycleConfigError::MalformedXml {
+                    reason: "missing LifecycleConfiguration element".to_string(),
+                });
+            };
+            self.rules = Some(rules);
+            Ok(())
+        }
+    }
+
+    fn text(&mut self, raw: &[u8]) -> Result<(), LifecycleConfigError> {
+        let raw = std::str::from_utf8(raw).map_err(|_| LifecycleConfigError::MalformedXml {
+            reason: "XML body is not valid UTF-8".to_string(),
+        })?;
+        let value = xml_unescape(raw)?;
+        match self.frames.last_mut() {
+            Some(LifecycleXmlFrame::Text { value: text, .. }) => text.push_str(&value),
+            Some(_) if value.trim().is_empty() => {}
+            Some(frame) => {
+                return Err(LifecycleConfigError::MalformedXml {
+                    reason: format!("<{}> must not contain text content", frame.element_name()),
+                });
+            }
+            None if value.trim().is_empty() => {}
+            None => {
+                return Err(LifecycleConfigError::MalformedXml {
+                    reason: "unexpected text outside root XML element".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl LifecycleXmlFrame {
+    fn text(target: TextTarget) -> Self {
+        Self::Text {
+            target,
+            value: String::new(),
+        }
+    }
+
+    fn element_name(&self) -> &'static str {
+        match self {
+            Self::Configuration { .. } => "LifecycleConfiguration",
+            Self::Rule(_) => "Rule",
+            Self::Filter(_) => "Filter",
+            Self::And(_) => "And",
+            Self::Tag(_) => "Tag",
+            Self::Expiration(_) => "Expiration",
+            Self::NoncurrentVersionExpiration(_) => "NoncurrentVersionExpiration",
+            Self::AbortIncompleteMultipartUpload(_) => "AbortIncompleteMultipartUpload",
+            Self::Text { target, .. } => target.element_name(),
+        }
+    }
+
+    fn finish(self) -> Result<CompletedLifecycleElement, LifecycleConfigError> {
+        match self {
+            Self::Configuration { rules } => Ok(CompletedLifecycleElement::Configuration(rules)),
+            Self::Rule(builder) => builder.finish().map(CompletedLifecycleElement::Rule),
+            Self::Filter(builder) => Ok(CompletedLifecycleElement::Filter(builder.filter)),
+            Self::And(builder) => Ok(CompletedLifecycleElement::And(builder.filter)),
+            Self::Tag(builder) => builder.finish().map(CompletedLifecycleElement::Tag),
+            Self::Expiration(builder) => {
+                builder.finish().map(CompletedLifecycleElement::Expiration)
+            }
+            Self::NoncurrentVersionExpiration(builder) => builder
+                .finish()
+                .map(CompletedLifecycleElement::NoncurrentVersionExpiration),
+            Self::AbortIncompleteMultipartUpload(builder) => builder
+                .finish()
+                .map(CompletedLifecycleElement::AbortIncompleteMultipartUpload),
+            Self::Text { target, value } => Ok(CompletedLifecycleElement::Text(target, value)),
+        }
+    }
+
+    fn accept(&mut self, completed: CompletedLifecycleElement) -> Result<(), LifecycleConfigError> {
+        match (self, completed) {
+            (Self::Configuration { rules }, CompletedLifecycleElement::Rule(rule)) => {
+                rules.push(rule);
+                Ok(())
+            }
+            (Self::Rule(builder), completed) => builder.accept(completed),
+            (Self::Filter(builder), completed) => builder.accept(completed),
+            (Self::And(builder), completed) => builder.accept(completed),
+            (Self::Tag(builder), CompletedLifecycleElement::Text(target, value)) => {
+                builder.accept(target, value)
+            }
+            (Self::Expiration(builder), CompletedLifecycleElement::Text(target, value)) => {
+                builder.accept(target, &value)
+            }
+            (
+                Self::NoncurrentVersionExpiration(builder),
+                CompletedLifecycleElement::Text(target, value),
+            ) => builder.accept(target, &value),
+            (
+                Self::AbortIncompleteMultipartUpload(builder),
+                CompletedLifecycleElement::Text(target, value),
+            ) => builder.accept(target, &value),
+            (parent, child) => Err(LifecycleConfigError::MalformedXml {
+                reason: format!(
+                    "unexpected <{}> in <{}>",
+                    child.element_name(),
+                    parent.element_name()
+                ),
+            }),
+        }
+    }
+}
+
+impl CompletedLifecycleElement {
+    fn element_name(&self) -> &'static str {
+        match self {
+            Self::Configuration(_) => "LifecycleConfiguration",
+            Self::Rule(_) => "Rule",
+            Self::Filter(_) => "Filter",
+            Self::And(_) => "And",
+            Self::Tag(_) => "Tag",
+            Self::Expiration(_) => "Expiration",
+            Self::NoncurrentVersionExpiration(_) => "NoncurrentVersionExpiration",
+            Self::AbortIncompleteMultipartUpload(_) => "AbortIncompleteMultipartUpload",
+            Self::Text(target, _) => target.element_name(),
+        }
+    }
+}
+
+impl TextTarget {
+    fn element_name(self) -> &'static str {
+        match self {
+            Self::RuleId => "ID",
+            Self::RuleStatus => "Status",
+            Self::RuleLegacyPrefix | Self::FilterPrefix | Self::AndPrefix => "Prefix",
+            Self::FilterObjectSizeGreaterThan | Self::AndObjectSizeGreaterThan => {
+                "ObjectSizeGreaterThan"
+            }
+            Self::FilterObjectSizeLessThan | Self::AndObjectSizeLessThan => "ObjectSizeLessThan",
+            Self::TagKey => "Key",
+            Self::TagValue => "Value",
+            Self::ExpirationDays => "Days",
+            Self::ExpirationDate => "Date",
+            Self::ExpirationDeleteMarker => "ExpiredObjectDeleteMarker",
+            Self::NoncurrentDays => "NoncurrentDays",
+            Self::NewerNoncurrentVersions => "NewerNoncurrentVersions",
+            Self::DaysAfterInitiation => "DaysAfterInitiation",
+        }
+    }
+}
+
+impl RuleBuilder {
+    fn open_child(&mut self, name: &str) -> Result<LifecycleXmlFrame, LifecycleConfigError> {
+        match name {
+            "ID" => Ok(LifecycleXmlFrame::text(TextTarget::RuleId)),
+            "Status" => Ok(LifecycleXmlFrame::text(TextTarget::RuleStatus)),
+            "Prefix" => Ok(LifecycleXmlFrame::text(TextTarget::RuleLegacyPrefix)),
+            "Filter" if self.filter.explicit_filter => Err(LifecycleConfigError::MalformedXml {
+                reason: "duplicate Filter element in lifecycle rule".to_string(),
+            }),
+            "Filter" => Ok(LifecycleXmlFrame::Filter(FilterBuilder::new())),
+            "Expiration" => Ok(LifecycleXmlFrame::Expiration(ExpirationBuilder::default())),
+            "NoncurrentVersionExpiration" => Ok(LifecycleXmlFrame::NoncurrentVersionExpiration(
+                NoncurrentVersionExpirationBuilder::default(),
+            )),
+            "AbortIncompleteMultipartUpload" => {
+                Ok(LifecycleXmlFrame::AbortIncompleteMultipartUpload(
+                    AbortIncompleteMultipartUploadBuilder::default(),
+                ))
+            }
+            "Transition"
+            | "Transitions"
+            | "NoncurrentVersionTransition"
+            | "NoncurrentVersionTransitions" => Err(LifecycleConfigError::NotImplemented {
+                feature: "Lifecycle transition rules".to_string(),
+            }),
+            _ => Err(unexpected_element(name, "lifecycle rule")),
+        }
+    }
+
+    fn accept(&mut self, completed: CompletedLifecycleElement) -> Result<(), LifecycleConfigError> {
+        match completed {
+            CompletedLifecycleElement::Text(TextTarget::RuleId, value) => {
+                set_once(&mut self.id, value.trim().to_string(), "ID")
+            }
+            CompletedLifecycleElement::Text(TextTarget::RuleStatus, value) => {
+                let status = match value.trim() {
                     "Enabled" => LifecycleRuleStatus::Enabled,
                     "Disabled" => LifecycleRuleStatus::Disabled,
                     _ => {
@@ -634,327 +1031,315 @@ fn parse_rule(element: &XmlElement) -> Result<LifecycleRule, LifecycleConfigErro
                         });
                     }
                 };
-                set_once(&mut status, parsed, "Status")?;
+                set_once(&mut self.status, status, "Status")
             }
-            "Prefix" => {
-                set_once(
-                    &mut legacy_prefix,
-                    child.trimmed_text()?.to_string(),
-                    "Prefix",
-                )?;
+            CompletedLifecycleElement::Text(TextTarget::RuleLegacyPrefix, value) => {
+                set_once(&mut self.legacy_prefix, value.trim().to_string(), "Prefix")
             }
-            "Filter" => {
-                if filter.explicit_filter {
-                    return Err(LifecycleConfigError::MalformedXml {
-                        reason: "duplicate Filter element in lifecycle rule".to_string(),
-                    });
-                }
-                filter = parse_filter(child)?;
+            CompletedLifecycleElement::Filter(filter) => {
+                self.filter = filter;
+                Ok(())
             }
-            "Expiration" => {
-                set_once(&mut expiration, parse_expiration(child)?, "Expiration")?;
+            CompletedLifecycleElement::Expiration(expiration) => {
+                set_once(&mut self.expiration, expiration, "Expiration")
             }
-            "NoncurrentVersionExpiration" => {
-                set_once(
-                    &mut noncurrent_version_expiration,
-                    parse_noncurrent_version_expiration(child)?,
-                    "NoncurrentVersionExpiration",
-                )?;
-            }
-            "AbortIncompleteMultipartUpload" => {
-                set_once(
-                    &mut abort_incomplete_multipart_upload,
-                    parse_abort_incomplete_multipart_upload(child)?,
-                    "AbortIncompleteMultipartUpload",
-                )?;
-            }
-            "Transition"
-            | "Transitions"
-            | "NoncurrentVersionTransition"
-            | "NoncurrentVersionTransitions" => {
-                return Err(LifecycleConfigError::NotImplemented {
-                    feature: "Lifecycle transition rules".to_string(),
-                });
-            }
-            other => {
+            CompletedLifecycleElement::NoncurrentVersionExpiration(expiration) => set_once(
+                &mut self.noncurrent_version_expiration,
+                expiration,
+                "NoncurrentVersionExpiration",
+            ),
+            CompletedLifecycleElement::AbortIncompleteMultipartUpload(abort) => set_once(
+                &mut self.abort_incomplete_multipart_upload,
+                abort,
+                "AbortIncompleteMultipartUpload",
+            ),
+            other => Err(unexpected_element(other.element_name(), "lifecycle rule")),
+        }
+    }
+
+    fn finish(mut self) -> Result<LifecycleRule, LifecycleConfigError> {
+        if let Some(prefix) = self.legacy_prefix {
+            if self.filter.explicit_filter {
                 return Err(LifecycleConfigError::MalformedXml {
-                    reason: format!("unexpected <{other}> in lifecycle rule"),
+                    reason: "lifecycle rule may not contain both Prefix and Filter".to_string(),
                 });
             }
+            validate_prefix(&prefix)?;
+            self.filter.prefix = Some(prefix);
         }
+        let status = self
+            .status
+            .ok_or_else(|| LifecycleConfigError::MalformedXml {
+                reason: "lifecycle rule is missing Status".to_string(),
+            })?;
+        Ok(LifecycleRule {
+            id: self.id,
+            status,
+            filter: self.filter,
+            expiration: self.expiration,
+            noncurrent_version_expiration: self.noncurrent_version_expiration,
+            abort_incomplete_multipart_upload: self.abort_incomplete_multipart_upload,
+        })
     }
-
-    if let Some(prefix) = legacy_prefix {
-        if filter.explicit_filter {
-            return Err(LifecycleConfigError::MalformedXml {
-                reason: "lifecycle rule may not contain both Prefix and Filter".to_string(),
-            });
-        }
-        validate_prefix(&prefix)?;
-        filter.prefix = Some(prefix);
-    }
-
-    let status = status.ok_or_else(|| LifecycleConfigError::MalformedXml {
-        reason: "lifecycle rule is missing Status".to_string(),
-    })?;
-
-    Ok(LifecycleRule {
-        id,
-        status,
-        filter,
-        expiration,
-        noncurrent_version_expiration,
-        abort_incomplete_multipart_upload,
-    })
 }
 
-fn parse_filter(element: &XmlElement) -> Result<LifecycleRuleFilter, LifecycleConfigError> {
-    element.ensure_no_text()?;
-    let mut filter = LifecycleRuleFilter {
-        explicit_filter: true,
-        ..LifecycleRuleFilter::default()
-    };
-    let mut predicate = None;
+impl FilterBuilder {
+    fn new() -> Self {
+        Self {
+            filter: LifecycleRuleFilter {
+                explicit_filter: true,
+                ..LifecycleRuleFilter::default()
+            },
+            predicate: None,
+        }
+    }
 
-    for child in &element.children {
-        match child.name.as_str() {
-            "Prefix" => {
-                let prefix = child.trimmed_text()?.to_string();
-                validate_prefix(&prefix)?;
-                mark_filter_predicate(&mut predicate, "Prefix")?;
-                set_once(&mut filter.prefix, prefix, "Prefix")?;
+    fn open_child(&mut self, name: &str) -> Result<LifecycleXmlFrame, LifecycleConfigError> {
+        let (predicate, frame) = match name {
+            "Prefix" => ("Prefix", LifecycleXmlFrame::text(TextTarget::FilterPrefix)),
+            "Tag" => ("Tag", LifecycleXmlFrame::Tag(TagBuilder::default())),
+            "And" => ("And", LifecycleXmlFrame::And(AndBuilder::default())),
+            "ObjectSizeGreaterThan" => (
+                "ObjectSizeGreaterThan",
+                LifecycleXmlFrame::text(TextTarget::FilterObjectSizeGreaterThan),
+            ),
+            "ObjectSizeLessThan" => (
+                "ObjectSizeLessThan",
+                LifecycleXmlFrame::text(TextTarget::FilterObjectSizeLessThan),
+            ),
+            _ => return Err(unexpected_element(name, "lifecycle filter")),
+        };
+        mark_filter_predicate(&mut self.predicate, predicate)?;
+        Ok(frame)
+    }
+
+    fn accept(&mut self, completed: CompletedLifecycleElement) -> Result<(), LifecycleConfigError> {
+        match completed {
+            CompletedLifecycleElement::Text(TextTarget::FilterPrefix, value) => {
+                let value = value.trim().to_string();
+                validate_prefix(&value)?;
+                set_once(&mut self.filter.prefix, value, "Prefix")
             }
-            "Tag" => {
-                mark_filter_predicate(&mut predicate, "Tag")?;
-                filter.add_tag(parse_tag(child)?)?;
-            }
-            "And" => {
-                mark_filter_predicate(&mut predicate, "And")?;
-                parse_and(child, &mut filter)?;
-            }
-            "ObjectSizeGreaterThan" => {
-                mark_filter_predicate(&mut predicate, "ObjectSizeGreaterThan")?;
+            CompletedLifecycleElement::Text(TextTarget::FilterObjectSizeGreaterThan, value) => {
                 set_once(
-                    &mut filter.object_size_greater_than,
-                    parse_u64_text(child, "ObjectSizeGreaterThan")?,
+                    &mut self.filter.object_size_greater_than,
+                    parse_u64_text(&value, "ObjectSizeGreaterThan")?,
                     "ObjectSizeGreaterThan",
-                )?;
+                )
             }
-            "ObjectSizeLessThan" => {
-                mark_filter_predicate(&mut predicate, "ObjectSizeLessThan")?;
+            CompletedLifecycleElement::Text(TextTarget::FilterObjectSizeLessThan, value) => {
                 set_once(
-                    &mut filter.object_size_less_than,
-                    parse_u64_text(child, "ObjectSizeLessThan")?,
+                    &mut self.filter.object_size_less_than,
+                    parse_u64_text(&value, "ObjectSizeLessThan")?,
                     "ObjectSizeLessThan",
-                )?;
+                )
             }
-            other => {
-                return Err(LifecycleConfigError::MalformedXml {
-                    reason: format!("unexpected <{other}> in lifecycle filter"),
-                });
+            CompletedLifecycleElement::Tag(tag) => self.filter.add_tag(tag),
+            CompletedLifecycleElement::And(and) => {
+                self.filter.prefix = and.prefix;
+                self.filter.tags = and.tags;
+                self.filter.object_size_greater_than = and.object_size_greater_than;
+                self.filter.object_size_less_than = and.object_size_less_than;
+                Ok(())
             }
+            other => Err(unexpected_element(other.element_name(), "lifecycle filter")),
+        }
+    }
+}
+
+impl AndBuilder {
+    fn open_child(&mut self, name: &str) -> Result<LifecycleXmlFrame, LifecycleConfigError> {
+        match name {
+            "Prefix" => Ok(LifecycleXmlFrame::text(TextTarget::AndPrefix)),
+            "Tag" => Ok(LifecycleXmlFrame::Tag(TagBuilder::default())),
+            "ObjectSizeGreaterThan" => Ok(LifecycleXmlFrame::text(
+                TextTarget::AndObjectSizeGreaterThan,
+            )),
+            "ObjectSizeLessThan" => Ok(LifecycleXmlFrame::text(TextTarget::AndObjectSizeLessThan)),
+            _ => Err(unexpected_element(name, "lifecycle filter And")),
         }
     }
 
-    Ok(filter)
-}
-
-fn parse_and(
-    element: &XmlElement,
-    filter: &mut LifecycleRuleFilter,
-) -> Result<(), LifecycleConfigError> {
-    element.ensure_no_text()?;
-    for child in &element.children {
-        match child.name.as_str() {
-            "Prefix" => {
-                let prefix = child.trimmed_text()?.to_string();
-                validate_prefix(&prefix)?;
-                set_once(&mut filter.prefix, prefix, "Prefix")?;
+    fn accept(&mut self, completed: CompletedLifecycleElement) -> Result<(), LifecycleConfigError> {
+        match completed {
+            CompletedLifecycleElement::Text(TextTarget::AndPrefix, value) => {
+                let value = value.trim().to_string();
+                validate_prefix(&value)?;
+                set_once(&mut self.filter.prefix, value, "Prefix")
             }
-            "Tag" => {
-                filter.add_tag(parse_tag(child)?)?;
-            }
-            "ObjectSizeGreaterThan" => {
+            CompletedLifecycleElement::Text(TextTarget::AndObjectSizeGreaterThan, value) => {
                 set_once(
-                    &mut filter.object_size_greater_than,
-                    parse_u64_text(child, "ObjectSizeGreaterThan")?,
+                    &mut self.filter.object_size_greater_than,
+                    parse_u64_text(&value, "ObjectSizeGreaterThan")?,
                     "ObjectSizeGreaterThan",
-                )?;
+                )
             }
-            "ObjectSizeLessThan" => {
-                set_once(
-                    &mut filter.object_size_less_than,
-                    parse_u64_text(child, "ObjectSizeLessThan")?,
-                    "ObjectSizeLessThan",
-                )?;
-            }
-            other => {
-                return Err(LifecycleConfigError::MalformedXml {
-                    reason: format!("unexpected <{other}> in lifecycle filter And"),
-                });
-            }
+            CompletedLifecycleElement::Text(TextTarget::AndObjectSizeLessThan, value) => set_once(
+                &mut self.filter.object_size_less_than,
+                parse_u64_text(&value, "ObjectSizeLessThan")?,
+                "ObjectSizeLessThan",
+            ),
+            CompletedLifecycleElement::Tag(tag) => self.filter.add_tag(tag),
+            other => Err(unexpected_element(
+                other.element_name(),
+                "lifecycle filter And",
+            )),
         }
     }
-    Ok(())
 }
 
-fn parse_tag(element: &XmlElement) -> Result<LifecycleTag, LifecycleConfigError> {
-    element.ensure_no_text()?;
-    let mut key = None;
-    let mut value = None;
-
-    for child in &element.children {
-        match child.name.as_str() {
-            "Key" => {
-                set_once(&mut key, child.trimmed_text()?.to_string(), "Key")?;
-            }
-            "Value" => {
-                set_once(&mut value, child.trimmed_text()?.to_string(), "Value")?;
-            }
-            other => {
-                return Err(LifecycleConfigError::MalformedXml {
-                    reason: format!("unexpected <{other}> in lifecycle Tag"),
-                });
-            }
+impl TagBuilder {
+    fn accept(&mut self, target: TextTarget, value: String) -> Result<(), LifecycleConfigError> {
+        match target {
+            TextTarget::TagKey => set_once(&mut self.key, value.trim().to_string(), "Key"),
+            TextTarget::TagValue => set_once(&mut self.value, value.trim().to_string(), "Value"),
+            _ => Err(unexpected_element(target.element_name(), "lifecycle Tag")),
         }
     }
 
-    let key = key.ok_or_else(|| LifecycleConfigError::MalformedXml {
-        reason: format!("missing <Key> in <{}>", element.name),
-    })?;
-    let value = value.ok_or_else(|| LifecycleConfigError::MalformedXml {
-        reason: format!("missing <Value> in <{}>", element.name),
-    })?;
-    validate_tag_key(&key)?;
-    validate_tag_value(&value)?;
-
-    Ok(LifecycleTag { key, value })
+    fn finish(self) -> Result<LifecycleTag, LifecycleConfigError> {
+        let key = self.key.ok_or_else(|| LifecycleConfigError::MalformedXml {
+            reason: "missing <Key> in <Tag>".to_string(),
+        })?;
+        let value = self
+            .value
+            .ok_or_else(|| LifecycleConfigError::MalformedXml {
+                reason: "missing <Value> in <Tag>".to_string(),
+            })?;
+        validate_tag_key(&key)?;
+        validate_tag_value(&value)?;
+        Ok(LifecycleTag { key, value })
+    }
 }
 
-fn parse_expiration(element: &XmlElement) -> Result<LifecycleExpiration, LifecycleConfigError> {
-    element.ensure_no_text()?;
-    let mut days = None;
-    let mut date = None;
-    let mut delete_marker = None;
-
-    for child in &element.children {
-        match child.name.as_str() {
-            "Days" => {
-                set_once(&mut days, parse_non_zero_u32_text(child, "Days")?, "Days")?;
+impl ExpirationBuilder {
+    fn accept(&mut self, target: TextTarget, value: &str) -> Result<(), LifecycleConfigError> {
+        match target {
+            TextTarget::ExpirationDays => set_once(
+                &mut self.days,
+                parse_non_zero_u32_text(value, "Days")?,
+                "Days",
+            ),
+            TextTarget::ExpirationDate => {
+                set_once(&mut self.date, parse_lifecycle_date(value.trim())?, "Date")
             }
-            "Date" => {
-                set_once(
-                    &mut date,
-                    parse_lifecycle_date(child.trimmed_text()?)?,
-                    "Date",
-                )?;
-            }
-            "ExpiredObjectDeleteMarker" => {
-                set_once(
-                    &mut delete_marker,
-                    parse_bool_text(child.trimmed_text()?, "ExpiredObjectDeleteMarker")?,
-                    "ExpiredObjectDeleteMarker",
-                )?;
-            }
-            other => {
-                return Err(LifecycleConfigError::MalformedXml {
-                    reason: format!("unexpected <{other}> in Expiration"),
-                });
-            }
+            TextTarget::ExpirationDeleteMarker => set_once(
+                &mut self.delete_marker,
+                parse_bool_text(value, "ExpiredObjectDeleteMarker")?,
+                "ExpiredObjectDeleteMarker",
+            ),
+            _ => Err(unexpected_element(target.element_name(), "Expiration")),
         }
     }
 
-    match (days, date, delete_marker) {
-        (Some(_), Some(_), _) => Err(LifecycleConfigError::InvalidArgument {
-            reason: "Expiration may not specify both Days and Date".to_string(),
-        }),
-        (Some(_), _, Some(true)) | (_, Some(_), Some(true)) => {
-            Err(LifecycleConfigError::MalformedXml {
-                reason: "ExpiredObjectDeleteMarker may not be combined with Days or Date"
+    fn finish(self) -> Result<LifecycleExpiration, LifecycleConfigError> {
+        match (self.days, self.date, self.delete_marker) {
+            (Some(_), Some(_), _) => Err(LifecycleConfigError::InvalidArgument {
+                reason: "Expiration may not specify both Days and Date".to_string(),
+            }),
+            (Some(_), _, Some(true)) | (_, Some(_), Some(true)) => {
+                Err(LifecycleConfigError::MalformedXml {
+                    reason: "ExpiredObjectDeleteMarker may not be combined with Days or Date"
+                        .to_string(),
+                })
+            }
+            (Some(days), None, _) => Ok(LifecycleExpiration::Days(days)),
+            (None, Some(date), _) => Ok(LifecycleExpiration::Date(date)),
+            (None, None, Some(true)) => Ok(LifecycleExpiration::ExpiredObjectDeleteMarker),
+            _ => Err(LifecycleConfigError::InvalidArgument {
+                reason: "Expiration must contain Days, Date, or ExpiredObjectDeleteMarker"
                     .to_string(),
-            })
+            }),
         }
-        (Some(days), None, _) => Ok(LifecycleExpiration::Days(days)),
-        (None, Some(date), _) => Ok(LifecycleExpiration::Date(date)),
-        (None, None, Some(true)) => Ok(LifecycleExpiration::ExpiredObjectDeleteMarker),
-        _ => Err(LifecycleConfigError::InvalidArgument {
-            reason: "Expiration must contain Days, Date, or ExpiredObjectDeleteMarker".to_string(),
-        }),
     }
 }
 
-fn parse_noncurrent_version_expiration(
-    element: &XmlElement,
-) -> Result<NoncurrentVersionExpiration, LifecycleConfigError> {
-    element.ensure_no_text()?;
-    let mut noncurrent_days = None;
-    let mut newer_noncurrent_versions = None;
-
-    for child in &element.children {
-        match child.name.as_str() {
-            "NoncurrentDays" => {
-                set_once(
-                    &mut noncurrent_days,
-                    parse_non_zero_u32_text(child, "NoncurrentDays")?,
-                    "NoncurrentDays",
-                )?;
-            }
-            "NewerNoncurrentVersions" => {
-                let value = parse_non_zero_u32_text(child, "NewerNoncurrentVersions")?;
+impl NoncurrentVersionExpirationBuilder {
+    fn accept(&mut self, target: TextTarget, value: &str) -> Result<(), LifecycleConfigError> {
+        match target {
+            TextTarget::NoncurrentDays => set_once(
+                &mut self.noncurrent_days,
+                parse_non_zero_u32_text(value, "NoncurrentDays")?,
+                "NoncurrentDays",
+            ),
+            TextTarget::NewerNoncurrentVersions => {
+                let value = parse_non_zero_u32_text(value, "NewerNoncurrentVersions")?;
                 if value.get() > 100 {
                     return Err(LifecycleConfigError::InvalidArgument {
                         reason: "NewerNoncurrentVersions must be between 1 and 100".to_string(),
                     });
                 }
                 set_once(
-                    &mut newer_noncurrent_versions,
+                    &mut self.newer_noncurrent_versions,
                     value,
                     "NewerNoncurrentVersions",
-                )?;
+                )
             }
-            other => {
-                return Err(LifecycleConfigError::MalformedXml {
-                    reason: format!("unexpected <{other}> in NoncurrentVersionExpiration"),
-                });
-            }
+            _ => Err(unexpected_element(
+                target.element_name(),
+                "NoncurrentVersionExpiration",
+            )),
         }
     }
 
-    Ok(NoncurrentVersionExpiration {
-        noncurrent_days: noncurrent_days.ok_or_else(|| LifecycleConfigError::InvalidArgument {
-            reason: "NoncurrentVersionExpiration must contain NoncurrentDays".to_string(),
-        })?,
-        newer_noncurrent_versions,
+    fn finish(self) -> Result<NoncurrentVersionExpiration, LifecycleConfigError> {
+        Ok(NoncurrentVersionExpiration {
+            noncurrent_days: self.noncurrent_days.ok_or_else(|| {
+                LifecycleConfigError::InvalidArgument {
+                    reason: "NoncurrentVersionExpiration must contain NoncurrentDays".to_string(),
+                }
+            })?,
+            newer_noncurrent_versions: self.newer_noncurrent_versions,
+        })
+    }
+}
+
+impl AbortIncompleteMultipartUploadBuilder {
+    fn accept(&mut self, target: TextTarget, value: &str) -> Result<(), LifecycleConfigError> {
+        match target {
+            TextTarget::DaysAfterInitiation => set_once(
+                &mut self.days,
+                parse_non_zero_u32_text(value, "DaysAfterInitiation")?,
+                "DaysAfterInitiation",
+            ),
+            _ => Err(unexpected_element(
+                target.element_name(),
+                "AbortIncompleteMultipartUpload",
+            )),
+        }
+    }
+
+    fn finish(self) -> Result<AbortIncompleteMultipartUpload, LifecycleConfigError> {
+        Ok(AbortIncompleteMultipartUpload {
+            days_after_initiation: self.days.ok_or_else(|| {
+                LifecycleConfigError::InvalidArgument {
+                    reason: "AbortIncompleteMultipartUpload must contain DaysAfterInitiation"
+                        .to_string(),
+                }
+            })?,
+        })
+    }
+}
+
+fn unexpected_element(name: &str, parent: &str) -> LifecycleConfigError {
+    LifecycleConfigError::MalformedXml {
+        reason: format!("unexpected <{name}> in {parent}"),
+    }
+}
+
+fn local_element_name(name: &[u8]) -> Result<&str, LifecycleConfigError> {
+    std::str::from_utf8(name).map_err(|_| LifecycleConfigError::MalformedXml {
+        reason: "XML element name is not valid UTF-8".to_string(),
     })
 }
 
-fn parse_abort_incomplete_multipart_upload(
-    element: &XmlElement,
-) -> Result<AbortIncompleteMultipartUpload, LifecycleConfigError> {
-    element.ensure_no_text()?;
-    let mut days = None;
-    for child in &element.children {
-        match child.name.as_str() {
-            "DaysAfterInitiation" => {
-                set_once(
-                    &mut days,
-                    parse_non_zero_u32_text(child, "DaysAfterInitiation")?,
-                    "DaysAfterInitiation",
-                )?;
-            }
-            other => {
-                return Err(LifecycleConfigError::MalformedXml {
-                    reason: format!("unexpected <{other}> in AbortIncompleteMultipartUpload"),
-                });
-            }
-        }
+fn validate_lifecycle_xml_attributes(element: &BytesStart<'_>) -> Result<(), LifecycleConfigError> {
+    for attribute in element.attributes() {
+        attribute.map_err(|error| LifecycleConfigError::MalformedXml {
+            reason: format!("invalid lifecycle XML attribute: {error}"),
+        })?;
     }
-
-    Ok(AbortIncompleteMultipartUpload {
-        days_after_initiation: days.ok_or_else(|| LifecycleConfigError::InvalidArgument {
-            reason: "AbortIncompleteMultipartUpload must contain DaysAfterInitiation".to_string(),
-        })?,
-    })
+    Ok(())
 }
 
 fn parse_lifecycle_date(text: &str) -> Result<LifecycleDate, LifecycleConfigError> {
@@ -1068,26 +1453,21 @@ fn parse_bool_text(value: &str, field: &str) -> Result<bool, LifecycleConfigErro
     }
 }
 
-fn parse_u64_text(element: &XmlElement, field: &str) -> Result<u64, LifecycleConfigError> {
-    element
-        .trimmed_text()?
+fn parse_u64_text(text: &str, field: &str) -> Result<u64, LifecycleConfigError> {
+    text.trim()
         .parse()
         .map_err(|_| LifecycleConfigError::InvalidArgument {
             reason: format!("{field} must be a non-negative integer"),
         })
 }
 
-fn parse_non_zero_u32_text(
-    element: &XmlElement,
-    field: &str,
-) -> Result<NonZeroU32, LifecycleConfigError> {
-    let value: u32 =
-        element
-            .trimmed_text()?
-            .parse()
-            .map_err(|_| LifecycleConfigError::InvalidArgument {
-                reason: format!("{field} must be a positive integer"),
-            })?;
+fn parse_non_zero_u32_text(text: &str, field: &str) -> Result<NonZeroU32, LifecycleConfigError> {
+    let value: u32 = text
+        .trim()
+        .parse()
+        .map_err(|_| LifecycleConfigError::InvalidArgument {
+            reason: format!("{field} must be a positive integer"),
+        })?;
     NonZeroU32::new(value).ok_or_else(|| LifecycleConfigError::InvalidArgument {
         reason: format!("{field} must be greater than zero"),
     })
@@ -1101,185 +1481,6 @@ fn set_once<T>(slot: &mut Option<T>, value: T, field: &str) -> Result<(), Lifecy
     }
     *slot = Some(value);
     Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct XmlElement {
-    name: String,
-    children: Vec<XmlElement>,
-    text: String,
-}
-
-impl XmlElement {
-    fn ensure_no_text(&self) -> Result<(), LifecycleConfigError> {
-        if !self.text.trim().is_empty() {
-            return Err(LifecycleConfigError::MalformedXml {
-                reason: format!("<{}> must not contain text content", self.name),
-            });
-        }
-        Ok(())
-    }
-
-    fn trimmed_text(&self) -> Result<&str, LifecycleConfigError> {
-        if !self.children.is_empty() {
-            return Err(LifecycleConfigError::MalformedXml {
-                reason: format!("<{}> must not contain child elements", self.name),
-            });
-        }
-        Ok(self.text.trim())
-    }
-}
-
-fn parse_xml_document(data: &[u8]) -> Result<XmlElement, LifecycleConfigError> {
-    let input = std::str::from_utf8(data).map_err(|_| LifecycleConfigError::MalformedXml {
-        reason: "XML body is not valid UTF-8".to_string(),
-    })?;
-
-    let bytes = input.as_bytes();
-    let mut index = 0;
-    let mut root = None;
-    let mut stack: Vec<XmlElement> = Vec::new();
-
-    while index < bytes.len() {
-        if bytes[index] != b'<' {
-            let next_tag = input[index..]
-                .find('<')
-                .map_or(bytes.len(), |offset| index + offset);
-            let text = &input[index..next_tag];
-            if !text.is_empty() {
-                if let Some(current) = stack.last_mut() {
-                    current.text.push_str(&xml_unescape(text)?);
-                } else if !text.trim().is_empty() {
-                    return Err(LifecycleConfigError::MalformedXml {
-                        reason: "unexpected text outside root XML element".to_string(),
-                    });
-                }
-            }
-            index = next_tag;
-            continue;
-        }
-
-        if input[index..].starts_with("<?") {
-            let Some(end) = input[index + 2..].find("?>") else {
-                return Err(LifecycleConfigError::MalformedXml {
-                    reason: "unterminated XML declaration".to_string(),
-                });
-            };
-            index += end + 4;
-            continue;
-        }
-        if input[index..].starts_with("<!--") {
-            let Some(end) = input[index + 4..].find("-->") else {
-                return Err(LifecycleConfigError::MalformedXml {
-                    reason: "unterminated XML comment".to_string(),
-                });
-            };
-            index += end + 7;
-            continue;
-        }
-        if input[index..].starts_with("<!") {
-            return Err(LifecycleConfigError::MalformedXml {
-                reason: "unsupported XML declaration".to_string(),
-            });
-        }
-
-        let tag_end = find_tag_end(input, index + 1)?;
-        let inner = &input[index + 1..tag_end];
-        if let Some(stripped) = inner.strip_prefix('/') {
-            let name = normalize_tag_name(stripped.trim().trim_end_matches('/'));
-            let element = stack
-                .pop()
-                .ok_or_else(|| LifecycleConfigError::MalformedXml {
-                    reason: format!("unexpected closing </{name}>"),
-                })?;
-            if element.name != name {
-                return Err(LifecycleConfigError::MalformedXml {
-                    reason: format!("closing tag </{name}> does not match <{}>", element.name),
-                });
-            }
-            if let Some(parent) = stack.last_mut() {
-                parent.children.push(element);
-            } else if root.is_none() {
-                root = Some(element);
-            } else {
-                return Err(LifecycleConfigError::MalformedXml {
-                    reason: "multiple root XML elements are not allowed".to_string(),
-                });
-            }
-        } else {
-            let self_closing = inner.trim_end().ends_with('/');
-            let name = start_tag_name(inner)?;
-            let element = XmlElement {
-                name: name.to_string(),
-                children: Vec::new(),
-                text: String::new(),
-            };
-            if self_closing {
-                if let Some(parent) = stack.last_mut() {
-                    parent.children.push(element);
-                } else if root.is_none() {
-                    root = Some(element);
-                } else {
-                    return Err(LifecycleConfigError::MalformedXml {
-                        reason: "multiple root XML elements are not allowed".to_string(),
-                    });
-                }
-            } else {
-                stack.push(element);
-            }
-        }
-        index = tag_end + 1;
-    }
-
-    if let Some(unclosed) = stack.last() {
-        return Err(LifecycleConfigError::MalformedXml {
-            reason: format!("unclosed <{}> element", unclosed.name),
-        });
-    }
-
-    root.ok_or_else(|| LifecycleConfigError::MalformedXml {
-        reason: "missing root XML element".to_string(),
-    })
-}
-
-fn find_tag_end(input: &str, mut index: usize) -> Result<usize, LifecycleConfigError> {
-    let bytes = input.as_bytes();
-    let mut quote = None;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if let Some(expected) = quote {
-            if byte == expected {
-                quote = None;
-            }
-        } else {
-            match byte {
-                b'"' | b'\'' => quote = Some(byte),
-                b'>' => return Ok(index),
-                _ => {}
-            }
-        }
-        index += 1;
-    }
-    Err(LifecycleConfigError::MalformedXml {
-        reason: "unterminated XML tag".to_string(),
-    })
-}
-
-fn start_tag_name(inner: &str) -> Result<&str, LifecycleConfigError> {
-    let trimmed = inner.trim();
-    let end = trimmed
-        .find(|character: char| character.is_ascii_whitespace() || character == '/')
-        .unwrap_or(trimmed.len());
-    if end == 0 {
-        return Err(LifecycleConfigError::MalformedXml {
-            reason: "missing XML tag name".to_string(),
-        });
-    }
-    Ok(normalize_tag_name(&trimmed[..end]))
-}
-
-fn normalize_tag_name(name: &str) -> &str {
-    name.rsplit(':').next().unwrap_or(name)
 }
 
 fn xml_unescape(text: &str) -> Result<String, LifecycleConfigError> {

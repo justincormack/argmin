@@ -8977,6 +8977,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_lifecycle_configuration_rejects_deep_nesting_without_recursive_drop() {
+        const DEPTH: usize = 200_000;
+        let mut xml = String::with_capacity(DEPTH * 7 + 64);
+        xml.push_str("<LifecycleConfiguration><Rule>");
+        for _ in 0..DEPTH {
+            xml.push_str("<a>");
+        }
+        for _ in 0..DEPTH {
+            xml.push_str("</a>");
+        }
+        xml.push_str("</Rule></LifecycleConfiguration>");
+        assert!(xml.len() < 2 * 1024 * 1024);
+
+        assert!(matches!(
+            parse_bucket_lifecycle_configuration_xml(xml.as_bytes()),
+            Err(ServerError::MalformedXML { .. })
+        ));
+    }
+
+    #[test]
     fn parse_tagging_xml_rejects_over_160k_document() {
         let xml = format!(
             "<Tagging><TagSet><Tag><Key>a</Key><Value>{}</Value></Tag></TagSet></Tagging>",
