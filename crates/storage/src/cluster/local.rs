@@ -3209,6 +3209,19 @@ impl LocalClusterMap {
         first_error.map_or(Ok(()), Err)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_object_payload_reclaim_is_active(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> bool {
+        self.nodes.values().any(|node| {
+            node.test_node()
+                .test_object_payload_reclaim_is_active(bucket, key, generation_id)
+        })
+    }
+
     pub(crate) fn clear_object_payload_reclaim_fence(
         &self,
         bucket: &BucketName,

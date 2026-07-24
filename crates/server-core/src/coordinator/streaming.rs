@@ -565,7 +565,8 @@ impl Coordinator {
         self.maybe_run_stream_append_prepare_hook(session_id, segment_index);
 
         let written_shards = storage_node
-            .write_stream_segment_payload_shards(&segment_record, payload.storage_bytes)?;
+            .write_stream_segment_payload_shards(&segment_record, payload.storage_bytes)
+            .map_err(super::map_store_error)?;
 
         let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
             .iter()

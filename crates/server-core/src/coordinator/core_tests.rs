@@ -6528,6 +6528,17 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
             now_ms: 1_001,
         }),
     });
+    assert_maps_to_operation_aborted(storage::StoreError::ShardStore {
+        node_id: 1,
+        pg_id: 2,
+        cluster_epoch: storage::ClusterEpoch::INITIAL,
+        source: Box::new(storage::StoreError::StorageRpc {
+            node_id: 1,
+            operation: "shard write",
+            code: storage::StorageRpcErrorCode::StaleShardLocation,
+            message: "request route epoch is stale".to_string(),
+        }),
+    });
     assert!(matches!(
         Coordinator::map_object_pg_action_error(storage::ObjectPgActionError::Store(
             resource_exhausted(),
@@ -6558,6 +6569,78 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
         )),
         ServerError::SlowDown
     ));
+}
+
+fn injected_stale_shard_location() -> storage::StoreError {
+    storage::StoreError::StorageRpc {
+        node_id: 0,
+        operation: "injected payload shard write",
+        code: storage::StorageRpcErrorCode::StaleShardLocation,
+        message: "injected stale shard location".to_string(),
+    }
+}
+
+#[test]
+fn direct_put_payload_stale_shard_location_maps_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let _hook =
+        storage_cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(|_, _| {
+            Err(injected_stale_shard_location())
+        }));
+
+    let error = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "direct", test_requester(), None),
+            data: b"direct payload",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+}
+
+#[test]
+fn stream_put_payload_stale_shard_location_maps_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let session_id = begin_stream_put_test(&coord, "bucket", "stream").unwrap();
+    let hook =
+        storage_cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(|_, _| {
+            Err(injected_stale_shard_location())
+        }));
+
+    let error = coord
+        .append_plaintext_stream_segment_for_test(
+            "bucket",
+            "stream",
+            &session_id,
+            0,
+            b"stream payload",
+        )
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+
+    drop(hook);
+    coord
+        .abort_stream_put("bucket", "stream", &session_id)
+        .unwrap();
 }
 
 #[test]
@@ -14885,6 +14968,252 @@ fn reclaim_object_payload_delete_failure_keeps_retryable_reclaim_record() {
     drop(placed_cleanup_guard);
     reclaim_object_payload(&coord, "bucket", "key", generation_id);
     assert_shard_set_deleted(&coord, data_pg_id, &okh, segment_vid, ec);
+}
+
+fn setup_deleted_object_reclaim_test(
+    payload: &[u8],
+) -> (
+    test_util::TempDir,
+    Coordinator,
+    BucketName,
+    ObjectKey,
+    GenerationId,
+) {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_without_reclaim_sweeper(tmp.path());
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+
+    coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                bucket.as_str(),
+                key.as_str(),
+                test_requester(),
+                None,
+            ),
+            data: payload,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let generation_id = coord
+        .storage_node()
+        .test_get_object_meta(&bucket, &key)
+        .unwrap()
+        .into_live()
+        .expect("put object should create a live object")
+        .generation_id;
+    coord
+        .delete_object(&delete_object_request(
+            bucket.as_str(),
+            key.as_str(),
+            None,
+            test_requester(),
+            false,
+            NO_DELETE,
+        ))
+        .unwrap();
+
+    (tmp, coord, bucket, key, generation_id)
+}
+
+#[test]
+fn reclaim_zero_apply_failure_releases_claim_after_pending_slot_cleanup() {
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (_tmp, coord, bucket, key, generation_id) =
+        setup_deleted_object_reclaim_test(b"claim-release-after-zero-apply");
+
+    let failed_once = Arc::new(AtomicBool::new(false));
+    let hook_failed_once = Arc::clone(&failed_once);
+    let apply_guard = coord
+        .storage_node()
+        .test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+            if context.kind == MetadataCommandApplyTestKind::DeleteObjectPayloadReclaim
+                && !hook_failed_once.swap(true, Ordering::SeqCst)
+            {
+                return Err(storage::StoreError::StaleMetadataOperation {
+                    pg_id: 0,
+                    operation_epoch: ClusterEpoch::INITIAL,
+                    current_epoch: ClusterEpoch::new(2).unwrap(),
+                });
+            }
+            Ok(())
+        }));
+
+    let error = coord
+        .read_runtime()
+        .try_reclaim_object_payload("bucket", "key", generation_id)
+        .unwrap_err();
+    assert!(failed_once.load(Ordering::SeqCst));
+    assert!(
+        matches!(error, ServerError::OperationAborted),
+        "zero-apply route failure should remain retryable, got {error:?}"
+    );
+
+    drop(apply_guard);
+    assert!(
+        coord
+            .read_runtime()
+            .try_reclaim_object_payload("bucket", "key", generation_id)
+            .unwrap(),
+        "retry must complete rather than defer behind a leaked reclaim claim"
+    );
+    assert!(
+        !coord
+            .storage_node()
+            .test_payload_reclaim_exists(&bucket, &key, generation_id,)
+            .unwrap(),
+        "completed retry must remove the durable reclaim root"
+    );
+}
+
+#[test]
+fn reclaim_ownership_lookup_failure_clears_active_reclaim_slot() {
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (_tmp, coord, bucket, key, generation_id) =
+        setup_deleted_object_reclaim_test(b"claim-ownership-lookup-failure");
+
+    let apply_failed = Arc::new(AtomicBool::new(false));
+    let hook_apply_failed = Arc::clone(&apply_failed);
+    let _apply_guard = coord
+        .storage_node()
+        .test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+            if context.kind == MetadataCommandApplyTestKind::DeleteObjectPayloadReclaim
+                && !hook_apply_failed.swap(true, Ordering::SeqCst)
+            {
+                return Err(storage::StoreError::StaleMetadataOperation {
+                    pg_id: 0,
+                    operation_epoch: ClusterEpoch::INITIAL,
+                    current_epoch: ClusterEpoch::new(2).unwrap(),
+                });
+            }
+            Ok(())
+        }));
+    let ownership_lookup_failed = Arc::new(AtomicBool::new(false));
+    let hook_ownership_lookup_failed = Arc::clone(&ownership_lookup_failed);
+    let _lookup_guard = coord
+        .storage_node()
+        .test_install_before_reclaim_ownership_lookup_hook(Arc::new(move || {
+            hook_ownership_lookup_failed.store(true, Ordering::SeqCst);
+            Err(storage::ObjectPgActionError::Store(
+                storage::StoreError::Io {
+                    context: "injected reclaim ownership lookup failure",
+                    source: std::io::Error::other("injected reclaim ownership lookup failure"),
+                },
+            ))
+        }));
+
+    let error = coord
+        .read_runtime()
+        .try_reclaim_object_payload("bucket", "key", generation_id)
+        .unwrap_err();
+    assert!(apply_failed.load(Ordering::SeqCst));
+    assert!(ownership_lookup_failed.load(Ordering::SeqCst));
+    assert!(
+        matches!(error, ServerError::OperationAborted),
+        "the original retryable apply error should be preserved, got {error:?}"
+    );
+    assert!(
+        !coord
+            .storage_node()
+            .test_object_payload_reclaim_is_active(&bucket, &key, generation_id),
+        "ownership uncertainty must retain the fence without stranding the process-local active slot"
+    );
+    assert!(
+        coord
+            .storage_node()
+            .test_payload_reclaim_exists(&bucket, &key, generation_id)
+            .unwrap(),
+        "ownership uncertainty must preserve the durable reclaim root"
+    );
+}
+
+#[test]
+fn reclaim_claim_release_failure_clears_active_reclaim_slot() {
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (_tmp, coord, bucket, key, generation_id) =
+        setup_deleted_object_reclaim_test(b"claim-release-failure");
+
+    let apply_failed = Arc::new(AtomicBool::new(false));
+    let hook_apply_failed = Arc::clone(&apply_failed);
+    let _apply_guard = coord
+        .storage_node()
+        .test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+            if context.kind == MetadataCommandApplyTestKind::DeleteObjectPayloadReclaim
+                && !hook_apply_failed.swap(true, Ordering::SeqCst)
+            {
+                return Err(storage::StoreError::StaleMetadataOperation {
+                    pg_id: 0,
+                    operation_epoch: ClusterEpoch::INITIAL,
+                    current_epoch: ClusterEpoch::new(2).unwrap(),
+                });
+            }
+            Ok(())
+        }));
+    let claim_release_failed = Arc::new(AtomicBool::new(false));
+    let hook_claim_release_failed = Arc::clone(&claim_release_failed);
+    let _release_guard = coord
+        .storage_node()
+        .test_install_before_reclaim_claim_release_hook(Arc::new(move || {
+            hook_claim_release_failed.store(true, Ordering::SeqCst);
+            Err(storage::ObjectPgActionError::Store(
+                storage::StoreError::Io {
+                    context: "injected reclaim claim release failure",
+                    source: std::io::Error::other("injected reclaim claim release failure"),
+                },
+            ))
+        }));
+
+    let error = coord
+        .read_runtime()
+        .try_reclaim_object_payload("bucket", "key", generation_id)
+        .unwrap_err();
+    assert!(apply_failed.load(Ordering::SeqCst));
+    assert!(claim_release_failed.load(Ordering::SeqCst));
+    assert!(
+        matches!(
+            error,
+            ServerError::Store(storage::StoreError::Io {
+                context: "injected reclaim claim release failure",
+                ..
+            })
+        ),
+        "claim release failure should be returned, got {error:?}"
+    );
+    assert!(
+        !coord
+            .storage_node()
+            .test_object_payload_reclaim_is_active(&bucket, &key, generation_id),
+        "claim release uncertainty must retain the fence without stranding the process-local active slot"
+    );
+    assert!(
+        coord
+            .storage_node()
+            .test_payload_reclaim_exists(&bucket, &key, generation_id)
+            .unwrap(),
+        "claim release uncertainty must preserve the durable reclaim root"
+    );
 }
 
 #[test]

@@ -1738,6 +1738,20 @@ impl SharedStorageNode {
         true
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_object_payload_reclaim_is_active(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> bool {
+        self.object_payload_leases
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active_reclaims
+            .contains_key(&(bucket.clone(), key.clone(), generation_id))
+    }
+
     /// Clear a reclaim fence after a matching terminal reclaim command has converged.
     pub(crate) fn clear_object_payload_reclaim_fence(
         &self,

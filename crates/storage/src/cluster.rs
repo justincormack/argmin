@@ -704,11 +704,18 @@ type ObjectMetadataReservationAcquiredHook =
 type ObjectListingPgCompleteHook = Arc<dyn Fn(u32) + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
+type ReclaimCoordinationTestHook = Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
 pub type PayloadShardCleanupTestHook =
     Arc<dyn Fn(&ShardKey) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub type PayloadShardReadTestHook =
+    Arc<dyn Fn(&ShardLocation, &ShardKey) -> Result<(), StoreError> + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub type PayloadShardWriteTestHook =
     Arc<dyn Fn(&ShardLocation, &ShardKey) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -730,6 +737,9 @@ struct StorageClusterTestHooks {
     after_stream_append_command_id_allocated: Option<StreamAppendCommandIdAllocatedHook>,
     after_object_metadata_reservation_acquired: Option<ObjectMetadataReservationAcquiredHook>,
     after_object_listing_pg_complete: Option<ObjectListingPgCompleteHook>,
+    before_reclaim_ownership_lookup: Option<ReclaimCoordinationTestHook>,
+    before_reclaim_claim_release: Option<ReclaimCoordinationTestHook>,
+    before_placed_payload_shard_write: Option<PayloadShardWriteTestHook>,
     before_placed_payload_shard_read: Option<PayloadShardReadTestHook>,
     before_placed_payload_shard_delete: Option<PayloadShardCleanupTestHook>,
     before_metadata_primary_payload_ack_delete: Option<PayloadShardCleanupTestHook>,
@@ -797,7 +807,22 @@ pub struct ObjectListingPgCompleteHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
+pub struct ReclaimOwnershipLookupTestHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct ReclaimClaimReleaseTestHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
 pub struct PayloadShardReadTestHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct PayloadShardWriteTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -917,9 +942,30 @@ impl Drop for ObjectListingPgCompleteHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
+impl Drop for ReclaimOwnershipLookupTestHookGuard {
+    fn drop(&mut self) {
+        self.hooks.lock().unwrap().before_reclaim_ownership_lookup = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for ReclaimClaimReleaseTestHookGuard {
+    fn drop(&mut self) {
+        self.hooks.lock().unwrap().before_reclaim_claim_release = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
 impl Drop for PayloadShardReadTestHookGuard {
     fn drop(&mut self) {
         self.hooks.lock().unwrap().before_placed_payload_shard_read = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for PayloadShardWriteTestHookGuard {
+    fn drop(&mut self) {
+        self.hooks.lock().unwrap().before_placed_payload_shard_write = None;
     }
 }
 
@@ -5786,6 +5832,38 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_before_reclaim_ownership_lookup_hook(&self) -> Result<(), ObjectPgActionError> {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_reclaim_ownership_lookup
+            .clone();
+        hook.map_or(Ok(()), |hook| hook())
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn maybe_run_before_reclaim_ownership_lookup_hook(&self) -> Result<(), ObjectPgActionError> {
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_before_reclaim_claim_release_hook(&self) -> Result<(), ObjectPgActionError> {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_reclaim_claim_release
+            .clone();
+        hook.map_or(Ok(()), |hook| hook())
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn maybe_run_before_reclaim_claim_release_hook(&self) -> Result<(), ObjectPgActionError> {
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     fn maybe_run_before_direct_put_command_id_hook(&self) {
         let hook = self
             .test_hooks
@@ -5920,6 +5998,38 @@ impl StorageCluster {
         &self,
         _shard_key: &ShardKey,
     ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_before_placed_payload_shard_write_hook(
+        &self,
+        location: ShardLocation,
+        shard_key: &ShardKey,
+    ) -> Result<(), ShardIoError> {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_placed_payload_shard_write
+            .clone();
+        if let Some(hook) = hook {
+            hook(&location, shard_key).map_err(|source| ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source,
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn maybe_run_before_placed_payload_shard_write_hook(
+        &self,
+        _location: ShardLocation,
+        _shard_key: &ShardKey,
+    ) -> Result<(), ShardIoError> {
         Ok(())
     }
 
@@ -7558,6 +7668,31 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_reclaim_ownership_lookup_hook(
+        &self,
+        hook: ReclaimCoordinationTestHook,
+    ) -> ReclaimOwnershipLookupTestHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .before_reclaim_ownership_lookup = Some(hook);
+        ReclaimOwnershipLookupTestHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_reclaim_claim_release_hook(
+        &self,
+        hook: ReclaimCoordinationTestHook,
+    ) -> ReclaimClaimReleaseTestHookGuard {
+        self.test_hooks.lock().unwrap().before_reclaim_claim_release = Some(hook);
+        ReclaimClaimReleaseTestHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_install_before_direct_put_command_id_hook(
         &self,
         hook: Arc<dyn Fn() + Send + Sync>,
@@ -7650,6 +7785,20 @@ impl StorageCluster {
         PayloadCleanupTestHookGuard {
             hooks: Arc::clone(&self.test_hooks),
             kind: PayloadCleanupTestHookKind::PlacedShardDelete,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_placed_payload_shard_write_hook(
+        &self,
+        hook: PayloadShardWriteTestHook,
+    ) -> PayloadShardWriteTestHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .before_placed_payload_shard_write = Some(hook);
+        PayloadShardWriteTestHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
         }
     }
 
@@ -7793,6 +7942,7 @@ impl StorageCluster {
         key: &ShardKey,
         data: &[u8],
     ) -> Result<WriteAck, ShardIoError> {
+        self.maybe_run_before_placed_payload_shard_write_hook(location, key)?;
         self.local_map
             .write_payload_shard(self.operation_epoch(), location, key, data)
     }

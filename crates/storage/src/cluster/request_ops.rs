@@ -10755,6 +10755,7 @@ impl super::StorageCluster {
         let reclaim_authority = ObjectPayloadReclaimClaimProof::from(&claim);
 
         let release_reclaim_claim = || -> Result<(), ObjectPgActionError> {
+            self.maybe_run_before_reclaim_claim_release_hook()?;
             mutation_client
                 .release_object_payload_reclaim_claim(object_pg_id, &claim)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
@@ -10876,11 +10877,39 @@ impl super::StorageCluster {
                 return Ok(super::ObjectPayloadReclaimAttempt::Completed);
             }
         })();
+        let (pending_command_owns_reclaim_claim, reclaim_ownership_unknown) =
+            if result.is_err() && command_owns_reclaim_claim {
+                match self
+                    .maybe_run_before_reclaim_ownership_lookup_hook()
+                    .and_then(|()| {
+                        self.pending_metadata_command_for_bucket(pg_id, bucket)
+                            .map_err(Into::into)
+                    }) {
+                    Ok(command) => (
+                        command.is_some_and(|command| {
+                            matches!(
+                                command.payload(),
+                                MetadataCommandPayload::DeleteObjectPayloadReclaim(delete)
+                                    if delete.matches_request(bucket, key, generation_id)
+                                        && delete.reclaim_claim == reclaim_authority
+                            )
+                        }),
+                        false,
+                    ),
+                    Err(_) => (true, true),
+                }
+            } else {
+                (command_owns_reclaim_claim, false)
+            };
+        let mut reclaim_release_unknown = false;
         let result = match result {
-            Err(error) if !command_owns_reclaim_claim => {
-                release_reclaim_claim()?;
-                Err(error)
-            }
+            Err(error) if !pending_command_owns_reclaim_claim => match release_reclaim_claim() {
+                Ok(()) => Err(error),
+                Err(release_error) => {
+                    reclaim_release_unknown = true;
+                    Err(release_error)
+                }
+            },
             result => result,
         };
         match &result {
@@ -10889,7 +10918,8 @@ impl super::StorageCluster {
             Ok(super::ObjectPayloadReclaimAttempt::MissingRoot) => emit_outcome("missing_root"),
             Err(_) => emit_outcome("error"),
         }
-        let keep_reclaim_fence = result.is_err() && payload_delete_started;
+        let keep_reclaim_fence = result.is_err()
+            && (payload_delete_started || reclaim_ownership_unknown || reclaim_release_unknown);
         self.local_map.finish_object_payload_reclaim(
             bucket,
             key,
@@ -14414,6 +14444,17 @@ impl super::StorageCluster {
     ) -> Result<bool, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_payload_reclaim_exists(bucket, key, generation_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_payload_reclaim_is_active(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> bool {
+        self.local_map
+            .test_object_payload_reclaim_is_active(bucket, key, generation_id)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

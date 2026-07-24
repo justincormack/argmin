@@ -217,7 +217,7 @@ impl Coordinator {
                                 authorized.key_typed(),
                                 &transient_segment_id,
                             );
-                            return Err(error.into());
+                            return Err(super::map_store_error(error));
                         }
                     };
                     let commit_req = CommitDirectPutObjectReq {
