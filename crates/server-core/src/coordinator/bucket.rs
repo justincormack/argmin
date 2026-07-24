@@ -852,15 +852,25 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_tags(&self, req: &BucketRequest<'_>) -> Result<Option<String>, ServerError> {
+    pub fn get_bucket_tags_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_tags",
+            "Coordinator::get_bucket_tags_on_admitted_route",
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_get_bucket_tagging(req)?;
+        let authorized = self.authorize_get_bucket_tagging_on_admitted_route(admission, req)?;
         Ok(authorized.body)
+    }
+
+    #[cfg(test)]
+    pub fn get_bucket_tags(&self, req: &BucketRequest<'_>) -> Result<Option<String>, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_bucket_tags_on_admitted_route(&admission, req)
     }
 
     pub fn delete_bucket_tags(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
@@ -1017,15 +1027,25 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_abac(&self, req: &BucketRequest<'_>) -> Result<bool, ServerError> {
+    pub fn get_bucket_abac_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<bool, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_abac",
+            "Coordinator::get_bucket_abac_on_admitted_route",
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_get_bucket_abac(req)?;
+        let authorized = self.authorize_get_bucket_abac_on_admitted_route(admission, req)?;
         Ok(authorized.enabled)
+    }
+
+    #[cfg(test)]
+    pub fn get_bucket_abac(&self, req: &BucketRequest<'_>) -> Result<bool, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_bucket_abac_on_admitted_route(&admission, req)
     }
 
     pub fn put_bucket_policy(&self, req: &PutBucketPolicyRequest<'_>) -> Result<(), ServerError> {
@@ -1137,18 +1157,28 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_lifecycle(
+    pub fn get_bucket_lifecycle_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_lifecycle",
+            "Coordinator::get_bucket_lifecycle_on_admitted_route",
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_get_bucket_lifecycle(req)?;
+        let authorized = self.authorize_get_bucket_lifecycle_on_admitted_route(admission, req)?;
         Ok(authorized.body)
+    }
+
+    #[cfg(test)]
+    pub fn get_bucket_lifecycle(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_bucket_lifecycle_on_admitted_route(&admission, req)
     }
 
     pub fn delete_bucket_lifecycle(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {

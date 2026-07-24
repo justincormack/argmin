@@ -2485,6 +2485,32 @@ Fifty-first Phase 3 slice:
   the storage boundary checker, and workspace-wide strict Clippy pass. The full
   parallel workspace suite passes (7,549 tests).
 
+Fifty-second Phase 3 slice:
+
+- `GetBucketTagging`, `GetBucketAbac`, and `GetBucketLifecycle` now consume the
+  buffered request's existing `StorageClusterRouteAdmission`. Their tag,
+  summary-only ABAC, and lifecycle views load through the admitted route, and
+  their production coordinator entry points can no longer resample the
+  renewable runtime-map handle. Crate-local coordinator tests retain helpers
+  which acquire fresh admission before entering the production paths.
+- tagging and lifecycle authorization now separate admitted handle loading
+  from the unchanged policy evaluation. The ABAC path similarly evaluates its
+  owner-account-admin rule against an admitted summary-only handle. Existing
+  expected-owner, conditional bucket-tag ABAC, cross-account bucket-policy,
+  missing-tag-set, disabled-ABAC, and missing-lifecycle behavior is preserved.
+- the shared bucket-metadata regressions now cover nine operations and three
+  additional handle shapes. Positive canaries and negative same-cluster/
+  different-publication-domain cases prove the admitted tag, summary-only, and
+  lifecycle paths all reject foreign authority; the captured-deadline matrix
+  proves same-generation renewal cannot extend any of them.
+- the other buffered coordinator workflows, their production raw entry points,
+  and capability requirements on the node-client traits remain open in Phase
+  3.
+- focused coordinator, tagging, lifecycle, ABAC-admin, expected-owner,
+  bucket-policy, and conditional-ABAC tests pass (126 tests). Formatting passes;
+  the storage boundary checker and workspace-wide strict Clippy pass. The full
+  parallel workspace suite passes (7,549 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

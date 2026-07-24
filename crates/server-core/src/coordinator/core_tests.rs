@@ -301,6 +301,24 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
                     .get_bucket_cors_on_admitted_route(&admission, &request)
                     .map(|_| ()),
             ),
+            (
+                "GetBucketTagging",
+                coord
+                    .get_bucket_tags_on_admitted_route(&admission, &request)
+                    .map(|_| ()),
+            ),
+            (
+                "GetBucketAbac",
+                coord
+                    .get_bucket_abac_on_admitted_route(&admission, &request)
+                    .map(|_| ()),
+            ),
+            (
+                "GetBucketLifecycle",
+                coord
+                    .get_bucket_lifecycle_on_admitted_route(&admission, &request)
+                    .map(|_| ()),
+            ),
         ] {
             let error = result.expect_err(operation);
             assert!(
@@ -476,6 +494,15 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
     foreign
         .get_bucket_cors_on_admitted_route(&foreign_admission, &request)
         .unwrap();
+    foreign
+        .get_bucket_tags_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    foreign
+        .get_bucket_abac_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    foreign
+        .get_bucket_lifecycle_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
 
     for (operation, result) in [
         (
@@ -513,6 +540,24 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
             "GetBucketCors",
             local
                 .get_bucket_cors_on_admitted_route(&foreign_admission, &request)
+                .map(|_| ()),
+        ),
+        (
+            "GetBucketTagging",
+            local
+                .get_bucket_tags_on_admitted_route(&foreign_admission, &request)
+                .map(|_| ()),
+        ),
+        (
+            "GetBucketAbac",
+            local
+                .get_bucket_abac_on_admitted_route(&foreign_admission, &request)
+                .map(|_| ()),
+        ),
+        (
+            "GetBucketLifecycle",
+            local
+                .get_bucket_lifecycle_on_admitted_route(&foreign_admission, &request)
                 .map(|_| ()),
         ),
     ] {

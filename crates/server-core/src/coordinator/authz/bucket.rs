@@ -300,14 +300,24 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_get_bucket_tagging(
+    pub(in crate::coordinator) fn authorize_get_bucket_tagging_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketTagging, ServerError> {
-        let bucket = self.load_bucket_handle_for_bucket_read(
+        let bucket = self.load_bucket_handle_for_bucket_read_on_admitted_route(
+            admission,
             req,
             BucketHandleRequest::new().requiring_bucket_tags(),
         )?;
+        self.authorize_get_bucket_tagging_with_loaded_handle(req, bucket)
+    }
+
+    fn authorize_get_bucket_tagging_with_loaded_handle(
+        &self,
+        req: &BucketRequest<'_>,
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedGetBucketTagging, ServerError> {
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let policy_decision = self.bucket_policy_decision_for_loaded_handle(
             &req.requester,
@@ -526,15 +536,24 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_get_bucket_abac(
+    pub(in crate::coordinator) fn authorize_get_bucket_abac_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketAbac, ServerError> {
-        let bucket = self.bucket_handle_loader().load_bucket(
+        let bucket = self.bucket_handle_loader().load_bucket_on_admitted_route(
+            admission,
             req.name_typed(),
             req.expected_bucket_owner(),
             BucketHandleRequest::new(),
         )?;
+        Self::authorize_get_bucket_abac_with_loaded_handle(req, bucket)
+    }
+
+    fn authorize_get_bucket_abac_with_loaded_handle(
+        req: &BucketRequest<'_>,
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedGetBucketAbac, ServerError> {
         if !Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()) {
             return Err(ServerError::AccessDenied);
         }
@@ -810,6 +829,7 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_get_bucket_lifecycle(
         &self,
         req: &BucketRequest<'_>,
@@ -818,6 +838,27 @@ impl Coordinator {
             req,
             BucketHandleRequest::new().requiring_lifecycle_view(),
         )?;
+        self.authorize_get_bucket_lifecycle_with_loaded_handle(req, bucket)
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_lifecycle_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketLifecycle, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_read_on_admitted_route(
+            admission,
+            req,
+            BucketHandleRequest::new().requiring_lifecycle_view(),
+        )?;
+        self.authorize_get_bucket_lifecycle_with_loaded_handle(req, bucket)
+    }
+
+    fn authorize_get_bucket_lifecycle_with_loaded_handle(
+        &self,
+        req: &BucketRequest<'_>,
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedGetBucketLifecycle, ServerError> {
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let allowed = self.requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
             &req.requester,

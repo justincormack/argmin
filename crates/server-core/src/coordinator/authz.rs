@@ -1880,6 +1880,7 @@ impl Coordinator {
             .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
     }
 
+    #[cfg(test)]
     fn load_bucket_handle_for_bucket_read(
         &self,
         req: &BucketRequest<'_>,

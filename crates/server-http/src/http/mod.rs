@@ -2608,11 +2608,10 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketTagging { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                match self.coordinator.get_bucket_tags(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)? {
+                match self.coordinator.get_bucket_tags_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )? {
                     Some(tags_xml) => Ok(S3Response::get_bucket_tagging(&tags_xml)),
                     None => Err(ServerError::NoSuchTagSet {
                         resource: bucket.to_string(),
@@ -2644,11 +2643,10 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketAbac { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                let enabled = self.coordinator.get_bucket_abac(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)?;
+                let enabled = self.coordinator.get_bucket_abac_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )?;
                 Ok(S3Response::get_bucket_abac(&xml::get_bucket_abac_xml(
                     enabled,
                 )))
@@ -2670,11 +2668,10 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketLifecycle { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                match self.coordinator.get_bucket_lifecycle(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)? {
+                match self.coordinator.get_bucket_lifecycle_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )? {
                     Some(config_xml) => Ok(S3Response::get_bucket_lifecycle(&config_xml)),
                     None => Err(ServerError::NoSuchLifecycleConfiguration {
                         bucket: bucket.to_string(),
