@@ -70,9 +70,9 @@ mod traits {
 }
 
 pub use cluster::{
-    ActiveBucketRoute, ActiveBucketRoutePair, BucketWriteSnapshotAction, DurableReclaimScanBatch,
-    DurableReclaimScanOutcome, LeasedObjectReadSnapshotOutcome, LocalClusterMap,
-    LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
+    ActiveBucketMetadataScan, ActiveBucketRoute, ActiveBucketRoutePair, BucketWriteSnapshotAction,
+    DurableReclaimScanBatch, DurableReclaimScanOutcome, LeasedObjectReadSnapshotOutcome,
+    LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
     LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
     LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PgMetadataTransferArtifact,
     PlacedSegmentShardBackfillCopyTarget, PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth,

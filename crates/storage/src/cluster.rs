@@ -74,8 +74,8 @@ use crate::storage_rpc::{
 use crate::traits::PgMetadataStore;
 use crate::types::{
     BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
-    BucketSubresourceKind, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
-    CommitDirectPutObjectReq, CreateStreamUploadReq, DirectPutCommitSnapshot,
+    BucketSubresourceKind, BucketWriteDrainRecord, BucketWriteReservationRecord, CanonicalUserId,
+    ClusterEpoch, CommitDirectPutObjectReq, CreateStreamUploadReq, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
     MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot,
     ObjectSegmentRecord, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
@@ -701,7 +701,7 @@ type ObjectMetadataReservationAcquiredHook =
     Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
-type ObjectListingPgCompleteHook = Arc<dyn Fn(u32) + Send + Sync>;
+type MetadataListingPgCompleteHook = Arc<dyn Fn(u32) + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
 type ReclaimCoordinationTestHook = Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
@@ -736,7 +736,7 @@ struct StorageClusterTestHooks {
     #[cfg(test)]
     after_stream_append_command_id_allocated: Option<StreamAppendCommandIdAllocatedHook>,
     after_object_metadata_reservation_acquired: Option<ObjectMetadataReservationAcquiredHook>,
-    after_object_listing_pg_complete: Option<ObjectListingPgCompleteHook>,
+    after_metadata_listing_pg_complete: Option<MetadataListingPgCompleteHook>,
     before_reclaim_ownership_lookup: Option<ReclaimCoordinationTestHook>,
     before_reclaim_claim_release: Option<ReclaimCoordinationTestHook>,
     before_placed_payload_shard_write: Option<PayloadShardWriteTestHook>,
@@ -802,7 +802,7 @@ pub struct ObjectMetadataReservationAcquiredHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct ObjectListingPgCompleteHookGuard {
+pub struct MetadataListingPgCompleteHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -935,9 +935,12 @@ impl Drop for ObjectMetadataReservationAcquiredHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-impl Drop for ObjectListingPgCompleteHookGuard {
+impl Drop for MetadataListingPgCompleteHookGuard {
     fn drop(&mut self) {
-        self.hooks.lock().unwrap().after_object_listing_pg_complete = None;
+        self.hooks
+            .lock()
+            .unwrap()
+            .after_metadata_listing_pg_complete = None;
     }
 }
 
@@ -1704,6 +1707,19 @@ impl StorageClusterRouteAdmission {
         })
     }
 
+    /// Derive active authority for an account-scoped scan across every bucket
+    /// metadata PG in this request's admitted runtime-map generation.
+    pub fn active_bucket_metadata_scan(
+        &self,
+        owner_canonical_id: &CanonicalUserId,
+    ) -> Result<ActiveBucketMetadataScan<'_>, StoreError> {
+        self.require_valid_now()?;
+        Ok(ActiveBucketMetadataScan {
+            admission: self,
+            owner_canonical_id: owner_canonical_id.clone(),
+        })
+    }
+
     /// Narrow this admitted request to cleanup authority for one stream-upload
     /// object. The returned capability can only remove an abandoned session
     /// and its staged state from this admitted route generation; it cannot
@@ -1781,6 +1797,35 @@ pub struct ActiveBucketRoute<'admission> {
     admission: &'admission StorageClusterRouteAdmission,
     bucket: BucketName,
     pg_id: BucketPgId,
+}
+
+/// Non-cloneable active authority for an account-scoped bucket metadata scan.
+///
+/// The scan is fixed to the admitted runtime-map generation. It rechecks the
+/// captured deadline before every bucket-PG node access, so a long scan cannot
+/// continue under a later renewal of the same generation.
+///
+/// ```compile_fail
+/// use storage::ActiveBucketMetadataScan;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn cache_scan(scan: &ActiveBucketMetadataScan<'_>) {
+///     require_clone(scan);
+/// }
+/// ```
+pub struct ActiveBucketMetadataScan<'admission> {
+    admission: &'admission StorageClusterRouteAdmission,
+    owner_canonical_id: CanonicalUserId,
+}
+
+impl ActiveBucketMetadataScan<'_> {
+    pub fn list_buckets_for_owner(&self) -> Result<Vec<BucketInfo>, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .list_buckets_for_owner_with_route_validation(self.owner_canonical_id.as_str(), || {
+                self.admission.require_valid_now()
+            })
+    }
 }
 
 impl ActiveBucketRoute<'_> {
@@ -5819,12 +5864,12 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn maybe_run_after_object_listing_pg_complete_hook(&self, pg_id: u32) {
+    fn maybe_run_after_metadata_listing_pg_complete_hook(&self, pg_id: u32) {
         let hook = self
             .test_hooks
             .lock()
             .unwrap()
-            .after_object_listing_pg_complete
+            .after_metadata_listing_pg_complete
             .clone();
         if let Some(hook) = hook {
             hook(pg_id);
@@ -7654,15 +7699,15 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_object_listing_pg_complete_hook(
+    pub fn test_install_after_metadata_listing_pg_complete_hook(
         &self,
         hook: Arc<dyn Fn(u32) + Send + Sync>,
-    ) -> ObjectListingPgCompleteHookGuard {
+    ) -> MetadataListingPgCompleteHookGuard {
         self.test_hooks
             .lock()
             .unwrap()
-            .after_object_listing_pg_complete = Some(hook);
-        ObjectListingPgCompleteHookGuard {
+            .after_metadata_listing_pg_complete = Some(hook);
+        MetadataListingPgCompleteHookGuard {
             hooks: Arc::clone(&self.test_hooks),
         }
     }

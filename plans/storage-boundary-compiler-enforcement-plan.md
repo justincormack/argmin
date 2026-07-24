@@ -2563,6 +2563,33 @@ Fifty-fourth Phase 3 slice:
   tests). Formatting, the storage boundary checker, and workspace-wide strict
   Clippy pass. The full parallel workspace suite passes (7,549 tests).
 
+Fifty-fifth Phase 3 slice:
+
+- `ListBuckets` now consumes the buffered request's existing
+  `StorageClusterRouteAdmission`; its production coordinator entry point can no
+  longer resample the renewable runtime-map handle. The crate-local coordinator
+  tests retain a helper which acquires fresh admission before entering the same
+  production path.
+- `ActiveBucketMetadataScan` is a non-cloneable, account-scoped capability over
+  the admitted runtime-map generation. It binds the authorized canonical owner
+  identity at construction, owns no independently reusable cluster handle, and
+  revalidates the admission's captured deadline immediately before every
+  bucket-PG node access. The old raw cluster scan is now available only to tests
+  and explicit test-hook builds.
+- the metadata-listing completion hook now covers bucket as well as object and
+  multipart scans. A deterministic three-PG regression expires the route after
+  the first bucket-PG response and requires the capability to fail before the
+  next access. The shared coordinator regressions add positive, expired-
+  deadline, and same-cluster/different-publication-domain `ListBuckets`
+  coverage alongside the fourteen subject-bound bucket reads.
+- object and multipart listings, object reads and mutations, the remaining
+  buffered coordinator workflows, and capability requirements on the
+  node-client traits remain open in Phase 3.
+- focused storage, coordinator, HTTP, endpoint-neutral response/root, and
+  local-only anonymous-listing tests pass (18 tests). Formatting, the storage
+  boundary checker, and workspace-wide strict Clippy pass. The full parallel
+  workspace suite passes (7,557 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

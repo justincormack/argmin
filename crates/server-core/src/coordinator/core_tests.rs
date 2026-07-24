@@ -268,6 +268,17 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
         let request = bucket_request_with_expected_owner("bucket", test_requester(), None);
         for (operation, result) in [
             (
+                "ListBuckets",
+                coord
+                    .list_buckets_on_admitted_route(
+                        &admission,
+                        &ListBucketsRequest {
+                            requester: test_requester(),
+                        },
+                    )
+                    .map(|_| ()),
+            ),
+            (
                 "HeadBucket",
                 coord
                     .head_bucket_on_admitted_route(&admission, &request)
@@ -515,6 +526,14 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
     let foreign_admission = foreign.admit_storage_route_for_request().unwrap();
     let request = bucket_request_with_expected_owner("bucket", test_requester(), None);
     foreign
+        .list_buckets_on_admitted_route(
+            &foreign_admission,
+            &ListBucketsRequest {
+                requester: test_requester(),
+            },
+        )
+        .unwrap();
+    foreign
         .head_bucket_on_admitted_route(&foreign_admission, &request)
         .unwrap();
     foreign
@@ -558,6 +577,17 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         .unwrap();
 
     for (operation, result) in [
+        (
+            "ListBuckets",
+            local
+                .list_buckets_on_admitted_route(
+                    &foreign_admission,
+                    &ListBucketsRequest {
+                        requester: test_requester(),
+                    },
+                )
+                .map(|_| ()),
+        ),
         (
             "HeadBucket",
             local

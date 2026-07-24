@@ -1751,9 +1751,10 @@ impl HttpFrontend {
                 let requester = self.requester_from_auth(auth, req)?;
                 let owner_account = Self::authenticated_account(auth)?;
                 let prefix = req.query_param_lossy("prefix");
-                let mut buckets = self
-                    .coordinator
-                    .list_buckets(&crate::coordinator::ListBucketsRequest { requester })?;
+                let mut buckets = self.coordinator.list_buckets_on_admitted_route(
+                    storage_route_admission,
+                    &crate::coordinator::ListBucketsRequest { requester },
+                )?;
                 if let Some(ref prefix) = prefix {
                     buckets.retain(|bucket| bucket.name.as_str().starts_with(prefix.as_ref()));
                 }

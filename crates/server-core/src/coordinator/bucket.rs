@@ -548,17 +548,29 @@ impl Coordinator {
         }
     }
 
+    pub fn list_buckets_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &ListBucketsRequest,
+    ) -> Result<Vec<BucketSummary>, ServerError> {
+        observability::trace_scope!(TRACE_TARGET, "Coordinator::list_buckets_on_admitted_route");
+        self.require_storage_route_admission(admission)?;
+        let AuthorizedListBuckets { owner_canonical_id } = self.authorize_list_buckets(req)?;
+        let buckets = admission
+            .active_bucket_metadata_scan(&owner_canonical_id)
+            .map_err(super::map_store_error)?
+            .list_buckets_for_owner()
+            .map_err(Self::map_object_pg_action_error)?;
+        Ok(buckets.into_iter().map(Self::bucket_summary).collect())
+    }
+
+    #[cfg(test)]
     pub fn list_buckets(
         &self,
         req: &ListBucketsRequest,
     ) -> Result<Vec<BucketSummary>, ServerError> {
-        observability::trace_scope!(TRACE_TARGET, "Coordinator::list_buckets");
-        let AuthorizedListBuckets { owner_canonical_id } = self.authorize_list_buckets(req)?;
-        let buckets = self
-            .storage_node()
-            .list_buckets_for_owner(owner_canonical_id.as_str())
-            .map_err(Self::map_object_pg_action_error)?;
-        Ok(buckets.into_iter().map(Self::bucket_summary).collect())
+        let admission = self.admit_storage_route_for_request()?;
+        self.list_buckets_on_admitted_route(&admission, req)
     }
 
     pub fn put_bucket_versioning(

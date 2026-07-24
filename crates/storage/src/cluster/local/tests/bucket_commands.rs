@@ -1,5 +1,5 @@
 use super::*;
-use crate::BucketAclSummary;
+use crate::{BucketAclSummary, StorageClusterRuntimeMapHandle};
 
 #[test]
 fn composite_object_listings_fan_out_to_routed_pg_primaries() {
@@ -409,7 +409,7 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
             crate::clock::current_time_millis().saturating_add(60_000),
         ));
         let weak_cluster = Arc::downgrade(&cluster);
-        cluster.test_install_after_object_listing_pg_complete_hook(Arc::new(move |pg_id| {
+        cluster.test_install_after_metadata_listing_pg_complete_hook(Arc::new(move |pg_id| {
             if pg_id == 0 {
                 weak_cluster
                     .upgrade()
@@ -420,6 +420,23 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
             }
         }))
     };
+
+    let bucket_admission = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster))
+        .admit_current_route()
+        .unwrap();
+    let bucket_hook = install_expiry_hook();
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let bucket_error = bucket_admission
+        .active_bucket_metadata_scan(&owner)
+        .unwrap()
+        .list_buckets_for_owner()
+        .unwrap_err();
+    assert!(matches!(
+        bucket_error,
+        crate::ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
+    ));
+    drop(bucket_hook);
+    drop(bucket_admission);
 
     let object_hook = install_expiry_hook();
     let object_error = cluster

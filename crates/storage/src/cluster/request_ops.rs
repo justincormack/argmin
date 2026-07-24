@@ -7500,12 +7500,14 @@ impl super::StorageCluster {
         }
     }
 
-    pub fn list_buckets_for_owner(
+    pub(super) fn list_buckets_for_owner_with_route_validation(
         &self,
         owner_canonical_id: &str,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<Vec<BucketInfo>, ObjectPgActionError> {
         let mut buckets = Vec::new();
         for pg_id in self.metadata_pg_ids() {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             let pg_id = PgId::new(pg_id);
             let node = self
                 .local_map
@@ -7515,10 +7517,20 @@ impl super::StorageCluster {
                 .list_buckets(self.validated_bucket_metadata_pg(pg_id), owner_canonical_id)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
             self.validate_bucket_list_page_for_pg(pg_id, node.node_id(), &page)?;
+            #[cfg(any(test, feature = "test-hooks"))]
+            self.maybe_run_after_metadata_listing_pg_complete_hook(pg_id.get());
             buckets.append(&mut page);
         }
         buckets.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(buckets)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn list_buckets_for_owner(
+        &self,
+        owner_canonical_id: &str,
+    ) -> Result<Vec<BucketInfo>, ObjectPgActionError> {
+        self.list_buckets_for_owner_with_route_validation(owner_canonical_id, || Ok(()))
     }
 
     pub(crate) fn validate_bucket_list_page_for_pg(
@@ -7860,7 +7872,7 @@ impl super::StorageCluster {
                     },
                 )?;
                 #[cfg(any(test, feature = "test-hooks"))]
-                self.maybe_run_after_object_listing_pg_complete_hook(pg_id);
+                self.maybe_run_after_metadata_listing_pg_complete_hook(pg_id);
                 for object in resp.objects {
                     smallest.insert(object.key().clone(), object);
                 }
@@ -13214,7 +13226,7 @@ impl super::StorageCluster {
                     },
                 )?;
                 #[cfg(any(test, feature = "test-hooks"))]
-                self.maybe_run_after_object_listing_pg_complete_hook(pg_id);
+                self.maybe_run_after_metadata_listing_pg_complete_hook(pg_id);
                 for upload in resp.uploads {
                     let order = (
                         upload.key.clone(),
