@@ -2837,7 +2837,7 @@ impl super::StorageCluster {
         for node in nodes {
             match node
                 .bucket_metadata_client()
-                .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)
+                .head_bucket_replica_for_delete(self.validated_bucket_metadata_pg(pg_id), bucket)
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)
             {
                 Ok(info)
@@ -2871,7 +2871,7 @@ impl super::StorageCluster {
         for node in nodes {
             match node
                 .bucket_metadata_client()
-                .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)
+                .head_bucket_replica_for_delete(self.validated_bucket_metadata_pg(pg_id), bucket)
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)
             {
                 Ok(info) if info.state == BucketState::Deleting => {

@@ -576,6 +576,44 @@ struct DeferredReclaimWork<T> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredReclaimClass {
+    ObjectPayload,
+    BucketDeleteBegin,
+    BucketDeleteFinalize,
+}
+
+impl DeferredReclaimClass {
+    fn next(self) -> Self {
+        match self {
+            Self::ObjectPayload => Self::BucketDeleteBegin,
+            Self::BucketDeleteBegin => Self::BucketDeleteFinalize,
+            Self::BucketDeleteFinalize => Self::ObjectPayload,
+        }
+    }
+}
+
+fn select_deferred_reclaim_class(
+    next_class: &mut DeferredReclaimClass,
+    object_payload_available: bool,
+    bucket_delete_begin_available: bool,
+    bucket_delete_finalize_available: bool,
+) -> Option<DeferredReclaimClass> {
+    for _ in 0..3 {
+        let candidate = *next_class;
+        *next_class = candidate.next();
+        let available = match candidate {
+            DeferredReclaimClass::ObjectPayload => object_payload_available,
+            DeferredReclaimClass::BucketDeleteBegin => bucket_delete_begin_available,
+            DeferredReclaimClass::BucketDeleteFinalize => bucket_delete_finalize_available,
+        };
+        if available {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BucketDeleteFinalizeWorkerDisposition {
     Finish,
     RetryAfter(Duration),
@@ -836,6 +874,7 @@ impl ReclaimSweeper {
                 > = VecDeque::new();
                 let mut deferred_bucket_delete_finalize_roots: HashSet<BucketDeleteFinalizeRoot> =
                     HashSet::new();
+                let mut next_deferred_reclaim_class = DeferredReclaimClass::ObjectPayload;
                 let mut durable_scan_schedule = DurableReclaimScanSchedule::immediate();
                 let mut pending_work: Option<(Arc<StorageCluster>, ReclaimWorkItem)> = None;
                 while !worker_stop.load(Ordering::SeqCst) {
@@ -872,39 +911,46 @@ impl ReclaimSweeper {
                                 .try_take_reclaim_work()
                                 .map(|work| (Arc::clone(&current_worker_node), work))
                                 .or_else(|| {
-                                    if let Some(deferred) =
-                                        deferred_object_payload_reclaim.pop_front()
-                                    {
-                                        deferred_object_payload_reclaim_roots
-                                            .remove(&deferred.root);
-                                        return Some((
-                                            deferred.queue_owner,
-                                            ReclaimWorkItem::ObjectPayload(deferred.root),
-                                        ));
-                                    }
-                                    deferred_bucket_delete_begin
-                                        .pop_front()
-                                        .map(|root| {
+                                    let class = select_deferred_reclaim_class(
+                                        &mut next_deferred_reclaim_class,
+                                        !deferred_object_payload_reclaim.is_empty(),
+                                        !deferred_bucket_delete_begin.is_empty(),
+                                        !deferred_bucket_delete_finalize.is_empty(),
+                                    )?;
+                                    Some(match class {
+                                        DeferredReclaimClass::ObjectPayload => {
+                                            let deferred = deferred_object_payload_reclaim
+                                                .pop_front()
+                                                .expect("selected deferred object reclaim");
+                                            deferred_object_payload_reclaim_roots
+                                                .remove(&deferred.root);
+                                            (
+                                                deferred.queue_owner,
+                                                ReclaimWorkItem::ObjectPayload(deferred.root),
+                                            )
+                                        }
+                                        DeferredReclaimClass::BucketDeleteBegin => {
+                                            let root = deferred_bucket_delete_begin
+                                                .pop_front()
+                                                .expect("selected deferred bucket-delete begin");
                                             deferred_bucket_delete_begin_roots.remove(&root);
                                             (
                                                 Arc::clone(&current_worker_node),
                                                 ReclaimWorkItem::BucketDeleteBegin(root),
                                             )
-                                        })
-                                        .or_else(|| {
-                                            deferred_bucket_delete_finalize.pop_front().map(
-                                                |deferred| {
-                                                    deferred_bucket_delete_finalize_roots
-                                                        .remove(&deferred.root);
-                                                    (
-                                                        deferred.queue_owner,
-                                                        ReclaimWorkItem::BucketDelete(
-                                                            deferred.root,
-                                                        ),
-                                                    )
-                                                },
+                                        }
+                                        DeferredReclaimClass::BucketDeleteFinalize => {
+                                            let deferred = deferred_bucket_delete_finalize
+                                                .pop_front()
+                                                .expect("selected deferred bucket finalizer");
+                                            deferred_bucket_delete_finalize_roots
+                                                .remove(&deferred.root);
+                                            (
+                                                deferred.queue_owner,
+                                                ReclaimWorkItem::BucketDelete(deferred.root),
                                             )
-                                        })
+                                        }
+                                    })
                                 })
                         })
                         .or_else(|| {
@@ -3451,6 +3497,33 @@ mod tests {
             earliest_bucket_delete_finalize_retry_sleep(&deferred_work, &retry_after_by_root),
             None,
             "ready finalizer root should not sleep"
+        );
+    }
+
+    #[test]
+    fn deferred_reclaim_selection_rotates_between_nonempty_classes() {
+        let mut next_class = DeferredReclaimClass::ObjectPayload;
+
+        assert_eq!(
+            select_deferred_reclaim_class(&mut next_class, true, false, true),
+            Some(DeferredReclaimClass::ObjectPayload)
+        );
+        assert_eq!(
+            select_deferred_reclaim_class(&mut next_class, true, false, true),
+            Some(DeferredReclaimClass::BucketDeleteFinalize),
+            "a continuously deferred object reclaim must not starve bucket finalizers"
+        );
+        assert_eq!(
+            select_deferred_reclaim_class(&mut next_class, true, true, true),
+            Some(DeferredReclaimClass::ObjectPayload)
+        );
+        assert_eq!(
+            select_deferred_reclaim_class(&mut next_class, true, true, true),
+            Some(DeferredReclaimClass::BucketDeleteBegin)
+        );
+        assert_eq!(
+            select_deferred_reclaim_class(&mut next_class, true, true, true),
+            Some(DeferredReclaimClass::BucketDeleteFinalize)
         );
     }
 

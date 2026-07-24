@@ -1263,7 +1263,8 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         | StorageRpcMessageKind::BucketDeleteBeginRoots
         | StorageRpcMessageKind::BucketDeleteFinalizeClaimGet
         | StorageRpcMessageKind::BucketDeleteFinalizeClaimAcquire
-        | StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease => {
+        | StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease
+        | StorageRpcMessageKind::BucketDeleteReplicaHead => {
             StorageRpcAuthorizedRoles::FRONTEND_MAINTENANCE
         }
 
@@ -1625,6 +1626,7 @@ mod tests {
     ];
 
     const BUCKET_DELETE_MAINTENANCE_WORKFLOW: &[StorageRpcMessageKind] = &[
+        StorageRpcMessageKind::BucketDeleteReplicaHead,
         StorageRpcMessageKind::BucketHeadRaw,
         StorageRpcMessageKind::BucketWriteDrainBegin,
         StorageRpcMessageKind::BucketWriteDrainClear,
@@ -2042,7 +2044,7 @@ mod tests {
         };
         let kinds = recognized_storage_rpc_message_kinds();
 
-        assert_eq!(kinds.len(), 165, "every wire kind must be classified");
+        assert_eq!(kinds.len(), 166, "every wire kind must be classified");
         for kind in kinds {
             assert!(
                 [&frontend, &storage, &admin, &maintenance,]

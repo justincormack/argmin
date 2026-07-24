@@ -14,6 +14,12 @@ pub(crate) enum CreateBucketCommandBuild {
 }
 
 pub(crate) trait BucketMetadataNodeClient: Send + Sync {
+    fn head_bucket_replica_for_delete(
+        &self,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError>;
+
     fn head_bucket_raw(
         &self,
         pg_id: BucketPgId,

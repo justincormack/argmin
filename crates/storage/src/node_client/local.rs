@@ -588,6 +588,14 @@ impl ShardScavengerNodeClient for LocalStorageNodeClient {
 }
 
 impl BucketMetadataNodeClient for LocalStorageNodeClient {
+    fn head_bucket_replica_for_delete(
+        &self,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::head_bucket_raw(self, pg_id, bucket)
+    }
+
     fn head_bucket_raw(
         &self,
         pg_id: BucketPgId,

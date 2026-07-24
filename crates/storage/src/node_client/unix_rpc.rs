@@ -3434,6 +3434,18 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
 }
 
 impl BucketMetadataNodeClient for UnixStorageNodeClient {
+    fn head_bucket_replica_for_delete(
+        &self,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.head_bucket_with_kind(
+            StorageRpcMessageKind::BucketDeleteReplicaHead,
+            pg_id.pg_id(),
+            bucket,
+        )
+    }
+
     fn head_bucket_raw(
         &self,
         pg_id: BucketPgId,

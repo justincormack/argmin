@@ -657,6 +657,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandRecoveryPendingSlotReplace = 163,
     MetadataCommandRetainedAbortApply = 165,
     MetadataCommandRetainedAbortFinish = 166,
+    BucketDeleteReplicaHead = 167,
     BucketHeadRaw = 32,
     BucketHeadInfo = 33,
     BucketCreateCommandBuild = 34,
@@ -926,6 +927,7 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandRetainedAbortFinish => {
                 "metadata command retained stream abort finish"
             }
+            Self::BucketDeleteReplicaHead => "bucket delete replica head",
             Self::MetadataCommandPeeringReplayApplyAndRecord => {
                 "metadata command peering replay apply and record"
             }
@@ -1116,6 +1118,7 @@ impl StorageRpcMessageKind {
             163 => Ok(Self::MetadataCommandRecoveryPendingSlotReplace),
             165 => Ok(Self::MetadataCommandRetainedAbortApply),
             166 => Ok(Self::MetadataCommandRetainedAbortFinish),
+            167 => Ok(Self::BucketDeleteReplicaHead),
             32 => Ok(Self::BucketHeadRaw),
             33 => Ok(Self::BucketHeadInfo),
             34 => Ok(Self::BucketCreateCommandBuild),
@@ -3726,9 +3729,9 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::MetadataCommandPgLockRelease => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
-        StorageRpcMessageKind::BucketHeadRaw | StorageRpcMessageKind::BucketHeadInfo => {
-            STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
-        }
+        StorageRpcMessageKind::BucketDeleteReplicaHead
+        | StorageRpcMessageKind::BucketHeadRaw
+        | StorageRpcMessageKind::BucketHeadInfo => STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN,
         StorageRpcMessageKind::BucketSnapshotLoad => {
             STORAGE_RPC_MAX_BUCKET_SNAPSHOT_REQUEST_PAYLOAD_LEN
         }

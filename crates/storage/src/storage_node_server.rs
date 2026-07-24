@@ -3454,6 +3454,14 @@ struct StorageNodeActiveBucketRoute<'a> {
     bucket: &'a BucketName,
 }
 
+struct StorageNodeBucketDeleteReplicaHeadRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    _route_permit: &'a StorageNodeRouteAdmissionPermit,
+    fence: StorageNodeRouteFence,
+    pg_id: BucketPgId,
+    bucket: &'a BucketName,
+}
+
 struct StorageNodeActiveBucketRoutePair<'a> {
     source: StorageNodeActiveBucketRoute<'a>,
     destination: StorageNodeActiveBucketRoute<'a>,
@@ -4065,6 +4073,23 @@ impl StorageNodeActiveBucketRoute<'_> {
             last_error,
         )
         .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+}
+
+impl StorageNodeBucketDeleteReplicaHeadRoute<'_> {
+    fn head_bucket(&self) -> Result<BucketInfo, StorageNodeBucketRouteError> {
+        self.fence
+            .validate_rpc_at(
+                crate::clock::current_time_millis(),
+                crate::clock::monotonic_time_millis(),
+            )
+            .map_err(StorageNodeBucketRouteError::Route)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketMetadataNodeClient::head_bucket_raw(&local_client, self.pg_id, self.bucket)
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 }
 
@@ -6775,6 +6800,7 @@ impl StorageNodeConnectionHandler {
                         | StorageRpcMessageKind::BucketWriteReservationRelease
                         | StorageRpcMessageKind::BucketWriteDrainClear
                         | StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease
+                        | StorageRpcMessageKind::BucketDeleteReplicaHead
                         | StorageRpcMessageKind::LifecycleSweepClaimRelease
                         | StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease
                         | StorageRpcMessageKind::ReadHandlesRelease
@@ -8346,6 +8372,15 @@ impl StorageNodeConnectionHandler {
                     message: error.to_string(),
                 }),
             },
+            StorageRpcMessageKind::BucketDeleteReplicaHead => {
+                match decode_bucket_request(&frame.payload) {
+                    Ok(request) => self.bucket_delete_replica_head_response(route_permit, request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::BucketHeadInfo => match decode_bucket_request(&frame.payload) {
                 Ok(request) => self.bucket_head_response(route_permit, request, true),
                 Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
@@ -11411,6 +11446,45 @@ impl StorageNodeConnectionHandler {
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         match route.head_bucket(filtered) {
+            Ok(info) => {
+                let payload =
+                    encode_bucket_info_outcome_response(&StorageRpcBucketInfoOutcomeResponse {
+                        outcome: StorageRpcBucketInfoOutcome::Info(info),
+                    });
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(StorageNodeBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketNotFound { name },
+            ))) => {
+                let payload =
+                    encode_bucket_info_outcome_response(&StorageRpcBucketInfoOutcomeResponse {
+                        outcome: StorageRpcBucketInfoOutcome::BucketNotFound { name },
+                    });
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
+        }
+    }
+
+    fn bucket_delete_replica_head_response(
+        &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
+        request: StorageRpcBucketRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let route = match self.bucket_delete_replica_route(
+            route_permit,
+            &request,
+            "bucket delete replica head",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.head_bucket() {
             Ok(info) => {
                 let payload =
                     encode_bucket_info_outcome_response(&StorageRpcBucketInfoOutcomeResponse {
@@ -15599,19 +15673,7 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
-        let expected_pg_id = PgId::new(self.node.pg_topology().bucket_pg_for(bucket));
-        if pg_id != expected_pg_id {
-            return Err(StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::PayloadDecode,
-                message: format!(
-                    "{operation} PG {} does not match bucket {} PG {}",
-                    pg_id.get(),
-                    bucket.as_str(),
-                    expected_pg_id.get()
-                ),
-            });
-        }
-        Ok(())
+        self.validate_pg_for_bucket(pg_id, bucket, operation)
     }
 
     fn retained_lifecycle_sweep_claim_route<'a>(
@@ -15718,6 +15780,38 @@ impl StorageNodeConnectionHandler {
             fence,
             pg_id: self.node.bucket_metadata_pg_for(bucket),
             bucket,
+        })
+    }
+
+    fn bucket_delete_replica_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcBucketRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeBucketDeleteReplicaHeadRoute<'a>, StorageRpcErrorResponse> {
+        self.validate_retained_cleanup_admission(route_permit, operation)?;
+        if request.cluster_epoch < self.config.cluster_epoch {
+            self.validate_metadata_command_recovery_read(
+                request.node_id,
+                request.cluster_epoch,
+                request.pg_id,
+                false,
+            )?;
+        } else {
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)?;
+        }
+        self.validate_pg_for_bucket(request.pg_id, &request.bucket, operation)?;
+        let fence = StorageNodeRouteFence::current(&self.config, self.current_route_map_lease());
+        fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )?;
+        Ok(StorageNodeBucketDeleteReplicaHeadRoute {
+            handler: self,
+            _route_permit: route_permit,
+            fence,
+            pg_id: self.node.bucket_metadata_pg_for(&request.bucket),
+            bucket: &request.bucket,
         })
     }
 

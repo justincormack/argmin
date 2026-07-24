@@ -1,4 +1,101 @@
 use super::*;
+use crate::control_plane::{PendingMetadataCommandObservation, PendingMetadataCommandRecovery};
+
+#[derive(Clone, Copy)]
+enum HistoricalReplicaHeadAuthorization {
+    Matching,
+    Missing,
+    WrongEpoch,
+}
+
+fn historical_bucket_delete_replica_head(
+    authorization: HistoricalReplicaHeadAuthorization,
+) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    let tmp = test_util::tempdir();
+    let source_epoch = ClusterEpoch::new(1).unwrap();
+    let other_epoch = ClusterEpoch::new(2).unwrap();
+    let current_epoch = ClusterEpoch::new(3).unwrap();
+    let mut config = test_config(&tmp);
+    config.node_id = NodeId::new(8);
+    config.cluster_epoch = current_epoch;
+    config.route_map_validity =
+        RouteMapValidity::until_ms(crate::clock::current_time_millis().saturating_add(60_000))
+            .unwrap();
+    config.pg_routes[0] = StorageNodePgRoute {
+        pg_id: 0,
+        cluster_epoch: current_epoch,
+        state: crate::types::PgState::Peering,
+        primary_node_id: NodeId::new(7),
+        acting_set: vec![NodeId::new(7), NodeId::new(8)],
+    };
+    let retained_route = |cluster_epoch| StorageNodePgRoute {
+        pg_id: 0,
+        cluster_epoch,
+        state: crate::types::PgState::Active,
+        primary_node_id: NodeId::new(7),
+        acting_set: vec![NodeId::new(7), NodeId::new(8)],
+    };
+    config
+        .historical_pg_routes
+        .push(retained_route(source_epoch));
+    let authorized_epoch = match authorization {
+        HistoricalReplicaHeadAuthorization::Matching => Some(source_epoch),
+        HistoricalReplicaHeadAuthorization::Missing => None,
+        HistoricalReplicaHeadAuthorization::WrongEpoch => {
+            config
+                .historical_pg_routes
+                .push(retained_route(other_epoch));
+            Some(other_epoch)
+        }
+    };
+    if let Some(authorized_epoch) = authorized_epoch {
+        config.pending_metadata_command_recoveries.push((
+            PgId::new(0),
+            PendingMetadataCommandRecovery::new(
+                NodeId::new(7),
+                PendingMetadataCommandObservation::new(
+                    authorized_epoch,
+                    std::num::NonZeroU64::MIN,
+                    0x1234,
+                ),
+            ),
+        ));
+    }
+    let bucket = crate::tests::bucket_name("historical-delete-replica-head-bucket");
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &crate::CanonicalUserId::from_principal("owner"),
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let client =
+        UnixStorageNodeClient::new(config.node_id, source_epoch, config.socket_path.clone());
+    let result = BucketMetadataNodeClient::head_bucket_replica_for_delete(
+        &client,
+        bucket_pg_id_for_test(0),
+        &bucket,
+    );
+    server_thread.join().unwrap();
+    result
+}
 
 fn bucket_pg_id_for_test(pg_id: u32) -> BucketPgId {
     BucketPgId::new_for_test(PgId::new(pg_id))
@@ -3570,4 +3667,101 @@ fn unix_bucket_metadata_client_rejects_proof_release_on_non_primary() {
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+fn unix_bucket_delete_replica_head_reads_non_primary_acting_replica() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.node_id = NodeId::new(8);
+    config.pg_routes[0].primary_node_id = NodeId::new(7);
+    config.pg_routes[0].acting_set = vec![NodeId::new(7), NodeId::new(8)];
+    let bucket = crate::tests::bucket_name("delete-replica-head-bucket");
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &crate::CanonicalUserId::from_principal("owner"),
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..2)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let pg_id = bucket_pg_id_for_test(0);
+
+    let ordinary_error = BucketMetadataNodeClient::head_bucket_raw(&client, pg_id, &bucket)
+        .expect_err("ordinary bucket reads must remain primary-only");
+    assert!(matches!(
+        ordinary_error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::NonActingSetAccess,
+            ..
+        })
+    ));
+
+    let replica =
+        BucketMetadataNodeClient::head_bucket_replica_for_delete(&client, pg_id, &bucket).unwrap();
+    assert_eq!(replica.name, bucket);
+
+    for server_thread in server_threads {
+        server_thread.join().unwrap();
+    }
+}
+
+#[test]
+fn unix_bucket_delete_replica_head_reads_authorized_historical_active_replica() {
+    let info = historical_bucket_delete_replica_head(HistoricalReplicaHeadAuthorization::Matching)
+        .unwrap();
+    assert_eq!(info.name.as_str(), "historical-delete-replica-head-bucket");
+}
+
+#[test]
+fn unix_bucket_delete_replica_head_rejects_missing_historical_authorization() {
+    let error = historical_bucket_delete_replica_head(HistoricalReplicaHeadAuthorization::Missing)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::StaleShardLocation,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn unix_bucket_delete_replica_head_rejects_wrong_historical_authorization() {
+    let error =
+        historical_bucket_delete_replica_head(HistoricalReplicaHeadAuthorization::WrongEpoch)
+            .unwrap_err();
+    assert!(matches!(
+        error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::StaleShardLocation,
+            ..
+        })
+    ));
 }
