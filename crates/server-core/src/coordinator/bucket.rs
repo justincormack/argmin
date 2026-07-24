@@ -656,18 +656,29 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_object_lock_configuration(
+    pub fn get_bucket_object_lock_configuration_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<BucketObjectLockConfig, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_object_lock_configuration",
+            "Coordinator::get_bucket_object_lock_configuration_on_admitted_route",
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_get_bucket_object_lock_configuration(req)?;
+        let authorized =
+            self.authorize_get_bucket_object_lock_configuration_on_admitted_route(admission, req)?;
         Ok(authorized.config)
+    }
+
+    #[cfg(test)]
+    pub fn get_bucket_object_lock_configuration(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<BucketObjectLockConfig, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_bucket_object_lock_configuration_on_admitted_route(&admission, req)
     }
 
     pub fn put_bucket_encryption(
@@ -691,18 +702,28 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_encryption(
+    pub fn get_bucket_encryption_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<EffectiveBucketEncryptionConfig, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_encryption",
+            "Coordinator::get_bucket_encryption_on_admitted_route",
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_get_bucket_encryption(req)?;
+        let authorized = self.authorize_get_bucket_encryption_on_admitted_route(admission, req)?;
         Ok(authorized.config)
+    }
+
+    #[cfg(test)]
+    pub fn get_bucket_encryption(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<EffectiveBucketEncryptionConfig, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_bucket_encryption_on_admitted_route(&admission, req)
     }
 
     pub fn delete_bucket_encryption(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
@@ -748,15 +769,25 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_cors(&self, req: &BucketRequest<'_>) -> Result<Option<String>, ServerError> {
+    pub fn get_bucket_cors_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_cors",
+            "Coordinator::get_bucket_cors_on_admitted_route",
             "bucket={:?}",
             req.name
         );
-        let authorized = self.authorize_get_bucket_cors(req)?;
+        let authorized = self.authorize_get_bucket_cors_on_admitted_route(admission, req)?;
         Ok(authorized.body)
+    }
+
+    #[cfg(test)]
+    pub fn get_bucket_cors(&self, req: &BucketRequest<'_>) -> Result<Option<String>, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_bucket_cors_on_admitted_route(&admission, req)
     }
 
     pub fn load_bucket_cors_config(

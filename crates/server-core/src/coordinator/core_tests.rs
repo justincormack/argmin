@@ -232,9 +232,16 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
     let tmp = test_util::tempdir();
     let initial = open_test_storage_cluster(tmp.path(), &[0]);
     let initial_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
-    initial_coord
-        .create_bucket_for_owner("default-owner", "bucket", false)
-        .unwrap();
+    create_bucket_for_owner_with_flags(
+        &initial_coord,
+        "default-owner",
+        &CanonicalUserId::from_principal("default-owner"),
+        "bucket",
+        false,
+        false,
+        true,
+    )
+    .unwrap();
 
     let (cluster, coord, admission) = storage::clock::with_time_override(1_000, || {
         let cluster = same_store_cluster_with_route_map_validity(
@@ -274,6 +281,24 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
                 "GetBucketVersioning",
                 coord
                     .get_bucket_versioning_on_admitted_route(&admission, &request)
+                    .map(|_| ()),
+            ),
+            (
+                "GetBucketObjectLockConfiguration",
+                coord
+                    .get_bucket_object_lock_configuration_on_admitted_route(&admission, &request)
+                    .map(|_| ()),
+            ),
+            (
+                "GetBucketEncryption",
+                coord
+                    .get_bucket_encryption_on_admitted_route(&admission, &request)
+                    .map(|_| ()),
+            ),
+            (
+                "GetBucketCors",
+                coord
+                    .get_bucket_cors_on_admitted_route(&admission, &request)
                     .map(|_| ()),
             ),
         ] {
@@ -421,9 +446,16 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
     assert!(Arc::ptr_eq(&local.storage_node(), &foreign.storage_node()));
     assert!(!local.shares_storage_route_admission_with(&foreign));
 
-    foreign
-        .create_bucket_for_owner("default-owner", "bucket", false)
-        .unwrap();
+    create_bucket_for_owner_with_flags(
+        &foreign,
+        "default-owner",
+        &CanonicalUserId::from_principal("default-owner"),
+        "bucket",
+        false,
+        false,
+        true,
+    )
+    .unwrap();
     let foreign_admission = foreign.admit_storage_route_for_request().unwrap();
     let request = bucket_request_with_expected_owner("bucket", test_requester(), None);
     foreign
@@ -434,6 +466,15 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         .unwrap();
     foreign
         .get_bucket_versioning_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    foreign
+        .get_bucket_object_lock_configuration_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    foreign
+        .get_bucket_encryption_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    foreign
+        .get_bucket_cors_on_admitted_route(&foreign_admission, &request)
         .unwrap();
 
     for (operation, result) in [
@@ -451,6 +492,27 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
             "GetBucketVersioning",
             local
                 .get_bucket_versioning_on_admitted_route(&foreign_admission, &request)
+                .map(|_| ()),
+        ),
+        (
+            "GetBucketObjectLockConfiguration",
+            local
+                .get_bucket_object_lock_configuration_on_admitted_route(
+                    &foreign_admission,
+                    &request,
+                )
+                .map(|_| ()),
+        ),
+        (
+            "GetBucketEncryption",
+            local
+                .get_bucket_encryption_on_admitted_route(&foreign_admission, &request)
+                .map(|_| ()),
+        ),
+        (
+            "GetBucketCors",
+            local
+                .get_bucket_cors_on_admitted_route(&foreign_admission, &request)
                 .map(|_| ()),
         ),
     ] {

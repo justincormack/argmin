@@ -2456,6 +2456,35 @@ Fiftieth Phase 3 slice:
   formatting, the storage boundary checker, and workspace-wide strict Clippy
   pass. The full parallel workspace suite passes (7,549 tests).
 
+Fifty-first Phase 3 slice:
+
+- `GetBucketObjectLockConfiguration`, `GetBucketEncryption`, and
+  `GetBucketCors` now consume the buffered request's existing
+  `StorageClusterRouteAdmission`. Their complete policy, conditional-ABAC, and
+  requested subresource views load through the admitted `ActiveBucketRoute`;
+  production coordinator entry points can no longer resample the renewable
+  runtime-map handle. Crate-local tests retain convenience methods which admit
+  a fresh request before entering the same production paths.
+- the common bucket-action authorizer now separates route-bound loading from
+  policy evaluation on a `LoadedBucketHandle`, and the CORS authorizer does the
+  same for its larger handle request. This preserves the established
+  expected-owner, bucket-policy, owner-account-admin, object-lock-not-found,
+  encryption-default, and missing-CORS behavior while making the route
+  capability boundary explicit.
+- the shared bucket-metadata regressions now cover all six admitted operations:
+  HeadBucket, location, versioning, object-lock configuration, encryption, and
+  CORS. They prove an immutable captured deadline is not extended by a
+  same-generation route renewal and that an admission from a distinct
+  publication domain is rejected even when both runtime-map handles contain
+  the same cluster. Positive foreign-domain canaries cover all six operations.
+- the other buffered coordinator workflows, their production raw entry points,
+  and capability requirements on the node-client traits remain open in Phase
+  3.
+- focused coordinator, HTTP object-lock, and endpoint-neutral S3 bucket-config
+  tests pass, including bucket-policy and conditional-ABAC cases. Formatting,
+  the storage boundary checker, and workspace-wide strict Clippy pass. The full
+  parallel workspace suite passes (7,549 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

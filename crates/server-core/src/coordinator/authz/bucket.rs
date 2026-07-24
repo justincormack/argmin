@@ -253,6 +253,7 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_get_bucket_cors(
         &self,
         req: &BucketRequest<'_>,
@@ -261,6 +262,27 @@ impl Coordinator {
             req,
             BucketHandleRequest::new().requiring_cors_view(),
         )?;
+        self.authorize_get_bucket_cors_with_loaded_handle(req, bucket)
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_cors_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketCors, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_read_on_admitted_route(
+            admission,
+            req,
+            BucketHandleRequest::new().requiring_cors_view(),
+        )?;
+        self.authorize_get_bucket_cors_with_loaded_handle(req, bucket)
+    }
+
+    fn authorize_get_bucket_cors_with_loaded_handle(
+        &self,
+        req: &BucketRequest<'_>,
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedGetBucketCors, ServerError> {
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let allowed = self.requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
             &req.requester,
@@ -1149,6 +1171,7 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_get_bucket_encryption(
         &self,
         req: &BucketRequest<'_>,
@@ -1158,6 +1181,26 @@ impl Coordinator {
             auth::PolicyAction::GetEncryptionConfiguration,
             Self::requester_can_bucket_owner_account_admin,
         )?;
+        Self::authorize_get_bucket_encryption_with_loaded_handle(bucket)
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_encryption_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketEncryption, ServerError> {
+        let bucket = self.authorize_loaded_bucket_action_for_on_admitted_route(
+            admission,
+            req,
+            auth::PolicyAction::GetEncryptionConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Self::authorize_get_bucket_encryption_with_loaded_handle(bucket)
+    }
+
+    fn authorize_get_bucket_encryption_with_loaded_handle(
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedGetBucketEncryption, ServerError> {
         Ok(AuthorizedGetBucketEncryption {
             config: bucket.bucket().encryption,
         })
@@ -1179,6 +1222,7 @@ impl Coordinator {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_get_bucket_object_lock_configuration(
         &self,
         req: &BucketRequest<'_>,
@@ -1188,6 +1232,13 @@ impl Coordinator {
             auth::PolicyAction::GetBucketObjectLockConfiguration,
             Self::requester_can_bucket_owner_account_admin,
         )?;
+        Self::authorize_get_bucket_object_lock_configuration_with_loaded_handle(req, bucket)
+    }
+
+    fn authorize_get_bucket_object_lock_configuration_with_loaded_handle(
+        req: &BucketRequest<'_>,
+        bucket: LoadedBucketHandle,
+    ) -> Result<AuthorizedGetBucketObjectLockConfiguration, ServerError> {
         if !bucket.bucket().object_lock.enabled {
             return Err(ServerError::ObjectLockConfigurationNotFound {
                 bucket: req.name.to_string(),
@@ -1196,6 +1247,20 @@ impl Coordinator {
         Ok(AuthorizedGetBucketObjectLockConfiguration {
             config: bucket.bucket().object_lock,
         })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_bucket_object_lock_configuration_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketObjectLockConfiguration, ServerError> {
+        let bucket = self.authorize_loaded_bucket_action_for_on_admitted_route(
+            admission,
+            req,
+            auth::PolicyAction::GetBucketObjectLockConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Self::authorize_get_bucket_object_lock_configuration_with_loaded_handle(req, bucket)
     }
 
     pub(in crate::coordinator) fn authorize_get_bucket_policy_status(

@@ -2511,13 +2511,12 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketObjectLockConfiguration { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                let config =
-                    self.coordinator
-                        .get_bucket_object_lock_configuration(&bucket_request(
-                            &bucket,
-                            requester,
-                            expected_bucket_owner,
-                        )?)?;
+                let config = self
+                    .coordinator
+                    .get_bucket_object_lock_configuration_on_admitted_route(
+                        storage_route_admission,
+                        &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                    )?;
                 Ok(S3Response::get_bucket_object_lock_configuration(config))
             }
             S3Operation::PutBucketEncryption { bucket } => {
@@ -2534,11 +2533,10 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketEncryption { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                let config = self.coordinator.get_bucket_encryption(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)?;
+                let config = self.coordinator.get_bucket_encryption_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )?;
                 Ok(S3Response::get_bucket_encryption(config))
             }
             S3Operation::DeleteBucketEncryption { bucket } => {
@@ -2574,11 +2572,10 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketCors { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                match self.coordinator.get_bucket_cors(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)? {
+                match self.coordinator.get_bucket_cors_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )? {
                     Some(config_xml) => Ok(S3Response::get_bucket_cors(&config_xml)),
                     None => Err(ServerError::NoSuchCorsConfiguration {
                         bucket: bucket.to_string(),
@@ -9705,7 +9702,10 @@ mod tests {
         );
         assert_eq!(
             fe.coordinator
-                .get_bucket_object_lock_configuration(&test_bucket_request("mybucket",))
+                .get_bucket_object_lock_configuration_on_admitted_route(
+                    &storage_route_admission,
+                    &test_bucket_request("mybucket"),
+                )
                 .unwrap(),
             s3_types::BucketObjectLockConfig {
                 enabled: true,

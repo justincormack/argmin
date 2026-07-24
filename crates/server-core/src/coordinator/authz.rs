@@ -1895,6 +1895,23 @@ impl Coordinator {
         )
     }
 
+    fn load_bucket_handle_for_bucket_read_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+        request: BucketHandleRequest,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        let base_request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+        self.bucket_handle_loader().load_bucket_on_admitted_route(
+            admission,
+            req.name_typed(),
+            req.expected_bucket_owner(),
+            base_request.merge(request),
+        )
+    }
+
     fn loaded_bucket_subresource_body(
         value: &LoadedBucketValue<String>,
     ) -> Result<Option<String>, ServerError> {
@@ -1914,6 +1931,28 @@ impl Coordinator {
         default_allowed: impl FnOnce(&Requester, &BucketSummary) -> bool,
     ) -> Result<LoadedBucketHandle, ServerError> {
         let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        self.authorize_loaded_bucket_action_for_loaded_handle(req, bucket, action, default_allowed)
+    }
+
+    fn authorize_loaded_bucket_action_for_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+        action: auth::PolicyAction,
+        default_allowed: impl FnOnce(&Requester, &BucketSummary) -> bool,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        let bucket =
+            self.load_bucket_handle_for_bucket_policy_read_on_admitted_route(admission, req)?;
+        self.authorize_loaded_bucket_action_for_loaded_handle(req, bucket, action, default_allowed)
+    }
+
+    fn authorize_loaded_bucket_action_for_loaded_handle(
+        &self,
+        req: &BucketRequest<'_>,
+        bucket: LoadedBucketHandle,
+        action: auth::PolicyAction,
+        default_allowed: impl FnOnce(&Requester, &BucketSummary) -> bool,
+    ) -> Result<LoadedBucketHandle, ServerError> {
         let default_allowed = default_allowed(&req.requester, bucket.bucket());
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let allowed = self.requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
