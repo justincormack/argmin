@@ -24696,6 +24696,24 @@ mod tests {
         decode_storage_rpc_response_payload(&acquire.payload)
             .unwrap()
             .unwrap();
+        let acquire_drained_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let active_frames = server
+                .route_admission
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active_frames;
+            if active_frames == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < acquire_drained_deadline,
+                "PG-lock acquire frame did not leave route admission"
+            );
+            thread::yield_now();
+        }
 
         let old_command = test_metadata_command(0, 1);
         let old_request = encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
