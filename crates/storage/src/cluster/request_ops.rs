@@ -10773,20 +10773,20 @@ impl super::StorageCluster {
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
         };
 
-        if !self.local_map.try_begin_object_payload_reclaim(
-            bucket,
-            key,
-            generation_id,
-            &reclaim_authority,
-        )? {
-            release_reclaim_claim()?;
-            emit_outcome("deferred_active");
-            return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
-        }
-
+        let mut reclaim_fence_started = false;
         let mut payload_delete_started = false;
         let mut command_owns_reclaim_claim = false;
         let result = (|| -> Result<super::ObjectPayloadReclaimAttempt, ObjectPgActionError> {
+            self.maybe_run_after_reclaim_claim_acquired_hook()?;
+            if !self.local_map.try_begin_object_payload_reclaim(
+                bucket,
+                key,
+                generation_id,
+                &reclaim_authority,
+            )? {
+                return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
+            }
+            reclaim_fence_started = true;
             match &reclaim {
                 ObjectPayloadReclaimCommand::Segments(reclaim) => {
                     for segment in &reclaim.segments {
@@ -10914,31 +10914,39 @@ impl super::StorageCluster {
                 (command_owns_reclaim_claim, false)
             };
         let mut reclaim_release_unknown = false;
-        let result = match result {
-            Err(error) if !pending_command_owns_reclaim_claim => match release_reclaim_claim() {
-                Ok(()) => Err(error),
+        let release_claim = (result.is_err() && !pending_command_owns_reclaim_claim)
+            || matches!(
+                &result,
+                Ok(super::ObjectPayloadReclaimAttempt::Deferred) if !reclaim_fence_started
+            );
+        let result = if release_claim {
+            match release_reclaim_claim() {
+                Ok(()) => result,
                 Err(release_error) => {
                     reclaim_release_unknown = true;
                     Err(release_error)
                 }
-            },
-            result => result,
+            }
+        } else {
+            result
         };
         match &result {
             Ok(super::ObjectPayloadReclaimAttempt::Completed) => emit_outcome("completed"),
-            Ok(super::ObjectPayloadReclaimAttempt::Deferred) => emit_outcome("deferred"),
+            Ok(super::ObjectPayloadReclaimAttempt::Deferred) => emit_outcome("deferred_active"),
             Ok(super::ObjectPayloadReclaimAttempt::MissingRoot) => emit_outcome("missing_root"),
             Err(_) => emit_outcome("error"),
         }
         let keep_reclaim_fence = result.is_err()
             && (payload_delete_started || reclaim_ownership_unknown || reclaim_release_unknown);
-        self.local_map.finish_object_payload_reclaim(
-            bucket,
-            key,
-            generation_id,
-            &reclaim_authority,
-            keep_reclaim_fence,
-        )?;
+        if reclaim_fence_started {
+            self.local_map.finish_object_payload_reclaim(
+                bucket,
+                key,
+                generation_id,
+                &reclaim_authority,
+                keep_reclaim_fence,
+            )?;
+        }
         result
     }
 

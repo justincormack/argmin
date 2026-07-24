@@ -737,6 +737,7 @@ struct StorageClusterTestHooks {
     after_stream_append_command_id_allocated: Option<StreamAppendCommandIdAllocatedHook>,
     after_object_metadata_reservation_acquired: Option<ObjectMetadataReservationAcquiredHook>,
     after_metadata_listing_pg_complete: Option<MetadataListingPgCompleteHook>,
+    after_reclaim_claim_acquired: Option<ReclaimCoordinationTestHook>,
     before_reclaim_ownership_lookup: Option<ReclaimCoordinationTestHook>,
     before_reclaim_claim_release: Option<ReclaimCoordinationTestHook>,
     before_placed_payload_shard_write: Option<PayloadShardWriteTestHook>,
@@ -808,6 +809,11 @@ pub struct MetadataListingPgCompleteHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct ReclaimOwnershipLookupTestHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct ReclaimClaimAcquiredTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -948,6 +954,13 @@ impl Drop for MetadataListingPgCompleteHookGuard {
 impl Drop for ReclaimOwnershipLookupTestHookGuard {
     fn drop(&mut self) {
         self.hooks.lock().unwrap().before_reclaim_ownership_lookup = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for ReclaimClaimAcquiredTestHookGuard {
+    fn drop(&mut self) {
+        self.hooks.lock().unwrap().after_reclaim_claim_acquired = None;
     }
 }
 
@@ -5893,6 +5906,22 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_after_reclaim_claim_acquired_hook(&self) -> Result<(), ObjectPgActionError> {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .after_reclaim_claim_acquired
+            .clone();
+        hook.map_or(Ok(()), |hook| hook())
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn maybe_run_after_reclaim_claim_acquired_hook(&self) -> Result<(), ObjectPgActionError> {
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     fn maybe_run_before_reclaim_claim_release_hook(&self) -> Result<(), ObjectPgActionError> {
         let hook = self
             .test_hooks
@@ -7722,6 +7751,17 @@ impl StorageCluster {
             .unwrap()
             .before_reclaim_ownership_lookup = Some(hook);
         ReclaimOwnershipLookupTestHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_after_reclaim_claim_acquired_hook(
+        &self,
+        hook: ReclaimCoordinationTestHook,
+    ) -> ReclaimClaimAcquiredTestHookGuard {
+        self.test_hooks.lock().unwrap().after_reclaim_claim_acquired = Some(hook);
+        ReclaimClaimAcquiredTestHookGuard {
             hooks: Arc::clone(&self.test_hooks),
         }
     }

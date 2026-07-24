@@ -15113,6 +15113,63 @@ fn reclaim_zero_apply_failure_releases_claim_after_pending_slot_cleanup() {
 }
 
 #[test]
+fn reclaim_route_failure_after_claim_acquisition_releases_claim() {
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap();
+    let (_tmp, coord, bucket, key, generation_id) =
+        setup_deleted_object_reclaim_test(b"claim-release-after-route-failure");
+
+    let admission_failed = Arc::new(AtomicBool::new(false));
+    let hook_admission_failed = Arc::clone(&admission_failed);
+    let claim_guard = coord
+        .storage_node()
+        .test_install_after_reclaim_claim_acquired_hook(Arc::new(move || {
+            hook_admission_failed.store(true, Ordering::SeqCst);
+            Err(storage::ObjectPgActionError::Store(
+                storage::StoreError::StaleMetadataOperation {
+                    pg_id: 0,
+                    operation_epoch: ClusterEpoch::INITIAL,
+                    current_epoch: ClusterEpoch::new(2).unwrap(),
+                },
+            ))
+        }));
+
+    let error = coord
+        .read_runtime()
+        .try_reclaim_object_payload("bucket", "key", generation_id)
+        .unwrap_err();
+    assert!(admission_failed.load(Ordering::SeqCst));
+    assert!(
+        matches!(error, ServerError::OperationAborted),
+        "post-claim route failure should remain retryable, got {error:?}"
+    );
+    assert!(
+        !coord
+            .storage_node()
+            .test_object_payload_reclaim_is_active(&bucket, &key, generation_id),
+        "failure before reclaim admission must not create a process-local active slot"
+    );
+
+    drop(claim_guard);
+    assert!(
+        coord
+            .read_runtime()
+            .try_reclaim_object_payload("bucket", "key", generation_id)
+            .unwrap(),
+        "retry must not defer behind the claim acquired by the failed attempt"
+    );
+    assert!(
+        !coord
+            .storage_node()
+            .test_payload_reclaim_exists(&bucket, &key, generation_id)
+            .unwrap(),
+        "completed retry must remove the durable reclaim root"
+    );
+}
+
+#[test]
 fn reclaim_ownership_lookup_failure_clears_active_reclaim_slot() {
     let _storage_serial = STORAGE_TEST_HOOK_SERIAL
         .get_or_init(|| std::sync::Mutex::new(()))
