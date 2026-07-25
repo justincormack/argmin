@@ -1,21 +1,23 @@
 /// Async hyper HTTP server loop with frontend pool and backpressure.
 use std::convert::Infallible;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use checksum::{ChecksumAlgorithm, RawChecksum};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
-use hyper::body::Incoming;
+use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::Request;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use md5_legacy::Digest;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
 #[cfg(any(test, feature = "local-debug-endpoints"))]
@@ -768,6 +770,51 @@ async fn serve_connection<IO>(
     }
 }
 
+struct TrackedIncoming {
+    inner: Incoming,
+    eof_observed: bool,
+}
+
+impl TrackedIncoming {
+    fn new(inner: Incoming) -> Self {
+        // `true` is a definitive empty body. A `false` value is only a hint:
+        // chunked bodies can remain marked non-terminal after yielding EOF.
+        let eof_observed = inner.is_end_stream();
+        Self {
+            inner,
+            eof_observed,
+        }
+    }
+
+    fn into_parts(self) -> (Incoming, bool) {
+        (self.inner, self.eof_observed)
+    }
+}
+
+impl Body for TrackedIncoming {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let frame = Pin::new(&mut self.inner).poll_frame(cx);
+        if matches!(frame, Poll::Ready(None)) {
+            self.eof_observed = true;
+        }
+        frame
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.eof_observed
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// Handle a single HTTP request: parse, route streaming writes, or buffer body
 /// for control-plane dispatch.
 ///
@@ -822,15 +869,17 @@ async fn handle(
         )),
     );
 
+    let (parts, body) = req.into_parts();
+    let mut body = TrackedIncoming::new(body);
+
     #[cfg(any(test, feature = "local-debug-endpoints"))]
     if state.config.local_debug_endpoint {
-        if let Some(resp) = local_debug_response(&state, req.method(), req.uri().path()) {
-            return Ok(s3_response_to_hyper(
+        if let Some(resp) = local_debug_response(&state, &parts.method, parts.uri.path()) {
+            return Ok(response_to_hyper_with_request_body(
+                &state,
                 resp,
+                body,
                 None,
-                state.config.stream_read_chunk_size,
-                state.config.panic_on_500,
-                state.config.abort_on_500,
                 response_trace,
             ));
         }
@@ -884,18 +933,15 @@ async fn handle(
                 },
             );
             let resp = S3Response::error_with_ids(&ServerError::SlowDown, "", &wire_ids);
-            return Ok(s3_response_to_hyper(
+            return Ok(response_to_hyper_with_request_body(
+                &state,
                 resp,
+                body,
                 None,
-                state.config.stream_read_chunk_size,
-                state.config.panic_on_500,
-                state.config.abort_on_500,
                 response_trace,
             ));
         }
     };
-
-    let (parts, body) = req.into_parts();
 
     // Check if this request should use the streaming write path.
     let streaming_op = match is_streaming_write_for_endpoint(state.endpoint_kind, &parts) {
@@ -906,21 +952,16 @@ async fn handle(
             // still be sending the declared body. Keep the unread Incoming
             // alive until Hyper has delivered the response body; dropping it
             // first can close the connection after only the response headers.
-            let resp = close_response_connection(S3Response::error_with_ids(&err, "", &wire_ids));
-            let mut resp = s3_response_to_hyper(
-                resp,
+            return Ok(response_to_hyper_with_request_body(
+                &state,
+                S3Response::error_with_ids(&err, "", &wire_ids),
+                body,
                 Some(req_permit),
-                state.config.stream_read_chunk_size,
-                state.config.panic_on_500,
-                state.config.abort_on_500,
                 response_trace,
-            );
-            resp.body_mut().retain_unread_request_body(body);
-            return Ok(resp);
+            ));
         }
     };
     if let Some(op) = streaming_op {
-        let mut body = body;
         let s3req = match S3Request::from_hyper_headers_with_source_ip(
             parts,
             transport_security,
@@ -931,13 +972,12 @@ async fn handle(
         {
             Ok(req) => req,
             Err(err) => {
-                return Ok(s3_response_to_hyper(
+                return Ok(response_to_hyper_with_request_body(
+                    &state,
                     S3Response::error_with_ids(&err, "", &wire_ids),
+                    body,
                     Some(req_permit),
-                    state.config.stream_read_chunk_size,
-                    state.config.panic_on_500,
-                    state.config.abort_on_500,
-                    response_trace.clone(),
+                    response_trace,
                 ))
             }
         };
@@ -946,13 +986,12 @@ async fn handle(
         let chunked = match parse_chunked_mode(&s3req) {
             Ok(mode) => mode,
             Err(err) => {
-                return Ok(s3_response_to_hyper(
+                return Ok(response_to_hyper_with_request_body(
+                    &state,
                     S3Response::error_with_ids(&err, "", &wire_ids),
+                    body,
                     Some(req_permit),
-                    state.config.stream_read_chunk_size,
-                    state.config.panic_on_500,
-                    state.config.abort_on_500,
-                    response_trace.clone(),
+                    response_trace,
                 ))
             }
         };
@@ -1011,24 +1050,17 @@ async fn handle(
                 resp
             }
         };
-        let retain_unread_request_body = response_requests_connection_close(&resp);
-        let mut resp = s3_response_to_hyper(
+        return Ok(response_to_hyper_with_request_body(
+            &state,
             resp,
+            body,
             Some(req_permit),
-            state.config.stream_read_chunk_size,
-            state.config.panic_on_500,
-            state.config.abort_on_500,
             response_trace,
-        );
-        if retain_unread_request_body {
-            resp.body_mut().retain_unread_request_body(body);
-        }
-        return Ok(resp);
+        ));
     }
 
     if state.endpoint_kind != EndpointKind::StsOnly {
         if let Some(bucket) = post_object_bucket(&parts) {
-            let mut body = body;
             let s3req = match S3Request::from_hyper_headers_with_source_ip(
                 parts,
                 transport_security,
@@ -1039,12 +1071,11 @@ async fn handle(
             {
                 Ok(req) => req,
                 Err(err) => {
-                    return Ok(s3_response_to_hyper(
+                    return Ok(response_to_hyper_with_request_body(
+                        &state,
                         S3Response::error_with_ids(&err, "", &wire_ids),
+                        body,
                         Some(req_permit),
-                        state.config.stream_read_chunk_size,
-                        state.config.panic_on_500,
-                        state.config.abort_on_500,
                         response_trace,
                     ));
                 }
@@ -1069,19 +1100,13 @@ async fn handle(
                 &trace,
             )
             .await;
-            let retain_unread_request_body = response_requests_connection_close(&resp);
-            let mut resp = s3_response_to_hyper(
+            return Ok(response_to_hyper_with_request_body(
+                &state,
                 resp,
+                body,
                 Some(req_permit),
-                state.config.stream_read_chunk_size,
-                state.config.panic_on_500,
-                state.config.abort_on_500,
                 response_trace,
-            );
-            if retain_unread_request_body {
-                resp.body_mut().retain_unread_request_body(body);
-            }
-            return Ok(resp);
+            ));
         }
     }
 
@@ -1096,12 +1121,11 @@ async fn handle(
         {
             Ok(req) => req,
             Err(err) => {
-                return Ok(s3_response_to_hyper(
+                return Ok(response_to_hyper_with_request_body(
+                    &state,
                     S3Response::error_with_ids(&err, "", &wire_ids),
+                    body,
                     Some(req_permit),
-                    state.config.stream_read_chunk_size,
-                    state.config.panic_on_500,
-                    state.config.abort_on_500,
                     response_trace,
                 ));
             }
@@ -1124,12 +1148,11 @@ async fn handle(
         })
         .await
         .unwrap_or_else(|_| internal_error_response(&wire_ids));
-        return Ok(s3_response_to_hyper(
+        return Ok(response_to_hyper_with_request_body(
+            &state,
             resp,
+            body,
             Some(req_permit),
-            state.config.stream_read_chunk_size,
-            state.config.panic_on_500,
-            state.config.abort_on_500,
             response_trace,
         ));
     }
@@ -1137,20 +1160,24 @@ async fn handle(
     // Non-streaming path: collect the full body for buffered control-plane
     // style requests (mostly XML payloads).
     let body_limit = buffered_body_limit_for_request_parts(state.endpoint_kind, &parts);
-    let body_bytes =
-        match collect_body_with_limit(body, state.config.body_idle_timeout, body_limit).await {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                return Ok(s3_response_to_hyper(
-                    S3Response::error_with_ids(&err, "", &wire_ids),
-                    Some(req_permit),
-                    state.config.stream_read_chunk_size,
-                    state.config.panic_on_500,
-                    state.config.abort_on_500,
-                    response_trace,
-                ));
-            }
-        };
+    let body_bytes = match collect_body_with_limit(
+        &mut body,
+        state.config.body_idle_timeout,
+        body_limit,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return Ok(response_to_hyper_with_request_body(
+                &state,
+                S3Response::error_with_ids(&err, "", &wire_ids),
+                body,
+                Some(req_permit),
+                response_trace,
+            ));
+        }
+    };
 
     let s3req = match S3Request::from_hyper_with_source_ip(
         parts,
@@ -1163,12 +1190,11 @@ async fn handle(
     {
         Ok(req) => req,
         Err(err) => {
-            return Ok(s3_response_to_hyper(
+            return Ok(response_to_hyper_with_request_body(
+                &state,
                 S3Response::error_with_ids(&err, "", &wire_ids),
+                body,
                 Some(req_permit),
-                state.config.stream_read_chunk_size,
-                state.config.panic_on_500,
-                state.config.abort_on_500,
                 response_trace,
             ));
         }
@@ -1190,12 +1216,11 @@ async fn handle(
     .await
     .unwrap_or_else(|_| internal_error_response(&wire_ids));
 
-    Ok(s3_response_to_hyper(
+    Ok(response_to_hyper_with_request_body(
+        &state,
         resp,
+        body,
         Some(req_permit),
-        state.config.stream_read_chunk_size,
-        state.config.panic_on_500,
-        state.config.abort_on_500,
         response_trace,
     ))
 }
@@ -2800,7 +2825,7 @@ fn route_bounded_body_timeout_error(
 async fn handle_streaming_post_object(
     state: Arc<ServerState>,
     s3req: S3Request,
-    body: &mut Incoming,
+    body: &mut TrackedIncoming,
     bucket: BucketName,
     trace: observability::TraceContext,
     wire_ids: WireResponseIds,
@@ -3185,7 +3210,7 @@ enum PresignedStreamingOperation {
 }
 
 async fn presigned_streaming_body_error(
-    body: &mut Incoming,
+    body: &mut TrackedIncoming,
     chunked: &ChunkedMode,
     operation: PresignedStreamingOperation,
     idle_timeout: Duration,
@@ -3282,7 +3307,7 @@ async fn presigned_streaming_body_error(
 async fn handle_streaming_put(
     state: Arc<ServerState>,
     s3req: S3Request,
-    body: &mut Incoming,
+    body: &mut TrackedIncoming,
     bucket: BucketName,
     key: String,
     chunked: ChunkedMode,
@@ -4048,20 +4073,37 @@ fn close_response_connection(mut resp: S3Response) -> S3Response {
     resp
 }
 
-fn response_requests_connection_close(resp: &S3Response) -> bool {
-    resp.headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("connection")
-            && value
-                .split(',')
-                .any(|directive| directive.trim().eq_ignore_ascii_case("close"))
-    })
+fn response_to_hyper_with_request_body(
+    state: &ServerState,
+    mut resp: S3Response,
+    request_body: TrackedIncoming,
+    permit: Option<OwnedSemaphorePermit>,
+    response_trace: super::ResponseTraceMeta,
+) -> http::Response<S3HyperBody> {
+    let (request_body, eof_observed) = request_body.into_parts();
+    let retain_unread_request_body = !eof_observed;
+    if retain_unread_request_body {
+        resp = close_response_connection(resp);
+    }
+    let mut response = s3_response_to_hyper(
+        resp,
+        permit,
+        state.config.stream_read_chunk_size,
+        state.config.panic_on_500,
+        state.config.abort_on_500,
+        response_trace,
+    );
+    if retain_unread_request_body {
+        response.body_mut().retain_unread_request_body(request_body);
+    }
+    response
 }
 
 async fn finish_streaming_prepare_failure(
     resp: S3Response,
     err: &ServerError,
     has_auth_attempt: bool,
-    body: &mut Incoming,
+    body: &mut TrackedIncoming,
     idle_timeout: Duration,
 ) -> S3Response {
     if should_close_streaming_prepare_failure(err, has_auth_attempt) {
@@ -4105,7 +4147,7 @@ fn request_has_auth_attempt(req: &S3Request) -> bool {
 
 async fn finish_streaming_post_rejection(
     resp: S3Response,
-    body: &mut Incoming,
+    body: &mut TrackedIncoming,
     idle_timeout: Duration,
 ) -> S3Response {
     finish_streaming_rejection_bounded(resp, body, idle_timeout).await
@@ -4113,7 +4155,7 @@ async fn finish_streaming_post_rejection(
 
 async fn finish_streaming_rejection_bounded(
     resp: S3Response,
-    body: &mut Incoming,
+    body: &mut TrackedIncoming,
     idle_timeout: Duration,
 ) -> S3Response {
     if drain_request_body_bounded(
@@ -4131,7 +4173,7 @@ async fn finish_streaming_rejection_bounded(
 }
 
 async fn drain_request_body_bounded(
-    body: &mut Incoming,
+    body: &mut TrackedIncoming,
     idle_timeout: Duration,
     max_bytes: usize,
     max_duration: Duration,
@@ -4170,7 +4212,7 @@ async fn drain_request_body_bounded(
 async fn handle_streaming_part(
     state: Arc<ServerState>,
     s3req: S3Request,
-    body: &mut Incoming,
+    body: &mut TrackedIncoming,
     bucket: BucketName,
     key: String,
     upload_id: String,
@@ -5212,7 +5254,7 @@ fn acquire_frontend(state: &ServerState) -> Arc<HttpFrontend> {
 /// every chunk. A client sending data steadily (even slowly) will never be
 /// timed out; only truly stalled connections are killed.
 async fn collect_body_with_limit(
-    body: Incoming,
+    body: &mut TrackedIncoming,
     idle_timeout: Duration,
     max_size: usize,
 ) -> Result<Bytes, ServerError> {
@@ -5896,7 +5938,7 @@ Authorization: {}\r\n\
 x-amz-date: {}\r\n\
 x-amz-content-sha256: {}\r\n\
 Content-Length: {}\r\n\
-Connection: close\r\n\r\n",
+\r\n",
             signed.authorization,
             signed.amz_date,
             signed.amz_content_sha256,
@@ -6031,9 +6073,91 @@ Connection: close\r\n\r\n",
         let response = String::from_utf8_lossy(&response);
         assert!(response.starts_with("HTTP/1.1 409"), "{response}");
         assert!(
+            response.to_ascii_lowercase().contains("connection: close"),
+            "{response}"
+        );
+        assert!(
             response.contains("<Code>OperationAborted</Code>"),
             "{response}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completed_chunked_streaming_put_keeps_connection_reusable() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "chunked-keepalive-bucket");
+        let (addr, _guard) = start_test_server(frontend).await;
+
+        let payload = b"complete chunked request";
+        let signed = sign_streaming_headers(
+            "PUT",
+            "/chunked-keepalive-bucket/key",
+            &addr,
+            payload.len(),
+            &[],
+        );
+        let wire = build_signed_chunked_body(&signed, payload);
+        let put_request = format!(
+            "PUT /chunked-keepalive-bucket/key HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+content-encoding: aws-chunked\r\n\
+x-amz-decoded-content-length: {}\r\n\
+Transfer-Encoding: chunked\r\n\r\n",
+            signed.authorization,
+            signed.amz_date,
+            signed.amz_content_sha256,
+            payload.len()
+        );
+
+        tokio::task::spawn_blocking(move || {
+            let mut client = StdTcpStream::connect(&addr).unwrap();
+            client.write_all(put_request.as_bytes()).unwrap();
+            write!(client, "{:x}\r\n", wire.len()).unwrap();
+            client.write_all(&wire).unwrap();
+            client.write_all(b"\r\n0\r\n\r\n").unwrap();
+            client.flush().unwrap();
+
+            let put_response = read_http_response(&mut client, Duration::from_secs(3));
+            assert!(put_response.starts_with("HTTP/1.1 200"), "{put_response}");
+            assert!(
+                !put_response
+                    .to_ascii_lowercase()
+                    .contains("connection: close"),
+                "fully consumed chunked request must preserve keep-alive: {put_response}"
+            );
+
+            let signed_get = sign_headers(
+                "GET",
+                "/chunked-keepalive-bucket/key",
+                &addr,
+                b"",
+                &[],
+            );
+            let get_request = format!(
+                "GET /chunked-keepalive-bucket/key HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+Connection: close\r\n\r\n",
+                signed_get.authorization, signed_get.amz_date, signed_get.amz_content_sha256,
+            );
+            client.write_all(get_request.as_bytes()).unwrap();
+            client.flush().unwrap();
+
+            let get_response = read_http_response(&mut client, Duration::from_secs(3));
+            assert!(get_response.starts_with("HTTP/1.1 200"), "{get_response}");
+            assert!(
+                get_response.as_bytes().ends_with(payload),
+                "second request on the keep-alive connection returned the wrong body: {get_response}"
+            );
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -9801,8 +9925,77 @@ Connection: keep-alive\r\n\r\n"
             "OPTIONS preflight should not reject based on ignored body size: {response}"
         );
         assert!(
+            response.to_ascii_lowercase().contains("connection: close"),
+            "OPTIONS with an unread request body must close after its response: {response}"
+        );
+        assert!(
             bytes_sent < TOTAL_BODY_BYTES,
             "server read the full OPTIONS body before responding: sent {bytes_sent} bytes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admission_timeout_delivers_complete_response_before_closing_unread_body() {
+        const TOTAL_BODY_BYTES: usize = 256 * 1024;
+
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let config = ServeConfig {
+            request_wait_timeout: Duration::from_millis(20),
+            ..ServeConfig::default()
+        };
+        let (addr, _guard) = start_test_server_with_config(frontend, config, 0).await;
+        let request = format!(
+            "PUT /admission-timeout-bucket/key HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Content-Length: {TOTAL_BODY_BYTES}\r\n\
+Connection: keep-alive\r\n\r\n"
+        );
+
+        let (response, bytes_sent) =
+            response_before_request_body_sent(&addr, request, TOTAL_BODY_BYTES);
+
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.contains("<Code>SlowDown</Code>"), "{response}");
+        assert!(
+            response.to_ascii_lowercase().contains("connection: close"),
+            "admission timeout with an unread body must close after its response: {response}"
+        );
+        assert!(
+            bytes_sent < TOTAL_BODY_BYTES,
+            "admission timeout consumed the full request body: sent {bytes_sent} bytes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn buffered_body_limit_error_delivers_complete_response_before_closing() {
+        const TOTAL_BODY_BYTES: usize = MAX_CORS_CONFIGURATION_BYTES + (64 * 1024);
+
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let (addr, _guard) = start_test_server(frontend).await;
+        let request = format!(
+            "PUT /oversized-cors-bucket?cors HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Content-Length: {TOTAL_BODY_BYTES}\r\n\
+Connection: keep-alive\r\n\r\n"
+        );
+
+        let (response, bytes_sent) =
+            response_before_request_body_sent(&addr, request, TOTAL_BODY_BYTES);
+
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(
+            response.contains("<Code>MaxMessageLengthExceeded</Code>"),
+            "{response}"
+        );
+        assert!(
+            response.to_ascii_lowercase().contains("connection: close"),
+            "body-limit failure must close after its response: {response}"
+        );
+        assert!(
+            bytes_sent < TOTAL_BODY_BYTES,
+            "body-limit failure consumed the full request body: sent {bytes_sent} bytes"
         );
     }
 
