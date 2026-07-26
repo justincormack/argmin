@@ -2036,6 +2036,32 @@ impl Coordinator {
             .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
     }
 
+    pub(super) fn with_bucket_write_handle_on_admitted_route<R, T>(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &R,
+        request: BucketHandleRequest,
+        action: impl FnOnce(LoadedBucketHandle) -> Result<T, ServerError>,
+    ) -> Result<T, ServerError>
+    where
+        R: BucketScopedRequest + ExpectedBucketOwnerRequest + ?Sized,
+    {
+        self.require_storage_route_admission(admission)?;
+        let expected_bucket_owner = req.expected_bucket_owner();
+        admission
+            .active_bucket_route(req.bucket_name_typed())
+            .map_err(super::map_store_error)?
+            .with_bucket_write_snapshot(request.resolve_to_storage_request(), |snapshot| {
+                let bucket = self
+                    .bucket_handle_loader()
+                    .load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)?;
+                #[cfg(test)]
+                self.maybe_run_bucket_write_handle_loaded_hook(req.bucket_name_typed().as_str());
+                action(bucket)
+            })
+            .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
+    }
+
     pub(super) fn with_bucket_write_handle_for_command_with_storage_node<R, T>(
         &self,
         storage_node: &Arc<StorageCluster>,
@@ -2201,9 +2227,9 @@ impl Coordinator {
         )
     }
 
-    fn authorize_loaded_bucket_write_policy_action_for_storage_node<R>(
+    fn authorize_loaded_bucket_write_action_on_admitted_route<R>(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &R,
         action: auth::PolicyAction,
         default_allowed: impl FnOnce(&Requester, &BucketSummary) -> bool,
@@ -2211,8 +2237,44 @@ impl Coordinator {
     where
         R: BucketScopedAuthorizationRequest + ?Sized,
     {
-        self.with_bucket_write_handle_for_storage_node(
-            storage_node,
+        self.with_bucket_write_handle_on_admitted_route(
+            admission,
+            req,
+            BucketHandleRequest::new()
+                .requiring_policy_view()
+                .requiring_bucket_tags_if_abac_enabled(),
+            |bucket| {
+                let default_allowed = default_allowed(req.requester(), bucket.bucket());
+                let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+                let allowed = self
+                    .requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
+                        req.requester(),
+                        bucket.bucket(),
+                        Self::loaded_bucket_tags_for_policy(&bucket)?.as_deref(),
+                        action,
+                        bucket_policy.as_deref(),
+                        default_allowed,
+                    )?;
+                if !allowed {
+                    return Err(ServerError::AccessDenied);
+                }
+                Ok(bucket)
+            },
+        )
+    }
+
+    fn authorize_loaded_bucket_write_policy_action_on_admitted_route<R>(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &R,
+        action: auth::PolicyAction,
+        default_allowed: impl FnOnce(&Requester, &BucketSummary) -> bool,
+    ) -> Result<LoadedBucketHandle, ServerError>
+    where
+        R: BucketScopedAuthorizationRequest + ?Sized,
+    {
+        self.with_bucket_write_handle_on_admitted_route(
+            admission,
             req,
             BucketHandleRequest::new()
                 .requiring_policy_view()

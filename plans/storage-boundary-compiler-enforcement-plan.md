@@ -2849,6 +2849,47 @@ Sixty-first Phase 3 slice:
   validation, the storage boundary checker, and workspace-wide strict Clippy
   pass. The full parallel workspace suite passes (7,592 tests).
 
+Sixty-second Phase 3 slice:
+
+- Put/Delete Bucket CORS, Tagging, Policy, and Lifecycle now consume the
+  buffered request's existing `StorageClusterRouteAdmission` for both bucket
+  authorization and mutation. The S3 Control ListTagsForResource,
+  TagResource, and both UntagResource publication forms use the same admitted
+  path rather than resampling the renewable runtime-map handle. Direct test
+  and test-support wrappers acquire admission before entering those production
+  methods.
+- `ActiveBucketRoute` now owns the bucket-write authorization snapshot and
+  bucket-subresource publisher for its fixed bucket and bucket-metadata PG.
+  The former raw subresource publisher is test/test-hook only. Authorization
+  reservation acquisition, snapshot loading, command construction, and the
+  pending-slot insertion all recheck the request authority; exact installed
+  command application remains convergence.
+- bucket-control pending-slot insertion now accepts the immutable
+  `AdmittedRouteEffectFence`. Local, Unix-session, and ordinary Unix clients
+  validate it, and the storage RPC handler rebinds the portable deadline and
+  validates it after the PG lock and immediately before the atomic
+  drain-aware insertion. The existing wire request already carried the
+  optional portable effect deadline, so no encoding change was required.
+- the shared captured-deadline and same-cluster/different-publication-domain
+  matrices cover the eight S3 bucket-subresource mutations and all S3 Control
+  tagging paths, with exact post-rejection CORS, tag, lifecycle, and policy
+  canaries. A deterministic pending-install regression covers both put and
+  delete mutation shapes, and the raw Unix deadline regression now covers the
+  bucket-control insertion variant as well.
+- the existing before/after-authorization runtime-map pinning regressions now
+  publish the replacement map asynchronously. They prove publication reaches
+  draining behind the admitted mutation, the mutation completes against its
+  captured route, and publication proceeds only after request admission is
+  released, without deadlocking the hook inside the admitted request.
+- bucket property/versioning/ACL mutations, CreateBucket/DeleteBucket,
+  multipart control operations, other remaining buffered coordinator
+  workflows, and capability requirements on the node-client traits remain
+  open in Phase 3.
+- four focused admission/effect-boundary regressions and a 196-test bucket
+  configuration/control matrix pass. Formatting, diff validation, the storage
+  boundary checker, workspace-wide strict Clippy, and the full parallel
+  workspace suite pass (7,593 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

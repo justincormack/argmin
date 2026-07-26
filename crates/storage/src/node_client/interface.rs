@@ -1291,6 +1291,14 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         bucket: &BucketName,
     ) -> Result<bool, StoreError>;
 
+    fn try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<bool, StoreError>;
+
     fn remove_pending_metadata_command_slot(
         &self,
         pg_id: PgId,

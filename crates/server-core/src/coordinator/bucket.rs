@@ -758,7 +758,11 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn put_bucket_cors(&self, req: &PutBucketConfigRequest<'_>) -> Result<(), ServerError> {
+    pub fn put_bucket_cors_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_cors",
@@ -766,10 +770,10 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let storage_node = self.storage_node();
-        let authorized = self.authorize_put_bucket_cors_with_storage_node(&storage_node, req)?;
-        let info = self.store_bucket_subresource_with_storage_node(
-            &storage_node,
+        self.require_storage_route_admission(admission)?;
+        let authorized = self.authorize_put_bucket_cors_on_admitted_route(admission, req)?;
+        let info = self.store_bucket_subresource_on_admitted_route(
+            admission,
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Cors,
@@ -779,6 +783,12 @@ impl Coordinator {
         )?;
         self.clear_bucket_fast_path(&info);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn put_bucket_cors(&self, req: &PutBucketConfigRequest<'_>) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.put_bucket_cors_on_admitted_route(&admission, req)
     }
 
     pub fn get_bucket_cors_on_admitted_route(
@@ -822,26 +832,39 @@ impl Coordinator {
             .map_err(Self::map_bucket_snapshot_load_error)
     }
 
-    pub fn delete_bucket_cors(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+    pub fn delete_bucket_cors_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_cors",
             "bucket={:?}",
             req.name
         );
-        let storage_node = self.storage_node();
-        let authorized = self.authorize_delete_bucket_cors_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .delete_bucket_subresource_and_load_info(
-                &authorized.bucket,
-                storage::BucketSubresourceKind::Cors,
-            )
+        self.require_storage_route_admission(admission)?;
+        let authorized = self.authorize_delete_bucket_cors_on_admitted_route(admission, req)?;
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .delete_bucket_subresource_and_load_info(storage::BucketSubresourceKind::Cors)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
     }
 
-    pub fn put_bucket_tags(&self, req: &PutBucketConfigRequest<'_>) -> Result<(), ServerError> {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn delete_bucket_cors(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.delete_bucket_cors_on_admitted_route(&admission, req)
+    }
+
+    pub fn put_bucket_tags_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_tags",
@@ -849,10 +872,10 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let storage_node = self.storage_node();
-        let authorized = self.authorize_put_bucket_tagging_with_storage_node(&storage_node, req)?;
-        let info = self.store_bucket_subresource_with_storage_node(
-            &storage_node,
+        self.require_storage_route_admission(admission)?;
+        let authorized = self.authorize_put_bucket_tagging_on_admitted_route(admission, req)?;
+        let info = self.store_bucket_subresource_on_admitted_route(
+            admission,
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Tagging,
@@ -862,6 +885,12 @@ impl Coordinator {
         )?;
         self.clear_bucket_fast_path(&info);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn put_bucket_tags(&self, req: &PutBucketConfigRequest<'_>) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.put_bucket_tags_on_admitted_route(&admission, req)
     }
 
     pub fn get_bucket_tags_on_admitted_route(
@@ -885,28 +914,37 @@ impl Coordinator {
         self.get_bucket_tags_on_admitted_route(&admission, req)
     }
 
-    pub fn delete_bucket_tags(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+    pub fn delete_bucket_tags_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_tags",
             "bucket={:?}",
             req.name
         );
-        let storage_node = self.storage_node();
-        let authorized =
-            self.authorize_delete_bucket_tagging_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .delete_bucket_subresource_and_load_info(
-                &authorized.bucket,
-                storage::BucketSubresourceKind::Tagging,
-            )
+        self.require_storage_route_admission(admission)?;
+        let authorized = self.authorize_delete_bucket_tagging_on_admitted_route(admission, req)?;
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .delete_bucket_subresource_and_load_info(storage::BucketSubresourceKind::Tagging)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
     }
 
-    pub fn get_bucket_tags_for_control_action(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn delete_bucket_tags(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.delete_bucket_tags_on_admitted_route(&admission, req)
+    }
+
+    pub fn get_bucket_tags_for_control_action_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketTagControlRequest<'_>,
         request_tags: &[(String, String)],
         action: BucketTagControlAction,
@@ -917,14 +955,39 @@ impl Coordinator {
             "bucket={:?}",
             req.bucket.name
         );
-        let authorized = self.authorize_bucket_tag_resource_action(req, request_tags, action)?;
-        self.storage_node()
-            .get_bucket_subresource(&authorized.bucket, storage::BucketSubresourceKind::Tagging)
+        self.require_storage_route_admission(admission)?;
+        let authorized = self.authorize_bucket_tag_resource_action_on_admitted_route(
+            admission,
+            req,
+            request_tags,
+            action,
+        )?;
+        admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .get_bucket_subresource(storage::BucketSubresourceKind::Tagging)
             .map_err(Self::map_bucket_snapshot_load_error)
     }
 
-    pub fn put_bucket_tags_for_tag_resource(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn get_bucket_tags_for_control_action(
         &self,
+        req: &BucketTagControlRequest<'_>,
+        request_tags: &[(String, String)],
+        action: BucketTagControlAction,
+    ) -> Result<Option<String>, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_bucket_tags_for_control_action_on_admitted_route(
+            &admission,
+            req,
+            request_tags,
+            action,
+        )
+    }
+
+    pub fn put_bucket_tags_for_tag_resource_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketTagControlRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
@@ -934,11 +997,10 @@ impl Coordinator {
             req.control.bucket.name,
             req.config.len()
         );
-        let storage_node = self.storage_node();
-        let authorized =
-            self.authorize_put_bucket_tag_control_with_storage_node(&storage_node, req)?;
-        let info = self.store_bucket_subresource_with_storage_node(
-            &storage_node,
+        self.require_storage_route_admission(admission)?;
+        let authorized = self.authorize_put_bucket_tag_control_on_admitted_route(admission, req)?;
+        let info = self.store_bucket_subresource_on_admitted_route(
+            admission,
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Tagging,
@@ -950,30 +1012,18 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn delete_bucket_tags_for_tag_resource(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn put_bucket_tags_for_tag_resource(
         &self,
-        req: &BucketTagControlRequest<'_>,
+        req: &PutBucketTagControlRequest<'_>,
     ) -> Result<(), ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::delete_bucket_tags_for_tag_resource",
-            "bucket={:?}",
-            req.bucket.name
-        );
-        let storage_node = self.storage_node();
-        let authorized = self.authorize_bucket_tag_control_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .delete_bucket_subresource_and_load_info(
-                &authorized.bucket,
-                storage::BucketSubresourceKind::Tagging,
-            )
-            .map_err(Self::map_bucket_snapshot_load_error)?;
-        self.clear_bucket_fast_path(&info);
-        Ok(())
+        let admission = self.admit_storage_route_for_request()?;
+        self.put_bucket_tags_for_tag_resource_on_admitted_route(&admission, req)
     }
 
-    pub fn put_bucket_tags_for_untag_resource(
+    pub fn put_bucket_tags_for_untag_resource_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketTagsForUntagResourceRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
@@ -983,11 +1033,11 @@ impl Coordinator {
             req.control.bucket.name,
             req.config.len()
         );
-        let storage_node = self.storage_node();
-        let authorized = self
-            .authorize_put_bucket_tags_for_untag_resource_with_storage_node(&storage_node, req)?;
-        let info = self.store_bucket_subresource_with_storage_node(
-            &storage_node,
+        self.require_storage_route_admission(admission)?;
+        let authorized =
+            self.authorize_put_bucket_tags_for_untag_resource_on_admitted_route(admission, req)?;
+        let info = self.store_bucket_subresource_on_admitted_route(
+            admission,
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Tagging,
@@ -999,8 +1049,18 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn delete_bucket_tags_for_untag_resource(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn put_bucket_tags_for_untag_resource(
         &self,
+        req: &PutBucketTagsForUntagResourceRequest<'_>,
+    ) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.put_bucket_tags_for_untag_resource_on_admitted_route(&admission, req)
+    }
+
+    pub fn delete_bucket_tags_for_untag_resource_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &UntagBucketTagControlRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
@@ -1009,17 +1069,25 @@ impl Coordinator {
             "bucket={:?}",
             req.control.bucket.name
         );
-        let storage_node = self.storage_node();
+        self.require_storage_route_admission(admission)?;
         let authorized =
-            self.authorize_untag_bucket_tag_control_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .delete_bucket_subresource_and_load_info(
-                &authorized.bucket,
-                storage::BucketSubresourceKind::Tagging,
-            )
+            self.authorize_untag_bucket_tag_control_on_admitted_route(admission, req)?;
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .delete_bucket_subresource_and_load_info(storage::BucketSubresourceKind::Tagging)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn delete_bucket_tags_for_untag_resource(
+        &self,
+        req: &UntagBucketTagControlRequest<'_>,
+    ) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.delete_bucket_tags_for_untag_resource_on_admitted_route(&admission, req)
     }
 
     pub fn put_bucket_abac(&self, req: &PutBucketAbacRequest<'_>) -> Result<(), ServerError> {
@@ -1060,7 +1128,11 @@ impl Coordinator {
         self.get_bucket_abac_on_admitted_route(&admission, req)
     }
 
-    pub fn put_bucket_policy(&self, req: &PutBucketPolicyRequest<'_>) -> Result<(), ServerError> {
+    pub fn put_bucket_policy_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &PutBucketPolicyRequest<'_>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_policy",
@@ -1068,10 +1140,10 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let storage_node = self.storage_node();
-        let authorized = self.authorize_put_bucket_policy_with_storage_node(&storage_node, req)?;
-        let info = self.store_bucket_subresource_with_storage_node(
-            &storage_node,
+        self.require_storage_route_admission(admission)?;
+        let authorized = self.authorize_put_bucket_policy_on_admitted_route(admission, req)?;
+        let info = self.store_bucket_subresource_on_admitted_route(
+            admission,
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Policy,
@@ -1081,6 +1153,12 @@ impl Coordinator {
         )?;
         self.clear_bucket_fast_path(&info);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn put_bucket_policy(&self, req: &PutBucketPolicyRequest<'_>) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.put_bucket_policy_on_admitted_route(&admission, req)
     }
 
     pub fn get_bucket_policy_on_admitted_route(
@@ -1129,28 +1207,37 @@ impl Coordinator {
         self.get_bucket_policy_status_on_admitted_route(&admission, req)
     }
 
-    pub fn delete_bucket_policy(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+    pub fn delete_bucket_policy_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_policy",
             "bucket={:?}",
             req.name
         );
-        let storage_node = self.storage_node();
-        let authorized =
-            self.authorize_delete_bucket_policy_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .delete_bucket_subresource_and_load_info(
-                &authorized.bucket,
-                storage::BucketSubresourceKind::Policy,
-            )
+        self.require_storage_route_admission(admission)?;
+        let authorized = self.authorize_delete_bucket_policy_on_admitted_route(admission, req)?;
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .delete_bucket_subresource_and_load_info(storage::BucketSubresourceKind::Policy)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
     }
 
-    pub fn put_bucket_lifecycle(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn delete_bucket_policy(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.delete_bucket_policy_on_admitted_route(&admission, req)
+    }
+
+    pub fn put_bucket_lifecycle_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketConfigRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
@@ -1160,15 +1247,16 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let storage_node = self.storage_node();
+        self.require_storage_route_admission(admission)?;
         #[cfg(test)]
         self.maybe_run_bucket_mutation_storage_node_capture_hook(req.bucket.name.as_str());
-        let authorized =
-            self.authorize_put_bucket_lifecycle_with_storage_node(&storage_node, req)?;
+        let authorized = self.authorize_put_bucket_lifecycle_on_admitted_route(admission, req)?;
         #[cfg(test)]
         if self.should_probe_bucket_mutation_write(authorized.bucket.as_str()) {
-            let bucket_pg_ready = storage_node
-                .try_probe_bucket_pg_available(&authorized.bucket)
+            let bucket_pg_ready = admission
+                .active_bucket_route(&authorized.bucket)
+                .map_err(super::map_store_error)?
+                .try_probe_bucket_pg_available()
                 .map_err(Self::map_bucket_snapshot_load_error)?;
             if !bucket_pg_ready {
                 return Err(ServerError::InternalError {
@@ -1177,8 +1265,8 @@ impl Coordinator {
                 });
             }
         }
-        let info = self.store_bucket_subresource_with_storage_node(
-            &storage_node,
+        let info = self.store_bucket_subresource_on_admitted_route(
+            admission,
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Lifecycle,
@@ -1188,6 +1276,15 @@ impl Coordinator {
         )?;
         self.clear_bucket_fast_path(&info);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn put_bucket_lifecycle(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.put_bucket_lifecycle_on_admitted_route(&admission, req)
     }
 
     pub fn get_bucket_lifecycle_on_admitted_route(
@@ -1214,24 +1311,33 @@ impl Coordinator {
         self.get_bucket_lifecycle_on_admitted_route(&admission, req)
     }
 
-    pub fn delete_bucket_lifecycle(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+    pub fn delete_bucket_lifecycle_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_lifecycle",
             "bucket={:?}",
             req.name
         );
-        let storage_node = self.storage_node();
+        self.require_storage_route_admission(admission)?;
         let authorized =
-            self.authorize_delete_bucket_lifecycle_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .delete_bucket_subresource_and_load_info(
-                &authorized.bucket,
-                storage::BucketSubresourceKind::Lifecycle,
-            )
+            self.authorize_delete_bucket_lifecycle_on_admitted_route(admission, req)?;
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .delete_bucket_subresource_and_load_info(storage::BucketSubresourceKind::Lifecycle)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn delete_bucket_lifecycle(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.delete_bucket_lifecycle_on_admitted_route(&admission, req)
     }
 
     pub fn put_bucket_public_access_block(
@@ -1443,14 +1549,17 @@ impl Coordinator {
         Ok(())
     }
 
-    fn store_bucket_subresource_with_storage_node(
+    fn store_bucket_subresource_on_admitted_route(
         &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         name: &BucketName,
         req: storage::PutBucketSubresource<'_>,
     ) -> Result<storage::BucketInfo, ServerError> {
-        storage_node
-            .put_bucket_subresource_and_load_info(name, req)
+        self.require_storage_route_admission(admission)?;
+        admission
+            .active_bucket_route(name)
+            .map_err(super::map_store_error)?
+            .put_bucket_subresource_and_load_info(req)
             .map_err(Self::map_bucket_snapshot_load_error)
     }
 }

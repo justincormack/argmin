@@ -101,6 +101,7 @@ use crate::types::{
 };
 use crate::DataPgId;
 use crate::ObjectEtag;
+use crate::PutBucketSubresource;
 use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 use crate::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError};
 
@@ -2053,6 +2054,12 @@ pub struct ActiveBucketRoute<'admission> {
     pg_id: BucketPgId,
 }
 
+struct BucketMetadataMutationEffectRoute<'a> {
+    pg_id: BucketPgId,
+    bucket: &'a BucketName,
+    effect_fence: AdmittedRouteEffectFence,
+}
+
 /// Non-cloneable active authority for an account-scoped bucket metadata scan.
 ///
 /// The scan is fixed to the admitted runtime-map generation. It rechecks the
@@ -2531,6 +2538,14 @@ impl ActiveObjectMetadataScan<'_> {
 }
 
 impl ActiveBucketRoute<'_> {
+    fn mutation_effect_route(&self) -> BucketMetadataMutationEffectRoute<'_> {
+        BucketMetadataMutationEffectRoute {
+            pg_id: self.pg_id,
+            bucket: &self.bucket,
+            effect_fence: self.admission.effect_fence(),
+        }
+    }
+
     pub fn head_bucket_info(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.admission.require_valid_now()?;
         let cluster = &self.admission.cluster;
@@ -2565,6 +2580,55 @@ impl ActiveBucketRoute<'_> {
             .metadata_pg_primary_node(cluster.operation_epoch(), self.pg_id.pg_id())?
             .bucket_metadata_client()
             .load_bucket_snapshot(self.pg_id, &self.bucket, request)
+    }
+
+    pub fn with_bucket_write_snapshot<T, E>(
+        &self,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(BucketSnapshot) -> Result<T, E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        self.admission
+            .cluster
+            .with_bucket_write_snapshot_with_route_validation(
+                self.mutation_effect_route(),
+                || self.admission.require_valid_now(),
+                request,
+                action,
+            )
+    }
+
+    pub fn put_bucket_subresource_and_load_info(
+        &self,
+        req: PutBucketSubresource<'_>,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.admission
+            .cluster
+            .put_bucket_subresource_and_load_info_with_route_validation(
+                self.mutation_effect_route(),
+                || self.admission.require_valid_now(),
+                req,
+            )
+    }
+
+    pub fn delete_bucket_subresource_and_load_info(
+        &self,
+        kind: BucketSubresourceKind,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.admission
+            .cluster
+            .delete_bucket_subresource_and_load_info_with_route_validation(
+                self.mutation_effect_route(),
+                || self.admission.require_valid_now(),
+                kind,
+            )
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn try_probe_bucket_pg_available(&self) -> Result<bool, BucketSnapshotLoadError> {
+        self.admission.require_valid_now()?;
+        self.admission
+            .cluster
+            .try_probe_bucket_pg_available(&self.bucket)
     }
 }
 

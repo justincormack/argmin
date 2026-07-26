@@ -2536,15 +2536,27 @@ impl super::StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<bool, BucketSnapshotLoadError> {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        match primary
-            .metadata_command_client()
-            .try_insert_bucket_control_pending_metadata_command_slot(pg_id, command, bucket)
-        {
+        self.maybe_run_before_metadata_command_pending_install_hook();
+        let insert = match effect_fence {
+            Some(effect_fence) => primary
+                .metadata_command_client()
+                .try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence(
+                    pg_id,
+                    command,
+                    bucket,
+                    effect_fence,
+                ),
+            None => primary
+                .metadata_command_client()
+                .try_insert_bucket_control_pending_metadata_command_slot(pg_id, command, bucket),
+        };
+        match insert {
             Ok(true) => Ok(true),
             Ok(false) => {
                 if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -3094,9 +3106,31 @@ impl super::StorageCluster {
         request: BucketSnapshotRequest,
         action: impl FnOnce(BucketSnapshot) -> Result<T, E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        self.with_bucket_write_reservation_snapshot(bucket, request, |snapshot| {
-            Ok(action(snapshot))
-        })
+        self.with_bucket_write_snapshot_with_route_validation(
+            super::BucketMetadataMutationEffectRoute {
+                pg_id: self.bucket_metadata_pg(bucket),
+                bucket,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            request,
+            action,
+        )
+    }
+
+    pub(super) fn with_bucket_write_snapshot_with_route_validation<T, E>(
+        &self,
+        route: super::BucketMetadataMutationEffectRoute<'_>,
+        require_valid_route: impl FnMut() -> Result<(), StoreError>,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(BucketSnapshot) -> Result<T, E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        self.with_bucket_write_reservation_snapshot_with_route_validation(
+            route,
+            require_valid_route,
+            request,
+            |snapshot| Ok(action(snapshot)),
+        )
     }
 
     pub fn with_bucket_write_snapshot_for_command<T, E>(
@@ -3155,23 +3189,31 @@ impl super::StorageCluster {
         }
     }
 
-    pub(crate) fn with_bucket_write_reservation_snapshot<T, E>(
+    fn with_bucket_write_reservation_snapshot_with_route_validation<T, E>(
         &self,
-        bucket: &BucketName,
+        route: super::BucketMetadataMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         request: BucketSnapshotRequest,
         action: impl FnOnce(BucketSnapshot) -> Result<Result<T, E>, BucketSnapshotLoadError>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let super::BucketMetadataMutationEffectRoute {
+            pg_id: bucket_pg_id,
+            bucket,
+            effect_fence,
+        } = route;
+        let pg_id = bucket_pg_id.pg_id();
         let mut work_budget =
             super::RequestWorkBudget::new(super::BUCKET_WRITE_DRAIN_RETRY_BUDGET, None)
                 .for_operation("bucket_write_reservation_snapshot")
                 .for_pg(pg_id);
         loop {
             work_budget.check("bucket write reservation snapshot retry budget exhausted")?;
-            let reservation = match self.acquire_durable_bucket_write_reservation(
+            require_valid_route()?;
+            let reservation = match self.acquire_durable_bucket_write_reservation_with_effect_fence(
                 bucket,
                 "bucket-write-snapshot",
                 None,
+                Some(effect_fence),
             ) {
                 Ok(reservation) => reservation,
                 Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
@@ -3182,11 +3224,10 @@ impl super::StorageCluster {
             };
 
             let result = (|| {
-                let snapshot = reservation.node.load_bucket_snapshot(
-                    self.validated_bucket_metadata_pg(PgId::new(reservation.pg_id)),
-                    bucket,
-                    request,
-                )?;
+                require_valid_route()?;
+                let storage_client = &reservation.node;
+                let snapshot =
+                    storage_client.load_bucket_snapshot(bucket_pg_id, bucket, request)?;
                 action(snapshot)
             })();
             let release_result = self.release_durable_bucket_write_reservation(reservation);
@@ -7033,6 +7074,7 @@ impl super::StorageCluster {
                     pg_id,
                     bucket,
                     &command,
+                    None,
                     &mut work_budget,
                 )? {
                     continue;
@@ -7238,6 +7280,7 @@ impl super::StorageCluster {
                     pg_id,
                     bucket,
                     &command,
+                    None,
                     &mut work_budget,
                 )? {
                     continue;
@@ -7360,6 +7403,7 @@ impl super::StorageCluster {
                     pg_id,
                     bucket,
                     &command,
+                    None,
                     &mut work_budget,
                 )? {
                     continue;
@@ -7383,13 +7427,32 @@ impl super::StorageCluster {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn put_bucket_subresource_and_load_info(
         &self,
         bucket: &BucketName,
         req: PutBucketSubresource<'_>,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.put_bucket_subresource_command_and_load_info(
-            bucket,
+        self.put_bucket_subresource_and_load_info_with_route_validation(
+            super::BucketMetadataMutationEffectRoute {
+                pg_id: self.bucket_metadata_pg(bucket),
+                bucket,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            req,
+        )
+    }
+
+    pub(super) fn put_bucket_subresource_and_load_info_with_route_validation(
+        &self,
+        route: super::BucketMetadataMutationEffectRoute<'_>,
+        require_valid_route: impl FnMut() -> Result<(), StoreError>,
+        req: PutBucketSubresource<'_>,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.put_bucket_subresource_command_and_load_info_with_route_validation(
+            route,
+            require_valid_route,
             BucketSubresourceMutation::Put {
                 kind: req.kind,
                 body: req.body.to_owned(),
@@ -7398,23 +7461,48 @@ impl super::StorageCluster {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn delete_bucket_subresource_and_load_info(
         &self,
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.put_bucket_subresource_command_and_load_info(
-            bucket,
+        self.delete_bucket_subresource_and_load_info_with_route_validation(
+            super::BucketMetadataMutationEffectRoute {
+                pg_id: self.bucket_metadata_pg(bucket),
+                bucket,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            kind,
+        )
+    }
+
+    pub(super) fn delete_bucket_subresource_and_load_info_with_route_validation(
+        &self,
+        route: super::BucketMetadataMutationEffectRoute<'_>,
+        require_valid_route: impl FnMut() -> Result<(), StoreError>,
+        kind: BucketSubresourceKind,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.put_bucket_subresource_command_and_load_info_with_route_validation(
+            route,
+            require_valid_route,
             BucketSubresourceMutation::Delete { kind },
         )
     }
 
-    fn put_bucket_subresource_command_and_load_info(
+    fn put_bucket_subresource_command_and_load_info_with_route_validation(
         &self,
-        bucket: &BucketName,
+        route: super::BucketMetadataMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mutation: BucketSubresourceMutation,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         crate::metadata_command::metadata_command_publisher!(PutBucketSubresource);
+        let super::BucketMetadataMutationEffectRoute {
+            pg_id: bucket_pg_id,
+            bucket,
+            effect_fence,
+        } = route;
         if let BucketSubresourceMutation::Put { kind, aux, .. } = &mutation {
             if !kind.supports_aux(*aux) {
                 return Err(MetadataError::Db {
@@ -7427,14 +7515,15 @@ impl super::StorageCluster {
             }
         }
 
-        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let pg_id = bucket_pg_id.pg_id();
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         {
+            require_valid_route()?;
             primary_store
                 .bucket_metadata_client()
-                .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)?;
+                .head_bucket_raw(bucket_pg_id, bucket)?;
         }
         let mut work_budget = super::RequestWorkBudget::new(
             std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
@@ -7444,6 +7533,7 @@ impl super::StorageCluster {
         .for_pg(pg_id);
         loop {
             work_budget.check("put bucket subresource command budget exhausted")?;
+            require_valid_route()?;
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
@@ -7492,15 +7582,17 @@ impl super::StorageCluster {
                 let command = primary_store
                     .bucket_metadata_client()
                     .build_put_bucket_subresource_command(
-                        self.validated_bucket_metadata_pg(pg_id),
+                        bucket_pg_id,
                         bucket,
                         command_id,
                         &mutation,
                     )?;
+                require_valid_route()?;
                 if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
                     pg_id,
                     bucket,
                     &command,
+                    Some(effect_fence),
                     &mut work_budget,
                 )? {
                     continue;
@@ -7519,7 +7611,7 @@ impl super::StorageCluster {
 
             let info = primary_store
                 .bucket_metadata_client()
-                .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)?;
+                .head_bucket_raw(bucket_pg_id, bucket)?;
             return Ok(info);
         }
     }

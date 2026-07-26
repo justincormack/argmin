@@ -1588,7 +1588,7 @@ impl HttpFrontend {
                 operation,
             ),
             ServiceOperation::S3Control(operation) => {
-                self.dispatch_s3_control(req, auth, operation)
+                self.dispatch_s3_control(req, auth, storage_route_admission, operation)
             }
         }
     }
@@ -1597,6 +1597,7 @@ impl HttpFrontend {
         &self,
         req: &S3Request,
         auth: &AuthContext,
+        storage_route_admission: &storage::StorageClusterRouteAdmission,
         operation: S3ControlOperation,
     ) -> Result<S3Response, ServerError> {
         observability::trace_scope!(
@@ -1617,7 +1618,8 @@ impl HttpFrontend {
                 };
                 let tags = self
                     .coordinator
-                    .get_bucket_tags_for_control_action(
+                    .get_bucket_tags_for_control_action_on_admitted_route(
+                        storage_route_admission,
                         &control,
                         &[],
                         crate::coordinator::BucketTagControlAction::ListTagsForResource,
@@ -1638,7 +1640,8 @@ impl HttpFrontend {
                 };
                 let existing_tags = self
                     .coordinator
-                    .get_bucket_tags_for_control_action(
+                    .get_bucket_tags_for_control_action_on_admitted_route(
+                        storage_route_admission,
                         &control,
                         request_tags.as_slice(),
                         crate::coordinator::BucketTagControlAction::TagResource,
@@ -1648,13 +1651,15 @@ impl HttpFrontend {
                     .unwrap_or_else(|| xml::TagSet::empty(50));
                 let merged_tags = existing_tags.merge(&tags)?;
                 let merged_xml = merged_tags.to_xml();
-                self.coordinator.put_bucket_tags_for_tag_resource(
-                    &crate::coordinator::PutBucketTagControlRequest {
-                        control,
-                        config: &merged_xml,
-                        request_tags: request_tags.as_slice(),
-                    },
-                )?;
+                self.coordinator
+                    .put_bucket_tags_for_tag_resource_on_admitted_route(
+                        storage_route_admission,
+                        &crate::coordinator::PutBucketTagControlRequest {
+                            control,
+                            config: &merged_xml,
+                            request_tags: request_tags.as_slice(),
+                        },
+                    )?;
                 Ok(S3Response::tag_resource())
             }
             S3ControlOperation::UntagResource { bucket } => {
@@ -1674,7 +1679,8 @@ impl HttpFrontend {
                 };
                 let existing_tags = self
                     .coordinator
-                    .get_bucket_tags_for_control_action(
+                    .get_bucket_tags_for_control_action_on_admitted_route(
+                        storage_route_admission,
                         &control,
                         request_tags.as_slice(),
                         crate::coordinator::BucketTagControlAction::UntagResource,
@@ -1691,21 +1697,25 @@ impl HttpFrontend {
                 let tag_keys = validate_untag_resource_tag_key_values(tag_keys)?;
                 let remaining_tags = existing_tags.remove_keys(&tag_keys);
                 if remaining_tags.is_empty() {
-                    self.coordinator.delete_bucket_tags_for_untag_resource(
-                        &crate::coordinator::UntagBucketTagControlRequest {
-                            control,
-                            request_tags: request_tags.as_slice(),
-                        },
-                    )?;
+                    self.coordinator
+                        .delete_bucket_tags_for_untag_resource_on_admitted_route(
+                            storage_route_admission,
+                            &crate::coordinator::UntagBucketTagControlRequest {
+                                control,
+                                request_tags: request_tags.as_slice(),
+                            },
+                        )?;
                 } else {
                     let remaining_xml = remaining_tags.to_xml();
-                    self.coordinator.put_bucket_tags_for_untag_resource(
-                        &crate::coordinator::PutBucketTagsForUntagResourceRequest {
-                            control,
-                            config: &remaining_xml,
-                            request_tags: request_tags.as_slice(),
-                        },
-                    )?;
+                    self.coordinator
+                        .put_bucket_tags_for_untag_resource_on_admitted_route(
+                            storage_route_admission,
+                            &crate::coordinator::PutBucketTagsForUntagResourceRequest {
+                                control,
+                                config: &remaining_xml,
+                                request_tags: request_tags.as_slice(),
+                            },
+                        )?;
                 }
                 Ok(S3Response::untag_resource())
             }
@@ -2579,11 +2589,13 @@ impl HttpFrontend {
                 let config = xml::parse_cors_config_xml(&req.body)?;
                 let config_xml = xml::get_cors_config_xml(&config);
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator
-                    .put_bucket_cors(&crate::coordinator::PutBucketConfigRequest {
+                self.coordinator.put_bucket_cors_on_admitted_route(
+                    storage_route_admission,
+                    &crate::coordinator::PutBucketConfigRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                         config: &config_xml,
-                    })?;
+                    },
+                )?;
                 Ok(S3Response::put_bucket_cors())
             }
             S3Operation::GetBucketCors { bucket } => {
@@ -2600,11 +2612,10 @@ impl HttpFrontend {
             }
             S3Operation::DeleteBucketCors { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator.delete_bucket_cors(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)?;
+                self.coordinator.delete_bucket_cors_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )?;
                 Ok(S3Response::delete_bucket_cors())
             }
             S3Operation::PutBucketTagging { bucket } => {
@@ -2615,11 +2626,13 @@ impl HttpFrontend {
                 let tags = xml::TagSet::parse_tagging_xml(&req.body, 50)?;
                 let tags_xml = tags.to_xml();
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator
-                    .put_bucket_tags(&crate::coordinator::PutBucketConfigRequest {
+                self.coordinator.put_bucket_tags_on_admitted_route(
+                    storage_route_admission,
+                    &crate::coordinator::PutBucketConfigRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                         config: &tags_xml,
-                    })?;
+                    },
+                )?;
                 Ok(S3Response::put_bucket_tagging())
             }
             S3Operation::GetBucketTagging { bucket } => {
@@ -2636,11 +2649,10 @@ impl HttpFrontend {
             }
             S3Operation::DeleteBucketTagging { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator.delete_bucket_tags(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)?;
+                self.coordinator.delete_bucket_tags_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )?;
                 Ok(S3Response::delete_bucket_tagging())
             }
             S3Operation::PutBucketAbac { bucket } => {
@@ -2674,7 +2686,8 @@ impl HttpFrontend {
                 )?;
                 let config_xml = xml::get_bucket_lifecycle_configuration_xml(&config);
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator.put_bucket_lifecycle(
+                self.coordinator.put_bucket_lifecycle_on_admitted_route(
+                    storage_route_admission,
                     &crate::coordinator::PutBucketConfigRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                         config: &config_xml,
@@ -2696,11 +2709,10 @@ impl HttpFrontend {
             }
             S3Operation::DeleteBucketLifecycle { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator.delete_bucket_lifecycle(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)?;
+                self.coordinator.delete_bucket_lifecycle_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )?;
                 Ok(S3Response::delete_bucket_lifecycle())
             }
             S3Operation::PutObjectRetention { bucket, key } => {
@@ -2987,7 +2999,8 @@ impl HttpFrontend {
                         }),
                 )?;
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator.put_bucket_policy(
+                self.coordinator.put_bucket_policy_on_admitted_route(
+                    storage_route_admission,
                     &crate::coordinator::PutBucketPolicyRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                         config: policy,
@@ -3020,11 +3033,10 @@ impl HttpFrontend {
             }
             S3Operation::DeleteBucketPolicy { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator.delete_bucket_policy(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)?;
+                self.coordinator.delete_bucket_policy_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )?;
                 Ok(S3Response::delete_bucket_policy())
             }
             S3Operation::GetBucketAcl { bucket } => {
@@ -12654,10 +12666,15 @@ mod tests {
         ));
 
         // S3 Control.
+        let admission = frontend
+            .coordinator
+            .admit_storage_route_for_request()
+            .unwrap();
         assert!(matches!(
             frontend.dispatch_s3_control(
                 &make_req(""),
                 &auth,
+                &admission,
                 S3ControlOperation::ListTagsForResource {
                     bucket: test_bucket_name("mybucket"),
                 },

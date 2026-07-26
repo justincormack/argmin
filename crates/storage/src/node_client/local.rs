@@ -4190,6 +4190,22 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<bool, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        effect_fence.require_valid_for(command.id().cluster_epoch())?;
+        pg.try_insert_bucket_control_pending_metadata_command_slot(
+            self.node_id.as_u32(),
+            command,
+            bucket,
+        )
+    }
+
     fn remove_pending_metadata_command_slot(
         &self,
         pg_id: PgId,

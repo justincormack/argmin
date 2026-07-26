@@ -14512,6 +14512,12 @@ impl StorageNodeConnectionHandler {
         let canonical_scope_bucket = request.command.bucket_name().clone();
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         metadata_mutation_route_guard_or_return!(self);
+        if let Err(error) =
+            admitted_route_effect_fence(request.cluster_epoch, request.effect_deadline)
+                .require_valid_for(request.command.id().cluster_epoch())
+        {
+            return encode_storage_rpc_error_response(&store_error_response(error));
+        }
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             let inserted = pg.try_insert_bucket_control_pending_metadata_command_slot(
                 self.config.node_id.as_u32(),
@@ -30997,6 +31003,33 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(pending_error.code, StorageRpcErrorCode::StaleShardLocation);
+        let bucket_control_response = send_frame(
+            &mut client,
+            3,
+            StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert,
+            encode_metadata_command_pending_slot_request(
+                &StorageRpcMetadataCommandPendingSlotRequest {
+                    node_id: config.node_id,
+                    cluster_epoch: config.cluster_epoch,
+                    pg_id: PgId::new(0),
+                    command,
+                    scope_bucket: Some(bucket.clone()),
+                    effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                        authority_valid_until_ms: 5_000,
+                        portable_wall_valid_until_ms: 4_000,
+                    }),
+                },
+            )
+            .unwrap(),
+        );
+        let bucket_control_error =
+            decode_storage_rpc_response_payload(&bucket_control_response.payload)
+                .unwrap()
+                .unwrap_err();
+        assert_eq!(
+            bucket_control_error.code,
+            StorageRpcErrorCode::StaleShardLocation
+        );
         drop(client);
         join.join().unwrap();
 

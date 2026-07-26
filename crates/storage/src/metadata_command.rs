@@ -134,7 +134,7 @@ define_metadata_command_publishers! {
         SnapshotSensitive
     ),
     PutBucketSubresource => (
-        "put_bucket_subresource_command_and_load_info",
+        "put_bucket_subresource_command_and_load_info_with_route_validation",
         "PutBucketSubresource",
         SnapshotSensitive
     ),

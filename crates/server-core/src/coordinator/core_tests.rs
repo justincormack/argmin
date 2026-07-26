@@ -372,7 +372,72 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
             policy_context: PutObjectPolicyContext::default()
                 .with_default_canned_acl(PutObjectAcl::PublicRead.policy_condition_value()),
         };
+        let put_cors_request = PutBucketConfigRequest {
+            bucket: bucket_request_with_expected_owner(
+                "bucket",
+                test_requester(),
+                None,
+            ),
+            config: "<CORSConfiguration><CORSRule><AllowedOrigin>https://expired.example</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>",
+        };
+        let put_bucket_tags_request = PutBucketConfigRequest {
+            bucket: bucket_request_with_expected_owner(
+                "bucket",
+                test_requester(),
+                None,
+            ),
+            config: "<Tagging><TagSet><Tag><Key>expired</Key><Value>route</Value></Tag></TagSet></Tagging>",
+        };
+        let put_lifecycle_request = PutBucketConfigRequest {
+            bucket: bucket_request_with_expected_owner(
+                "bucket",
+                test_requester(),
+                None,
+            ),
+            config: "<LifecycleConfiguration><Rule><ID>expired-route</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+        };
+        let put_policy_request = PutBucketPolicyRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            config: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"default-owner"},"Action":"s3:GetBucketPolicy","Resource":"arn:aws:s3:::bucket"}]}"#,
+            confirm_remove_self_bucket_access: false,
+        };
+        let control_request = BucketTagControlRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        };
+        let control_request_tags = vec![("expired".to_string(), "route".to_string())];
+        let put_control_request = PutBucketTagControlRequest {
+            control: BucketTagControlRequest {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            },
+            config: put_bucket_tags_request.config,
+            request_tags: &control_request_tags,
+        };
+        let put_untag_control_request = PutBucketTagsForUntagResourceRequest {
+            control: BucketTagControlRequest {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            },
+            config: put_bucket_tags_request.config,
+            request_tags: &control_request_tags,
+        };
+        let delete_untag_control_request = UntagBucketTagControlRequest {
+            control: BucketTagControlRequest {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            },
+            request_tags: &control_request_tags,
+        };
         let fresh_admission = coord.admit_storage_route_for_request().unwrap();
+        let baseline_cors = coord
+            .get_bucket_cors_on_admitted_route(&fresh_admission, &request)
+            .unwrap();
+        let baseline_bucket_tags = coord
+            .get_bucket_tags_on_admitted_route(&fresh_admission, &request)
+            .unwrap();
+        let baseline_lifecycle = coord
+            .get_bucket_lifecycle_on_admitted_route(&fresh_admission, &request)
+            .unwrap();
+        let baseline_policy = coord
+            .get_bucket_policy_on_admitted_route(&fresh_admission, &request)
+            .unwrap();
         let baseline_tags = coord
             .get_object_tags_on_admitted_route(&fresh_admission, &object_metadata_request)
             .unwrap();
@@ -608,6 +673,70 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
                     .put_object_acl_on_admitted_route(&admission, &put_acl_request)
                     .map(|_| ()),
             ),
+            (
+                "PutBucketCors",
+                coord.put_bucket_cors_on_admitted_route(&admission, &put_cors_request),
+            ),
+            (
+                "DeleteBucketCors",
+                coord.delete_bucket_cors_on_admitted_route(&admission, &request),
+            ),
+            (
+                "PutBucketTagging",
+                coord.put_bucket_tags_on_admitted_route(&admission, &put_bucket_tags_request),
+            ),
+            (
+                "DeleteBucketTagging",
+                coord.delete_bucket_tags_on_admitted_route(&admission, &request),
+            ),
+            (
+                "PutBucketLifecycle",
+                coord.put_bucket_lifecycle_on_admitted_route(&admission, &put_lifecycle_request),
+            ),
+            (
+                "DeleteBucketLifecycle",
+                coord.delete_bucket_lifecycle_on_admitted_route(&admission, &request),
+            ),
+            (
+                "PutBucketPolicy",
+                coord.put_bucket_policy_on_admitted_route(&admission, &put_policy_request),
+            ),
+            (
+                "DeleteBucketPolicy",
+                coord.delete_bucket_policy_on_admitted_route(&admission, &request),
+            ),
+            (
+                "ListTagsForResource",
+                coord
+                    .get_bucket_tags_for_control_action_on_admitted_route(
+                        &admission,
+                        &control_request,
+                        &[],
+                        BucketTagControlAction::ListTagsForResource,
+                    )
+                    .map(|_| ()),
+            ),
+            (
+                "TagResource",
+                coord.put_bucket_tags_for_tag_resource_on_admitted_route(
+                    &admission,
+                    &put_control_request,
+                ),
+            ),
+            (
+                "UntagResourcePut",
+                coord.put_bucket_tags_for_untag_resource_on_admitted_route(
+                    &admission,
+                    &put_untag_control_request,
+                ),
+            ),
+            (
+                "UntagResourceDelete",
+                coord.delete_bucket_tags_for_untag_resource_on_admitted_route(
+                    &admission,
+                    &delete_untag_control_request,
+                ),
+            ),
         ] {
             let error = result.expect_err(operation);
             assert!(
@@ -641,6 +770,30 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
                 .get_object_acl_on_admitted_route(&fresh_admission, &object_metadata_request)
                 .unwrap(),
             baseline_acl
+        );
+        assert_eq!(
+            coord
+                .get_bucket_cors_on_admitted_route(&fresh_admission, &request)
+                .unwrap(),
+            baseline_cors
+        );
+        assert_eq!(
+            coord
+                .get_bucket_tags_on_admitted_route(&fresh_admission, &request)
+                .unwrap(),
+            baseline_bucket_tags
+        );
+        assert_eq!(
+            coord
+                .get_bucket_lifecycle_on_admitted_route(&fresh_admission, &request)
+                .unwrap(),
+            baseline_lifecycle
+        );
+        assert_eq!(
+            coord
+                .get_bucket_policy_on_admitted_route(&fresh_admission, &request)
+                .unwrap(),
+            baseline_policy
         );
     });
 }
@@ -722,6 +875,86 @@ fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
             .unwrap()
             .as_deref(),
         Some(request.tags)
+    );
+}
+
+#[test]
+fn bucket_subresource_mutation_expires_at_pending_install_effect_boundary() {
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let bucket_request = bucket_request_with_expected_owner("bucket", test_requester(), None);
+    let put_request = PutBucketConfigRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config:
+            "<Tagging><TagSet><Tag><Key>late</Key><Value>write</Value></Tag></TagSet></Tagging>",
+    };
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let hook_clock = Arc::clone(&clock);
+    let hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            hook_clock.set(4_500)
+        }));
+    let error = coord
+        .put_bucket_tags_on_admitted_route(&admission, &put_request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+
+    clock.set(1_000);
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    assert_eq!(
+        coord
+            .get_bucket_tags_on_admitted_route(&admission, &bucket_request)
+            .unwrap(),
+        None
+    );
+    coord
+        .put_bucket_tags_on_admitted_route(&admission, &put_request)
+        .unwrap();
+    assert_eq!(
+        coord
+            .get_bucket_tags_on_admitted_route(&admission, &bucket_request)
+            .unwrap()
+            .as_deref(),
+        Some(put_request.config)
+    );
+    drop(admission);
+
+    clock.set(1_000);
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let hook_clock = Arc::clone(&clock);
+    let hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            hook_clock.set(4_500)
+        }));
+    let error = coord
+        .delete_bucket_tags_on_admitted_route(&admission, &bucket_request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+
+    clock.set(1_000);
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    assert_eq!(
+        coord
+            .get_bucket_tags_on_admitted_route(&admission, &bucket_request)
+            .unwrap()
+            .as_deref(),
+        Some(put_request.config)
     );
 }
 
@@ -1386,6 +1619,80 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
             },
         )
         .unwrap();
+    let baseline_cors_request = PutBucketConfigRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: "<CORSConfiguration><CORSRule><AllowedOrigin>https://baseline.example</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>",
+    };
+    let baseline_tags_request = PutBucketConfigRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: "<Tagging><TagSet><Tag><Key>domain</Key><Value>baseline</Value></Tag></TagSet></Tagging>",
+    };
+    let baseline_lifecycle_request = PutBucketConfigRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: "<LifecycleConfiguration><Rule><ID>domain-baseline</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+    };
+    foreign
+        .put_bucket_cors_on_admitted_route(&foreign_admission, &baseline_cors_request)
+        .unwrap();
+    foreign
+        .put_bucket_tags_on_admitted_route(&foreign_admission, &baseline_tags_request)
+        .unwrap();
+    foreign
+        .put_bucket_lifecycle_on_admitted_route(&foreign_admission, &baseline_lifecycle_request)
+        .unwrap();
+    let baseline_cors = foreign
+        .get_bucket_cors_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    let baseline_tags = foreign
+        .get_bucket_tags_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    let baseline_lifecycle = foreign
+        .get_bucket_lifecycle_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    let baseline_policy = foreign
+        .get_bucket_policy_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    let rejected_cors_request = PutBucketConfigRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: "<CORSConfiguration><CORSRule><AllowedOrigin>https://rejected.example</AllowedOrigin><AllowedMethod>PUT</AllowedMethod></CORSRule></CORSConfiguration>",
+    };
+    let rejected_tags_request = PutBucketConfigRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: "<Tagging><TagSet><Tag><Key>domain</Key><Value>rejected</Value></Tag></TagSet></Tagging>",
+    };
+    let rejected_lifecycle_request = PutBucketConfigRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: "<LifecycleConfiguration><Rule><ID>domain-rejected</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>2</Days></Expiration></Rule></LifecycleConfiguration>",
+    };
+    let rejected_policy_request = PutBucketPolicyRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"default-owner"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
+        confirm_remove_self_bucket_access: false,
+    };
+    let control_request = BucketTagControlRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+    };
+    let control_request_tags = vec![("domain".to_string(), "rejected".to_string())];
+    let put_control_request = PutBucketTagControlRequest {
+        control: BucketTagControlRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        },
+        config: rejected_tags_request.config,
+        request_tags: &control_request_tags,
+    };
+    let put_untag_control_request = PutBucketTagsForUntagResourceRequest {
+        control: BucketTagControlRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        },
+        config: rejected_tags_request.config,
+        request_tags: &control_request_tags,
+    };
+    let delete_untag_control_request = UntagBucketTagControlRequest {
+        control: BucketTagControlRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        },
+        request_tags: &control_request_tags,
+    };
 
     for (operation, result) in [
         (
@@ -1545,6 +1852,73 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
                 )
                 .map(|_| ()),
         ),
+        (
+            "PutBucketCors",
+            local.put_bucket_cors_on_admitted_route(&foreign_admission, &rejected_cors_request),
+        ),
+        (
+            "DeleteBucketCors",
+            local.delete_bucket_cors_on_admitted_route(&foreign_admission, &request),
+        ),
+        (
+            "PutBucketTagging",
+            local.put_bucket_tags_on_admitted_route(&foreign_admission, &rejected_tags_request),
+        ),
+        (
+            "DeleteBucketTagging",
+            local.delete_bucket_tags_on_admitted_route(&foreign_admission, &request),
+        ),
+        (
+            "PutBucketLifecycle",
+            local.put_bucket_lifecycle_on_admitted_route(
+                &foreign_admission,
+                &rejected_lifecycle_request,
+            ),
+        ),
+        (
+            "DeleteBucketLifecycle",
+            local.delete_bucket_lifecycle_on_admitted_route(&foreign_admission, &request),
+        ),
+        (
+            "PutBucketPolicy",
+            local.put_bucket_policy_on_admitted_route(&foreign_admission, &rejected_policy_request),
+        ),
+        (
+            "DeleteBucketPolicy",
+            local.delete_bucket_policy_on_admitted_route(&foreign_admission, &request),
+        ),
+        (
+            "ListTagsForResource",
+            local
+                .get_bucket_tags_for_control_action_on_admitted_route(
+                    &foreign_admission,
+                    &control_request,
+                    &[],
+                    BucketTagControlAction::ListTagsForResource,
+                )
+                .map(|_| ()),
+        ),
+        (
+            "TagResource",
+            local.put_bucket_tags_for_tag_resource_on_admitted_route(
+                &foreign_admission,
+                &put_control_request,
+            ),
+        ),
+        (
+            "UntagResourcePut",
+            local.put_bucket_tags_for_untag_resource_on_admitted_route(
+                &foreign_admission,
+                &put_untag_control_request,
+            ),
+        ),
+        (
+            "UntagResourceDelete",
+            local.delete_bucket_tags_for_untag_resource_on_admitted_route(
+                &foreign_admission,
+                &delete_untag_control_request,
+            ),
+        ),
     ] {
         let error = result.expect_err(operation);
         assert!(
@@ -1552,6 +1926,30 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
             "{operation}: {error:?}"
         );
     }
+    assert_eq!(
+        foreign
+            .get_bucket_cors_on_admitted_route(&foreign_admission, &request)
+            .unwrap(),
+        baseline_cors
+    );
+    assert_eq!(
+        foreign
+            .get_bucket_tags_on_admitted_route(&foreign_admission, &request)
+            .unwrap(),
+        baseline_tags
+    );
+    assert_eq!(
+        foreign
+            .get_bucket_lifecycle_on_admitted_route(&foreign_admission, &request)
+            .unwrap(),
+        baseline_lifecycle
+    );
+    assert_eq!(
+        foreign
+            .get_bucket_policy_on_admitted_route(&foreign_admission, &request)
+            .unwrap(),
+        baseline_policy
+    );
 }
 
 #[test]
@@ -3885,6 +4283,8 @@ fn bucket_subresource_write_pins_runtime_map_after_authorization() {
         candidate_tmp.path(),
         &[0, 1],
     ));
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -3893,13 +4293,26 @@ fn bucket_subresource_write_pins_runtime_map_after_authorization() {
     let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_loaded: Some(Arc::new(move || {
-            hook_handle.install(Arc::clone(&candidate)).unwrap();
+            let publishing_handle = hook_handle.clone();
+            let publishing_candidate = Arc::clone(&candidate);
+            let thread = thread::spawn(move || {
+                publishing_handle.install(publishing_candidate).unwrap();
+            });
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
         })),
         ..BucketWriteHandleTestHooks::default()
     });
 
     let lifecycle = "<LifecycleConfiguration><Rule><ID>pin</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>";
     put_bucket_lifecycle_test(&coord, "bucket", lifecycle, test_requester(), None).unwrap();
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("bucket lifecycle hook should start route publication")
+        .join()
+        .unwrap();
 
     handle
         .install(make_dynamic_runtime_map_candidate(initial))
@@ -3938,6 +4351,8 @@ fn bucket_subresource_write_pins_runtime_map_before_authorization() {
         candidate_tmp.path(),
         &[0, 1],
     ));
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -3946,13 +4361,26 @@ fn bucket_subresource_write_pins_runtime_map_before_authorization() {
     let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_bucket_mutation_storage_node_capture: Some(Arc::new(move || {
-            hook_handle.install(Arc::clone(&candidate)).unwrap();
+            let publishing_handle = hook_handle.clone();
+            let publishing_candidate = Arc::clone(&candidate);
+            let thread = thread::spawn(move || {
+                publishing_handle.install(publishing_candidate).unwrap();
+            });
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
         })),
         ..BucketWriteHandleTestHooks::default()
     });
 
     let lifecycle = "<LifecycleConfiguration><Rule><ID>pin-before-auth</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>";
     put_bucket_lifecycle_test(&coord, "bucket", lifecycle, test_requester(), None).unwrap();
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("bucket lifecycle hook should start route publication")
+        .join()
+        .unwrap();
 
     handle
         .install(make_dynamic_runtime_map_candidate(initial))

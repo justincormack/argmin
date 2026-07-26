@@ -894,13 +894,34 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
         command: &MetadataCommandEnvelope,
         bucket: &BucketName,
     ) -> Result<bool, StoreError> {
+        self.try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence(
+            pg_id,
+            command,
+            bucket,
+            AdmittedRouteEffectFence::unbounded(command.id().cluster_epoch()),
+        )
+    }
+
+    fn try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<bool, StoreError> {
+        effect_fence.require_valid_for(command.id().cluster_epoch())?;
         let request = StorageRpcMetadataCommandPendingSlotRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
             pg_id,
             command: command.clone(),
             scope_bucket: Some(bucket.clone()),
-            effect_deadline: None,
+            effect_deadline: effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
         };
         let payload = encode_metadata_command_pending_slot_request(&request).map_err(|error| {
             self.rpc_payload_error(

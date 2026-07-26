@@ -236,13 +236,13 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_put_bucket_cors_with_storage_node(
+    pub(in crate::coordinator) fn authorize_put_bucket_cors_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketConfigRequest<'_>,
     ) -> Result<AuthorizedPutBucketCors, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_write_action_for_storage_node(
-            storage_node,
+        let _bucket = self.authorize_loaded_bucket_write_action_on_admitted_route(
+            admission,
             &req.bucket,
             auth::PolicyAction::PutBucketCors,
             Self::requester_can_bucket_owner_account_admin,
@@ -353,13 +353,13 @@ impl Coordinator {
         }
     }
 
-    pub(in crate::coordinator) fn authorize_delete_bucket_cors_with_storage_node(
+    pub(in crate::coordinator) fn authorize_delete_bucket_cors_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedDeleteBucketCors, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_write_action_for_storage_node(
-            storage_node,
+        let _bucket = self.authorize_loaded_bucket_write_action_on_admitted_route(
+            admission,
             req,
             auth::PolicyAction::PutBucketCors,
             Self::requester_can_bucket_owner_account_admin,
@@ -369,13 +369,13 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_put_bucket_tagging_with_storage_node(
+    pub(in crate::coordinator) fn authorize_put_bucket_tagging_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketConfigRequest<'_>,
     ) -> Result<AuthorizedPutBucketTagging, ServerError> {
-        let bucket = self.authorize_loaded_bucket_write_action_for_storage_node(
-            storage_node,
+        let bucket = self.authorize_loaded_bucket_write_action_on_admitted_route(
+            admission,
             &req.bucket,
             auth::PolicyAction::PutBucketTagging,
             Self::requester_can_bucket_owner_account_admin,
@@ -391,13 +391,13 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_delete_bucket_tagging_with_storage_node(
+    pub(in crate::coordinator) fn authorize_delete_bucket_tagging_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedDeleteBucketTagging, ServerError> {
-        let bucket = self.authorize_loaded_bucket_write_action_for_storage_node(
-            storage_node,
+        let bucket = self.authorize_loaded_bucket_write_action_on_admitted_route(
+            admission,
             req,
             auth::PolicyAction::PutBucketTagging,
             Self::requester_can_bucket_owner_account_admin,
@@ -412,82 +412,54 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_bucket_tag_control_with_storage_node(
+    pub(in crate::coordinator) fn authorize_put_bucket_tag_control_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
-        req: &BucketTagControlRequest<'_>,
-    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_owner_account_admin_write_for_storage_node(
-            storage_node,
-            &req.bucket,
-        )?;
-        Ok(AuthorizedBucketConfigAccess {
-            bucket: req.bucket.name_typed().clone(),
-        })
-    }
-
-    pub(in crate::coordinator) fn authorize_put_bucket_tag_control_with_storage_node(
-        &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketTagControlRequest<'_>,
     ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        self.authorize_bucket_tag_resource_action_with_storage_node(
-            storage_node,
+        self.authorize_bucket_tag_resource_action_on_admitted_route(
+            admission,
             &req.control,
             req.request_tags,
             BucketTagControlAction::TagResource,
         )
     }
 
-    pub(in crate::coordinator) fn authorize_put_bucket_tags_for_untag_resource_with_storage_node(
+    pub(in crate::coordinator) fn authorize_put_bucket_tags_for_untag_resource_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketTagsForUntagResourceRequest<'_>,
     ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        self.authorize_bucket_tag_resource_action_with_storage_node(
-            storage_node,
+        self.authorize_bucket_tag_resource_action_on_admitted_route(
+            admission,
             &req.control,
             req.request_tags,
             BucketTagControlAction::UntagResource,
         )
     }
 
-    pub(in crate::coordinator) fn authorize_untag_bucket_tag_control_with_storage_node(
+    pub(in crate::coordinator) fn authorize_untag_bucket_tag_control_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &UntagBucketTagControlRequest<'_>,
     ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        self.authorize_bucket_tag_resource_action_with_storage_node(
-            storage_node,
+        self.authorize_bucket_tag_resource_action_on_admitted_route(
+            admission,
             &req.control,
             req.request_tags,
             BucketTagControlAction::UntagResource,
         )
     }
 
-    pub(in crate::coordinator) fn authorize_bucket_tag_resource_action(
+    pub(in crate::coordinator) fn authorize_bucket_tag_resource_action_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         control: &BucketTagControlRequest<'_>,
         request_tags: &[(String, String)],
         action: BucketTagControlAction,
     ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        self.authorize_bucket_tag_resource_action_with_storage_node(
-            &self.storage_node(),
-            control,
-            request_tags,
-            action,
-        )
-    }
-
-    pub(in crate::coordinator) fn authorize_bucket_tag_resource_action_with_storage_node(
-        &self,
-        storage_node: &Arc<StorageCluster>,
-        control: &BucketTagControlRequest<'_>,
-        request_tags: &[(String, String)],
-        action: BucketTagControlAction,
-    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        self.with_bucket_write_handle_for_storage_node(
-            storage_node,
+        self.with_bucket_write_handle_on_admitted_route(
+            admission,
             &control.bucket,
             BucketHandleRequest::new()
                 .requiring_policy_view()
@@ -567,16 +539,17 @@ impl Coordinator {
         &self,
         req: &PutBucketPolicyRequest<'_>,
     ) -> Result<AuthorizedPutBucketPolicy, ServerError> {
-        self.authorize_put_bucket_policy_with_storage_node(&self.storage_node(), req)
+        let admission = self.admit_storage_route_for_request()?;
+        self.authorize_put_bucket_policy_on_admitted_route(&admission, req)
     }
 
-    pub(in crate::coordinator) fn authorize_put_bucket_policy_with_storage_node(
+    pub(in crate::coordinator) fn authorize_put_bucket_policy_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketPolicyRequest<'_>,
     ) -> Result<AuthorizedPutBucketPolicy, ServerError> {
-        let bucket = self.authorize_loaded_bucket_write_policy_action_for_storage_node(
-            storage_node,
+        let bucket = self.authorize_loaded_bucket_write_policy_action_on_admitted_route(
+            admission,
             &req.bucket,
             auth::PolicyAction::PutBucketPolicy,
             Self::requester_can_bucket_owner_account_admin,
@@ -649,13 +622,13 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_delete_bucket_policy_with_storage_node(
+    pub(in crate::coordinator) fn authorize_delete_bucket_policy_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedDeleteBucketPolicy, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_write_policy_action_for_storage_node(
-            storage_node,
+        let _bucket = self.authorize_loaded_bucket_write_policy_action_on_admitted_route(
+            admission,
             req,
             auth::PolicyAction::DeleteBucketPolicy,
             Self::requester_can_bucket_owner_account_admin,
@@ -843,13 +816,13 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_put_bucket_lifecycle_with_storage_node(
+    pub(in crate::coordinator) fn authorize_put_bucket_lifecycle_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketConfigRequest<'_>,
     ) -> Result<AuthorizedPutBucketLifecycle, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_write_action_for_storage_node(
-            storage_node,
+        let _bucket = self.authorize_loaded_bucket_write_action_on_admitted_route(
+            admission,
             &req.bucket,
             auth::PolicyAction::PutLifecycleConfiguration,
             Self::requester_can_bucket_owner_account_admin,
@@ -940,13 +913,13 @@ impl Coordinator {
         }
     }
 
-    pub(in crate::coordinator) fn authorize_delete_bucket_lifecycle_with_storage_node(
+    pub(in crate::coordinator) fn authorize_delete_bucket_lifecycle_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedDeleteBucketLifecycle, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_write_action_for_storage_node(
-            storage_node,
+        let _bucket = self.authorize_loaded_bucket_write_action_on_admitted_route(
+            admission,
             req,
             auth::PolicyAction::PutLifecycleConfiguration,
             Self::requester_can_bucket_owner_account_admin,
