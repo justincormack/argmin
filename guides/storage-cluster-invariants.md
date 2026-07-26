@@ -250,7 +250,7 @@ script in the same change.
 | `try_finalize_bucket_delete` | Epoch-fenced routed metadata PG fanout plus storage-node object-payload read-handle checks and local runtime worker queue |
 | `load_available_bucket_execution_generation_batches` | Best-effort routed metadata PG |
 | `try_probe_object_pg_available`, `load_object_if`, `load_existing_live_object`, `load_object_read_snapshot_if`, `load_leased_object_read_snapshot_if`, `payload_reclaim_exists`, `get_object_tags_if`, `get_object_legal_hold_if`, `get_object_retention_if` | Epoch-fenced routed metadata PG. Admitted object-subresource reads load their exact authorization subject through `ActiveObjectReadRoute`, which binds bucket/key/version/PG and rechecks the immutable request deadline immediately before node access. The leased snapshot helper additionally acquires a broad payload-generation lease before exact snapshot validation, retries if the authorization subject changed, and returns an opaque non-cloneable handoff binding that snapshot, its route provenance, and the lease |
-| `put_object_tags_if`, `delete_object_tags_if`, `put_object_retention_if`, `put_object_legal_hold_if`, `put_object_acl_if`, `delete_specific_object_version_if`, `delete_current_object_if`, `insert_current_delete_marker_if`, `expire_current_object_if_due`, `delete_noncurrent_live_versions_if_due`, `delete_expired_delete_marker_if_due` | Epoch-fenced routed metadata PG command apply |
+| `put_object_tags_if`, `delete_object_tags_if`, `put_object_retention_if`, `put_object_legal_hold_if`, `put_object_acl_if`, `delete_specific_object_version_if`, `delete_current_object_if`, `insert_current_delete_marker_if`, `expire_current_object_if_due`, `delete_noncurrent_live_versions_if_due`, `delete_expired_delete_marker_if_due` | Epoch-fenced routed metadata PG command apply. Production object-subresource mutations use `ActiveObjectMetadataMutationRoute`; the corresponding raw cluster entry points are test-only |
 | `list_all_objects_for_bucket`, `list_all_object_versions_for_bucket`, `list_all_multipart_uploads_for_bucket`, `list_objects_for_bucket`, `list_object_versions_for_bucket` | Epoch-fenced routed metadata PG fanout |
 | `acquire_object_payload_lease`, `acquire_object_payload_lease_for_shard_locations` | Epoch-fenced routed metadata PG plus volatile storage-node-owned object-payload read handles. Copy-source and response-body snapshot loading acquire the coarse generation lease through the actual storage-node clients, so it remains visible to refreshed runtime maps and other frontends, then hand off without a gap to the shard-location helper through an opaque leased-snapshot token. Payload reads acquire all-or-release handles for every shard-owner node of the selected segments, including parity/recovery candidates. Every recorded placement epoch is validated and read through its exact retained route while acquisition remains authorized by the current admitted request epoch; the boundary script rejects direct payload-byte read bypasses |
 | `enqueue_object_payload_reclaim`, `enqueue_bucket_delete_finalize`, `wait_for_reclaim_work`, `wake_reclaim_workers` | Best-effort local runtime worker queue |
@@ -274,6 +274,26 @@ snapshot loads use the same route for HEAD, object attributes, response-body
 GET, and copy-source reads. Every node access rechecks the admission's
 immutable deadline, and the coordinator accepts the route only from its own
 publication domain.
+
+`ActiveObjectMetadataMutationRoute` is the non-cloneable active mutation
+authority for one bucket/key/requested-version/object-metadata-PG tuple.
+PutObjectTagging, DeleteObjectTagging, PutObjectAcl, PutObjectRetention, and
+PutObjectLegalHold use the buffered request's existing admission for both
+policy context and the mutation command. The route rechecks that admission's
+immutable deadline before snapshot loading and command construction. It also
+carries an `AdmittedRouteEffectFence` through bucket-write reservation
+acquisition and pending-command installation, where the embedded or RPC
+storage node revalidates the request's original epoch and clock health
+immediately before inserting the durable row. Embedded calls retain the exact
+conservatively bound monotonic deadline. RPC requests contain no monotonic
+timestamp: they carry a portable wall-clock upper bound which Unix and TLS/TCP
+receivers shorten for inter-host skew and bind to their own monotonic clock.
+The authority timestamp remains available for diagnostics, but is not used as
+the later cutoff. A same-epoch route renewal therefore cannot extend authority
+already handed to a request. Once the
+authorized command is installed, applying that exact command is convergence
+and may complete while a successor map waits to publish. Raw cluster
+metadata-mutation entry points are available only to storage unit tests.
 
 `LeasedObjectReadSnapshot` is the non-cloneable broad-to-narrow handoff token.
 Its private fields bind the exact object snapshot, requested version, metadata

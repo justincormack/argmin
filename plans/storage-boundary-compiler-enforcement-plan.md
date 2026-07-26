@@ -2748,6 +2748,71 @@ Fifty-ninth Phase 3 slice:
   the storage boundary checker, and workspace-wide strict Clippy pass. The full
   parallel workspace suite passes (7,577 tests).
 
+Sixtieth Phase 3 slice:
+
+- PutObjectTagging, DeleteObjectTagging, PutObjectAcl, PutObjectRetention, and
+  PutObjectLegalHold now consume the buffered request's existing
+  `StorageClusterRouteAdmission` for bucket policy context and mutation. Direct
+  coordinator/test-support wrappers acquire admission before entering the same
+  production methods.
+- `ActiveObjectMetadataMutationRoute` is a non-cloneable authority bound to one
+  bucket, key, requested version, object-metadata PG, originating cluster, and
+  frontend publication domain. It rechecks the immutable request deadline
+  before reservation acquisition, snapshot loading, command construction, and
+  command installation. Application of the exact durably installed command is
+  convergence after the authorized effect boundary. The former raw cluster
+  entry points remain only under `cfg(test)`.
+- the shared captured-deadline and same-cluster/different-publication-domain
+  matrices now cover all five mutations plus DeleteObjectTagging, include
+  positive canaries, and prove rejected calls preserve tags, retention, legal
+  hold, and ACL state exactly. The object-metadata publication regression now
+  proves both mutation and read admissions block publication. Existing
+  post-install epoch-transition tests publish asynchronously, require the map
+  to reach draining behind the admitted request, and prove the installed
+  command converges exactly once before publication completes.
+- DeleteObject/DeleteObjects, the remaining buffered coordinator workflows,
+  and capability requirements on the node-client traits remain open in Phase
+  3.
+- the nine focused deadline/domain/publication/epoch-transition regressions
+  pass. Formatting, diff validation, the storage boundary checker, and
+  workspace-wide strict Clippy pass. The full parallel workspace suite passes
+  (7,577 tests).
+
+Sixtieth Phase 3 review correction:
+
+- the earlier slice's checks immediately before reservation acquisition and
+  pending-command installation did not make the deadline check atomic with the
+  durable effect. A lock wait, test hook, or storage RPC round trip could cross the
+  request's captured deadline after that check while a same-epoch renewal kept
+  the raw route live.
+- `AdmittedRouteEffectFence` now binds the frontend admission's cluster epoch,
+  authority timestamp, and immutable, conservatively bound monotonic deadline.
+  Object-metadata mutation must supply this fence; the local and storage RPC
+  bucket-reservation and pending-slot clients carry it to the storage node,
+  which revalidates clock health and the effective deadline after
+  routing/locking and immediately before inserting the durable reservation or
+  pending slot.
+- monotonic timestamps are explicitly absent from the wire format. The two
+  changed RPC requests carry the original authority timestamp and a delegated
+  wall-clock upper bound. The receiving host subtracts the inter-host skew
+  budget and binds that bound to its own monotonic clock. Storage RPC frame
+  encoding advances to version 6. Ordinary recovery/maintenance calls
+  retain their existing non-frontend path, while admitted mutation cannot omit
+  the fence.
+- a deterministic same-epoch-renewal regression advances time inside the
+  pre-install hook to after the effective monotonic deadline but before the raw
+  authority timestamp, and proves the object mutation is rejected, publishes
+  no tags, releases its reservation, and can subsequently succeed. A raw Unix
+  RPC regression pins the same interval for both durable effects while the
+  storage node's renewed route remains live, with neither row inserted. A
+  production TLS/TCP regression enters through the fenced reservation and
+  pending-slot client APIs, gives frontend and storage threads deliberately
+  different monotonic origins, proves a pre-deadline reservation succeeds, and
+  proves a post-deadline pending insert is rejected without mutation.
+- focused regressions, formatting, diff validation, the storage boundary
+  checker, and workspace-wide strict Clippy pass. The full parallel workspace
+  suite passes (7,580 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

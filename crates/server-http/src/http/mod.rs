@@ -2711,7 +2711,8 @@ impl HttpFrontend {
                     .header("x-amz-bypass-governance-retention")
                     .is_some_and(|value| value.eq_ignore_ascii_case("true"));
                 let requester = self.requester_from_auth(auth, req)?;
-                let version_id = self.coordinator.put_object_retention(
+                let version_id = self.coordinator.put_object_retention_on_admitted_route(
+                    storage_route_admission,
                     &crate::coordinator::PutObjectRetentionRequest {
                         object: object_version_request(
                             &bucket,
@@ -2743,7 +2744,8 @@ impl HttpFrontend {
                 let vid = parse_version_id(req)?;
                 let legal_hold = xml::parse_object_legal_hold_xml(&req.body)?;
                 let requester = self.requester_from_auth(auth, req)?;
-                let version_id = self.coordinator.put_object_legal_hold(
+                let version_id = self.coordinator.put_object_legal_hold_on_admitted_route(
+                    storage_route_admission,
                     &crate::coordinator::PutObjectLegalHoldRequest {
                         object: object_version_request(
                             &bucket,
@@ -2772,8 +2774,9 @@ impl HttpFrontend {
                 let tags = xml::TagSet::parse_tagging_xml(&req.body, 10)?;
                 let tags_xml = tags.to_xml();
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator
-                    .put_object_tags(&crate::coordinator::PutObjectTagsRequest {
+                self.coordinator.put_object_tags_on_admitted_route(
+                    storage_route_admission,
+                    &crate::coordinator::PutObjectTagsRequest {
                         object: object_version_request(
                             &bucket,
                             &key,
@@ -2782,7 +2785,8 @@ impl HttpFrontend {
                             expected_bucket_owner,
                         )?,
                         tags: &tags_xml,
-                    })?;
+                    },
+                )?;
                 Ok(S3Response::put_object_tagging())
             }
             S3Operation::GetObjectTagging { bucket, key } => {
@@ -2804,14 +2808,10 @@ impl HttpFrontend {
             S3Operation::DeleteObjectTagging { bucket, key } => {
                 let vid = parse_version_id(req)?;
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator
-                    .delete_object_tags(&object_version_request(
-                        &bucket,
-                        &key,
-                        vid,
-                        requester,
-                        expected_bucket_owner,
-                    )?)?;
+                self.coordinator.delete_object_tags_on_admitted_route(
+                    storage_route_admission,
+                    &object_version_request(&bucket, &key, vid, requester, expected_bucket_owner)?,
+                )?;
                 Ok(S3Response::delete_object_tagging())
             }
             S3Operation::GetObjectAcl { bucket, key } => {
@@ -2852,8 +2852,9 @@ impl HttpFrontend {
                         return Err(canned_acl_and_header_grants_conflict());
                     }
                     let acl = parse_put_object_acl(req.header("x-amz-acl"));
-                    self.coordinator
-                        .put_object_acl(&crate::coordinator::PutObjectAclRequest {
+                    self.coordinator.put_object_acl_on_admitted_route(
+                        storage_route_admission,
+                        &crate::coordinator::PutObjectAclRequest {
                             object: object_version_request(
                                 &bucket,
                                 &key,
@@ -2864,11 +2865,13 @@ impl HttpFrontend {
                             acl: crate::coordinator::PutObjectAclInput::Canned(acl),
                             policy_context: crate::coordinator::PutObjectPolicyContext::default()
                                 .with_default_canned_acl(acl.policy_condition_value()),
-                        })?
+                        },
+                    )?
                 } else {
                     let acl_grants = parse_acl_grants(req)?;
-                    self.coordinator
-                        .put_object_acl(&crate::coordinator::PutObjectAclRequest {
+                    self.coordinator.put_object_acl_on_admitted_route(
+                        storage_route_admission,
+                        &crate::coordinator::PutObjectAclRequest {
                             object: object_version_request(
                                 &bucket,
                                 &key,
@@ -2885,7 +2888,8 @@ impl HttpFrontend {
                                     req.header("x-amz-grant-write-acp"),
                                     req.header("x-amz-grant-full-control"),
                                 ),
-                        })?
+                        },
+                    )?
                 };
                 Ok(S3Response::put_object_acl(result_version_id))
             }

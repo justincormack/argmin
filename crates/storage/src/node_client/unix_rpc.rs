@@ -2650,12 +2650,25 @@ impl UnixStorageNodeClient {
         command: &MetadataCommandEnvelope,
         bucket: Option<&BucketName>,
     ) -> Result<(), StoreError> {
+        self.try_insert_pending_metadata_command_slot_with_effect_deadline(
+            pg_id, command, bucket, None,
+        )
+    }
+
+    fn try_insert_pending_metadata_command_slot_with_effect_deadline(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
+    ) -> Result<(), StoreError> {
         let request = StorageRpcMetadataCommandPendingSlotRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
             pg_id,
             command: command.clone(),
             scope_bucket: bucket.cloned(),
+            effect_deadline,
         };
         let payload = encode_metadata_command_pending_slot_request(&request).map_err(|error| {
             self.rpc_payload_error(
@@ -2727,6 +2740,7 @@ impl UnixStorageNodeClient {
             pg_id,
             command: command.clone(),
             scope_bucket: Some(bucket.clone()),
+            effect_deadline: None,
         };
         let payload = encode_metadata_command_pending_slot_request(&request).map_err(|error| {
             self.rpc_payload_error(
@@ -3068,6 +3082,27 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
     ) -> Result<(), StoreError> {
         UnixStorageNodeClient::try_insert_pending_metadata_command_slot(
             self, pg_id, command, bucket,
+        )
+    }
+
+    fn try_insert_pending_metadata_command_slot_with_effect_fence(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(), StoreError> {
+        effect_fence.require_valid_for(command.id().cluster_epoch())?;
+        self.try_insert_pending_metadata_command_slot_with_effect_deadline(
+            pg_id,
+            command,
+            bucket,
+            effect_fence
+                .deadline()
+                .map(|deadline| StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }),
         )
     }
 

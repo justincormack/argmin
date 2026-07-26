@@ -77,7 +77,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU32;
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 5;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 6;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -250,7 +250,12 @@ const STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         + STORAGE_RPC_MAX_METADATA_COMMAND_ITEM_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REQUEST_PAYLOAD_LEN: usize =
-    STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 1 + 4 + STORAGE_RPC_MAX_BUCKET_NAME_LEN;
+    STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN
+        + 1
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_NAME_LEN
+        + 1
+        + 16;
 const STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         + 2 * STORAGE_RPC_MAX_METADATA_COMMAND_ITEM_PAYLOAD_LEN
@@ -466,7 +471,9 @@ const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN: usize =
         + 8
         + 1
         + 4
-        + STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN;
+        + STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN
+        + 1
+        + 16;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_HEARTBEAT_PAYLOAD_LEN: usize =
@@ -2739,6 +2746,22 @@ pub(crate) struct StorageRpcMetadataCommandPendingSlotRequest {
     pub(crate) pg_id: PgId,
     pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
     pub(crate) scope_bucket: Option<BucketName>,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StorageRpcAdmittedRouteEffectDeadline {
+    pub(crate) authority_valid_until_ms: u64,
+    pub(crate) portable_wall_valid_until_ms: u64,
+}
+
+fn admitted_route_effect_deadline_is_conservative(
+    deadline: StorageRpcAdmittedRouteEffectDeadline,
+) -> bool {
+    deadline.portable_wall_valid_until_ms
+        <= deadline
+            .authority_valid_until_ms
+            .saturating_sub(crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3297,6 +3320,7 @@ pub(crate) struct StorageRpcBucketWriteReservationAcquireRequest {
     pub(crate) created_at: u64,
     pub(crate) lease_deadline: u64,
     pub(crate) target_context: Option<String>,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8158,6 +8182,16 @@ pub(crate) fn decode_lifecycle_sweep_claim_record_response(
 pub(crate) fn encode_metadata_command_pending_slot_request(
     request: &StorageRpcMetadataCommandPendingSlotRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request
+        .effect_deadline
+        .is_some_and(|deadline| !admitted_route_effect_deadline_is_conservative(deadline))
+    {
+        return Err(
+            StorageRpcPayloadError::InvalidMetadataCommandPendingSlotRequest(
+                "effect deadline is not conservatively delegated",
+            ),
+        );
+    }
     validate_metadata_command_route(request.cluster_epoch, request.pg_id, request.command.id())?;
     let command_request = StorageRpcMetadataCommandRequest {
         node_id: request.node_id,
@@ -8171,6 +8205,14 @@ pub(crate) fn encode_metadata_command_pending_slot_request(
         Some(bucket) => {
             put_u8(&mut out, 1);
             put_string(&mut out, bucket.as_str());
+        }
+    }
+    match request.effect_deadline {
+        None => put_u8(&mut out, 0),
+        Some(deadline) => {
+            put_u8(&mut out, 1);
+            put_u64(&mut out, deadline.authority_valid_until_ms);
+            put_u64(&mut out, deadline.portable_wall_valid_until_ms);
         }
     }
     Ok(out)
@@ -8201,6 +8243,29 @@ pub(crate) fn decode_metadata_command_pending_slot_request(
             )
         }
     };
+    let effect_deadline = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(StorageRpcAdmittedRouteEffectDeadline {
+            authority_valid_until_ms: decoder.read_u64()?,
+            portable_wall_valid_until_ms: decoder.read_u64()?,
+        }),
+        _ => {
+            return Err(
+                StorageRpcPayloadError::InvalidMetadataCommandPendingSlotRequest(
+                    "invalid optional effect deadline tag",
+                ),
+            )
+        }
+    };
+    if effect_deadline
+        .is_some_and(|deadline| !admitted_route_effect_deadline_is_conservative(deadline))
+    {
+        return Err(
+            StorageRpcPayloadError::InvalidMetadataCommandPendingSlotRequest(
+                "effect deadline is not conservatively delegated",
+            ),
+        );
+    }
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandPendingSlotRequest {
         node_id,
@@ -8208,6 +8273,7 @@ pub(crate) fn decode_metadata_command_pending_slot_request(
         pg_id,
         command,
         scope_bucket,
+        effect_deadline,
     })
 }
 
@@ -11349,6 +11415,14 @@ pub(crate) fn decode_proof_release_request(
 pub(crate) fn encode_bucket_write_reservation_acquire_request(
     request: &StorageRpcBucketWriteReservationAcquireRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request
+        .effect_deadline
+        .is_some_and(|deadline| !admitted_route_effect_deadline_is_conservative(deadline))
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "effect deadline is not conservatively delegated",
+        ));
+    }
     validate_bucket_write_reservation_identity(
         &request.reservation_id,
         &request.owner_token,
@@ -11366,6 +11440,14 @@ pub(crate) fn encode_bucket_write_reservation_acquire_request(
     put_u64(&mut out, request.created_at);
     put_u64(&mut out, request.lease_deadline);
     put_optional_string(&mut out, request.target_context.as_deref());
+    match request.effect_deadline {
+        None => put_u8(&mut out, 0),
+        Some(deadline) => {
+            put_u8(&mut out, 1);
+            put_u64(&mut out, deadline.authority_valid_until_ms);
+            put_u64(&mut out, deadline.portable_wall_valid_until_ms);
+        }
+    }
     Ok(out)
 }
 
@@ -11405,6 +11487,25 @@ pub(crate) fn decode_bucket_write_reservation_acquire_request(
             "target context exceeds maximum length",
         ),
     )?;
+    let effect_deadline = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(StorageRpcAdmittedRouteEffectDeadline {
+            authority_valid_until_ms: decoder.read_u64()?,
+            portable_wall_valid_until_ms: decoder.read_u64()?,
+        }),
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "invalid optional effect deadline tag",
+            ))
+        }
+    };
+    if effect_deadline
+        .is_some_and(|deadline| !admitted_route_effect_deadline_is_conservative(deadline))
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "effect deadline is not conservatively delegated",
+        ));
+    }
     decoder.finish()?;
     validate_bucket_write_reservation_identity(
         &reservation_id,
@@ -11423,6 +11524,7 @@ pub(crate) fn decode_bucket_write_reservation_acquire_request(
         created_at,
         lease_deadline,
         target_context,
+        effect_deadline,
     })
 }
 
@@ -17418,7 +17520,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&5u16.to_le_bytes());
+        expected.extend_from_slice(&6u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -17429,15 +17531,15 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_rejects_version_four_fixture() {
+    fn storage_rpc_frame_rejects_version_five_fixture() {
         let mut bytes =
             encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
         let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&4_u16.to_le_bytes());
+        bytes[version_offset..version_offset + 2].copy_from_slice(&5_u16.to_le_bytes());
 
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnsupportedVersion(4))
+            Err(StorageRpcFrameError::UnsupportedVersion(5))
         );
     }
 
@@ -17813,6 +17915,10 @@ mod tests {
             pg_id: command.id().pg_id(),
             command: command.clone(),
             scope_bucket: Some(BucketName::try_from("pending-scope").unwrap()),
+            effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                authority_valid_until_ms: 5_000,
+                portable_wall_valid_until_ms: 4_000,
+            }),
         };
 
         let bytes = encode_metadata_command_pending_slot_request(&request).unwrap();
@@ -17820,6 +17926,24 @@ mod tests {
 
         assert_eq!(decoded, request);
         assert_eq!(decoded.command.command_bytes(), command.command_bytes());
+
+        let mut nonconservative = request.clone();
+        nonconservative
+            .effect_deadline
+            .as_mut()
+            .unwrap()
+            .portable_wall_valid_until_ms = 4_001;
+        assert!(matches!(
+            encode_metadata_command_pending_slot_request(&nonconservative),
+            Err(StorageRpcPayloadError::InvalidMetadataCommandPendingSlotRequest(_))
+        ));
+        let mut nonconservative_wire = bytes;
+        let wire_len = nonconservative_wire.len();
+        nonconservative_wire[wire_len - 8..].copy_from_slice(&4_001_u64.to_be_bytes());
+        assert!(matches!(
+            decode_metadata_command_pending_slot_request(&nonconservative_wire),
+            Err(StorageRpcPayloadError::InvalidMetadataCommandPendingSlotRequest(_))
+        ));
     }
 
     #[test]
@@ -21130,6 +21254,10 @@ mod tests {
             created_at: 10,
             lease_deadline: 20,
             target_context: Some("key=a".to_string()),
+            effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                authority_valid_until_ms: 5_000,
+                portable_wall_valid_until_ms: 4_000,
+            }),
         };
         let bytes = encode_bucket_write_reservation_acquire_request(&acquire).unwrap();
         let decoded = decode_bucket_write_reservation_acquire_request(&bytes).unwrap();

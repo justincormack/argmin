@@ -44,6 +44,7 @@ use crate::node_client::{
 use crate::traits::DurableBucketWriteReservationAcquire;
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::traits::PgMetadataStore;
+use crate::types::AdmittedRouteEffectFence;
 use crate::*;
 
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
@@ -3199,27 +3200,50 @@ impl super::StorageCluster {
         operation_kind: &'static str,
         target_context: Option<&str>,
     ) -> Result<super::DurableBucketWriteReservation, BucketSnapshotLoadError> {
+        self.acquire_durable_bucket_write_reservation_with_effect_fence(
+            bucket,
+            operation_kind,
+            target_context,
+            None,
+        )
+    }
+
+    fn acquire_durable_bucket_write_reservation_with_effect_fence(
+        &self,
+        bucket: &BucketName,
+        operation_kind: &'static str,
+        target_context: Option<&str>,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+    ) -> Result<super::DurableBucketWriteReservation, BucketSnapshotLoadError> {
         let pg_id = self.bucket_metadata_pg_id(bucket);
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
         let reservation_id = self.next_bucket_write_reservation_id()?;
         let owner_token = self.bucket_write_owner_token();
-        let record = node
-            .bucket_write_reservation_client()
-            .acquire_durable_bucket_write_reservation(
+        let client = node.bucket_write_reservation_client();
+        let acquire = DurableBucketWriteReservationAcquire {
+            name: bucket,
+            reservation_id: &reservation_id,
+            owner_token: &owner_token,
+            cluster_epoch: self.operation_epoch(),
+            operation_kind,
+            created_at: crate::clock::current_time_millis(),
+            lease_deadline: self.bucket_write_reservation_lease_deadline(),
+            target_context,
+        };
+        let record = match effect_fence {
+            Some(effect_fence) => client
+                .acquire_durable_bucket_write_reservation_with_effect_fence(
+                    self.validated_bucket_metadata_pg(PgId::new(pg_id)),
+                    acquire,
+                    effect_fence,
+                )?,
+            None => client.acquire_durable_bucket_write_reservation(
                 self.validated_bucket_metadata_pg(PgId::new(pg_id)),
-                DurableBucketWriteReservationAcquire {
-                    name: bucket,
-                    reservation_id: &reservation_id,
-                    owner_token: &owner_token,
-                    cluster_epoch: self.operation_epoch(),
-                    operation_kind,
-                    created_at: crate::clock::current_time_millis(),
-                    lease_deadline: self.bucket_write_reservation_lease_deadline(),
-                    target_context,
-                },
-            )?;
+                acquire,
+            )?,
+        };
         Ok(super::DurableBucketWriteReservation {
             node: Arc::clone(node.bucket_metadata_client()),
             pg_id,
@@ -8660,19 +8684,28 @@ impl super::StorageCluster {
         ))
     }
 
-    fn put_object_metadata_if<T, E>(
+    pub(super) fn put_object_metadata_if_with_route_validation<T, E>(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        requested_version_id: Option<VersionId>,
+        route: super::ObjectMetadataMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut action: impl FnMut(&StoredObject) -> Result<(T, VersionId, PutObjectMetadataMutation), E>,
     ) -> Result<Result<T, E>, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(PutObjectMetadataIf);
-        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let super::ObjectMetadataMutationEffectRoute {
+            pg_id: object_pg_id,
+            bucket,
+            key,
+            requested_version_id,
+            effect_fence,
+        } = route;
         let pg_id = object_pg_id.pg_id();
-        let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
         loop {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
+            let storage_client = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+                .object_mutation_metadata_client();
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::PutObjectMetadata(update) = command.payload() {
                     if update.object.bucket == *bucket && update.object.key == *key {
@@ -8711,6 +8744,7 @@ impl super::StorageCluster {
                                 "conflicting pending command for object metadata update",
                             ));
                         }
+                        require_valid_route().map_err(ObjectPgActionError::Store)?;
                         self.apply_exact_pending_object_metadata_command(
                             pg_id,
                             super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
@@ -8723,10 +8757,12 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let reservation = match self.acquire_durable_bucket_write_reservation(
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
+            let reservation = match self.acquire_durable_bucket_write_reservation_with_effect_fence(
                 bucket,
                 PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
                 Some(key.as_str()),
+                Some(effect_fence),
             ) {
                 Ok(reservation) => reservation,
                 Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
@@ -8756,6 +8792,10 @@ impl super::StorageCluster {
                 continue;
             }
 
+            if let Err(error) = require_valid_route() {
+                release_bucket_write_proof!()?;
+                return Err(ObjectPgActionError::Store(error));
+            }
             let stored = match storage_client.load_put_object_metadata_snapshot(
                 object_pg_id,
                 bucket,
@@ -8775,6 +8815,10 @@ impl super::StorageCluster {
                     return Ok(Err(error));
                 }
             };
+            if let Err(error) = require_valid_route() {
+                release_bucket_write_proof!()?;
+                return Err(ObjectPgActionError::Store(error));
+            }
             let command = match storage_client.build_put_object_metadata_command(
                 BuildPutObjectMetadataCommandReq {
                     pg_id: object_pg_id,
@@ -8805,9 +8849,16 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             };
-            let install = match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
-            {
+            if let Err(error) = require_valid_route() {
+                release_bucket_write_proof!()?;
+                return Err(ObjectPgActionError::Store(error));
+            }
+            let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
+                pg_id,
+                bucket,
+                &command,
+                Some(effect_fence),
+            ) {
                 Ok(install) => install,
                 Err(error) => {
                     release_bucket_write_proof!()?;
@@ -8826,6 +8877,28 @@ impl super::StorageCluster {
         }
     }
 
+    #[cfg(test)]
+    fn put_object_metadata_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        requested_version_id: Option<VersionId>,
+        action: impl FnMut(&StoredObject) -> Result<(T, VersionId, PutObjectMetadataMutation), E>,
+    ) -> Result<Result<T, E>, ObjectPgActionError> {
+        self.put_object_metadata_if_with_route_validation(
+            super::ObjectMetadataMutationEffectRoute {
+                pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                requested_version_id,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            action,
+        )
+    }
+
+    #[cfg(test)]
     pub fn put_object_tags_if<E>(
         &self,
         bucket: &BucketName,
@@ -8844,6 +8917,7 @@ impl super::StorageCluster {
         })
     }
 
+    #[cfg(test)]
     pub fn delete_object_tags_if<E>(
         &self,
         bucket: &BucketName,
@@ -8858,6 +8932,7 @@ impl super::StorageCluster {
     }
 
     /// Returns the version id the retention was applied to.
+    #[cfg(test)]
     pub fn put_object_retention_if<E>(
         &self,
         bucket: &BucketName,
@@ -8877,6 +8952,7 @@ impl super::StorageCluster {
     }
 
     /// Returns the version id the legal hold was applied to.
+    #[cfg(test)]
     pub fn put_object_legal_hold_if<E>(
         &self,
         bucket: &BucketName,
@@ -8895,6 +8971,7 @@ impl super::StorageCluster {
         })
     }
 
+    #[cfg(test)]
     pub fn put_object_acl_if<E>(
         &self,
         bucket: &BucketName,
@@ -9360,7 +9437,7 @@ impl super::StorageCluster {
                 }
             };
             let install = match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command, None)
             {
                 Ok(install) => install,
                 Err(error) => {
@@ -9534,7 +9611,7 @@ impl super::StorageCluster {
                 }
             };
             let install = match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command, None)
             {
                 Ok(install) => install,
                 Err(error) => {
@@ -9726,7 +9803,7 @@ impl super::StorageCluster {
                 }
             };
             let install = match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command, None)
             {
                 Ok(install) => install,
                 Err(error) => {
@@ -10024,7 +10101,7 @@ impl super::StorageCluster {
                 _ => unreachable!("lifecycle current expiry command changed payload kind"),
             };
             let install = match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command, None)
             {
                 Ok(install) => install,
                 Err(error) => {
@@ -10208,9 +10285,9 @@ impl super::StorageCluster {
                         return Err(error);
                     }
                 };
-                let install = match self
-                    .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
-                {
+                let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
+                    pg_id, bucket, &command, None,
+                ) {
                     Ok(install) => install,
                     Err(error) => {
                         self.release_bucket_write_proof_for_object_metadata_command(
@@ -10424,7 +10501,7 @@ impl super::StorageCluster {
                 }
             };
             let install = match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command, None)
             {
                 Ok(install) => install,
                 Err(error) => {
@@ -12123,7 +12200,9 @@ impl super::StorageCluster {
                     );
                 }
                 match self
-                    .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
+                    .install_snapshot_sensitive_metadata_command_or_drain(
+                        pg_id, bucket, &command, None,
+                    )
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
                 {
                     super::SnapshotSensitiveCommandInstall::Installed => {}
@@ -12330,8 +12409,9 @@ impl super::StorageCluster {
                     ));
                 }
             };
-            let install_result =
-                self.install_snapshot_sensitive_metadata_command_or_drain(pg_id, &bucket, &command);
+            let install_result = self.install_snapshot_sensitive_metadata_command_or_drain(
+                pg_id, &bucket, &command, None,
+            );
             match install_result {
                 Ok(super::SnapshotSensitiveCommandInstall::Installed) => {}
                 Ok(super::SnapshotSensitiveCommandInstall::ContenderDrained) => continue,
@@ -12469,7 +12549,8 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             };
-            match self.install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
+            match self
+                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command, None)
             {
                 Ok(super::SnapshotSensitiveCommandInstall::Installed) => {}
                 Ok(super::SnapshotSensitiveCommandInstall::ContenderDrained) => {

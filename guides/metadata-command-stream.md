@@ -130,6 +130,17 @@ Command safety is classified at the publisher path, not just by command kind.
 The risk depends on which metadata snapshot, authorization result, or request
 precondition was used before the pending slot was installed.
 
+For frontend-admitted publishers, checking admission before calling the
+installer is insufficient: lock waits and RPC transport can cross the captured
+deadline while the raw same-epoch route is renewed. Their immutable
+`AdmittedRouteEffectFence`, including the admission's conservatively bound
+monotonic deadline, is therefore carried to the effect boundary. Monotonic
+timestamps are never serialized: RPC requests carry a portable wall-clock
+upper bound, and the receiving host subtracts the inter-host skew budget before
+binding it to its own monotonic clock. Embedded and RPC nodes revalidate clock
+health and their local effective deadline immediately before the durable
+pending-slot insert.
+
 Publisher classes:
 
 - `SnapshotSensitive`: the publisher must rebuild the command from a fresh
@@ -183,7 +194,7 @@ Current production pending-command publishers:
 | `create_put_object_stream_session_record_under_reservation` | `CreateStreamUpload` | `SnapshotSensitive` | Low-level PutObject stream-create publisher. The public wrapper first holds a durable bucket write reservation; this internal publisher rebuilds session command and reservation cleanup from fresh object state after contention. |
 | `commit_stream_segment_append` | `AppendStreamSegment` | `ApplyValidated` | Command-id and pending-install contention are drained and retried from a fresh stream-session snapshot without deleting the staged payload; apply validates session binding/state and existing staged segment before inserting. |
 | `abort_stream_upload_session` | `AbortStreamUpload` | `TerminalSessionRetry` | Rebuild staged-segment snapshot after unrelated pending-slot or command-id contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching/session-completion branch can finish it. |
-| `put_object_metadata_if` | `PutObjectMetadata` | `SnapshotSensitive` | Rerun request action/preconditions after contention. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
+| `put_object_metadata_if_with_route_validation` | `PutObjectMetadata` | `SnapshotSensitive` | Revalidate request-scoped route authority and rerun request action/preconditions after contention. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `delete_specific_object_version_if` | `DeleteObjectVersion` | `SnapshotSensitive` | Rerun delete preconditions after contention. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `delete_current_object_if` | `DeleteObjectVersion` | `SnapshotSensitive` | Rerun current-object selection after contention. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `insert_current_delete_marker_if` | `InsertDeleteMarker` | `SnapshotSensitive` | Rerun current-object/versioning selection after contention. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |

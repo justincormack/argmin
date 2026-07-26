@@ -70,6 +70,122 @@ impl std::fmt::Display for ClusterEpoch {
     }
 }
 
+/// Immutable effective deadline carried from a frontend route admission to a
+/// storage-node durable-effect boundary.
+///
+/// The route map used internally by a storage client can be renewed while a
+/// request is in flight. This fence preserves both the authority timestamp and
+/// the admission's conservatively bound process-monotonic deadline so a
+/// renewal cannot extend its authority to acquire a reservation or install a
+/// pending metadata command. Monotonic timestamps never cross an RPC boundary:
+/// remote clients derive a portable wall-clock upper bound, and the receiving
+/// host conservatively binds it to its own monotonic clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdmittedRouteEffectFence {
+    cluster_epoch: ClusterEpoch,
+    deadline: Option<AdmittedRouteEffectDeadline>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdmittedRouteEffectDeadline {
+    authority_valid_until_ms: u64,
+    local_valid_until_monotonic_ms: u64,
+}
+
+impl AdmittedRouteEffectFence {
+    pub(crate) fn unbounded(cluster_epoch: ClusterEpoch) -> Self {
+        Self {
+            cluster_epoch,
+            deadline: None,
+        }
+    }
+
+    pub(crate) fn bounded(
+        cluster_epoch: ClusterEpoch,
+        authority_valid_until_ms: u64,
+        local_valid_until_monotonic_ms: u64,
+    ) -> Self {
+        Self {
+            cluster_epoch,
+            deadline: Some(AdmittedRouteEffectDeadline {
+                authority_valid_until_ms,
+                local_valid_until_monotonic_ms,
+            }),
+        }
+    }
+
+    pub(crate) fn bind_portable(
+        cluster_epoch: ClusterEpoch,
+        authority_valid_until_ms: u64,
+        portable_wall_valid_until_ms: u64,
+    ) -> Self {
+        let local_wall_ms = crate::clock::current_time_millis();
+        let local_monotonic_ms = crate::clock::monotonic_time_millis();
+        let conservative_local_wall_deadline_ms = portable_wall_valid_until_ms
+            .saturating_sub(crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS);
+        let remaining_ms = conservative_local_wall_deadline_ms.saturating_sub(local_wall_ms);
+        let local_valid_until_monotonic_ms = local_monotonic_ms
+            .checked_add(remaining_ms)
+            .unwrap_or(local_monotonic_ms);
+        Self::bounded(
+            cluster_epoch,
+            authority_valid_until_ms,
+            local_valid_until_monotonic_ms,
+        )
+    }
+
+    pub(crate) fn deadline(self) -> Option<AdmittedRouteEffectDeadline> {
+        self.deadline
+    }
+
+    pub(crate) fn require_valid_for(self, operation_epoch: ClusterEpoch) -> Result<(), StoreError> {
+        if self.cluster_epoch != operation_epoch {
+            return Err(StoreError::RouteAdmissionClusterMismatch {
+                admitted_epoch: self.cluster_epoch,
+                operation_epoch,
+            });
+        }
+        let Some(deadline) = self.deadline else {
+            return Ok(());
+        };
+        let now_ms = crate::clock::current_time_millis();
+        let now_monotonic_ms = crate::clock::monotonic_time_millis();
+        if crate::control_plane_lease::validate_process_lease_clock(
+            now_ms,
+            crate::clock::clock_health_time_millis(),
+            crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+        )
+        .is_ok()
+            && deadline.local_valid_until_monotonic_ms > now_monotonic_ms
+        {
+            return Ok(());
+        }
+        Err(StoreError::RouteMapExpired {
+            cluster_epoch: self.cluster_epoch,
+            valid_until_ms: deadline.authority_valid_until_ms,
+            now_ms,
+        })
+    }
+}
+
+impl AdmittedRouteEffectDeadline {
+    pub(crate) fn authority_valid_until_ms(self) -> u64 {
+        self.authority_valid_until_ms
+    }
+
+    pub(crate) fn portable_wall_valid_until_ms(self) -> u64 {
+        let remaining_ms = self
+            .local_valid_until_monotonic_ms
+            .saturating_sub(crate::clock::monotonic_time_millis());
+        let projected_effective_wall_deadline_ms =
+            crate::clock::current_time_millis().saturating_add(remaining_ms);
+        projected_effective_wall_deadline_ms.min(
+            self.authority_valid_until_ms
+                .saturating_sub(crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS),
+        )
+    }
+}
+
 /// Raw placement-group identifier.
 ///
 /// Prefer one of the role-specific wrappers below at new cluster boundaries.

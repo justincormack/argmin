@@ -869,6 +869,19 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         <Self as StorageNodeClient>::acquire_durable_bucket_write_reservation(self, pg_id, acquire)
     }
 
+    fn acquire_durable_bucket_write_reservation_with_effect_fence(
+        &self,
+        pg_id: BucketPgId,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        effect_fence.require_valid_for(acquire.cluster_epoch)?;
+        Ok(PgMetadataStore::acquire_durable_bucket_write_reservation(
+            &*pg, acquire,
+        )?)
+    }
+
     fn validate_bucket_write_reservation_proof(
         &self,
         pg_id: BucketPgId,
@@ -4148,6 +4161,18 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         bucket: Option<&BucketName>,
     ) -> Result<(), StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.try_insert_pending_metadata_command_slot(self.node_id.as_u32(), command, bucket)
+    }
+
+    fn try_insert_pending_metadata_command_slot_with_effect_fence(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        effect_fence.require_valid_for(command.id().cluster_epoch())?;
         pg.try_insert_pending_metadata_command_slot(self.node_id.as_u32(), command, bucket)
     }
 

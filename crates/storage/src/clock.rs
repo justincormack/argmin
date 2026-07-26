@@ -42,6 +42,7 @@ impl WallClockHealthSampleWindowTooWide {
 
 thread_local! {
     static TIME_OVERRIDE_MILLIS: Cell<Option<u64>> = const { Cell::new(None) };
+    static MONOTONIC_TIME_OVERRIDE_MILLIS: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 struct TimeOverrideReset<'a> {
@@ -60,6 +61,29 @@ pub fn with_time_override<T>(now_millis: u64, f: impl FnOnce() -> T) -> T {
         let previous = slot.replace(Some(now_millis));
         let _reset = TimeOverrideReset { slot, previous };
         f()
+    })
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn with_time_and_monotonic_override<T>(
+    wall_time_millis: u64,
+    monotonic_time_millis: u64,
+    f: impl FnOnce() -> T,
+) -> T {
+    TIME_OVERRIDE_MILLIS.with(|wall_slot| {
+        MONOTONIC_TIME_OVERRIDE_MILLIS.with(|monotonic_slot| {
+            let previous_wall = wall_slot.replace(Some(wall_time_millis));
+            let previous_monotonic = monotonic_slot.replace(Some(monotonic_time_millis));
+            let _wall_reset = TimeOverrideReset {
+                slot: wall_slot,
+                previous: previous_wall,
+            };
+            let _monotonic_reset = TimeOverrideReset {
+                slot: monotonic_slot,
+                previous: previous_monotonic,
+            };
+            f()
+        })
     })
 }
 
@@ -105,6 +129,9 @@ pub fn current_time_millis() -> u64 {
 }
 
 pub fn monotonic_time_millis() -> u64 {
+    if let Some(now_millis) = MONOTONIC_TIME_OVERRIDE_MILLIS.with(Cell::get) {
+        return now_millis;
+    }
     if let Some(now_millis) = override_time_millis() {
         return now_millis;
     }

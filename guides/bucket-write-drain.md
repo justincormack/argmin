@@ -78,7 +78,7 @@ write-drain mechanism.
 | UploadPart stream finalize | `finalize_upload_part_stream` | Carries a durable reservation proof in the committed-part command; apply/retry/open-time convergence validate and release it |
 | UploadPartCopy | `upload_part_copy` creates a destination stream session, appends copied source segments, and finalizes | Needs destination reservation for session create/finalize; source read authorization is separate |
 | Bucket control-plane writes | policy, CORS, tagging/ABAC, public access block, ownership controls, lifecycle, encryption, versioning, object lock, ACL | Must either acquire the durable reservation, be explicitly blocked by an active drain, or prove the command is itself the drain/delete transition |
-| Object tags/ACL/retention/legal-hold | `put_object_metadata_if` / `PutObjectMetadata` | Carries a durable reservation proof in the object-metadata command; apply/retry/open-time convergence validate and release it |
+| Object tags/ACL/retention/legal-hold | `put_object_metadata_if_with_route_validation` / `PutObjectMetadata` | Carries a durable reservation proof in the object-metadata command; apply/retry/open-time convergence validate and release it |
 | User-visible object metadata deletes | current DeleteObject, specific-version delete, delete-marker insertion, lifecycle current/noncurrent expiry, expired delete-marker cleanup | Carry a durable reservation proof in `DeleteObjectVersion`/`InsertDeleteMarker`; apply/retry/open-time convergence validate and release it |
 | DeleteBucket begin | `begin_bucket_delete` / `MarkBucketDeleting` | Owns the temporary drain fence and publishes the terminal delete command |
 | DeleteBucket finalize | `try_finalize_bucket_delete` | Must not acquire a new write reservation; it only finalizes a bucket already marked Deleting |
@@ -102,6 +102,15 @@ equivalent command envelope field:
 - reservation id
 - reservation owner token
 - bucket PG and cluster epoch
+
+Frontend-admitted object-metadata writes also carry the admission's immutable
+epoch and conservatively bound monotonic deadline into reservation acquisition.
+Embedded nodes revalidate that exact effective deadline. Storage RPC never
+serializes a monotonic timestamp: it carries a delegated wall-clock upper bound
+which Unix or TLS/TCP receivers shorten by the inter-host skew budget and bind
+to their own monotonic clock. Both paths revalidate clock health immediately
+before inserting the durable reservation, independently of any later
+same-epoch route-map renewal.
 
 The object metadata command families that can publish user-visible bucket
 writes are proof-required commands: `CommitDirectPutObject`,

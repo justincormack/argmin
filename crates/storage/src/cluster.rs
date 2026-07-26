@@ -41,8 +41,8 @@ use crate::metadata_command::{
     BucketWriteReservationProof, CreateMultipartUploadCommand, CreateStreamUploadCommand,
     DeleteObjectVersionTarget, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
     MetadataCommandPayload, MetadataCommandReplicaState, MetadataTransferCommand,
-    ObjectPayloadReclaimCommand, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
-    ReserveObjectVersionCommand,
+    ObjectPayloadReclaimCommand, PutObjectMetadataMutation, ReleaseObjectGenerationCommand,
+    ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
@@ -73,24 +73,24 @@ use crate::storage_rpc::{
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
 use crate::types::{
-    BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
-    BucketSubresourceKind, BucketWriteDrainRecord, BucketWriteReservationRecord, CanonicalUserId,
-    ClusterEpoch, CommitDirectPutObjectReq, CreateStreamUploadReq, DirectPutCommitSnapshot,
-    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
-    ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot,
-    ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectSegmentRecord, PgId, PgState,
-    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
-    PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
-    PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
-    PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,
-    PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
-    PrepareStreamUploadSegmentAppendReq, RouteMapValidity, SegmentStoredBytesRequest, SessionId,
-    ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
-    ShardScavengerObservationReason, ShardScavengerObservationRecord,
-    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference, StoredObject,
-    StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
-    StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
+    AclGrants, AdmittedRouteEffectFence, BucketInfo, BucketName, BucketSnapshot,
+    BucketSnapshotPair, BucketSnapshotRequest, BucketSubresourceKind, BucketWriteDrainRecord,
+    BucketWriteReservationRecord, CanonicalUserId, ClusterEpoch, CommitDirectPutObjectReq,
+    CreateStreamUploadReq, DirectPutCommitSnapshot, DirectPutWrittenSegment, EcShape,
+    FinalizeDirectPutObjectOutcome, GenerationId, ListedBucketMultipartUploads,
+    ListedBucketObjectVersions, ListedBucketObjects, MultipartUploadRecord, ObjectEncryption,
+    ObjectKey, ObjectLayout, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome,
+    ObjectRetention, ObjectSegmentRecord, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
+    PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
+    PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
+    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,
+    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
+    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq, RouteMapValidity,
+    SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
+    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
+    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus,
+    StoredObject, StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
 };
 #[cfg(test)]
 use crate::types::{
@@ -1860,6 +1860,23 @@ impl StorageClusterRouteAdmission {
         self.admitted_lease.validity.valid_until_ms()
     }
 
+    fn effect_fence(&self) -> AdmittedRouteEffectFence {
+        match (
+            self.authority_valid_until_ms(),
+            self.admitted_lease.local_valid_until_monotonic_ms,
+        ) {
+            (Some(authority_valid_until_ms), Some(local_valid_until_monotonic_ms)) => {
+                AdmittedRouteEffectFence::bounded(
+                    self.cluster_epoch(),
+                    authority_valid_until_ms,
+                    local_valid_until_monotonic_ms,
+                )
+            }
+            (None, None) => AdmittedRouteEffectFence::unbounded(self.cluster_epoch()),
+            _ => unreachable!("route admission deadline representations must agree"),
+        }
+    }
+
     /// Derive active bucket-metadata authority for one bucket from this
     /// request's admitted runtime-map generation.
     pub fn active_bucket_route<'admission>(
@@ -1933,6 +1950,24 @@ impl StorageClusterRouteAdmission {
             key: key.clone(),
             version_id,
             snapshot_mode,
+            pg_id: self.cluster.object_metadata_pg(bucket, key),
+        })
+    }
+
+    /// Derive active object-metadata mutation authority for one object from
+    /// this request's admitted runtime-map generation.
+    pub fn active_object_metadata_mutation_route<'admission>(
+        &'admission self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+    ) -> Result<ActiveObjectMetadataMutationRoute<'admission>, StoreError> {
+        self.require_valid_now()?;
+        Ok(ActiveObjectMetadataMutationRoute {
+            admission: self,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id,
             pg_id: self.cluster.object_metadata_pg(bucket, key),
         })
     }
@@ -2087,12 +2122,44 @@ pub struct ActiveObjectReadRoute<'admission> {
     pg_id: ObjectMetadataPgId,
 }
 
+/// Non-cloneable active authority for one object's metadata mutations.
+///
+/// The bucket, key, requested version, and routed object-metadata PG are fixed
+/// at construction. Mutation entry and every retry recheck the request's
+/// immutable admitted deadline. Once a metadata command is durably installed,
+/// applying it is convergence of that already-authorized command rather than
+/// a new frontend effect.
+///
+/// ```compile_fail
+/// use storage::ActiveObjectMetadataMutationRoute;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn cache_route(route: &ActiveObjectMetadataMutationRoute<'_>) {
+///     require_clone(route);
+/// }
+/// ```
+pub struct ActiveObjectMetadataMutationRoute<'admission> {
+    admission: &'admission StorageClusterRouteAdmission,
+    bucket: BucketName,
+    key: ObjectKey,
+    version_id: Option<VersionId>,
+    pg_id: ObjectMetadataPgId,
+}
+
 struct ObjectReadMetadataRoute<'a> {
     bucket: &'a BucketName,
     key: &'a ObjectKey,
     version_id: Option<VersionId>,
     snapshot_mode: ObjectReadSnapshotMode,
     pg_id: ObjectMetadataPgId,
+}
+
+struct ObjectMetadataMutationEffectRoute<'a> {
+    pg_id: ObjectMetadataPgId,
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
+    requested_version_id: Option<VersionId>,
+    effect_fence: AdmittedRouteEffectFence,
 }
 
 impl ActiveObjectReadRoute<'_> {
@@ -2189,6 +2256,130 @@ impl ActiveObjectReadRoute<'_> {
             .retain_object_payload_read_from_leased_snapshot(leased_snapshot, || {
                 self.admission.require_valid_now()
             })
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn try_probe_object_pg_available(&self) -> Result<bool, ObjectPgActionError> {
+        self.admission.require_valid_now()?;
+        self.admission
+            .cluster
+            .try_probe_object_pg_available(&self.bucket, &self.key)
+    }
+}
+
+impl ActiveObjectMetadataMutationRoute<'_> {
+    fn effect_route(&self) -> ObjectMetadataMutationEffectRoute<'_> {
+        ObjectMetadataMutationEffectRoute {
+            pg_id: self.pg_id,
+            bucket: &self.bucket,
+            key: &self.key,
+            requested_version_id: self.version_id,
+            effect_fence: self.admission.effect_fence(),
+        }
+    }
+
+    pub fn put_tags_if<E>(
+        &self,
+        tags: &str,
+        mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
+    ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .put_object_metadata_if_with_route_validation(
+                self.effect_route(),
+                || self.admission.require_valid_now(),
+                |stored| {
+                    let version_id = action(stored)?;
+                    Ok((
+                        version_id,
+                        version_id,
+                        PutObjectMetadataMutation::PutTags(tags.to_string()),
+                    ))
+                },
+            )
+    }
+
+    pub fn delete_tags_if<E>(
+        &self,
+        mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
+    ) -> Result<Result<(), E>, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .put_object_metadata_if_with_route_validation(
+                self.effect_route(),
+                || self.admission.require_valid_now(),
+                |stored| {
+                    let version_id = action(stored)?;
+                    Ok(((), version_id, PutObjectMetadataMutation::DeleteTags))
+                },
+            )
+    }
+
+    /// Returns the version id the retention was applied to.
+    pub fn put_retention_if<E>(
+        &self,
+        retention: ObjectRetention,
+        mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
+    ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .put_object_metadata_if_with_route_validation(
+                self.effect_route(),
+                || self.admission.require_valid_now(),
+                |stored| {
+                    let version_id = action(stored)?;
+                    Ok((
+                        version_id,
+                        version_id,
+                        PutObjectMetadataMutation::PutRetention(retention),
+                    ))
+                },
+            )
+    }
+
+    /// Returns the version id the legal hold was applied to.
+    pub fn put_legal_hold_if<E>(
+        &self,
+        legal_hold: StoredLegalHoldStatus,
+        mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
+    ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .put_object_metadata_if_with_route_validation(
+                self.effect_route(),
+                || self.admission.require_valid_now(),
+                |stored| {
+                    let version_id = action(stored)?;
+                    Ok((
+                        version_id,
+                        version_id,
+                        PutObjectMetadataMutation::PutLegalHold(legal_hold),
+                    ))
+                },
+            )
+    }
+
+    pub fn put_acl_if<E>(
+        &self,
+        mut action: impl FnMut(&StoredObject) -> Result<(VersionId, AclGrants, bool), E>,
+    ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .put_object_metadata_if_with_route_validation(
+                self.effect_route(),
+                || self.admission.require_valid_now(),
+                |stored| {
+                    let (version_id, acl_grants, public_read) = action(stored)?;
+                    Ok((
+                        version_id,
+                        version_id,
+                        PutObjectMetadataMutation::PutAcl {
+                            acl_grants,
+                            public_read,
+                        },
+                    ))
+                },
+            )
     }
 
     #[cfg(feature = "test-hooks")]
@@ -7156,6 +7347,16 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_store_route_map_lease(
+        &self,
+        validity: RouteMapValidity,
+        local_valid_until_monotonic_ms: Option<u64>,
+    ) {
+        self.local_map
+            .test_store_route_map_lease(validity, local_valid_until_monotonic_ms);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_bucket_delete_finalize_outstanding_depth(&self) -> usize {
         self.local_map
             .runtime_state()
@@ -7229,9 +7430,26 @@ impl StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, ObjectPgActionError> {
+        self.try_install_pending_metadata_command_for_bucket_with_effect_fence(
+            pg_id, bucket, command, None,
+        )
+    }
+
+    fn try_install_pending_metadata_command_for_bucket_with_effect_fence(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+    ) -> Result<bool, ObjectPgActionError> {
         self.maybe_run_before_metadata_command_pending_install_hook();
         Ok(self
-            .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command)
+            .try_set_pending_metadata_command_for_bucket_with_effect_fence(
+                pg_id,
+                bucket,
+                command,
+                effect_fence,
+            )
             .map_err(ObjectPgActionError::from)?
             .is_some())
     }
@@ -7242,12 +7460,29 @@ impl StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<()>, StoreError> {
+        self.try_set_pending_metadata_command_for_bucket_with_effect_fence(
+            pg_id, bucket, command, None,
+        )
+    }
+
+    fn try_set_pending_metadata_command_for_bucket_with_effect_fence(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+    ) -> Result<Option<()>, StoreError> {
         let pg_lock = self
             .local_map
             .runtime_state()
             .metadata_command_pg_lock(pg_id);
         let _pg_guard = pg_lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.try_set_pending_metadata_command_for_bucket_locked(pg_id, bucket, command)
+        self.try_set_pending_metadata_command_for_bucket_locked_with_effect_fence(
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+        )
     }
 
     fn try_set_pending_metadata_command_for_bucket_locked(
@@ -7256,13 +7491,37 @@ impl StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<()>, StoreError> {
+        self.try_set_pending_metadata_command_for_bucket_locked_with_effect_fence(
+            pg_id, bucket, command, None,
+        )
+    }
+
+    fn try_set_pending_metadata_command_for_bucket_locked_with_effect_fence(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+    ) -> Result<Option<()>, StoreError> {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        match primary
-            .metadata_command_client()
-            .try_insert_pending_metadata_command_slot(pg_id, command, Some(bucket))
-        {
+        let metadata_client = primary.metadata_command_client();
+        let result = match effect_fence {
+            Some(effect_fence) => metadata_client
+                .try_insert_pending_metadata_command_slot_with_effect_fence(
+                    pg_id,
+                    command,
+                    Some(bucket),
+                    effect_fence,
+                ),
+            None => metadata_client.try_insert_pending_metadata_command_slot(
+                pg_id,
+                command,
+                Some(bucket),
+            ),
+        };
+        match result {
             Ok(()) => Ok(Some(())),
             Err(StoreError::MetadataCommandPendingConflict { .. }) => {
                 self.emit_metadata_command_conflict(
@@ -7345,8 +7604,14 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
     ) -> Result<SnapshotSensitiveCommandInstall, ObjectPgActionError> {
-        match self.try_install_pending_metadata_command_for_bucket(pg_id, bucket, command) {
+        match self.try_install_pending_metadata_command_for_bucket_with_effect_fence(
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+        ) {
             Ok(true) => Ok(SnapshotSensitiveCommandInstall::Installed),
             Ok(false)
             | Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {

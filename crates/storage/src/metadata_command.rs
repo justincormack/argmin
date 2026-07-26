@@ -179,7 +179,7 @@ define_metadata_command_publishers! {
         TerminalSessionRetry
     ),
     PutObjectMetadataIf => (
-        "put_object_metadata_if",
+        "put_object_metadata_if_with_route_validation",
         "PutObjectMetadata",
         SnapshotSensitive
     ),

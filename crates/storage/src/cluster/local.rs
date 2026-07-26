@@ -2951,6 +2951,18 @@ impl LocalClusterMap {
         });
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_store_route_map_lease(
+        &self,
+        validity: RouteMapValidity,
+        local_valid_until_monotonic_ms: Option<u64>,
+    ) {
+        self.replace_route_map_lease_snapshot(LocalRouteMapLeaseSnapshot {
+            validity,
+            local_valid_until_monotonic_ms,
+        });
+    }
+
     pub fn process_local_registry_key(&self) -> ProcessLocalRegistryKey {
         self.process_local_registry_key
     }

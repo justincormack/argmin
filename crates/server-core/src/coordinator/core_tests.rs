@@ -228,7 +228,7 @@ fn coordinator_storage_node_tracks_runtime_map_handle_install() {
 }
 
 #[test]
-fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_load() {
+fn buffered_metadata_operations_recheck_request_admission_deadline_before_storage_access() {
     let tmp = test_util::tempdir();
     let initial = open_test_storage_cluster(tmp.path(), &[0]);
     let initial_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
@@ -326,6 +326,65 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
             test_requester(),
             None,
         );
+        let put_tags_request = PutObjectTagsRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            tags: "<Tagging><TagSet><Tag><Key>expired</Key><Value>route</Value></Tag></TagSet></Tagging>",
+        };
+        let put_retention_request = PutObjectRetentionRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            retention: ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: 3_600,
+            },
+            bypass_governance: false,
+        };
+        let put_legal_hold_request = PutObjectLegalHoldRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            legal_hold: LegalHoldStatus::On,
+        };
+        let put_acl_request = PutObjectAclRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            acl: PutObjectAclInput::Canned(PutObjectAcl::PublicRead),
+            policy_context: PutObjectPolicyContext::default()
+                .with_default_canned_acl(PutObjectAcl::PublicRead.policy_condition_value()),
+        };
+        let fresh_admission = coord.admit_storage_route_for_request().unwrap();
+        let baseline_tags = coord
+            .get_object_tags_on_admitted_route(&fresh_admission, &object_metadata_request)
+            .unwrap();
+        let baseline_retention = coord
+            .get_object_retention_on_admitted_route(&fresh_admission, &object_metadata_request)
+            .unwrap();
+        let baseline_legal_hold = coord
+            .get_object_legal_hold_on_admitted_route(&fresh_admission, &object_metadata_request)
+            .unwrap();
+        let baseline_acl = coord
+            .get_object_acl_on_admitted_route(&fresh_admission, &object_metadata_request)
+            .unwrap();
         for (operation, result) in [
             (
                 "ListBuckets",
@@ -523,6 +582,32 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
                     .get_object_legal_hold_on_admitted_route(&admission, &object_metadata_request)
                     .map(|_| ()),
             ),
+            (
+                "PutObjectTagging",
+                coord.put_object_tags_on_admitted_route(&admission, &put_tags_request),
+            ),
+            (
+                "DeleteObjectTagging",
+                coord.delete_object_tags_on_admitted_route(&admission, &object_metadata_request),
+            ),
+            (
+                "PutObjectRetention",
+                coord
+                    .put_object_retention_on_admitted_route(&admission, &put_retention_request)
+                    .map(|_| ()),
+            ),
+            (
+                "PutObjectLegalHold",
+                coord
+                    .put_object_legal_hold_on_admitted_route(&admission, &put_legal_hold_request)
+                    .map(|_| ()),
+            ),
+            (
+                "PutObjectAcl",
+                coord
+                    .put_object_acl_on_admitted_route(&admission, &put_acl_request)
+                    .map(|_| ()),
+            ),
         ] {
             let error = result.expect_err(operation);
             assert!(
@@ -530,7 +615,114 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
                 "{operation}: {error:?}"
             );
         }
+        assert_eq!(
+            coord
+                .get_object_tags_on_admitted_route(&fresh_admission, &object_metadata_request)
+                .unwrap(),
+            baseline_tags
+        );
+        assert_eq!(
+            coord
+                .get_object_retention_on_admitted_route(&fresh_admission, &object_metadata_request)
+                .unwrap(),
+            baseline_retention
+        );
+        assert_eq!(
+            coord
+                .get_object_legal_hold_on_admitted_route(
+                    &fresh_admission,
+                    &object_metadata_request,
+                )
+                .unwrap(),
+            baseline_legal_hold
+        );
+        assert_eq!(
+            coord
+                .get_object_acl_on_admitted_route(&fresh_admission, &object_metadata_request)
+                .unwrap(),
+            baseline_acl
+        );
     });
+}
+
+#[test]
+fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    test_helpers::put_object(
+        &initial_coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let cluster = same_store_cluster_with_route_map_validity(
+        &initial,
+        tmp.path(),
+        RouteMapValidity::until_ms(5_000).unwrap(),
+    );
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+
+    let hook_clock = Arc::clone(&clock);
+    let hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            hook_clock.set(4_500)
+        }));
+    let request = PutObjectTagsRequest {
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        tags: "<Tagging><TagSet><Tag><Key>late</Key><Value>write</Value></Tag></TagSet></Tagging>",
+    };
+    let error = coord
+        .put_object_tags_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+
+    clock.set(1_000);
+    let fresh_admission = coord.admit_storage_route_for_request().unwrap();
+    assert_eq!(
+        coord
+            .get_object_tags_on_admitted_route(&fresh_admission, &request.object)
+            .unwrap(),
+        None
+    );
+    coord
+        .put_object_tags_on_admitted_route(&fresh_admission, &request)
+        .unwrap();
+    assert_eq!(
+        coord
+            .get_object_tags_on_admitted_route(&fresh_admission, &request.object)
+            .unwrap()
+            .as_deref(),
+        Some(request.tags)
+    );
 }
 
 #[test]
@@ -1153,7 +1345,7 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
 }
 
 #[test]
-fn object_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
+fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
     let tmp = test_util::tempdir();
     let cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
@@ -1245,6 +1437,67 @@ fn object_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         object_version_request_with_expected_owner("bucket", "key", None, test_requester(), None);
 
     let foreign_admission = foreign.admit_storage_route_for_request().unwrap();
+    let canary_tags =
+        "<Tagging><TagSet><Tag><Key>domain</Key><Value>canary</Value></Tag></TagSet></Tagging>";
+    let put_tags_request = PutObjectTagsRequest {
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        tags: canary_tags,
+    };
+    let baseline_retention = ObjectRetention {
+        mode: ObjectLockMode::Governance,
+        retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3_600,
+    };
+    let put_retention_request = PutObjectRetentionRequest {
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        retention: baseline_retention,
+        bypass_governance: false,
+    };
+    let put_legal_hold_request = PutObjectLegalHoldRequest {
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        legal_hold: LegalHoldStatus::On,
+    };
+    let put_acl_request = PutObjectAclRequest {
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        acl: PutObjectAclInput::Canned(PutObjectAcl::Private),
+        policy_context: PutObjectPolicyContext::default()
+            .with_default_canned_acl(PutObjectAcl::Private.policy_condition_value()),
+    };
+    foreign
+        .put_object_tags_on_admitted_route(&foreign_admission, &put_tags_request)
+        .unwrap();
+    foreign
+        .put_object_retention_on_admitted_route(&foreign_admission, &put_retention_request)
+        .unwrap();
+    foreign
+        .put_object_legal_hold_on_admitted_route(&foreign_admission, &put_legal_hold_request)
+        .unwrap();
+    foreign
+        .put_object_acl_on_admitted_route(&foreign_admission, &put_acl_request)
+        .unwrap();
     foreign
         .head_object_on_admitted_route(&foreign_admission, &request)
         .unwrap();
@@ -1257,7 +1510,7 @@ fn object_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
     foreign
         .get_object_tags_on_admitted_route(&foreign_admission, &metadata_request)
         .unwrap();
-    foreign
+    let baseline_acl = foreign
         .get_object_acl_on_admitted_route(&foreign_admission, &metadata_request)
         .unwrap();
     foreign
@@ -1266,6 +1519,53 @@ fn object_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
     foreign
         .get_object_legal_hold_on_admitted_route(&foreign_admission, &metadata_request)
         .unwrap();
+
+    let rejected_tags = PutObjectTagsRequest {
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        tags: "<Tagging><TagSet><Tag><Key>foreign</Key><Value>mutation</Value></Tag></TagSet></Tagging>",
+    };
+    let rejected_retention = PutObjectRetentionRequest {
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        retention: ObjectRetention {
+            mode: ObjectLockMode::Governance,
+            retain_until_unix_seconds: baseline_retention.retain_until_unix_seconds + 3_600,
+        },
+        bypass_governance: false,
+    };
+    let rejected_legal_hold = PutObjectLegalHoldRequest {
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        legal_hold: LegalHoldStatus::Off,
+    };
+    let rejected_acl = PutObjectAclRequest {
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        acl: PutObjectAclInput::Canned(PutObjectAcl::PublicRead),
+        policy_context: PutObjectPolicyContext::default()
+            .with_default_canned_acl(PutObjectAcl::PublicRead.policy_condition_value()),
+    };
 
     for (operation, result) in [
         (
@@ -1310,6 +1610,32 @@ fn object_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
                 .get_object_legal_hold_on_admitted_route(&foreign_admission, &metadata_request)
                 .map(|_| ()),
         ),
+        (
+            "PutObjectTagging",
+            local.put_object_tags_on_admitted_route(&foreign_admission, &rejected_tags),
+        ),
+        (
+            "DeleteObjectTagging",
+            local.delete_object_tags_on_admitted_route(&foreign_admission, &metadata_request),
+        ),
+        (
+            "PutObjectRetention",
+            local
+                .put_object_retention_on_admitted_route(&foreign_admission, &rejected_retention)
+                .map(|_| ()),
+        ),
+        (
+            "PutObjectLegalHold",
+            local
+                .put_object_legal_hold_on_admitted_route(&foreign_admission, &rejected_legal_hold)
+                .map(|_| ()),
+        ),
+        (
+            "PutObjectAcl",
+            local
+                .put_object_acl_on_admitted_route(&foreign_admission, &rejected_acl)
+                .map(|_| ()),
+        ),
     ] {
         let error = result.expect_err(operation);
         assert!(
@@ -1317,6 +1643,32 @@ fn object_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
             "{operation}: {error:?}"
         );
     }
+    assert_eq!(
+        foreign
+            .get_object_tags_on_admitted_route(&foreign_admission, &metadata_request)
+            .unwrap()
+            .as_deref(),
+        Some(canary_tags)
+    );
+    assert_eq!(
+        foreign
+            .get_object_retention_on_admitted_route(&foreign_admission, &metadata_request)
+            .unwrap(),
+        Some(baseline_retention)
+    );
+    assert_eq!(
+        foreign
+            .get_object_legal_hold_on_admitted_route(&foreign_admission, &metadata_request)
+            .unwrap(),
+        Some(LegalHoldStatus::On)
+    );
+    assert_eq!(
+        foreign
+            .get_object_acl_on_admitted_route(&foreign_admission, &metadata_request)
+            .unwrap()
+            .acl_grants,
+        baseline_acl.acl_grants
+    );
 }
 
 #[test]
@@ -2116,8 +2468,8 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
     let hook_handle = handle.clone();
     let hook_invocations = Arc::new(AtomicUsize::new(0));
     let hook_invocations_for_hook = Arc::clone(&hook_invocations);
-    let publication_thread = Arc::new(Mutex::new(None));
-    let hook_publication_thread = Arc::clone(&publication_thread);
+    let publication_threads = Arc::new(Mutex::new(Vec::new()));
+    let hook_publication_threads = Arc::clone(&publication_threads);
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -2125,16 +2477,13 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
     let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_object_metadata_policy_context: Some(Arc::new(move || {
-            if hook_invocations_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
-                hook_handle.install(Arc::clone(&candidate)).unwrap();
-                return;
-            }
+            hook_invocations_for_hook.fetch_add(1, Ordering::SeqCst);
             let publishing_handle = hook_handle.clone();
             let publishing_candidate = Arc::clone(&candidate);
             let thread = thread::spawn(move || {
                 publishing_handle.install(publishing_candidate).unwrap();
             });
-            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_publication_threads.lock().unwrap().push(thread);
             hook_handle.test_wait_until_route_publication_is_pending();
         })),
         ..BucketWriteHandleTestHooks::default()
@@ -2150,6 +2499,13 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
         None,
     )
     .unwrap();
+    publication_threads
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("PutObjectTagging hook should start route publication")
+        .join()
+        .unwrap();
 
     handle
         .install(make_dynamic_runtime_map_candidate(initial))
@@ -2157,10 +2513,10 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
     let tags = get_object_tags_test(&coord, "bucket", "key", None, test_requester(), None)
         .unwrap()
         .unwrap();
-    publication_thread
+    publication_threads
         .lock()
         .unwrap()
-        .take()
+        .pop()
         .expect("GetObjectTagging hook should start route publication")
         .join()
         .unwrap();
@@ -3605,6 +3961,25 @@ fn install_next_epoch_runtime_map_with_historical_routes(
     handle.install(candidate).unwrap();
 }
 
+fn begin_next_epoch_runtime_map_publication_with_historical_routes(
+    handle: &StorageClusterRuntimeMapHandle,
+    initial: &Arc<StorageCluster>,
+    node_root: &std::path::Path,
+) -> thread::JoinHandle<()> {
+    let publishing_handle = handle.clone();
+    let publishing_initial = Arc::clone(initial);
+    let publishing_node_root = node_root.to_path_buf();
+    let publication_thread = thread::spawn(move || {
+        install_next_epoch_runtime_map_with_historical_routes(
+            &publishing_handle,
+            &publishing_initial,
+            &publishing_node_root,
+        );
+    });
+    handle.test_wait_until_route_publication_is_pending();
+    publication_thread
+}
+
 fn install_same_store_next_epoch_runtime_map(
     handle: &StorageClusterRuntimeMapHandle,
     initial: &Arc<StorageCluster>,
@@ -5001,10 +5376,15 @@ fn put_object_tags_epoch_change_before_metadata_apply_commits_once_on_pinned_rou
         "tag update should not apply the object-PG metadata command before the pre-apply gate"
     );
 
-    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
+        &handle,
+        &initial,
+        tmp.path(),
+    );
 
     gate.release();
     tag_thread.join().unwrap().unwrap();
+    publication_thread.join().unwrap();
     let after_object_pg_proof = initial
         .test_object_pg_metadata_proof(&bucket_name, &object_key)
         .unwrap();
@@ -5126,10 +5506,15 @@ fn put_object_legal_hold_epoch_change_before_metadata_apply_commits_once_on_pinn
         "legal-hold update should not apply the object-PG metadata command before the pre-apply gate"
     );
 
-    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
+        &handle,
+        &initial,
+        tmp.path(),
+    );
 
     gate.release();
     legal_hold_thread.join().unwrap().unwrap();
+    publication_thread.join().unwrap();
     let after_object_pg_proof = initial
         .test_object_pg_metadata_proof(&bucket_name, &object_key)
         .unwrap();
@@ -5253,10 +5638,15 @@ fn put_object_retention_epoch_change_before_metadata_apply_commits_once_on_pinne
         "retention update should not apply the object-PG metadata command before the pre-apply gate"
     );
 
-    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
+        &handle,
+        &initial,
+        tmp.path(),
+    );
 
     gate.release();
     retention_thread.join().unwrap().unwrap();
+    publication_thread.join().unwrap();
     let after_object_pg_proof = initial
         .test_object_pg_metadata_proof(&bucket_name, &object_key)
         .unwrap();
@@ -5376,10 +5766,15 @@ fn put_object_acl_epoch_change_before_metadata_apply_commits_once_on_pinned_rout
         "ACL update should not apply the object-PG metadata command before the pre-apply gate"
     );
 
-    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
+        &handle,
+        &initial,
+        tmp.path(),
+    );
 
     gate.release();
     acl_thread.join().unwrap().unwrap();
+    publication_thread.join().unwrap();
     let after_object_pg_proof = initial
         .test_object_pg_metadata_proof(&bucket_name, &object_key)
         .unwrap();

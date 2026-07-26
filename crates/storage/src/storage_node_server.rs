@@ -184,7 +184,7 @@ use crate::storage_rpc::{
     encode_stream_uploads_list_response, read_storage_rpc_request_frame_from,
     validate_read_handle_acquire_request, validate_read_handle_release_request,
     write_storage_rpc_frame_to, StorageRpcAbortMultipartCleanupResponse,
-    StorageRpcAbortMultipartCommandBuildRequest,
+    StorageRpcAbortMultipartCommandBuildRequest, StorageRpcAdmittedRouteEffectDeadline,
     StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketBatchRequest,
     StorageRpcBucketDeleteAttemptOutcomeOptionalRecordResponse,
     StorageRpcBucketDeleteAttemptOutcomeRecordRequest, StorageRpcBucketDeleteBeginRootsRequest,
@@ -321,7 +321,10 @@ use crate::storage_rpc_auth::{
 use crate::storage_rpc_transport::{
     accepted_tls_tcp_stream, accepted_unix_stream, BoxStorageRpcStream, STORAGE_RPC_TLS_ALPN,
 };
-use crate::types::{BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
+use crate::types::{
+    AdmittedRouteEffectFence, BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId,
+    WriteAck,
+};
 use crate::types::{
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
@@ -3731,6 +3734,7 @@ impl StorageNodeActiveBucketRoute<'_> {
     fn acquire_write_reservation(
         &self,
         acquire: DurableBucketWriteReservationAcquire<'_>,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteReservationRecord, StorageNodeBucketRouteError> {
         self.require_valid_now()?;
         if acquire.name != self.bucket {
@@ -3746,10 +3750,11 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
+        BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation_with_effect_fence(
             &local_client,
             self.pg_id,
             acquire,
+            effect_fence,
         )
         .map_err(StorageNodeBucketRouteError::Bucket)
     }
@@ -8794,16 +8799,19 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        match route.acquire_write_reservation(DurableBucketWriteReservationAcquire {
-            name: &request.bucket,
-            reservation_id: &request.reservation_id,
-            owner_token: &request.owner_token,
-            cluster_epoch: request.cluster_epoch,
-            operation_kind: &request.operation_kind,
-            created_at: request.created_at,
-            lease_deadline: request.lease_deadline,
-            target_context: request.target_context.as_deref(),
-        }) {
+        match route.acquire_write_reservation(
+            DurableBucketWriteReservationAcquire {
+                name: &request.bucket,
+                reservation_id: &request.reservation_id,
+                owner_token: &request.owner_token,
+                cluster_epoch: request.cluster_epoch,
+                operation_kind: &request.operation_kind,
+                created_at: request.created_at,
+                lease_deadline: request.lease_deadline,
+                target_context: request.target_context.as_deref(),
+            },
+            admitted_route_effect_fence(request.cluster_epoch, request.effect_deadline),
+        ) {
             Ok(record) => {
                 let payload = encode_bucket_write_reservation_record_response(
                     &StorageRpcBucketWriteReservationRecordResponse {
@@ -14399,6 +14407,12 @@ impl StorageNodeConnectionHandler {
         let canonical_scope_bucket = request.command.bucket_name().clone();
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         metadata_mutation_route_guard_or_return!(self);
+        if let Err(error) =
+            admitted_route_effect_fence(request.cluster_epoch, request.effect_deadline)
+                .require_valid_for(request.command.id().cluster_epoch())
+        {
+            return encode_storage_rpc_error_response(&store_error_response(error));
+        }
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.try_insert_pending_metadata_command_slot(
                 self.config.node_id.as_u32(),
@@ -17598,6 +17612,22 @@ fn store_error_response(error: StoreError) -> StorageRpcErrorResponse {
     }
 }
 
+fn admitted_route_effect_fence(
+    cluster_epoch: ClusterEpoch,
+    deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
+) -> AdmittedRouteEffectFence {
+    deadline.map_or_else(
+        || AdmittedRouteEffectFence::unbounded(cluster_epoch),
+        |deadline| {
+            AdmittedRouteEffectFence::bind_portable(
+                cluster_epoch,
+                deadline.authority_valid_until_ms,
+                deadline.portable_wall_valid_until_ms,
+            )
+        },
+    )
+}
+
 fn bucket_snapshot_error_response(error: BucketSnapshotLoadError) -> StorageRpcErrorResponse {
     match error {
         BucketSnapshotLoadError::Metadata(MetadataError::ReclaimClaimNotFound { claim_id }) => {
@@ -17629,6 +17659,9 @@ fn bucket_snapshot_error_response(error: BucketSnapshotLoadError) -> StorageRpcE
                 code: StorageRpcErrorCode::MetadataCommandContention,
                 message: format!("metadata command contention during {context}"),
             }
+        }
+        BucketSnapshotLoadError::Store(error @ StoreError::RouteMapExpired { .. }) => {
+            store_error_response(error)
         }
         error => StorageRpcErrorResponse {
             code: StorageRpcErrorCode::Internal,
@@ -21267,6 +21300,7 @@ mod tests {
             pg_id: PgId::new(0),
             command: command.clone(),
             scope_bucket: Some(command.bucket_name().clone()),
+            effect_deadline: None,
         };
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let _stderr_guard = server.suppress_metadata_command_lock_wait_stderr();
@@ -21727,6 +21761,107 @@ mod tests {
         assert_eq!(health.node_id, config.node_id);
         assert_eq!(health.cluster_epoch, config.cluster_epoch);
         assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn tls_tcp_durable_effect_deadline_rebinds_to_storage_host_monotonic_clock() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = crate::clock::with_time_and_monotonic_override(1_000, 900_000, || {
+            PreparedStorageNodeServer::new(config.clone())
+                .with_rpc_auth(storage_rpc_server_auth(&credential))
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::Tcp {
+                    bind_addr: "127.0.0.1:0".parse().unwrap(),
+                    tls_server_config: storage_rpc_tls_server_config(),
+                }])
+                .bind()
+                .unwrap()
+        });
+        let command = test_metadata_command(0, 1);
+        let bucket = command.bucket_name().clone();
+        let pg = server._node.get_pg(0).unwrap();
+        create_probe_bucket_direct(&pg, &bucket);
+        drop(pg);
+        let node = Arc::clone(&server._node);
+        let address = server.tcp_listener_addr_for_test();
+        let join = thread::spawn(move || {
+            crate::clock::with_time_and_monotonic_override(2_500, 901_500, || {
+                server.accept_one().unwrap()
+            });
+            crate::clock::with_time_and_monotonic_override(3_500, 902_500, || {
+                server.accept_one().unwrap()
+            });
+        });
+        let endpoint = StorageRpcClientEndpoint::tcp(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            storage_rpc_tls_client_config(),
+        )
+        .unwrap();
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+        // The frontend's captured deadline is 1,500 ms away on its local
+        // monotonic clock. The production client must project that to the
+        // portable wall deadline (4,000 ms); no monotonic timestamp may cross
+        // the TLS/TCP boundary.
+        let effect_fence = AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 11_500);
+        let reservation = crate::clock::with_time_and_monotonic_override(2_500, 10_000, || {
+            BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation_with_effect_fence(
+                    &client,
+                    BucketPgId::new_for_test(PgId::new(0)),
+                    DurableBucketWriteReservationAcquire {
+                        name: &bucket,
+                        reservation_id: "tcp-portable-reservation",
+                        owner_token: "tcp-portable-owner",
+                        cluster_epoch: config.cluster_epoch,
+                        operation_kind: "put-object-metadata",
+                        created_at: 1_000,
+                        lease_deadline: 9_000,
+                        target_context: Some("object"),
+                    },
+                    effect_fence,
+                )
+                .unwrap()
+        });
+        assert_eq!(reservation.bucket, bucket);
+
+        let pending_error = crate::clock::with_time_and_monotonic_override(3_500, 11_000, || {
+            MetadataCommandNodeClient::try_insert_pending_metadata_command_slot_with_effect_fence(
+                &client,
+                PgId::new(0),
+                &command,
+                Some(command.bucket_name()),
+                effect_fence,
+            )
+            .unwrap_err()
+        });
+        assert!(
+            matches!(
+                &pending_error,
+                StoreError::StorageRpc {
+                    code: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                }
+            ),
+            "{pending_error:?}"
+        );
+        join.join().unwrap();
+
+        let pg = node.get_pg(0).unwrap();
+        assert!(pg
+            .pending_metadata_command_slot(config.node_id.as_u32(), config.cluster_epoch)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -24504,16 +24639,19 @@ mod tests {
         });
         let reservation = crate::clock::with_time_override(1_000, || {
             route
-                .acquire_write_reservation(DurableBucketWriteReservationAcquire {
-                    name: &bucket,
-                    reservation_id: "captured-active-route-reservation",
-                    owner_token: "captured-active-route-owner",
-                    cluster_epoch: config.cluster_epoch,
-                    operation_kind: "test-active-route",
-                    created_at: 1_000,
-                    lease_deadline: 4_000,
-                    target_context: Some("key=a"),
-                })
+                .acquire_write_reservation(
+                    DurableBucketWriteReservationAcquire {
+                        name: &bucket,
+                        reservation_id: "captured-active-route-reservation",
+                        owner_token: "captured-active-route-owner",
+                        cluster_epoch: config.cluster_epoch,
+                        operation_kind: "test-active-route",
+                        created_at: 1_000,
+                        lease_deadline: 4_000,
+                        target_context: Some("key=a"),
+                    },
+                    AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 5_000),
+                )
                 .unwrap()
         });
         crate::clock::with_time_override(1_000, || {
@@ -24594,16 +24732,19 @@ mod tests {
                     panic!("expired captured route unexpectedly renewed reservation {record:?}")
                 }
             }
-            match route.acquire_write_reservation(DurableBucketWriteReservationAcquire {
-                name: &bucket,
-                reservation_id: "expired-active-route-reservation",
-                owner_token: "expired-active-route-owner",
-                cluster_epoch: config.cluster_epoch,
-                operation_kind: "test-expired-active-route",
-                created_at: 6_000,
-                lease_deadline: 9_000,
-                target_context: Some("key=b"),
-            }) {
+            match route.acquire_write_reservation(
+                DurableBucketWriteReservationAcquire {
+                    name: &bucket,
+                    reservation_id: "expired-active-route-reservation",
+                    owner_token: "expired-active-route-owner",
+                    cluster_epoch: config.cluster_epoch,
+                    operation_kind: "test-expired-active-route",
+                    created_at: 6_000,
+                    lease_deadline: 9_000,
+                    target_context: Some("key=b"),
+                },
+                AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 5_000),
+            ) {
                 Err(StorageNodeBucketRouteError::Route(error)) => {
                     assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
                 }
@@ -28932,6 +29073,7 @@ mod tests {
                     pg_id: PgId::new(0),
                     command: command.clone(),
                     scope_bucket: Some(command.bucket_name().clone()),
+                    effect_deadline: None,
                 },
             )
             .unwrap(),
@@ -30501,6 +30643,7 @@ mod tests {
             pg_id,
             command: command.clone(),
             scope_bucket: Some(command.bucket_name().clone()),
+            effect_deadline: None,
         };
         let pg_guard = server
             .metadata_command_locks
@@ -30781,6 +30924,95 @@ mod tests {
     }
 
     #[test]
+    fn unix_durable_effects_reject_expired_effective_deadline_before_authority_deadline() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let bucket = crate::tests::bucket_name("metadata-rpc-bucket");
+        let pg = server._node.get_pg(0).unwrap();
+        create_probe_bucket_direct(&pg, &bucket);
+        drop(pg);
+        let node = Arc::clone(&server._node);
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || {
+            crate::clock::with_time_override(4_500, || server.accept_one().unwrap());
+        });
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let reservation_response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::BucketWriteReservationAcquire,
+            crate::storage_rpc::encode_bucket_write_reservation_acquire_request(
+                &StorageRpcBucketWriteReservationAcquireRequest {
+                    node_id: config.node_id,
+                    cluster_epoch: config.cluster_epoch,
+                    pg_id: PgId::new(0),
+                    bucket: bucket.clone(),
+                    reservation_id: "expired-frontend-reservation".to_string(),
+                    owner_token: "expired-frontend-owner".to_string(),
+                    operation_kind: "put-object-metadata".to_string(),
+                    created_at: 1_000,
+                    lease_deadline: 9_000,
+                    target_context: Some("object".to_string()),
+                    effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                        authority_valid_until_ms: 5_000,
+                        portable_wall_valid_until_ms: 4_000,
+                    }),
+                },
+            )
+            .unwrap(),
+        );
+        let reservation_error = decode_storage_rpc_response_payload(&reservation_response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            reservation_error.code,
+            StorageRpcErrorCode::StaleShardLocation
+        );
+
+        let command = test_metadata_command(0, 1);
+        let pending_response = send_frame(
+            &mut client,
+            2,
+            StorageRpcMessageKind::MetadataCommandPendingSlotInsert,
+            encode_metadata_command_pending_slot_request(
+                &StorageRpcMetadataCommandPendingSlotRequest {
+                    node_id: config.node_id,
+                    cluster_epoch: config.cluster_epoch,
+                    pg_id: PgId::new(0),
+                    command: command.clone(),
+                    scope_bucket: Some(bucket.clone()),
+                    effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                        authority_valid_until_ms: 5_000,
+                        portable_wall_valid_until_ms: 4_000,
+                    }),
+                },
+            )
+            .unwrap(),
+        );
+        let pending_error = decode_storage_rpc_response_payload(&pending_response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(pending_error.code, StorageRpcErrorCode::StaleShardLocation);
+        drop(client);
+        join.join().unwrap();
+
+        let pg = node.get_pg(0).unwrap();
+        assert!(
+            PgMetadataStore::durable_bucket_write_reservations(&*pg, &bucket)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(pg
+            .pending_metadata_command_slot(config.node_id.as_u32(), config.cluster_epoch)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn storage_node_server_retries_lost_pending_slot_insert_exactly() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
@@ -30792,6 +31024,7 @@ mod tests {
             pg_id: PgId::new(0),
             command: command.clone(),
             scope_bucket: Some(crate::tests::bucket_name("metadata-rpc-bucket")),
+            effect_deadline: None,
         };
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let socket_path = config.socket_path.clone();
@@ -30885,6 +31118,7 @@ mod tests {
             pg_id: PgId::new(0),
             command: test_metadata_command(0, 1),
             scope_bucket: Some(crate::tests::bucket_name("wrong-scope-bucket")),
+            effect_deadline: None,
         };
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let socket_path = config.socket_path.clone();

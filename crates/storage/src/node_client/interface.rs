@@ -193,6 +193,13 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
 
+    fn acquire_durable_bucket_write_reservation_with_effect_fence(
+        &self,
+        pg_id: BucketPgId,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
+
     fn acquire_completion_durable_bucket_write_reservation(
         &self,
         pg_id: BucketPgId,
@@ -1267,6 +1274,14 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         bucket: Option<&BucketName>,
+    ) -> Result<(), StoreError>;
+
+    fn try_insert_pending_metadata_command_slot_with_effect_fence(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(), StoreError>;
 
     fn try_insert_bucket_control_pending_metadata_command_slot(
