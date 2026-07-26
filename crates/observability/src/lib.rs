@@ -723,7 +723,7 @@ pub fn record_control_plane_raft_wal_durability_queue_enter() {
 }
 
 pub fn record_control_plane_raft_wal_durability_queue_leave(elapsed: Duration) {
-    let _ = CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_DEPTH.fetch_update(
+    let _ = CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_DEPTH.try_update(
         Ordering::Relaxed,
         Ordering::Relaxed,
         |depth| Some(depth.saturating_sub(1)),

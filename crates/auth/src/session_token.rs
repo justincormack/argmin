@@ -151,7 +151,7 @@ impl SessionTokenKey {
     fn next_nonce(&self) -> Result<[u8; NONCE_LEN], SessionTokenSealError> {
         let counter = self
             .next_nonce_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| SessionTokenSealError::NonceExhausted)?;

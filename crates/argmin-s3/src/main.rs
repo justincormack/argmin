@@ -3572,7 +3572,7 @@ impl ExperimentalRaftPeerPreAuthByteBudget {
     ) -> Result<ExperimentalRaftPeerPreAuthByteReservation, ControlPlaneError> {
         let result =
             self.reserved_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
                     reserved
                         .checked_add(frame_bytes)
                         .filter(|total| *total <= self.limit_bytes)
@@ -3946,7 +3946,7 @@ fn reserve_experimental_raft_peer_rpc_worker(
     worker_limit: usize,
 ) -> bool {
     active_workers
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
             (active < worker_limit).then_some(active + 1)
         })
         .is_ok()
@@ -6134,7 +6134,7 @@ fn spawn_control_plane_rpc_worker_with_stream<T, RawStream, Prepare>(
 
 fn reserve_control_plane_rpc_worker(active_rpc_workers: &AtomicUsize, worker_limit: usize) -> bool {
     active_rpc_workers
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
             (active < worker_limit).then_some(active + 1)
         })
         .is_ok()
@@ -6310,7 +6310,7 @@ impl ControlPlaneRpcPreAuthByteBudget {
     ) -> Result<ControlPlaneRpcPreAuthByteReservation, ControlPlaneError> {
         let result =
             self.reserved_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
                     reserved
                         .checked_add(frame_bytes)
                         .filter(|total| *total <= self.limit_bytes)

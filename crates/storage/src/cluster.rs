@@ -121,7 +121,7 @@ pub struct ProcessLocalRegistryKey(NonZeroU64);
 impl ProcessLocalRegistryKey {
     pub(crate) fn allocate() -> Option<Self> {
         NEXT_PROCESS_LOCAL_REGISTRY_KEY
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .ok()

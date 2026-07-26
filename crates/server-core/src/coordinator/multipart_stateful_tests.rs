@@ -533,7 +533,7 @@ fn install_counted_multipart_complete_pre_commit_race_hooks(
         target: Some((bucket.to_string(), key.to_string())),
         after_multipart_complete_pre_commit: Some(Arc::new(move || {
             if remaining_hook
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()

@@ -1662,7 +1662,7 @@ fn versioned_multipart_completion_uses_time_budget_under_sustained_pg_contention
     let hook_guard =
         cluster.test_install_before_object_version_command_id_hook(Arc::new(move || {
             if hook_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()

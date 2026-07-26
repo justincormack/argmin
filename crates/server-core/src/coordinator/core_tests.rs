@@ -10132,7 +10132,7 @@ fn copy_object_failure_retries_destination_stream_abort_cleanup() {
             }
             if context.kind == MetadataCommandApplyTestKind::AppendStreamSegment
                 && hook_append_failures
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok()
@@ -10146,7 +10146,7 @@ fn copy_object_failure_retries_destination_stream_abort_cleanup() {
             }
             if context.kind == MetadataCommandApplyTestKind::AbortStreamUpload
                 && hook_abort_failures
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                         remaining.checked_sub(1)
                     })
                     .is_ok()

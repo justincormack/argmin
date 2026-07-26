@@ -776,7 +776,7 @@ impl StorageRpcPreAuthByteBudget {
     ) -> io::Result<StorageRpcPreAuthByteReservation> {
         let result =
             self.reserved_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
                     reserved
                         .checked_add(frame_bytes)
                         .filter(|total| *total <= self.limit_bytes)
