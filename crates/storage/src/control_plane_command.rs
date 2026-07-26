@@ -14,6 +14,7 @@ use crate::{
 };
 use placement::NodeId;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
 const CONTROL_PLANE_COMMAND_VERSION: u16 = 13;
@@ -1127,7 +1128,7 @@ impl ControlPlaneSnapshotArtifact {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicatedControlPlaneStateMachine {
-    snapshot: ClusterControlSnapshot,
+    snapshot: Arc<ClusterControlSnapshot>,
     last_applied: Option<ControlPlaneLogId>,
     snapshot_last_applied: Option<ControlPlaneLogId>,
 }
@@ -1136,7 +1137,7 @@ impl ReplicatedControlPlaneStateMachine {
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            snapshot: ClusterControlSnapshot::empty(),
+            snapshot: Arc::new(ClusterControlSnapshot::empty()),
             last_applied: None,
             snapshot_last_applied: None,
         }
@@ -1151,7 +1152,7 @@ impl ReplicatedControlPlaneStateMachine {
             &snapshot,
         )?;
         Ok(Self {
-            snapshot,
+            snapshot: Arc::new(snapshot),
             last_applied,
             snapshot_last_applied: None,
         })
@@ -1201,7 +1202,7 @@ impl ReplicatedControlPlaneStateMachine {
         match self.snapshot.apply_control_plane_command(command) {
             Ok(applied) => {
                 self.last_applied = Some(log_id);
-                self.snapshot = applied.snapshot().clone();
+                self.snapshot = Arc::new(applied.snapshot().clone());
                 Ok(CommittedControlPlaneLogCommand::applied(log_id, applied))
             }
             Err(error @ ControlPlaneError::SnapshotInvariantViolation { .. }) => Err(error),
@@ -1247,7 +1248,7 @@ impl ReplicatedControlPlaneStateMachine {
             "attempted to install invalid replicated control-plane snapshot",
             &snapshot,
         )?;
-        self.snapshot = snapshot;
+        self.snapshot = Arc::new(snapshot);
         self.last_applied = artifact.last_applied();
         self.snapshot_last_applied = artifact.last_applied();
         Ok(())
@@ -2826,8 +2827,10 @@ mod tests {
     #[test]
     fn replicated_control_plane_state_machine_fatal_invariant_does_not_advance() {
         let mut state_machine = ReplicatedControlPlaneStateMachine {
-            snapshot: ClusterControlSnapshot::test_invalid_active_without_metadata_proof_epoch(
-                PgId::new(27),
+            snapshot: Arc::new(
+                ClusterControlSnapshot::test_invalid_active_without_metadata_proof_epoch(
+                    PgId::new(27),
+                ),
             ),
             last_applied: Some(log_id(1, 1)),
             snapshot_last_applied: None,

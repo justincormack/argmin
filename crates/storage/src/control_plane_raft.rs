@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
-use std::io::{self, Cursor, Read, Write};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::{self, Read, Write};
 use std::ops::{Bound, RangeBounds};
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(test)]
@@ -5388,7 +5390,8 @@ impl ControlPlaneRaftAuthority {
             let state_machine = self
                 .capture_state_machine_restart_artifact()
                 .await?
-                .refresh_cached_snapshot()?;
+                .refresh_cached_snapshot_async()
+                .await?;
             let (log_store_artifact, wal_replay_offset) = log_store
                 .export_restart_artifact_with_wal_replay_offset()
                 .map_err(|source| ControlPlaneError::Io {
@@ -5892,7 +5895,30 @@ openraft::declare_raft_types!(
         Entry = ControlPlaneRaftEntry,
 );
 
-pub type ControlPlaneRaftSnapshotData = Cursor<Vec<u8>>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneRaftSnapshotData {
+    payload: Arc<Vec<u8>>,
+}
+
+impl ControlPlaneRaftSnapshotData {
+    #[must_use]
+    pub fn new(payload: Vec<u8>) -> Self {
+        Self {
+            payload: Arc::new(payload),
+        }
+    }
+
+    #[must_use]
+    pub fn get_ref(&self) -> &Vec<u8> {
+        &self.payload
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> Vec<u8> {
+        Arc::try_unwrap(self.payload).unwrap_or_else(|payload| (*payload).clone())
+    }
+}
+
 pub type ControlPlaneRaftSnapshot =
     SnapshotOf<ControlPlaneRaftTypeConfig, ControlPlaneRaftSnapshotData>;
 
@@ -8605,7 +8631,7 @@ impl ControlPlaneRaftRestartArtifact {
             })?;
         }
         if replayed.last_applied != state_machine.last_applied
-            || replayed.last_membership != state_machine.last_membership
+            || replayed.last_membership.as_ref() != &state_machine.last_membership
             || replayed.inner.snapshot() != state_machine.inner.snapshot()
             || replayed.inner.last_applied() != state_machine.inner.last_applied()
         {
@@ -10265,7 +10291,7 @@ impl<'a> RaftArtifactReader<'a> {
         let payload = self.read_bytes(payload_field)?.to_vec();
         Ok(Snapshot {
             meta,
-            snapshot: Cursor::new(payload),
+            snapshot: ControlPlaneRaftSnapshotData::new(payload),
         })
     }
 
@@ -10278,7 +10304,7 @@ impl<'a> RaftArtifactReader<'a> {
         let payload = self.read_limited_bytes(payload_field, max_payload_bytes)?;
         Ok(Snapshot {
             meta,
-            snapshot: Cursor::new(payload.to_vec()),
+            snapshot: ControlPlaneRaftSnapshotData::new(payload.to_vec()),
         })
     }
 
@@ -10558,23 +10584,231 @@ fn raft_entry_payload_name(entry: &ControlPlaneRaftEntry) -> &'static str {
     }
 }
 
+type ControlPlaneRaftSnapshotCache = Arc<Mutex<Option<ControlPlaneRaftSnapshot>>>;
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ControlPlaneRaftStateMachineBlockingHook {
+    state: Mutex<ControlPlaneRaftStateMachineBlockingHookState>,
+    condition: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ControlPlaneRaftStateMachineBlockingHookState {
+    entered: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+impl ControlPlaneRaftStateMachineBlockingHook {
+    fn block(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("state-machine blocking hook should not be poisoned");
+        state.entered = true;
+        self.condition.notify_all();
+        while !state.released {
+            state = self
+                .condition
+                .wait(state)
+                .expect("state-machine blocking hook should not be poisoned");
+        }
+    }
+
+    fn wait_until_entered(&self, timeout: Duration) {
+        let state = self
+            .state
+            .lock()
+            .expect("state-machine blocking hook should not be poisoned");
+        let (state, wait) = self
+            .condition
+            .wait_timeout_while(state, timeout, |state| !state.entered)
+            .expect("state-machine blocking hook should not be poisoned");
+        assert!(state.entered, "state-machine operation did not enter hook");
+        assert!(!wait.timed_out(), "state-machine hook wait timed out");
+    }
+
+    fn entered(&self) -> bool {
+        self.state
+            .lock()
+            .expect("state-machine blocking hook should not be poisoned")
+            .entered
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("state-machine blocking hook should not be poisoned");
+        state.released = true;
+        self.condition.notify_all();
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+struct ControlPlaneRaftStateMachineTestHooks {
+    apply: Option<Arc<ControlPlaneRaftStateMachineBlockingHook>>,
+    snapshot_build: Option<Arc<ControlPlaneRaftStateMachineBlockingHook>>,
+    snapshot_install: Option<Arc<ControlPlaneRaftStateMachineBlockingHook>>,
+    retire_generation: Option<Arc<ControlPlaneRaftStateMachineBlockingHook>>,
+}
+
+fn lock_control_plane_raft_snapshot_cache(
+    cache: &ControlPlaneRaftSnapshotCache,
+) -> MutexGuard<'_, Option<ControlPlaneRaftSnapshot>> {
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct ControlPlaneRaftSnapshotPublication {
+    outcome: Result<(), ControlPlaneError>,
+    retired: Option<ControlPlaneRaftSnapshot>,
+}
+
+impl ControlPlaneRaftSnapshotPublication {
+    fn finish_on_current_thread(self) -> Result<(), ControlPlaneError> {
+        let Self { outcome, retired } = self;
+        drop(retired);
+        outcome
+    }
+}
+
+fn publish_control_plane_raft_snapshot(
+    cache: &ControlPlaneRaftSnapshotCache,
+    snapshot: ControlPlaneRaftSnapshot,
+) -> ControlPlaneRaftSnapshotPublication {
+    let mut current = lock_control_plane_raft_snapshot_cache(cache);
+    let should_publish = match current.as_ref() {
+        None => true,
+        Some(current) => match (current.meta.last_log_id, snapshot.meta.last_log_id) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(current_log_id), Some(candidate_log_id)) => {
+                if candidate_log_id.index() == current_log_id.index()
+                    && candidate_log_id != current_log_id
+                {
+                    return ControlPlaneRaftSnapshotPublication {
+                        outcome: Err(ControlPlaneError::SnapshotDecode {
+                            message: format!(
+                                "OpenRaft snapshot publication log id {candidate_log_id} conflicts with current snapshot {current_log_id} at the same index"
+                            ),
+                        }),
+                        retired: Some(snapshot),
+                    };
+                }
+                candidate_log_id.index() > current_log_id.index()
+                    || candidate_log_id == current_log_id
+            }
+        },
+    };
+    let retired = if should_publish {
+        current.replace(snapshot)
+    } else {
+        Some(snapshot)
+    };
+    ControlPlaneRaftSnapshotPublication {
+        outcome: Ok(()),
+        retired,
+    }
+}
+
+#[derive(Debug)]
+struct ControlPlaneRaftRetiredGeneration {
+    inner: ReplicatedControlPlaneStateMachine,
+    last_membership: Arc<StoredMembershipOf<ControlPlaneRaftTypeConfig>>,
+    cached_snapshot: Option<ControlPlaneRaftSnapshot>,
+    #[cfg(test)]
+    hook: Option<Arc<ControlPlaneRaftStateMachineBlockingHook>>,
+}
+
+impl Drop for ControlPlaneRaftRetiredGeneration {
+    fn drop(&mut self) {
+        let _ = (&self.inner, &self.last_membership, &self.cached_snapshot);
+        #[cfg(test)]
+        if let Some(hook) = &self.hook {
+            hook.block();
+        }
+    }
+}
+
+impl ControlPlaneRaftRetiredGeneration {
+    async fn retire(self, context: &'static str) -> Result<(), io::Error> {
+        tokio::task::spawn_blocking(move || drop(self))
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("{context} retirement worker failed: {error}"))
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ControlPlaneRaftSnapshotBuildInput {
+    inner: ReplicatedControlPlaneStateMachine,
+    last_applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    last_membership: Arc<StoredMembershipOf<ControlPlaneRaftTypeConfig>>,
+    #[cfg(test)]
+    hook: Option<Arc<ControlPlaneRaftStateMachineBlockingHook>>,
+}
+
+impl ControlPlaneRaftSnapshotBuildInput {
+    fn build(mut self) -> Result<ControlPlaneRaftSnapshot, ControlPlaneError> {
+        #[cfg(test)]
+        if let Some(hook) = &self.hook {
+            hook.block();
+        }
+        let artifact = self.inner.build_snapshot_artifact()?;
+        let meta = ControlPlaneRaftStateMachine::snapshot_meta_for_artifact_parts(
+            &artifact,
+            self.last_applied,
+            self.last_membership.as_ref(),
+        )?;
+        Ok(Snapshot {
+            meta,
+            snapshot: ControlPlaneRaftSnapshotData::new(artifact.into_payload()),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ControlPlaneRaftSnapshotBuildWork {
+    Ready(ControlPlaneRaftSnapshot),
+    Captured(ControlPlaneRaftSnapshotBuildInput),
+}
+
 #[derive(Debug, Clone)]
 pub struct ControlPlaneRaftSnapshotBuilder {
-    snapshot: Result<ControlPlaneRaftSnapshot, String>,
+    work: Result<ControlPlaneRaftSnapshotBuildWork, String>,
+    cache: Option<ControlPlaneRaftSnapshotCache>,
 }
 
 impl ControlPlaneRaftSnapshotBuilder {
     #[must_use]
     pub fn new(snapshot: ControlPlaneRaftSnapshot) -> Self {
         Self {
-            snapshot: Ok(snapshot),
+            work: Ok(ControlPlaneRaftSnapshotBuildWork::Ready(snapshot)),
+            cache: None,
+        }
+    }
+
+    fn captured(
+        input: ControlPlaneRaftSnapshotBuildInput,
+        cache: ControlPlaneRaftSnapshotCache,
+    ) -> Self {
+        Self {
+            work: Ok(ControlPlaneRaftSnapshotBuildWork::Captured(input)),
+            cache: Some(cache),
         }
     }
 
     #[must_use]
     pub fn from_error(error: ControlPlaneError) -> Self {
         Self {
-            snapshot: Err(error.to_string()),
+            work: Err(error.to_string()),
+            cache: None,
         }
     }
 }
@@ -10583,21 +10817,58 @@ impl RaftSnapshotBuilder<ControlPlaneRaftTypeConfig> for ControlPlaneRaftSnapsho
     type SnapshotData = ControlPlaneRaftSnapshotData;
 
     async fn build_snapshot(&mut self) -> Result<ControlPlaneRaftSnapshot, io::Error> {
-        self.snapshot.clone().map_err(|message| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("control-plane OpenRaft snapshot build failed: {message}"),
-            )
-        })
+        let work = self
+            .work
+            .clone()
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+        let snapshot = match work {
+            ControlPlaneRaftSnapshotBuildWork::Ready(snapshot) => snapshot,
+            ControlPlaneRaftSnapshotBuildWork::Captured(input) => {
+                let cache = self.cache.clone();
+                tokio::task::spawn_blocking(move || {
+                    let snapshot = input.build()?;
+                    if let Some(cache) = cache {
+                        publish_control_plane_raft_snapshot(&cache, snapshot.clone())
+                            .finish_on_current_thread()?;
+                    }
+                    Ok::<_, ControlPlaneError>(snapshot)
+                })
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!(
+                        "control-plane OpenRaft snapshot worker failed: {error}"
+                    ))
+                })?
+                .map_err(|error| {
+                    control_plane_error_to_io_error("OpenRaft snapshot build", error)
+                })?
+            }
+        };
+        Ok(snapshot)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ControlPlaneRaftStateMachine {
     inner: ReplicatedControlPlaneStateMachine,
     last_applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
-    last_membership: StoredMembershipOf<ControlPlaneRaftTypeConfig>,
-    current_snapshot: Option<ControlPlaneRaftSnapshot>,
+    last_membership: Arc<StoredMembershipOf<ControlPlaneRaftTypeConfig>>,
+    current_snapshot: ControlPlaneRaftSnapshotCache,
+    #[cfg(test)]
+    test_hooks: ControlPlaneRaftStateMachineTestHooks,
+}
+
+impl Clone for ControlPlaneRaftStateMachine {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            last_applied: self.last_applied,
+            last_membership: Arc::clone(&self.last_membership),
+            current_snapshot: Arc::new(Mutex::new(self.current_snapshot())),
+            #[cfg(test)]
+            test_hooks: self.test_hooks.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -10622,9 +10893,20 @@ impl ControlPlaneRaftStateMachineRestartArtifact {
         )?;
         self.current_snapshot = Some(Snapshot {
             meta,
-            snapshot: Cursor::new(snapshot_artifact.into_payload()),
+            snapshot: ControlPlaneRaftSnapshotData::new(snapshot_artifact.into_payload()),
         });
         Ok(self)
+    }
+
+    async fn refresh_cached_snapshot_async(self) -> Result<Self, ControlPlaneError> {
+        tokio::task::spawn_blocking(move || self.refresh_cached_snapshot())
+            .await
+            .map_err(|error| ControlPlaneError::Io {
+                context: "refresh control-plane OpenRaft cached restart snapshot",
+                source: io::Error::other(format!(
+                    "control-plane OpenRaft cached restart snapshot worker failed: {error}"
+                )),
+            })?
     }
 }
 
@@ -10654,8 +10936,7 @@ impl ControlPlaneRaftStateMachine {
 
     #[must_use]
     pub fn export_restart_artifact(&self) -> ControlPlaneRaftStateMachineRestartArtifact {
-        let current_snapshot = self
-            .current_snapshot
+        let current_snapshot = lock_control_plane_raft_snapshot_cache(&self.current_snapshot)
             .as_ref()
             .filter(|snapshot| {
                 Self::snapshot_at_or_before(snapshot.meta.last_log_id, self.last_applied)
@@ -10664,7 +10945,7 @@ impl ControlPlaneRaftStateMachine {
         ControlPlaneRaftStateMachineRestartArtifact {
             inner: self.inner.clone(),
             last_applied: self.last_applied,
-            last_membership: self.last_membership.clone(),
+            last_membership: self.last_membership.as_ref().clone(),
             current_snapshot,
         }
     }
@@ -10672,14 +10953,15 @@ impl ControlPlaneRaftStateMachine {
     pub fn from_restart_artifact(
         artifact: ControlPlaneRaftStateMachineRestartArtifact,
     ) -> Result<Self, ControlPlaneError> {
-        let mut state_machine = Self::new(
+        let state_machine = Self::new(
             artifact.inner,
             artifact.last_applied,
             artifact.last_membership,
         )?;
         if let Some(snapshot) = artifact.current_snapshot {
             state_machine.validate_cached_snapshot(&snapshot)?;
-            state_machine.current_snapshot = Some(snapshot);
+            publish_control_plane_raft_snapshot(&state_machine.current_snapshot, snapshot)
+                .finish_on_current_thread()?;
         }
         Ok(state_machine)
     }
@@ -10692,8 +10974,10 @@ impl ControlPlaneRaftStateMachine {
         Self {
             inner,
             last_applied,
-            last_membership,
-            current_snapshot: None,
+            last_membership: Arc::new(last_membership),
+            current_snapshot: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_hooks: ControlPlaneRaftStateMachineTestHooks::default(),
         }
     }
 
@@ -10709,12 +10993,28 @@ impl ControlPlaneRaftStateMachine {
 
     #[must_use]
     pub fn last_membership(&self) -> &StoredMembershipOf<ControlPlaneRaftTypeConfig> {
-        &self.last_membership
+        self.last_membership.as_ref()
     }
 
     #[must_use]
-    pub fn current_snapshot(&self) -> Option<&ControlPlaneRaftSnapshot> {
-        self.current_snapshot.as_ref()
+    pub fn current_snapshot(&self) -> Option<ControlPlaneRaftSnapshot> {
+        lock_control_plane_raft_snapshot_cache(&self.current_snapshot).clone()
+    }
+
+    #[cfg(test)]
+    fn set_test_hooks(&mut self, hooks: ControlPlaneRaftStateMachineTestHooks) {
+        self.test_hooks = hooks;
+    }
+
+    fn capture_apply_candidate(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            last_applied: self.last_applied,
+            last_membership: Arc::clone(&self.last_membership),
+            current_snapshot: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_hooks: self.test_hooks.clone(),
+        }
     }
 
     fn validate_cached_snapshot(
@@ -10808,7 +11108,7 @@ impl ControlPlaneRaftStateMachine {
         Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
         StoredMembershipOf<ControlPlaneRaftTypeConfig>,
     ) {
-        (self.last_applied, self.last_membership.clone())
+        (self.last_applied, self.last_membership.as_ref().clone())
     }
 
     pub fn runtime_map_for_applied_read_index(
@@ -10875,7 +11175,8 @@ impl ControlPlaneRaftStateMachine {
                     let control_plane_log_id = Self::control_plane_log_id_for_entry(raft_log_id)?;
                     self.inner.apply_committed_noop(control_plane_log_id)?;
                 }
-                self.last_membership = StoredMembership::new(Some(raft_log_id), membership);
+                self.last_membership =
+                    Arc::new(StoredMembership::new(Some(raft_log_id), membership));
                 self.last_applied = Some(raft_log_id);
                 Ok(ControlPlaneRaftApplyResponse::Membership)
             }
@@ -10969,9 +11270,10 @@ impl ControlPlaneRaftStateMachine {
         let meta = self.snapshot_meta_for_artifact(&artifact)?;
         let snapshot = Snapshot {
             meta,
-            snapshot: Cursor::new(artifact.into_payload()),
+            snapshot: ControlPlaneRaftSnapshotData::new(artifact.into_payload()),
         };
-        self.current_snapshot = Some(snapshot.clone());
+        publish_control_plane_raft_snapshot(&self.current_snapshot, snapshot.clone())
+            .finish_on_current_thread()?;
         Ok(snapshot)
     }
 
@@ -10981,10 +11283,23 @@ impl ControlPlaneRaftStateMachine {
         Ok(ControlPlaneRaftSnapshotBuilder::new(self.build_snapshot()?))
     }
 
+    fn capture_snapshot_builder(&self) -> ControlPlaneRaftSnapshotBuilder {
+        ControlPlaneRaftSnapshotBuilder::captured(
+            ControlPlaneRaftSnapshotBuildInput {
+                inner: self.inner.clone(),
+                last_applied: self.last_applied,
+                last_membership: Arc::clone(&self.last_membership),
+                #[cfg(test)]
+                hook: self.test_hooks.snapshot_build.clone(),
+            },
+            Arc::clone(&self.current_snapshot),
+        )
+    }
+
     pub fn install_snapshot(
         &mut self,
         meta: &SnapshotMetaOf<ControlPlaneRaftTypeConfig>,
-        snapshot: Cursor<Vec<u8>>,
+        snapshot: ControlPlaneRaftSnapshotData,
     ) -> Result<(), ControlPlaneError> {
         let last_applied = self.validate_snapshot_meta(meta)?;
         let payload = snapshot.into_inner();
@@ -10994,11 +11309,15 @@ impl ControlPlaneRaftStateMachine {
                 payload.clone(),
             ))?;
         self.last_applied = meta.last_log_id;
-        self.last_membership = meta.last_membership.clone();
-        self.current_snapshot = Some(Snapshot {
-            meta: meta.clone(),
-            snapshot: Cursor::new(payload),
-        });
+        self.last_membership = Arc::new(meta.last_membership.clone());
+        publish_control_plane_raft_snapshot(
+            &self.current_snapshot,
+            Snapshot {
+                meta: meta.clone(),
+                snapshot: ControlPlaneRaftSnapshotData::new(payload),
+            },
+        )
+        .finish_on_current_thread()?;
         Ok(())
     }
 
@@ -11247,7 +11566,15 @@ impl RaftStateMachine<ControlPlaneRaftTypeConfig> for ControlPlaneRaftStateMachi
         ),
         io::Error,
     > {
-        Ok(ControlPlaneRaftStateMachine::applied_state(self))
+        let last_applied = self.last_applied;
+        let last_membership = Arc::clone(&self.last_membership);
+        tokio::task::spawn_blocking(move || (last_applied, last_membership.as_ref().clone()))
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "control-plane OpenRaft applied-state worker failed: {error}"
+                ))
+            })
     }
 
     async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
@@ -11258,9 +11585,37 @@ impl RaftStateMachine<ControlPlaneRaftTypeConfig> for ControlPlaneRaftStateMachi
     {
         while let Some(entry) = entries.next().await {
             let (entry, responder) = entry?;
-            let response = self
-                .apply_entry(entry)
-                .map_err(|error| control_plane_error_to_io_error("OpenRaft apply", error))?;
+            let mut candidate = self.capture_apply_candidate();
+            #[cfg(test)]
+            let hook = self.test_hooks.apply.clone();
+            let (candidate, response) = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(hook) = hook {
+                    hook.block();
+                }
+                let response = candidate.apply_entry(entry)?;
+                Ok::<_, ControlPlaneError>((candidate, response))
+            })
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "control-plane OpenRaft apply worker failed: {error}"
+                ))
+            })?
+            .map_err(|error| control_plane_error_to_io_error("OpenRaft apply", error))?;
+            let retired_inner = std::mem::replace(&mut self.inner, candidate.inner);
+            self.last_applied = candidate.last_applied;
+            let retired_membership =
+                std::mem::replace(&mut self.last_membership, candidate.last_membership);
+            ControlPlaneRaftRetiredGeneration {
+                inner: retired_inner,
+                last_membership: retired_membership,
+                cached_snapshot: None,
+                #[cfg(test)]
+                hook: self.test_hooks.retire_generation.clone(),
+            }
+            .retire("control-plane OpenRaft applied generation")
+            .await?;
             if let Some(responder) = responder {
                 responder.send(response);
             }
@@ -11273,29 +11628,86 @@ impl RaftStateMachine<ControlPlaneRaftTypeConfig> for ControlPlaneRaftStateMachi
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        match self.create_snapshot_builder() {
-            Ok(builder) => builder,
-            Err(error) => ControlPlaneRaftSnapshotBuilder::from_error(error),
-        }
+        self.capture_snapshot_builder()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Cursor<Vec<u8>>, io::Error> {
-        Ok(Cursor::new(Vec::new()))
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<ControlPlaneRaftSnapshotData, io::Error> {
+        Ok(ControlPlaneRaftSnapshotData::new(Vec::new()))
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMetaOf<ControlPlaneRaftTypeConfig>,
-        snapshot: Cursor<Vec<u8>>,
+        snapshot: ControlPlaneRaftSnapshotData,
     ) -> Result<(), io::Error> {
-        ControlPlaneRaftStateMachine::install_snapshot(self, meta, snapshot)
-            .map_err(|error| control_plane_error_to_io_error("OpenRaft install snapshot", error))
+        let last_applied = self
+            .validate_snapshot_meta(meta)
+            .map_err(|error| control_plane_error_to_io_error("OpenRaft install snapshot", error))?;
+        let cached_snapshot = Snapshot {
+            meta: meta.clone(),
+            snapshot: snapshot.clone(),
+        };
+        #[cfg(test)]
+        let hook = self.test_hooks.snapshot_install.clone();
+        let installed = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook.block();
+            }
+            let payload = snapshot.into_inner();
+            let mut installed = ReplicatedControlPlaneStateMachine::empty();
+            installed.install_snapshot_artifact(ControlPlaneSnapshotArtifact::new(
+                last_applied,
+                payload,
+            ))?;
+            Ok::<_, ControlPlaneError>(installed)
+        })
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "control-plane OpenRaft snapshot install worker failed: {error}"
+            ))
+        })?
+        .map_err(|error| control_plane_error_to_io_error("OpenRaft install snapshot", error))?;
+        let retired_inner = std::mem::replace(&mut self.inner, installed);
+        self.last_applied = meta.last_log_id;
+        let retired_membership = std::mem::replace(
+            &mut self.last_membership,
+            Arc::new(meta.last_membership.clone()),
+        );
+        let publication =
+            publish_control_plane_raft_snapshot(&self.current_snapshot, cached_snapshot);
+        let ControlPlaneRaftSnapshotPublication {
+            outcome,
+            retired: cached_snapshot,
+        } = publication;
+        ControlPlaneRaftRetiredGeneration {
+            inner: retired_inner,
+            last_membership: retired_membership,
+            cached_snapshot,
+            #[cfg(test)]
+            hook: self.test_hooks.retire_generation.clone(),
+        }
+        .retire("control-plane OpenRaft installed generation")
+        .await?;
+        outcome
+            .map_err(|error| control_plane_error_to_io_error("OpenRaft install snapshot", error))?;
+        Ok(())
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<ControlPlaneRaftSnapshot>, io::Error> {
-        Ok(self.current_snapshot.clone())
+        let cache = Arc::clone(&self.current_snapshot);
+        tokio::task::spawn_blocking(move || lock_control_plane_raft_snapshot_cache(&cache).clone())
+            .await
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "control-plane OpenRaft current-snapshot worker failed: {error}"
+                ))
+            })
     }
 }
 
@@ -11692,6 +12104,49 @@ mod tests {
             state.released = true;
             condition.notify_all();
         }
+    }
+
+    fn state_machine_executor_progress_watchdog(
+        hook: Arc<ControlPlaneRaftStateMachineBlockingHook>,
+        timer_completed: Arc<AtomicBool>,
+    ) -> thread::JoinHandle<bool> {
+        thread::spawn(move || {
+            hook.wait_until_entered(Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(100));
+            let progressed_before_release = timer_completed.load(Ordering::SeqCst);
+            hook.release();
+            progressed_before_release
+        })
+    }
+
+    fn state_machine_retirement_progress_watchdog(
+        hook: Arc<ControlPlaneRaftStateMachineBlockingHook>,
+        retirement_entered: Arc<AtomicBool>,
+        timer_completed: Arc<AtomicBool>,
+    ) -> thread::JoinHandle<bool> {
+        thread::spawn(move || {
+            hook.wait_until_entered(Duration::from_secs(1));
+            retirement_entered.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(100));
+            let progressed_before_release = timer_completed.load(Ordering::SeqCst);
+            hook.release();
+            progressed_before_release
+        })
+    }
+
+    async fn mark_executor_timer_progress(timer_completed: Arc<AtomicBool>) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        timer_completed.store(true, Ordering::SeqCst);
+    }
+
+    async fn mark_executor_timer_progress_after_phase_entry(
+        phase_entered: Arc<AtomicBool>,
+        timer_completed: Arc<AtomicBool>,
+    ) {
+        while !phase_entered.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        mark_executor_timer_progress(timer_completed).await;
     }
 
     impl Drop for TestWalFileSyncGate {
@@ -18516,6 +18971,316 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_raft_state_machine_apply_does_not_block_single_worker_executor() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let hook = Arc::new(ControlPlaneRaftStateMachineBlockingHook::default());
+            let timer_completed = Arc::new(AtomicBool::new(false));
+            let watchdog = state_machine_executor_progress_watchdog(
+                Arc::clone(&hook),
+                Arc::clone(&timer_completed),
+            );
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine.set_test_hooks(ControlPlaneRaftStateMachineTestHooks {
+                apply: Some(hook),
+                ..ControlPlaneRaftStateMachineTestHooks::default()
+            });
+            let operation = tokio::spawn(async move {
+                let entries = stream::iter(vec![Ok((blank_entry(1, 1, 1), None))]);
+                RaftStateMachine::apply(&mut state_machine, entries)
+                    .await
+                    .unwrap();
+                state_machine
+            });
+            let timer = tokio::spawn(mark_executor_timer_progress(Arc::clone(&timer_completed)));
+
+            let state_machine = operation.await.unwrap();
+            timer.await.unwrap();
+            assert_eq!(state_machine.last_applied(), Some(raft_log_id(1, 1, 1)));
+            assert!(
+                watchdog.join().unwrap(),
+                "single-worker executor timer must progress while command apply is blocked"
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_apply_publication_retires_state_off_single_worker_executor() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let hook = Arc::new(ControlPlaneRaftStateMachineBlockingHook::default());
+            let retirement_entered = Arc::new(AtomicBool::new(false));
+            let timer_completed = Arc::new(AtomicBool::new(false));
+            let watchdog = state_machine_retirement_progress_watchdog(
+                Arc::clone(&hook),
+                Arc::clone(&retirement_entered),
+                Arc::clone(&timer_completed),
+            );
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine.set_test_hooks(ControlPlaneRaftStateMachineTestHooks {
+                retire_generation: Some(hook),
+                ..ControlPlaneRaftStateMachineTestHooks::default()
+            });
+            let operation = tokio::spawn(async move {
+                let entries = stream::iter(vec![Ok((
+                    normal_entry(
+                        1,
+                        1,
+                        1,
+                        ControlPlaneCommand::BootstrapInitialClusterMap {
+                            nodes: vec![(NodeId::new(1), "node-1".to_string())],
+                            pg_ids: vec![PgId::new(0)],
+                        },
+                    ),
+                    None,
+                ))]);
+                RaftStateMachine::apply(&mut state_machine, entries)
+                    .await
+                    .unwrap();
+                state_machine
+            });
+            let timer = tokio::spawn(mark_executor_timer_progress_after_phase_entry(
+                retirement_entered,
+                Arc::clone(&timer_completed),
+            ));
+
+            let state_machine = operation.await.unwrap();
+            timer.await.unwrap();
+            assert_eq!(state_machine.last_applied(), Some(raft_log_id(1, 1, 1)));
+            assert!(
+                watchdog.join().unwrap(),
+                "single-worker executor timer must progress while the replaced state generation is awaiting destruction"
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_snapshot_build_does_not_block_single_worker_executor() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let hook = Arc::new(ControlPlaneRaftStateMachineBlockingHook::default());
+            let timer_completed = Arc::new(AtomicBool::new(false));
+            let watchdog = state_machine_executor_progress_watchdog(
+                Arc::clone(&hook),
+                Arc::clone(&timer_completed),
+            );
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine.apply_entry(blank_entry(1, 1, 1)).unwrap();
+            state_machine.set_test_hooks(ControlPlaneRaftStateMachineTestHooks {
+                snapshot_build: Some(hook),
+                ..ControlPlaneRaftStateMachineTestHooks::default()
+            });
+            let mut builder = RaftStateMachine::get_snapshot_builder(&mut state_machine).await;
+            let operation = tokio::spawn(async move { builder.build_snapshot().await.unwrap() });
+            let timer = tokio::spawn(mark_executor_timer_progress(Arc::clone(&timer_completed)));
+
+            let snapshot = operation.await.unwrap();
+            timer.await.unwrap();
+            assert_eq!(snapshot.meta.last_log_id, Some(raft_log_id(1, 1, 1)));
+            assert!(
+                watchdog.join().unwrap(),
+                "single-worker executor timer must progress while snapshot build is blocked"
+            );
+            let current_snapshot = state_machine
+                .current_snapshot()
+                .expect("completed builder should publish the current snapshot");
+            assert_eq!(
+                current_snapshot.meta.last_log_id,
+                Some(raft_log_id(1, 1, 1)),
+            );
+            assert!(
+                Arc::ptr_eq(
+                    &snapshot.snapshot.payload,
+                    &current_snapshot.snapshot.payload,
+                ),
+                "current-snapshot reads must share rather than copy the payload",
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_late_snapshot_builder_cannot_regress_current_snapshot() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let hook = Arc::new(ControlPlaneRaftStateMachineBlockingHook::default());
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine.apply_entry(blank_entry(1, 1, 1)).unwrap();
+            state_machine.set_test_hooks(ControlPlaneRaftStateMachineTestHooks {
+                snapshot_build: Some(Arc::clone(&hook)),
+                ..ControlPlaneRaftStateMachineTestHooks::default()
+            });
+            let mut old_builder = RaftStateMachine::get_snapshot_builder(&mut state_machine).await;
+            let old_build =
+                tokio::spawn(async move { old_builder.build_snapshot().await.unwrap() });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !hook.entered() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("old snapshot builder should enter its blocking hook");
+
+            state_machine.apply_entry(blank_entry(1, 1, 2)).unwrap();
+            state_machine.set_test_hooks(ControlPlaneRaftStateMachineTestHooks::default());
+            let newer = state_machine.build_snapshot().unwrap();
+            hook.release();
+            let older = old_build.await.unwrap();
+
+            assert_eq!(older.meta.last_log_id, Some(raft_log_id(1, 1, 1)));
+            assert_eq!(newer.meta.last_log_id, Some(raft_log_id(1, 1, 2)));
+            assert_eq!(
+                state_machine
+                    .current_snapshot()
+                    .and_then(|snapshot| snapshot.meta.last_log_id),
+                Some(raft_log_id(1, 1, 2)),
+                "a late older builder must not replace a newer current snapshot"
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_snapshot_cache_rejects_conflicting_same_index_publication() {
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        state_machine.apply_entry(blank_entry(1, 1, 1)).unwrap();
+        let current = state_machine.build_snapshot().unwrap();
+        let mut conflicting = current.clone();
+        conflicting.meta.last_log_id = Some(raft_log_id(1, 2, 1));
+
+        let error =
+            publish_control_plane_raft_snapshot(&state_machine.current_snapshot, conflicting)
+                .finish_on_current_thread()
+                .unwrap_err();
+
+        assert!(matches!(error, ControlPlaneError::SnapshotDecode { .. }));
+        assert_eq!(
+            state_machine
+                .current_snapshot()
+                .and_then(|snapshot| snapshot.meta.last_log_id),
+            current.meta.last_log_id,
+        );
+    }
+
+    #[test]
+    fn control_plane_raft_snapshot_install_does_not_block_single_worker_executor() {
+        let mut source = ControlPlaneRaftStateMachine::empty();
+        source.apply_entry(blank_entry(1, 1, 1)).unwrap();
+        let snapshot = source.build_snapshot().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let hook = Arc::new(ControlPlaneRaftStateMachineBlockingHook::default());
+            let timer_completed = Arc::new(AtomicBool::new(false));
+            let watchdog = state_machine_executor_progress_watchdog(
+                Arc::clone(&hook),
+                Arc::clone(&timer_completed),
+            );
+            let mut target = ControlPlaneRaftStateMachine::empty();
+            target.set_test_hooks(ControlPlaneRaftStateMachineTestHooks {
+                snapshot_install: Some(hook),
+                ..ControlPlaneRaftStateMachineTestHooks::default()
+            });
+            let operation = tokio::spawn(async move {
+                RaftStateMachine::install_snapshot(&mut target, &snapshot.meta, snapshot.snapshot)
+                    .await
+                    .unwrap();
+                target
+            });
+            let timer = tokio::spawn(mark_executor_timer_progress(Arc::clone(&timer_completed)));
+
+            let target = operation.await.unwrap();
+            timer.await.unwrap();
+            assert_eq!(target.last_applied(), Some(raft_log_id(1, 1, 1)));
+            assert!(
+                watchdog.join().unwrap(),
+                "single-worker executor timer must progress while snapshot install is blocked"
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_snapshot_publication_retires_state_and_cache_off_executor() {
+        let mut source = ControlPlaneRaftStateMachine::empty();
+        source
+            .apply_entry(normal_entry(
+                1,
+                1,
+                1,
+                ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(1), "node-1".to_string())],
+                    pg_ids: vec![PgId::new(0)],
+                },
+            ))
+            .unwrap();
+        source.apply_entry(blank_entry(1, 1, 2)).unwrap();
+        let snapshot = source.build_snapshot().unwrap();
+
+        let mut target = ControlPlaneRaftStateMachine::empty();
+        target
+            .apply_entry(normal_entry(
+                1,
+                1,
+                1,
+                ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(2), "node-2".to_string())],
+                    pg_ids: vec![PgId::new(0)],
+                },
+            ))
+            .unwrap();
+        drop(target.build_snapshot().unwrap());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let hook = Arc::new(ControlPlaneRaftStateMachineBlockingHook::default());
+            let retirement_entered = Arc::new(AtomicBool::new(false));
+            let timer_completed = Arc::new(AtomicBool::new(false));
+            let watchdog = state_machine_retirement_progress_watchdog(
+                Arc::clone(&hook),
+                Arc::clone(&retirement_entered),
+                Arc::clone(&timer_completed),
+            );
+            target.set_test_hooks(ControlPlaneRaftStateMachineTestHooks {
+                retire_generation: Some(hook),
+                ..ControlPlaneRaftStateMachineTestHooks::default()
+            });
+            let operation = tokio::spawn(async move {
+                RaftStateMachine::install_snapshot(&mut target, &snapshot.meta, snapshot.snapshot)
+                    .await
+                    .unwrap();
+                target
+            });
+            let timer = tokio::spawn(mark_executor_timer_progress_after_phase_entry(
+                retirement_entered,
+                Arc::clone(&timer_completed),
+            ));
+
+            let target = operation.await.unwrap();
+            timer.await.unwrap();
+            assert_eq!(target.last_applied(), Some(raft_log_id(1, 1, 2)));
+            assert!(
+                watchdog.join().unwrap(),
+                "single-worker executor timer must progress while replaced state and cached snapshot generations await destruction"
+            );
+        });
+    }
+
+    #[test]
     fn control_plane_raft_openraft_log_suite_compatible_cases_pass() {
         ControlPlaneRaftTypeConfig::run(async {
             async fn suite_pair() -> (ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine) {
@@ -22596,8 +23361,10 @@ mod tests {
             snapshot_source.apply_entry(blank_entry(3, 1, 2)).unwrap();
             let snapshot = snapshot_source.build_snapshot().unwrap();
 
-            let mut state_machine = ControlPlaneRaftStateMachine::empty();
-            state_machine.current_snapshot = Some(snapshot);
+            let state_machine = ControlPlaneRaftStateMachine::empty();
+            publish_control_plane_raft_snapshot(&state_machine.current_snapshot, snapshot)
+                .finish_on_current_thread()
+                .unwrap();
 
             let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                 1,

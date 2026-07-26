@@ -11511,7 +11511,7 @@ Required production shape and implementation order:
    time and fails above 1 MiB/s of combined WAL/checkpoint bytes. The monitor
    lock regression and WAL-ack/compaction regression run in the control-plane
    release gate alongside that workload.
-   **Raft WAL executor isolation (implemented; state-machine CPU audit open):**
+   **Raft executor isolation (implemented):**
    the fsynced WAL remains the required
    acknowledgement boundary, but synchronous filesystem work must not execute
    on Tokio cooperative-runtime workers. The previous OpenRaft
@@ -11574,10 +11574,29 @@ Required production shape and implementation order:
    classes, and compaction barriers. Runtime diagnostics and the
    production-shaped release workload report queue depth/high-water, queue
    wait, append-acceptance latency, worker-operation latency, sync latency, and
-   WAL bytes. The remaining executor-isolation work is the separately scoped
-   audit of large synchronous state-machine snapshot construction, cloning,
-   decode, and installation below; it does not reopen WAL acknowledgement
-   isolation.
+   WAL bytes. The state-machine CPU audit is now also complete. Replicated
+   state uses immutable reference-counted snapshot and membership views, so an
+   OpenRaft snapshot builder captures one exact applied view without cloning
+   retained history on the cooperative executor. Builder serialization runs on
+   the blocking pool and publishes through a shared monotonic snapshot cache;
+   a late older builder cannot replace a newer snapshot. OpenRaft command apply
+   runs against an isolated candidate on the blocking pool and publishes its
+   state plus responder result in log order only after successful completion.
+   Snapshot installation similarly decodes and validates a candidate off the
+   cooperative executor before atomically replacing live state. Current-
+   snapshot reads clone reference-counted payload storage rather than copying
+   the complete frame, and asynchronous restart-artifact cache refresh also
+   uses the blocking pool. Publication swaps the new immutable generation into
+   place, moves the replaced state, membership, and serialized snapshot-cache
+   generation into one retirement object, and awaits that object's destruction
+   on the blocking pool. This is required because releasing the final `Arc`
+   recursively destroys the complete retained map/history or serialized frame;
+   reference counting makes capture cheap but does not make final destruction
+   constant-time. Snapshot builders already replace and retire cache entries
+   inside their blocking worker. Single-worker deterministic regressions block
+   apply, snapshot build, snapshot installation, and the actual post-publication
+   retirement destructor while proving timer progress, and separately pin
+   monotonic publication when builders finish out of order.
    Restart cost is part of the same bound. A retained route-change soak exposed
    a 12.66 MB restart artifact with 2,883 retained entries whose cached
    OpenRaft snapshot was at index 5,000 while the materialized state was at
