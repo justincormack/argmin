@@ -726,6 +726,216 @@ fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
 }
 
 #[test]
+fn object_delete_mutations_expire_at_pending_install_effect_boundary() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    for bucket in ["unversioned", "versioned", "batch"] {
+        initial_coord
+            .create_bucket_for_owner("default-owner", bucket, false)
+            .unwrap();
+    }
+    put_bucket_versioning_test(
+        &initial_coord,
+        "versioned",
+        BucketVersioningState::Enabled,
+        test_requester(),
+        None,
+    )
+    .unwrap();
+    for (bucket, key) in [
+        ("unversioned", "key"),
+        ("versioned", "key"),
+        ("batch", "first"),
+        ("batch", "second"),
+    ] {
+        test_helpers::put_object(
+            &initial_coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+                data: format!("{bucket}/{key}").as_bytes(),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let cluster = initial;
+    let coord = initial_coord;
+
+    for bucket in ["unversioned", "versioned"] {
+        clock.set(1_000);
+        cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+        let admission = coord.admit_storage_route_for_request().unwrap();
+        cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+        let baseline = coord
+            .get_object_on_admitted_route(
+                &admission,
+                &GetObjectRequest {
+                    object: object_version_request_with_expected_owner(
+                        bucket,
+                        "key",
+                        None,
+                        test_requester(),
+                        None,
+                    ),
+                    cond: NO_READ,
+                    sse_customer: None,
+                },
+            )
+            .unwrap();
+        let delete_condition = DeleteCondition::IfMatch(baseline.etag.into());
+        let hook_clock = Arc::clone(&clock);
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls_for_hook = Arc::clone(&hook_calls);
+        let hook = cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(
+            move || {
+                hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                hook_clock.set(4_500);
+            },
+        ));
+        let request = DeleteObjectRequest {
+            object: object_version_request_with_expected_owner(
+                bucket,
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            bypass_governance: false,
+            cond: &delete_condition,
+        };
+        let result = coord.delete_object_on_admitted_route(&admission, &request);
+        let hook_call_count = hook_calls.load(Ordering::SeqCst);
+        assert!(hook_call_count > 0, "{bucket}");
+        let admission_error = admission.require_valid_now().unwrap_err();
+        let error = result.err().unwrap_or_else(|| {
+            panic!(
+                "{bucket} unexpectedly succeeded after {hook_call_count} hook calls; admission: {admission_error:?}"
+            )
+        });
+        assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+        drop(hook);
+        drop(admission);
+
+        clock.set(1_000);
+        let fresh_admission = coord.admit_storage_route_for_request().unwrap();
+        let current = coord
+            .get_object_on_admitted_route(
+                &fresh_admission,
+                &GetObjectRequest {
+                    object: object_version_request_with_expected_owner(
+                        bucket,
+                        "key",
+                        None,
+                        test_requester(),
+                        None,
+                    ),
+                    cond: NO_READ,
+                    sse_customer: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            current.body.read_all().unwrap(),
+            format!("{bucket}/key").as_bytes()
+        );
+    }
+
+    clock.set(1_000);
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let batch_etags = ["first", "second"].map(|key| {
+        coord
+            .get_object_on_admitted_route(
+                &admission,
+                &GetObjectRequest {
+                    object: object_version_request_with_expected_owner(
+                        "batch",
+                        key,
+                        None,
+                        test_requester(),
+                        None,
+                    ),
+                    cond: NO_READ,
+                    sse_customer: None,
+                },
+            )
+            .unwrap()
+            .etag
+    });
+    let hook_clock = Arc::clone(&clock);
+    let hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            hook_clock.set(4_500)
+        }));
+    let entries = [
+        DeleteEntry {
+            key: trusted_object_key("first"),
+            version_id: None,
+            cond: DeleteCondition::IfMatch(batch_etags[0].clone().into()),
+        },
+        DeleteEntry {
+            key: trusted_object_key("second"),
+            version_id: None,
+            cond: DeleteCondition::IfMatch(batch_etags[1].clone().into()),
+        },
+    ];
+    let result = coord
+        .delete_objects_on_admitted_route(
+            &admission,
+            &DeleteObjectsRequest {
+                bucket: bucket_request_with_expected_owner("batch", test_requester(), None),
+                entries: &entries,
+                bypass_governance: false,
+            },
+        )
+        .unwrap();
+    assert!(result.deleted.is_empty());
+    assert_eq!(result.errors.len(), 2);
+    assert!(result
+        .errors
+        .iter()
+        .all(|error| error.code == "OperationAborted"));
+    drop(hook);
+    drop(admission);
+
+    clock.set(1_000);
+    let fresh_admission = coord.admit_storage_route_for_request().unwrap();
+    for key in ["first", "second"] {
+        let current = coord
+            .get_object_on_admitted_route(
+                &fresh_admission,
+                &GetObjectRequest {
+                    object: object_version_request_with_expected_owner(
+                        "batch",
+                        key,
+                        None,
+                        test_requester(),
+                        None,
+                    ),
+                    cond: NO_READ,
+                    sse_customer: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            current.body.read_all().unwrap(),
+            format!("batch/{key}").as_bytes()
+        );
+    }
+}
+
+#[test]
 fn object_body_reads_recheck_admission_before_retaining_payload_authority() {
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -1435,6 +1645,27 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
     };
     let metadata_request =
         object_version_request_with_expected_owner("bucket", "key", None, test_requester(), None);
+    let delete_request = DeleteObjectRequest {
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        bypass_governance: false,
+        cond: &DeleteCondition::None,
+    };
+    let delete_entries = [DeleteEntry {
+        key: trusted_object_key("key"),
+        version_id: None,
+        cond: DeleteCondition::None,
+    }];
+    let delete_objects_request = DeleteObjectsRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        entries: &delete_entries,
+        bypass_governance: false,
+    };
 
     let foreign_admission = foreign.admit_storage_route_for_request().unwrap();
     let canary_tags =
@@ -1634,6 +1865,18 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
             "PutObjectAcl",
             local
                 .put_object_acl_on_admitted_route(&foreign_admission, &rejected_acl)
+                .map(|_| ()),
+        ),
+        (
+            "DeleteObject",
+            local
+                .delete_object_on_admitted_route(&foreign_admission, &delete_request)
+                .map(|_| ()),
+        ),
+        (
+            "DeleteObjects",
+            local
+                .delete_objects_on_admitted_route(&foreign_admission, &delete_objects_request)
                 .map(|_| ()),
         ),
     ] {
@@ -4798,10 +5041,15 @@ fn delete_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route
         "delete should not apply the object-PG command before the pre-apply gate"
     );
 
-    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
+        &handle,
+        &initial,
+        tmp.path(),
+    );
 
     gate.release();
     delete_thread.join().unwrap().unwrap();
+    publication_thread.join().unwrap();
     let after_object_pg_proof = initial
         .test_object_pg_metadata_proof(&bucket_name, &object_key)
         .unwrap();

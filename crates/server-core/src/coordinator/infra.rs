@@ -353,6 +353,19 @@ impl Coordinator {
         )
     }
 
+    pub(super) fn checked_active_bucket_summary_for_admitted_route(
+        &self,
+        admission: &StorageClusterRouteAdmission,
+        name: &BucketName,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<ValidatedBucket, ServerError> {
+        self.require_storage_route_admission(admission)?;
+        Self::validate_expected_bucket_owner(
+            self.unchecked_active_bucket_summary_for_admitted_route(admission, name)?,
+            expected_bucket_owner,
+        )
+    }
+
     /// Create a new coordinator over a cluster-shaped storage handle.
     pub fn new_with_storage_cluster(
         storage_cluster: Arc<StorageCluster>,

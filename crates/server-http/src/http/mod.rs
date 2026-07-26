@@ -2251,19 +2251,20 @@ impl HttpFrontend {
                     });
                 }
                 let requester = self.requester_from_auth(auth, req)?;
-                let result =
-                    self.coordinator
-                        .delete_object(&crate::coordinator::DeleteObjectRequest {
-                            object: object_version_request(
-                                &bucket,
-                                &key,
-                                vid,
-                                requester,
-                                expected_bucket_owner,
-                            )?,
-                            bypass_governance,
-                            cond: &cond,
-                        })?;
+                let result = self.coordinator.delete_object_on_admitted_route(
+                    storage_route_admission,
+                    &crate::coordinator::DeleteObjectRequest {
+                        object: object_version_request(
+                            &bucket,
+                            &key,
+                            vid,
+                            requester,
+                            expected_bucket_owner,
+                        )?,
+                        bypass_governance,
+                        cond: &cond,
+                    },
+                )?;
                 Ok(S3Response::delete_object(&result))
             }
             S3Operation::HeadObject { bucket, key } => {
@@ -2477,12 +2478,14 @@ impl HttpFrontend {
                         errors: Vec::new(),
                     }
                 } else {
-                    self.coordinator
-                        .delete_objects(&crate::coordinator::DeleteObjectsRequest {
+                    self.coordinator.delete_objects_on_admitted_route(
+                        storage_route_admission,
+                        &crate::coordinator::DeleteObjectsRequest {
                             bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                             entries: &entries,
                             bypass_governance,
-                        })?
+                        },
+                    )?
                 };
                 result.errors.extend(validation_errors);
                 Ok(S3Response::delete_objects(&result, quiet))

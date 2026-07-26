@@ -184,17 +184,17 @@ define_metadata_command_publishers! {
         SnapshotSensitive
     ),
     DeleteSpecificObjectVersionIf => (
-        "delete_specific_object_version_if",
+        "delete_specific_object_version_if_with_route_validation",
         "DeleteObjectVersion",
         SnapshotSensitive
     ),
     DeleteCurrentObjectIf => (
-        "delete_current_object_if",
+        "delete_current_object_if_with_route_validation",
         "DeleteObjectVersion",
         SnapshotSensitive
     ),
     InsertCurrentDeleteMarkerIf => (
-        "insert_current_delete_marker_if",
+        "insert_current_delete_marker_if_with_route_validation",
         "InsertDeleteMarker",
         SnapshotSensitive
     ),

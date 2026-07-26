@@ -9203,18 +9203,29 @@ impl super::StorageCluster {
         }
     }
 
-    fn acquire_bucket_write_proof_for_object_metadata_command(
+    fn acquire_bucket_write_proof_for_object_metadata_command_with_effect_fence(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         operation_kind: &'static str,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<BucketWriteReservationProof>, ObjectPgActionError> {
-        self.try_acquire_bucket_write_proof_for_object_metadata_command(
+        match self.acquire_durable_bucket_write_reservation_with_effect_fence(
             bucket,
-            key,
             operation_kind,
-            true,
-        )
+            Some(key.as_str()),
+            Some(effect_fence),
+        ) {
+            Ok(reservation) => Ok(Some(BucketWriteReservationProof::from(&reservation.record))),
+            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
+                self.wait_for_durable_bucket_write_drain(bucket)
+                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+                Ok(None)
+            }
+            Err(error) => Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                error,
+            )),
+        }
     }
 
     fn try_acquire_bucket_write_proof_for_object_metadata_command(
@@ -9309,22 +9320,34 @@ impl super::StorageCluster {
         }
     }
 
-    pub fn delete_specific_object_version_if<T, E>(
+    pub(super) fn delete_specific_object_version_if_with_route_validation<T, E>(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
+        route: super::ObjectMetadataMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(DeleteSpecificObjectVersionIf);
-        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let super::ObjectMetadataMutationEffectRoute {
+            pg_id: object_pg_id,
+            bucket,
+            key,
+            requested_version_id,
+            effect_fence,
+        } = route;
+        let Some(version_id) = requested_version_id else {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "specific-version delete route is missing its version id".to_string(),
+            });
+        };
         let pg_id = object_pg_id.pg_id();
-        let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
         loop {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
+            let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.matches_request(bucket, key, version_id) {
+                        require_valid_route().map_err(ObjectPgActionError::Store)?;
                         let snapshot = storage_client.load_specific_object_delete_snapshot(
                             object_pg_id,
                             bucket,
@@ -9335,6 +9358,7 @@ impl super::StorageCluster {
                             Ok(value) => value,
                             Err(error) => return Ok(Err(error)),
                         };
+                        require_valid_route().map_err(ObjectPgActionError::Store)?;
                         self.apply_exact_pending_object_metadata_command(
                             pg_id,
                             super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
@@ -9349,15 +9373,23 @@ impl super::StorageCluster {
                 continue;
             }
 
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             let bucket_write_reservation = match self
-                .acquire_bucket_write_proof_for_object_metadata_command(
+                .acquire_bucket_write_proof_for_object_metadata_command_with_effect_fence(
                     bucket,
                     key,
                     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
+                    effect_fence,
                 )? {
                 Some(proof) => proof,
                 None => continue,
             };
+            if let Err(error) = require_valid_route() {
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
+                return Err(ObjectPgActionError::Store(error));
+            }
             let snapshot = match storage_client.load_specific_object_delete_snapshot(
                 object_pg_id,
                 bucket,
@@ -9389,6 +9421,12 @@ impl super::StorageCluster {
                     value,
                     deleted: DeletedSpecificObjectVersion::Missing,
                 }));
+            }
+            if let Err(error) = require_valid_route() {
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
+                return Err(ObjectPgActionError::Store(error));
             }
             let command = storage_client.build_delete_specific_object_version_command(
                 BuildDeleteSpecificObjectVersionCommandReq {
@@ -9436,9 +9474,18 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             };
-            let install = match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command, None)
-            {
+            if let Err(error) = require_valid_route() {
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
+                return Err(ObjectPgActionError::Store(error));
+            }
+            let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
+                pg_id,
+                bucket,
+                &command,
+                Some(effect_fence),
+            ) {
                 Ok(install) => install,
                 Err(error) => {
                     self.release_bucket_write_proof_for_object_metadata_command(
@@ -9467,21 +9514,35 @@ impl super::StorageCluster {
         }
     }
 
-    pub fn delete_current_object_if<T, E>(
+    pub(super) fn delete_current_object_if_with_route_validation<T, E>(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
+        route: super::ObjectMetadataMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(DeleteCurrentObjectIf);
-        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let super::ObjectMetadataMutationEffectRoute {
+            pg_id: object_pg_id,
+            bucket,
+            key,
+            requested_version_id,
+            effect_fence,
+        } = route;
+        if requested_version_id.is_some() {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "current-object delete route unexpectedly contains a version id"
+                    .to_string(),
+            });
+        }
         let pg_id = object_pg_id.pg_id();
-        let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
         loop {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
+            let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.bucket == *bucket && delete.key == *key {
+                        require_valid_route().map_err(ObjectPgActionError::Store)?;
                         let snapshot = storage_client.load_current_object_delete_snapshot(
                             object_pg_id,
                             bucket,
@@ -9496,6 +9557,7 @@ impl super::StorageCluster {
                                 Ok(value) => value,
                                 Err(error) => return Ok(Err(error)),
                             };
+                            require_valid_route().map_err(ObjectPgActionError::Store)?;
                             self.apply_exact_pending_object_metadata_command(
                                 pg_id,
                                 super::ExactPendingObjectMetadataCommand::for_checked_request(
@@ -9513,11 +9575,13 @@ impl super::StorageCluster {
                 continue;
             }
 
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             let bucket_write_reservation = match self
-                .acquire_bucket_write_proof_for_object_metadata_command(
+                .acquire_bucket_write_proof_for_object_metadata_command_with_effect_fence(
                     bucket,
                     key,
                     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
+                    effect_fence,
                 )? {
                 Some(proof) => proof,
                 None => continue,
@@ -9527,6 +9591,12 @@ impl super::StorageCluster {
                     &bucket_write_reservation,
                 )?;
                 return Err(error);
+            }
+            if let Err(error) = require_valid_route() {
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
+                return Err(ObjectPgActionError::Store(error));
             }
             let snapshot =
                 match storage_client.load_current_object_delete_snapshot(object_pg_id, bucket, key)
@@ -9566,6 +9636,12 @@ impl super::StorageCluster {
                     deleted: DeletedCurrentObject::DeleteMarker,
                 }));
             };
+            if let Err(error) = require_valid_route() {
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
+                return Err(ObjectPgActionError::Store(error));
+            }
             let command = storage_client.build_delete_current_object_command(
                 BuildDeleteCurrentObjectCommandReq {
                     pg_id: object_pg_id,
@@ -9610,9 +9686,18 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             };
-            let install = match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command, None)
-            {
+            if let Err(error) = require_valid_route() {
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
+                return Err(ObjectPgActionError::Store(error));
+            }
+            let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
+                pg_id,
+                bucket,
+                &command,
+                Some(effect_fence),
+            ) {
                 Ok(install) => install,
                 Err(error) => {
                     self.release_bucket_write_proof_for_object_metadata_command(
@@ -9641,23 +9726,37 @@ impl super::StorageCluster {
         }
     }
 
-    pub fn insert_current_delete_marker_if<T, E>(
+    pub(super) fn insert_current_delete_marker_if_with_route_validation<T, E>(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
+        route: super::ObjectMetadataMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         versioning: BucketVersioningState,
         owner: OwnerIdentity,
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(InsertCurrentDeleteMarkerIf);
-        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let super::ObjectMetadataMutationEffectRoute {
+            pg_id: object_pg_id,
+            bucket,
+            key,
+            requested_version_id,
+            effect_fence,
+        } = route;
+        if requested_version_id.is_some() {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "delete-marker insertion route unexpectedly contains a version id"
+                    .to_string(),
+            });
+        }
         let pg_id = object_pg_id.pg_id();
-        let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
         loop {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
+            let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::InsertDeleteMarker(marker) = command.payload() {
                     if marker.matches_request(bucket, key) {
+                        require_valid_route().map_err(ObjectPgActionError::Store)?;
                         let snapshot = storage_client.load_current_object_delete_snapshot(
                             object_pg_id,
                             bucket,
@@ -9667,6 +9766,7 @@ impl super::StorageCluster {
                             Ok(value) => value,
                             Err(error) => return Ok(Err(error)),
                         };
+                        require_valid_route().map_err(ObjectPgActionError::Store)?;
                         self.apply_exact_pending_object_metadata_command(
                             pg_id,
                             super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
@@ -9681,15 +9781,23 @@ impl super::StorageCluster {
                 continue;
             }
 
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             let bucket_write_reservation = match self
-                .acquire_bucket_write_proof_for_object_metadata_command(
+                .acquire_bucket_write_proof_for_object_metadata_command_with_effect_fence(
                     bucket,
                     key,
                     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+                    effect_fence,
                 )? {
                 Some(proof) => proof,
                 None => continue,
             };
+            if let Err(error) = require_valid_route() {
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
+                return Err(ObjectPgActionError::Store(error));
+            }
             let snapshot =
                 match storage_client.load_current_object_delete_snapshot(object_pg_id, bucket, key)
                 {
@@ -9711,6 +9819,12 @@ impl super::StorageCluster {
                 }
             };
             let null_snapshot = if versioning == BucketVersioningState::Suspended {
+                if let Err(error) = require_valid_route() {
+                    self.release_bucket_write_proof_for_object_metadata_command(
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(ObjectPgActionError::Store(error));
+                }
                 match storage_client.load_specific_object_delete_snapshot(
                     object_pg_id,
                     bucket,
@@ -9730,7 +9844,13 @@ impl super::StorageCluster {
             };
             let marker_vid = match versioning {
                 BucketVersioningState::Enabled => {
-                    match self.reserve_next_object_version(pg_id, bucket, key) {
+                    match self.reserve_next_object_version_with_effect_fence(
+                        pg_id,
+                        bucket,
+                        key,
+                        effect_fence,
+                        &mut require_valid_route,
+                    ) {
                         Ok(marker_vid) => marker_vid,
                         Err(error) => {
                             self.release_bucket_write_proof_for_object_metadata_command(
@@ -9802,9 +9922,18 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             };
-            let install = match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command, None)
-            {
+            if let Err(error) = require_valid_route() {
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
+                return Err(ObjectPgActionError::Store(error));
+            }
+            let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
+                pg_id,
+                bucket,
+                &command,
+                Some(effect_fence),
+            ) {
                 Ok(install) => install,
                 Err(error) => {
                     self.release_bucket_write_proof_for_object_metadata_command(
@@ -9828,6 +9957,71 @@ impl super::StorageCluster {
                 version_id: marker_vid,
             }));
         }
+    }
+
+    #[cfg(test)]
+    pub fn delete_specific_object_version_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
+        self.delete_specific_object_version_if_with_route_validation(
+            super::ObjectMetadataMutationEffectRoute {
+                pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                requested_version_id: Some(version_id),
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            action,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn delete_current_object_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
+        self.delete_current_object_if_with_route_validation(
+            super::ObjectMetadataMutationEffectRoute {
+                pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                requested_version_id: None,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            action,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn insert_current_delete_marker_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        versioning: BucketVersioningState,
+        owner: OwnerIdentity,
+        action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
+        self.insert_current_delete_marker_if_with_route_validation(
+            super::ObjectMetadataMutationEffectRoute {
+                pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                requested_version_id: None,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            versioning,
+            owner,
+            action,
+        )
     }
 
     pub fn expire_current_object_if_due<E>(

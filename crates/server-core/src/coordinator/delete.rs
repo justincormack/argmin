@@ -1,7 +1,9 @@
 use s3_types::VersionId;
 #[cfg(test)]
 use storage::ObjectLayout;
-use storage::{StorageCluster, StoredObject};
+#[cfg(test)]
+use storage::StorageCluster;
+use storage::{StorageClusterRouteAdmission, StoredObject};
 
 #[cfg(test)]
 use super::{
@@ -31,12 +33,13 @@ impl Coordinator {
         }
     }
 
-    pub(super) fn apply_authorized_delete_object(
+    pub(super) fn apply_authorized_delete_object_on_admitted_route(
         &self,
-        storage_node: &std::sync::Arc<StorageCluster>,
+        admission: &StorageClusterRouteAdmission,
         authorized: AuthorizedDeleteObject,
         cond: &DeleteCondition,
     ) -> Result<DeleteObjectResult, ServerError> {
+        self.require_storage_route_admission(admission)?;
         match authorized {
             AuthorizedDeleteObject::UnversionedDelete {
                 bucket,
@@ -46,8 +49,11 @@ impl Coordinator {
                 bucket_policy,
                 bucket_tags,
             } => {
-                let deleted = storage_node
-                    .delete_current_object_if(&bucket, &key, |stored| -> Result<(), ServerError> {
+                let route = admission
+                    .active_object_metadata_mutation_route(&bucket, &key, None)
+                    .map_err(super::map_store_error)?;
+                let deleted = route
+                    .delete_current_object_if(|stored| -> Result<(), ServerError> {
                         if !self.requester_can_delete_object_with_bucket_policy(
                             crate::coordinator::authz::BucketPolicyAccess {
                                 requester: &requester,
@@ -100,8 +106,7 @@ impl Coordinator {
                     }
                     #[cfg(not(test))]
                     let _ = layout;
-                    self.read_runtime_for_storage_node(std::sync::Arc::clone(storage_node))
-                        .enqueue_object_payload_reclaim_for(&bucket, &key, generation_id);
+                    route.enqueue_object_payload_reclaim(generation_id);
                 }
 
                 Ok(DeleteObjectResult {
@@ -131,12 +136,11 @@ impl Coordinator {
                     });
                 }
 
-                let deleted = storage_node
-                    .delete_specific_object_version_if(
-                        &bucket,
-                        &key,
-                        version_id,
-                        |stored| -> Result<(), ServerError> {
+                let route = admission
+                    .active_object_metadata_mutation_route(&bucket, &key, Some(version_id))
+                    .map_err(super::map_store_error)?;
+                let deleted = route
+                    .delete_specific_object_version_if(|stored| -> Result<(), ServerError> {
                             if !self.requester_can_delete_object_version_with_bucket_policy(
                                 crate::coordinator::authz::BucketPolicyAccess {
                                     requester: &requester,
@@ -187,8 +191,7 @@ impl Coordinator {
                                 Some(StoredObject::DeleteMarker(_)) => {}
                             }
                             Ok(())
-                        },
-                    )
+                        })
                     .map_err(Self::map_object_pg_action_error)??;
 
                 match deleted.deleted {
@@ -221,8 +224,7 @@ impl Coordinator {
                         }
                         #[cfg(not(test))]
                         let _ = layout;
-                        self.read_runtime_for_storage_node(std::sync::Arc::clone(storage_node))
-                            .enqueue_object_payload_reclaim_for(&bucket, &key, generation_id);
+                        route.enqueue_object_payload_reclaim(generation_id);
 
                         Ok(DeleteObjectResult {
                             version_id: Some(version_id),
@@ -240,10 +242,11 @@ impl Coordinator {
                 bucket_policy,
                 bucket_tags,
             } => {
-                let marker = storage_node
+                let route = admission
+                    .active_object_metadata_mutation_route(&bucket, &key, None)
+                    .map_err(super::map_store_error)?;
+                let marker = route
                     .insert_current_delete_marker_if(
-                        &bucket,
-                        &key,
                         bucket_info.versioning,
                         owner,
                         |stored| -> Result<(), ServerError> {
@@ -288,9 +291,29 @@ impl Coordinator {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn apply_authorized_delete_object(
+        &self,
+        _storage_node: &std::sync::Arc<StorageCluster>,
+        authorized: AuthorizedDeleteObject,
+        cond: &DeleteCondition,
+    ) -> Result<DeleteObjectResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.apply_authorized_delete_object_on_admitted_route(&admission, authorized, cond)
+    }
+
     /// Delete an object.
     pub fn delete_object(
         &self,
+        req: &DeleteObjectRequest,
+    ) -> Result<DeleteObjectResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.delete_object_on_admitted_route(&admission, req)
+    }
+
+    pub fn delete_object_on_admitted_route(
+        &self,
+        admission: &StorageClusterRouteAdmission,
         req: &DeleteObjectRequest,
     ) -> Result<DeleteObjectResult, ServerError> {
         observability::trace_scope!(
@@ -302,14 +325,23 @@ impl Coordinator {
             req.object.version_id,
             req.bypass_governance
         );
-        let storage_node = self.storage_node();
-        let authorized = self.authorize_delete_object_with_storage_node(&storage_node, req)?;
-        self.apply_authorized_delete_object(&storage_node, authorized, req.cond)
+        self.require_storage_route_admission(admission)?;
+        let authorized = self.authorize_delete_object_on_admitted_route(admission, req)?;
+        self.apply_authorized_delete_object_on_admitted_route(admission, authorized, req.cond)
     }
 
     /// Batch-delete objects.
     pub fn delete_objects(
         &self,
+        req: &DeleteObjectsRequest,
+    ) -> Result<DeleteObjectsResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.delete_objects_on_admitted_route(&admission, req)
+    }
+
+    pub fn delete_objects_on_admitted_route(
+        &self,
+        admission: &StorageClusterRouteAdmission,
         req: &DeleteObjectsRequest,
     ) -> Result<DeleteObjectsResult, ServerError> {
         observability::trace_scope!(
@@ -320,10 +352,10 @@ impl Coordinator {
             req.entries.len(),
             req.bypass_governance
         );
+        self.require_storage_route_admission(admission)?;
         let entries = req.entries;
-        let storage_node = self.storage_node();
-        self.checked_active_bucket_summary_for_storage_node(
-            &storage_node,
+        self.checked_active_bucket_summary_for_admitted_route(
+            admission,
             req.bucket.name_typed(),
             req.expected_bucket_owner(),
         )?;
@@ -333,9 +365,13 @@ impl Coordinator {
 
         for entry in entries {
             match self
-                .authorize_delete_objects_entry_with_storage_node(&storage_node, req, entry)
+                .authorize_delete_objects_entry_on_admitted_route(admission, req, entry)
                 .and_then(|authorized| {
-                    self.apply_authorized_delete_object(&storage_node, authorized, &entry.cond)
+                    self.apply_authorized_delete_object_on_admitted_route(
+                        admission,
+                        authorized,
+                        &entry.cond,
+                    )
                 }) {
                 Ok(result) => {
                     deleted.push(DeletedObject {

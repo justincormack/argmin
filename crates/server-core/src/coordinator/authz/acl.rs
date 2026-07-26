@@ -139,7 +139,7 @@ impl Coordinator {
 
     pub(super) fn authorize_delete_object_impl_non_boe(
         &self,
-        storage_node: &Arc<storage::StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         object: &ObjectVersionRequest<'_>,
         bypass_governance: bool,
         bucket_handle: NonBoeLoadedBucketHandle<'_>,
@@ -152,10 +152,22 @@ impl Coordinator {
         let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
         let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
+        let lookup_version_id = match bucket_info.versioning {
+            BucketVersioningState::Disabled => None,
+            BucketVersioningState::Enabled | BucketVersioningState::Suspended => request_version_id,
+        };
+        let route = admission
+            .active_object_read_route(
+                bucket,
+                key,
+                lookup_version_id,
+                ObjectReadSnapshotMode::MetadataOnly,
+            )
+            .map_err(crate::coordinator::map_store_error)?;
         #[cfg(test)]
         if self.should_probe_delete_object_lookup(bucket.as_str()) {
-            let object_pg_ready = storage_node
-                .try_probe_object_pg_available(bucket, key)
+            let object_pg_ready = route
+                .try_probe_object_pg_available()
                 .map_err(Self::map_object_pg_action_error)?;
             if !object_pg_ready {
                 return Err(ServerError::InternalError {
@@ -167,7 +179,7 @@ impl Coordinator {
 
         match (bucket_info.versioning, request_version_id) {
             (BucketVersioningState::Disabled, _) => {
-                match storage_node.load_object_if(bucket, key, None, |stored| {
+                match route.load_object_if(|stored| {
                     let allowed = self.requester_can_delete_object_with_bucket_policy(
                         BucketPolicyAccess {
                             requester,
@@ -223,7 +235,7 @@ impl Coordinator {
                 }
             }
             (_, Some(version_id)) => {
-                match storage_node.load_object_if(bucket, key, Some(version_id), |stored| {
+                match route.load_object_if(|stored| {
                     let allowed = self.requester_can_delete_object_with_bucket_policy(
                         BucketPolicyAccess {
                             requester,
@@ -306,7 +318,7 @@ impl Coordinator {
             (_, None) => {
                 let owner =
                     Self::effective_object_owner(&bucket_info, requester, PutObjectAcl::None);
-                match storage_node.load_object_if(bucket, key, None, |stored| {
+                match route.load_object_if(|stored| {
                     let allowed = self.requester_can_delete_object_with_bucket_policy(
                         BucketPolicyAccess {
                             requester,
@@ -371,15 +383,16 @@ impl Coordinator {
         &self,
         req: &DeleteObjectRequest<'_>,
     ) -> Result<AuthorizedDeleteObject, ServerError> {
-        self.authorize_delete_object_with_storage_node(&self.storage_node(), req)
+        let admission = self.admit_storage_route_for_request()?;
+        self.authorize_delete_object_on_admitted_route(&admission, req)
     }
 
-    pub(in crate::coordinator) fn authorize_delete_object_with_storage_node(
+    pub(in crate::coordinator) fn authorize_delete_object_on_admitted_route(
         &self,
-        storage_node: &Arc<storage::StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &DeleteObjectRequest<'_>,
     ) -> Result<AuthorizedDeleteObject, ServerError> {
-        self.authorize_delete_object_impl(storage_node, &req.object, req.bypass_governance)
+        self.authorize_delete_object_impl(admission, &req.object, req.bypass_governance)
     }
 
     #[cfg(test)]
@@ -388,12 +401,13 @@ impl Coordinator {
         req: &DeleteObjectsRequest<'_>,
         entry: &DeleteEntry,
     ) -> Result<AuthorizedDeleteObject, ServerError> {
-        self.authorize_delete_objects_entry_with_storage_node(&self.storage_node(), req, entry)
+        let admission = self.admit_storage_route_for_request()?;
+        self.authorize_delete_objects_entry_on_admitted_route(&admission, req, entry)
     }
 
-    pub(in crate::coordinator) fn authorize_delete_objects_entry_with_storage_node(
+    pub(in crate::coordinator) fn authorize_delete_objects_entry_on_admitted_route(
         &self,
-        storage_node: &Arc<storage::StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &DeleteObjectsRequest<'_>,
         entry: &DeleteEntry,
     ) -> Result<AuthorizedDeleteObject, ServerError> {
@@ -406,7 +420,7 @@ impl Coordinator {
             ),
             entry.version_id,
         );
-        self.authorize_delete_object_impl(storage_node, &object, req.bypass_governance)
+        self.authorize_delete_object_impl(admission, &object, req.bypass_governance)
     }
 
     #[cfg(test)]

@@ -74,13 +74,15 @@ use crate::storage_rpc::{
 use crate::traits::PgMetadataStore;
 use crate::types::{
     AclGrants, AdmittedRouteEffectFence, BucketInfo, BucketName, BucketSnapshot,
-    BucketSnapshotPair, BucketSnapshotRequest, BucketSubresourceKind, BucketWriteDrainRecord,
-    BucketWriteReservationRecord, CanonicalUserId, ClusterEpoch, CommitDirectPutObjectReq,
-    CreateStreamUploadReq, DirectPutCommitSnapshot, DirectPutWrittenSegment, EcShape,
-    FinalizeDirectPutObjectOutcome, GenerationId, ListedBucketMultipartUploads,
-    ListedBucketObjectVersions, ListedBucketObjects, MultipartUploadRecord, ObjectEncryption,
-    ObjectKey, ObjectLayout, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome,
-    ObjectRetention, ObjectSegmentRecord, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
+    BucketSnapshotPair, BucketSnapshotRequest, BucketSubresourceKind, BucketVersioningState,
+    BucketWriteDrainRecord, BucketWriteReservationRecord, CanonicalUserId, ClusterEpoch,
+    CommitDirectPutObjectReq, CreateStreamUploadReq, DeleteCurrentObjectOutcome,
+    DeleteSpecificObjectVersionOutcome, DirectPutCommitSnapshot, DirectPutWrittenSegment, EcShape,
+    FinalizeDirectPutObjectOutcome, GenerationId, InsertCurrentDeleteMarkerOutcome,
+    ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
+    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot,
+    ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord,
+    OwnerIdentity, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
     PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,
@@ -2380,6 +2382,57 @@ impl ActiveObjectMetadataMutationRoute<'_> {
                     ))
                 },
             )
+    }
+
+    pub fn delete_current_object_if<T, E>(
+        &self,
+        action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .delete_current_object_if_with_route_validation(
+                self.effect_route(),
+                || self.admission.require_valid_now(),
+                action,
+            )
+    }
+
+    pub fn delete_specific_object_version_if<T, E>(
+        &self,
+        action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .delete_specific_object_version_if_with_route_validation(
+                self.effect_route(),
+                || self.admission.require_valid_now(),
+                action,
+            )
+    }
+
+    pub fn insert_current_delete_marker_if<T, E>(
+        &self,
+        versioning: BucketVersioningState,
+        owner: OwnerIdentity,
+        action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .insert_current_delete_marker_if_with_route_validation(
+                self.effect_route(),
+                || self.admission.require_valid_now(),
+                versioning,
+                owner,
+                action,
+            )
+    }
+
+    pub fn enqueue_object_payload_reclaim(&self, generation_id: GenerationId) {
+        self.admission.cluster.enqueue_object_payload_reclaim(
+            &self.bucket,
+            &self.key,
+            generation_id,
+        );
     }
 
     #[cfg(feature = "test-hooks")]
@@ -7485,17 +7538,6 @@ impl StorageCluster {
         )
     }
 
-    fn try_set_pending_metadata_command_for_bucket_locked(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<Option<()>, StoreError> {
-        self.try_set_pending_metadata_command_for_bucket_locked_with_effect_fence(
-            pg_id, bucket, command, None,
-        )
-    }
-
     fn try_set_pending_metadata_command_for_bucket_locked_with_effect_fence(
         &self,
         pg_id: PgId,
@@ -7542,6 +7584,7 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         completion_admission: bool,
+        effect_fence: Option<AdmittedRouteEffectFence>,
         build_command: impl FnOnce(MetadataCommandId) -> MetadataCommandEnvelope,
     ) -> Result<ObjectPgPendingCommandInstall, ObjectPgActionError> {
         let pg_lock = self
@@ -7566,7 +7609,12 @@ impl StorageCluster {
             Err(error) => return Err(error),
         };
         let command = build_command(command_id);
-        match self.try_set_pending_metadata_command_for_bucket_locked(pg_id, bucket, &command) {
+        match self.try_set_pending_metadata_command_for_bucket_locked_with_effect_fence(
+            pg_id,
+            bucket,
+            &command,
+            effect_fence,
+        ) {
             Ok(Some(())) => Ok(ObjectPgPendingCommandInstall::Installed(command)),
             Ok(None) => {
                 let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? else {
@@ -9066,6 +9114,7 @@ impl StorageCluster {
                 pg_id,
                 bucket,
                 false,
+                None,
                 |command_id| {
                     MetadataCommandEnvelope::new(
                         command_id,
@@ -9242,7 +9291,32 @@ impl StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<VersionId, ObjectPgActionError> {
-        self.reserve_next_object_version_with_completion_admission(pg_id, bucket, key, false)
+        self.reserve_next_object_version_with_completion_admission(
+            pg_id,
+            bucket,
+            key,
+            false,
+            None,
+            || Ok(()),
+        )
+    }
+
+    fn reserve_next_object_version_with_effect_fence(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        effect_fence: AdmittedRouteEffectFence,
+        require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<VersionId, ObjectPgActionError> {
+        self.reserve_next_object_version_with_completion_admission(
+            pg_id,
+            bucket,
+            key,
+            false,
+            Some(effect_fence),
+            require_valid_route,
+        )
     }
 
     fn reserve_next_object_version_for_completion(
@@ -9251,7 +9325,14 @@ impl StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<VersionId, ObjectPgActionError> {
-        self.reserve_next_object_version_with_completion_admission(pg_id, bucket, key, true)
+        self.reserve_next_object_version_with_completion_admission(
+            pg_id,
+            bucket,
+            key,
+            true,
+            None,
+            || Ok(()),
+        )
     }
 
     fn reserve_next_object_version_with_completion_admission(
@@ -9260,12 +9341,15 @@ impl StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         completion_admission: bool,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<VersionId, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(ReserveNextObjectVersion);
         let mut work_budget = RequestWorkBudget::new(OBJECT_VERSION_RESERVATION_RETRY_BUDGET, None)
             .for_operation("reserve_object_version")
             .for_pg(pg_id);
         loop {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             work_budget
                 .check("object version reservation retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
@@ -9274,6 +9358,7 @@ impl StorageCluster {
                 {
                     let reserved_version_id = reservation.version_id;
                     let exact = ExactPendingObjectMetadataCommand::for_checked_request(&command);
+                    require_valid_route().map_err(ObjectPgActionError::Store)?;
                     let outcome = match self
                         .finish_exact_pending_object_metadata_command(pg_id, exact)
                     {
@@ -9334,6 +9419,7 @@ impl StorageCluster {
                 continue;
             }
 
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             let version_id = self.max_next_object_version_id_on_acting_set(
                 self.object_metadata_pg(bucket, key),
                 bucket,
@@ -9341,10 +9427,12 @@ impl StorageCluster {
                 completion_admission,
             )?;
             self.maybe_run_before_object_version_command_id_hook();
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             let command = match self.try_install_object_pg_pending_command_with_fresh_id(
                 pg_id,
                 bucket,
                 completion_admission,
+                effect_fence,
                 |command_id| {
                     MetadataCommandEnvelope::new(
                         command_id,
@@ -10205,6 +10293,7 @@ impl StorageCluster {
                 pg_id,
                 bucket,
                 false,
+                None,
                 |command_id| {
                     MetadataCommandEnvelope::new(
                         command_id,
@@ -12227,6 +12316,7 @@ impl StorageCluster {
                 pg_id,
                 bucket,
                 false,
+                None,
                 |command_id| {
                     self.maybe_run_after_stream_append_command_id_allocated_hook(command_id);
                     MetadataCommandEnvelope::new(

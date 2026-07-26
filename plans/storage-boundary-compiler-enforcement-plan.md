@@ -2813,6 +2813,42 @@ Sixtieth Phase 3 review correction:
   checker, and workspace-wide strict Clippy pass. The full parallel workspace
   suite passes (7,580 tests).
 
+Sixty-first Phase 3 slice:
+
+- DeleteObject and DeleteObjects now consume the buffered request's existing
+  `StorageClusterRouteAdmission` for bucket policy context, object-subject
+  authorization, and mutation. DeleteObjects retains that one admission over
+  its complete entry sequence. Direct coordinator/test wrappers acquire an
+  admission before entering the same production paths.
+- `ActiveObjectMetadataMutationRoute` now owns the current-version delete,
+  specific-version delete, and delete-marker insertion boundaries. Each route
+  is fixed to one bucket, key, optional version, object-metadata PG,
+  originating cluster, and frontend publication domain. The raw storage
+  publishers revalidate that route before reservation, snapshot, command
+  construction, and pending-slot installation; their former unfenced entry
+  points remain test-only.
+- the DeleteObject bucket-write reservation, delete command, delete-marker
+  command, and enabled-versioning marker-version reservation all carry the
+  admission's immutable `AdmittedRouteEffectFence` to their deepest durable
+  insertion boundary. Exact installed-command application and payload-reclaim
+  enqueue remain convergence after that boundary.
+- deterministic regressions renew only the raw same-epoch route, expire the
+  captured admission in the pending-install hook, and prove unversioned
+  deletion, enabled-versioning marker insertion, and every DeleteObjects entry
+  fail with `OperationAborted` without changing object state. The shared
+  same-cluster/different-publication-domain matrix now rejects both delete
+  operations while preserving its object canary.
+- the existing post-install epoch-transition delete regression now publishes
+  asynchronously: publication reaches draining behind the admitted request,
+  the already-installed delete converges exactly once, and publication
+  completes only after request admission is released.
+- remaining buffered coordinator workflows and capability requirements on the
+  node-client traits remain open in Phase 3.
+- 36 focused coordinator delete/auth regressions, 30 storage object-command
+  regressions, and 25 HTTP delete regressions pass. Formatting, diff
+  validation, the storage boundary checker, and workspace-wide strict Clippy
+  pass. The full parallel workspace suite passes (7,592 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

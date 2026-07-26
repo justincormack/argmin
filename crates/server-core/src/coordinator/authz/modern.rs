@@ -668,7 +668,7 @@ impl Coordinator {
 
     pub(super) fn authorize_delete_object_impl_boe(
         &self,
-        storage_node: &Arc<storage::StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         object: &ObjectVersionRequest<'_>,
         bypass_governance: bool,
         bucket_handle: BoeLoadedBucketHandle<'_>,
@@ -684,10 +684,22 @@ impl Coordinator {
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
         let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
         let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
+        let lookup_version_id = match bucket_info.versioning {
+            BucketVersioningState::Disabled => None,
+            BucketVersioningState::Enabled | BucketVersioningState::Suspended => request_version_id,
+        };
+        let route = admission
+            .active_object_read_route(
+                bucket,
+                key,
+                lookup_version_id,
+                ObjectReadSnapshotMode::MetadataOnly,
+            )
+            .map_err(crate::coordinator::map_store_error)?;
         #[cfg(test)]
         if self.should_probe_delete_object_lookup(bucket.as_str()) {
-            let object_pg_ready = storage_node
-                .try_probe_object_pg_available(bucket, key)
+            let object_pg_ready = route
+                .try_probe_object_pg_available()
                 .map_err(Self::map_object_pg_action_error)?;
             if !object_pg_ready {
                 return Err(ServerError::InternalError {
@@ -699,7 +711,7 @@ impl Coordinator {
 
         match (bucket_info.versioning, request_version_id) {
             (BucketVersioningState::Disabled, _) => {
-                match storage_node.load_object_if(bucket, key, None, |stored| {
+                match route.load_object_if(|stored| {
                     let allowed = delete_object_authorization_with_bucket_policy(
                         requester,
                         modern_bucket,
@@ -751,7 +763,7 @@ impl Coordinator {
                 }
             }
             (_, Some(version_id)) => {
-                match storage_node.load_object_if(bucket, key, Some(version_id), |stored| {
+                match route.load_object_if(|stored| {
                     let allowed = delete_object_authorization_with_bucket_policy(
                         requester,
                         modern_bucket,
@@ -830,7 +842,7 @@ impl Coordinator {
             (_, None) => {
                 let owner =
                     Self::effective_object_owner(&bucket_info, requester, PutObjectAcl::None);
-                match storage_node.load_object_if(bucket, key, None, |stored| {
+                match route.load_object_if(|stored| {
                     let allowed = delete_object_authorization_with_bucket_policy(
                         requester,
                         modern_bucket,

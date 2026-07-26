@@ -15,8 +15,8 @@ use s3_types::{
 use storage::{
     BucketName, BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls,
     BucketState, ManagedEncryptionAlgorithm, MultipartUploadRecord, ObjectKey,
-    ObjectReadSnapshotMode, OwnerIdentity, PublicAccessBlockConfig, StorageCluster, StoredObject,
-    UploadState,
+    ObjectReadSnapshotMode, OwnerIdentity, PublicAccessBlockConfig, StorageCluster,
+    StorageClusterRouteAdmission, StoredObject, UploadState,
 };
 
 use self::acl::NonBoeLoadedBucketHandle;
@@ -311,26 +311,27 @@ impl Coordinator {
 
     fn authorize_delete_object_impl(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &StorageClusterRouteAdmission,
         object: &ObjectVersionRequest<'_>,
         bypass_governance: bool,
     ) -> Result<AuthorizedDeleteObject, ServerError> {
-        let bucket_handle = self.load_bucket_handle_for_object_policy_read_with_storage_node(
-            storage_node,
+        self.require_storage_route_admission(admission)?;
+        let bucket_handle = self.load_bucket_handle_for_object_policy_read_on_admitted_route(
+            admission,
             object.bucket_name_typed(),
             object.expected_bucket_owner(),
         )?;
         match ObjectAuthLoadedBucketHandle::classify(&bucket_handle) {
             ObjectAuthLoadedBucketHandle::Boe(bucket_handle) => self
                 .authorize_delete_object_impl_boe(
-                    storage_node,
+                    admission,
                     object,
                     bypass_governance,
                     bucket_handle,
                 ),
             ObjectAuthLoadedBucketHandle::NonBoe(bucket_handle) => self
                 .authorize_delete_object_impl_non_boe(
-                    storage_node,
+                    admission,
                     object,
                     bypass_governance,
                     bucket_handle,
