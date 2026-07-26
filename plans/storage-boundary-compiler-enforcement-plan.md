@@ -2717,6 +2717,37 @@ Fifty-eighth Phase 3 slice:
   the storage boundary checker, and workspace-wide strict Clippy pass. The full
   parallel workspace suite passes (7,575 tests).
 
+Fifty-ninth Phase 3 slice:
+
+- GetObjectTagging, GetObjectAcl, GetObjectRetention, and GetObjectLegalHold
+  now consume the buffered request's existing `StorageClusterRouteAdmission`
+  for bucket policy context and exact object-subject loading. Their production
+  HTTP paths cannot resample the renewable runtime-map handle; direct test and
+  test-support wrappers acquire admission before entering the same production
+  methods.
+- `ActiveObjectReadRoute` now exposes a metadata-only subject load fixed to
+  its bucket, key, requested version, object-metadata PG, originating cluster,
+  and frontend publication domain. It rechecks the request's immutable
+  deadline immediately before node access and confers no mutation authority.
+  GetObjectTagging returns the tags from that same authorized subject, avoiding
+  a separate unadmitted tag read while preserving one coherent linearization.
+- the shared captured-deadline matrix now covers all four subresources, and
+  their same-cluster/different-publication-domain matrix includes positive
+  local canaries before rejecting foreign admission. A direct capability
+  regression renews only the raw route and proves metadata subject loading
+  still rejects the expired captured deadline. The existing object-metadata
+  publication test now starts its read-side publication asynchronously and
+  proves it waits behind admission. The existing same-PG tagging and retention
+  regressions now probe availability through the admitted object-read route
+  immediately before subject loading, proving bucket policy-context loading
+  has released the object-PG lock.
+- object mutations, the remaining buffered coordinator workflows, and
+  capability requirements on the node-client traits remain open in Phase 3.
+- the focused deadline/domain/publication regressions and 28 focused
+  coordinator/HTTP object-subresource tests pass. Formatting, diff validation,
+  the storage boundary checker, and workspace-wide strict Clippy pass. The full
+  parallel workspace suite passes (7,577 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

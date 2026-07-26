@@ -8334,13 +8334,35 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<T, E>, ObjectPgActionError> {
-        let object_pg_id = self.object_metadata_pg(bucket, key);
-        let pg_id = object_pg_id.pg_id();
-        let subject = self
+        let route = super::ObjectReadMetadataRoute {
+            bucket,
+            key,
+            version_id,
+            snapshot_mode: ObjectReadSnapshotMode::MetadataOnly,
+            pg_id: self.object_metadata_pg(bucket, key),
+        };
+        self.load_object_if_on_route(&route, action, || Ok(()))
+    }
+
+    pub(super) fn load_object_if_on_route<T, E>(
+        &self,
+        route: &super::ObjectReadMetadataRoute<'_>,
+        action: impl FnOnce(&StoredObject) -> Result<T, E>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<Result<T, E>, ObjectPgActionError> {
+        let pg_id = route.pg_id.pg_id();
+        require_valid_route()?;
+        let object_read_client = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_read_metadata_client()
-            .load_object_read_auth_subject(object_pg_id, bucket, key, version_id)?;
+            .object_read_metadata_client();
+        require_valid_route()?;
+        let subject = object_read_client.load_object_read_auth_subject(
+            route.pg_id,
+            route.bucket,
+            route.key,
+            route.version_id,
+        )?;
         Ok(action(&subject.stored))
     }
 

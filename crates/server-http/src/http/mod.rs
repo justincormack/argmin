@@ -2729,15 +2729,10 @@ impl HttpFrontend {
             S3Operation::GetObjectRetention { bucket, key } => {
                 let vid = parse_version_id(req)?;
                 let requester = self.requester_from_auth(auth, req)?;
-                let retention = self
-                    .coordinator
-                    .get_object_retention(&object_version_request(
-                        &bucket,
-                        &key,
-                        vid,
-                        requester,
-                        expected_bucket_owner,
-                    )?)?;
+                let retention = self.coordinator.get_object_retention_on_admitted_route(
+                    storage_route_admission,
+                    &object_version_request(&bucket, &key, vid, requester, expected_bucket_owner)?,
+                )?;
                 Ok(S3Response::get_object_retention(retention))
             }
             S3Operation::PutObjectLegalHold { bucket, key } => {
@@ -2765,15 +2760,10 @@ impl HttpFrontend {
             S3Operation::GetObjectLegalHold { bucket, key } => {
                 let vid = parse_version_id(req)?;
                 let requester = self.requester_from_auth(auth, req)?;
-                let legal_hold =
-                    self.coordinator
-                        .get_object_legal_hold(&object_version_request(
-                            &bucket,
-                            &key,
-                            vid,
-                            requester,
-                            expected_bucket_owner,
-                        )?)?;
+                let legal_hold = self.coordinator.get_object_legal_hold_on_admitted_route(
+                    storage_route_admission,
+                    &object_version_request(&bucket, &key, vid, requester, expected_bucket_owner)?,
+                )?;
                 Ok(S3Response::get_object_legal_hold(legal_hold))
             }
             S3Operation::PutObjectTagging { bucket, key } => {
@@ -2798,7 +2788,8 @@ impl HttpFrontend {
             S3Operation::GetObjectTagging { bucket, key } => {
                 let vid = parse_version_id(req)?;
                 let requester = self.requester_from_auth(auth, req)?;
-                if let Some(tags_xml) = self.coordinator.get_object_tags(
+                if let Some(tags_xml) = self.coordinator.get_object_tags_on_admitted_route(
+                    storage_route_admission,
                     &object_version_request(&bucket, &key, vid, requester, expected_bucket_owner)?,
                 )? {
                     let mut tags = xml::TagSet::parse_tagging_xml(tags_xml.as_bytes(), 10)?;
@@ -2826,13 +2817,16 @@ impl HttpFrontend {
             S3Operation::GetObjectAcl { bucket, key } => {
                 let version_id = parse_version_id(req)?;
                 let requester = self.requester_from_auth(auth, req)?;
-                let result = self.coordinator.get_object_acl(&object_version_request(
-                    &bucket,
-                    &key,
-                    version_id,
-                    requester,
-                    expected_bucket_owner,
-                )?)?;
+                let result = self.coordinator.get_object_acl_on_admitted_route(
+                    storage_route_admission,
+                    &object_version_request(
+                        &bucket,
+                        &key,
+                        version_id,
+                        requester,
+                        expected_bucket_owner,
+                    )?,
+                )?;
                 let (owner_display_name, grants) = self.render_acl_grants(
                     &result.owner_principal,
                     &result.owner_canonical_id,

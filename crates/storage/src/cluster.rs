@@ -2096,6 +2096,27 @@ struct ObjectReadMetadataRoute<'a> {
 }
 
 impl ActiveObjectReadRoute<'_> {
+    /// Load the authorization subject for this exact object route.
+    ///
+    /// This is the narrow metadata-only path used by object subresource
+    /// reads. It rechecks the immutable admitted deadline immediately before
+    /// the storage-node access and does not confer mutation authority.
+    pub fn load_object_if<T, E>(
+        &self,
+        action: impl FnOnce(&StoredObject) -> Result<T, E>,
+    ) -> Result<Result<T, E>, ObjectPgActionError> {
+        let route = ObjectReadMetadataRoute {
+            bucket: &self.bucket,
+            key: &self.key,
+            version_id: self.version_id,
+            snapshot_mode: self.snapshot_mode,
+            pg_id: self.pg_id,
+        };
+        self.admission
+            .cluster
+            .load_object_if_on_route(&route, action, || self.admission.require_valid_now())
+    }
+
     pub fn load_object_read_snapshot_if<T, E>(
         &self,
         action: impl FnMut(&StoredObject) -> Result<T, E>,

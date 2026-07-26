@@ -319,6 +319,13 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
             max_parts: 1_000,
             sse_customer: None,
         };
+        let object_metadata_request = object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        );
         for (operation, result) in [
             (
                 "ListBuckets",
@@ -490,6 +497,30 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
                 "GetObjectAttributes",
                 coord
                     .get_object_attributes_on_admitted_route(&admission, &object_attributes_request)
+                    .map(|_| ()),
+            ),
+            (
+                "GetObjectTagging",
+                coord
+                    .get_object_tags_on_admitted_route(&admission, &object_metadata_request)
+                    .map(|_| ()),
+            ),
+            (
+                "GetObjectAcl",
+                coord
+                    .get_object_acl_on_admitted_route(&admission, &object_metadata_request)
+                    .map(|_| ()),
+            ),
+            (
+                "GetObjectRetention",
+                coord
+                    .get_object_retention_on_admitted_route(&admission, &object_metadata_request)
+                    .map(|_| ()),
+            ),
+            (
+                "GetObjectLegalHold",
+                coord
+                    .get_object_legal_hold_on_admitted_route(&admission, &object_metadata_request)
                     .map(|_| ()),
             ),
         ] {
@@ -782,6 +813,14 @@ fn object_snapshot_route_rechecks_deadline_after_warm_bucket_fast_path() {
             storage::ObjectReadSnapshotMode::MetadataOnly,
         )
         .unwrap();
+    clock.set(6_000);
+    let metadata_error = route.load_object_if(|_| Ok::<(), ()>(())).unwrap_err();
+    assert!(matches!(
+        metadata_error,
+        storage::ObjectPgActionError::Store(storage::StoreError::RouteMapExpired { .. })
+    ));
+    clock.set(1_000);
+
     let action_clock = Arc::clone(&clock);
     let snapshot_error = route
         .load_object_read_snapshot_if(move |_| {
@@ -1138,9 +1177,16 @@ fn object_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
     assert!(Arc::ptr_eq(&local.storage_node(), &foreign.storage_node()));
     assert!(!local.shares_storage_route_admission_with(&foreign));
 
-    foreign
-        .create_bucket_for_owner("default-owner", "bucket", false)
-        .unwrap();
+    create_bucket_for_owner_with_flags(
+        &foreign,
+        "default-owner",
+        &CanonicalUserId::from_principal("default-owner"),
+        "bucket",
+        false,
+        false,
+        true,
+    )
+    .unwrap();
     test_helpers::put_object(
         &foreign,
         &PutObjectRequest {
@@ -1195,6 +1241,8 @@ fn object_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         max_parts: 1_000,
         sse_customer: None,
     };
+    let metadata_request =
+        object_version_request_with_expected_owner("bucket", "key", None, test_requester(), None);
 
     let foreign_admission = foreign.admit_storage_route_for_request().unwrap();
     foreign
@@ -1205,6 +1253,18 @@ fn object_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         .unwrap();
     foreign
         .get_object_attributes_on_admitted_route(&foreign_admission, &attributes_request)
+        .unwrap();
+    foreign
+        .get_object_tags_on_admitted_route(&foreign_admission, &metadata_request)
+        .unwrap();
+    foreign
+        .get_object_acl_on_admitted_route(&foreign_admission, &metadata_request)
+        .unwrap();
+    foreign
+        .get_object_retention_on_admitted_route(&foreign_admission, &metadata_request)
+        .unwrap();
+    foreign
+        .get_object_legal_hold_on_admitted_route(&foreign_admission, &metadata_request)
         .unwrap();
 
     for (operation, result) in [
@@ -1224,6 +1284,30 @@ fn object_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
             "GetObjectAttributes",
             local
                 .get_object_attributes_on_admitted_route(&foreign_admission, &attributes_request)
+                .map(|_| ()),
+        ),
+        (
+            "GetObjectTagging",
+            local
+                .get_object_tags_on_admitted_route(&foreign_admission, &metadata_request)
+                .map(|_| ()),
+        ),
+        (
+            "GetObjectAcl",
+            local
+                .get_object_acl_on_admitted_route(&foreign_admission, &metadata_request)
+                .map(|_| ()),
+        ),
+        (
+            "GetObjectRetention",
+            local
+                .get_object_retention_on_admitted_route(&foreign_admission, &metadata_request)
+                .map(|_| ()),
+        ),
+        (
+            "GetObjectLegalHold",
+            local
+                .get_object_legal_hold_on_admitted_route(&foreign_admission, &metadata_request)
                 .map(|_| ()),
         ),
     ] {
@@ -2030,6 +2114,10 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
         &[0, 1],
     ));
     let hook_handle = handle.clone();
+    let hook_invocations = Arc::new(AtomicUsize::new(0));
+    let hook_invocations_for_hook = Arc::clone(&hook_invocations);
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -2037,7 +2125,17 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
     let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_object_metadata_policy_context: Some(Arc::new(move || {
-            hook_handle.install(Arc::clone(&candidate)).unwrap();
+            if hook_invocations_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                hook_handle.install(Arc::clone(&candidate)).unwrap();
+                return;
+            }
+            let publishing_handle = hook_handle.clone();
+            let publishing_candidate = Arc::clone(&candidate);
+            let thread = thread::spawn(move || {
+                publishing_handle.install(publishing_candidate).unwrap();
+            });
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
         })),
         ..BucketWriteHandleTestHooks::default()
     });
@@ -2059,6 +2157,14 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
     let tags = get_object_tags_test(&coord, "bucket", "key", None, test_requester(), None)
         .unwrap()
         .unwrap();
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("GetObjectTagging hook should start route publication")
+        .join()
+        .unwrap();
+    assert_eq!(hook_invocations.load(Ordering::SeqCst), 2);
     assert!(tags.contains("<Key>pin</Key>"));
     assert!(tags.contains("<Value>metadata</Value>"));
 }

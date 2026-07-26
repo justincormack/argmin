@@ -2,7 +2,10 @@ use s3_types::{
     AclGrants, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention,
     RetentionPeriod, StoredLegalHoldStatus, VersionId,
 };
-use storage::{BucketName, ObjectKey, ObjectLockState, StorageCluster};
+use storage::{
+    BucketName, ObjectKey, ObjectLockState, ObjectReadSnapshotMode, StorageCluster,
+    StorageClusterRouteAdmission,
+};
 
 use super::authz::BucketPolicyAccess;
 use super::{
@@ -47,6 +50,35 @@ impl Coordinator {
         Ok(context)
     }
 
+    fn load_object_metadata_policy_context_on_admitted_route(
+        &self,
+        admission: &StorageClusterRouteAdmission,
+        bucket: &BucketName,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<ObjectMetadataPolicyContext, ServerError> {
+        self.require_storage_route_admission(admission)?;
+        let loaded_bucket = self.load_bucket_handle_for_object_policy_read_on_admitted_route(
+            admission,
+            bucket,
+            expected_bucket_owner,
+        )?;
+        let bucket_info = loaded_bucket.bucket().clone();
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&loaded_bucket)?;
+        let bucket_tags = if bucket_policy.is_some() {
+            Self::loaded_bucket_tags_for_policy(&loaded_bucket)?
+        } else {
+            None
+        };
+        let context = ObjectMetadataPolicyContext {
+            bucket_info,
+            bucket_policy,
+            bucket_tags,
+        };
+        #[cfg(test)]
+        self.maybe_run_object_metadata_policy_context_hook(bucket.as_str());
+        Ok(context)
+    }
+
     fn map_object_metadata_access_error(
         bucket: &BucketName,
         key: &ObjectKey,
@@ -55,6 +87,37 @@ impl Coordinator {
         error: storage::ObjectPgActionError,
     ) -> ServerError {
         Self::map_object_read_snapshot_error(bucket, key, version_id, can_discover_missing, error)
+    }
+
+    #[cfg(test)]
+    fn probe_object_metadata_access_on_admitted_route(
+        &self,
+        route: &storage::ActiveObjectReadRoute<'_>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        can_discover_missing: bool,
+    ) -> Result<(), ServerError> {
+        if !self.should_probe_object_metadata_access(bucket.as_str()) {
+            return Ok(());
+        }
+        let object_pg_ready = route.try_probe_object_pg_available().map_err(|error| {
+            Self::map_object_metadata_access_error(
+                bucket,
+                key,
+                version_id,
+                can_discover_missing,
+                error,
+            )
+        })?;
+        if object_pg_ready {
+            Ok(())
+        } else {
+            Err(ServerError::InternalError {
+                reason: "test probe: object pg still locked before object metadata access"
+                    .to_string(),
+            })
+        }
     }
 
     pub(super) fn ensure_object_lock_bucket(bucket: &BucketSummary) -> Result<(), ServerError> {
@@ -438,6 +501,15 @@ impl Coordinator {
         &self,
         req: &ObjectVersionRequest<'_>,
     ) -> Result<Option<ObjectRetention>, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_object_retention_on_admitted_route(&admission, req)
+    }
+
+    pub fn get_object_retention_on_admitted_route(
+        &self,
+        admission: &StorageClusterRouteAdmission,
+        req: &ObjectVersionRequest<'_>,
+    ) -> Result<Option<ObjectRetention>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_retention",
@@ -448,40 +520,36 @@ impl Coordinator {
         );
         let bucket = req.object.bucket_name_typed();
         let key = req.object.key_typed();
-        let storage_node = self.storage_node();
+        self.require_storage_route_admission(admission)?;
         let ObjectMetadataPolicyContext {
             bucket_info,
             bucket_policy,
             bucket_tags,
-        } = self.load_object_metadata_policy_context(
-            &storage_node,
+        } = self.load_object_metadata_policy_context_on_admitted_route(
+            admission,
             bucket,
             req.expected_bucket_owner(),
         )?;
         let can_discover_missing =
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
+        let route = admission
+            .active_object_read_route(
+                bucket,
+                key,
+                req.version_id,
+                ObjectReadSnapshotMode::MetadataOnly,
+            )
+            .map_err(super::map_store_error)?;
         #[cfg(test)]
-        if self.should_probe_object_metadata_access(bucket.as_str()) {
-            let object_pg_ready = storage_node
-                .try_probe_object_pg_available(bucket, key)
-                .map_err(|error| {
-                    Self::map_object_metadata_access_error(
-                        bucket,
-                        key,
-                        req.version_id,
-                        can_discover_missing,
-                        error,
-                    )
-                })?;
-            if !object_pg_ready {
-                return Err(ServerError::InternalError {
-                    reason: "test probe: object pg still locked before object metadata access"
-                        .to_string(),
-                });
-            }
-        }
-        storage_node
-            .get_object_retention_if(bucket, key, req.version_id, |stored| {
+        self.probe_object_metadata_access_on_admitted_route(
+            &route,
+            bucket,
+            key,
+            req.version_id,
+            can_discover_missing,
+        )?;
+        route
+            .load_object_if(|stored| {
                 if !self.requester_can_manage_object_lock_with_bucket_policy(
                     req.object.requester(),
                     &bucket_info,
@@ -568,6 +636,15 @@ impl Coordinator {
         &self,
         req: &ObjectVersionRequest<'_>,
     ) -> Result<Option<LegalHoldStatus>, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_object_legal_hold_on_admitted_route(&admission, req)
+    }
+
+    pub fn get_object_legal_hold_on_admitted_route(
+        &self,
+        admission: &StorageClusterRouteAdmission,
+        req: &ObjectVersionRequest<'_>,
+    ) -> Result<Option<LegalHoldStatus>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_legal_hold",
@@ -578,20 +655,36 @@ impl Coordinator {
         );
         let bucket = req.object.bucket_name_typed();
         let key = req.object.key_typed();
-        let storage_node = self.storage_node();
+        self.require_storage_route_admission(admission)?;
         let ObjectMetadataPolicyContext {
             bucket_info,
             bucket_policy,
             bucket_tags,
-        } = self.load_object_metadata_policy_context(
-            &storage_node,
+        } = self.load_object_metadata_policy_context_on_admitted_route(
+            admission,
             bucket,
             req.expected_bucket_owner(),
         )?;
         let can_discover_missing =
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
-        storage_node
-            .get_object_legal_hold_if(bucket, key, req.version_id, |stored| {
+        let route = admission
+            .active_object_read_route(
+                bucket,
+                key,
+                req.version_id,
+                ObjectReadSnapshotMode::MetadataOnly,
+            )
+            .map_err(super::map_store_error)?;
+        #[cfg(test)]
+        self.probe_object_metadata_access_on_admitted_route(
+            &route,
+            bucket,
+            key,
+            req.version_id,
+            can_discover_missing,
+        )?;
+        route
+            .load_object_if(|stored| {
                 if !self.requester_can_manage_object_lock_with_bucket_policy(
                     req.object.requester(),
                     &bucket_info,
@@ -621,6 +714,15 @@ impl Coordinator {
         &self,
         req: &ObjectVersionRequest<'_>,
     ) -> Result<Option<String>, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_object_tags_on_admitted_route(&admission, req)
+    }
+
+    pub fn get_object_tags_on_admitted_route(
+        &self,
+        admission: &StorageClusterRouteAdmission,
+        req: &ObjectVersionRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_tags",
@@ -630,40 +732,36 @@ impl Coordinator {
         );
         let bucket = req.object.bucket_name_typed();
         let key = req.object.key_typed();
-        let storage_node = self.storage_node();
+        self.require_storage_route_admission(admission)?;
         let ObjectMetadataPolicyContext {
             bucket_info,
             bucket_policy,
             bucket_tags,
-        } = self.load_object_metadata_policy_context(
-            &storage_node,
+        } = self.load_object_metadata_policy_context_on_admitted_route(
+            admission,
             bucket,
             req.expected_bucket_owner(),
         )?;
         let can_discover_missing =
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
+        let route = admission
+            .active_object_read_route(
+                bucket,
+                key,
+                req.version_id,
+                ObjectReadSnapshotMode::MetadataOnly,
+            )
+            .map_err(super::map_store_error)?;
         #[cfg(test)]
-        if self.should_probe_object_metadata_access(bucket.as_str()) {
-            let object_pg_ready = storage_node
-                .try_probe_object_pg_available(bucket, key)
-                .map_err(|error| {
-                    Self::map_object_metadata_access_error(
-                        bucket,
-                        key,
-                        req.version_id,
-                        can_discover_missing,
-                        error,
-                    )
-                })?;
-            if !object_pg_ready {
-                return Err(ServerError::InternalError {
-                    reason: "test probe: object pg still locked before object metadata access"
-                        .to_string(),
-                });
-            }
-        }
-        storage_node
-            .get_object_tags_if(bucket, key, req.version_id, |stored| {
+        self.probe_object_metadata_access_on_admitted_route(
+            &route,
+            bucket,
+            key,
+            req.version_id,
+            can_discover_missing,
+        )?;
+        route
+            .load_object_if(|stored| {
                 if !self.requester_can_manage_object_tags_with_bucket_policy(
                     BucketPolicyAccess {
                         requester: req.object.requester(),
@@ -680,7 +778,8 @@ impl Coordinator {
                 if stored.is_delete_marker() {
                     return Err(ServerError::MethodNotAllowed);
                 }
-                Ok(stored.version_id())
+                let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+                Ok(live.tags.clone().map(String::from))
             })
             .map_err(|error| {
                 Self::map_object_metadata_access_error(
@@ -751,6 +850,15 @@ impl Coordinator {
         &self,
         req: &ObjectVersionRequest<'_>,
     ) -> Result<GetObjectAclResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_object_acl_on_admitted_route(&admission, req)
+    }
+
+    pub fn get_object_acl_on_admitted_route(
+        &self,
+        admission: &StorageClusterRouteAdmission,
+        req: &ObjectVersionRequest<'_>,
+    ) -> Result<GetObjectAclResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_acl",
@@ -761,20 +869,36 @@ impl Coordinator {
         );
         let bucket = req.object.bucket_name_typed();
         let key = req.object.key_typed();
-        let storage_node = self.storage_node();
+        self.require_storage_route_admission(admission)?;
         let ObjectMetadataPolicyContext {
             bucket_info,
             bucket_policy,
             bucket_tags,
-        } = self.load_object_metadata_policy_context(
-            &storage_node,
+        } = self.load_object_metadata_policy_context_on_admitted_route(
+            admission,
             bucket,
             req.expected_bucket_owner(),
         )?;
         let can_discover_missing =
             Self::requester_can_discover_missing_object_acl(req.object.requester(), &bucket_info);
-        storage_node
-            .load_object_if(bucket, key, req.version_id, |stored| {
+        let route = admission
+            .active_object_read_route(
+                bucket,
+                key,
+                req.version_id,
+                ObjectReadSnapshotMode::MetadataOnly,
+            )
+            .map_err(super::map_store_error)?;
+        #[cfg(test)]
+        self.probe_object_metadata_access_on_admitted_route(
+            &route,
+            bucket,
+            key,
+            req.version_id,
+            can_discover_missing,
+        )?;
+        route
+            .load_object_if(|stored| {
                 if !self.requester_can_read_object_acl_with_bucket_policy(
                     req.object.requester(),
                     &bucket_info,

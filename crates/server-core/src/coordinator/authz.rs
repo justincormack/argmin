@@ -1853,6 +1853,27 @@ impl Coordinator {
         )
     }
 
+    pub(super) fn load_bucket_handle_for_object_policy_read_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        bucket: &BucketName,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        self.require_storage_route_admission(admission)?;
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+
+        #[cfg(test)]
+        maybe_run_bucket_policy_storage_load_hook(bucket.as_str());
+        self.bucket_handle_loader().load_bucket_on_admitted_route(
+            admission,
+            bucket,
+            expected_bucket_owner,
+            request,
+        )
+    }
+
     #[cfg(test)]
     fn load_bucket_handle_for_modern_object_read_with_storage_node(
         &self,
