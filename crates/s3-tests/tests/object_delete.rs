@@ -143,14 +143,20 @@ async fn race_conditional_delete_objects_with_put(
     let put_key = key.to_string();
     let put_task = tokio::spawn(async move {
         barrier.wait().await;
-        put_client
-            .put_object()
-            .bucket(put_bucket)
-            .key(put_key)
-            .metadata("replacement-state", replacement_state)
-            .body(ByteStream::from_static(replacement_body))
-            .send()
-            .await
+        // Either side of the deliberate overlap can receive AWS's transient
+        // whole-request contention response. Retrying only OperationAborted
+        // preserves the race while ensuring the unconditional replacement
+        // eventually establishes the state inspected below.
+        s3_tests::retrying_exact_operation_aborted_result(|| {
+            let request = put_client
+                .put_object()
+                .bucket(put_bucket.clone())
+                .key(put_key.clone())
+                .metadata("replacement-state", replacement_state)
+                .body(ByteStream::from_static(replacement_body));
+            async move { request.send().await }
+        })
+        .await
     });
     let (delete, put) = tokio::join!(delete_task, put_task);
     (delete.unwrap(), put.unwrap())
