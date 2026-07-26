@@ -2,6 +2,11 @@
 
 set -euo pipefail
 
+# The checked inventories are compared as ordered text. Locale collation can
+# order `cluster.rs` and `cluster/request_ops.rs` differently, so make every
+# sort and character-class match deterministic across caller environments.
+export LC_ALL=C
+
 if ! command -v rg >/dev/null 2>&1; then
     echo "error: rg is required for scripts/check-storage-cluster-boundaries" >&2
     exit 1
