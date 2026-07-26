@@ -16013,6 +16013,14 @@ fn write_control_plane_runtime_map_diagnostics(
     write_u64(out, raft_wal.directory_sync_total);
     write_u64(out, raft_wal.directory_sync_us_total);
     write_u64(out, raft_wal.directory_sync_us_max);
+    write_u64(out, raft_wal.durability_queue_depth);
+    write_u64(out, raft_wal.durability_queue_depth_max);
+    write_u64(out, raft_wal.durability_queue_wait_us_total);
+    write_u64(out, raft_wal.durability_queue_wait_us_max);
+    write_u64(out, raft_wal.append_accept_us_total);
+    write_u64(out, raft_wal.append_accept_us_max);
+    write_u64(out, raft_wal.durability_operation_us_total);
+    write_u64(out, raft_wal.durability_operation_us_max);
     let raft_command = observability::control_plane_raft_command_metrics_snapshot();
     write_u64(out, raft_command.submit_total);
     write_u64(out, raft_command.submit_error_total);
@@ -16180,6 +16188,14 @@ fn read_control_plane_runtime_map_diagnostics(
         directory_sync_total: reader.read_u64()?,
         directory_sync_us_total: reader.read_u64()?,
         directory_sync_us_max: reader.read_u64()?,
+        durability_queue_depth: reader.read_u64()?,
+        durability_queue_depth_max: reader.read_u64()?,
+        durability_queue_wait_us_total: reader.read_u64()?,
+        durability_queue_wait_us_max: reader.read_u64()?,
+        append_accept_us_total: reader.read_u64()?,
+        append_accept_us_max: reader.read_u64()?,
+        durability_operation_us_total: reader.read_u64()?,
+        durability_operation_us_max: reader.read_u64()?,
     };
     let raft_command_metrics = observability::ControlPlaneRaftCommandMetricSnapshot {
         submit_total: reader.read_u64()?,

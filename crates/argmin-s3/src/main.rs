@@ -1954,7 +1954,7 @@ fn format_control_plane_runtime_map_diagnostics_parts(
     ));
     output.push('\n');
     output.push_str(&format!(
-        "control_plane_raft_wal append_total={} append_error_total={} append_us_total={} append_us_max={} lock_wait_us_total={} lock_wait_us_max={} frame_bytes_total={} frame_bytes_last={} frame_bytes_max={} file_sync_total={} file_sync_us_total={} file_sync_us_max={} directory_sync_total={} directory_sync_us_total={} directory_sync_us_max={}",
+        "control_plane_raft_wal append_total={} append_error_total={} append_us_total={} append_us_max={} lock_wait_us_total={} lock_wait_us_max={} frame_bytes_total={} frame_bytes_last={} frame_bytes_max={} file_sync_total={} file_sync_us_total={} file_sync_us_max={} directory_sync_total={} directory_sync_us_total={} directory_sync_us_max={} durability_queue_depth={} durability_queue_depth_max={} durability_queue_wait_us_total={} durability_queue_wait_us_max={} append_accept_us_total={} append_accept_us_max={} durability_operation_us_total={} durability_operation_us_max={}",
         raft_wal.append_total,
         raft_wal.append_error_total,
         raft_wal.append_us_total,
@@ -1970,6 +1970,14 @@ fn format_control_plane_runtime_map_diagnostics_parts(
         raft_wal.directory_sync_total,
         raft_wal.directory_sync_us_total,
         raft_wal.directory_sync_us_max,
+        raft_wal.durability_queue_depth,
+        raft_wal.durability_queue_depth_max,
+        raft_wal.durability_queue_wait_us_total,
+        raft_wal.durability_queue_wait_us_max,
+        raft_wal.append_accept_us_total,
+        raft_wal.append_accept_us_max,
+        raft_wal.durability_operation_us_total,
+        raft_wal.durability_operation_us_max,
     ));
     output.push('\n');
     output.push_str(&format!(
@@ -12311,6 +12319,18 @@ mod tests {
             .append_us_total
             .checked_sub(wal_metrics_before.append_us_total)
             .expect("WAL append duration must advance monotonically");
+        let wal_append_accept_us_total_delta = wal_metrics_after
+            .append_accept_us_total
+            .checked_sub(wal_metrics_before.append_accept_us_total)
+            .expect("WAL append acceptance duration must advance monotonically");
+        let wal_durability_queue_wait_us_total_delta = wal_metrics_after
+            .durability_queue_wait_us_total
+            .checked_sub(wal_metrics_before.durability_queue_wait_us_total)
+            .expect("WAL durability queue wait must advance monotonically");
+        let wal_durability_operation_us_total_delta = wal_metrics_after
+            .durability_operation_us_total
+            .checked_sub(wal_metrics_before.durability_operation_us_total)
+            .expect("WAL durability operation duration must advance monotonically");
         let wal_file_sync_delta = wal_metrics_after
             .file_sync_total
             .checked_sub(wal_metrics_before.file_sync_total)
@@ -12335,6 +12355,7 @@ mod tests {
         assert!(wal_file_sync_delta > 0);
         assert!(wal_directory_sync_delta > 0);
         assert!(wal_bytes_appended > 0);
+        assert_eq!(wal_metrics_after.durability_queue_depth, 0);
         let extension_interval_ms = horizon_extension_at_ms
             .checked_sub(durable_timestamp_before)
             .expect("horizon extension must follow the previous durable timestamp");
@@ -12506,11 +12527,15 @@ mod tests {
         let final_checkpoint_metrics = concurrent_metrics_after.checkpoint;
 
         eprintln!(
-            "control_plane_write_amplification_release pgs={PG_COUNT} retained_epochs={RETAINED_HISTORY_EPOCHS} retained_artifact_bytes={large_artifact_bytes} storage_nodes={STORAGE_NODE_COUNT} sustained_peering_intervals={SUSTAINED_PEERING_INTERVALS} sustained_peering_rounds_per_interval={SUSTAINED_PEERING_ROUNDS} post_purge_artifact_bytes={post_purge_artifact_bytes:?} sustained_peering_checkpoint_bytes={sustained_checkpoint_bytes} sustained_peering_wal_bytes={sustained_wal_bytes} sustained_peering_durable_bytes_per_second={sustained_durable_bytes_per_second} steady_heartbeats={steady_heartbeat_requests} compact_status_reads={STEADY_HEARTBEAT_ROUNDS} wal_monitor_polls={monitor_poll_total} wal_monitor_poll_us_total={monitor_poll_us_total} wal_monitor_poll_us_max={monitor_poll_us_max} steady_checkpoint_stores=0 steady_checkpoint_syncs=0 steady_wal_appends=0 steady_wal_syncs=0 horizon_probe_heartbeats={horizon_probe_heartbeats} checkpoint_stores={checkpoint_store_delta} checkpoint_store_us_total={checkpoint_store_us_total_delta} checkpoint_store_us_lifetime_max={} checkpoint_file_syncs={checkpoint_file_sync_delta} checkpoint_file_sync_us_total={checkpoint_file_sync_us_total_delta} checkpoint_file_sync_us_lifetime_max={} checkpoint_directory_syncs={checkpoint_directory_sync_delta} checkpoint_directory_sync_us_total={checkpoint_directory_sync_us_total_delta} checkpoint_directory_sync_us_lifetime_max={} checkpoint_bytes={checkpoint_bytes} horizon_wal_appends={wal_append_delta} horizon_wal_append_us_total={wal_append_us_total_delta} horizon_wal_append_us_lifetime_max={} horizon_wal_file_syncs={wal_file_sync_delta} horizon_wal_file_sync_us_total={wal_file_sync_us_total_delta} horizon_wal_file_sync_us_lifetime_max={} horizon_wal_directory_syncs={wal_directory_sync_delta} horizon_wal_directory_sync_us_total={wal_directory_sync_us_total_delta} horizon_wal_directory_sync_us_lifetime_max={} horizon_wal_bytes_appended={wal_bytes_appended} horizon_wal_offset_advance={wal_offset_advance} horizon_extension_interval_ms={extension_interval_ms} checkpoint_amortization_interval_ms={checkpoint_amortization_interval_ms} amortized_durable_bytes_per_second={amortized_durable_bytes_per_second} concurrent_checkpoints={CONCURRENT_CHECKPOINT_COUNT} concurrent_checkpoint_call_us_total={concurrent_checkpoint_call_us_total} concurrent_checkpoint_batch_us={concurrent_checkpoint_batch_us} concurrent_checkpoint_us_max={concurrent_checkpoint_us_max} concurrent_heartbeats={} concurrent_heartbeat_us_max={concurrent_heartbeat_us_max} concurrent_status_reads={CONCURRENT_HEARTBEAT_ROUNDS} concurrent_status_us_max={concurrent_status_us_max}",
+            "control_plane_write_amplification_release pgs={PG_COUNT} retained_epochs={RETAINED_HISTORY_EPOCHS} retained_artifact_bytes={large_artifact_bytes} storage_nodes={STORAGE_NODE_COUNT} sustained_peering_intervals={SUSTAINED_PEERING_INTERVALS} sustained_peering_rounds_per_interval={SUSTAINED_PEERING_ROUNDS} post_purge_artifact_bytes={post_purge_artifact_bytes:?} sustained_peering_checkpoint_bytes={sustained_checkpoint_bytes} sustained_peering_wal_bytes={sustained_wal_bytes} sustained_peering_durable_bytes_per_second={sustained_durable_bytes_per_second} steady_heartbeats={steady_heartbeat_requests} compact_status_reads={STEADY_HEARTBEAT_ROUNDS} wal_monitor_polls={monitor_poll_total} wal_monitor_poll_us_total={monitor_poll_us_total} wal_monitor_poll_us_max={monitor_poll_us_max} steady_checkpoint_stores=0 steady_checkpoint_syncs=0 steady_wal_appends=0 steady_wal_syncs=0 horizon_probe_heartbeats={horizon_probe_heartbeats} checkpoint_stores={checkpoint_store_delta} checkpoint_store_us_total={checkpoint_store_us_total_delta} checkpoint_store_us_lifetime_max={} checkpoint_file_syncs={checkpoint_file_sync_delta} checkpoint_file_sync_us_total={checkpoint_file_sync_us_total_delta} checkpoint_file_sync_us_lifetime_max={} checkpoint_directory_syncs={checkpoint_directory_sync_delta} checkpoint_directory_sync_us_total={checkpoint_directory_sync_us_total_delta} checkpoint_directory_sync_us_lifetime_max={} checkpoint_bytes={checkpoint_bytes} horizon_wal_appends={wal_append_delta} horizon_wal_append_accept_us_total={wal_append_accept_us_total_delta} horizon_wal_append_accept_us_lifetime_max={} horizon_wal_append_us_total={wal_append_us_total_delta} horizon_wal_append_us_lifetime_max={} horizon_wal_durability_queue_depth_max={} horizon_wal_durability_queue_wait_us_total={wal_durability_queue_wait_us_total_delta} horizon_wal_durability_queue_wait_us_lifetime_max={} horizon_wal_durability_operation_us_total={wal_durability_operation_us_total_delta} horizon_wal_durability_operation_us_lifetime_max={} horizon_wal_file_syncs={wal_file_sync_delta} horizon_wal_file_sync_us_total={wal_file_sync_us_total_delta} horizon_wal_file_sync_us_lifetime_max={} horizon_wal_directory_syncs={wal_directory_sync_delta} horizon_wal_directory_sync_us_total={wal_directory_sync_us_total_delta} horizon_wal_directory_sync_us_lifetime_max={} horizon_wal_bytes_appended={wal_bytes_appended} horizon_wal_offset_advance={wal_offset_advance} horizon_extension_interval_ms={extension_interval_ms} checkpoint_amortization_interval_ms={checkpoint_amortization_interval_ms} amortized_durable_bytes_per_second={amortized_durable_bytes_per_second} concurrent_checkpoints={CONCURRENT_CHECKPOINT_COUNT} concurrent_checkpoint_call_us_total={concurrent_checkpoint_call_us_total} concurrent_checkpoint_batch_us={concurrent_checkpoint_batch_us} concurrent_checkpoint_us_max={concurrent_checkpoint_us_max} concurrent_heartbeats={} concurrent_heartbeat_us_max={concurrent_heartbeat_us_max} concurrent_status_reads={CONCURRENT_HEARTBEAT_ROUNDS} concurrent_status_us_max={concurrent_status_us_max}",
             final_checkpoint_metrics.store_us_max,
             final_checkpoint_metrics.file_sync_us_max,
             final_checkpoint_metrics.directory_sync_us_max,
+            wal_metrics_after.append_accept_us_max,
             wal_metrics_after.append_us_max,
+            wal_metrics_after.durability_queue_depth_max,
+            wal_metrics_after.durability_queue_wait_us_max,
+            wal_metrics_after.durability_operation_us_max,
             wal_metrics_after.file_sync_us_max,
             wal_metrics_after.directory_sync_us_max,
             CONCURRENT_HEARTBEAT_ROUNDS * u64::from(STORAGE_NODE_COUNT),
@@ -17283,6 +17308,14 @@ mod tests {
                     frame_bytes_last: 345,
                     file_sync_total: 13,
                     directory_sync_total: 14,
+                    durability_queue_depth: 20,
+                    durability_queue_depth_max: 21,
+                    durability_queue_wait_us_total: 22,
+                    durability_queue_wait_us_max: 23,
+                    append_accept_us_total: 24,
+                    append_accept_us_max: 25,
+                    durability_operation_us_total: 26,
+                    durability_operation_us_max: 27,
                     ..observability::ControlPlaneRaftWalMetricSnapshot::default()
                 },
                 observability::ControlPlaneRaftCommandMetricSnapshot {
@@ -17328,7 +17361,7 @@ mod tests {
         );
         assert!(
             diagnostics.contains(
-                "control_plane_raft_wal append_total=12 append_error_total=0 append_us_total=0 append_us_max=0 lock_wait_us_total=0 lock_wait_us_max=0 frame_bytes_total=0 frame_bytes_last=345 frame_bytes_max=0 file_sync_total=13 file_sync_us_total=0 file_sync_us_max=0 directory_sync_total=14"
+                "control_plane_raft_wal append_total=12 append_error_total=0 append_us_total=0 append_us_max=0 lock_wait_us_total=0 lock_wait_us_max=0 frame_bytes_total=0 frame_bytes_last=345 frame_bytes_max=0 file_sync_total=13 file_sync_us_total=0 file_sync_us_max=0 directory_sync_total=14 directory_sync_us_total=0 directory_sync_us_max=0 durability_queue_depth=20 durability_queue_depth_max=21 durability_queue_wait_us_total=22 durability_queue_wait_us_max=23 append_accept_us_total=24 append_accept_us_max=25 durability_operation_us_total=26 durability_operation_us_max=27"
             ),
             "{diagnostics}"
         );

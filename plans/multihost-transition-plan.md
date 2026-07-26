@@ -11511,12 +11511,13 @@ Required production shape and implementation order:
    time and fails above 1 MiB/s of combined WAL/checkpoint bytes. The monitor
    lock regression and WAL-ack/compaction regression run in the control-plane
    release gate alongside that workload.
-   **Raft executor isolation (open):** the fsynced WAL remains the required
+   **Raft WAL executor isolation (implemented; state-machine CPU audit open):**
+   the fsynced WAL remains the required
    acknowledgement boundary, but synchronous filesystem work must not execute
-   on Tokio cooperative-runtime workers. The OpenRaft `RaftLogStorage`
-   implementation currently holds its log-store mutex while synchronously
+   on Tokio cooperative-runtime workers. The previous OpenRaft
+   `RaftLogStorage` implementation held its log-store mutex while synchronously
    appending and syncing vote, committed-position, log, truncate, and purge
-   records. Before replicated-mode cutover, route these operations through one
+   records. The replicated implementation routes these operations through one
    bounded, serialized durability lane per authority, or an equivalent design
    that proves the same properties. The lane must preserve submission order and
    distinguish append acceptance from durable completion. Once a bounded queue
@@ -11557,6 +11558,26 @@ Required production shape and implementation order:
    barriers. Report durability-queue depth and wait, append acceptance and sync
    latency, bytes, and executor-delay maxima in the production-shaped
    control-plane release workload.
+   The implementation now uses one 64-slot durability lane and dedicated OS
+   thread per WAL-backed authority. Append validation publishes an accepted,
+   reader-visible view before returning; the ordered worker publishes the
+   separate durable view and completes `IOFlushed` only after the WAL file and
+   directory sync contract succeeds. Vote and other durable methods await the
+   same lane asynchronously. A worker/checkpoint-only publication gate orders
+   WAL append, durable-position publication, and compaction without putting an
+   I/O-held standard mutex in any async reader path. The async checkpoint
+   convenience API moves persistence and compaction to Tokio's blocking pool,
+   while production retains the explicit capture plus process-thread persist
+   boundary. Single-worker regressions cover blocked sync, accepted reads,
+   pending callbacks, timer progress, durable-method waiting, caller
+   cancellation, ordered completion, bounded-queue backpressure, poison
+   classes, and compaction barriers. Runtime diagnostics and the
+   production-shaped release workload report queue depth/high-water, queue
+   wait, append-acceptance latency, worker-operation latency, sync latency, and
+   WAL bytes. The remaining executor-isolation work is the separately scoped
+   audit of large synchronous state-machine snapshot construction, cloning,
+   decode, and installation below; it does not reopen WAL acknowledgement
+   isolation.
    Restart cost is part of the same bound. A retained route-change soak exposed
    a 12.66 MB restart artifact with 2,883 retained entries whose cached
    OpenRaft snapshot was at index 5,000 while the materialized state was at

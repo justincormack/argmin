@@ -282,6 +282,14 @@ static CONTROL_PLANE_RAFT_WAL_FILE_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_WAIT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_WAIT_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_APPEND_ACCEPT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_APPEND_ACCEPT_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_DURABILITY_OPERATION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_DURABILITY_OPERATION_US_MAX: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_JOURNAL_APPEND_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_JOURNAL_APPEND_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_JOURNAL_APPEND_US_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -705,6 +713,42 @@ pub fn record_control_plane_raft_wal_directory_sync(elapsed: Duration) {
     fetch_max_atomic(&CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_MAX, elapsed_us);
 }
 
+pub fn record_control_plane_raft_wal_durability_queue_enter() {
+    let depth = CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_DEPTH
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    fetch_max_atomic(&CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_DEPTH_MAX, depth);
+}
+
+pub fn record_control_plane_raft_wal_durability_queue_leave(elapsed: Duration) {
+    let _ = CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_DEPTH.fetch_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |depth| Some(depth.saturating_sub(1)),
+    );
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_WAIT_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(
+        &CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_WAIT_US_MAX,
+        elapsed_us,
+    );
+}
+
+pub fn record_control_plane_raft_wal_append_accept(elapsed: Duration) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_RAFT_WAL_APPEND_ACCEPT_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_RAFT_WAL_APPEND_ACCEPT_US_MAX, elapsed_us);
+}
+
+pub fn record_control_plane_raft_wal_durability_operation(elapsed: Duration) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_RAFT_WAL_DURABILITY_OPERATION_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(
+        &CONTROL_PLANE_RAFT_WAL_DURABILITY_OPERATION_US_MAX,
+        elapsed_us,
+    );
+}
+
 #[must_use]
 pub fn control_plane_raft_wal_metrics_snapshot() -> ControlPlaneRaftWalMetricSnapshot {
     ControlPlaneRaftWalMetricSnapshot {
@@ -724,6 +768,21 @@ pub fn control_plane_raft_wal_metrics_snapshot() -> ControlPlaneRaftWalMetricSna
         directory_sync_us_total: CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_TOTAL
             .load(Ordering::Relaxed),
         directory_sync_us_max: CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_MAX.load(Ordering::Relaxed),
+        durability_queue_depth: CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_DEPTH
+            .load(Ordering::Relaxed),
+        durability_queue_depth_max: CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_DEPTH_MAX
+            .load(Ordering::Relaxed),
+        durability_queue_wait_us_total: CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_WAIT_US_TOTAL
+            .load(Ordering::Relaxed),
+        durability_queue_wait_us_max: CONTROL_PLANE_RAFT_WAL_DURABILITY_QUEUE_WAIT_US_MAX
+            .load(Ordering::Relaxed),
+        append_accept_us_total: CONTROL_PLANE_RAFT_WAL_APPEND_ACCEPT_US_TOTAL
+            .load(Ordering::Relaxed),
+        append_accept_us_max: CONTROL_PLANE_RAFT_WAL_APPEND_ACCEPT_US_MAX.load(Ordering::Relaxed),
+        durability_operation_us_total: CONTROL_PLANE_RAFT_WAL_DURABILITY_OPERATION_US_TOTAL
+            .load(Ordering::Relaxed),
+        durability_operation_us_max: CONTROL_PLANE_RAFT_WAL_DURABILITY_OPERATION_US_MAX
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -981,6 +1040,14 @@ pub struct ControlPlaneRaftWalMetricSnapshot {
     pub directory_sync_total: u64,
     pub directory_sync_us_total: u64,
     pub directory_sync_us_max: u64,
+    pub durability_queue_depth: u64,
+    pub durability_queue_depth_max: u64,
+    pub durability_queue_wait_us_total: u64,
+    pub durability_queue_wait_us_max: u64,
+    pub append_accept_us_total: u64,
+    pub append_accept_us_max: u64,
+    pub durability_operation_us_total: u64,
+    pub durability_operation_us_max: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

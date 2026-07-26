@@ -7,6 +7,7 @@ use std::ops::{Bound, RangeBounds};
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(test)]
 use std::os::unix::net::UnixStream;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -43,6 +44,7 @@ use openraft::ServerState;
 use openraft::StoredMembership;
 use openraft::{AnyError, Config, SnapshotPolicy};
 use placement::NodeId;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::control_plane::{
     connect_unix_stream_until, AuthorityIncarnation, ClusterControlSnapshot,
@@ -2099,7 +2101,7 @@ pub struct ControlPlaneRaftAuthority {
         )>,
     >,
     checkpoint_instance: Arc<()>,
-    checkpoint_publication: Mutex<Option<ControlPlaneRaftCheckpointPosition>>,
+    checkpoint_publication: Arc<Mutex<Option<ControlPlaneRaftCheckpointPosition>>>,
     checkpoint_metrics: Arc<ControlPlaneRaftCheckpointMetrics>,
     command_metrics: Arc<ControlPlaneRaftCommandMetrics>,
 }
@@ -2268,6 +2270,42 @@ impl ControlPlaneRaftWalMetrics {
         snapshot.directory_sync_us_total =
             snapshot.directory_sync_us_total.saturating_add(elapsed_us);
         snapshot.directory_sync_us_max = snapshot.directory_sync_us_max.max(elapsed_us);
+    }
+
+    fn record_durability_queue_enter(&self) {
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.durability_queue_depth = snapshot.durability_queue_depth.saturating_add(1);
+        snapshot.durability_queue_depth_max = snapshot
+            .durability_queue_depth_max
+            .max(snapshot.durability_queue_depth);
+    }
+
+    fn record_durability_queue_leave(&self, elapsed: Duration) {
+        let elapsed_us = raft_metric_elapsed_us(elapsed);
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.durability_queue_depth = snapshot.durability_queue_depth.saturating_sub(1);
+        snapshot.durability_queue_wait_us_total = snapshot
+            .durability_queue_wait_us_total
+            .saturating_add(elapsed_us);
+        snapshot.durability_queue_wait_us_max =
+            snapshot.durability_queue_wait_us_max.max(elapsed_us);
+    }
+
+    fn record_append_accept(&self, elapsed: Duration) {
+        let elapsed_us = raft_metric_elapsed_us(elapsed);
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.append_accept_us_total =
+            snapshot.append_accept_us_total.saturating_add(elapsed_us);
+        snapshot.append_accept_us_max = snapshot.append_accept_us_max.max(elapsed_us);
+    }
+
+    fn record_durability_operation(&self, elapsed: Duration) {
+        let elapsed_us = raft_metric_elapsed_us(elapsed);
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.durability_operation_us_total = snapshot
+            .durability_operation_us_total
+            .saturating_add(elapsed_us);
+        snapshot.durability_operation_us_max = snapshot.durability_operation_us_max.max(elapsed_us);
     }
 }
 
@@ -4292,7 +4330,7 @@ impl ControlPlaneRaftAuthority {
             runtime_map_content_certificate: Mutex::new(None),
             runtime_map_overlay_content_certificate: Mutex::new(None),
             checkpoint_instance: Arc::new(()),
-            checkpoint_publication: Mutex::new(None),
+            checkpoint_publication: Arc::new(Mutex::new(None)),
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
             command_metrics: Arc::new(ControlPlaneRaftCommandMetrics::default()),
         }
@@ -4317,7 +4355,7 @@ impl ControlPlaneRaftAuthority {
             runtime_map_content_certificate: Mutex::new(None),
             runtime_map_overlay_content_certificate: Mutex::new(None),
             checkpoint_instance: Arc::new(()),
-            checkpoint_publication: Mutex::new(None),
+            checkpoint_publication: Arc::new(Mutex::new(None)),
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
             command_metrics: Arc::new(ControlPlaneRaftCommandMetrics::default()),
         }
@@ -4681,7 +4719,7 @@ impl ControlPlaneRaftAuthority {
             .map(ControlPlaneRaftLogStore::status_snapshot)
             .transpose()
             .map_err(|error| openraft_remote_error("clock-context log-store read", error))?
-            .and_then(|status| status.vote)
+            .and_then(|status| status.durable_vote)
             .map(|vote| vote.leader_id.term);
         let (committed, effective_voter) = self
             .raft
@@ -5186,7 +5224,25 @@ impl ControlPlaneRaftAuthority {
         path: &Path,
     ) -> Result<Option<u64>, ControlPlaneError> {
         let checkpoint = self.capture_durable_restart_checkpoint().await?;
-        self.persist_durable_restart_checkpoint(checkpoint, path)
+        let path = path.to_path_buf();
+        let checkpoint_instance = Arc::clone(&self.checkpoint_instance);
+        let checkpoint_publication = Arc::clone(&self.checkpoint_publication);
+        let checkpoint_metrics = Arc::clone(&self.checkpoint_metrics);
+        let log_store = self.log_store.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::persist_durable_restart_checkpoint_inner(
+                &checkpoint_instance,
+                &checkpoint_publication,
+                &checkpoint_metrics,
+                log_store.as_ref(),
+                checkpoint,
+                &path,
+            )
+        })
+        .await
+        .map_err(|error| ControlPlaneError::RpcRemote {
+            message: format!("OpenRaft checkpoint persistence worker failed: {error}"),
+        })?
     }
 
     pub async fn capture_durable_restart_checkpoint(
@@ -5203,7 +5259,25 @@ impl ControlPlaneRaftAuthority {
         checkpoint: ControlPlaneRaftCapturedRestartCheckpoint,
         path: &Path,
     ) -> Result<Option<u64>, ControlPlaneError> {
-        if !Arc::ptr_eq(&checkpoint.authority_instance, &self.checkpoint_instance) {
+        Self::persist_durable_restart_checkpoint_inner(
+            &self.checkpoint_instance,
+            &self.checkpoint_publication,
+            &self.checkpoint_metrics,
+            self.log_store.as_ref(),
+            checkpoint,
+            path,
+        )
+    }
+
+    fn persist_durable_restart_checkpoint_inner(
+        checkpoint_instance: &Arc<()>,
+        checkpoint_publication: &Mutex<Option<ControlPlaneRaftCheckpointPosition>>,
+        checkpoint_metrics: &ControlPlaneRaftCheckpointMetrics,
+        log_store: Option<&ControlPlaneRaftLogStore>,
+        checkpoint: ControlPlaneRaftCapturedRestartCheckpoint,
+        path: &Path,
+    ) -> Result<Option<u64>, ControlPlaneError> {
+        if !Arc::ptr_eq(&checkpoint.authority_instance, checkpoint_instance) {
             return Err(ControlPlaneError::RpcRemote {
                 message:
                     "captured OpenRaft restart checkpoint belongs to another authority instance"
@@ -5212,7 +5286,7 @@ impl ControlPlaneRaftAuthority {
         }
         let position = ControlPlaneRaftCheckpointPosition::for_artifact(&checkpoint.artifact);
         let mut last_publication =
-            self.checkpoint_publication
+            checkpoint_publication
                 .lock()
                 .map_err(|_| ControlPlaneError::RpcRemote {
                     message: "OpenRaft checkpoint publication mutex poisoned".to_string(),
@@ -5220,9 +5294,7 @@ impl ControlPlaneRaftAuthority {
         if let Some(previous) = *last_publication {
             position.validate_at_or_after(previous)?;
         }
-        if let Some(wal_status) = self
-            .log_store
-            .as_ref()
+        if let Some(wal_status) = log_store
             .map(ControlPlaneRaftLogStore::wal_monitor_snapshot)
             .transpose()
             .map_err(|source| ControlPlaneError::Io {
@@ -5255,8 +5327,8 @@ impl ControlPlaneRaftAuthority {
         *last_publication = Some(position);
         checkpoint
             .artifact
-            .store_durable_artifact_with_metrics(path, Some(&self.checkpoint_metrics))?;
-        if let Some(log_store) = &self.log_store {
+            .store_durable_artifact_with_metrics(path, Some(checkpoint_metrics))?;
+        if let Some(log_store) = log_store {
             let compact_started = Instant::now();
             let result = log_store.compact_wal_through(wal_replay_offset);
             let compact_elapsed = compact_started.elapsed();
@@ -5264,8 +5336,7 @@ impl ControlPlaneRaftAuthority {
                 compact_elapsed,
                 result.is_ok(),
             );
-            self.checkpoint_metrics
-                .record_compaction(compact_elapsed, result.is_ok());
+            checkpoint_metrics.record_compaction(compact_elapsed, result.is_ok());
             result.map_err(|source| ControlPlaneError::Io {
                 context: "compact control-plane OpenRaft WAL after durable checkpoint",
                 source,
@@ -5366,19 +5437,23 @@ impl ControlPlaneRaftAuthority {
             .map(ControlPlaneRaftLogStore::status_snapshot)
             .transpose()
             .map_err(|error| openraft_remote_error("status log-store read", error))?;
-        let persisted_vote = log_store_status.as_ref().and_then(|status| status.vote);
+        let persisted_vote = log_store_status
+            .as_ref()
+            .and_then(|status| status.durable_vote);
         let durable_last_vote = persisted_vote;
         let current_term = persisted_vote.map(|vote| vote.leader_id.term);
         let durable_last_log_id = log_store_status
             .as_ref()
-            .and_then(|status| status.last_log_id);
+            .and_then(|status| status.durable_last_log_id);
         let durable_committed = log_store_status
             .as_ref()
-            .and_then(|status| status.committed);
+            .and_then(|status| status.durable_committed);
         let last_purged_log_id = log_store_status
             .as_ref()
             .and_then(|status| status.last_purged_log_id);
-        let durable_last_purged_log_id = last_purged_log_id;
+        let durable_last_purged_log_id = log_store_status
+            .as_ref()
+            .and_then(|status| status.durable_last_purged_log_id);
         let durability_status = log_store_status.as_ref().map(|status| &status.durability);
         let durable_wal_backed = durability_status
             .as_ref()
@@ -6085,10 +6160,12 @@ fn observe_deadline_range(
     *latest_ms = Some(latest_ms.map_or(deadline_ms, |existing| existing.max(deadline_ms)));
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ControlPlaneRaftLogStore {
     inner: Arc<Mutex<ControlPlaneRaftLogStoreInner>>,
+    durable: Arc<Mutex<ControlPlaneRaftLogStoreDurableState>>,
     wal: Option<Arc<ControlPlaneRaftWalFile>>,
+    durability_lane: Option<Arc<ControlPlaneRaftDurabilityLane>>,
 }
 
 #[cfg(test)]
@@ -6096,6 +6173,24 @@ static CONTROL_PLANE_RAFT_WAL_FAIL_NEXT_FILE_SYNC: Mutex<Option<PathBuf>> = Mute
 
 #[cfg(test)]
 static CONTROL_PLANE_RAFT_WAL_FAIL_NEXT_PARENT_SYNC: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ControlPlaneRaftWalFileSyncGateState {
+    entered: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+type ControlPlaneRaftWalFileSyncGate = Arc<(
+    Mutex<ControlPlaneRaftWalFileSyncGateState>,
+    std::sync::Condvar,
+)>;
+
+#[cfg(test)]
+static CONTROL_PLANE_RAFT_WAL_FILE_SYNC_GATES: Mutex<
+    BTreeMap<PathBuf, ControlPlaneRaftWalFileSyncGate>,
+> = Mutex::new(BTreeMap::new());
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ControlPlaneRaftLogStoreRestartArtifact {
@@ -6490,6 +6585,59 @@ struct ControlPlaneRaftLogStoreInner {
     poisoned: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ControlPlaneRaftLogStoreDurableState {
+    inner: ControlPlaneRaftLogStoreInner,
+    wal_offsets: ControlPlaneRaftWalOffsets,
+}
+
+const CONTROL_PLANE_RAFT_DURABILITY_QUEUE_CAPACITY: usize = 64;
+
+struct ControlPlaneRaftDurabilityLane {
+    sender: mpsc::Sender<ControlPlaneRaftDurabilityRequest>,
+    wal: Arc<ControlPlaneRaftWalFile>,
+    durable: Arc<Mutex<ControlPlaneRaftLogStoreDurableState>>,
+    publication_gate: Arc<Mutex<()>>,
+}
+
+impl fmt::Debug for ControlPlaneRaftDurabilityLane {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlPlaneRaftDurabilityLane")
+            .field("queue_capacity", &self.sender.max_capacity())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPlaneRaftDurabilityRequestMode {
+    Append,
+    Durable,
+}
+
+struct ControlPlaneRaftDurabilityRequest {
+    record: ControlPlaneRaftWalRecord,
+    mode: ControlPlaneRaftDurabilityRequestMode,
+    enqueued_at: Instant,
+    completion: Mutex<ControlPlaneRaftDurabilityCompletion>,
+}
+
+struct ControlPlaneRaftDurabilityQueueGuard {
+    metrics: Arc<ControlPlaneRaftWalMetrics>,
+    entered_at: Instant,
+    submitted: bool,
+}
+
+enum ControlPlaneRaftDurabilityCompletion {
+    Append {
+        accepted: Option<oneshot::Sender<Result<(), String>>>,
+        flushed: Option<IOFlushed<ControlPlaneRaftTypeConfig>>,
+    },
+    Durable {
+        completed: Option<oneshot::Sender<Result<(), String>>>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ControlPlaneRaftLogStoreDurabilityStatus {
     wal_backed: bool,
@@ -6499,11 +6647,390 @@ struct ControlPlaneRaftLogStoreDurabilityStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ControlPlaneRaftLogStoreStatusSnapshot {
-    vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
-    committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
-    last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     last_purged_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    durable_vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
+    durable_committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    durable_last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    durable_last_purged_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     durability: ControlPlaneRaftLogStoreDurabilityStatus,
+}
+
+impl Default for ControlPlaneRaftLogStore {
+    fn default() -> Self {
+        let inner = ControlPlaneRaftLogStoreInner::default();
+        Self {
+            inner: Arc::new(Mutex::new(inner.clone())),
+            durable: Arc::new(Mutex::new(ControlPlaneRaftLogStoreDurableState {
+                inner,
+                wal_offsets: ControlPlaneRaftWalOffsets {
+                    base_offset: 0,
+                    clean_len: 0,
+                },
+            })),
+            wal: None,
+            durability_lane: None,
+        }
+    }
+}
+
+impl ControlPlaneRaftDurabilityRequest {
+    fn append(
+        record: ControlPlaneRaftWalRecord,
+        flushed: IOFlushed<ControlPlaneRaftTypeConfig>,
+    ) -> (Self, oneshot::Receiver<Result<(), String>>) {
+        let (accepted, receiver) = oneshot::channel();
+        (
+            Self {
+                record,
+                mode: ControlPlaneRaftDurabilityRequestMode::Append,
+                enqueued_at: Instant::now(),
+                completion: Mutex::new(ControlPlaneRaftDurabilityCompletion::Append {
+                    accepted: Some(accepted),
+                    flushed: Some(flushed),
+                }),
+            },
+            receiver,
+        )
+    }
+
+    fn durable(record: ControlPlaneRaftWalRecord) -> (Self, oneshot::Receiver<Result<(), String>>) {
+        let (completed, receiver) = oneshot::channel();
+        (
+            Self {
+                record,
+                mode: ControlPlaneRaftDurabilityRequestMode::Durable,
+                enqueued_at: Instant::now(),
+                completion: Mutex::new(ControlPlaneRaftDurabilityCompletion::Durable {
+                    completed: Some(completed),
+                }),
+            },
+            receiver,
+        )
+    }
+
+    fn completion(&self) -> MutexGuard<'_, ControlPlaneRaftDurabilityCompletion> {
+        self.completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn accepted(&self) {
+        let mut completion = self.completion();
+        let ControlPlaneRaftDurabilityCompletion::Append { accepted, .. } = &mut *completion else {
+            return;
+        };
+        if let Some(accepted) = accepted.take() {
+            let _ = accepted.send(Ok(()));
+        }
+    }
+
+    fn completed(&self) {
+        let mut completion = self.completion();
+        match &mut *completion {
+            ControlPlaneRaftDurabilityCompletion::Append { accepted, flushed } => {
+                if let Some(accepted) = accepted.take() {
+                    let _ = accepted.send(Ok(()));
+                }
+                if let Some(flushed) = flushed.take() {
+                    flushed.io_completed(Ok(()));
+                }
+            }
+            ControlPlaneRaftDurabilityCompletion::Durable { completed } => {
+                if let Some(completed) = completed.take() {
+                    let _ = completed.send(Ok(()));
+                }
+            }
+        }
+    }
+
+    fn failed(&self, message: impl Into<String>) {
+        let message = message.into();
+        let mut completion = self.completion();
+        match &mut *completion {
+            ControlPlaneRaftDurabilityCompletion::Append { accepted, flushed } => {
+                if let Some(accepted) = accepted.take() {
+                    let _ = accepted.send(Err(message.clone()));
+                }
+                if let Some(flushed) = flushed.take() {
+                    flushed.io_completed(Err(raft_log_store_error(message)));
+                }
+            }
+            ControlPlaneRaftDurabilityCompletion::Durable { completed } => {
+                if let Some(completed) = completed.take() {
+                    let _ = completed.send(Err(message));
+                }
+            }
+        }
+    }
+}
+
+impl ControlPlaneRaftDurabilityQueueGuard {
+    fn enter(metrics: Arc<ControlPlaneRaftWalMetrics>) -> Self {
+        metrics.record_durability_queue_enter();
+        observability::record_control_plane_raft_wal_durability_queue_enter();
+        Self {
+            metrics,
+            entered_at: Instant::now(),
+            submitted: false,
+        }
+    }
+
+    fn submitted(mut self) {
+        self.submitted = true;
+    }
+}
+
+impl Drop for ControlPlaneRaftDurabilityQueueGuard {
+    fn drop(&mut self) {
+        if !self.submitted {
+            let elapsed = self.entered_at.elapsed();
+            self.metrics.record_durability_queue_leave(elapsed);
+            observability::record_control_plane_raft_wal_durability_queue_leave(elapsed);
+        }
+    }
+}
+
+impl ControlPlaneRaftDurabilityLane {
+    fn new(
+        accepted: Arc<Mutex<ControlPlaneRaftLogStoreInner>>,
+        durable: Arc<Mutex<ControlPlaneRaftLogStoreDurableState>>,
+        wal: Arc<ControlPlaneRaftWalFile>,
+    ) -> Result<Arc<Self>, io::Error> {
+        let (sender, receiver) = mpsc::channel(CONTROL_PLANE_RAFT_DURABILITY_QUEUE_CAPACITY);
+        let publication_gate = Arc::new(Mutex::new(()));
+        let worker_name = format!("argmin-raft-wal-{}", wal.local_node_id);
+        let worker_durable = Arc::clone(&durable);
+        let worker_wal = Arc::clone(&wal);
+        let worker_publication_gate = Arc::clone(&publication_gate);
+        std::thread::Builder::new()
+            .name(worker_name)
+            .spawn(move || {
+                Self::run(
+                    receiver,
+                    accepted,
+                    worker_durable,
+                    worker_wal,
+                    worker_publication_gate,
+                );
+            })
+            .map_err(|source| {
+                io::Error::new(
+                    source.kind(),
+                    format!("spawn control-plane OpenRaft WAL durability worker: {source}"),
+                )
+            })?;
+        Ok(Arc::new(Self {
+            sender,
+            wal,
+            durable,
+            publication_gate,
+        }))
+    }
+
+    async fn append(
+        &self,
+        record: ControlPlaneRaftWalRecord,
+        callback: IOFlushed<ControlPlaneRaftTypeConfig>,
+    ) -> Result<(), io::Error> {
+        let acceptance_started = Instant::now();
+        let admission = ControlPlaneRaftDurabilityQueueGuard::enter(Arc::clone(&self.wal.metrics));
+        let (request, accepted) = ControlPlaneRaftDurabilityRequest::append(record, callback);
+        if let Err(error) = self.sender.send(request).await {
+            let message = "control-plane OpenRaft WAL durability worker is unavailable";
+            error.0.failed(message);
+            return Err(raft_log_store_error(message));
+        }
+        admission.submitted();
+        let result = match accepted.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(raft_log_store_error(message)),
+            Err(_) => Err(raft_log_store_error(
+                "control-plane OpenRaft WAL durability worker dropped append acceptance",
+            )),
+        };
+        let elapsed = acceptance_started.elapsed();
+        self.wal.metrics.record_append_accept(elapsed);
+        observability::record_control_plane_raft_wal_append_accept(elapsed);
+        result
+    }
+
+    async fn durable(&self, record: ControlPlaneRaftWalRecord) -> Result<(), io::Error> {
+        let admission = ControlPlaneRaftDurabilityQueueGuard::enter(Arc::clone(&self.wal.metrics));
+        let (request, completed) = ControlPlaneRaftDurabilityRequest::durable(record);
+        if let Err(error) = self.sender.send(request).await {
+            let message = "control-plane OpenRaft WAL durability worker is unavailable";
+            error.0.failed(message);
+            return Err(raft_log_store_error(message));
+        }
+        admission.submitted();
+        match completed.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(raft_log_store_error(message)),
+            Err(_) => Err(raft_log_store_error(
+                "control-plane OpenRaft WAL durability worker dropped operation completion",
+            )),
+        }
+    }
+
+    fn compact_through(&self, replay_offset: u64) -> Result<(), io::Error> {
+        // This gate is acquired only by the dedicated durability worker and
+        // the synchronous checkpoint worker. Async log readers never wait on
+        // a standard mutex held across filesystem I/O.
+        let _publication = self
+            .publication_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.wal.compact_through(replay_offset).map_err(|error| {
+            control_plane_error_to_io_error("compact control-plane OpenRaft WAL", error)
+        })?;
+        let offsets = self.wal.status_offsets().map_err(|error| {
+            control_plane_error_to_io_error(
+                "read control-plane OpenRaft WAL offsets after compaction",
+                error,
+            )
+        })?;
+        self.durable
+            .lock()
+            .map_err(|_| {
+                io::Error::other("control-plane OpenRaft durable log store lock poisoned")
+            })?
+            .wal_offsets = offsets;
+        Ok(())
+    }
+
+    fn run(
+        mut receiver: mpsc::Receiver<ControlPlaneRaftDurabilityRequest>,
+        accepted: Arc<Mutex<ControlPlaneRaftLogStoreInner>>,
+        durable: Arc<Mutex<ControlPlaneRaftLogStoreDurableState>>,
+        wal: Arc<ControlPlaneRaftWalFile>,
+        publication_gate: Arc<Mutex<()>>,
+    ) {
+        while let Some(request) = receiver.blocking_recv() {
+            let queue_wait = request.enqueued_at.elapsed();
+            wal.metrics.record_durability_queue_leave(queue_wait);
+            observability::record_control_plane_raft_wal_durability_queue_leave(queue_wait);
+            let operation_started = Instant::now();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                Self::process(&request, &accepted, &durable, &wal, &publication_gate)
+            }));
+            if result.is_err() {
+                let message = "control-plane OpenRaft WAL durability worker panicked";
+                Self::poison(&accepted, &durable, message, None);
+                request.failed(message);
+            }
+            let elapsed = operation_started.elapsed();
+            wal.metrics.record_durability_operation(elapsed);
+            observability::record_control_plane_raft_wal_durability_operation(elapsed);
+        }
+    }
+
+    fn process(
+        request: &ControlPlaneRaftDurabilityRequest,
+        accepted: &Arc<Mutex<ControlPlaneRaftLogStoreInner>>,
+        durable: &Arc<Mutex<ControlPlaneRaftLogStoreDurableState>>,
+        wal: &ControlPlaneRaftWalFile,
+        publication_gate: &Mutex<()>,
+    ) {
+        let candidate = {
+            let current = accepted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(reason) = &current.poisoned {
+                request.failed(format!(
+                    "control-plane OpenRaft WAL-backed log store poisoned: {reason}"
+                ));
+                return;
+            }
+            let mut candidate = current.clone();
+            if let Err(error) = request.record.apply_to_log_store_inner(&mut candidate) {
+                request.failed(error.to_string());
+                return;
+            }
+            if candidate == *current {
+                request.completed();
+                return;
+            }
+            candidate
+        };
+
+        if request.mode == ControlPlaneRaftDurabilityRequestMode::Append {
+            *accepted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.clone();
+            request.accepted();
+        }
+
+        let _publication = publication_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match wal.append_record_for_log_store(&request.record) {
+            Ok(()) => {
+                let offsets = match wal.status_offsets() {
+                    Ok(offsets) => offsets,
+                    Err(error) => {
+                        let message = format!(
+                            "read control-plane OpenRaft WAL offsets after durable append: {error}"
+                        );
+                        Self::poison(accepted, durable, &message, Some(candidate));
+                        request.failed(message);
+                        return;
+                    }
+                };
+                if request.mode == ControlPlaneRaftDurabilityRequestMode::Durable {
+                    *accepted
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.clone();
+                }
+                *durable
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    ControlPlaneRaftLogStoreDurableState {
+                        inner: candidate,
+                        wal_offsets: offsets,
+                    };
+                request.completed();
+            }
+            Err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord(error)) => {
+                let message = format!("append OpenRaft WAL record: {error}");
+                if request.mode == ControlPlaneRaftDurabilityRequestMode::Append {
+                    Self::poison(accepted, durable, &message, None);
+                }
+                request.failed(message);
+            }
+            Err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist(error)) => {
+                let message =
+                    format!("ambiguous WAL append after WAL write before file sync: {error}");
+                Self::poison(accepted, durable, &message, None);
+                request.failed(message);
+            }
+            Err(ControlPlaneRaftWalAppendError::ReplayableRecordMayExist(error)) => {
+                let message = format!(
+                    "WAL append failed after file sync; restart required to reconcile durable state: {error}"
+                );
+                Self::poison(accepted, durable, &message, Some(candidate));
+                request.failed(message);
+            }
+        }
+    }
+
+    fn poison(
+        accepted: &Arc<Mutex<ControlPlaneRaftLogStoreInner>>,
+        durable: &Arc<Mutex<ControlPlaneRaftLogStoreDurableState>>,
+        message: &str,
+        durable_candidate: Option<ControlPlaneRaftLogStoreInner>,
+    ) {
+        let mut accepted = accepted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        accepted.poisoned = Some(message.to_string());
+        let mut durable = durable
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(candidate) = durable_candidate {
+            durable.inner = candidate;
+        }
+        durable.inner.poisoned = Some(message.to_string());
+    }
 }
 
 impl ControlPlaneRaftLogStore {
@@ -6515,33 +7042,23 @@ impl ControlPlaneRaftLogStore {
     pub fn export_restart_artifact(
         &self,
     ) -> Result<ControlPlaneRaftLogStoreRestartArtifact, io::Error> {
-        let inner = self.lock()?;
-        Ok(Self::restart_artifact_from_inner(&inner))
+        let durable = self.lock_durable()?;
+        Ok(Self::restart_artifact_from_inner(&durable.inner))
     }
 
     fn export_restart_artifact_with_wal_replay_offset(
         &self,
     ) -> Result<(ControlPlaneRaftLogStoreRestartArtifact, u64), io::Error> {
-        let inner = self.lock()?;
-        let artifact = Self::restart_artifact_from_inner(&inner);
-        let wal_replay_offset = if let Some(wal) = &self.wal {
-            wal.clean_len().map_err(|error| {
-                control_plane_error_to_io_error(
-                    "read control-plane OpenRaft WAL clean length while exporting log store",
-                    error,
-                )
-            })?
-        } else {
-            0
-        };
-        Ok((artifact, wal_replay_offset))
+        let durable = self.lock_durable()?;
+        Ok((
+            Self::restart_artifact_from_inner(&durable.inner),
+            durable.wal_offsets.clean_len,
+        ))
     }
 
     fn compact_wal_through(&self, replay_offset: u64) -> Result<(), io::Error> {
-        if let Some(wal) = &self.wal {
-            wal.compact_through(replay_offset).map_err(|error| {
-                control_plane_error_to_io_error("compact control-plane OpenRaft WAL", error)
-            })?;
+        if let Some(durability_lane) = &self.durability_lane {
+            durability_lane.compact_through(replay_offset)?;
         }
         Ok(())
     }
@@ -6553,28 +7070,25 @@ impl ControlPlaneRaftLogStore {
     fn wal_monitor_snapshot(
         &self,
     ) -> Result<Option<ControlPlaneRaftWalMonitorSnapshot>, io::Error> {
-        let poisoned = match self.inner.lock() {
-            Ok(inner) => inner.poisoned.clone(),
+        let (poisoned, offsets) = match self.durable.lock() {
+            Ok(durable) => (durable.inner.poisoned.clone(), durable.wal_offsets),
             Err(error) => {
-                let inner = error.into_inner();
-                Some(inner.poisoned.clone().unwrap_or_else(|| {
-                    "control-plane OpenRaft log store mutex poisoned".to_string()
-                }))
+                let durable = error.into_inner();
+                (
+                    Some(durable.inner.poisoned.clone().unwrap_or_else(|| {
+                        "control-plane OpenRaft durable log store mutex poisoned".to_string()
+                    })),
+                    durable.wal_offsets,
+                )
             }
         };
         let Some(wal) = &self.wal else {
             return Ok(None);
         };
-        // Sample append progress before offsets so an append racing this read is
-        // either represented by both values or remains visible as a suffix on
-        // the next monitor pass.
+        // Metrics may lead the published durable offset while a completed sync
+        // is being recorded. The monitor conservatively observes that suffix on
+        // its next pass; it never reports accepted-only state as durable.
         let metrics = wal.metrics.snapshot();
-        let offsets = wal.status_offsets().map_err(|error| {
-            control_plane_error_to_io_error(
-                "read control-plane OpenRaft WAL offsets for monitor",
-                error,
-            )
-        })?;
         Ok(Some(ControlPlaneRaftWalMonitorSnapshot {
             offsets,
             metrics,
@@ -6600,41 +7114,34 @@ impl ControlPlaneRaftLogStore {
     }
 
     pub fn persisted_vote(&self) -> Result<Option<VoteOf<ControlPlaneRaftTypeConfig>>, io::Error> {
-        Ok(self.lock()?.vote)
+        Ok(self.lock_durable()?.inner.vote)
     }
 
     fn status_snapshot(&self) -> Result<ControlPlaneRaftLogStoreStatusSnapshot, io::Error> {
-        let (vote, committed, last_log_id, last_purged_log_id, wal_backed, wal_poisoned) = {
+        let (last_purged_log_id, wal_backed, wal_poisoned) = {
             let inner = self
                 .inner
                 .lock()
                 .map_err(|_| io::Error::other("control-plane OpenRaft log store lock poisoned"))?;
             (
-                inner.vote,
-                inner.committed,
-                inner.last_log_id(),
                 inner.last_purged_log_id,
                 self.wal.is_some(),
                 inner.poisoned.clone(),
             )
         };
+        let durable = self.durable.lock().map_err(|_| {
+            io::Error::other("control-plane OpenRaft durable log store lock poisoned")
+        })?;
         let wal_offsets = match (&self.wal, &wal_poisoned) {
-            (Some(wal), None) => {
-                let offsets = wal.status_offsets().map_err(|error| {
-                    control_plane_error_to_io_error(
-                        "read control-plane OpenRaft WAL offsets for status",
-                        error,
-                    )
-                })?;
-                Some(offsets)
-            }
+            (Some(_), None) => Some(durable.wal_offsets),
             (Some(_), Some(_)) | (None, _) => None,
         };
         Ok(ControlPlaneRaftLogStoreStatusSnapshot {
-            vote,
-            committed,
-            last_log_id,
             last_purged_log_id,
+            durable_vote: durable.inner.vote,
+            durable_committed: durable.inner.committed,
+            durable_last_log_id: durable.inner.last_log_id(),
+            durable_last_purged_log_id: durable.inner.last_purged_log_id,
             durability: ControlPlaneRaftLogStoreDurabilityStatus {
                 wal_backed,
                 wal_offsets,
@@ -6683,9 +7190,41 @@ impl ControlPlaneRaftLogStore {
         Self::validate_committed_update(&inner, artifact.committed)?;
         inner.committed = artifact.committed;
         Self::validate_purged_boundary_has_committed(&inner)?;
+        let wal_offsets = wal
+            .as_ref()
+            .map(|wal| {
+                wal.status_offsets().map_err(|error| {
+                    control_plane_error_to_io_error(
+                        "read restored control-plane OpenRaft WAL offsets",
+                        error,
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(ControlPlaneRaftWalOffsets {
+                base_offset: 0,
+                clean_len: 0,
+            });
+        let accepted = Arc::new(Mutex::new(inner.clone()));
+        let durable = Arc::new(Mutex::new(ControlPlaneRaftLogStoreDurableState {
+            inner,
+            wal_offsets,
+        }));
+        let durability_lane = wal
+            .as_ref()
+            .map(|wal| {
+                ControlPlaneRaftDurabilityLane::new(
+                    Arc::clone(&accepted),
+                    Arc::clone(&durable),
+                    Arc::clone(wal),
+                )
+            })
+            .transpose()?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(inner)),
+            inner: accepted,
+            durable,
             wal,
+            durability_lane,
         })
     }
 
@@ -6700,6 +7239,20 @@ impl ControlPlaneRaftLogStore {
             )));
         }
         Ok(inner)
+    }
+
+    fn lock_durable(
+        &self,
+    ) -> Result<MutexGuard<'_, ControlPlaneRaftLogStoreDurableState>, io::Error> {
+        let durable = self.durable.lock().map_err(|_| {
+            io::Error::other("control-plane OpenRaft durable log store lock poisoned")
+        })?;
+        if let Some(reason) = &durable.inner.poisoned {
+            return Err(io::Error::other(format!(
+                "control-plane OpenRaft WAL-backed durable log store poisoned: {reason}"
+            )));
+        }
+        Ok(durable)
     }
 
     fn validate_contiguous_append(
@@ -7005,50 +7558,20 @@ impl ControlPlaneRaftLogStore {
         Ok(())
     }
 
-    fn apply_record(
+    fn apply_in_memory_record(
         &self,
         inner: &mut ControlPlaneRaftLogStoreInner,
         record: &ControlPlaneRaftWalRecord,
     ) -> Result<(), io::Error> {
+        debug_assert!(self.wal.is_none());
         let mut candidate = inner.clone();
         record.apply_to_log_store_inner(&mut candidate)?;
         if candidate == *inner {
             return Ok(());
         }
-        if let Some(wal) = &self.wal {
-            if let Err(error) = wal.append_record_for_log_store(record) {
-                match error {
-                    ControlPlaneRaftWalAppendError::BeforeReplayableRecord(error) => {
-                        return Err(control_plane_error_to_io_error(
-                            "append OpenRaft WAL record",
-                            error,
-                        ));
-                    }
-                    ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist(error) => {
-                        let message = error.to_string();
-                        inner.poisoned = Some(format!(
-                            "ambiguous WAL append after WAL write before file sync: {message}"
-                        ));
-                        return Err(control_plane_error_to_io_error(
-                            "append OpenRaft WAL record after ambiguous record write",
-                            error,
-                        ));
-                    }
-                    ControlPlaneRaftWalAppendError::ReplayableRecordMayExist(error) => {
-                        *inner = candidate;
-                        let message = error.to_string();
-                        inner.poisoned = Some(format!(
-                            "WAL append failed after file sync; restart required to reconcile durable state: {message}"
-                        ));
-                        return Err(control_plane_error_to_io_error(
-                            "append OpenRaft WAL record after replayable record write",
-                            error,
-                        ));
-                    }
-                }
-            }
-        }
-        *inner = candidate;
+        let mut durable = self.lock_durable()?;
+        *inner = candidate.clone();
+        durable.inner = candidate;
         Ok(())
     }
 }
@@ -7068,13 +7591,13 @@ impl ControlPlaneRaftLogStoreRestartArtifact {
         records: &[ControlPlaneRaftWalRecord],
     ) -> Result<Self, io::Error> {
         let store = ControlPlaneRaftLogStore::from_restart_artifact_in_memory(self.clone())?;
-        {
-            let mut inner = store.lock()?;
-            for record in records {
-                record.apply_to_log_store_inner(&mut inner)?;
-            }
+        let mut inner = store.lock()?;
+        for record in records {
+            record.apply_to_log_store_inner(&mut inner)?;
         }
-        store.export_restart_artifact()
+        Ok(ControlPlaneRaftLogStore::restart_artifact_from_inner(
+            &inner,
+        ))
     }
 }
 
@@ -8968,6 +9491,25 @@ fn sync_durable_artifact_parent(
 fn inject_control_plane_raft_wal_file_sync_failure(path: &Path) -> Result<(), ControlPlaneError> {
     #[cfg(test)]
     {
+        let gate = CONTROL_PLANE_RAFT_WAL_FILE_SYNC_GATES
+            .lock()
+            .expect("test WAL file-sync gate lock should not be poisoned")
+            .get(path)
+            .cloned();
+        if let Some(gate) = gate {
+            let (state, condition) = &*gate;
+            let mut state = state
+                .lock()
+                .expect("test WAL file-sync gate state should not be poisoned");
+            state.entered = true;
+            condition.notify_all();
+            while !state.released {
+                state = condition
+                    .wait(state)
+                    .expect("test WAL file-sync gate state should not be poisoned");
+            }
+        }
+
         let mut injected_path = CONTROL_PLANE_RAFT_WAL_FAIL_NEXT_FILE_SYNC
             .lock()
             .expect("test WAL file-sync fault lock should not be poisoned");
@@ -9914,16 +10456,26 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         &mut self,
         vote: &VoteOf<ControlPlaneRaftTypeConfig>,
     ) -> Result<(), io::Error> {
+        if let Some(durability_lane) = &self.durability_lane {
+            return durability_lane
+                .durable(ControlPlaneRaftWalRecord::SaveVote(*vote))
+                .await;
+        }
         let mut inner = self.lock()?;
-        self.apply_record(&mut inner, &ControlPlaneRaftWalRecord::SaveVote(*vote))
+        self.apply_in_memory_record(&mut inner, &ControlPlaneRaftWalRecord::SaveVote(*vote))
     }
 
     async fn save_committed(
         &mut self,
         committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     ) -> Result<(), io::Error> {
+        if let Some(durability_lane) = &self.durability_lane {
+            return durability_lane
+                .durable(ControlPlaneRaftWalRecord::SaveCommitted(committed))
+                .await;
+        }
         let mut inner = self.lock()?;
-        self.apply_record(
+        self.apply_in_memory_record(
             &mut inner,
             &ControlPlaneRaftWalRecord::SaveCommitted(committed),
         )
@@ -9945,10 +10497,15 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         I::IntoIter: OptionalSend,
     {
         let entries = entries.into_iter().collect::<Vec<_>>();
+        if let Some(durability_lane) = &self.durability_lane {
+            return durability_lane
+                .append(ControlPlaneRaftWalRecord::Append(entries), callback)
+                .await;
+        }
         {
             let mut inner = self.lock()?;
             if let Err(error) =
-                self.apply_record(&mut inner, &ControlPlaneRaftWalRecord::Append(entries))
+                self.apply_in_memory_record(&mut inner, &ControlPlaneRaftWalRecord::Append(entries))
             {
                 let message = error.to_string();
                 callback.io_completed(Err(raft_log_store_error(message.clone())));
@@ -9963,8 +10520,13 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         &mut self,
         last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     ) -> Result<(), io::Error> {
+        if let Some(durability_lane) = &self.durability_lane {
+            return durability_lane
+                .durable(ControlPlaneRaftWalRecord::TruncateAfter(last_log_id))
+                .await;
+        }
         let mut inner = self.lock()?;
-        self.apply_record(
+        self.apply_in_memory_record(
             &mut inner,
             &ControlPlaneRaftWalRecord::TruncateAfter(last_log_id),
         )
@@ -9974,8 +10536,13 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         &mut self,
         log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
     ) -> Result<(), io::Error> {
+        if let Some(durability_lane) = &self.durability_lane {
+            return durability_lane
+                .durable(ControlPlaneRaftWalRecord::Purge(log_id))
+                .await;
+        }
         let mut inner = self.lock()?;
-        self.apply_record(&mut inner, &ControlPlaneRaftWalRecord::Purge(log_id))
+        self.apply_in_memory_record(&mut inner, &ControlPlaneRaftWalRecord::Purge(log_id))
     }
 }
 
@@ -11067,6 +11634,79 @@ mod tests {
             cluster_name: cluster_name.into(),
             local_node_id,
         })
+    }
+
+    async fn append_and_wait_for_durability(
+        store: &mut ControlPlaneRaftLogStore,
+        entries: Vec<ControlPlaneRaftEntry>,
+    ) -> (Result<(), io::Error>, Result<(), io::Error>) {
+        let (flushed, durability) = ControlPlaneRaftTypeConfig::oneshot();
+        let accepted = RaftLogStorage::append(store, entries, IOFlushed::signal(flushed)).await;
+        let durability = durability
+            .await
+            .expect("WAL durability worker should complete the flush callback");
+        (accepted, durability)
+    }
+
+    struct TestWalFileSyncGate {
+        path: PathBuf,
+        state: ControlPlaneRaftWalFileSyncGate,
+    }
+
+    impl TestWalFileSyncGate {
+        fn install(path: PathBuf) -> Self {
+            let state = Arc::new((
+                Mutex::new(ControlPlaneRaftWalFileSyncGateState::default()),
+                std::sync::Condvar::new(),
+            ));
+            let mut gates = CONTROL_PLANE_RAFT_WAL_FILE_SYNC_GATES
+                .lock()
+                .expect("test WAL file-sync gate lock should not be poisoned");
+            assert!(
+                gates.insert(path.clone(), Arc::clone(&state)).is_none(),
+                "only one WAL file-sync gate may be active per WAL path"
+            );
+            drop(gates);
+            Self { path, state }
+        }
+
+        fn wait_until_entered(&self, timeout: Duration) {
+            let (state, condition) = &*self.state;
+            let state = state
+                .lock()
+                .expect("test WAL file-sync gate state should not be poisoned");
+            let (state, wait) = condition
+                .wait_timeout_while(state, timeout, |state| !state.entered)
+                .expect("test WAL file-sync gate state should not be poisoned");
+            assert!(
+                state.entered && !wait.timed_out(),
+                "WAL durability worker did not reach the file-sync gate"
+            );
+        }
+
+        fn release(&self) {
+            let (state, condition) = &*self.state;
+            let mut state = state
+                .lock()
+                .expect("test WAL file-sync gate state should not be poisoned");
+            state.released = true;
+            condition.notify_all();
+        }
+    }
+
+    impl Drop for TestWalFileSyncGate {
+        fn drop(&mut self) {
+            self.release();
+            let mut gates = CONTROL_PLANE_RAFT_WAL_FILE_SYNC_GATES
+                .lock()
+                .expect("test WAL file-sync gate lock should not be poisoned");
+            if gates
+                .get(&self.path)
+                .is_some_and(|state| Arc::ptr_eq(state, &self.state))
+            {
+                gates.remove(&self.path);
+            }
+        }
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -16199,22 +16839,27 @@ mod tests {
             let tmp = test_util::tempdir();
             let path = tmp.path().join("raft.wal");
             let wal = test_raft_wal_file(&path, "test-cluster", 1);
-            let log_store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
+            let mut log_store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
                 ControlPlaneRaftLogStoreRestartArtifact::default(),
                 wal.clone(),
             )
             .expect("WAL-backed log store should initialize");
 
-            for record in [
-                ControlPlaneRaftWalRecord::Append(vec![bootstrap_membership_entry(1)]),
-                ControlPlaneRaftWalRecord::SaveVote(
-                    Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1),
-                ),
-                ControlPlaneRaftWalRecord::Append(vec![blank_entry(3, 1, 1)]),
-            ] {
-                wal.append_record(&record)
-                    .expect("WAL append should succeed");
-            }
+            let (accepted, durable) =
+                append_and_wait_for_durability(&mut log_store, vec![bootstrap_membership_entry(1)])
+                    .await;
+            accepted.expect("bootstrap append should be accepted");
+            durable.expect("bootstrap append should become durable");
+            RaftLogStorage::save_vote(
+                &mut log_store,
+                &Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1),
+            )
+            .await
+            .expect("vote should become durable");
+            let (accepted, durable) =
+                append_and_wait_for_durability(&mut log_store, vec![blank_entry(3, 1, 1)]).await;
+            accepted.expect("blank entry should be accepted");
+            durable.expect("blank entry should become durable");
 
             let mut bytes = fs::read(&path).unwrap();
             let second_start = wal_file_frame_end(&bytes, 0);
@@ -16410,7 +17055,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_raft_wal_backed_log_store_failure_does_not_publish_mutation() {
+    fn control_plane_raft_wal_backed_log_store_failure_publishes_only_accepted_mutation() {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let parent = tmp.path().join("wal-parent");
@@ -16425,26 +17070,27 @@ mod tests {
             fs::remove_dir(&parent).unwrap();
             fs::write(&parent, b"not a directory").unwrap();
 
-            let err = RaftLogStorage::append(
-                &mut store,
-                vec![bootstrap_membership_entry(1)],
-                IOFlushed::noop(),
-            )
-            .await
-            .expect_err("WAL append failure should reject log-store mutation");
+            let (accepted, durability) =
+                append_and_wait_for_durability(&mut store, vec![bootstrap_membership_entry(1)])
+                    .await;
+            accepted.expect("append should publish its readable view before WAL I/O");
+            let err = durability.expect_err("WAL append failure should fail durability");
             assert!(
                 err.to_string().contains("append OpenRaft WAL record"),
                 "unexpected WAL append error: {err:?}"
             );
-            assert_eq!(
-                store.export_restart_artifact().unwrap(),
-                ControlPlaneRaftLogStoreRestartArtifact::default()
-            );
+            let accepted = store.inner.lock().unwrap();
+            assert_eq!(accepted.entries.len(), 1);
+            assert!(accepted.poisoned.is_some());
+            drop(accepted);
+            let durable = store.durable.lock().unwrap();
+            assert!(durable.inner.entries.is_empty());
+            assert!(durable.inner.poisoned.is_some());
         });
     }
 
     #[test]
-    fn control_plane_raft_wal_backed_log_store_rejects_torn_header_without_publishing() {
+    fn control_plane_raft_wal_backed_log_store_torn_header_poisons_after_acceptance() {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let wal_path = tmp.path().join("raft.wal");
@@ -16460,22 +17106,284 @@ mod tests {
             )
             .unwrap();
 
-            let err = RaftLogStorage::append(
-                &mut store,
-                vec![bootstrap_membership_entry(1)],
-                IOFlushed::noop(),
-            )
-            .await
-            .expect_err("pre-existing torn WAL header should reject append");
+            let (accepted, durability) =
+                append_and_wait_for_durability(&mut store, vec![bootstrap_membership_entry(1)])
+                    .await;
+            accepted.expect("append should become readable before checking its WAL header");
+            let err = durability.expect_err("torn WAL header should fail durability");
             assert!(
                 err.to_string()
                     .contains("truncated control-plane OpenRaft WAL file header"),
                 "unexpected WAL append error: {err:?}"
             );
-            assert_eq!(
-                store.export_restart_artifact().unwrap(),
-                ControlPlaneRaftLogStoreRestartArtifact::default()
-            );
+            let accepted = store.inner.lock().unwrap();
+            assert_eq!(accepted.entries.len(), 1);
+            assert!(accepted.poisoned.is_some());
+            drop(accepted);
+            assert!(store.durable.lock().unwrap().inner.entries.is_empty());
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_wal_append_is_readable_without_blocking_executor_on_file_sync() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("single-worker Tokio runtime should initialize")
+            .block_on(async {
+                let tmp = test_util::tempdir();
+                let wal_path = tmp.path().join("raft.wal");
+                let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
+                let mut store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
+                    ControlPlaneRaftLogStoreRestartArtifact::default(),
+                    wal,
+                )
+                .expect("WAL-backed log store should initialize");
+                let gate = TestWalFileSyncGate::install(wal_path);
+                let (flushed, mut durability) = ControlPlaneRaftTypeConfig::oneshot();
+
+                RaftLogStorage::append(
+                    &mut store,
+                    vec![bootstrap_membership_entry(1)],
+                    IOFlushed::signal(flushed),
+                )
+                .await
+                .expect("append should return after publishing the readable view");
+                gate.wait_until_entered(Duration::from_secs(1));
+
+                let log_state = RaftLogStorage::get_log_state(&mut store)
+                    .await
+                    .expect("accepted log state should remain readable during fsync");
+                assert_eq!(log_state.last_log_id, Some(raft_log_id(0, 1, 0)));
+                let status = store
+                    .status_snapshot()
+                    .expect("log-store status should remain readable during fsync");
+                assert_eq!(status.durable_last_log_id, None);
+                assert_eq!(status.durable_vote, None);
+                assert!(store.durable.lock().unwrap().inner.entries.is_empty());
+                assert!(matches!(
+                    durability.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                })
+                .await
+                .expect("Tokio timer should progress while the WAL worker is blocked in fsync");
+                assert!(matches!(
+                    durability.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+
+                gate.release();
+                tokio::time::timeout(Duration::from_secs(1), durability)
+                    .await
+                    .expect("flush callback should complete after releasing file sync")
+                    .expect("flush callback sender should remain available")
+                    .expect("WAL append should become durable");
+                assert_eq!(store.export_restart_artifact().unwrap().entries.len(), 1);
+            });
+    }
+
+    #[test]
+    fn control_plane_raft_durable_operation_survives_caller_cancellation_in_order() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("single-worker Tokio runtime should initialize")
+            .block_on(async {
+                let tmp = test_util::tempdir();
+                let wal_path = tmp.path().join("raft.wal");
+                let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
+                let mut store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
+                    ControlPlaneRaftLogStoreRestartArtifact::default(),
+                    wal,
+                )
+                .expect("WAL-backed log store should initialize");
+                let gate = TestWalFileSyncGate::install(wal_path);
+                let (flushed, durability) = ControlPlaneRaftTypeConfig::oneshot();
+                RaftLogStorage::append(
+                    &mut store,
+                    vec![bootstrap_membership_entry(1)],
+                    IOFlushed::signal(flushed),
+                )
+                .await
+                .expect("append should be accepted before file sync");
+                gate.wait_until_entered(Duration::from_secs(1));
+
+                let vote = Vote::<ControlPlaneRaftLeaderId>::new(3, 1);
+                let mut vote_store = store.clone();
+                let vote_task =
+                    tokio::spawn(
+                        async move { RaftLogStorage::save_vote(&mut vote_store, &vote).await },
+                    );
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if store
+                            .wal_metric_snapshot()
+                            .is_some_and(|metrics| metrics.durability_queue_depth > 0)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("durable vote should enter the ordered queue");
+                assert!(!vote_task.is_finished());
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                })
+                .await
+                .expect("Tokio timer should progress while the durable vote waits");
+
+                vote_task.abort();
+                assert!(vote_task.await.unwrap_err().is_cancelled());
+                gate.release();
+                durability
+                    .await
+                    .expect("append flush callback should remain connected")
+                    .expect("accepted append should become durable");
+
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if store.persisted_vote().unwrap() == Some(vote) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("submitted vote should complete after its caller is cancelled");
+                let durable = store.export_restart_artifact().unwrap();
+                assert_eq!(durable.entries.len(), 1);
+                assert_eq!(durable.vote, Some(vote));
+            });
+    }
+
+    #[test]
+    fn control_plane_raft_durability_queue_applies_bounded_backpressure() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("single-worker Tokio runtime should initialize")
+            .block_on(async {
+                let tmp = test_util::tempdir();
+                let wal_path = tmp.path().join("raft.wal");
+                let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
+                let mut store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
+                    ControlPlaneRaftLogStoreRestartArtifact::default(),
+                    wal,
+                )
+                .expect("WAL-backed log store should initialize");
+                let gate = TestWalFileSyncGate::install(wal_path);
+                let (flushed, durability) = ControlPlaneRaftTypeConfig::oneshot();
+                RaftLogStorage::append(
+                    &mut store,
+                    vec![bootstrap_membership_entry(1)],
+                    IOFlushed::signal(flushed),
+                )
+                .await
+                .expect("append should be accepted before file sync");
+                gate.wait_until_entered(Duration::from_secs(1));
+
+                let mut tasks = Vec::new();
+                for term in 1..=CONTROL_PLANE_RAFT_DURABILITY_QUEUE_CAPACITY + 1 {
+                    let mut queued_store = store.clone();
+                    tasks.push(tokio::spawn(async move {
+                        let vote =
+                            Vote::<ControlPlaneRaftLeaderId>::new(u64::try_from(term).unwrap(), 1);
+                        RaftLogStorage::save_vote(&mut queued_store, &vote).await
+                    }));
+                }
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if store.wal_metric_snapshot().is_some_and(|metrics| {
+                            metrics.durability_queue_depth
+                                > u64::try_from(CONTROL_PLANE_RAFT_DURABILITY_QUEUE_CAPACITY)
+                                    .unwrap()
+                        }) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("one durable operation should wait outside the full bounded queue");
+                let lane = store.durability_lane.as_ref().unwrap();
+                assert_eq!(
+                    lane.sender.max_capacity(),
+                    CONTROL_PLANE_RAFT_DURABILITY_QUEUE_CAPACITY
+                );
+                assert_eq!(lane.sender.capacity(), 0);
+                assert!(tasks.iter().any(|task| !task.is_finished()));
+
+                gate.release();
+                durability
+                    .await
+                    .expect("append flush callback should remain connected")
+                    .expect("accepted append should become durable");
+                for task in tasks {
+                    task.await
+                        .expect("durable operation task should remain available")
+                        .expect("queued durable operation should complete");
+                }
+                assert_eq!(
+                    store.wal_metric_snapshot().unwrap().durability_queue_depth,
+                    0
+                );
+            });
+    }
+
+    #[test]
+    fn control_plane_raft_wal_compaction_waits_for_durable_publication() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let wal_path = tmp.path().join("raft.wal");
+            let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
+            let mut store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
+                ControlPlaneRaftLogStoreRestartArtifact::default(),
+                wal,
+            )
+            .expect("WAL-backed log store should initialize");
+            let gate = TestWalFileSyncGate::install(wal_path);
+            let (flushed, durability) = ControlPlaneRaftTypeConfig::oneshot();
+            RaftLogStorage::append(
+                &mut store,
+                vec![bootstrap_membership_entry(1)],
+                IOFlushed::signal(flushed),
+            )
+            .await
+            .expect("append should be accepted before file sync");
+            gate.wait_until_entered(Duration::from_secs(1));
+
+            let compact_store = store.clone();
+            let (compacted, compacted_rx) = std::sync::mpsc::channel();
+            let compact_thread = thread::spawn(move || {
+                let _ = compacted.send(compact_store.compact_wal_through(0));
+            });
+            assert!(matches!(
+                compacted_rx.recv_timeout(Duration::from_millis(20)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+
+            gate.release();
+            durability
+                .await
+                .expect("append flush callback should remain connected")
+                .expect("accepted append should become durable");
+            compacted_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("compaction should continue after durable publication")
+                .expect("compaction should succeed");
+            compact_thread.join().unwrap();
+
+            let durable = store.export_restart_artifact().unwrap();
+            assert_eq!(durable.entries.len(), 1);
+            let offsets = store.wal_monitor_snapshot().unwrap().unwrap().offsets();
+            assert_eq!(offsets.base_offset(), 0);
+            assert!(offsets.clean_len() > 0);
         });
     }
 
@@ -16497,16 +17405,14 @@ mod tests {
                 .expect("test WAL file-sync fault lock should not be poisoned") =
                 Some(wal_path.clone());
             let metrics_before = observability::control_plane_raft_wal_metrics_snapshot();
-            let err = RaftLogStorage::append(
-                &mut store,
-                vec![bootstrap_membership_entry(1)],
-                IOFlushed::noop(),
-            )
-            .await
-            .expect_err("ambiguous WAL sync failure should return an error");
+            let (accepted, durability) =
+                append_and_wait_for_durability(&mut store, vec![bootstrap_membership_entry(1)])
+                    .await;
+            accepted.expect("append should become readable before WAL sync");
+            let err = durability.expect_err("ambiguous WAL sync failure should fail durability");
             assert!(
                 err.to_string()
-                    .contains("append OpenRaft WAL record after ambiguous record write"),
+                    .contains("ambiguous WAL append after WAL write before file sync"),
                 "unexpected WAL append error: {err:?}"
             );
             let metrics_after = observability::control_plane_raft_wal_metrics_snapshot();
@@ -16519,7 +17425,7 @@ mod tests {
                 .expect_err("ambiguous WAL sync failure should poison the live log store");
             assert!(
                 err.to_string()
-                    .contains("control-plane OpenRaft WAL-backed log store poisoned"),
+                    .contains("control-plane OpenRaft WAL-backed durable log store poisoned"),
                 "unexpected poison error: {err:?}"
             );
             let inner = store
@@ -16529,7 +17435,7 @@ mod tests {
             assert_eq!(inner.vote, base.vote);
             assert_eq!(inner.committed, base.committed);
             assert_eq!(inner.last_purged_log_id, base.last_purged_log_id);
-            assert!(inner.entries.is_empty());
+            assert_eq!(inner.entries.len(), 1);
             assert!(
                 inner
                     .poisoned
@@ -16584,16 +17490,14 @@ mod tests {
                 .expect("test WAL parent-sync fault lock should not be poisoned") =
                 Some(wal_path.clone());
             let metrics_before = observability::control_plane_raft_wal_metrics_snapshot();
-            let err = RaftLogStorage::append(
-                &mut store,
-                vec![bootstrap_membership_entry(1)],
-                IOFlushed::noop(),
-            )
-            .await
-            .expect_err("post-write WAL sync failure should still return an error");
+            let (accepted, durability) =
+                append_and_wait_for_durability(&mut store, vec![bootstrap_membership_entry(1)])
+                    .await;
+            accepted.expect("append should become readable before WAL sync");
+            let err = durability.expect_err("post-write WAL sync failure should fail durability");
             assert!(
                 err.to_string()
-                    .contains("append OpenRaft WAL record after replayable record write"),
+                    .contains("WAL append failed after file sync"),
                 "unexpected WAL append error: {err:?}"
             );
             let metrics_after = observability::control_plane_raft_wal_metrics_snapshot();
@@ -16612,7 +17516,7 @@ mod tests {
                 .expect_err("post-file-sync failure should poison the live log store");
             assert!(
                 err.to_string()
-                    .contains("control-plane OpenRaft WAL-backed log store poisoned"),
+                    .contains("control-plane OpenRaft WAL-backed durable log store poisoned"),
                 "unexpected poison error: {err:?}"
             );
             let live_artifact = {
