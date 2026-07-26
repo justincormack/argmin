@@ -9841,6 +9841,46 @@ pub struct UnixControlPlaneClient {
     preferred_socket_index: Arc<AtomicUsize>,
 }
 
+#[derive(Debug)]
+struct ControlPlaneEndpointPass {
+    endpoint_count: usize,
+    next_endpoint_index: usize,
+    remaining: usize,
+    last_endpoint_index: Option<usize>,
+}
+
+impl ControlPlaneEndpointPass {
+    fn new(start: usize, endpoint_count: usize) -> Self {
+        debug_assert!(endpoint_count > 0);
+        Self {
+            endpoint_count,
+            next_endpoint_index: start % endpoint_count,
+            remaining: endpoint_count,
+            last_endpoint_index: None,
+        }
+    }
+
+    fn next(&mut self) -> Option<usize> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let endpoint_index = self.next_endpoint_index;
+        self.next_endpoint_index = (endpoint_index + 1) % self.endpoint_count;
+        self.remaining -= 1;
+        self.last_endpoint_index = Some(endpoint_index);
+        Some(endpoint_index)
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn last_endpoint_index(&self) -> usize {
+        self.last_endpoint_index
+            .expect("endpoint pass records every attempted endpoint")
+    }
+}
+
 impl std::fmt::Debug for UnixControlPlaneClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnixControlPlaneClient")
@@ -10737,9 +10777,22 @@ impl UnixControlPlaneClient {
             .store(socket_index % self.endpoint_count(), Ordering::Release);
     }
 
-    fn advance_preferred_socket(&self) {
-        let next = (self.preferred_socket_index() + 1) % self.endpoint_count();
-        self.prefer_socket_index(next);
+    fn endpoint_pass(&self) -> ControlPlaneEndpointPass {
+        ControlPlaneEndpointPass::new(self.preferred_socket_index(), self.endpoint_count())
+    }
+
+    fn prefer_next_endpoint_after_failure(&self, pass: &ControlPlaneEndpointPass) {
+        let rejected = pass.last_endpoint_index();
+        let _ = self.preferred_socket_index.compare_exchange(
+            rejected,
+            pass.next_endpoint_index,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn prefer_successful_endpoint(&self, pass: &ControlPlaneEndpointPass) {
+        self.prefer_socket_index(pass.last_endpoint_index());
     }
 
     fn endpoint_count(&self) -> usize {
@@ -10774,41 +10827,56 @@ impl UnixControlPlaneClient {
         deadline: Instant,
     ) -> Result<Vec<u8>, ControlPlaneError> {
         let mut last_routing_error = None;
-        for _ in 0..self.endpoint_count() {
-            let response_payload = self.send_request_raw_response_until(kind, payload, deadline)?;
+        let mut endpoint_pass = self.endpoint_pass();
+        while !endpoint_pass.is_exhausted() {
+            let response_payload = self.send_request_raw_response_with_endpoint_pass_until(
+                kind,
+                payload,
+                deadline,
+                &mut endpoint_pass,
+            )?;
             match decode_control_plane_rpc_response(response_payload) {
                 Err(error) if error.is_control_plane_leader_routing_rejection() => {
                     last_routing_error = Some(error);
-                    self.advance_preferred_socket();
+                    self.prefer_next_endpoint_after_failure(&endpoint_pass);
                 }
-                result => return result,
+                result => {
+                    self.prefer_successful_endpoint(&endpoint_pass);
+                    return result;
+                }
             }
         }
         Err(last_routing_error.expect("leader routing retry requires at least one endpoint"))
     }
 
-    fn send_request_raw_response_with_timeout(
-        &self,
-        kind: ControlPlaneRpcKind,
-        payload: &[u8],
-        io_timeout: Duration,
-    ) -> Result<Vec<u8>, ControlPlaneError> {
-        self.send_request_raw_response_until(kind, payload, Instant::now() + io_timeout)
-    }
-
+    #[cfg(test)]
     fn send_request_raw_response_until(
         &self,
         kind: ControlPlaneRpcKind,
         payload: &[u8],
         deadline: Instant,
     ) -> Result<Vec<u8>, ControlPlaneError> {
+        let mut endpoint_pass = self.endpoint_pass();
+        self.send_request_raw_response_with_endpoint_pass_until(
+            kind,
+            payload,
+            deadline,
+            &mut endpoint_pass,
+        )
+    }
+
+    fn send_request_raw_response_with_endpoint_pass_until(
+        &self,
+        kind: ControlPlaneRpcKind,
+        payload: &[u8],
+        deadline: Instant,
+        endpoint_pass: &mut ControlPlaneEndpointPass,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
         if let Some(transport) = &self.frame_transport {
             let request_frame = encode_control_plane_rpc_frame(kind, payload)?;
-            let start = self.preferred_socket_index();
             let mut response_frame = None;
             let mut last_pre_request_error = None;
-            for offset in 0..self.frame_transport_endpoints.len() {
-                let endpoint_index = (start + offset) % self.frame_transport_endpoints.len();
+            while let Some(endpoint_index) = endpoint_pass.next() {
                 match transport.exchange(ControlPlaneRpcFrameExchange {
                     endpoint: self.frame_transport_endpoints[endpoint_index].clone(),
                     request_frame: request_frame.clone(),
@@ -10816,15 +10884,12 @@ impl UnixControlPlaneClient {
                     max_frame_bytes: control_plane_rpc_max_frame_bytes(),
                 }) {
                     Ok(response) => {
-                        self.prefer_socket_index(endpoint_index);
                         response_frame = Some(response);
                         break;
                     }
                     Err(error) if !error.request_may_have_been_sent() => {
                         last_pre_request_error = Some(error.into_error());
-                        self.prefer_socket_index(
-                            (endpoint_index + 1) % self.frame_transport_endpoints.len(),
-                        );
+                        self.prefer_next_endpoint_after_failure(endpoint_pass);
                     }
                     Err(error) => return Err(error.into_error()),
                 }
@@ -10859,14 +10924,11 @@ impl UnixControlPlaneClient {
             }
             return Ok(response_payload);
         }
-        let start = self.preferred_socket_index();
         let mut stream = None;
         let mut last_connect_error = None;
-        for offset in 0..self.socket_paths.len() {
-            let socket_index = (start + offset) % self.socket_paths.len();
+        while let Some(socket_index) = endpoint_pass.next() {
             match connect_unix_stream_until(&self.socket_paths[socket_index], deadline) {
                 Ok(connected) => {
-                    self.prefer_socket_index(socket_index);
                     stream = Some(connected);
                     break;
                 }
@@ -10875,7 +10937,7 @@ impl UnixControlPlaneClient {
                         context: "connect control-plane socket",
                         source,
                     });
-                    self.prefer_socket_index((socket_index + 1) % self.socket_paths.len());
+                    self.prefer_next_endpoint_after_failure(endpoint_pass);
                 }
             }
         }
@@ -10952,22 +11014,30 @@ impl UnixControlPlaneClient {
         retry_budget: Duration,
     ) -> Result<Vec<u8>, ControlPlaneError> {
         let deadline = Instant::now() + retry_budget;
+        let mut endpoint_pass = self.endpoint_pass();
         loop {
-            let response_payload =
-                self.send_liveness_request_raw_response_until(kind, payload, deadline)?;
+            let response_payload = self.send_liveness_request_raw_response_until(
+                kind,
+                payload,
+                deadline,
+                &mut endpoint_pass,
+            )?;
             match decode_control_plane_rpc_response(response_payload) {
                 Err(error)
                     if error.is_control_plane_leader_routing_rejection()
                         && Instant::now() < deadline =>
                 {
-                    self.advance_preferred_socket();
+                    self.prefer_next_endpoint_after_failure(&endpoint_pass);
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     let retry_sleep = CONTROL_PLANE_RPC_LIVENESS_RETRY_BACKOFF.min(remaining / 2);
                     if !retry_sleep.is_zero() {
                         std::thread::sleep(retry_sleep);
                     }
                 }
-                result => return result,
+                result => {
+                    self.prefer_successful_endpoint(&endpoint_pass);
+                    return result;
+                }
             }
         }
     }
@@ -10977,6 +11047,7 @@ impl UnixControlPlaneClient {
         kind: ControlPlaneRpcKind,
         payload: &[u8],
         deadline: Instant,
+        endpoint_pass: &mut ControlPlaneEndpointPass,
     ) -> Result<Vec<u8>, ControlPlaneError> {
         debug_assert_eq!(kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
         let mut retry_started = false;
@@ -11000,7 +11071,15 @@ impl UnixControlPlaneClient {
             }
             let read_timeout = remaining.min(CONTROL_PLANE_RPC_LIVENESS_IO_TIMEOUT);
             let attempt_deadline = now + read_timeout;
-            match self.send_request_raw_response_until(kind, payload, attempt_deadline) {
+            if endpoint_pass.is_exhausted() {
+                *endpoint_pass = self.endpoint_pass();
+            }
+            match self.send_request_raw_response_with_endpoint_pass_until(
+                kind,
+                payload,
+                attempt_deadline,
+                endpoint_pass,
+            ) {
                 Ok(payload) => return Ok(payload),
                 Err(error) if error.is_retryable_control_plane_rpc_transport_error() => {
                     let now = Instant::now();
@@ -11642,6 +11721,28 @@ impl AuthenticatedUnixControlPlaneClient {
         &self,
         kind: ControlPlaneRpcKind,
         deadline: Instant,
+        build_payload: B,
+        verify_response: V,
+    ) -> Result<Vec<u8>, ControlPlaneError>
+    where
+        B: FnMut() -> Result<Vec<u8>, ControlPlaneError>,
+        V: FnMut(&[u8]) -> Result<Vec<u8>, ControlPlaneError>,
+    {
+        let mut endpoint_pass = self.inner.endpoint_pass();
+        self.send_verified_request_with_endpoint_pass_until(
+            kind,
+            deadline,
+            &mut endpoint_pass,
+            build_payload,
+            verify_response,
+        )
+    }
+
+    fn send_verified_request_with_endpoint_pass_until<B, V>(
+        &self,
+        kind: ControlPlaneRpcKind,
+        deadline: Instant,
+        endpoint_pass: &mut ControlPlaneEndpointPass,
         mut build_payload: B,
         mut verify_response: V,
     ) -> Result<Vec<u8>, ControlPlaneError>
@@ -11650,7 +11751,7 @@ impl AuthenticatedUnixControlPlaneClient {
         V: FnMut(&[u8]) -> Result<Vec<u8>, ControlPlaneError>,
     {
         let mut last_routing_error = None;
-        for _ in 0..self.inner.endpoint_count() {
+        while !endpoint_pass.is_exhausted() {
             let payload = build_payload()?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -11664,14 +11765,22 @@ impl AuthenticatedUnixControlPlaneClient {
             }
             let response = self
                 .inner
-                .send_request_raw_response_until(kind, &payload, deadline)?;
+                .send_request_raw_response_with_endpoint_pass_until(
+                    kind,
+                    &payload,
+                    deadline,
+                    endpoint_pass,
+                )?;
             let response = verify_response(&response)?;
             match decode_control_plane_rpc_response(response) {
                 Err(error) if error.is_control_plane_leader_routing_rejection() => {
                     last_routing_error = Some(error);
-                    self.inner.advance_preferred_socket();
+                    self.inner.prefer_next_endpoint_after_failure(endpoint_pass);
                 }
-                result => return result,
+                result => {
+                    self.inner.prefer_successful_endpoint(endpoint_pass);
+                    return result;
+                }
             }
         }
         Err(last_routing_error.expect("leader routing retry requires at least one endpoint"))
@@ -11763,20 +11872,30 @@ impl AuthenticatedUnixControlPlaneClient {
         F: FnMut() -> Result<u64, ControlPlaneError>,
     {
         let mut last_routing_error = None;
-        for _ in 0..self.inner.endpoint_count() {
+        let mut endpoint_pass = self.inner.endpoint_pass();
+        while !endpoint_pass.is_exhausted() {
             let request =
                 self.sign_admin_control_plane_request(kind, authority_now_ms()?, payload.clone())?;
-            let response =
-                self.inner
-                    .send_request_raw_response_with_timeout(kind, &request, read_timeout)?;
+            let response = self
+                .inner
+                .send_request_raw_response_with_endpoint_pass_until(
+                    kind,
+                    &request,
+                    Instant::now() + read_timeout,
+                    &mut endpoint_pass,
+                )?;
             let response =
                 self.verify_admin_control_plane_response(kind, authority_now_ms()?, &response)?;
             match decode_control_plane_rpc_response(response) {
                 Err(error) if error.is_control_plane_leader_routing_rejection() => {
                     last_routing_error = Some(error);
-                    self.inner.advance_preferred_socket();
+                    self.inner
+                        .prefer_next_endpoint_after_failure(&endpoint_pass);
                 }
-                result => return result,
+                result => {
+                    self.inner.prefer_successful_endpoint(&endpoint_pass);
+                    return result;
+                }
             }
         }
         Err(last_routing_error.expect("leader routing retry requires at least one endpoint"))
@@ -12446,28 +12565,55 @@ impl AuthenticatedUnixControlPlaneClient {
         deadline: Instant,
         attempt_timeout: Duration,
     ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
-        for attempt in 0..self.inner.endpoint_count() {
+        let mut endpoint_pass = self.inner.endpoint_pass();
+        self.authority_clock_status_with_endpoint_pass_until(
+            authority_now_ms,
+            deadline,
+            attempt_timeout,
+            &mut endpoint_pass,
+        )
+    }
+
+    fn authority_clock_status_with_endpoint_pass_until(
+        &self,
+        authority_now_ms: u64,
+        deadline: Instant,
+        attempt_timeout: Duration,
+        endpoint_pass: &mut ControlPlaneEndpointPass,
+    ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+        loop {
             let attempt_deadline =
                 authority_clock_admin_attempt_deadline(deadline, attempt_timeout)?;
-            let payload = self.send_admin_request_until_and_clocks(
+            let payload = self.send_verified_request_with_endpoint_pass_until(
                 ControlPlaneRpcKind::AuthorityClockStatus,
-                Vec::new(),
                 attempt_deadline,
-                || Ok(authority_now_ms),
-                || Ok(crate::clock::current_time_millis()),
+                endpoint_pass,
+                || {
+                    self.sign_admin_control_plane_request(
+                        ControlPlaneRpcKind::AuthorityClockStatus,
+                        authority_now_ms,
+                        Vec::new(),
+                    )
+                },
+                |response| {
+                    self.verify_admin_control_plane_response(
+                        ControlPlaneRpcKind::AuthorityClockStatus,
+                        crate::clock::current_time_millis(),
+                        response,
+                    )
+                },
             )?;
             let mut reader = PayloadReader::new(&payload);
             let status = read_authority_clock_status(&mut reader)?;
             reader.finish()?;
             if status.current_raft_leadership_term().is_none()
                 || status.local_raft_authority_leader()
-                || attempt + 1 == self.inner.endpoint_count()
+                || endpoint_pass.is_exhausted()
             {
                 return Ok(status);
             }
-            self.inner.advance_preferred_socket();
+            self.inner.prefer_next_endpoint_after_failure(endpoint_pass);
         }
-        unreachable!("control-plane endpoint set is non-empty")
     }
 
     fn reestablish_authority_clock_from_status_with_attempt_timeout(
@@ -12608,15 +12754,21 @@ impl AuthenticatedUnixControlPlaneClient {
         deadline: Instant,
         attempt_timeout: Duration,
     ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+        let mut endpoint_pass = self.inner.endpoint_pass();
         loop {
-            match self.authority_clock_status_until_with_attempt_timeout(
+            if endpoint_pass.is_exhausted() {
+                endpoint_pass = self.inner.endpoint_pass();
+            }
+            match self.authority_clock_status_with_endpoint_pass_until(
                 authority_now_ms,
                 deadline,
                 attempt_timeout,
+                &mut endpoint_pass,
             ) {
                 Ok(status) => return Ok(status),
                 Err(error) if error.is_retryable_read_only_rpc_transport_error() => {
-                    self.inner.advance_preferred_socket();
+                    self.inner
+                        .prefer_next_endpoint_after_failure(&endpoint_pass);
                     let remaining = authority_clock_admin_remaining(deadline).map_err(|_| error)?;
                     std::thread::sleep(
                         CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF.min(remaining),
@@ -12659,12 +12811,18 @@ impl AuthenticatedUnixControlPlaneClient {
         let deadline = Instant::now() + CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE;
         loop {
             let mut last_retryable_error = None;
-            for _ in 0..self.inner.endpoint_count() {
+            let mut endpoint_pass = self.inner.endpoint_pass();
+            while !endpoint_pass.is_exhausted() {
                 let request =
                     self.sign_read_only_request(kind, authority_now_ms()?, payload.clone())?;
-                let response =
-                    self.inner
-                        .send_request_raw_response_with_timeout(kind, &request, read_timeout);
+                let response = self
+                    .inner
+                    .send_request_raw_response_with_endpoint_pass_until(
+                        kind,
+                        &request,
+                        Instant::now() + read_timeout,
+                        &mut endpoint_pass,
+                    );
                 let response = match response {
                     Ok(response) => response,
                     Err(error)
@@ -12672,7 +12830,8 @@ impl AuthenticatedUnixControlPlaneClient {
                             && Instant::now() < deadline =>
                     {
                         last_retryable_error = Some(error);
-                        self.inner.advance_preferred_socket();
+                        self.inner
+                            .prefer_next_endpoint_after_failure(&endpoint_pass);
                         std::thread::sleep(CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF);
                         continue;
                     }
@@ -12683,9 +12842,13 @@ impl AuthenticatedUnixControlPlaneClient {
                 match decode_control_plane_rpc_response(response) {
                     Err(error) if error.is_control_plane_leader_routing_rejection() => {
                         last_retryable_error = Some(error);
-                        self.inner.advance_preferred_socket();
+                        self.inner
+                            .prefer_next_endpoint_after_failure(&endpoint_pass);
                     }
-                    result => return result,
+                    result => {
+                        self.inner.prefer_successful_endpoint(&endpoint_pass);
+                        return result;
+                    }
                 }
             }
             let error = last_retryable_error
@@ -13968,6 +14131,7 @@ impl AuthenticatedUnixControlPlaneClient {
         );
         let retry_budget = Duration::from_millis(heartbeat.requested_lease_duration_ms);
         let deadline = Instant::now() + retry_budget;
+        let mut endpoint_pass = self.inner.endpoint_pass();
         let payload = loop {
             let issued_at_ms = authority_now_ms()?;
             let expires_at_ms = issued_at_ms
@@ -13999,6 +14163,7 @@ impl AuthenticatedUnixControlPlaneClient {
                 ControlPlaneRpcKind::RefreshNodeHeartbeat,
                 &request,
                 deadline,
+                &mut endpoint_pass,
             )?;
             let response = self.verify_runtime_map_response(
                 ControlPlaneRpcKind::RefreshNodeHeartbeat,
@@ -14010,14 +14175,18 @@ impl AuthenticatedUnixControlPlaneClient {
                     if error.is_control_plane_leader_routing_rejection()
                         && Instant::now() < deadline =>
                 {
-                    self.inner.advance_preferred_socket();
+                    self.inner
+                        .prefer_next_endpoint_after_failure(&endpoint_pass);
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     let retry_sleep = CONTROL_PLANE_RPC_LIVENESS_RETRY_BACKOFF.min(remaining / 2);
                     if !retry_sleep.is_zero() {
                         std::thread::sleep(retry_sleep);
                     }
                 }
-                result => break result?,
+                result => {
+                    self.inner.prefer_successful_endpoint(&endpoint_pass);
+                    break result?;
+                }
             }
         };
         let mut reader = PayloadReader::new(&payload);
@@ -21136,6 +21305,41 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RoutingControlPlaneFrameTransport {
+        endpoints: Mutex<Vec<String>>,
+    }
+
+    impl ControlPlaneRpcFrameTransport for RoutingControlPlaneFrameTransport {
+        fn name(&self) -> &'static str {
+            "routing-test"
+        }
+
+        fn exchange(
+            &self,
+            exchange: ControlPlaneRpcFrameExchange,
+        ) -> Result<Vec<u8>, ControlPlaneRpcFrameExchangeError> {
+            self.endpoints
+                .lock()
+                .unwrap()
+                .push(exchange.endpoint.clone());
+            let response = match exchange.endpoint.as_str() {
+                "follower" => {
+                    encode_control_plane_rpc_response(Err(ControlPlaneError::RpcRemote {
+                        message: "local OpenRaft authority is not the serving leader".to_owned(),
+                    }))
+                    .unwrap()
+                }
+                "leader" => encode_control_plane_rpc_response(Ok(b"leader".to_vec())).unwrap(),
+                endpoint => panic!("request-local failover unexpectedly visited {endpoint}"),
+            };
+            Ok(
+                encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &response)
+                    .unwrap(),
+            )
+        }
+    }
+
     #[test]
     fn framed_control_plane_client_fails_over_only_before_request_starts() {
         let failover_transport = Arc::new(TestControlPlaneFrameTransport {
@@ -21185,6 +21389,49 @@ mod tests {
                 if source.kind() == ErrorKind::ConnectionReset
         ));
         assert_eq!(ambiguous_transport.calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn authenticated_endpoint_failover_ignores_concurrent_shared_hint_changes() {
+        let transport = Arc::new(RoutingControlPlaneFrameTransport::default());
+        let inner = UnixControlPlaneClient::with_frame_transport(
+            [
+                "follower".to_owned(),
+                "leader".to_owned(),
+                "concurrent-hint".to_owned(),
+            ],
+            transport.clone(),
+        )
+        .unwrap();
+        let concurrent_client = inner.clone();
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            inner,
+            frontend_auth_credential("auth-cluster", "frontend-1"),
+        );
+        let changed_hint = AtomicBool::new(false);
+
+        let response = client
+            .send_verified_request_with_endpoint_failover_until(
+                ControlPlaneRpcKind::RuntimeMapStatus,
+                Instant::now() + Duration::from_secs(1),
+                || Ok(Vec::new()),
+                |response| {
+                    if !changed_hint.swap(true, Ordering::AcqRel) {
+                        // A concurrent request may update the cache after this request has
+                        // already selected its endpoint pass.
+                        concurrent_client.prefer_socket_index(2);
+                    }
+                    Ok(response.to_vec())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(response, b"leader");
+        assert_eq!(
+            *transport.endpoints.lock().unwrap(),
+            ["follower".to_owned(), "leader".to_owned()]
+        );
+        assert_eq!(client.inner().preferred_socket_index(), 1);
     }
 
     fn assert_snapshot_invariant_error(
@@ -26380,6 +26627,69 @@ mod tests {
         assert!(status.established());
         let server_status = server.join().unwrap();
         assert_eq!(status, server_status);
+    }
+
+    #[test]
+    fn authenticated_authority_clock_recovery_status_moves_past_response_loss() {
+        let tmp = test_util::tempdir();
+        let failing_socket = tmp.path().join("failing.sock");
+        let healthy_socket = tmp.path().join("healthy.sock");
+        let failing_listener = std::os::unix::net::UnixListener::bind(&failing_socket).unwrap();
+        let healthy_listener = std::os::unix::net::UnixListener::bind(&healthy_socket).unwrap();
+        let wall_ms = 2_000;
+        let expected = ControlPlaneAuthorityClockStatus {
+            generation: 7,
+            established: false,
+            blocked_reason: Some(ControlPlaneAuthorityClockBlockedReason::RaftLeadershipChanged),
+            committed_timestamp_high_water_ms: Some(1_000),
+            bound_raft_leadership_term: None,
+            current_raft_leadership_term: Some(3),
+            local_raft_authority_leader: true,
+            local_raft_authority_serving: true,
+        };
+        let failing_server = std::thread::spawn(move || {
+            let (mut stream, _addr) = failing_listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::AuthorityClockStatus);
+        });
+        let healthy_server = std::thread::spawn(move || {
+            let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+            let (mut stream, _addr) = healthy_listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            let request_now_ms = ControlPlaneAuthEnvelope::decode_frame(
+                &request.payload,
+                CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+            )
+            .unwrap()
+            .header()
+            .issued_at_ms()
+            .unwrap();
+            let response = scripted_authenticated_authority_clock_response(
+                request,
+                &verifier,
+                request_now_ms,
+                Ok(expected),
+            );
+            write_control_plane_unix_response(&mut stream, response).unwrap();
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::with_socket_paths([failing_socket, healthy_socket]).unwrap(),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let observed = crate::clock::with_time_override(wall_ms, || {
+            client.retry_authority_clock_status_until(
+                wall_ms,
+                Instant::now() + Duration::from_secs(1),
+                Duration::from_millis(100),
+            )
+        })
+        .unwrap();
+
+        failing_server.join().unwrap();
+        healthy_server.join().unwrap();
+        assert_eq!(observed, expected);
+        assert_eq!(client.inner().preferred_socket_index(), 1);
     }
 
     #[test]
