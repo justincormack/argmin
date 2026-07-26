@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-quick-xml = "0.37"
+quick-xml = "0.41"
 ring = "0.17"
 thiserror = "2"
 unicode-general-category = "1.1"

@@ -7,7 +7,7 @@ use crate::coordinator::{
 use crate::error::ServerError;
 use auth::SignatureMismatchDiagnostics;
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
-use quick_xml::{escape::unescape, events::Event, Reader};
+use quick_xml::{escape::unescape, events::Event, Reader, XmlVersion};
 #[cfg(test)]
 use s3_types::VersionId;
 use s3_types::{
@@ -1430,6 +1430,7 @@ pub fn parse_acl_xml(data: &[u8]) -> Result<AclGrants, ServerError> {
     let mut current_grantee: Option<AclGrantee> = None;
     let mut current_permission: Option<AclPermission> = None;
     let mut current_text_field: Option<TextField> = None;
+    let mut current_text = String::new();
     let mut in_grantee = false;
 
     loop {
@@ -1445,18 +1446,30 @@ pub fn parse_acl_xml(data: &[u8]) -> Result<AclGrants, ServerError> {
                         })?;
                         if attr.key.as_ref().ends_with(b"type") {
                             current_grantee_type = Some(
-                                attr.decode_and_unescape_value(reader.decoder())
-                                    .map_err(|_| ServerError::InvalidArgument {
-                                        reason: "invalid ACL grantee type".to_string(),
-                                    })?
-                                    .into_owned(),
+                                attr.decoded_and_normalized_value(
+                                    XmlVersion::Implicit1_0,
+                                    reader.decoder(),
+                                )
+                                .map_err(|_| ServerError::InvalidArgument {
+                                    reason: "invalid ACL grantee type".to_string(),
+                                })?
+                                .into_owned(),
                             );
                         }
                     }
                 }
-                b"ID" if in_grantee => current_text_field = Some(TextField::GranteeId),
-                b"URI" if in_grantee => current_text_field = Some(TextField::GranteeUri),
-                b"Permission" => current_text_field = Some(TextField::Permission),
+                b"ID" if in_grantee => {
+                    current_text.clear();
+                    current_text_field = Some(TextField::GranteeId);
+                }
+                b"URI" if in_grantee => {
+                    current_text.clear();
+                    current_text_field = Some(TextField::GranteeUri);
+                }
+                b"Permission" => {
+                    current_text.clear();
+                    current_text_field = Some(TextField::Permission);
+                }
                 _ => {}
             },
             Ok(Event::Empty(e)) if e.local_name().as_ref() == b"Grantee" => {
@@ -1469,81 +1482,95 @@ pub fn parse_acl_xml(data: &[u8]) -> Result<AclGrants, ServerError> {
                     })?;
                     if attr.key.as_ref().ends_with(b"type") {
                         current_grantee_type = Some(
-                            attr.decode_and_unescape_value(reader.decoder())
-                                .map_err(|_| ServerError::InvalidArgument {
-                                    reason: "invalid ACL grantee type".to_string(),
-                                })?
-                                .into_owned(),
+                            attr.decoded_and_normalized_value(
+                                XmlVersion::Implicit1_0,
+                                reader.decoder(),
+                            )
+                            .map_err(|_| ServerError::InvalidArgument {
+                                reason: "invalid ACL grantee type".to_string(),
+                            })?
+                            .into_owned(),
                         );
                     }
                 }
             }
-            Ok(Event::Text(e)) => {
-                let Some(field) = current_text_field else {
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                if current_text_field.is_none() {
                     buf.clear();
                     continue;
-                };
-                let text = decode_xml_text(
-                    e.as_ref(),
-                    "invalid UTF-8 in ACL XML",
-                    "invalid escaped text in ACL XML",
-                )?;
-                match field {
-                    TextField::Permission => {
-                        current_permission =
-                            Some(AclPermission::parse(text.trim()).ok_or_else(|| {
-                                ServerError::InvalidArgument {
-                                    reason: format!("unsupported ACL permission: {}", text.trim()),
-                                }
-                            })?);
-                    }
-                    TextField::GranteeId => {
-                        let grantee_type = current_grantee_type.as_deref().ok_or_else(|| {
-                            ServerError::InvalidArgument {
-                                reason: "missing ACL grantee type".to_string(),
-                            }
-                        })?;
-                        if grantee_type != "CanonicalUser" {
-                            return Err(ServerError::InvalidArgument {
-                                reason: format!("unsupported ACL grantee type: {grantee_type}"),
-                            });
-                        }
-                        current_grantee = Some(AclGrantee::CanonicalUser(
-                            CanonicalUserId::new(text.trim()).ok_or_else(|| {
-                                ServerError::InvalidArgument {
-                                    reason: "invalid canonical user ID in ACL XML".to_string(),
-                                }
-                            })?,
-                        ));
-                    }
-                    TextField::GranteeUri => {
-                        let grantee_type = current_grantee_type.as_deref().ok_or_else(|| {
-                            ServerError::InvalidArgument {
-                                reason: "missing ACL grantee type".to_string(),
-                            }
-                        })?;
-                        if grantee_type != "Group" {
-                            return Err(ServerError::InvalidArgument {
-                                reason: format!("unsupported ACL grantee type: {grantee_type}"),
-                            });
-                        }
-                        current_grantee =
-                            Some(AclGrantee::parse_group_uri(text.trim()).ok_or_else(|| {
-                                ServerError::InvalidArgument {
-                                    reason: format!("unsupported ACL group URI: {}", text.trim()),
-                                }
-                            })?);
-                    }
                 }
+                let text = decode_xml_text_event(event, |bytes| {
+                    decode_xml_text(
+                        bytes,
+                        "invalid UTF-8 in ACL XML",
+                        "invalid escaped text in ACL XML",
+                    )
+                })?;
+                current_text.push_str(&text);
             }
             Ok(Event::End(e)) => match e.local_name().as_ref() {
                 b"Grantee" => {
                     in_grantee = false;
                     current_text_field = None;
                 }
-                b"ID" | b"URI" | b"Permission" => {
+                b"ID" if current_text_field == Some(TextField::GranteeId) => {
+                    let grantee_type = current_grantee_type.as_deref().ok_or_else(|| {
+                        ServerError::InvalidArgument {
+                            reason: "missing ACL grantee type".to_string(),
+                        }
+                    })?;
+                    if grantee_type != "CanonicalUser" {
+                        return Err(ServerError::InvalidArgument {
+                            reason: format!("unsupported ACL grantee type: {grantee_type}"),
+                        });
+                    }
+                    current_grantee = Some(AclGrantee::CanonicalUser(
+                        CanonicalUserId::new(current_text.trim()).ok_or_else(|| {
+                            ServerError::InvalidArgument {
+                                reason: "invalid canonical user ID in ACL XML".to_string(),
+                            }
+                        })?,
+                    ));
+                    current_text.clear();
                     current_text_field = None;
                 }
+                b"URI" if current_text_field == Some(TextField::GranteeUri) => {
+                    let grantee_type = current_grantee_type.as_deref().ok_or_else(|| {
+                        ServerError::InvalidArgument {
+                            reason: "missing ACL grantee type".to_string(),
+                        }
+                    })?;
+                    if grantee_type != "Group" {
+                        return Err(ServerError::InvalidArgument {
+                            reason: format!("unsupported ACL grantee type: {grantee_type}"),
+                        });
+                    }
+                    current_grantee =
+                        Some(AclGrantee::parse_group_uri(current_text.trim()).ok_or_else(
+                            || ServerError::InvalidArgument {
+                                reason: format!(
+                                    "unsupported ACL group URI: {}",
+                                    current_text.trim()
+                                ),
+                            },
+                        )?);
+                    current_text.clear();
+                    current_text_field = None;
+                }
+                b"Permission" if current_text_field == Some(TextField::Permission) => {
+                    current_permission =
+                        Some(AclPermission::parse(current_text.trim()).ok_or_else(|| {
+                            ServerError::InvalidArgument {
+                                reason: format!(
+                                    "unsupported ACL permission: {}",
+                                    current_text.trim()
+                                ),
+                            }
+                        })?);
+                    current_text.clear();
+                    current_text_field = None;
+                }
+                b"ID" | b"URI" | b"Permission" => {}
                 b"Grant" => {
                     let grantee =
                         current_grantee
@@ -1931,12 +1958,14 @@ pub fn parse_delete_objects_xml(
                     ))
                 }
             },
-            Ok(Event::Text(t)) => {
-                let text = decode_xml_text(
-                    t.as_ref(),
-                    "invalid UTF-8 in delete XML body",
-                    "invalid XML entity in delete XML body",
-                )
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                let text = decode_xml_text_event(event, |bytes| {
+                    decode_xml_text(
+                        bytes,
+                        "invalid UTF-8 in delete XML body",
+                        "invalid XML entity in delete XML body",
+                    )
+                })
                 .map_err(|error| match error {
                     ServerError::MalformedXML { reason } => {
                         ServerError::MalformedXMLNoDecl { reason }
@@ -2111,12 +2140,14 @@ pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState,
                     });
                 }
             },
-            Ok(Event::Text(t)) => {
-                let text = decode_xml_text(
-                    t.as_ref(),
-                    "invalid UTF-8 in versioning XML body",
-                    "invalid XML entity in versioning XML body",
-                )?;
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                let text = decode_xml_text_event(event, |bytes| {
+                    decode_xml_text(
+                        bytes,
+                        "invalid UTF-8 in versioning XML body",
+                        "invalid XML entity in versioning XML body",
+                    )
+                })?;
                 match state {
                     State::InStatus => current_text.push_str(&text),
                     _ if text.trim().is_empty() => {}
@@ -2339,8 +2370,8 @@ pub fn parse_bucket_object_lock_configuration_xml(
                     });
                 }
             },
-            Ok(Event::Text(t)) => {
-                let text = decode_object_lock_text(t.as_ref())?;
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                let text = decode_xml_text_event(event, decode_object_lock_text)?;
                 match state {
                     State::InObjectLockEnabled | State::InMode | State::InDays | State::InYears => {
                         current_text.push_str(&text);
@@ -2538,8 +2569,8 @@ pub fn parse_object_retention_xml(data: &[u8]) -> Result<ObjectRetention, Server
                     ))
                 }
             },
-            Ok(Event::Text(t)) => {
-                let text = decode_retention_text(t.as_ref())?;
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                let text = decode_xml_text_event(event, decode_retention_text)?;
                 match state {
                     State::InMode | State::InRetainUntilDate => current_text.push_str(&text),
                     _ if text.trim().is_empty() => {}
@@ -2677,8 +2708,8 @@ pub fn parse_object_legal_hold_xml(data: &[u8]) -> Result<LegalHoldStatus, Serve
                     ))
                 }
             },
-            Ok(Event::Text(t)) => {
-                let text = decode_legal_hold_text(t.as_ref())?;
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                let text = decode_xml_text_event(event, decode_legal_hold_text)?;
                 match state {
                     State::InStatus => current_text.push_str(&text),
                     _ if text.trim().is_empty() => {}
@@ -2890,8 +2921,8 @@ pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig
                     ));
                 }
             },
-            Ok(Event::Text(t)) => {
-                let text = decode_bucket_encryption_text(t.as_ref())?;
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                let text = decode_xml_text_event(event, decode_bucket_encryption_text)?;
                 match state {
                     State::InSseAlgorithm
                     | State::InKmsMasterKeyId
@@ -3512,8 +3543,8 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
                 }
                 _ => return Err(malformed_cors_xml("unexpected closing element in CORS XML")),
             },
-            Ok(Event::Text(t)) => {
-                let text = decode_cors_text(t.as_ref())?;
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                let text = decode_xml_text_event(event, decode_cors_text)?;
                 match state {
                     State::InAllowedOrigin
                     | State::InAllowedMethod
@@ -3632,6 +3663,23 @@ fn decode_xml_text(
         .map_err(|_| ServerError::MalformedXML {
             reason: invalid_entity_reason.to_string(),
         })
+}
+
+fn decode_xml_text_event(
+    event: Event<'_>,
+    decode: impl FnOnce(&[u8]) -> Result<String, ServerError>,
+) -> Result<String, ServerError> {
+    match event {
+        Event::Text(text) => decode(text.as_ref()),
+        Event::GeneralRef(reference) => {
+            let mut escaped = Vec::with_capacity(reference.len() + 2);
+            escaped.push(b'&');
+            escaped.extend_from_slice(reference.as_ref());
+            escaped.push(b';');
+            decode(&escaped)
+        }
+        _ => unreachable!("decode_xml_text_event only accepts text and reference events"),
+    }
 }
 
 fn decode_tagging_text(bytes: &[u8]) -> Result<String, ServerError> {
@@ -3863,8 +3911,8 @@ fn parse_tag_collection_xml(
                     ));
                 }
             },
-            Ok(Event::Text(t)) => {
-                let text = decode_tagging_text(t.as_ref())?;
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                let text = decode_xml_text_event(event, decode_tagging_text)?;
                 match state {
                     State::InKey | State::InValue => current_text.push_str(&text),
                     _ if text.trim().is_empty() => {}
@@ -4469,8 +4517,8 @@ pub fn parse_public_access_block_xml(data: &[u8]) -> Result<PublicAccessBlockCon
                     ));
                 }
             },
-            Ok(Event::Text(t)) => {
-                let text = decode_pab_text(t.as_ref())?;
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                let text = decode_xml_text_event(event, decode_pab_text)?;
                 match state {
                     State::InBlockPublicAcls
                     | State::InIgnorePublicAcls
@@ -4639,8 +4687,8 @@ pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<BucketOwnershipContro
                     ));
                 }
             },
-            Ok(Event::Text(t)) => {
-                let text = decode_ownership_text(t.as_ref())?;
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                let text = decode_xml_text_event(event, decode_ownership_text)?;
                 match state {
                     State::InObjectOwnership => current_text.push_str(&text),
                     _ if text.trim().is_empty() => {}
@@ -4767,12 +4815,14 @@ pub fn parse_bucket_abac_xml(data: &[u8]) -> Result<bool, ServerError> {
                     ));
                 }
             },
-            Ok(Event::Text(t)) => {
-                let text = decode_xml_text(
-                    t.as_ref(),
-                    "invalid UTF-8 in bucket ABAC XML body",
-                    "invalid XML entity in bucket ABAC XML body",
-                )?;
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                let text = decode_xml_text_event(event, |bytes| {
+                    decode_xml_text(
+                        bytes,
+                        "invalid UTF-8 in bucket ABAC XML body",
+                        "invalid XML entity in bucket ABAC XML body",
+                    )
+                })?;
                 match state {
                     State::InStatus => current_text.push_str(&text),
                     _ if text.trim().is_empty() => {}
@@ -5413,8 +5463,8 @@ pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePa
                 }
                 _ => return Err(malformed_complete_multipart_xml()),
             },
-            Ok(Event::Text(t)) => {
-                let text = decode_complete_multipart_text(t.as_ref())?;
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                let text = decode_xml_text_event(event, decode_complete_multipart_text)?;
                 match state {
                     State::InPartNumber | State::InETag | State::InChecksum(_) => {
                         current_text.push_str(&text);
@@ -5680,6 +5730,38 @@ mod tests {
         assert!(grants.iter().any(|grant| {
             grant.grantee() == &AclGrantee::AuthenticatedUsers
                 && grant.permission() == AclPermission::Read
+        }));
+    }
+
+    #[test]
+    fn parse_acl_xml_accumulates_split_reference_events() {
+        let canonical_id = CanonicalUserId::from_principal("reference-owner");
+        let escaped_canonical_id = format!(
+            "&#{};{}",
+            canonical_id.as_str().as_bytes()[0],
+            &canonical_id.as_str()[1..]
+        );
+        let escaped_group_uri = AclGrantee::authenticated_users_uri().replacen('/', "&#47;", 1);
+        let grants = parse_acl_xml(
+            format!(
+                "<AccessControlPolicy><AccessControlList>\
+                 <Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">\
+                 <ID>{escaped_canonical_id}</ID></Grantee><Permission>FULL&#95;CONTROL</Permission></Grant>\
+                 <Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"Group\">\
+                 <URI>{escaped_group_uri}</URI></Grantee><Permission>READ&#95;ACP</Permission></Grant>\
+                 </AccessControlList></AccessControlPolicy>"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+        assert!(grants.iter().any(|grant| {
+            grant.grantee() == &AclGrantee::CanonicalUser(canonical_id.clone())
+                && grant.permission() == AclPermission::FullControl
+        }));
+        assert!(grants.iter().any(|grant| {
+            grant.grantee() == &AclGrantee::AuthenticatedUsers
+                && grant.permission() == AclPermission::ReadAcp
         }));
     }
 
@@ -6033,6 +6115,18 @@ mod tests {
         assert_eq!(entries[0].key, "key1");
         assert_eq!(entries[1].key, "key2");
         assert!(!quiet);
+    }
+
+    #[test]
+    fn parse_delete_objects_decodes_split_reference_events() {
+        let xml = b"<Delete><Object><Key>a&amp;b&#x2f;c</Key></Object></Delete>";
+        let (entries, _) = parse_delete_objects_xml(xml).unwrap();
+        assert_eq!(entries[0].key, "a&b/c");
+
+        assert!(parse_delete_objects_xml(
+            b"<Delete><Object><Key>a&unknown;b</Key></Object></Delete>"
+        )
+        .is_err());
     }
 
     #[test]

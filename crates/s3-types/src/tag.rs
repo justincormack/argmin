@@ -427,19 +427,17 @@ impl TagSet {
                     (State::ExpectRootEnd, b"Tagging") => state = State::Done,
                     _ => return Err(malformed("unexpected closing element in stored tag XML")),
                 },
-                Ok(Event::Text(text)) => {
-                    let raw = std::str::from_utf8(text.as_ref())
-                        .map_err(|_| malformed("stored tag XML is not UTF-8"))?;
+                Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                    let entity_reason = match state {
+                        State::InKey => "invalid entity in stored tag key",
+                        State::InValue => "invalid entity in stored tag value",
+                        _ => "invalid entity in stored tag XML",
+                    };
+                    let text = decode_canonical_tag_text(event, entity_reason)?;
                     match state {
-                        State::InKey => key.push_str(
-                            &unescape(raw)
-                                .map_err(|_| malformed("invalid entity in stored tag key"))?,
-                        ),
-                        State::InValue => value.push_str(
-                            &unescape(raw)
-                                .map_err(|_| malformed("invalid entity in stored tag value"))?,
-                        ),
-                        _ if raw.trim().is_empty() => {}
+                        State::InKey => key.push_str(&text),
+                        State::InValue => value.push_str(&text),
+                        _ if text.trim().is_empty() => {}
                         _ => return Err(malformed("unexpected text in stored tag XML")),
                     }
                 }
@@ -466,6 +464,33 @@ impl TagSet {
 
         Self::from_pairs(pairs, maximum).map_err(CanonicalTagSetParseError::from)
     }
+}
+
+fn decode_canonical_tag_text(
+    event: Event<'_>,
+    invalid_entity_reason: &str,
+) -> Result<String, CanonicalTagSetParseError> {
+    let malformed = |reason: &str| CanonicalTagSetParseError::Malformed {
+        reason: reason.to_string(),
+    };
+    let escaped;
+    let raw = match event {
+        Event::Text(text) => text.into_inner(),
+        Event::GeneralRef(reference) => {
+            let mut bytes = Vec::with_capacity(reference.len() + 2);
+            bytes.push(b'&');
+            bytes.extend_from_slice(reference.as_ref());
+            bytes.push(b';');
+            escaped = bytes;
+            escaped.into()
+        }
+        _ => unreachable!("decode_canonical_tag_text only accepts text and reference events"),
+    };
+    let raw =
+        std::str::from_utf8(raw.as_ref()).map_err(|_| malformed("stored tag XML is not UTF-8"))?;
+    unescape(raw)
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|_| malformed(invalid_entity_reason))
 }
 
 fn validate_tagging_root_attributes(
@@ -551,6 +576,19 @@ mod tests {
         assert_eq!(
             TagSet::parse_canonical_xml(&tags.to_xml(), 10).unwrap(),
             tags
+        );
+    }
+
+    #[test]
+    fn canonical_xml_parser_decodes_split_reference_events() {
+        let tags = TagSet::parse_canonical_xml(
+            "<Tagging><TagSet><Tag><Key>k&#x31;</Key><Value>v&#50;</Value></Tag></TagSet></Tagging>",
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            tags,
+            TagSet::from_pairs(vec![("k1".to_string(), "v2".to_string())], 10).unwrap()
         );
     }
 

@@ -715,7 +715,9 @@ impl LifecycleXmlParser {
                 Ok(Event::End(element)) => {
                     parser.close(local_element_name(element.local_name().as_ref())?)?;
                 }
-                Ok(Event::Text(text)) => parser.text(text.as_ref())?,
+                Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                    parser.text_event(event)?;
+                }
                 Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_)) => {}
                 Ok(Event::CData(_) | Event::DocType(_)) => {
                     return Err(LifecycleConfigError::MalformedXml {
@@ -870,6 +872,20 @@ impl LifecycleXmlParser {
             }
         }
         Ok(())
+    }
+
+    fn text_event(&mut self, event: Event<'_>) -> Result<(), LifecycleConfigError> {
+        match event {
+            Event::Text(text) => self.text(text.as_ref()),
+            Event::GeneralRef(reference) => {
+                let mut escaped = Vec::with_capacity(reference.len() + 2);
+                escaped.push(b'&');
+                escaped.extend_from_slice(reference.as_ref());
+                escaped.push(b';');
+                self.text(&escaped)
+            }
+            _ => unreachable!("text_event only accepts text and reference events"),
+        }
     }
 }
 
