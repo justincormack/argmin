@@ -11511,6 +11511,52 @@ Required production shape and implementation order:
    time and fails above 1 MiB/s of combined WAL/checkpoint bytes. The monitor
    lock regression and WAL-ack/compaction regression run in the control-plane
    release gate alongside that workload.
+   **Raft executor isolation (open):** the fsynced WAL remains the required
+   acknowledgement boundary, but synchronous filesystem work must not execute
+   on Tokio cooperative-runtime workers. The OpenRaft `RaftLogStorage`
+   implementation currently holds its log-store mutex while synchronously
+   appending and syncing vote, committed-position, log, truncate, and purge
+   records. Before replicated-mode cutover, route these operations through one
+   bounded, serialized durability lane per authority, or an equivalent design
+   that proves the same properties. The lane must preserve submission order and
+   distinguish append acceptance from durable completion. Once a bounded queue
+   slot is reserved and an append is validated, publish its candidate entries
+   to a reader-visible accepted view and allow `RaftLogStorage::append()` to
+   return without waiting for filesystem sync. Retain the operation and its
+   `IOFlushed` callback in the durability lane; publish its durable position and
+   complete that callback only after the corresponding file and required
+   directory syncs succeed. Methods whose OpenRaft contract requires durable
+   completion before return, including vote persistence, must await the same
+   ordered lane without blocking a Tokio worker. A log reader or other async
+   operation must never wait on a `std::sync::Mutex` held by the durability
+   worker across write or sync I/O.
+   An already-submitted operation must continue to a classified outcome even
+   if its async caller is cancelled. Queue saturation must apply bounded
+   backpressure rather than consuming unbounded memory. Ambiguous I/O, worker
+   failure, or panic after append acceptance must fail its callback and retain
+   the existing fail-closed poison/restart semantics; accepted state must not
+   be mistaken for durable state. Checkpoint capture and WAL compaction must
+   either use the same lane or cross an explicit durable-position barrier so
+   they cannot overtake an append, persist an unsynced accepted suffix as
+   durable, or compact bytes whose completion has not been published.
+   Do not solve this by weakening fsync-before-ack or by issuing independent
+   unordered blocking tasks. The production checkpoint publisher already runs
+   persistence on dedicated process threads; remove, restrict, or make
+   executor-safe any async convenience API that can inline full artifact
+   encoding, sync, and compaction. Audit the remaining OpenRaft async
+   state-machine methods separately for large synchronous snapshot
+   construction, cloning, decode, and installation work, because executor
+   starvation is not limited to explicit `fsync` calls.
+   Add deterministic regressions using a single-worker Tokio runtime and a
+   blocked durability hook. They must prove that `append()` returns, an
+   immediate `LogReader` observes the accepted entries, `IOFlushed` remains
+   pending, and timers plus Raft work continue; releasing the hook must then
+   complete the callback. Also prove durable-method waiting without executor
+   starvation, cancellation and concurrent-operation ordering, bounded-queue
+   behavior, accepted-but-failed poison handling, and checkpoint/compaction
+   barriers. Report durability-queue depth and wait, append acceptance and sync
+   latency, bytes, and executor-delay maxima in the production-shaped
+   control-plane release workload.
    Restart cost is part of the same bound. A retained route-change soak exposed
    a 12.66 MB restart artifact with 2,883 retained entries whose cached
    OpenRaft snapshot was at index 5,000 while the materialized state was at
