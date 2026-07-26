@@ -936,6 +936,77 @@ fn payload_lease_for_shard_locations_only_acquires_selected_storage_nodes() {
 }
 
 #[test]
+fn payload_lease_for_historical_shard_location_uses_retained_route() {
+    let tmp = test_util::tempdir();
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+    ];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let current_epoch = ClusterEpoch::new(2).unwrap();
+    let configs = node_ids.map(|node_id| {
+        LocalNodeStoreConfig::new(
+            node_id,
+            tmp.path().join(format!("node-{}", node_id.as_u32())),
+        )
+    });
+    let mut map = LocalClusterMap::open_with_configs_and_epoch(
+        NodeId::new(0),
+        configs,
+        &[0],
+        ec_shape,
+        current_epoch,
+    )
+    .unwrap();
+    let current_route = map.pg_routes.get_mut(&PgId::new(0)).unwrap();
+    current_route.primary_node_id = NodeId::new(1);
+    current_route.acting_set = Arc::from([NodeId::new(1), NodeId::new(2), NodeId::new(3)]);
+    map.test_install_historical_pg_routes([PgRouteSnapshot::reconstructed(
+        ClusterEpoch::INITIAL,
+        PgId::new(0),
+        NodeId::new(0),
+        vec![NodeId::new(0), NodeId::new(1), NodeId::new(2)],
+        PgState::Active,
+    )]);
+
+    let bucket = BucketName::try_from("bucket".to_string()).unwrap();
+    let key = ObjectKey::try_from("key".to_string()).unwrap();
+    let generation_id = GenerationId::MIN;
+    let historical = ShardLocation::new(
+        ClusterEpoch::INITIAL,
+        DataPgId::new_for_test(PgId::new(0)),
+        ShardIndex::new(0),
+        NodeId::new(0),
+    );
+
+    let leases = map
+        .try_acquire_object_payload_lease_on_locations(&bucket, &key, generation_id, &[historical])
+        .unwrap();
+    assert_eq!(leases.len(), 1);
+    for node_id in node_ids {
+        let expected = usize::from(node_id == historical.node_id());
+        assert_eq!(
+            map.node(node_id)
+                .unwrap()
+                .storage_node()
+                .object_payload_lease_count(&bucket, &key, generation_id),
+            expected,
+            "historical payload lease must bind only its recorded shard owner"
+        );
+    }
+    drop(leases);
+    assert_eq!(
+        map.node(historical.node_id())
+            .unwrap()
+            .storage_node()
+            .object_payload_lease_count(&bucket, &key, generation_id),
+        0
+    );
+}
+
+#[test]
 fn payload_lease_for_shard_locations_releases_partial_acquire_on_fence() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

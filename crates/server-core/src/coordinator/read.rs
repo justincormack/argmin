@@ -1,8 +1,9 @@
-use checksum::RawChecksum;
 use std::sync::Arc;
+
+use checksum::RawChecksum;
 use storage::{ObjectLayout, StoredObject};
 
-use super::read_core::snapshotted_multipart_parts_from_storage;
+use super::read_core::{snapshotted_multipart_parts_from_storage, ReadRuntime};
 #[cfg(test)]
 use super::{maybe_run_multipart_snapshot_hook, maybe_run_object_read_snapshot_hook};
 use super::{
@@ -16,6 +17,49 @@ use crate::conditional::check_read_conditions;
 use crate::error::ServerError;
 
 impl Coordinator {
+    fn take_authorized_object_read_snapshot(
+        snapshot: Arc<storage::ObjectReadSnapshot>,
+    ) -> Result<storage::ObjectReadSnapshot, ServerError> {
+        Arc::try_unwrap(snapshot).map_err(|_| ServerError::InternalError {
+            reason: "authorized object snapshot remains shared after payload handoff".to_string(),
+        })
+    }
+
+    fn retained_read_runtime_for_snapshot(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        object: &ObjectVersionRequest,
+        snapshot: &storage::ObjectReadSnapshot,
+        payload_handoff: Option<storage::LeasedObjectReadSnapshot>,
+    ) -> Result<Option<ReadRuntime>, ServerError> {
+        let Some(live) = snapshot.stored.as_live() else {
+            return Ok(None);
+        };
+        if live.size == 0 {
+            return Ok(None);
+        }
+        let payload_handoff = payload_handoff.ok_or_else(|| ServerError::InternalError {
+            reason: "live object payload snapshot lacks its leased handoff authority".to_string(),
+        })?;
+        self.require_storage_route_admission(admission)?;
+        let route = admission
+            .active_object_read_route(
+                object.bucket_name_typed(),
+                object.key_typed(),
+                object.version_id,
+                storage::ObjectReadSnapshotMode::FullPayloadLayout,
+            )
+            .map_err(super::map_store_error)?;
+        let retained = route
+            .retain_object_payload_read(payload_handoff)
+            .map_err(super::map_store_error)?
+            .ok_or_else(|| ServerError::InternalError {
+                reason: "live object snapshot did not produce retained payload authority"
+                    .to_string(),
+            })?;
+        Ok(Some(self.read_runtime_for_retained_payload_read(retained)))
+    }
+
     fn authorized_tag_count(
         &self,
         attribute_permissions: super::authz_results::ObjectAttributePermissions,
@@ -34,7 +78,11 @@ impl Coordinator {
     }
 
     /// Get an object from storage.
-    pub fn get_object(&self, req: &GetObjectRequest) -> Result<GetObjectResult, ServerError> {
+    pub fn get_object_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &GetObjectRequest,
+    ) -> Result<GetObjectResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object",
@@ -47,21 +95,26 @@ impl Coordinator {
         let key = req.object.key();
         let version_id = req.object.version_id;
         let cond = req.cond;
-        let storage_node = self.storage_node();
-        let read_runtime = self.read_runtime_for_storage_node(Arc::clone(&storage_node));
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
             attribute_permissions,
-        } = self.authorize_get_object_with_storage_node(&storage_node, req)?;
+            payload_handoff,
+        } = self.authorize_get_object_on_admitted_route(admission, req)?;
+        #[cfg(test)]
+        maybe_run_object_read_snapshot_hook(bucket, key);
+        let mut read_runtime = self.retained_read_runtime_for_snapshot(
+            admission,
+            &req.object,
+            &snapshot,
+            payload_handoff,
+        )?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments,
             multipart_parts,
             multipart_part_segments,
-        } = snapshot;
-        #[cfg(test)]
-        maybe_run_object_read_snapshot_hook(bucket, key);
+        } = Self::take_authorized_object_read_snapshot(snapshot)?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -93,18 +146,24 @@ impl Coordinator {
                 req.sse_customer,
             )?;
 
-            let body = ReadHandle::from_multipart(
-                read_runtime.clone(),
-                req.object.bucket_name_typed(),
-                req.object.key_typed(),
-                record.generation_id,
-                obj_parts,
-                record.size as usize,
-                req.sse_customer.cloned(),
-            )?;
+            let body = if record.size == 0 {
+                ReadHandle::from_buffered_bytes(vec![])
+            } else {
+                ReadHandle::from_multipart(
+                    read_runtime
+                        .take()
+                        .expect("nonempty live object must retain payload authority"),
+                    req.object.bucket_name_typed(),
+                    req.object.key_typed(),
+                    record.generation_id,
+                    obj_parts,
+                    record.size as usize,
+                    req.sse_customer.cloned(),
+                )?
+            };
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                self.current_object_lifecycle_expiration_with_storage_node(
-                    &storage_node,
+                self.current_object_lifecycle_expiration_on_admitted_route(
+                    admission,
                     &bucket_summary,
                     key,
                     record.tags.as_deref(),
@@ -149,7 +208,9 @@ impl Coordinator {
             } else {
                 let body = ReadHandle::from_segments(
                     ReadObjectContext {
-                        runtime: read_runtime,
+                        runtime: read_runtime
+                            .take()
+                            .expect("nonempty live object must retain payload authority"),
                         bucket: req.object.bucket_name_typed(),
                         key: req.object.key_typed(),
                         generation_id: record.generation_id,
@@ -165,8 +226,8 @@ impl Coordinator {
                 body
             };
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                self.current_object_lifecycle_expiration_with_storage_node(
-                    &storage_node,
+                self.current_object_lifecycle_expiration_on_admitted_route(
+                    admission,
                     &bucket_summary,
                     key,
                     record.tags.as_deref(),
@@ -196,13 +257,20 @@ impl Coordinator {
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn get_object(&self, req: &GetObjectRequest) -> Result<GetObjectResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_object_on_admitted_route(&admission, req)
+    }
+
     /// Retrieve a single part of an object by part number.
     ///
     /// For multipart objects, returns the data for the specified part along with
     /// its checksum and byte range within the full object.
     /// For non-multipart objects, `part_number == 1` returns the full body.
-    pub fn get_object_part(
+    pub fn get_object_part_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &GetObjectPartRequest,
     ) -> Result<GetObjectPartResult, ServerError> {
         observability::trace_scope!(
@@ -219,14 +287,13 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
-        let storage_node = self.storage_node();
-        let read_runtime = self.read_runtime_for_storage_node(Arc::clone(&storage_node));
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
             attribute_permissions,
-        } = self.authorize_get_object_with_storage_node(
-            &storage_node,
+            payload_handoff,
+        } = self.authorize_get_object_on_admitted_route(
+            admission,
             &GetObjectRequest {
                 object: ObjectVersionRequest::new(
                     req.object.bucket_name_typed().clone(),
@@ -239,14 +306,20 @@ impl Coordinator {
                 sse_customer: req.sse_customer,
             },
         )?;
+        #[cfg(test)]
+        maybe_run_object_read_snapshot_hook(bucket, key);
+        let mut read_runtime = self.retained_read_runtime_for_snapshot(
+            admission,
+            &req.object,
+            &snapshot,
+            payload_handoff,
+        )?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments,
             multipart_parts,
             multipart_part_segments,
-        } = snapshot;
-        #[cfg(test)]
-        maybe_run_object_read_snapshot_hook(bucket, key);
+        } = Self::take_authorized_object_read_snapshot(snapshot)?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -309,18 +382,24 @@ impl Coordinator {
 
             let mut part_body = part.clone();
             part_body.object_offset_start = 0;
-            let body = ReadHandle::from_multipart(
-                read_runtime.clone(),
-                req.object.bucket_name_typed(),
-                req.object.key_typed(),
-                record.generation_id,
-                vec![part_body],
-                part.record.size as usize,
-                req.sse_customer.cloned(),
-            )?;
+            let body = if part.record.size == 0 {
+                ReadHandle::from_buffered_bytes(vec![])
+            } else {
+                ReadHandle::from_multipart(
+                    read_runtime
+                        .take()
+                        .expect("nonempty live object must retain payload authority"),
+                    req.object.bucket_name_typed(),
+                    req.object.key_typed(),
+                    record.generation_id,
+                    vec![part_body],
+                    part.record.size as usize,
+                    req.sse_customer.cloned(),
+                )?
+            };
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                self.current_object_lifecycle_expiration_with_storage_node(
-                    &storage_node,
+                self.current_object_lifecycle_expiration_on_admitted_route(
+                    admission,
                     &bucket_summary,
                     key,
                     record.tags.as_deref(),
@@ -370,7 +449,9 @@ impl Coordinator {
             } else {
                 let body = ReadHandle::from_segments(
                     ReadObjectContext {
-                        runtime: read_runtime,
+                        runtime: read_runtime
+                            .take()
+                            .expect("nonempty live object must retain payload authority"),
                         bucket: req.object.bucket_name_typed(),
                         key: req.object.key_typed(),
                         generation_id: record.generation_id,
@@ -386,8 +467,8 @@ impl Coordinator {
                 body
             };
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                self.current_object_lifecycle_expiration_with_storage_node(
-                    &storage_node,
+                self.current_object_lifecycle_expiration_on_admitted_route(
+                    admission,
                     &bucket_summary,
                     key,
                     record.tags.as_deref(),
@@ -429,6 +510,15 @@ impl Coordinator {
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn get_object_part(
+        &self,
+        req: &GetObjectPartRequest,
+    ) -> Result<GetObjectPartResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_object_part_on_admitted_route(&admission, req)
+    }
+
     /// Head a single part of an object by part number (no body).
     pub fn head_object_part_on_admitted_route(
         &self,
@@ -453,6 +543,7 @@ impl Coordinator {
             bucket: bucket_summary,
             snapshot,
             attribute_permissions,
+            payload_handoff: _,
         } = self.authorize_head_object_for_part_on_admitted_route(
             admission,
             &GetObjectRequest {
@@ -472,7 +563,7 @@ impl Coordinator {
             object_segments: _,
             multipart_parts,
             multipart_part_segments: _,
-        } = snapshot;
+        } = Self::take_authorized_object_read_snapshot(snapshot)?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -644,13 +735,14 @@ impl Coordinator {
             bucket: bucket_summary,
             snapshot,
             attribute_permissions,
+            payload_handoff: _,
         } = self.authorize_head_object_on_admitted_route(admission, req)?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments: _,
             multipart_parts: _,
             multipart_part_segments: _,
-        } = snapshot;
+        } = Self::take_authorized_object_read_snapshot(snapshot)?;
         #[cfg(test)]
         maybe_run_object_read_snapshot_hook(bucket, key);
 
@@ -744,13 +836,14 @@ impl Coordinator {
             bucket: _,
             snapshot,
             attribute_permissions: _,
+            payload_handoff: _,
         } = self.authorize_get_object_attributes_on_admitted_route(admission, req)?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments: _,
             multipart_parts,
             multipart_part_segments: _,
-        } = snapshot;
+        } = Self::take_authorized_object_read_snapshot(snapshot)?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -864,8 +957,9 @@ impl Coordinator {
     /// Get a byte range of an object from storage (for HTTP Range requests).
     ///
     /// Returns 206 Partial Content data.
-    pub fn get_object_range(
+    pub fn get_object_range_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &GetObjectRangeRequest,
     ) -> Result<GetObjectRangeResult, ServerError> {
         observability::trace_scope!(
@@ -882,14 +976,13 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let range = req.range;
         let cond = req.cond;
-        let storage_node = self.storage_node();
-        let read_runtime = self.read_runtime_for_storage_node(Arc::clone(&storage_node));
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
             attribute_permissions,
-        } = self.authorize_get_object_with_storage_node(
-            &storage_node,
+            payload_handoff,
+        } = self.authorize_get_object_on_admitted_route(
+            admission,
             &GetObjectRequest {
                 object: ObjectVersionRequest::new(
                     req.object.bucket_name_typed().clone(),
@@ -902,14 +995,20 @@ impl Coordinator {
                 sse_customer: req.sse_customer,
             },
         )?;
+        #[cfg(test)]
+        maybe_run_object_read_snapshot_hook(bucket, key);
+        let mut read_runtime = self.retained_read_runtime_for_snapshot(
+            admission,
+            &req.object,
+            &snapshot,
+            payload_handoff,
+        )?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments,
             multipart_parts,
             multipart_part_segments,
-        } = snapshot;
-        #[cfg(test)]
-        maybe_run_object_read_snapshot_hook(bucket, key);
+        } = Self::take_authorized_object_read_snapshot(snapshot)?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -997,7 +1096,9 @@ impl Coordinator {
             )?;
 
             let body = ReadHandle::from_multipart_range(
-                read_runtime.clone(),
+                read_runtime
+                    .take()
+                    .expect("nonempty live object must retain payload authority"),
                 req.object.bucket_name_typed(),
                 req.object.key_typed(),
                 record.generation_id,
@@ -1018,7 +1119,9 @@ impl Coordinator {
 
             let body = ReadHandle::from_segments_range(
                 ReadObjectContext {
-                    runtime: read_runtime,
+                    runtime: read_runtime
+                        .take()
+                        .expect("nonempty live object must retain payload authority"),
                     bucket: req.object.bucket_name_typed(),
                     key: req.object.key_typed(),
                     generation_id: record.generation_id,
@@ -1032,8 +1135,8 @@ impl Coordinator {
             (metadata, system_metadata, body)
         };
         let lifecycle_expiration = if emit_lifecycle_expiration {
-            self.current_object_lifecycle_expiration_with_storage_node(
-                &storage_node,
+            self.current_object_lifecycle_expiration_on_admitted_route(
+                admission,
                 &bucket_summary,
                 key,
                 record.tags.as_deref(),
@@ -1061,5 +1164,14 @@ impl Coordinator {
             sse_customer,
             lifecycle_expiration,
         })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn get_object_range(
+        &self,
+        req: &GetObjectRangeRequest,
+    ) -> Result<GetObjectRangeResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_object_range_on_admitted_route(&admission, req)
     }
 }

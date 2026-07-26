@@ -930,7 +930,9 @@ migrated_simple_object_read_bypasses=$(
             if ($0 ~ /cluster\.load_object_read_snapshot_if\(/ || $0 ~ /self\.load_object_read_snapshot_if\(/) {
                 next
             }
-            if ($0 ~ /cluster\.payload_reclaim_exists\(/ || $0 ~ /self\.payload_reclaim_exists\(/) {
+            if ($0 ~ /cluster\.payload_reclaim_exists\(/ \
+                || $0 ~ /self\.payload_reclaim_exists\(/ \
+                || $0 ~ /released\.payload_reclaim_exists\(/) {
                 next
             }
             print FILENAME ":" FNR ":" $0
@@ -1681,12 +1683,12 @@ segment_payload_read_callers=$(
         | sed 's/^ *//'
 )
 expected_segment_payload_read_callers=$(cat <<'EOF'
-1 crates/server-core/src/coordinator/runtime.rs:read_segment_payload
+1 crates/server-core/src/coordinator/runtime.rs:read_checked_segment_payload
 EOF
 )
 if [[ "$segment_payload_read_callers" != "$expected_segment_payload_read_callers" ]]; then
     fail_with_matches \
-        "Server-core payload bytes must be read only through ReadRuntime::read_segment_payload after ReadHandle acquisition" \
+        "Server-core payload bytes must be read only through ReadRuntime::read_checked_segment_payload after ReadHandle acquisition" \
         "$segment_payload_read_callers"
 fi
 
@@ -1728,7 +1730,7 @@ coarse_payload_lease_callers=$(
         update_function_context()
         if ($0 ~ /\.[[:space:]]*acquire_object_payload_lease\(/ \
             && current_fn != "acquire_object_payload_lease" \
-            && current_fn != "load_leased_object_read_snapshot_if<T, E>" \
+            && current_fn != "load_leased_object_read_snapshot_if_on_route<T, E>" \
             && current_fn != "try_acquire_object_payload_lease" \
             && current_fn != "try_acquire_object_payload_lease_on_locations" \
             && current_fn != "acquire_object_payload_lease_session_admission" \

@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use storage::{
     BucketName, GenerationId, MultipartPartSegmentRecord, ObjectEncryption, ObjectKey,
-    ObjectPartRecord, ObjectPayloadLease, ObjectSegmentRecord, ShardLocation, StorageCluster,
+    ObjectPartRecord, ObjectPayloadLease, ObjectSegmentRecord, RetainedObjectPayloadRead,
+    StorageCluster,
 };
 
 use super::object_state::SnapshottedMultipartPart;
@@ -23,8 +24,14 @@ pub struct ReadChunk {
 }
 
 #[derive(Clone)]
+pub(super) enum ReadStorage {
+    Cluster(Arc<StorageCluster>),
+    Retained(Arc<RetainedObjectPayloadRead>),
+}
+
+#[derive(Clone)]
 pub(super) struct ReadRuntime {
-    pub(super) storage_node: Arc<StorageCluster>,
+    pub(super) storage: ReadStorage,
     #[cfg(test)]
     pub(super) pg_topology: PgTopology,
     pub(super) payload_buffer_pool: Arc<PayloadBufferPool>,
@@ -439,43 +446,6 @@ impl MultipartReader {
 }
 
 impl ReadHandle {
-    fn shard_locations_for_segment_slices(
-        runtime: &ReadRuntime,
-        slices: &[SegmentSliceRecord],
-    ) -> Result<Vec<ShardLocation>, ServerError> {
-        let mut locations = Vec::new();
-        for slice in slices {
-            if slice.payload.stored_size() == 0 {
-                continue;
-            }
-            let segment_locations = runtime.storage_node.segment_payload_shard_locations(
-                slice.payload.data_pg_id,
-                storage::EcShape {
-                    k: slice.payload.ec_k,
-                    m: slice.payload.ec_m,
-                },
-                &slice.payload.segment_okh,
-                slice.payload.segment_vid,
-            )?;
-            locations.extend(segment_locations);
-        }
-        Ok(locations)
-    }
-
-    fn shard_locations_for_multipart_ranges(
-        runtime: &ReadRuntime,
-        ranges: &[SnapshottedMultipartPartRange],
-    ) -> Result<Vec<ShardLocation>, ServerError> {
-        let mut locations = Vec::new();
-        for range in ranges {
-            locations.extend(Self::shard_locations_for_segment_slices(
-                runtime,
-                &range.segments,
-            )?);
-        }
-        Ok(locations)
-    }
-
     fn segment_slices_for_range(
         segments: Vec<SegmentPayloadRecord>,
         start: usize,
@@ -576,17 +546,16 @@ impl ReadHandle {
         let key_owned = key.as_str().to_string();
         let segments =
             Self::segment_slices_for_range(segments, 0, expected_size.saturating_sub(1), 0, None);
-        let locations = Self::shard_locations_for_segment_slices(&runtime, &segments)?;
-        let lease = runtime.acquire_object_payload_lease_for_shard_locations(
+        let lease = runtime.prepare_object_payload_read(
             bucket,
             key,
             generation_id,
-            &locations,
+            segments.iter().map(|slice| &slice.payload),
         )?;
         Ok(Self {
             bucket: bucket_owned.clone(),
             key: key_owned.clone(),
-            lease: Some(lease),
+            lease,
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -630,17 +599,16 @@ impl ReadHandle {
         let bucket_owned = bucket.as_str().to_string();
         let key_owned = key.as_str().to_string();
         let segments = Self::segment_slices_for_range(segments, start, end, 0, None);
-        let locations = Self::shard_locations_for_segment_slices(&runtime, &segments)?;
-        let lease = runtime.acquire_object_payload_lease_for_shard_locations(
+        let lease = runtime.prepare_object_payload_read(
             bucket,
             key,
             generation_id,
-            &locations,
+            segments.iter().map(|slice| &slice.payload),
         )?;
         Ok(Self {
             bucket: bucket_owned.clone(),
             key: key_owned.clone(),
-            lease: Some(lease),
+            lease,
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -667,17 +635,18 @@ impl ReadHandle {
     ) -> Result<Self, ServerError> {
         let ranges =
             Self::multipart_ranges_for_range(parts, 0, expected_size.saturating_sub(1), true);
-        let locations = Self::shard_locations_for_multipart_ranges(&runtime, &ranges)?;
-        let lease = runtime.acquire_object_payload_lease_for_shard_locations(
+        let lease = runtime.prepare_object_payload_read(
             bucket,
             key,
             generation_id,
-            &locations,
+            ranges
+                .iter()
+                .flat_map(|range| range.segments.iter().map(|slice| &slice.payload)),
         )?;
         Ok(Self {
             bucket: bucket.as_str().to_string(),
             key: key.as_str().to_string(),
-            lease: Some(lease),
+            lease,
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -707,17 +676,18 @@ impl ReadHandle {
         let (start, end) = range;
         let expected_size = end - start + 1;
         let ranges = Self::multipart_ranges_for_range(parts, start, end, false);
-        let locations = Self::shard_locations_for_multipart_ranges(&runtime, &ranges)?;
-        let lease = runtime.acquire_object_payload_lease_for_shard_locations(
+        let lease = runtime.prepare_object_payload_read(
             bucket,
             key,
             generation_id,
-            &locations,
+            ranges
+                .iter()
+                .flat_map(|range| range.segments.iter().map(|slice| &slice.payload)),
         )?;
         Ok(Self {
             bucket: bucket.as_str().to_string(),
             key: key.as_str().to_string(),
-            lease: Some(lease),
+            lease,
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,

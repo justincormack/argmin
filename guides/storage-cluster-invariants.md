@@ -249,10 +249,10 @@ script in the same change.
 | `begin_bucket_delete` | Epoch-fenced routed metadata PG fanout |
 | `try_finalize_bucket_delete` | Epoch-fenced routed metadata PG fanout plus storage-node object-payload read-handle checks and local runtime worker queue |
 | `load_available_bucket_execution_generation_batches` | Best-effort routed metadata PG |
-| `try_probe_object_pg_available`, `load_object_if`, `load_existing_live_object`, `load_object_read_snapshot_if`, `load_leased_object_read_snapshot_if`, `payload_reclaim_exists`, `get_object_tags_if`, `get_object_legal_hold_if`, `get_object_retention_if` | Epoch-fenced routed metadata PG. The leased snapshot helper acquires a broad payload-generation lease before exact snapshot validation, retries if the authorization subject changed, and returns the snapshot and lease together |
+| `try_probe_object_pg_available`, `load_object_if`, `load_existing_live_object`, `load_object_read_snapshot_if`, `load_leased_object_read_snapshot_if`, `payload_reclaim_exists`, `get_object_tags_if`, `get_object_legal_hold_if`, `get_object_retention_if` | Epoch-fenced routed metadata PG. The leased snapshot helper acquires a broad payload-generation lease before exact snapshot validation, retries if the authorization subject changed, and returns an opaque non-cloneable handoff binding that snapshot, its route provenance, and the lease |
 | `put_object_tags_if`, `delete_object_tags_if`, `put_object_retention_if`, `put_object_legal_hold_if`, `put_object_acl_if`, `delete_specific_object_version_if`, `delete_current_object_if`, `insert_current_delete_marker_if`, `expire_current_object_if_due`, `delete_noncurrent_live_versions_if_due`, `delete_expired_delete_marker_if_due` | Epoch-fenced routed metadata PG command apply |
 | `list_all_objects_for_bucket`, `list_all_object_versions_for_bucket`, `list_all_multipart_uploads_for_bucket`, `list_objects_for_bucket`, `list_object_versions_for_bucket` | Epoch-fenced routed metadata PG fanout |
-| `acquire_object_payload_lease`, `acquire_object_payload_lease_for_shard_locations` | Epoch-fenced routed metadata PG plus volatile storage-node-owned object-payload read handles. Copy-source snapshot loading acquires the coarse generation lease through the actual storage-node clients, so it remains visible to refreshed runtime maps and other frontends, then hands off without a gap to the shard-location helper. Payload reads acquire all-or-release handles for every shard-owner node of the selected segments, including parity/recovery candidates; the boundary script rejects direct payload-byte read bypasses |
+| `acquire_object_payload_lease`, `acquire_object_payload_lease_for_shard_locations` | Epoch-fenced routed metadata PG plus volatile storage-node-owned object-payload read handles. Copy-source and response-body snapshot loading acquire the coarse generation lease through the actual storage-node clients, so it remains visible to refreshed runtime maps and other frontends, then hand off without a gap to the shard-location helper through an opaque leased-snapshot token. Payload reads acquire all-or-release handles for every shard-owner node of the selected segments, including parity/recovery candidates. Every recorded placement epoch is validated and read through its exact retained route while acquisition remains authorized by the current admitted request epoch; the boundary script rejects direct payload-byte read bypasses |
 | `enqueue_object_payload_reclaim`, `enqueue_bucket_delete_finalize`, `wait_for_reclaim_work`, `wake_reclaim_workers` | Best-effort local runtime worker queue |
 | `reclaim_object_payload_if_unleased` | Epoch-fenced routed object metadata PG command apply for reclaim-row deletion, storage-node-owned read-handle/delete fencing, and placed payload cleanup |
 | `complete_multipart_upload_commit_serialized` | Bucket-PG-primary multipart completion barrier, then epoch-fenced routed object metadata PG command apply for completed-object publication, deterministic object write sequencing, selected streamed part segment metadata, object-version-scoped replay metadata, and omitted staging cleanup. The barrier advances one fixed-size bucket scalar and retains no upload history |
@@ -265,6 +265,35 @@ script in the same change.
 | `test_from_local_map_with_epoch`, `test_install_before_stream_abort_storage_hook`, `test_install_after_direct_put_metadata_publish_hook`, `test_install_before_placed_payload_shard_delete_hook`, `test_install_before_metadata_primary_payload_ack_delete_hook`, `test_install_best_effort_payload_cleanup_error_hook`, `test_install_before_metadata_command_apply_hook`, `test_install_before_abort_multipart_pending_install_hook`, `test_install_before_stream_put_create_pending_install_hook`, `test_install_before_stream_put_create_command_id_hook`, `test_install_before_bucket_delete_command_id_hook`, `test_install_before_metadata_command_apply_context_hook`, `test_apply_metadata_command_to_acting_set_from_origin`, `test_establish_multipart_completion_barrier`, `test_pg_ids`, `object_payload_lease_count`, `bucket_object_payload_lease_count`, `try_take_reclaim_work`, `test_ec_scratch_allocation_count`, `test_bucket_pg_id_for`, `test_head_bucket_raw`, `test_object_pg_id_for`, `test_data_pg_id_for`, `test_object_generation_reservation_for`, `test_multipart_part_data_pg_id_for`, `test_get_object_meta`, `test_get_multipart_upload`, `test_get_multipart_part`, `test_list_multipart_parts`, `test_list_multipart_uploads_for_bucket`, `test_get_object_segments`, `test_replace_live_object_segments`, `test_get_object_parts`, `test_replace_object_parts`, `test_get_object_version`, `test_get_object_segments_reclaim`, `test_put_object_segments_reclaim`, `test_put_multipart_reclaim`, `test_payload_reclaim_exists`, `test_list_bucket_payload_reclaim_roots`, `test_force_became_noncurrent_at`, `test_create_deleting_bucket`, `test_delete_bucket_metadata`, `test_get_all_multipart_part_segments_for_upload`, `test_set_upload_state`, `test_list_stream_segments`, `test_force_stream_upload_created_at`, `test_list_all_stream_uploads`, `test_create_stream_upload`, `test_shard_exists`, `test_lock_bucket_pg`, `test_payload_shard_file_path`, `test_payload_shard_file_exists` | Test hook |
 
 ## Associated Token Types
+
+`LeasedObjectReadSnapshot` is the non-cloneable broad-to-narrow handoff token.
+Its private fields bind the exact object snapshot, requested version, metadata
+route, originating cluster, and broad generation lease; callers may inspect the
+snapshot but cannot pair another snapshot with that lease. An
+`ActiveObjectReadRoute` can consume it only when all provenance matches, while
+the pinned cluster retained by an admitted CopyObject or UploadPartCopy request
+consumes the same source token. Both forms derive every shard owner from the
+token's recorded placement epochs, acquire the narrow storage-node leases, and
+only then release the broad lease. Copy-source snapshot loading itself uses the
+request admission, so its retained repair fence captures the publication
+generation and immutable request deadline. The authorization result and token
+share one immutable snapshot allocation, so large multipart part and segment
+vectors are not cloned during handoff.
+
+`RetainedObjectPayloadRead` is the resulting response-body or copy-source
+authority. It carries no long-lived publication admission and cannot perform
+object metadata reads. It binds one bucket/key/generation and a private
+allowlist of complete segment descriptors; range, part, ordinary GET, and copy
+bodies can read only those descriptors. Every payload read uses exact
+retained-route inspection, including when the segment's placement epoch equals
+the originating frontend's epoch. If recovery discovers a corrupt shard, it
+may reacquire a short publication permit solely to record repair work, but
+only if the originating publication generation remains current and the
+admission's immutable captured deadline is still valid. After map publication
+or deadline expiry it skips that stale active-route mutation. The payload read
+therefore remains valid if the storage nodes install a successor map before
+the body's first read. Dropping the final body reference releases the captured
+node sessions and performs the ordinary reclaim follow-up.
 
 `ObjectPayloadLease::release` is the current active token release path. It must
 release against the actual storage-node sessions captured at acquisition time

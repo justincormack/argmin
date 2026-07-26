@@ -218,7 +218,7 @@ fn make_test_read_runtime(dir: &Path) -> ReadRuntime {
     let storage_cluster = open_test_storage_cluster(dir, &[0]);
     let ec_shape = storage_cluster.default_payload_ec_shape();
     ReadRuntime {
-        storage_node: storage_cluster,
+        storage: super::read_core::ReadStorage::Cluster(storage_cluster),
         #[cfg(test)]
         pg_topology: PgTopology::new(&[0]).unwrap(),
         payload_buffer_pool: PayloadBufferPool::new(ec_shape),
@@ -2025,7 +2025,7 @@ fn dropping_a_read_only_payload_lease_does_not_enqueue_reclaim_work() {
     drop(runtime.acquire_object_payload_lease("bucket", "key", generation_id));
 
     assert!(
-        runtime.storage_node.try_take_reclaim_work().is_none(),
+        runtime.storage_node().try_take_reclaim_work().is_none(),
         "{invariant}: unexpected reclaim work appeared after dropping a read-only lease"
     );
 }
@@ -2046,7 +2046,7 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
 
     {
         runtime
-            .storage_node
+            .storage_node()
             .test_put_object_segments_reclaim(
                 &bucket,
                 &key,
@@ -2070,7 +2070,7 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
     let lease = runtime.acquire_object_payload_lease("bucket", "key", generation_id);
     runtime.enqueue_object_payload_reclaim("bucket", "key", generation_id);
 
-    match runtime.storage_node.try_take_reclaim_work() {
+    match runtime.storage_node().try_take_reclaim_work() {
         Some(ReclaimWorkItem::ObjectPayload((bucket, key, queued_generation_id))) => {
             assert_eq!(bucket, "bucket");
             assert_eq!(key, "key");
@@ -2096,7 +2096,7 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
         .unwrap();
     assert!(
         runtime
-            .storage_node
+            .storage_node()
             .test_payload_reclaim_exists(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
@@ -2109,7 +2109,7 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
     drop(lease);
 
     assert!(
-        runtime.storage_node.try_take_reclaim_work().is_none(),
+        runtime.storage_node().try_take_reclaim_work().is_none(),
         "{invariant}: lease drop should deduplicate against the worker's deferred reclaim root"
     );
     let completed = runtime
@@ -2120,11 +2120,11 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
         "{invariant}: deferred reclaim should complete after the final lease drop"
     );
     runtime
-        .storage_node
+        .storage_node()
         .finish_object_payload_reclaim_work(&bucket, &key, generation_id);
     assert!(
         !runtime
-            .storage_node
+            .storage_node()
             .test_payload_reclaim_exists(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),

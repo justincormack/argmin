@@ -72,17 +72,17 @@ mod traits {
 pub use cluster::{
     ActiveBucketMetadataScan, ActiveBucketRoute, ActiveBucketRoutePair, ActiveObjectMetadataScan,
     ActiveObjectReadRoute, BucketWriteSnapshotAction, DurableReclaimScanBatch,
-    DurableReclaimScanOutcome, LeasedObjectReadSnapshotOutcome, LocalClusterMap,
-    LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
+    DurableReclaimScanOutcome, LeasedObjectReadSnapshot, LeasedObjectReadSnapshotOutcome,
+    LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
     LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
     LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PgMetadataTransferArtifact,
     PlacedSegmentShardBackfillCopyTarget, PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth,
     PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk, PlacedSegmentShardValidation,
-    ProcessLocalRegistryKey, ReleasedObjectPayloadLease, RetainedStreamUploadCleanup,
-    ShardLocation, StorageCluster, StorageClusterRouteAdmission, StorageClusterRuntimeMapHandle,
-    StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopFailure,
-    StorageClusterRuntimeMapRefreshLoopStatus, StorageClusterRuntimeMapRefreshLoopStatusHandle,
-    StorageClusterRuntimeMapRefreshLoopSuccess,
+    ProcessLocalRegistryKey, ReleasedObjectPayloadLease, RetainedObjectPayloadRead,
+    RetainedStreamUploadCleanup, ShardLocation, StorageCluster, StorageClusterRouteAdmission,
+    StorageClusterRuntimeMapHandle, StorageClusterRuntimeMapRefreshLoop,
+    StorageClusterRuntimeMapRefreshLoopFailure, StorageClusterRuntimeMapRefreshLoopStatus,
+    StorageClusterRuntimeMapRefreshLoopStatusHandle, StorageClusterRuntimeMapRefreshLoopSuccess,
 };
 #[cfg(feature = "test-hooks")]
 pub use cluster::{

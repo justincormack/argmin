@@ -2651,6 +2651,72 @@ Fifty-seventh Phase 3 slice:
   boundary checker, and workspace-wide strict Clippy pass. The full parallel
   workspace suite passes (7,568 tests).
 
+Fifty-eighth Phase 3 slice:
+
+- response-body `GetObject`, ranged GET, and part-level GET now consume the
+  buffered request's existing `StorageClusterRouteAdmission` for bucket
+  authorization, object authorization/snapshot loading, lifecycle-header
+  evaluation, and the payload-authority handoff. Their production coordinator
+  entry points can no longer resample the renewable runtime-map handle;
+  crate-local tests and the `test-utils` feature retain wrappers which acquire
+  admission before entering the same production paths.
+- full-payload snapshot loading now acquires the broad object-generation lease
+  before loading the exact subject-bound snapshot and revalidates the
+  admission's immutable deadline at every load, retry, lease acquisition, and
+  handoff boundary. The result is an opaque non-cloneable
+  `LeasedObjectReadSnapshot` which binds the exact snapshot, route provenance,
+  originating cluster, and broad lease. Only consuming that token can derive
+  `RetainedObjectPayloadRead`; it acquires every narrow lease before releasing
+  the broad lease, making the metadata-to-payload reclaim handoff a type-owned
+  transition rather than a caller convention. The authorization result and
+  token share one immutable snapshot allocation rather than cloning multipart
+  part and segment vectors. CopyObject and UploadPartCopy reuse the buffered
+  request's admission for source-bucket authorization and leased source
+  snapshot loading, then use the same token and retained reader. Their repair
+  fence therefore carries the request's publication generation and immutable
+  deadline instead of being absent on the former raw snapshot path.
+- the retained response-body capability deliberately owns no long-lived
+  route-publication admission and cannot perform another object metadata
+  read. It binds one
+  bucket/key/generation plus a private allowlist of complete segment
+  descriptors; ordinary, range, and part readers reject any crossed segment.
+  Segment locations are validated against retained PG routes while lease RPC
+  acquisition remains authorized by the current request epoch. Payload bytes
+  always use exact retained-route inspection, even when a segment's placement
+  epoch equals the originating frontend epoch, so a storage-node map advance
+  before the first body read neither rejects a valid old object nor contacts
+  the wrong current nodes.
+- read recovery preserves durable repair reporting while the originating
+  frontend generation and the admission's immutable deadline remain current.
+  The leased token captures both; the retained reader can acquire a short
+  permit and record repair work only if both still validate. Once publication
+  begins or completes, or the admitted deadline expires without publication,
+  repair reporting is skipped instead of sending a stale active RPC, while
+  reconstruction continues over the exact retained route.
+- deterministic regressions expire the captured admission after exact snapshot
+  load for all three GET variants, reject a crossed segment descriptor and a
+  handoff token presented through another version's route, prove historical
+  leases bind only the recorded old shard owner, and exercise an installed
+  Unix body created at epoch N whose first read reconstructs a corrupt shard
+  only after the same storage nodes and frontend install epoch N+1. A separate
+  expiry-without-publication regression renews only the raw route, then proves
+  retained reconstruction does not record repair after the captured deadline.
+  CopyObject and UploadPartCopy regressions corrupt a source shard, prove the
+  copy reconstructs coherent bytes, and require the source segment's durable
+  background repair record. Their existing publication interleavings now start
+  map publication asynchronously and prove it waits behind the request
+  admission rather than deadlocking inside a synchronous hook.
+  Existing runtime-map publication regressions now prove publication reaches
+  draining behind snapshot/handoff,
+  completes after admission is released, and the retained body remains
+  readable afterward.
+- object mutations, the remaining buffered coordinator workflows, and
+  capability requirements on the node-client traits remain open in Phase 3.
+- focused handoff/deadline/publication regressions and the broader 223-test
+  storage/coordinator/HTTP object-read matrix pass. Formatting, diff validation,
+  the storage boundary checker, and workspace-wide strict Clippy pass. The full
+  parallel workspace suite passes (7,575 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

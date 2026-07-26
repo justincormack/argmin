@@ -503,6 +503,107 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
 }
 
 #[test]
+fn object_body_reads_recheck_admission_before_retaining_payload_authority() {
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    test_helpers::put_object(
+        &initial_coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"admitted-payload",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let time = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let cluster = same_store_cluster_with_route_map_validity(
+        &initial,
+        tmp.path(),
+        RouteMapValidity::until_ms(5_000).unwrap(),
+    );
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let hook_time = Arc::clone(&time);
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some(("bucket".to_string(), "key".to_string())),
+        after_object_read_snapshot: Some(Arc::new(move || hook_time.set(6_000))),
+        ..ReclamationTestHooks::default()
+    });
+    let object = || {
+        object_version_request_with_expected_owner("bucket", "key", None, test_requester(), None)
+    };
+
+    time.set(1_000);
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let error = coord
+        .get_object_on_admitted_route(
+            &admission,
+            &GetObjectRequest {
+                object: object(),
+                cond: NO_READ,
+                sse_customer: None,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted));
+    drop(admission);
+
+    time.set(1_000);
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let error = coord
+        .get_object_part_on_admitted_route(
+            &admission,
+            &GetObjectPartRequest {
+                object: object(),
+                part_number: 1,
+                cond: NO_READ,
+                sse_customer: None,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted));
+    drop(admission);
+
+    time.set(1_000);
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let error = coord
+        .get_object_range_on_admitted_route(
+            &admission,
+            &GetObjectRangeRequest {
+                object: object(),
+                range: ByteRange::Range { start: 0, end: 3 },
+                cond: NO_READ,
+                sse_customer: None,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted));
+}
+
+#[test]
 fn head_bucket_warm_policy_cache_uses_loaded_identity_and_captured_deadline() {
     let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -1332,7 +1433,7 @@ fn maintenance_worker_operations_sample_epoch_refreshed_runtime_map() {
 
     let lifecycle_runtime =
         super::runtime::lifecycle_runtime_for_sweep(&handle, &stale_lifecycle_runtime);
-    assert!(Arc::ptr_eq(&lifecycle_runtime.storage_node, &refreshed));
+    assert!(Arc::ptr_eq(lifecycle_runtime.storage_node(), &refreshed));
 
     let repair_cluster = super::runtime::shard_repair_cluster_for_work(&handle);
     assert!(Arc::ptr_eq(&repair_cluster, &refreshed));
@@ -1730,6 +1831,9 @@ fn get_object_pins_runtime_map_for_snapshot_and_body() {
         candidate_tmp.path(),
         &[0, 1],
     ));
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
+    let hook_handle = handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -1737,7 +1841,13 @@ fn get_object_pins_runtime_map_for_snapshot_and_body() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some(("bucket".to_string(), "key".to_string())),
         after_object_read_snapshot: Some(Arc::new(move || {
-            handle.install(Arc::clone(&candidate)).unwrap();
+            let publishing_handle = hook_handle.clone();
+            let publishing_candidate = Arc::clone(&candidate);
+            let thread = thread::spawn(move || {
+                publishing_handle.install(publishing_candidate).unwrap();
+            });
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
         })),
         ..ReclamationTestHooks::default()
     });
@@ -1754,6 +1864,14 @@ fn get_object_pins_runtime_map_for_snapshot_and_body() {
             ),
             cond: NO_READ,
         })
+        .unwrap();
+
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("GetObject hook should start route publication")
+        .join()
         .unwrap();
 
     assert_eq!(result.body.read_all().unwrap(), b"pinned-runtime-map");
@@ -1800,6 +1918,8 @@ fn copy_object_pins_runtime_map_for_source_and_destination() {
         candidate_tmp.path(),
         &[0, 1],
     ));
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
     let handle_for_hook = handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -1808,7 +1928,13 @@ fn copy_object_pins_runtime_map_for_source_and_destination() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some(("bucket".to_string(), "src".to_string())),
         after_object_read_snapshot: Some(Arc::new(move || {
-            handle_for_hook.install(Arc::clone(&candidate)).unwrap();
+            let publishing_handle = handle_for_hook.clone();
+            let publishing_candidate = Arc::clone(&candidate);
+            let thread = thread::spawn(move || {
+                publishing_handle.install(publishing_candidate).unwrap();
+            });
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            handle_for_hook.test_wait_until_route_publication_is_pending();
         })),
         ..ReclamationTestHooks::default()
     });
@@ -1832,6 +1958,14 @@ fn copy_object_pins_runtime_map_for_source_and_destination() {
             destination_encryption: WriteEncryptionRequest::none(),
             object_lock: ObjectLockState::default(),
         })
+        .unwrap();
+
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("CopyObject hook should start route publication")
+        .join()
         .unwrap();
 
     handle
@@ -3183,6 +3317,9 @@ fn upload_part_copy_pins_runtime_map_after_stream_session_create() {
         candidate_tmp.path(),
         &[0, 1],
     ));
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
+    let hook_handle = handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -3190,7 +3327,13 @@ fn upload_part_copy_pins_runtime_map_after_stream_session_create() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some(("bucket".to_string(), "dst".to_string())),
         after_upload_part_copy_stream_session: Some(Arc::new(move || {
-            handle.install(Arc::clone(&candidate)).unwrap();
+            let publishing_handle = hook_handle.clone();
+            let publishing_candidate = Arc::clone(&candidate);
+            let thread = thread::spawn(move || {
+                publishing_handle.install(publishing_candidate).unwrap();
+            });
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
         })),
         ..ReclamationTestHooks::default()
     });
@@ -3211,6 +3354,13 @@ fn upload_part_copy_pins_runtime_map_after_stream_session_create() {
             source_sse_customer: None,
             sse_customer: None,
         })
+        .unwrap();
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("UploadPartCopy hook should start route publication")
+        .join()
         .unwrap();
 }
 
@@ -4032,10 +4182,21 @@ fn copy_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route()
         "copy should apply the expected destination command prefix before the gated commit"
     );
 
-    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+    let publishing_handle = handle.clone();
+    let publishing_initial = Arc::clone(&initial);
+    let publishing_node_root = tmp.path().to_path_buf();
+    let publication_thread = thread::spawn(move || {
+        install_next_epoch_runtime_map_with_historical_routes(
+            &publishing_handle,
+            &publishing_initial,
+            &publishing_node_root,
+        );
+    });
+    handle.test_wait_until_route_publication_is_pending();
 
     gate.release();
     let copy_result = copy_thread.join().unwrap().unwrap();
+    publication_thread.join().unwrap();
     assert_eq!(copy_result.version_id, VersionId::Null);
     let after_object_pg_proof = initial
         .test_object_pg_metadata_proof(&bucket_name, &dst_object_key)
@@ -4577,10 +4738,21 @@ fn upload_part_copy_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
         "UploadPartCopy should apply the expected destination command prefix before the gated part commit"
     );
 
-    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+    let publishing_handle = handle.clone();
+    let publishing_initial = Arc::clone(&initial);
+    let publishing_node_root = tmp.path().to_path_buf();
+    let publication_thread = thread::spawn(move || {
+        install_next_epoch_runtime_map_with_historical_routes(
+            &publishing_handle,
+            &publishing_initial,
+            &publishing_node_root,
+        );
+    });
+    handle.test_wait_until_route_publication_is_pending();
 
     gate.release();
     let part = copy_thread.join().unwrap().unwrap();
+    publication_thread.join().unwrap();
     let after_object_pg_proof = initial
         .test_object_pg_metadata_proof(&bucket_name, &dst_object_key)
         .unwrap();
@@ -5176,6 +5348,8 @@ fn get_object_epoch_change_after_read_snapshot_uses_pinned_route() {
     let hook_handle = handle.clone();
     let hook_initial = Arc::clone(&initial);
     let hook_node_root = tmp.path().to_path_buf();
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -5183,11 +5357,18 @@ fn get_object_epoch_change_after_read_snapshot_uses_pinned_route() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some((bucket.to_string(), key.to_string())),
         after_object_read_snapshot: Some(Arc::new(move || {
-            install_next_epoch_runtime_map_with_historical_routes(
-                &hook_handle,
-                &hook_initial,
-                &hook_node_root,
-            );
+            let publishing_handle = hook_handle.clone();
+            let publishing_initial = Arc::clone(&hook_initial);
+            let publishing_node_root = hook_node_root.clone();
+            let thread = thread::spawn(move || {
+                install_next_epoch_runtime_map_with_historical_routes(
+                    &publishing_handle,
+                    &publishing_initial,
+                    &publishing_node_root,
+                );
+            });
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
         })),
         ..ReclamationTestHooks::default()
     });
@@ -5204,6 +5385,13 @@ fn get_object_epoch_change_after_read_snapshot_uses_pinned_route() {
             ),
             cond: NO_READ,
         })
+        .unwrap();
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("GetObject hook should start route publication")
+        .join()
         .unwrap();
     assert_eq!(result.body.read_all().unwrap(), b"get-crosses-epoch-change");
 }
@@ -5299,8 +5487,7 @@ fn head_object_epoch_change_after_read_snapshot_uses_pinned_route() {
 }
 
 #[test]
-fn get_uses_retained_payload_route_over_unix_after_data_pg_move_and_metadata_reads_stay_available()
-{
+fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read() {
     let tmp = test_util::tempdir();
     let old_acting_set = vec![NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let moved_acting_set = vec![NodeId::new(3), NodeId::new(4), NodeId::new(5)];
@@ -5408,25 +5595,27 @@ fn get_uses_retained_payload_route_over_unix_after_data_pg_move_and_metadata_rea
         .collect::<Vec<_>>();
     let socket_dir = tmp.path().join("remote-read-sockets");
     make_private_socket_dir(&socket_dir);
+    let server_route_validity = long_lived_test_route_map_validity();
     let stop = Arc::new(AtomicBool::new(false));
     let mut server_threads = Vec::new();
     let mut wake_socket_paths = Vec::new();
+    let mut servers = Vec::new();
     let mut client_configs = Vec::new();
     for config in &configs {
         let socket_path = socket_dir.join(format!("node-{}.sock", config.node_id().as_u32()));
         let server_config = StorageNodeProcessConfig::new(StorageNodeProcessConfigParts {
             node_id: config.node_id(),
-            cluster_epoch: next_epoch,
-            route_map_validity: RouteMapValidity::Forever,
+            cluster_epoch: current_epoch,
+            route_map_validity: server_route_validity,
             data_dir: config.data_dir().to_path_buf(),
             default_ec_shape: ec_shape,
             pg_ids: pg_ids.clone(),
             socket_path: socket_path.clone(),
-            pg_routes: next_routes.iter().map(StorageNodePgRoute::from).collect(),
-            historical_pg_routes: current_routes
+            pg_routes: current_routes
                 .iter()
                 .map(StorageNodePgRoute::from)
                 .collect(),
+            historical_pg_routes: Vec::new(),
             pending_metadata_command_recoveries: Vec::new(),
         })
         .unwrap();
@@ -5438,10 +5627,82 @@ fn get_uses_retained_payload_route_over_unix_after_data_pg_move_and_metadata_rea
             ));
             wake_socket_paths.push(socket_path.clone());
         }
+        servers.push(Arc::clone(&server));
         client_configs.push(LocalUnixStorageNodeClientConfig::new(
             config.node_id(),
             socket_path,
         ));
+    }
+
+    let mut current_unix_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs.clone(),
+        &pg_ids,
+        ec_shape,
+        current_epoch,
+        current_routes.iter().map(LocalPgRoute::from),
+    )
+    .unwrap();
+    current_unix_map
+        .install_unix_storage_node_clients(client_configs.clone())
+        .unwrap();
+    current_unix_map.test_set_route_map_validity(long_lived_test_route_map_validity());
+    let current_unix_cluster = StorageCluster::from_local_map(Arc::new(current_unix_map)).unwrap();
+    handle.install(current_unix_cluster).unwrap();
+
+    let read = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                &bucket,
+                &key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+
+    // Force the first retained body read to reconstruct from parity. Besides
+    // proving the payload RPC uses the exact historical route after the map
+    // advance, this pins that repair reporting cannot fall back to an active
+    // epoch-N mutation once that frontend generation has been unpublished.
+    let corrupt_path = current_cluster
+        .test_payload_shard_file_path(
+            segment.data_pg_id,
+            ec_shape,
+            &segment.segment_okh,
+            segment.segment_vid,
+            0,
+        )
+        .unwrap();
+    let mut corrupt_bytes = std::fs::read(&corrupt_path).unwrap();
+    assert!(!corrupt_bytes.is_empty(), "placed shard must not be empty");
+    corrupt_bytes[0] ^= 0xff;
+    std::fs::write(&corrupt_path, corrupt_bytes).unwrap();
+
+    for (server, config) in servers.iter().zip(&configs) {
+        let socket_path = socket_dir.join(format!("node-{}.sock", config.node_id().as_u32()));
+        let next_server_config = StorageNodeProcessConfig::new(StorageNodeProcessConfigParts {
+            node_id: config.node_id(),
+            cluster_epoch: next_epoch,
+            route_map_validity: server_route_validity,
+            data_dir: config.data_dir().to_path_buf(),
+            default_ec_shape: ec_shape,
+            pg_ids: pg_ids.clone(),
+            socket_path,
+            pg_routes: next_routes.iter().map(StorageNodePgRoute::from).collect(),
+            historical_pg_routes: current_routes
+                .iter()
+                .map(StorageNodePgRoute::from)
+                .collect(),
+            pending_metadata_command_recoveries: Vec::new(),
+        })
+        .unwrap();
+        server
+            .install_control_plane_runtime_config(next_server_config)
+            .unwrap();
     }
 
     let mut next_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
@@ -5461,19 +5722,6 @@ fn get_uses_retained_payload_route_over_unix_after_data_pg_move_and_metadata_rea
     let next_cluster = StorageCluster::from_local_map(Arc::new(next_map)).unwrap();
     handle.install(next_cluster).unwrap();
 
-    let read = coord
-        .get_object(&GetObjectRequest {
-            sse_customer: None,
-            object: object_version_request_with_expected_owner(
-                &bucket,
-                &key,
-                None,
-                test_requester(),
-                None,
-            ),
-            cond: NO_READ,
-        })
-        .unwrap();
     assert_eq!(read.body.read_all().unwrap(), payload);
     let head = coord
         .head_object(&GetObjectRequest {
@@ -14993,6 +15241,289 @@ fn read_discovered_corrupt_shard_queues_background_repair_without_inline_rewrite
             .try_take_placed_segment_shard_repair_work(),
         Some(*repair),
         "successful read recovery should leave a background repair wake hint"
+    );
+}
+
+#[test]
+fn copy_object_discovered_corrupt_source_shard_queues_background_repair() {
+    if !backend_supports_parity_recovery() {
+        return;
+    }
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let data = b"copy should recover its source and queue repair";
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let source_key = trusted_object_key("src");
+    let segment = coord
+        .storage_node()
+        .test_get_object_segments(&bucket, &source_key, VersionId::Null)
+        .unwrap()
+        .pop()
+        .expect("source object should create one segment");
+    let corrupt_shard_index = 0;
+    corrupt_shard_on_disk(&coord, "bucket", "src", corrupt_shard_index);
+
+    coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("bucket", "src", None),
+            destination: object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap();
+    let copied = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "dst",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(copied.body.read_all().unwrap(), data);
+
+    let repairs = coord
+        .storage_node()
+        .list_placed_segment_shard_repairs(segment.data_pg_id)
+        .unwrap();
+    assert_eq!(repairs.len(), 1);
+    let repair = &repairs[0].work_item;
+    assert_eq!(repair.request.data_pg_id, segment.data_pg_id);
+    assert_eq!(repair.request.segment_okh, segment.segment_okh);
+    assert_eq!(repair.request.segment_vid, segment.segment_vid);
+    assert_eq!(repair.request.segment_crc64, segment.segment_crc64);
+    assert_eq!(repair.shard_index.get(), corrupt_shard_index);
+}
+
+#[test]
+fn upload_part_copy_discovered_corrupt_source_shard_queues_background_repair() {
+    if !backend_supports_parity_recovery() {
+        return;
+    }
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let data = b"upload part copy should recover its source and queue repair";
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data,
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner("bucket", "dst", test_requester(), None),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let source_key = trusted_object_key("src");
+    let segment = coord
+        .storage_node()
+        .test_get_object_segments(&bucket, &source_key, VersionId::Null)
+        .unwrap()
+        .pop()
+        .expect("source object should create one segment");
+    let corrupt_shard_index = 0;
+    corrupt_shard_on_disk(&coord, "bucket", "src", corrupt_shard_index);
+
+    let part = coord
+        .upload_part_copy(&UploadPartCopyRequest {
+            source: copy_source("bucket", "src", None),
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            copy_source_range: None,
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            sse_customer: None,
+        })
+        .unwrap();
+    coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &[CompletePart {
+                part_number: 1,
+                etag: part.etag,
+                checksum: None,
+            }],
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: NO_WRITE,
+            sse_customer: None,
+        })
+        .unwrap();
+    let copied = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "dst",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(copied.body.read_all().unwrap(), data);
+
+    let repairs = coord
+        .storage_node()
+        .list_placed_segment_shard_repairs(segment.data_pg_id)
+        .unwrap();
+    assert_eq!(repairs.len(), 1);
+    let repair = &repairs[0].work_item;
+    assert_eq!(repair.request.data_pg_id, segment.data_pg_id);
+    assert_eq!(repair.request.segment_okh, segment.segment_okh);
+    assert_eq!(repair.request.segment_vid, segment.segment_vid);
+    assert_eq!(repair.request.segment_crc64, segment.segment_crc64);
+    assert_eq!(repair.shard_index.get(), corrupt_shard_index);
+}
+
+#[test]
+fn retained_read_skips_repair_record_after_admitted_route_expiry_without_publication() {
+    if !backend_supports_parity_recovery() {
+        return;
+    }
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let data = b"expired retained read must not record repair through renewed raw authority";
+    test_helpers::put_object(
+        &initial_coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let time = storage::clock::test_time_override_guard(1_000);
+    let cluster = same_store_cluster_with_route_map_validity(
+        &initial,
+        tmp.path(),
+        RouteMapValidity::until_ms(5_000).unwrap(),
+    );
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let segment = cluster
+        .test_get_object_segments(&bucket, &key, VersionId::Null)
+        .unwrap()
+        .pop()
+        .expect("put object should create one segment");
+    corrupt_shard_on_disk(&coord, "bucket", "key", 0);
+
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    time.set(6_000);
+    assert_eq!(result.body.read_all().unwrap(), data);
+    assert!(
+        cluster
+            .list_placed_segment_shard_repairs(segment.data_pg_id)
+            .unwrap()
+            .is_empty(),
+        "expired admitted authority must not record repair through the renewed raw route"
     );
 }
 

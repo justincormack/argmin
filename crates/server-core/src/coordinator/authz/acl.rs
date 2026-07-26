@@ -414,12 +414,25 @@ impl Coordinator {
         &self,
         req: &CopyObjectRequest<'_>,
     ) -> Result<AuthorizedCopyObject, ServerError> {
-        self.authorize_copy_object_with_storage_node(&self.storage_node(), req)
+        let admission = self.admit_storage_route_for_request()?;
+        let storage_node = self.storage_node();
+        self.authorize_copy_object_on_admitted_route(&admission, &storage_node, req)
     }
 
-    pub(in crate::coordinator) fn authorize_copy_object_with_storage_node(
+    pub(in crate::coordinator) fn authorize_copy_object_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        storage_node: &Arc<storage::StorageCluster>,
+        req: &CopyObjectRequest<'_>,
+    ) -> Result<AuthorizedCopyObject, ServerError> {
+        self.require_storage_route_admission(admission)?;
+        self.authorize_copy_object_with_storage_node_and_admission(storage_node, admission, req)
+    }
+
+    fn authorize_copy_object_with_storage_node_and_admission(
         &self,
         storage_node: &Arc<storage::StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &CopyObjectRequest<'_>,
     ) -> Result<AuthorizedCopyObject, ServerError> {
         let src_version_id = req.source.version_id;
@@ -470,8 +483,8 @@ impl Coordinator {
                 encryption: req.destination_encryption,
             },
         )?;
-        let source = self.authorize_copy_source_read_snapshot_with_storage_node(
-            storage_node,
+        let source = self.authorize_copy_source_read_snapshot(
+            admission,
             CopySourceReadSnapshotRequest {
                 requester,
                 bucket: &req.source.bucket,
@@ -543,6 +556,7 @@ impl Coordinator {
     pub(in crate::coordinator) fn authorize_upload_part_copy_non_boe(
         &self,
         storage_node: &Arc<storage::StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &UploadPartCopyRequest<'_>,
         dst_bucket_handle: NonBoeLoadedBucketHandle<'_>,
     ) -> Result<AuthorizedUploadPartCopy, ServerError> {
@@ -589,8 +603,8 @@ impl Coordinator {
             true,
         )?;
 
-        let source = self.authorize_copy_source_read_snapshot_with_storage_node(
-            storage_node,
+        let source = self.authorize_copy_source_read_snapshot(
+            admission,
             CopySourceReadSnapshotRequest {
                 requester,
                 bucket: &req.source.bucket,
@@ -990,8 +1004,9 @@ impl Coordinator {
     ) -> Result<
         (
             BucketSummary,
-            storage::ObjectReadSnapshot,
+            Arc<storage::ObjectReadSnapshot>,
             ObjectAttributePermissions,
+            Option<storage::LeasedObjectReadSnapshot>,
         ),
         ServerError,
     > {
@@ -1092,12 +1107,17 @@ impl Coordinator {
                     error,
                 )
             })??;
-        Ok((bucket_summary, outcome.snapshot, outcome.value))
+        Ok((
+            bucket_summary,
+            outcome.snapshot,
+            outcome.value,
+            outcome.payload_handoff,
+        ))
     }
 
     pub(super) fn authorize_copy_source_read_snapshot_non_boe(
         &self,
-        storage_node: &Arc<storage::StorageCluster>,
+        route: &ObjectReadSnapshotRoute<'_>,
         req: CopySourceReadSnapshotRequest<'_>,
         bucket: NonBoeLoadedBucketHandle<'_>,
     ) -> Result<AuthorizedCopySourceRead, ServerError> {
@@ -1120,42 +1140,36 @@ impl Coordinator {
                 req.key.as_str(),
                 req.version_id,
             )?;
-        let outcome = storage_node
-            .load_leased_object_read_snapshot_if(
-                &bucket.bucket().name,
-                req.key,
-                req.version_id,
-                ObjectReadSnapshotMode::FullPayloadLayout,
-                |stored| {
-                    let allowed = if matches!(
-                        req.existing_object_tags_mode,
-                        ExistingObjectTagsMode::Available
-                    ) {
-                        self.requester_can_read_object_with_bucket_policy(
-                            req.requester,
-                            &bucket_info,
-                            bucket_tags.as_deref(),
-                            stored,
-                            req.policy_action,
-                            bucket_policy.as_deref(),
-                        )?
-                    } else {
-                        self.requester_can_read_object_without_existing_tags_with_bucket_policy(
-                            req.requester,
-                            &bucket_info,
-                            bucket_tags.as_deref(),
-                            stored,
-                            req.policy_action,
-                            bucket_policy.as_deref(),
-                        )?
-                    };
-                    if allowed {
-                        Ok(())
-                    } else {
-                        Err(ServerError::AccessDenied)
-                    }
-                },
-            )
+        let outcome = route
+            .load(|stored| {
+                let allowed = if matches!(
+                    req.existing_object_tags_mode,
+                    ExistingObjectTagsMode::Available
+                ) {
+                    self.requester_can_read_object_with_bucket_policy(
+                        req.requester,
+                        &bucket_info,
+                        bucket_tags.as_deref(),
+                        stored,
+                        req.policy_action,
+                        bucket_policy.as_deref(),
+                    )?
+                } else {
+                    self.requester_can_read_object_without_existing_tags_with_bucket_policy(
+                        req.requester,
+                        &bucket_info,
+                        bucket_tags.as_deref(),
+                        stored,
+                        req.policy_action,
+                        bucket_policy.as_deref(),
+                    )?
+                };
+                if allowed {
+                    Ok(())
+                } else {
+                    Err(ServerError::AccessDenied)
+                }
+            })
             .map_err(|error| {
                 Self::map_object_read_snapshot_error(
                     &bucket.bucket().name,
@@ -1165,9 +1179,15 @@ impl Coordinator {
                     error,
                 )
             })??;
+        let payload_handoff =
+            outcome
+                .payload_handoff
+                .ok_or_else(|| ServerError::InternalError {
+                    reason: "copy source snapshot lacks leased payload handoff".to_string(),
+                })?;
         Ok(AuthorizedCopySourceRead {
             snapshot: outcome.snapshot,
-            payload_lease: outcome.payload_lease,
+            payload_handoff,
         })
     }
 
@@ -1207,12 +1227,13 @@ impl Coordinator {
         self.authorize_get_object_with_storage_node(&self.storage_node(), req)
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_get_object_with_storage_node(
         &self,
         storage_node: &Arc<storage::StorageCluster>,
         req: &GetObjectRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
-        let (bucket, snapshot, attribute_permissions) = self
+        let (bucket, snapshot, attribute_permissions, payload_handoff) = self
             .authorize_object_read_snapshot_with_storage_node(
                 storage_node,
                 AuthorizedObjectReadSnapshotRequest {
@@ -1230,6 +1251,34 @@ impl Coordinator {
             bucket,
             snapshot,
             attribute_permissions,
+            payload_handoff,
+        })
+    }
+
+    pub(in crate::coordinator) fn authorize_get_object_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &GetObjectRequest<'_>,
+    ) -> Result<AuthorizedObjectRead, ServerError> {
+        let (bucket, snapshot, attribute_permissions, payload_handoff) = self
+            .authorize_object_read_snapshot_on_admitted_route(
+                admission,
+                AuthorizedObjectReadSnapshotRequest {
+                    requester: req.object.requester(),
+                    bucket: req.object.bucket_name_typed(),
+                    key: req.object.key_typed(),
+                    version_id: req.object.version_id,
+                    expected_bucket_owner: req.expected_bucket_owner(),
+                    missing_discovery: MissingObjectDiscovery::ReadBucket,
+                    modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
+                    snapshot_mode: ObjectReadSnapshotMode::FullPayloadLayout,
+                },
+            )?;
+        Ok(AuthorizedObjectRead {
+            bucket,
+            snapshot,
+            attribute_permissions,
+            payload_handoff,
         })
     }
 
@@ -1238,7 +1287,7 @@ impl Coordinator {
         admission: &storage::StorageClusterRouteAdmission,
         req: &GetObjectRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
-        let (bucket, snapshot, attribute_permissions) = self
+        let (bucket, snapshot, attribute_permissions, payload_handoff) = self
             .authorize_object_read_snapshot_on_admitted_route(
                 admission,
                 AuthorizedObjectReadSnapshotRequest {
@@ -1256,6 +1305,7 @@ impl Coordinator {
             bucket,
             snapshot,
             attribute_permissions,
+            payload_handoff,
         })
     }
 
@@ -1264,7 +1314,7 @@ impl Coordinator {
         admission: &storage::StorageClusterRouteAdmission,
         req: &GetObjectAttributesRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
-        let (bucket, snapshot, attribute_permissions) = self
+        let (bucket, snapshot, attribute_permissions, payload_handoff) = self
             .authorize_object_read_snapshot_on_admitted_route(
                 admission,
                 AuthorizedObjectReadSnapshotRequest {
@@ -1288,6 +1338,7 @@ impl Coordinator {
             bucket,
             snapshot,
             attribute_permissions,
+            payload_handoff,
         })
     }
 
@@ -1296,7 +1347,7 @@ impl Coordinator {
         admission: &storage::StorageClusterRouteAdmission,
         req: &GetObjectRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
-        let (bucket, snapshot, attribute_permissions) = self
+        let (bucket, snapshot, attribute_permissions, payload_handoff) = self
             .authorize_object_read_snapshot_on_admitted_route(
                 admission,
                 AuthorizedObjectReadSnapshotRequest {
@@ -1314,6 +1365,7 @@ impl Coordinator {
             bucket,
             snapshot,
             attribute_permissions,
+            payload_handoff,
         })
     }
 }

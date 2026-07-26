@@ -1167,10 +1167,138 @@ pub struct ObjectPayloadLease {
     released: bool,
 }
 
+/// One immutable payload segment selected by an admitted object snapshot.
+///
+/// The fields are private so callers cannot mint payload-read authority from
+/// arbitrary shard coordinates. [`RetainedObjectPayloadRead`] constructs the
+/// set only by consuming the exact [`LeasedObjectReadSnapshot`] returned by a
+/// leased snapshot load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RetainedObjectPayloadSegment {
+    placement_cluster_epoch: ClusterEpoch,
+    request: SegmentStoredBytesRequest,
+}
+
+/// Subject-bound payload-read authority retained by a streaming response.
+///
+/// This capability deliberately does not retain request route admission. It
+/// owns the deletion-exclusion lease acquired while that admission was valid
+/// and permits reads only for segment descriptors present in the admitted
+/// object snapshot. Read recovery may briefly reacquire admission solely to
+/// record repair work, and only while the originating publication generation
+/// is still current.
+pub struct RetainedObjectPayloadRead {
+    cluster: Arc<StorageCluster>,
+    bucket: BucketName,
+    key: ObjectKey,
+    generation_id: GenerationId,
+    segments: HashSet<RetainedObjectPayloadSegment>,
+    lease: Mutex<Option<ObjectPayloadLease>>,
+    repair_fence: Option<RetainedActiveRouteRepairFence>,
+}
+
+impl RetainedObjectPayloadRead {
+    pub fn matches_subject(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> bool {
+        self.bucket == *bucket && self.key == *key && self.generation_id == generation_id
+    }
+
+    pub fn contains_segment(
+        &self,
+        placement_cluster_epoch: ClusterEpoch,
+        request: SegmentStoredBytesRequest,
+    ) -> bool {
+        self.segments.contains(&RetainedObjectPayloadSegment {
+            placement_cluster_epoch,
+            request,
+        })
+    }
+
+    pub fn read_segment_payload_stored_bytes_into(
+        &self,
+        placement_cluster_epoch: ClusterEpoch,
+        request: SegmentStoredBytesRequest,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), StoreError> {
+        if !self.contains_segment(placement_cluster_epoch, request) {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "payload read is outside the retained object snapshot".to_string(),
+            });
+        }
+        self.cluster
+            .read_retained_segment_payload_stored_bytes_at_placement_epoch_into(
+                placement_cluster_epoch,
+                request,
+                dst,
+                self.repair_fence.as_ref(),
+            )
+    }
+}
+
+impl Drop for RetainedObjectPayloadRead {
+    fn drop(&mut self) {
+        let Some(lease) = self
+            .lease
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let released = lease.release();
+        if released.remaining() == 0 && released.payload_reclaim_exists().unwrap_or(true) {
+            released.enqueue_object_payload_reclaim();
+        }
+    }
+}
+
 pub struct LeasedObjectReadSnapshotOutcome<T> {
-    pub value: T,
-    pub snapshot: ObjectReadSnapshot,
-    pub payload_lease: Option<ObjectPayloadLease>,
+    value: T,
+    leased_snapshot: LeasedObjectReadSnapshot,
+}
+
+impl<T> LeasedObjectReadSnapshotOutcome<T> {
+    pub fn snapshot(&self) -> &ObjectReadSnapshot {
+        self.leased_snapshot.snapshot.as_ref()
+    }
+
+    /// Split the authorization result into its value, shared immutable
+    /// snapshot, and non-cloneable payload handoff. The snapshot and handoff
+    /// refer to the same allocation rather than duplicating payload vectors.
+    pub fn into_parts(self) -> (T, Arc<ObjectReadSnapshot>, LeasedObjectReadSnapshot) {
+        let snapshot = Arc::clone(&self.leased_snapshot.snapshot);
+        (self.value, snapshot, self.leased_snapshot)
+    }
+}
+
+/// Non-cloneable proof that an exact object snapshot was loaded while its
+/// payload generation was protected by a broad deletion-exclusion lease.
+///
+/// The fields are private so callers cannot pair an arbitrary snapshot with a
+/// lease acquired for another version. A payload reader can be created only by
+/// consuming this value through the originating cluster or admitted route.
+/// Its immutable snapshot is shared with the authorization result so the
+/// handoff does not duplicate part or segment vectors.
+pub struct LeasedObjectReadSnapshot {
+    cluster: Arc<StorageCluster>,
+    bucket: BucketName,
+    key: ObjectKey,
+    version_id: Option<VersionId>,
+    snapshot_mode: ObjectReadSnapshotMode,
+    pg_id: ObjectMetadataPgId,
+    snapshot: Arc<ObjectReadSnapshot>,
+    payload_lease: Option<ObjectPayloadLease>,
+    repair_fence: Option<RetainedActiveRouteRepairFence>,
+}
+
+impl LeasedObjectReadSnapshot {
+    pub fn snapshot(&self) -> &ObjectReadSnapshot {
+        self.snapshot.as_ref()
+    }
 }
 
 impl ObjectPayloadLease {
@@ -1469,6 +1597,7 @@ enum StorageClusterRouteTransitionState {
 struct StorageClusterRouteAdmissionState {
     active_requests: usize,
     transition: StorageClusterRouteTransitionState,
+    publication_generation: u64,
 }
 
 impl StorageClusterRouteAdmissionGate {
@@ -1518,6 +1647,35 @@ impl StorageClusterRouteAdmissionGate {
         }
         state.transition = StorageClusterRouteTransitionState::Publishing;
         StorageClusterRoutePublicationGuard { gate: self.clone() }
+    }
+
+    fn acquire_for_publication_generation(
+        &self,
+        publication_generation: u64,
+    ) -> Option<StorageClusterRouteAdmissionPermit> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.transition != StorageClusterRouteTransitionState::Open
+            || state.publication_generation != publication_generation
+        {
+            return None;
+        }
+        state.active_requests = state
+            .active_requests
+            .checked_add(1)
+            .expect("route admission permit count must not overflow");
+        Some(StorageClusterRouteAdmissionPermit { gate: self.clone() })
+    }
+
+    fn publication_generation(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .publication_generation
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1585,9 +1743,20 @@ impl Drop for StorageClusterRoutePublicationGuard {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.publication_generation = state
+            .publication_generation
+            .checked_add(1)
+            .expect("route publication generation must not overflow");
         state.transition = StorageClusterRouteTransitionState::Open;
         self.gate.inner.changed.notify_all();
     }
+}
+
+#[derive(Clone)]
+struct RetainedActiveRouteRepairFence {
+    gate: StorageClusterRouteAdmissionGate,
+    publication_generation: u64,
+    admitted_lease: LocalRouteMapLeaseSnapshot,
 }
 
 /// Non-cloneable request admission for one installed frontend route-map
@@ -1945,7 +2114,63 @@ impl ActiveObjectReadRoute<'_> {
             })
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn load_leased_object_read_snapshot_if<T, E>(
+        &self,
+        action: impl FnMut(&StoredObject) -> Result<T, E>,
+    ) -> Result<Result<LeasedObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
+        let route = ObjectReadMetadataRoute {
+            bucket: &self.bucket,
+            key: &self.key,
+            version_id: self.version_id,
+            snapshot_mode: self.snapshot_mode,
+            pg_id: self.pg_id,
+        };
+        let outcome = self
+            .admission
+            .cluster
+            .load_leased_object_read_snapshot_if_on_route(&route, action, || {
+                self.admission.require_valid_now()
+            })?;
+        Ok(outcome.map(|mut outcome| {
+            outcome.leased_snapshot.repair_fence = Some(RetainedActiveRouteRepairFence {
+                gate: self.admission._permit.gate.clone(),
+                publication_generation: self.admission._permit.gate.publication_generation(),
+                admitted_lease: self.admission.admitted_lease,
+            });
+            outcome
+        }))
+    }
+
+    /// Retain narrowly scoped payload authority for the exact snapshot loaded
+    /// through this route.
+    ///
+    /// The returned capability owns only deletion-exclusion leases and exact
+    /// segment descriptors. It does not retain this request's publication
+    /// admission and therefore cannot perform another object metadata lookup.
+    pub fn retain_object_payload_read(
+        &self,
+        leased_snapshot: LeasedObjectReadSnapshot,
+    ) -> Result<Option<RetainedObjectPayloadRead>, StoreError> {
+        if !Arc::ptr_eq(&self.admission.cluster, &leased_snapshot.cluster)
+            || leased_snapshot.bucket != self.bucket
+            || leased_snapshot.key != self.key
+            || leased_snapshot.version_id != self.version_id
+            || leased_snapshot.snapshot_mode != self.snapshot_mode
+            || leased_snapshot.pg_id != self.pg_id
+        {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "leased object snapshot provenance does not match active read route"
+                    .to_string(),
+            });
+        }
+        self.admission
+            .cluster
+            .retain_object_payload_read_from_leased_snapshot(leased_snapshot, || {
+                self.admission.require_valid_now()
+            })
+    }
+
+    #[cfg(feature = "test-hooks")]
     pub fn try_probe_object_pg_available(&self) -> Result<bool, ObjectPgActionError> {
         self.admission.require_valid_now()?;
         self.admission
@@ -4130,6 +4355,119 @@ fn classify_metadata_transfer_import_destination(
 }
 
 impl StorageCluster {
+    fn retain_object_payload_read_from_leased_snapshot(
+        self: &Arc<Self>,
+        leased_snapshot: LeasedObjectReadSnapshot,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<Option<RetainedObjectPayloadRead>, StoreError> {
+        let LeasedObjectReadSnapshot {
+            cluster,
+            bucket,
+            key,
+            version_id: _,
+            snapshot_mode: _,
+            pg_id: _,
+            snapshot,
+            payload_lease,
+            repair_fence,
+        } = leased_snapshot;
+        if !Arc::ptr_eq(self, &cluster) {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "leased object snapshot belongs to another storage cluster".to_string(),
+            });
+        }
+        let Some(live) = snapshot.stored.as_live() else {
+            return Ok(None);
+        };
+
+        let stored_size_extra = live.encryption.segment_ciphertext_extra_len();
+        let mut segments = HashSet::new();
+        for segment in &snapshot.object_segments {
+            if segment.bucket != bucket
+                || segment.key != key
+                || segment.version_id != live.version_id
+            {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: "object segment does not match leased snapshot subject".to_string(),
+                });
+            }
+            segments.insert(RetainedObjectPayloadSegment {
+                placement_cluster_epoch: segment.placement_cluster_epoch,
+                request: SegmentStoredBytesRequest {
+                    data_pg_id: segment.data_pg_id,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    stored_size: segment.size as usize + stored_size_extra,
+                    segment_crc64: segment.segment_crc64,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                },
+            });
+        }
+        for segment in &snapshot.multipart_part_segments {
+            if segment.bucket != bucket || segment.key != key {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: "multipart segment does not match leased snapshot subject".to_string(),
+                });
+            }
+            segments.insert(RetainedObjectPayloadSegment {
+                placement_cluster_epoch: segment.placement_cluster_epoch,
+                request: SegmentStoredBytesRequest {
+                    data_pg_id: segment.data_pg_id,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    stored_size: segment.size as usize + stored_size_extra,
+                    segment_crc64: segment.segment_crc64,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                },
+            });
+        }
+
+        let mut locations = Vec::new();
+        for segment in &segments {
+            if segment.request.stored_size == 0 {
+                continue;
+            }
+            require_valid_route()?;
+            locations.extend(self.segment_payload_shard_locations_at_placement_epoch(
+                segment.placement_cluster_epoch,
+                &segment.request,
+            )?);
+        }
+        require_valid_route()?;
+        let narrow_lease = self.acquire_object_payload_lease_for_shard_locations(
+            &bucket,
+            &key,
+            live.generation_id,
+            &locations,
+        )?;
+        require_valid_route()?;
+
+        let retained = RetainedObjectPayloadRead {
+            cluster,
+            bucket,
+            key,
+            generation_id: live.generation_id,
+            segments,
+            lease: Mutex::new(Some(narrow_lease)),
+            repair_fence,
+        };
+        drop(payload_lease);
+        Ok(Some(retained))
+    }
+
+    pub fn retain_object_payload_read(
+        self: &Arc<Self>,
+        leased_snapshot: LeasedObjectReadSnapshot,
+    ) -> Result<Option<RetainedObjectPayloadRead>, StoreError> {
+        self.retain_object_payload_read_from_leased_snapshot(leased_snapshot, || Ok(()))
+    }
+
     fn emit_metadata_command_conflict(
         &self,
         node_id: Option<NodeId>,
@@ -12426,10 +12764,64 @@ impl StorageCluster {
             let data_pg = self.validated_data_pg(PgId::new(req.data_pg_id))?;
             let route =
                 self.reconstructed_pg_route_at_epoch(data_pg.pg_id(), placement_cluster_epoch)?;
-            self.try_read_placed_segment_stored_bytes_for_pg_route_snapshot_into(&route, req, dst)?
+            self.try_read_placed_segment_stored_bytes_for_pg_route_snapshot_into(
+                &route, req, dst, None,
+            )?
         };
         match found {
             true => Ok(()),
+            false => {
+                dst.clear();
+                Err(StoreError::NotFound)
+            }
+        }
+    }
+
+    fn read_retained_segment_payload_stored_bytes_at_placement_epoch_into(
+        &self,
+        placement_cluster_epoch: ClusterEpoch,
+        req: SegmentStoredBytesRequest,
+        dst: &mut Vec<u8>,
+        repair_fence: Option<&RetainedActiveRouteRepairFence>,
+    ) -> Result<(), StoreError> {
+        self.require_current_payload_operation_epoch(req.data_pg_id)?;
+        let data_pg = self.validated_data_pg(PgId::new(req.data_pg_id))?;
+        let route =
+            self.reconstructed_pg_route_at_epoch(data_pg.pg_id(), placement_cluster_epoch)?;
+        let mut repair_targets = Vec::new();
+        match self.try_read_placed_segment_stored_bytes_for_pg_route_snapshot_into(
+            &route,
+            req,
+            dst,
+            Some(&mut repair_targets),
+        )? {
+            true => {
+                let Some(repair_fence) = repair_fence else {
+                    return Ok(());
+                };
+                if !self.local_map.route_map_lease_snapshot_is_valid_at(
+                    repair_fence.admitted_lease,
+                    crate::clock::monotonic_time_millis(),
+                ) {
+                    return Ok(());
+                }
+                let Some(_permit) = repair_fence
+                    .gate
+                    .acquire_for_publication_generation(repair_fence.publication_generation)
+                else {
+                    return Ok(());
+                };
+                for shard_index in repair_targets {
+                    if !self.local_map.route_map_lease_snapshot_is_valid_at(
+                        repair_fence.admitted_lease,
+                        crate::clock::monotonic_time_millis(),
+                    ) {
+                        break;
+                    }
+                    self.schedule_placed_segment_shard_repair(req, shard_index)?;
+                }
+                Ok(())
+            }
             false => {
                 dst.clear();
                 Err(StoreError::NotFound)
@@ -13135,6 +13527,7 @@ impl StorageCluster {
                 source_route,
                 req,
                 &mut segment,
+                None,
             )? {
                 return Err(StoreError::NotFound);
             }
@@ -13583,6 +13976,7 @@ impl StorageCluster {
         route: &PgRouteSnapshot,
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
+        mut repair_targets: Option<&mut Vec<ShardIndex>>,
     ) -> Result<bool, StoreError> {
         let ec_config = validate_placed_segment_repair_ec_shape(req.ec)?;
         let k = usize::from(req.ec.k);
@@ -13614,6 +14008,7 @@ impl StorageCluster {
                 shard_size,
                 &mut all_shards,
                 &mut present_count,
+                repair_targets.as_deref_mut(),
             )?;
         }
 
@@ -13632,6 +14027,7 @@ impl StorageCluster {
                     shard_size,
                     &mut all_shards,
                     &mut present_count,
+                    repair_targets.as_deref_mut(),
                 )?;
             }
         }
@@ -14014,7 +14410,18 @@ impl StorageCluster {
         shard_size: usize,
         all_shards: &mut [Option<Vec<u8>>],
         present_count: &mut usize,
+        repair_targets: Option<&mut Vec<ShardIndex>>,
     ) -> Result<(), StoreError> {
+        fn record_repair_target(targets: Option<&mut Vec<ShardIndex>>, shard_index: usize) {
+            let Some(targets) = targets else {
+                return;
+            };
+            let shard_index = ShardIndex::new(shard_index as u8);
+            if !targets.contains(&shard_index) {
+                targets.push(shard_index);
+            }
+        }
+
         let Some(location) = locations.get(shard_index).copied() else {
             return Ok(());
         };
@@ -14023,10 +14430,21 @@ impl StorageCluster {
             .load_payload_shard_ack_for_pg_route_snapshot(route, data_pg_id, &shard_key)
         {
             Ok(ack) => ack,
-            Err(StoreError::NotFound) => return Ok(()),
+            Err(StoreError::NotFound) => {
+                record_repair_target(repair_targets, shard_index);
+                return Ok(());
+            }
             Err(error) => return Err(error),
         };
         if ack.stored_size != shard_size as u64 {
+            record_repair_target(repair_targets, shard_index);
+            return Ok(());
+        }
+        if let Err(error) =
+            self.maybe_run_before_placed_payload_shard_read_hook(location, &shard_key)
+        {
+            placed_segment_recoverable_shard_error(error)?;
+            record_repair_target(repair_targets, shard_index);
             return Ok(());
         }
         match self.read_payload_shard_for_historical_inspection(location, &shard_key, ack) {
@@ -14036,6 +14454,7 @@ impl StorageCluster {
             }
             Err(error) => {
                 placed_segment_recoverable_shard_error(error)?;
+                record_repair_target(repair_targets, shard_index);
             }
         }
         Ok(())
@@ -14169,6 +14588,23 @@ impl StorageCluster {
         let data_pg_id = self.validated_data_pg(PgId::new(data_pg_id))?;
         let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
         self.place_payload_shards(data_pg_id, ec, &placement_key)
+            .map_err(cluster_build_error_to_store)
+    }
+
+    fn segment_payload_shard_locations_at_placement_epoch(
+        &self,
+        placement_cluster_epoch: ClusterEpoch,
+        request: &SegmentStoredBytesRequest,
+    ) -> Result<Vec<ShardLocation>, StoreError> {
+        if placement_cluster_epoch == self.operation_epoch() {
+            return self.segment_payload_locations(request);
+        }
+        let data_pg = self.validated_data_pg(PgId::new(request.data_pg_id))?;
+        let route =
+            self.reconstructed_pg_route_at_epoch(data_pg.pg_id(), placement_cluster_epoch)?;
+        let placement_key =
+            segment_payload_placement_key(&request.segment_okh, request.segment_vid);
+        self.place_payload_shards_for_pg_route_snapshot(&route, data_pg, request.ec, &placement_key)
             .map_err(cluster_build_error_to_store)
     }
 
@@ -15356,11 +15792,13 @@ fn is_recoverable_remote_shard_read_error(
     operation: &'static str,
     code: StorageRpcErrorCode,
 ) -> bool {
-    matches!(operation, "shard read" | "shard read range")
-        && matches!(
-            code,
-            StorageRpcErrorCode::NotFound | StorageRpcErrorCode::ShardIntegrity
-        )
+    matches!(
+        operation,
+        "shard read" | "shard read range" | "shard historical read"
+    ) && matches!(
+        code,
+        StorageRpcErrorCode::NotFound | StorageRpcErrorCode::ShardIntegrity
+    )
 }
 
 fn is_recoverable_physical_shard_io_error(context: &'static str, kind: std::io::ErrorKind) -> bool {
@@ -15693,26 +16131,28 @@ mod reissue_decision_tests {
 
     #[test]
     fn placed_segment_read_recovers_remote_shard_read_damage_errors() {
-        for (code, message) in [
-            (StorageRpcErrorCode::NotFound, "not found".to_string()),
-            (
-                StorageRpcErrorCode::ShardIntegrity,
-                "remote shard integrity failure".to_string(),
-            ),
-        ] {
-            let error = ShardIoError::Store {
-                node_id: 5,
-                pg_id: 13,
-                cluster_epoch: ClusterEpoch::INITIAL,
-                source: StoreError::StorageRpc {
+        for operation in ["shard read", "shard read range", "shard historical read"] {
+            for (code, message) in [
+                (StorageRpcErrorCode::NotFound, "not found".to_string()),
+                (
+                    StorageRpcErrorCode::ShardIntegrity,
+                    "remote shard integrity failure".to_string(),
+                ),
+            ] {
+                let error = ShardIoError::Store {
                     node_id: 5,
-                    operation: "shard read",
-                    code,
-                    message,
-                },
-            };
+                    pg_id: 13,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    source: StoreError::StorageRpc {
+                        node_id: 5,
+                        operation,
+                        code,
+                        message,
+                    },
+                };
 
-            placed_segment_recoverable_shard_error(error).unwrap();
+                placed_segment_recoverable_shard_error(error).unwrap();
+            }
         }
     }
 

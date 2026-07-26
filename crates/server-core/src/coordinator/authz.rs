@@ -190,6 +190,7 @@ struct AuthorizedObjectReadSnapshotRequest<'a> {
 }
 
 enum ObjectReadSnapshotRoute<'a> {
+    #[cfg(test)]
     Raw {
         storage_node: &'a Arc<StorageCluster>,
         bucket: &'a BucketName,
@@ -197,30 +198,65 @@ enum ObjectReadSnapshotRoute<'a> {
         version_id: Option<VersionId>,
         snapshot_mode: ObjectReadSnapshotMode,
     },
-    Admitted(storage::ActiveObjectReadRoute<'a>),
+    Admitted {
+        route: storage::ActiveObjectReadRoute<'a>,
+        retain_payload: bool,
+    },
+}
+
+struct RoutedObjectReadSnapshotOutcome<T> {
+    value: T,
+    snapshot: Arc<storage::ObjectReadSnapshot>,
+    payload_handoff: Option<storage::LeasedObjectReadSnapshot>,
 }
 
 impl ObjectReadSnapshotRoute<'_> {
     fn load<T, E>(
         &self,
         action: impl FnMut(&StoredObject) -> Result<T, E>,
-    ) -> Result<Result<storage::ObjectReadSnapshotOutcome<T>, E>, storage::ObjectPgActionError>
-    {
+    ) -> Result<Result<RoutedObjectReadSnapshotOutcome<T>, E>, storage::ObjectPgActionError> {
         match self {
+            #[cfg(test)]
             Self::Raw {
                 storage_node,
                 bucket,
                 key,
                 version_id,
                 snapshot_mode,
-            } => storage_node.load_object_read_snapshot_if(
-                bucket,
-                key,
-                *version_id,
-                *snapshot_mode,
-                action,
-            ),
-            Self::Admitted(route) => route.load_object_read_snapshot_if(action),
+            } => storage_node
+                .load_object_read_snapshot_if(bucket, key, *version_id, *snapshot_mode, action)
+                .map(|outcome| {
+                    outcome.map(|outcome| RoutedObjectReadSnapshotOutcome {
+                        value: outcome.value,
+                        snapshot: Arc::new(outcome.snapshot),
+                        payload_handoff: None,
+                    })
+                }),
+            Self::Admitted {
+                route,
+                retain_payload: true,
+            } => route
+                .load_leased_object_read_snapshot_if(action)
+                .map(|outcome| {
+                    outcome.map(|outcome| {
+                        let (value, snapshot, payload_handoff) = outcome.into_parts();
+                        RoutedObjectReadSnapshotOutcome {
+                            value,
+                            snapshot,
+                            payload_handoff: Some(payload_handoff),
+                        }
+                    })
+                }),
+            Self::Admitted {
+                route,
+                retain_payload: false,
+            } => route.load_object_read_snapshot_if(action).map(|outcome| {
+                outcome.map(|outcome| RoutedObjectReadSnapshotOutcome {
+                    value: outcome.value,
+                    snapshot: Arc::new(outcome.snapshot),
+                    payload_handoff: None,
+                })
+            }),
         }
     }
 
@@ -234,7 +270,7 @@ impl ObjectReadSnapshotRoute<'_> {
                 version_id: _,
                 snapshot_mode: _,
             } => storage_node.try_probe_object_pg_available(bucket, key),
-            Self::Admitted(route) => route.try_probe_object_pg_available(),
+            Self::Admitted { route, .. } => route.try_probe_object_pg_available(),
         }
     }
 }
@@ -326,14 +362,18 @@ impl Coordinator {
         &self,
         req: &UploadPartCopyRequest<'_>,
     ) -> Result<AuthorizedUploadPartCopy, ServerError> {
-        self.authorize_upload_part_copy_with_storage_node(&self.storage_node(), req)
+        let admission = self.admit_storage_route_for_request()?;
+        let storage_node = self.storage_node();
+        self.authorize_upload_part_copy_on_admitted_route(&admission, &storage_node, req)
     }
 
-    pub(in crate::coordinator) fn authorize_upload_part_copy_with_storage_node(
+    pub(in crate::coordinator) fn authorize_upload_part_copy_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         storage_node: &Arc<StorageCluster>,
         req: &UploadPartCopyRequest<'_>,
     ) -> Result<AuthorizedUploadPartCopy, ServerError> {
+        self.require_storage_route_admission(admission)?;
         let dst_bucket_handle = self.load_bucket_handle_for_object_policy_read_with_storage_node(
             storage_node,
             req.upload.bucket_name_typed(),
@@ -341,11 +381,15 @@ impl Coordinator {
         )?;
         match ObjectAuthLoadedBucketHandle::classify(&dst_bucket_handle) {
             ObjectAuthLoadedBucketHandle::Boe(dst_bucket_handle) => {
-                self.authorize_upload_part_copy_boe(storage_node, req, dst_bucket_handle)
+                self.authorize_upload_part_copy_boe(storage_node, admission, req, dst_bucket_handle)
             }
-            ObjectAuthLoadedBucketHandle::NonBoe(dst_bucket_handle) => {
-                self.authorize_upload_part_copy_non_boe(storage_node, req, dst_bucket_handle)
-            }
+            ObjectAuthLoadedBucketHandle::NonBoe(dst_bucket_handle) => self
+                .authorize_upload_part_copy_non_boe(
+                    storage_node,
+                    admission,
+                    req,
+                    dst_bucket_handle,
+                ),
         }
     }
 
@@ -402,6 +446,7 @@ impl Coordinator {
         )
     }
 
+    #[cfg(test)]
     fn authorize_object_read_snapshot_with_storage_node(
         &self,
         storage_node: &Arc<StorageCluster>,
@@ -409,8 +454,9 @@ impl Coordinator {
     ) -> Result<
         (
             BucketSummary,
-            storage::ObjectReadSnapshot,
+            Arc<storage::ObjectReadSnapshot>,
             ObjectAttributePermissions,
+            Option<storage::LeasedObjectReadSnapshot>,
         ),
         ServerError,
     > {
@@ -443,8 +489,9 @@ impl Coordinator {
     ) -> Result<
         (
             BucketSummary,
-            storage::ObjectReadSnapshot,
+            Arc<storage::ObjectReadSnapshot>,
             ObjectAttributePermissions,
+            Option<storage::LeasedObjectReadSnapshot>,
         ),
         ServerError,
     > {
@@ -454,11 +501,12 @@ impl Coordinator {
             req.bucket,
             req.expected_bucket_owner,
         )?;
-        let route = ObjectReadSnapshotRoute::Admitted(
-            admission
+        let route = ObjectReadSnapshotRoute::Admitted {
+            route: admission
                 .active_object_read_route(req.bucket, req.key, req.version_id, req.snapshot_mode)
                 .map_err(super::map_store_error)?,
-        );
+            retain_payload: req.snapshot_mode == ObjectReadSnapshotMode::FullPayloadLayout,
+        };
         match ObjectAuthLoadedBucketHandle::classify(&bucket) {
             ObjectAuthLoadedBucketHandle::Boe(bucket) => {
                 self.authorize_object_read_snapshot_boe(&route, req, bucket)
@@ -469,22 +517,34 @@ impl Coordinator {
         }
     }
 
-    fn authorize_copy_source_read_snapshot_with_storage_node(
+    fn authorize_copy_source_read_snapshot(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: CopySourceReadSnapshotRequest<'_>,
     ) -> Result<AuthorizedCopySourceRead, ServerError> {
-        let bucket = self.load_bucket_handle_for_object_policy_read_with_storage_node(
-            storage_node,
+        self.require_storage_route_admission(admission)?;
+        let bucket = self.load_bucket_handle_for_modern_object_read_on_admitted_route(
+            admission,
             req.bucket,
             req.expected_bucket_owner,
         )?;
+        let route = ObjectReadSnapshotRoute::Admitted {
+            route: admission
+                .active_object_read_route(
+                    req.bucket,
+                    req.key,
+                    req.version_id,
+                    ObjectReadSnapshotMode::FullPayloadLayout,
+                )
+                .map_err(super::map_store_error)?,
+            retain_payload: true,
+        };
         match ObjectAuthLoadedBucketHandle::classify(&bucket) {
             ObjectAuthLoadedBucketHandle::Boe(bucket) => {
-                self.authorize_copy_source_read_snapshot_boe(storage_node, req, bucket)
+                self.authorize_copy_source_read_snapshot_boe(&route, req, bucket)
             }
             ObjectAuthLoadedBucketHandle::NonBoe(bucket) => {
-                self.authorize_copy_source_read_snapshot_non_boe(storage_node, req, bucket)
+                self.authorize_copy_source_read_snapshot_non_boe(&route, req, bucket)
             }
         }
     }
@@ -1793,6 +1853,7 @@ impl Coordinator {
         )
     }
 
+    #[cfg(test)]
     fn load_bucket_handle_for_modern_object_read_with_storage_node(
         &self,
         storage_node: &Arc<StorageCluster>,

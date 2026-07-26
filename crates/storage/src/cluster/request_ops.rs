@@ -8445,10 +8445,27 @@ impl super::StorageCluster {
         key: &ObjectKey,
         version_id: Option<VersionId>,
         snapshot_mode: ObjectReadSnapshotMode,
-        mut action: impl FnMut(&StoredObject) -> Result<T, E>,
+        action: impl FnMut(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<super::LeasedObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
-        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let route = super::ObjectReadMetadataRoute {
+            bucket,
+            key,
+            version_id,
+            snapshot_mode,
+            pg_id: self.object_metadata_pg(bucket, key),
+        };
+        self.load_leased_object_read_snapshot_if_on_route(&route, action, || Ok(()))
+    }
+
+    pub(super) fn load_leased_object_read_snapshot_if_on_route<T, E>(
+        self: &Arc<Self>,
+        route: &super::ObjectReadMetadataRoute<'_>,
+        mut action: impl FnMut(&StoredObject) -> Result<T, E>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<Result<super::LeasedObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
+        let object_pg_id = route.pg_id;
         let pg_id = object_pg_id.pg_id();
+        require_valid_route()?;
         let object_read_client = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
@@ -8462,18 +8479,21 @@ impl super::StorageCluster {
             work_budget
                 .check("load leased object read snapshot stale retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
+            require_valid_route()?;
             let subject = object_read_client.load_object_read_auth_subject(
                 object_pg_id,
-                bucket,
-                key,
-                version_id,
+                route.bucket,
+                route.key,
+                route.version_id,
             )?;
             let value = match action(&subject.stored) {
                 Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
             };
             let payload_lease = if let Some(live) = subject.stored.as_live() {
-                match self.acquire_object_payload_lease(bucket, key, live.generation_id) {
+                require_valid_route()?;
+                match self.acquire_object_payload_lease(route.bucket, route.key, live.generation_id)
+                {
                     Ok(lease) => Some(lease),
                     Err(StoreError::NotFound) => {
                         work_budget
@@ -8488,19 +8508,30 @@ impl super::StorageCluster {
             } else {
                 None
             };
+            require_valid_route()?;
             match object_read_client.load_object_read_snapshot_for_subject(
                 object_pg_id,
-                bucket,
-                key,
-                version_id,
+                route.bucket,
+                route.key,
+                route.version_id,
                 &subject.identity,
-                snapshot_mode,
+                route.snapshot_mode,
             ) {
                 Ok(snapshot) => {
+                    require_valid_route()?;
                     return Ok(Ok(super::LeasedObjectReadSnapshotOutcome {
                         value,
-                        snapshot,
-                        payload_lease,
+                        leased_snapshot: super::LeasedObjectReadSnapshot {
+                            cluster: Arc::clone(self),
+                            bucket: route.bucket.clone(),
+                            key: route.key.clone(),
+                            version_id: route.version_id,
+                            snapshot_mode: route.snapshot_mode,
+                            pg_id: route.pg_id,
+                            snapshot: Arc::new(snapshot),
+                            payload_lease,
+                            repair_fence: None,
+                        },
                     }));
                 }
                 Err(ObjectPgActionError::StaleObjectReadSubject) => {

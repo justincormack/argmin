@@ -228,6 +228,7 @@ impl Coordinator {
     pub(super) fn authorize_upload_part_copy_boe(
         &self,
         storage_node: &Arc<storage::StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &UploadPartCopyRequest<'_>,
         dst_bucket_handle: BoeLoadedBucketHandle<'_>,
     ) -> Result<AuthorizedUploadPartCopy, ServerError> {
@@ -276,8 +277,8 @@ impl Coordinator {
             SseCustomerSegmentScope::multipart_part(part_number)?,
             true,
         )?;
-        let source = self.authorize_copy_source_read_snapshot_with_storage_node(
-            storage_node,
+        let source = self.authorize_copy_source_read_snapshot(
+            admission,
             CopySourceReadSnapshotRequest {
                 requester,
                 bucket: &req.source.bucket,
@@ -501,7 +502,7 @@ impl Coordinator {
 
     pub(super) fn authorize_copy_source_read_snapshot_boe(
         &self,
-        storage_node: &Arc<storage::StorageCluster>,
+        route: &ObjectReadSnapshotRoute<'_>,
         req: CopySourceReadSnapshotRequest<'_>,
         bucket: BoeLoadedBucketHandle<'_>,
     ) -> Result<AuthorizedCopySourceRead, ServerError> {
@@ -527,32 +528,26 @@ impl Coordinator {
                 req.key.as_str(),
                 req.version_id,
             )?;
-        let outcome = storage_node
-            .load_leased_object_read_snapshot_if(
-                &bucket.bucket().name,
-                req.key,
-                req.version_id,
-                ObjectReadSnapshotMode::FullPayloadLayout,
-                |stored| {
-                    let allowed = matches!(
-                        copy_source_read_authorization_with_bucket_policy(
-                            req.requester,
-                            modern_bucket,
-                            modern_bucket_tags,
-                            stored,
-                            req.policy_action,
-                            req.existing_object_tags_mode,
-                            bucket_policy.as_deref(),
-                        )?,
-                        ModernObjectReadAuthorization::Allowed
-                    );
-                    if allowed {
-                        Ok(())
-                    } else {
-                        Err(ServerError::AccessDenied)
-                    }
-                },
-            )
+        let outcome = route
+            .load(|stored| {
+                let allowed = matches!(
+                    copy_source_read_authorization_with_bucket_policy(
+                        req.requester,
+                        modern_bucket,
+                        modern_bucket_tags,
+                        stored,
+                        req.policy_action,
+                        req.existing_object_tags_mode,
+                        bucket_policy.as_deref(),
+                    )?,
+                    ModernObjectReadAuthorization::Allowed
+                );
+                if allowed {
+                    Ok(())
+                } else {
+                    Err(ServerError::AccessDenied)
+                }
+            })
             .map_err(|error| {
                 Self::map_object_read_snapshot_error(
                     &bucket.bucket().name,
@@ -562,9 +557,15 @@ impl Coordinator {
                     error,
                 )
             })??;
+        let payload_handoff =
+            outcome
+                .payload_handoff
+                .ok_or_else(|| ServerError::InternalError {
+                    reason: "copy source snapshot lacks leased payload handoff".to_string(),
+                })?;
         Ok(AuthorizedCopySourceRead {
             snapshot: outcome.snapshot,
-            payload_lease: outcome.payload_lease,
+            payload_handoff,
         })
     }
 
@@ -576,8 +577,9 @@ impl Coordinator {
     ) -> Result<
         (
             BucketSummary,
-            storage::ObjectReadSnapshot,
+            Arc<storage::ObjectReadSnapshot>,
             ObjectAttributePermissions,
+            Option<storage::LeasedObjectReadSnapshot>,
         ),
         ServerError,
     > {
@@ -656,7 +658,12 @@ impl Coordinator {
                     error,
                 )
             })??;
-        Ok((bucket_summary, outcome.snapshot, outcome.value))
+        Ok((
+            bucket_summary,
+            outcome.snapshot,
+            outcome.value,
+            outcome.payload_handoff,
+        ))
     }
 
     pub(super) fn authorize_delete_object_impl_boe(

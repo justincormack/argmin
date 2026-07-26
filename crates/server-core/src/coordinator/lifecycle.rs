@@ -116,32 +116,6 @@ impl Coordinator {
         }
     }
 
-    pub(super) fn current_object_lifecycle_expiration_with_storage_node(
-        &self,
-        storage_node: &Arc<StorageCluster>,
-        bucket: &BucketSummary,
-        key: &str,
-        tags_xml: Option<&str>,
-        size: u64,
-        last_modified: u64,
-    ) -> Result<Option<LifecycleExpirationHeader>, ServerError> {
-        let Some(config) = self.cached_bucket_lifecycle_with_storage_node(storage_node, bucket)?
-        else {
-            return Ok(None);
-        };
-        let tags = match tags_xml {
-            Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
-            None => Vec::new(),
-        };
-        Ok(Self::evaluate_current_object_lifecycle_expiration(
-            &config,
-            key,
-            &tags,
-            size,
-            last_modified,
-        ))
-    }
-
     pub(super) fn current_object_lifecycle_expiration_on_admitted_route(
         &self,
         admission: &storage::StorageClusterRouteAdmission,

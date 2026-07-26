@@ -1,5 +1,6 @@
-use checksum::MultipartChecksumConfig;
 use std::sync::Arc;
+
+use checksum::MultipartChecksumConfig;
 use storage::{
     BucketName, ObjectEncryption, ObjectKey, ObjectLayout, SerializedTagSet, StoredObject,
 };
@@ -33,6 +34,15 @@ fn copy_source_response_version_id(
 }
 
 impl Coordinator {
+    fn take_authorized_copy_source_snapshot(
+        snapshot: Arc<storage::ObjectReadSnapshot>,
+    ) -> Result<storage::ObjectReadSnapshot, ServerError> {
+        Arc::try_unwrap(snapshot).map_err(|_| ServerError::InternalError {
+            reason: "authorized copy-source snapshot remains shared after payload handoff"
+                .to_string(),
+        })
+    }
+
     fn copy_source_snapshot_to_read_handle(
         &self,
         bucket: &BucketName,
@@ -170,6 +180,15 @@ impl Coordinator {
     /// and metadata directive (COPY preserves source metadata, REPLACE
     /// uses new headers).
     pub fn copy_object(&self, req: &CopyObjectRequest) -> Result<CopyObjectResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.copy_object_on_admitted_route(&admission, req)
+    }
+
+    pub fn copy_object_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &CopyObjectRequest,
+    ) -> Result<CopyObjectResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::copy_object",
@@ -188,8 +207,8 @@ impl Coordinator {
         let dst_cond = req.dst_condition;
         let directive = &req.directive;
         let source_sse_customer = req.source_sse_customer;
+        self.require_storage_route_admission(admission)?;
         let storage_node = self.storage_node();
-        let read_runtime = self.read_runtime_for_storage_node(Arc::clone(&storage_node));
         let dst_explicit_sse_customer = self.prepare_sse_customer_write_context(
             req.destination_encryption.sse_customer_request(),
         )?;
@@ -199,11 +218,11 @@ impl Coordinator {
         let AuthorizedCopyObject {
             source: source_snapshot,
             destination: dst_authorized,
-        } = self.authorize_copy_object_with_storage_node(&storage_node, req)?;
+        } = self.authorize_copy_object_on_admitted_route(admission, &storage_node, req)?;
 
         let AuthorizedCopySourceRead {
             snapshot: source_snapshot,
-            payload_lease: source_payload_lease,
+            payload_handoff: source_payload_handoff,
         } = source_snapshot;
         let (src_metadata, src_system_metadata, src_tags, copy_source_version_id, mut source_body) = {
             let src_stored = source_snapshot.stored.clone();
@@ -265,16 +284,21 @@ impl Coordinator {
                 });
             }
 
+            let retained = storage_node
+                .retain_object_payload_read(source_payload_handoff)
+                .map_err(super::map_store_error)?
+                .ok_or_else(|| ServerError::InternalError {
+                    reason: "live copy source did not produce retained payload authority"
+                        .to_string(),
+                })?;
+            let source_snapshot = Self::take_authorized_copy_source_snapshot(source_snapshot)?;
             let body = self.copy_source_snapshot_to_read_handle(
                 &req.source.bucket,
                 &req.source.key,
-                read_runtime,
+                self.read_runtime_for_retained_payload_read(retained),
                 source_snapshot,
                 source_sse_customer,
             )?;
-            // The broad lease must outlive acquisition of the read handle's
-            // shard-specific lease, closing the snapshot-to-reader reclaim gap.
-            drop(source_payload_lease);
 
             let src_metadata = Self::deserialize_user_metadata(src_record.metadata_blob.as_ref())?;
             let src_system_metadata = self.deserialize_visible_system_metadata(
@@ -424,6 +448,15 @@ impl Coordinator {
         &self,
         req: &UploadPartCopyRequest,
     ) -> Result<UploadPartCopyResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.upload_part_copy_on_admitted_route(&admission, req)
+    }
+
+    pub fn upload_part_copy_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &UploadPartCopyRequest,
+    ) -> Result<UploadPartCopyResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::upload_part_copy",
@@ -442,16 +475,16 @@ impl Coordinator {
         let src_cond = req.source.condition;
         let copy_source_range = req.copy_source_range;
         let source_sse_customer = req.source_sse_customer;
+        self.require_storage_route_admission(admission)?;
         let storage_node = self.storage_node();
-        let read_runtime = self.read_runtime_for_storage_node(Arc::clone(&storage_node));
         let AuthorizedUploadPartCopy {
             source,
             destination,
-        } = self.authorize_upload_part_copy_with_storage_node(&storage_node, req)?;
+        } = self.authorize_upload_part_copy_on_admitted_route(admission, &storage_node, req)?;
 
         let AuthorizedCopySourceRead {
             snapshot: source,
-            payload_lease: source_payload_lease,
+            payload_handoff: source_payload_handoff,
         } = source;
 
         let (copy_source_version_id, mut source_body) = {
@@ -503,17 +536,22 @@ impl Coordinator {
                 });
             }
 
+            let retained = storage_node
+                .retain_object_payload_read(source_payload_handoff)
+                .map_err(super::map_store_error)?
+                .ok_or_else(|| ServerError::InternalError {
+                    reason: "live copy source did not produce retained payload authority"
+                        .to_string(),
+                })?;
+            let source = Self::take_authorized_copy_source_snapshot(source)?;
             let body = self.copy_source_snapshot_to_range_read_handle(
                 &req.source.bucket,
                 &req.source.key,
-                read_runtime,
+                self.read_runtime_for_retained_payload_read(retained),
                 source,
                 (read_start as usize, read_end as usize),
                 source_sse_customer,
             )?;
-            // Hand off from the broad snapshot lease only after the range read
-            // handle has acquired its shard-specific lease.
-            drop(source_payload_lease);
             (
                 copy_source_response_version_id(src_version_id, src_record.version_id),
                 body,

@@ -15,8 +15,8 @@ use s3_types::{
 use storage::BucketObjectOwnership;
 use storage::{
     AuthorizedMultipartUploadRecord, BucketAclSummary, BucketEncryptionConfig, BucketName,
-    BucketObjectLockConfig, BucketOwnershipControls, EffectiveBucketEncryptionConfig, ObjectKey,
-    ObjectLockState, ObjectPayloadLease, ObjectReadSnapshot, OwnerIdentity,
+    BucketObjectLockConfig, BucketOwnershipControls, EffectiveBucketEncryptionConfig,
+    LeasedObjectReadSnapshot, ObjectKey, ObjectLockState, ObjectReadSnapshot, OwnerIdentity,
     PublicAccessBlockConfig, UploadId,
 };
 
@@ -216,8 +216,9 @@ pub(super) struct AuthorizedPutBucketAcl {
 
 pub(super) struct AuthorizedObjectRead {
     pub(super) bucket: BucketSummary,
-    pub(super) snapshot: ObjectReadSnapshot,
+    pub(super) snapshot: Arc<ObjectReadSnapshot>,
     pub(super) attribute_permissions: ObjectAttributePermissions,
+    pub(super) payload_handoff: Option<LeasedObjectReadSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -262,8 +263,8 @@ impl ObjectAttributePermissions {
 }
 
 pub(super) struct AuthorizedCopySourceRead {
-    pub(super) snapshot: ObjectReadSnapshot,
-    pub(super) payload_lease: Option<ObjectPayloadLease>,
+    pub(super) snapshot: Arc<ObjectReadSnapshot>,
+    pub(super) payload_handoff: LeasedObjectReadSnapshot,
 }
 
 pub(super) struct AuthorizedCopyObject {

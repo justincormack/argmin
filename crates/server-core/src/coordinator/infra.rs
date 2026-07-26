@@ -676,7 +676,9 @@ impl Coordinator {
         let payload_buffer_pool =
             PayloadBufferPool::new(storage_cluster.default_payload_ec_shape());
         let read_runtime = ReadRuntime {
-            storage_node: Arc::clone(&background_storage_cluster),
+            storage: super::read_core::ReadStorage::Cluster(Arc::clone(
+                &background_storage_cluster,
+            )),
             #[cfg(test)]
             pg_topology: pg_topology.clone(),
             payload_buffer_pool: Arc::clone(&payload_buffer_pool),
@@ -728,9 +730,24 @@ impl Coordinator {
         storage_node: Arc<StorageCluster>,
     ) -> ReadRuntime {
         ReadRuntime {
-            storage_node: Arc::clone(&storage_node),
+            storage: super::read_core::ReadStorage::Cluster(Arc::clone(&storage_node)),
             #[cfg(test)]
             pg_topology: PgTopology::new(storage_node.test_pg_ids())
+                .expect("coordinator storage node should expose a valid PG topology"),
+            payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
+            sse_c_validator: self.sse_c_validator.clone(),
+            managed_key_provider: self.managed_key_provider.clone(),
+        }
+    }
+
+    pub(super) fn read_runtime_for_retained_payload_read(
+        &self,
+        retained_payload_read: storage::RetainedObjectPayloadRead,
+    ) -> ReadRuntime {
+        ReadRuntime {
+            storage: super::read_core::ReadStorage::Retained(Arc::new(retained_payload_read)),
+            #[cfg(test)]
+            pg_topology: PgTopology::new(self.storage_node().test_pg_ids())
                 .expect("coordinator storage node should expose a valid PG topology"),
             payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
             sse_c_validator: self.sse_c_validator.clone(),

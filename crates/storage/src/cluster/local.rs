@@ -3058,38 +3058,27 @@ impl LocalClusterMap {
     ) -> Result<Vec<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError> {
         let mut node_ids = BTreeMap::new();
         for location in locations {
-            if location.cluster_epoch() != self.epoch {
-                return Err(StoreError::StaleMetadataOperation {
+            let route = self
+                .reconstructed_pg_route_at_epoch(
+                    location.data_pg_id().pg_id(),
+                    location.cluster_epoch(),
+                )
+                .ok_or(StoreError::ClusterPgNotFound {
                     pg_id: location.data_pg_id().get(),
-                    operation_epoch: location.cluster_epoch(),
-                    current_epoch: self.epoch,
-                });
-            }
-            let route = self.pg_routes.get(&location.data_pg_id().pg_id()).ok_or(
-                StoreError::ClusterPgNotFound {
-                    pg_id: location.data_pg_id().get(),
-                    cluster_epoch: self.epoch,
-                },
-            )?;
-            if route.cluster_epoch() != self.epoch {
-                return Err(StoreError::StaleMetadataRoute {
-                    pg_id: location.data_pg_id().get(),
-                    route_epoch: route.cluster_epoch(),
-                    current_epoch: self.epoch,
-                });
-            }
-            if !route.is_active() {
+                    cluster_epoch: location.cluster_epoch(),
+                })?;
+            if route.state() != PgState::Active {
                 return Err(StoreError::PgNotActive {
                     pg_id: location.data_pg_id().get(),
-                    cluster_epoch: self.epoch,
+                    cluster_epoch: location.cluster_epoch(),
                     state: route.state(),
                 });
             }
-            if !route.contains_node(location.node_id()) {
+            if !route.acting_set().contains(&location.node_id()) {
                 return Err(StoreError::NodeNotInActingSet {
                     node_id: location.node_id().as_u32(),
                     pg_id: location.data_pg_id().get(),
-                    cluster_epoch: self.epoch,
+                    cluster_epoch: location.cluster_epoch(),
                 });
             }
             node_ids

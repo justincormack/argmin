@@ -17,7 +17,7 @@ use storage::{
 };
 
 use super::payload::SharedPayloadBuffer;
-use super::read_core::{PayloadLease, ReadRuntime, SegmentPayloadRecord};
+use super::read_core::{PayloadLease, ReadRuntime, ReadStorage, SegmentPayloadRecord};
 #[cfg(test)]
 use super::test_hooks::{
     maybe_run_after_reclaim_work_dequeued_hook, maybe_run_before_reclaim_work_execute_hook,
@@ -1139,15 +1139,17 @@ impl ReclaimSweeper {
                                     root,
                                 );
                             } else {
-                                match current_runtime.storage_node.begin_bucket_delete_if_current(
-                                    &root.bucket,
-                                    storage::cluster::BucketIdentityGenerations {
-                                        bucket_execution_generation: root
-                                            .bucket_execution_generation,
-                                        bucket_incarnation_generation: root
-                                            .bucket_incarnation_generation,
-                                    },
-                                ) {
+                                match current_runtime
+                                    .storage_node()
+                                    .begin_bucket_delete_if_current(
+                                        &root.bucket,
+                                        storage::cluster::BucketIdentityGenerations {
+                                            bucket_execution_generation: root
+                                                .bucket_execution_generation,
+                                            bucket_incarnation_generation: root
+                                                .bucket_incarnation_generation,
+                                        },
+                                    ) {
                                     Ok(()) => {
                                         bucket_delete_begin_retry_after.remove(&root);
                                         queue_owner.enqueue_bucket_delete_finalize(
@@ -1160,7 +1162,7 @@ impl ReclaimSweeper {
                                     }
                                     Err(error) => {
                                         if bucket_delete_begin_root_is_stale(
-                                            &current_runtime.storage_node,
+                                            current_runtime.storage_node(),
                                             &root,
                                         ) {
                                             bucket_delete_begin_retry_after.remove(&root);
@@ -2393,9 +2395,18 @@ impl StreamSessionSweeper {
 }
 
 impl ReadRuntime {
+    pub(super) fn storage_node(&self) -> &Arc<StorageCluster> {
+        match &self.storage {
+            ReadStorage::Cluster(storage_node) => storage_node,
+            ReadStorage::Retained(_) => {
+                panic!("raw storage operations require a cluster-backed read runtime")
+            }
+        }
+    }
+
     fn with_storage_node(&self, storage_node: Arc<StorageCluster>) -> Self {
         Self {
-            storage_node: Arc::clone(&storage_node),
+            storage: ReadStorage::Cluster(Arc::clone(&storage_node)),
             #[cfg(test)]
             pg_topology: PgTopology::new(storage_node.test_pg_ids())
                 .expect("coordinator storage node should expose a valid PG topology"),
@@ -2433,7 +2444,7 @@ impl ReadRuntime {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) {
-        self.storage_node
+        self.storage_node()
             .enqueue_object_payload_reclaim(bucket, key, generation_id);
     }
 
@@ -2452,7 +2463,7 @@ impl ReadRuntime {
     }
 
     pub(super) fn enqueue_bucket_delete_finalize_for(&self, root: BucketDeleteFinalizeRoot) {
-        self.storage_node.enqueue_bucket_delete_finalize(root);
+        self.storage_node().enqueue_bucket_delete_finalize(root);
     }
 
     fn lifecycle_config_for_bucket_info(
@@ -2464,7 +2475,7 @@ impl ReadRuntime {
         }
 
         let raw_config = self
-            .storage_node
+            .storage_node()
             .get_bucket_subresource(&bucket_info.name, storage::BucketSubresourceKind::Lifecycle)
             .map_err(Self::map_bucket_snapshot_error)?;
 
@@ -2510,7 +2521,7 @@ impl ReadRuntime {
         let mut processed_buckets: HashSet<(BucketName, u64)> = HashSet::new();
         let claim_now_millis = storage::clock::wall_time_millis();
         let sweep_roots = self
-            .storage_node
+            .storage_node()
             .list_lifecycle_sweep_roots(claim_now_millis)
             .map_err(Coordinator::map_object_pg_action_error)?;
         stats.discovered_roots = sweep_roots.len() as u64;
@@ -2526,7 +2537,7 @@ impl ReadRuntime {
         for root in sweep_roots {
             let claim_now_millis = storage::clock::wall_time_millis();
             let Some(claim) = self
-                .storage_node
+                .storage_node()
                 .acquire_lifecycle_sweep_claim(
                     &root.bucket,
                     root.bucket_incarnation_generation,
@@ -2563,14 +2574,14 @@ impl ReadRuntime {
             );
             if !processed_buckets.insert((root.bucket.clone(), root.bucket_incarnation_generation))
             {
-                self.storage_node
+                self.storage_node()
                     .release_lifecycle_sweep_claim(&claim)
                     .map_err(Coordinator::map_object_pg_action_error)?;
                 stats.released_claims += 1;
                 continue;
             }
             let claim = self
-                .storage_node
+                .storage_node()
                 .heartbeat_lifecycle_sweep_claim(&claim, storage::clock::wall_time_millis())
                 .map_err(Coordinator::map_object_pg_action_error)?;
 
@@ -2579,7 +2590,7 @@ impl ReadRuntime {
                 self.run_claimed_lifecycle_sweep_for_bucket(&claim, now_millis, &mut stats);
             match result {
                 Ok(()) => {
-                    self.storage_node
+                    self.storage_node()
                         .release_lifecycle_sweep_claim(&claim)
                         .map_err(Coordinator::map_object_pg_action_error)?;
                     stats.released_claims += 1;
@@ -2596,7 +2607,7 @@ impl ReadRuntime {
                     stats.failed_claims += 1;
                     let error_context = lifecycle_sweep_error_context(&error);
                     let record_result = self
-                        .storage_node
+                        .storage_node()
                         .record_lifecycle_sweep_claim_error(&claim, &error_context);
                     match record_result {
                         Ok(_) => {
@@ -2659,7 +2670,7 @@ impl ReadRuntime {
         stats: &mut LifecycleSweepStats,
     ) -> Result<(), ServerError> {
         let bucket = &claim.bucket;
-        let bucket_info = match self.storage_node.head_bucket_info(bucket) {
+        let bucket_info = match self.storage_node().head_bucket_info(bucket) {
             Ok(bucket_info) => bucket_info,
             Err(storage::BucketSnapshotLoadError::Metadata(
                 storage::MetadataError::BucketNotFound { .. },
@@ -2684,7 +2695,7 @@ impl ReadRuntime {
         &self,
         claim: &storage::LifecycleSweepClaimRecord,
     ) -> Result<(), ServerError> {
-        self.storage_node
+        self.storage_node()
             .heartbeat_lifecycle_sweep_claim(claim, storage::clock::wall_time_millis())
             .map(drop)
             .map_err(Coordinator::map_object_pg_action_error)
@@ -2703,7 +2714,7 @@ impl ReadRuntime {
 
         let mut candidates = Vec::new();
         let objects = self
-            .storage_node
+            .storage_node()
             .list_all_objects_for_bucket(&bucket_info.name)
             .map_err(Coordinator::map_object_pg_action_error)?;
         for (index, object) in objects.into_iter().enumerate() {
@@ -2754,7 +2765,7 @@ impl ReadRuntime {
     ) -> Result<u64, ServerError> {
         let mut candidates = Vec::new();
         let uploads = self
-            .storage_node
+            .storage_node()
             .list_all_multipart_uploads_for_bucket(bucket)
             .map_err(Coordinator::map_object_pg_action_error)?;
         for (index, upload) in uploads.into_iter().enumerate() {
@@ -2793,7 +2804,7 @@ impl ReadRuntime {
 
         let mut candidate_keys = Vec::new();
         let versions = self
-            .storage_node
+            .storage_node()
             .list_all_object_versions_for_bucket(&bucket_info.name)
             .map_err(Coordinator::map_object_pg_action_error)?;
         let mut group_start = 0usize;
@@ -2845,7 +2856,7 @@ impl ReadRuntime {
         now_millis: u64,
     ) -> Result<bool, ServerError> {
         let outcome = self
-            .storage_node
+            .storage_node()
             .expire_current_object_if_due(
                 bucket,
                 key,
@@ -2895,7 +2906,7 @@ impl ReadRuntime {
     ) -> Result<u64, ServerError> {
         let current_unix_seconds = Coordinator::current_unix_seconds()?;
         let reclaimed_generation_ids = self
-            .storage_node
+            .storage_node()
             .delete_noncurrent_live_versions_if_due(
                 bucket,
                 key,
@@ -2954,7 +2965,7 @@ impl ReadRuntime {
 
         let mut candidates = Vec::new();
         let versions = self
-            .storage_node
+            .storage_node()
             .list_all_object_versions_for_bucket(&bucket_info.name)
             .map_err(Coordinator::map_object_pg_action_error)?;
         let mut group_start = 0usize;
@@ -3008,7 +3019,7 @@ impl ReadRuntime {
         expected_bucket_incarnation_generation: u64,
         now_millis: u64,
     ) -> Result<bool, ServerError> {
-        self.storage_node
+        self.storage_node()
             .delete_expired_delete_marker_if_due(
                 bucket,
                 key,
@@ -3044,7 +3055,7 @@ impl ReadRuntime {
 
         let mut candidates = Vec::new();
         let uploads = self
-            .storage_node
+            .storage_node()
             .list_all_multipart_uploads_for_bucket(&bucket_info.name)
             .map_err(Coordinator::map_object_pg_action_error)?;
         for (index, upload) in uploads.into_iter().enumerate() {
@@ -3102,7 +3113,7 @@ impl ReadRuntime {
                 )),
             );
         }
-        self.storage_node
+        self.storage_node()
             .abort_multipart_upload_if_due(
                 bucket,
                 key,
@@ -3135,7 +3146,7 @@ impl ReadRuntime {
         upload_id: &UploadId,
         expected_bucket_incarnation_generation: u64,
     ) -> Result<bool, ServerError> {
-        self.storage_node
+        self.storage_node()
             .abort_multipart_upload_for_lifecycle_sweep(
                 bucket,
                 key,
@@ -3149,7 +3160,7 @@ impl ReadRuntime {
         &self,
         upload: &AuthorizedMultipartUploadRecord,
     ) -> Result<bool, ServerError> {
-        self.storage_node
+        self.storage_node()
             .abort_authorized_multipart_upload(upload)
             .map_err(Coordinator::map_object_pg_action_error)
     }
@@ -3162,27 +3173,68 @@ impl ReadRuntime {
         generation_id: GenerationId,
     ) -> Result<PayloadLease, ServerError> {
         let lease = self
-            .storage_node
+            .storage_node()
             .acquire_object_payload_lease(bucket, key, generation_id)?;
         Ok(PayloadLease { lease: Some(lease) })
     }
 
-    pub(super) fn acquire_object_payload_lease_for_shard_locations(
+    pub(super) fn prepare_object_payload_read<'a>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-        locations: &[storage::ShardLocation],
-    ) -> Result<PayloadLease, ServerError> {
-        let lease = self
-            .storage_node
-            .acquire_object_payload_lease_for_shard_locations(
-                bucket,
-                key,
-                generation_id,
-                locations,
-            )?;
-        Ok(PayloadLease { lease: Some(lease) })
+        segments: impl IntoIterator<Item = &'a SegmentPayloadRecord>,
+    ) -> Result<Option<PayloadLease>, ServerError> {
+        let segments = segments.into_iter().collect::<Vec<_>>();
+        if let ReadStorage::Retained(retained) = &self.storage {
+            if !retained.matches_subject(bucket, key, generation_id)
+                || segments.iter().any(|segment| {
+                    !retained.contains_segment(
+                        segment.placement_cluster_epoch,
+                        SegmentStoredBytesRequest {
+                            data_pg_id: segment.data_pg_id,
+                            segment_okh: segment.segment_okh,
+                            segment_vid: segment.segment_vid,
+                            stored_size: segment.stored_size(),
+                            segment_crc64: segment.segment_crc64,
+                            ec: EcShape {
+                                k: segment.ec_k,
+                                m: segment.ec_m,
+                            },
+                        },
+                    )
+                })
+            {
+                return Err(ServerError::InternalError {
+                    reason: "object body is outside its retained payload-read snapshot".to_string(),
+                });
+            }
+            return Ok(None);
+        }
+
+        let storage_node = self.storage_node();
+        let mut locations = Vec::new();
+        for segment in segments {
+            if segment.stored_size() == 0 {
+                continue;
+            }
+            locations.extend(storage_node.segment_payload_shard_locations(
+                segment.data_pg_id,
+                EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+                &segment.segment_okh,
+                segment.segment_vid,
+            )?);
+        }
+        let lease = storage_node.acquire_object_payload_lease_for_shard_locations(
+            bucket,
+            key,
+            generation_id,
+            &locations,
+        )?;
+        Ok(Some(PayloadLease { lease: Some(lease) }))
     }
 
     #[cfg(test)]
@@ -3207,7 +3259,7 @@ impl ReadRuntime {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ServerError> {
-        self.storage_node
+        self.storage_node()
             .reclaim_object_payload_if_unleased(bucket, key, generation_id)
             .map_err(Coordinator::map_object_pg_action_error)
     }
@@ -3218,7 +3270,7 @@ impl ReadRuntime {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<storage::cluster::ObjectPayloadReclaimAttempt, ServerError> {
-        self.storage_node
+        self.storage_node()
             .reclaim_object_payload_if_unleased_with_outcome(bucket, key, generation_id)
             .map_err(Coordinator::map_object_pg_action_error)
     }
@@ -3243,7 +3295,7 @@ impl ReadRuntime {
         bucket: &BucketName,
     ) -> Result<(), ServerError> {
         match self
-            .storage_node
+            .storage_node()
             .try_finalize_bucket_delete(bucket)
             .map_err(super::bucket::map_bucket_write_drain_error)?
         {
@@ -3259,7 +3311,7 @@ impl ReadRuntime {
         &self,
         root: &BucketDeleteFinalizeRoot,
     ) -> Result<storage::BucketDeleteFinalizeOutcome, ServerError> {
-        let result = self.storage_node.try_finalize_bucket_delete_root(root);
+        let result = self.storage_node().try_finalize_bucket_delete_root(root);
         if let Err(error) = &result {
             let _ = observability::event(
                 TRACE_TARGET,
@@ -3280,23 +3332,31 @@ impl ReadRuntime {
         let padded = segment.stored_size().div_ceil(k) * k;
 
         let mut buf = self.payload_buffer_pool.checkout(padded);
-        self.storage_node
-            .read_segment_payload_stored_bytes_at_placement_epoch_into(
+        let request = SegmentStoredBytesRequest {
+            data_pg_id: segment.data_pg_id,
+            segment_okh: segment.segment_okh,
+            segment_vid: segment.segment_vid,
+            stored_size: segment.stored_size(),
+            segment_crc64: segment.segment_crc64,
+            ec: EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+        };
+        match &self.storage {
+            ReadStorage::Retained(retained) => retained.read_segment_payload_stored_bytes_into(
                 segment.placement_cluster_epoch,
-                SegmentStoredBytesRequest {
-                    data_pg_id: segment.data_pg_id,
-                    segment_okh: segment.segment_okh,
-                    segment_vid: segment.segment_vid,
-                    stored_size: segment.stored_size(),
-                    segment_crc64: segment.segment_crc64,
-                    ec: EcShape {
-                        k: segment.ec_k,
-                        m: segment.ec_m,
-                    },
-                },
+                request,
                 &mut buf,
-            )
-            .map_err(super::map_store_error)?;
+            ),
+            ReadStorage::Cluster(storage_node) => storage_node
+                .read_segment_payload_stored_bytes_at_placement_epoch_into(
+                    segment.placement_cluster_epoch,
+                    request,
+                    &mut buf,
+                ),
+        }
+        .map_err(super::map_store_error)?;
         if matches!(segment.encryption, ObjectEncryption::None) {
             Ok(buf.into_shared())
         } else {
@@ -3963,7 +4023,7 @@ mod tests {
         )
         .unwrap();
         let runtime = ReadRuntime {
-            storage_node: stale_cluster,
+            storage: ReadStorage::Cluster(stale_cluster),
             pg_topology: PgTopology::new(&[0]).unwrap(),
             payload_buffer_pool: PayloadBufferPool::new(ec_shape),
             sse_c_validator: None,

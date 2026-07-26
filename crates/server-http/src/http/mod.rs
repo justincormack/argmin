@@ -2001,34 +2001,37 @@ impl HttpFrontend {
                         acl.policy_condition_value(),
                         destination_managed_encryption,
                     );
-                    let result = self.coordinator.copy_object(&CopyObjectRequest {
-                        source: CopySource::new(
-                            src_bucket,
-                            src_key,
-                            src_version_id,
-                            &src_cond,
-                            expected_source_bucket_owner(req),
-                        ),
-                        destination: object_request(
-                            &bucket,
-                            &key,
-                            requester,
-                            expected_bucket_owner,
-                        )?,
-                        dst_condition: &dst_cond,
-                        directive,
-                        website_redirect_location,
-                        tagging,
-                        acl,
-                        policy_context,
-                        source_sse_customer: source_sse_customer.as_ref(),
-                        destination_encryption:
-                            crate::coordinator::WriteEncryptionRequest::from_request_parts(
-                                dst_sse_customer.as_ref(),
-                                destination_managed_encryption,
+                    let result = self.coordinator.copy_object_on_admitted_route(
+                        storage_route_admission,
+                        &CopyObjectRequest {
+                            source: CopySource::new(
+                                src_bucket,
+                                src_key,
+                                src_version_id,
+                                &src_cond,
+                                expected_source_bucket_owner(req),
+                            ),
+                            destination: object_request(
+                                &bucket,
+                                &key,
+                                requester,
+                                expected_bucket_owner,
                             )?,
-                        object_lock,
-                    })?;
+                            dst_condition: &dst_cond,
+                            directive,
+                            website_redirect_location,
+                            tagging,
+                            acl,
+                            policy_context,
+                            source_sse_customer: source_sse_customer.as_ref(),
+                            destination_encryption:
+                                crate::coordinator::WriteEncryptionRequest::from_request_parts(
+                                    dst_sse_customer.as_ref(),
+                                    destination_managed_encryption,
+                                )?,
+                            object_lock,
+                        },
+                    )?;
                     Ok(S3Response::copy_object(&result))
                 } else {
                     // Normal PutObject — use streaming upload path directly.
@@ -2133,7 +2136,8 @@ impl HttpFrontend {
                             bucket, key, vid, part_number
                         )),
                     );
-                    let result = self.coordinator.get_object_part(
+                    let result = self.coordinator.get_object_part_on_admitted_route(
+                        storage_route_admission,
                         &crate::coordinator::GetObjectPartRequest {
                             object: object_version_request(
                                 &bucket,
@@ -2163,7 +2167,8 @@ impl HttpFrontend {
                                     bucket, key, vid, range_header, byte_range
                                 )),
                             );
-                            let result = self.coordinator.get_object_range(
+                            let result = self.coordinator.get_object_range_on_admitted_route(
+                                storage_route_admission,
                                 &crate::coordinator::GetObjectRangeRequest {
                                     object: object_version_request(
                                         &bucket,
@@ -2193,7 +2198,8 @@ impl HttpFrontend {
                                     range_header
                                 )),
                             );
-                            let result = self.coordinator.get_object(
+                            let result = self.coordinator.get_object_on_admitted_route(
+                                storage_route_admission,
                                 &crate::coordinator::GetObjectRequest {
                                     object: object_version_request(
                                         &bucket,
@@ -2213,19 +2219,20 @@ impl HttpFrontend {
                         }
                     }
                 } else {
-                    let result =
-                        self.coordinator
-                            .get_object(&crate::coordinator::GetObjectRequest {
-                                object: object_version_request(
-                                    &bucket,
-                                    &key,
-                                    vid,
-                                    requester,
-                                    expected_bucket_owner,
-                                )?,
-                                cond: &cond,
-                                sse_customer: sse_customer.as_ref(),
-                            })?;
+                    let result = self.coordinator.get_object_on_admitted_route(
+                        storage_route_admission,
+                        &crate::coordinator::GetObjectRequest {
+                            object: object_version_request(
+                                &bucket,
+                                &key,
+                                vid,
+                                requester,
+                                expected_bucket_owner,
+                            )?,
+                            cond: &cond,
+                            sse_customer: sse_customer.as_ref(),
+                        },
+                    )?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
                     let mut resp = S3Response::get_object(result, checksum_mode);
                     apply_response_overrides(&mut resp, req);
@@ -3232,21 +3239,28 @@ impl HttpFrontend {
                     };
                 let result = self
                     .coordinator
-                    .upload_part_copy(&UploadPartCopyRequest {
-                        source: CopySource::new(
-                            src_bucket,
-                            src_key,
-                            src_version_id,
-                            &src_cond,
-                            expected_source_bucket_owner(req),
-                        ),
-                        upload: upload_request,
-                        part_number,
-                        copy_source_range,
-                        policy_context: PutObjectPolicyContext::new(Some(copy_source), None, None),
-                        source_sse_customer: source_sse_customer.as_ref(),
-                        sse_customer: sse_customer.as_ref(),
-                    })
+                    .upload_part_copy_on_admitted_route(
+                        storage_route_admission,
+                        &UploadPartCopyRequest {
+                            source: CopySource::new(
+                                src_bucket,
+                                src_key,
+                                src_version_id,
+                                &src_cond,
+                                expected_source_bucket_owner(req),
+                            ),
+                            upload: upload_request,
+                            part_number,
+                            copy_source_range,
+                            policy_context: PutObjectPolicyContext::new(
+                                Some(copy_source),
+                                None,
+                                None,
+                            ),
+                            source_sse_customer: source_sse_customer.as_ref(),
+                            sse_customer: sse_customer.as_ref(),
+                        },
+                    )
                     .map_err(|err| match err {
                         ServerError::PreconditionFailed { condition } => {
                             ServerError::UploadPartCopyPreconditionFailed {
