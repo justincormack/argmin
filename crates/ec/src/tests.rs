@@ -572,6 +572,8 @@ mod alloc_tests {
 
     struct CountingAllocator;
 
+    // SAFETY: allocation and deallocation are delegated unchanged to the system allocator. The
+    // thread-local bookkeeping neither reads nor modifies the allocated region.
     unsafe impl GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             COUNTING.with(|c| {
@@ -579,10 +581,13 @@ mod alloc_tests {
                     ALLOC_COUNT.with(|a| a.set(a.get() + 1));
                 }
             });
+            // SAFETY: the caller supplies the valid allocation layout required by GlobalAlloc.
             unsafe { System.alloc(layout) }
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: GlobalAlloc requires callers to pass the pointer and layout returned by the
+            // matching allocation, and both are forwarded unchanged to the system allocator.
             unsafe { System.dealloc(ptr, layout) }
         }
     }

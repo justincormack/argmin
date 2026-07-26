@@ -294,12 +294,18 @@ pub(crate) fn encode_rows(
     match backend {
         Backend::Scalar => encode_rows_scalar(k, tables, data, outputs),
         #[cfg(target_arch = "aarch64")]
+        // SAFETY: selected_backend verified Neon support, and codec validation established the
+        // table and equal-shard-length invariants required by the backend.
         Backend::NeonAarch64 => unsafe { aarch64_neon::encode_rows(k, neon_tables, data, outputs) },
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: selected_backend verified AVX-512F/BW support, and codec validation established
+        // the table and equal-shard-length invariants required by the backend.
         Backend::Avx512X86_64 => unsafe {
             x86_64_avx512::encode_rows(k, x86_tables, data, outputs)
         },
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: selected_backend verified AVX2 support, and codec validation established the
+        // table and equal-shard-length invariants required by the backend.
         Backend::Avx2X86_64 => unsafe { x86_64_avx2::encode_rows(k, x86_tables, data, outputs) },
     }
 }
@@ -343,14 +349,20 @@ pub(crate) fn apply_matrix_rows(
     match backend {
         Backend::Scalar => apply_matrix_rows_scalar(k, rows, inputs, outputs),
         #[cfg(target_arch = "aarch64")]
+        // SAFETY: selected_backend verified Neon support, and reconstruction validation
+        // established the row and equal-shard-length invariants required by the backend.
         Backend::NeonAarch64 => unsafe {
             aarch64_neon::apply_matrix_rows(k, rows, inputs, outputs)
         },
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: selected_backend verified AVX-512F/BW support, and reconstruction validation
+        // established the row and equal-shard-length invariants required by the backend.
         Backend::Avx512X86_64 => unsafe {
             x86_64_avx512::apply_matrix_rows(k, rows, inputs, outputs)
         },
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: selected_backend verified AVX2 support, and reconstruction validation
+        // established the row and equal-shard-length invariants required by the backend.
         Backend::Avx2X86_64 => unsafe { x86_64_avx2::apply_matrix_rows(k, rows, inputs, outputs) },
     }
 }
@@ -407,6 +419,13 @@ mod aarch64_neon {
         uint8x16_t, vandq_u8, vdupq_n_u8, veorq_u8, vld1q_u8, vqtbl1q_u8, vshrq_n_u8, vst1q_u8,
     };
 
+    /// Encodes output rows using Neon table lookups.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon. `k` must not exceed `MAX_TOTAL_SHARDS`; `data`
+    /// must contain at least `k` equally sized shards; every output must have that same size;
+    /// and `tables` must contain 32 bytes for every output-row/input-column pair.
     #[target_feature(enable = "neon")]
     pub(super) unsafe fn encode_rows(
         k: usize,
@@ -419,6 +438,12 @@ mod aarch64_neon {
         }
     }
 
+    /// Computes one encoded output row using Neon table lookups.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon, and the parent `encode_rows` shape invariants must
+    /// hold for `row_index` and `output`.
     #[target_feature(enable = "neon")]
     unsafe fn dot_prod_table_row(
         k: usize,
@@ -540,6 +565,13 @@ mod aarch64_neon {
         }
     }
 
+    /// Applies matrix rows using Neon table lookups.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon. `k` must not exceed `MAX_TOTAL_SHARDS`; `inputs`
+    /// must contain at least `k` equally sized shards; every output must be no longer than an
+    /// input shard; and `rows` must contain `k` coefficients for every output.
     #[target_feature(enable = "neon")]
     pub(super) unsafe fn apply_matrix_rows(
         k: usize,
@@ -553,6 +585,12 @@ mod aarch64_neon {
         }
     }
 
+    /// Computes one matrix output row using Neon table lookups.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon, and the parent `apply_matrix_rows` shape invariants
+    /// must hold for `row`, `inputs`, and `output`.
     #[target_feature(enable = "neon")]
     unsafe fn dot_prod_row(k: usize, row: &[u8], inputs: &[&[u8]], output: &mut [u8]) {
         let mut active_coeffs = [0u8; MAX_TOTAL_SHARDS];
@@ -659,6 +697,11 @@ mod aarch64_neon {
         }
     }
 
+    /// Multiplies one Neon vector by a nibble lookup table.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon.
     #[target_feature(enable = "neon")]
     unsafe fn mul_chunk(
         src_chunk: uint8x16_t,
@@ -685,6 +728,14 @@ mod x86_64_avx512 {
         _mm512_storeu_si512, _mm512_xor_si512, _mm_loadu_si128,
     };
 
+    /// Encodes output rows using AVX-512 table lookups.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support AVX-512F and AVX-512BW. `k` must not exceed
+    /// `MAX_TOTAL_SHARDS`; `data` must contain at least `k` equally sized shards; every output
+    /// must have that same size; and `tables` must contain 32 bytes for every
+    /// output-row/input-column pair.
     #[target_feature(enable = "avx512f,avx512bw")]
     pub(super) unsafe fn encode_rows(
         k: usize,
@@ -729,6 +780,14 @@ mod x86_64_avx512 {
         }
     }
 
+    /// Applies matrix rows using AVX-512 table lookups.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support AVX-512F and AVX-512BW. `k` must not exceed
+    /// `MAX_TOTAL_SHARDS`; `inputs` must contain at least `k` equally sized shards; every output
+    /// must be no longer than an input shard; and `rows` must contain `k` coefficients for every
+    /// output.
     #[target_feature(enable = "avx512f,avx512bw")]
     pub(super) unsafe fn apply_matrix_rows(
         k: usize,
@@ -742,6 +801,12 @@ mod x86_64_avx512 {
         }
     }
 
+    /// Computes one matrix output row using AVX-512 table lookups.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support AVX-512F and AVX-512BW, and the parent
+    /// `apply_matrix_rows` shape invariants must hold for `row`, `inputs`, and `output`.
     #[target_feature(enable = "avx512f,avx512bw")]
     unsafe fn dot_prod_row(k: usize, row: &[u8], inputs: &[&[u8]], output: &mut [u8]) {
         let mut active_coeffs = [0u8; MAX_TOTAL_SHARDS];
@@ -816,6 +881,12 @@ mod x86_64_avx512 {
         }
     }
 
+    /// Writes one shard multiplied by a nibble lookup table.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support AVX-512F and AVX-512BW; `src` must be at least as long as
+    /// `dest`; and `table` must contain at least 32 bytes.
     #[target_feature(enable = "avx512f,avx512bw")]
     unsafe fn write_with_nibble_table(dest: &mut [u8], src: &[u8], table: &[u8]) {
         let coeff = table[1];
@@ -843,6 +914,12 @@ mod x86_64_avx512 {
         }
     }
 
+    /// XORs one shard multiplied by a nibble lookup table into another shard.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support AVX-512F and AVX-512BW; `src` must be at least as long as
+    /// `dest`; and `table` must contain at least 32 bytes.
     #[target_feature(enable = "avx512f,avx512bw")]
     unsafe fn xor_with_nibble_table(dest: &mut [u8], src: &[u8], table: &[u8]) {
         let coeff = table[1];
@@ -872,6 +949,11 @@ mod x86_64_avx512 {
         }
     }
 
+    /// Multiplies one AVX-512 vector by a nibble lookup table.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support AVX-512F and AVX-512BW.
     #[target_feature(enable = "avx512f,avx512bw")]
     unsafe fn mul_chunk(
         src_chunk: __m512i,
@@ -898,6 +980,13 @@ mod x86_64_avx2 {
         _mm256_storeu_si256, _mm256_xor_si256, _mm_loadu_si128,
     };
 
+    /// Encodes output rows using AVX2 table lookups.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support AVX2. `k` must not exceed `MAX_TOTAL_SHARDS`; `data` must
+    /// contain at least `k` equally sized shards; every output must have that same size; and
+    /// `tables` must contain 32 bytes for every output-row/input-column pair.
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn encode_rows(
         k: usize,
@@ -942,6 +1031,13 @@ mod x86_64_avx2 {
         }
     }
 
+    /// Applies matrix rows using AVX2 table lookups.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support AVX2. `k` must not exceed `MAX_TOTAL_SHARDS`; `inputs` must
+    /// contain at least `k` equally sized shards; every output must be no longer than an input
+    /// shard; and `rows` must contain `k` coefficients for every output.
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn apply_matrix_rows(
         k: usize,
@@ -955,6 +1051,12 @@ mod x86_64_avx2 {
         }
     }
 
+    /// Computes one matrix output row using AVX2 table lookups.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support AVX2, and the parent `apply_matrix_rows` shape invariants
+    /// must hold for `row`, `inputs`, and `output`.
     #[target_feature(enable = "avx2")]
     unsafe fn dot_prod_row(k: usize, row: &[u8], inputs: &[&[u8]], output: &mut [u8]) {
         let mut active_coeffs = [0u8; MAX_TOTAL_SHARDS];
@@ -1030,6 +1132,12 @@ mod x86_64_avx2 {
         }
     }
 
+    /// Writes one shard multiplied by a nibble lookup table.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support AVX2; `src` must be at least as long as `dest`; and `table`
+    /// must contain at least 32 bytes.
     #[target_feature(enable = "avx2")]
     unsafe fn write_with_nibble_table(dest: &mut [u8], src: &[u8], table: &[u8]) {
         let coeff = table[1];
@@ -1058,6 +1166,12 @@ mod x86_64_avx2 {
         }
     }
 
+    /// XORs one shard multiplied by a nibble lookup table into another shard.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support AVX2; `src` must be at least as long as `dest`; and `table`
+    /// must contain at least 32 bytes.
     #[target_feature(enable = "avx2")]
     unsafe fn xor_with_nibble_table(dest: &mut [u8], src: &[u8], table: &[u8]) {
         let coeff = table[1];
@@ -1088,6 +1202,11 @@ mod x86_64_avx2 {
         }
     }
 
+    /// Multiplies one AVX2 vector by a nibble lookup table.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support AVX2.
     #[target_feature(enable = "avx2")]
     unsafe fn mul_chunk(
         src_chunk: __m256i,

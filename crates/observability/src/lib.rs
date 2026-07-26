@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;

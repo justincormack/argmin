@@ -3,6 +3,10 @@ name = "ec"
 version = "0.1.0"
 edition = "2021"
 
+[lints.clippy]
+missing_safety_doc = "deny"
+undocumented_unsafe_blocks = "deny"
+
 [features]
 deep-tracing = ["observability/deep-tracing"]
 

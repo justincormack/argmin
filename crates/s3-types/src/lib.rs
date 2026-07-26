@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Shared S3/domain value types used across storage and server layers.
 
 use std::fmt::Write;

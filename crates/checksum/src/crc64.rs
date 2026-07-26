@@ -81,14 +81,19 @@ fn extend(crc: u64, data: &[u8]) -> u64 {
     match pure_rust_backend() {
         PureRustBackend::Scalar => extend_scalar(crc, data),
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: backend selection verified pclmulqdq, vpclmulqdq, and avx512f support.
         PureRustBackend::Avx512X86_64 => unsafe { extend_avx512_x86_64(crc, data) },
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: backend selection verified pclmulqdq, vpclmulqdq, and avx2 support.
         PureRustBackend::VpclmulX86_64 => unsafe { extend_vpclmul_x86_64(crc, data) },
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: backend selection verified pclmulqdq support.
         PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(crc, data) },
         #[cfg(target_arch = "aarch64")]
+        // SAFETY: backend selection verified neon, aes, and sha3 support.
         PureRustBackend::PmullSha3Aarch64 => unsafe { extend_pmull_sha3_aarch64(crc, data) },
         #[cfg(target_arch = "aarch64")]
+        // SAFETY: backend selection verified neon and aes support.
         PureRustBackend::PmullAarch64 => unsafe { extend_pmull_aarch64(crc, data) },
     }
 }
@@ -377,21 +382,26 @@ mod x86_64_pclmul {
 
     #[inline]
     fn xor_crc(block: __m128i, crc: u64) -> __m128i {
+        // SAFETY: called only from target-feature-gated PCLMUL implementations.
         unsafe { _mm_xor_si128(block, _mm_set_epi64x(0, crc as i64)) }
     }
 
     #[inline]
     fn xor_crc256(block: __m256i, crc: u64) -> __m256i {
+        // SAFETY: called only from the target-feature-gated VPCLMUL implementation, which enables
+        // AVX2 for both intrinsics.
         unsafe { _mm256_xor_si256(block, _mm256_set_epi64x(0, 0, 0, crc as i64)) }
     }
 
     #[inline]
     fn xor_crc512(block: __m512i, crc: u64) -> __m512i {
+        // SAFETY: called only from the target-feature-gated AVX-512 implementation.
         unsafe { _mm512_xor_si512(block, _mm512_set_epi64(0, 0, 0, 0, 0, 0, 0, crc as i64)) }
     }
 
     #[inline]
     fn fold_block(x: __m128i, next: __m128i, constant: __m128i) -> __m128i {
+        // SAFETY: called only from target-feature-gated PCLMUL implementations.
         unsafe {
             let lo = _mm_clmulepi64_si128::<0x01>(x, constant);
             let hi = _mm_clmulepi64_si128::<0x10>(x, constant);
@@ -401,6 +411,7 @@ mod x86_64_pclmul {
 
     #[inline]
     fn fold_without_next(x: __m128i, constant: __m128i) -> __m128i {
+        // SAFETY: called only from target-feature-gated PCLMUL implementations.
         unsafe {
             let lo = _mm_clmulepi64_si128::<0x01>(x, constant);
             let hi = _mm_clmulepi64_si128::<0x10>(x, constant);
@@ -410,6 +421,7 @@ mod x86_64_pclmul {
 
     #[inline]
     fn fold_block256(x: __m256i, next: __m256i, constant: __m256i) -> __m256i {
+        // SAFETY: called only from the target-feature-gated VPCLMUL implementation.
         unsafe {
             let lo = _mm256_clmulepi64_epi128::<0x01>(x, constant);
             let hi = _mm256_clmulepi64_epi128::<0x10>(x, constant);
@@ -419,6 +431,7 @@ mod x86_64_pclmul {
 
     #[inline]
     fn fold_without_next256(x: __m256i, constant: __m256i) -> __m256i {
+        // SAFETY: called only from the target-feature-gated VPCLMUL implementation.
         unsafe {
             let lo = _mm256_clmulepi64_epi128::<0x01>(x, constant);
             let hi = _mm256_clmulepi64_epi128::<0x10>(x, constant);
@@ -428,6 +441,7 @@ mod x86_64_pclmul {
 
     #[inline]
     fn fold_block512(x: __m512i, next: __m512i, constant: __m512i) -> __m512i {
+        // SAFETY: called only from the target-feature-gated AVX-512 implementation.
         unsafe {
             let lo = _mm512_clmulepi64_epi128::<0x01>(x, constant);
             let hi = _mm512_clmulepi64_epi128::<0x10>(x, constant);
@@ -437,6 +451,7 @@ mod x86_64_pclmul {
 
     #[inline]
     fn fold_without_next512(x: __m512i, constant: __m512i) -> __m512i {
+        // SAFETY: called only from the target-feature-gated AVX-512 implementation.
         unsafe {
             let lo = _mm512_clmulepi64_epi128::<0x01>(x, constant);
             let hi = _mm512_clmulepi64_epi128::<0x10>(x, constant);
@@ -446,6 +461,7 @@ mod x86_64_pclmul {
 
     #[inline]
     fn reduce_to_crc(x: __m128i) -> u64 {
+        // SAFETY: called only from target-feature-gated PCLMUL implementations.
         unsafe {
             let fold = load_aligned(&FOLD_128_TO_64);
             let hi = _mm_srli_si128::<8>(x);
@@ -462,6 +478,11 @@ mod x86_64_pclmul {
         }
     }
 
+    /// Extends a CRC using the PCLMUL backend.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support PCLMULQDQ.
     #[target_feature(enable = "pclmulqdq")]
     pub unsafe fn extend(crc: u64, data: &[u8]) -> u64 {
         let prefix_len = data.len() & !0x0F;
@@ -474,6 +495,11 @@ mod x86_64_pclmul {
         super::extend_scalar(prefix_crc, tail)
     }
 
+    /// Extends a CRC using the VPCLMUL backend.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support PCLMULQDQ, VPCLMULQDQ, and AVX2.
     #[target_feature(enable = "pclmulqdq,vpclmulqdq,avx2")]
     pub unsafe fn extend_vpclmul(crc: u64, data: &[u8]) -> u64 {
         let prefix_len = data.len() & !0x0F;
@@ -487,6 +513,11 @@ mod x86_64_pclmul {
         super::extend_scalar(prefix_crc, tail)
     }
 
+    /// Extends a CRC using the AVX-512 VPCLMUL backend.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support PCLMULQDQ, VPCLMULQDQ, and AVX-512F.
     #[target_feature(enable = "pclmulqdq,vpclmulqdq,avx512f")]
     pub unsafe fn extend_avx512(crc: u64, data: &[u8]) -> u64 {
         let prefix_len = data.len() & !0x0F;
@@ -500,6 +531,12 @@ mod x86_64_pclmul {
         super::extend_scalar(prefix_crc, tail)
     }
 
+    /// Extends a CRC over whole 16-byte blocks using the PCLMUL backend.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support PCLMULQDQ. `data` must contain at least 32 bytes
+    /// and its length must be a multiple of 16.
     #[target_feature(enable = "pclmulqdq")]
     unsafe fn extend_blocks_only(crc: u64, data: &[u8]) -> u64 {
         let fold_1 = load_aligned(&FOLD_1);
@@ -566,6 +603,12 @@ mod x86_64_pclmul {
         !reduce_to_crc(state)
     }
 
+    /// Extends a CRC over whole 128-byte blocks using the VPCLMUL backend.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support PCLMULQDQ, VPCLMULQDQ, and AVX2. `data` must be
+    /// nonempty and its length must be a multiple of 128.
     #[target_feature(enable = "pclmulqdq,vpclmulqdq,avx2")]
     unsafe fn extend_blocks_only_vpclmul(crc: u64, data: &[u8]) -> u64 {
         let fold_8x2 = load_aligned256(&FOLD_8X2);
@@ -601,6 +644,12 @@ mod x86_64_pclmul {
         !reduce_to_crc(state)
     }
 
+    /// Extends a CRC over whole 256-byte blocks using the AVX-512 backend.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support PCLMULQDQ, VPCLMULQDQ, and AVX-512F. `data` must
+    /// be nonempty and its length must be a multiple of 256.
     #[target_feature(enable = "pclmulqdq,vpclmulqdq,avx512f")]
     unsafe fn extend_blocks_only_avx512(crc: u64, data: &[u8]) -> u64 {
         let fold_16x4 = load_aligned512(&FOLD_16X4);
@@ -648,18 +697,33 @@ mod x86_64_pclmul {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
+/// Extends a CRC using the PCLMUL backend.
+///
+/// # Safety
+///
+/// The current CPU must support PCLMULQDQ.
 unsafe fn extend_pclmul_x86_64(crc: u64, data: &[u8]) -> u64 {
     x86_64_pclmul::extend(crc, data)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
+/// Extends a CRC using the VPCLMUL backend.
+///
+/// # Safety
+///
+/// The current CPU must support PCLMULQDQ, VPCLMULQDQ, and AVX2.
 unsafe fn extend_vpclmul_x86_64(crc: u64, data: &[u8]) -> u64 {
     x86_64_pclmul::extend_vpclmul(crc, data)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
+/// Extends a CRC using the AVX-512 VPCLMUL backend.
+///
+/// # Safety
+///
+/// The current CPU must support PCLMULQDQ, VPCLMULQDQ, and AVX-512F.
 unsafe fn extend_avx512_x86_64(crc: u64, data: &[u8]) -> u64 {
     x86_64_pclmul::extend_avx512(crc, data)
 }
@@ -681,50 +745,110 @@ mod aarch64_pmull {
     const BR_LOW: u64 = 0x27EC_FA32_9AEF_9F77;
     const BR_HIGH: u64 = 0x34D9_2653_5897_936B;
 
+    /// Builds a two-lane vector.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon and AES.
     #[inline]
+    #[target_feature(enable = "neon,aes")]
     unsafe fn u64x2(lo: u64, hi: u64) -> uint64x2_t {
         let value = vdupq_n_u64(0);
         let value = vsetq_lane_u64::<0>(lo, value);
         vsetq_lane_u64::<1>(hi, value)
     }
 
+    /// Builds a two-lane polynomial vector.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon and AES.
     #[inline]
+    #[target_feature(enable = "neon,aes")]
     unsafe fn poly64x2(lo: u64, hi: u64) -> poly64x2_t {
         vreinterpretq_p64_u64(u64x2(lo, hi))
     }
 
+    /// Places one word in the low lane of a byte vector.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon and AES.
     #[inline]
+    #[target_feature(enable = "neon,aes")]
     unsafe fn low64_as_u8x16(value: u64) -> uint8x16_t {
         vreinterpretq_u8_u64(u64x2(value, 0))
     }
 
+    /// Loads one unaligned byte vector.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon and AES, and `ptr` must identify at least 16
+    /// readable bytes.
     #[inline]
-    fn load_block(ptr: *const u8) -> uint8x16_t {
+    #[target_feature(enable = "neon,aes")]
+    unsafe fn load_block(ptr: *const u8) -> uint8x16_t {
+        // SAFETY: callers pass pointers within a validated slice with 16 readable bytes, and this
+        // helper is called only from target-feature-gated PMULL implementations.
         unsafe { vld1q_u8(ptr) }
     }
 
+    /// XORs a CRC into the low vector lane.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon and AES.
     #[inline]
-    fn xor_crc(block: uint8x16_t, crc: u64) -> uint8x16_t {
+    #[target_feature(enable = "neon,aes")]
+    unsafe fn xor_crc(block: uint8x16_t, crc: u64) -> uint8x16_t {
+        // SAFETY: called only from target-feature-gated PMULL implementations.
         unsafe { veorq_u8(block, low64_as_u8x16(crc)) }
     }
 
+    /// Extracts the low polynomial lane.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon and AES.
     #[inline]
-    fn low_p64(x: poly64x2_t) -> u64 {
-        unsafe { vget_lane_p64::<0>(vget_low_p64(x)) }
+    #[target_feature(enable = "neon,aes")]
+    unsafe fn low_p64(x: poly64x2_t) -> u64 {
+        vget_lane_p64::<0>(vget_low_p64(x))
     }
 
+    /// Multiplies the low polynomial lanes.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon and AES.
     #[inline]
-    fn clmul_low(x: poly64x2_t, y: poly64x2_t) -> uint8x16_t {
+    #[target_feature(enable = "neon,aes")]
+    unsafe fn clmul_low(x: poly64x2_t, y: poly64x2_t) -> uint8x16_t {
+        // SAFETY: called only from target-feature-gated PMULL implementations.
         unsafe { vreinterpretq_u8_p128(vmull_p64(low_p64(x), low_p64(y))) }
     }
 
+    /// Multiplies the high polynomial lanes.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon and AES.
     #[inline]
-    fn clmul_high(x: poly64x2_t, y: poly64x2_t) -> uint8x16_t {
-        unsafe { vreinterpretq_u8_p128(vmull_high_p64(x, y)) }
+    #[target_feature(enable = "neon,aes")]
+    unsafe fn clmul_high(x: poly64x2_t, y: poly64x2_t) -> uint8x16_t {
+        vreinterpretq_u8_p128(vmull_high_p64(x, y))
     }
 
+    /// Folds one vector and XORs the next block.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon and AES.
     #[inline]
-    fn fold_block(x: uint8x16_t, next: uint8x16_t, constant: poly64x2_t) -> uint8x16_t {
+    #[target_feature(enable = "neon,aes")]
+    unsafe fn fold_block(x: uint8x16_t, next: uint8x16_t, constant: poly64x2_t) -> uint8x16_t {
+        // SAFETY: called only from target-feature-gated PMULL implementations.
         unsafe {
             let poly = vreinterpretq_p64_u8(x);
             veorq_u8(
@@ -734,16 +858,30 @@ mod aarch64_pmull {
         }
     }
 
+    /// Folds one vector without a following block.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon and AES.
     #[inline]
-    fn fold_without_next(x: uint8x16_t, constant: poly64x2_t) -> uint8x16_t {
+    #[target_feature(enable = "neon,aes")]
+    unsafe fn fold_without_next(x: uint8x16_t, constant: poly64x2_t) -> uint8x16_t {
+        // SAFETY: called only from target-feature-gated PMULL implementations.
         unsafe {
             let poly = vreinterpretq_p64_u8(x);
             veorq_u8(clmul_low(poly, constant), clmul_high(poly, constant))
         }
     }
 
+    /// Reduces one polynomial vector to a CRC.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon and AES.
     #[inline]
-    fn reduce_to_crc(x: uint8x16_t) -> u64 {
+    #[target_feature(enable = "neon,aes")]
+    unsafe fn reduce_to_crc(x: uint8x16_t) -> u64 {
+        // SAFETY: called only from target-feature-gated PMULL implementations.
         unsafe {
             let folded = {
                 let x_poly = vreinterpretq_p64_u8(x);
@@ -764,6 +902,11 @@ mod aarch64_pmull {
         }
     }
 
+    /// Extends a CRC using the Arm PMULL backend.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon and AES.
     #[target_feature(enable = "neon,aes")]
     pub unsafe fn extend(crc: u64, data: &[u8]) -> u64 {
         let prefix_len = data.len() & !0x3F;
@@ -776,6 +919,12 @@ mod aarch64_pmull {
         super::extend_scalar(prefix_crc, tail)
     }
 
+    /// Extends a CRC over whole 64-byte blocks using the Arm PMULL backend.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon and AES. `data` must be nonempty and its length
+    /// must be a multiple of 64.
     #[target_feature(enable = "neon,aes")]
     unsafe fn extend_blocks_only(crc: u64, data: &[u8]) -> u64 {
         let p4 = poly64x2(P4_LOW, P4_HIGH);
@@ -804,6 +953,11 @@ mod aarch64_pmull {
         !reduce_to_crc(x3)
     }
 
+    /// Extends a CRC using the Arm PMULL and SHA3 backend.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon, AES, and SHA3.
     #[target_feature(enable = "neon,aes,sha3")]
     pub unsafe fn extend_sha3(crc: u64, data: &[u8]) -> u64 {
         let prefix_len = data.len() & !0x3F;
@@ -816,6 +970,12 @@ mod aarch64_pmull {
         super::extend_scalar(prefix_crc, tail)
     }
 
+    /// Extends a CRC over whole 64-byte blocks using the Arm PMULL and SHA3 backend.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Neon, AES, and SHA3. `data` must be nonempty and its
+    /// length must be a multiple of 64.
     #[target_feature(enable = "neon,aes,sha3")]
     unsafe fn extend_blocks_only_sha3(crc: u64, data: &[u8]) -> u64 {
         let p4 = poly64x2(P4_LOW, P4_HIGH);
@@ -847,12 +1007,22 @@ mod aarch64_pmull {
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
+/// Extends a CRC using the Arm PMULL backend.
+///
+/// # Safety
+///
+/// The current CPU must support Neon and AES.
 unsafe fn extend_pmull_aarch64(crc: u64, data: &[u8]) -> u64 {
     aarch64_pmull::extend(crc, data)
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
+/// Extends a CRC using the Arm PMULL and SHA3 backend.
+///
+/// # Safety
+///
+/// The current CPU must support Neon, AES, and SHA3.
 unsafe fn extend_pmull_sha3_aarch64(crc: u64, data: &[u8]) -> u64 {
     aarch64_pmull::extend_sha3(crc, data)
 }
@@ -1074,14 +1244,19 @@ mod tests {
         match backend {
             PureRustBackend::Scalar => extend_scalar(0, data),
             #[cfg(target_arch = "x86_64")]
+            // SAFETY: supported_backends adds this case only after feature detection succeeds.
             PureRustBackend::Avx512X86_64 => unsafe { extend_avx512_x86_64(0, data) },
             #[cfg(target_arch = "x86_64")]
+            // SAFETY: supported_backends adds this case only after feature detection succeeds.
             PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(0, data) },
             #[cfg(target_arch = "x86_64")]
+            // SAFETY: supported_backends adds this case only after feature detection succeeds.
             PureRustBackend::VpclmulX86_64 => unsafe { extend_vpclmul_x86_64(0, data) },
             #[cfg(target_arch = "aarch64")]
+            // SAFETY: supported_backends adds this case only after feature detection succeeds.
             PureRustBackend::PmullAarch64 => unsafe { extend_pmull_aarch64(0, data) },
             #[cfg(target_arch = "aarch64")]
+            // SAFETY: supported_backends adds this case only after feature detection succeeds.
             PureRustBackend::PmullSha3Aarch64 => unsafe { extend_pmull_sha3_aarch64(0, data) },
         }
     }
@@ -1096,14 +1271,19 @@ mod tests {
             crc = match backend {
                 PureRustBackend::Scalar => extend_scalar(crc, chunk),
                 #[cfg(target_arch = "x86_64")]
+                // SAFETY: supported_backends adds this case only after feature detection succeeds.
                 PureRustBackend::Avx512X86_64 => unsafe { extend_avx512_x86_64(crc, chunk) },
                 #[cfg(target_arch = "x86_64")]
+                // SAFETY: supported_backends adds this case only after feature detection succeeds.
                 PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(crc, chunk) },
                 #[cfg(target_arch = "x86_64")]
+                // SAFETY: supported_backends adds this case only after feature detection succeeds.
                 PureRustBackend::VpclmulX86_64 => unsafe { extend_vpclmul_x86_64(crc, chunk) },
                 #[cfg(target_arch = "aarch64")]
+                // SAFETY: supported_backends adds this case only after feature detection succeeds.
                 PureRustBackend::PmullAarch64 => unsafe { extend_pmull_aarch64(crc, chunk) },
                 #[cfg(target_arch = "aarch64")]
+                // SAFETY: supported_backends adds this case only after feature detection succeeds.
                 PureRustBackend::PmullSha3Aarch64 => unsafe {
                     extend_pmull_sha3_aarch64(crc, chunk)
                 },
