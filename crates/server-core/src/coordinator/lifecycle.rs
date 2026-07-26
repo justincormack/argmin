@@ -64,6 +64,34 @@ impl Coordinator {
         }
     }
 
+    pub(super) fn cached_bucket_lifecycle_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        bucket: &BucketSummary,
+    ) -> Result<Option<BucketLifecycleConfiguration>, ServerError> {
+        if !bucket.bucket_lifecycle_present {
+            return Ok(None);
+        }
+
+        self.require_storage_route_admission(admission)?;
+        let raw_config = admission
+            .active_bucket_route(&bucket.name)
+            .map_err(super::map_store_error)?
+            .get_bucket_subresource(storage::BucketSubresourceKind::Lifecycle)
+            .map_err(Self::map_bucket_snapshot_load_error)?;
+        match raw_config {
+            Some(config_xml) => s3_types::parse_lifecycle_configuration_xml(config_xml.as_bytes())
+                .map(Some)
+                .map_err(|error| ServerError::InternalError {
+                    reason: format!(
+                        "stored lifecycle configuration for {} failed to parse at request time: {error}",
+                        bucket.name
+                    ),
+                }),
+            None => Ok(None),
+        }
+    }
+
     pub(super) fn cached_bucket_lifecycle_for_loaded_handle(
         &self,
         bucket: &LoadedBucketHandle,
@@ -98,6 +126,32 @@ impl Coordinator {
         last_modified: u64,
     ) -> Result<Option<LifecycleExpirationHeader>, ServerError> {
         let Some(config) = self.cached_bucket_lifecycle_with_storage_node(storage_node, bucket)?
+        else {
+            return Ok(None);
+        };
+        let tags = match tags_xml {
+            Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
+            None => Vec::new(),
+        };
+        Ok(Self::evaluate_current_object_lifecycle_expiration(
+            &config,
+            key,
+            &tags,
+            size,
+            last_modified,
+        ))
+    }
+
+    pub(super) fn current_object_lifecycle_expiration_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        bucket: &BucketSummary,
+        key: &str,
+        tags_xml: Option<&str>,
+        size: u64,
+        last_modified: u64,
+    ) -> Result<Option<LifecycleExpirationHeader>, ServerError> {
+        let Some(config) = self.cached_bucket_lifecycle_on_admitted_route(admission, bucket)?
         else {
             return Ok(None);
         };

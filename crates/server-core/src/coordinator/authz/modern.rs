@@ -570,7 +570,7 @@ impl Coordinator {
 
     pub(super) fn authorize_object_read_snapshot_boe(
         &self,
-        storage_node: &Arc<storage::StorageCluster>,
+        route: &ObjectReadSnapshotRoute<'_>,
         req: AuthorizedObjectReadSnapshotRequest<'_>,
         bucket: BoeLoadedBucketHandle<'_>,
     ) -> Result<
@@ -605,17 +605,15 @@ impl Coordinator {
         )?;
         #[cfg(test)]
         if self.should_probe_object_read_snapshot(bucket.bucket().name.as_str()) {
-            let object_pg_ready = storage_node
-                .try_probe_object_pg_available(&bucket.bucket().name, req.key)
-                .map_err(|error| {
-                    Self::map_object_read_snapshot_error(
-                        &bucket.bucket().name,
-                        req.key,
-                        req.version_id,
-                        can_discover_missing,
-                        error,
-                    )
-                })?;
+            let object_pg_ready = route.try_probe_object_pg_available().map_err(|error| {
+                Self::map_object_read_snapshot_error(
+                    &bucket.bucket().name,
+                    req.key,
+                    req.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })?;
             if !object_pg_ready {
                 return Err(ServerError::InternalError {
                     reason: "test probe: object pg still locked before object read snapshot"
@@ -623,38 +621,32 @@ impl Coordinator {
                 });
             }
         }
-        let outcome = storage_node
-            .load_object_read_snapshot_if(
-                &bucket.bucket().name,
-                req.key,
-                req.version_id,
-                req.snapshot_mode,
-                |stored| {
-                    let allowed = matches!(
-                        read_object_authorization_with_bucket_policy(
-                            req.requester,
-                            modern_bucket,
-                            modern_bucket_tags,
-                            stored,
-                            req.modern_action,
-                            bucket_policy.as_deref(),
-                        )?,
-                        ModernObjectReadAuthorization::Allowed
-                    );
-                    if allowed {
-                        self.object_attribute_permissions_with_bucket_policy(
-                            req.requester,
-                            &bucket_info,
-                            bucket_tags.as_deref(),
-                            stored,
-                            req.modern_action,
-                            bucket_policy.as_deref(),
-                        )
-                    } else {
-                        Err(ServerError::AccessDenied)
-                    }
-                },
-            )
+        let outcome = route
+            .load(|stored| {
+                let allowed = matches!(
+                    read_object_authorization_with_bucket_policy(
+                        req.requester,
+                        modern_bucket,
+                        modern_bucket_tags,
+                        stored,
+                        req.modern_action,
+                        bucket_policy.as_deref(),
+                    )?,
+                    ModernObjectReadAuthorization::Allowed
+                );
+                if allowed {
+                    self.object_attribute_permissions_with_bucket_policy(
+                        req.requester,
+                        &bucket_info,
+                        bucket_tags.as_deref(),
+                        stored,
+                        req.modern_action,
+                        bucket_policy.as_deref(),
+                    )
+                } else {
+                    Err(ServerError::AccessDenied)
+                }
+            })
             .map_err(|error| {
                 Self::map_object_read_snapshot_error(
                     &bucket.bucket().name,

@@ -2282,7 +2282,8 @@ impl HttpFrontend {
                             bucket, key, vid, part_number
                         )),
                     );
-                    let result = self.coordinator.head_object_part(
+                    let result = self.coordinator.head_object_part_on_admitted_route(
+                        storage_route_admission,
                         &crate::coordinator::GetObjectPartRequest {
                             object: object_version_request(
                                 &bucket,
@@ -2298,19 +2299,20 @@ impl HttpFrontend {
                     )?;
                     Ok(S3Response::head_object_part(&result))
                 } else {
-                    let result =
-                        self.coordinator
-                            .head_object(&crate::coordinator::GetObjectRequest {
-                                object: object_version_request(
-                                    &bucket,
-                                    &key,
-                                    vid,
-                                    requester,
-                                    expected_bucket_owner,
-                                )?,
-                                cond: &cond,
-                                sse_customer: sse_customer.as_ref(),
-                            })?;
+                    let result = self.coordinator.head_object_on_admitted_route(
+                        storage_route_admission,
+                        &crate::coordinator::GetObjectRequest {
+                            object: object_version_request(
+                                &bucket,
+                                &key,
+                                vid,
+                                requester,
+                                expected_bucket_owner,
+                            )?,
+                            cond: &cond,
+                            sse_customer: sse_customer.as_ref(),
+                        },
+                    )?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
                     Ok(S3Response::head_object(&result, checksum_mode))
                 }
@@ -2370,7 +2372,8 @@ impl HttpFrontend {
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
                 let requester_ctx = self.requester_from_auth(auth, req)?;
-                let result = self.coordinator.get_object_attributes(
+                let result = self.coordinator.get_object_attributes_on_admitted_route(
+                    storage_route_admission,
                     &crate::coordinator::GetObjectAttributesRequest {
                         object: object_version_request(
                             &bucket,

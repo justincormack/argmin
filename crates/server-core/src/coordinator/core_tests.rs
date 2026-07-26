@@ -242,6 +242,22 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
         true,
     )
     .unwrap();
+    test_helpers::put_object(
+        &initial_coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
 
     let (cluster, coord, admission) = storage::clock::with_time_override(1_000, || {
         let cluster = same_store_cluster_with_route_map_validity(
@@ -266,6 +282,43 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
             .head_bucket_info(&trusted_bucket_name("bucket"))
             .unwrap();
         let request = bucket_request_with_expected_owner("bucket", test_requester(), None);
+        let object_request = GetObjectRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+            sse_customer: None,
+        };
+        let object_part_request = GetObjectPartRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            cond: NO_READ,
+            sse_customer: None,
+        };
+        let object_attributes_request = GetObjectAttributesRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+            want_parts: false,
+            part_number_marker: None,
+            max_parts: 1_000,
+            sse_customer: None,
+        };
         for (operation, result) in [
             (
                 "ListBuckets",
@@ -421,6 +474,24 @@ fn bucket_metadata_reads_recheck_the_request_admission_deadline_before_snapshot_
                     )
                     .map(|_| ()),
             ),
+            (
+                "HeadObject",
+                coord
+                    .head_object_on_admitted_route(&admission, &object_request)
+                    .map(|_| ()),
+            ),
+            (
+                "HeadObjectPart",
+                coord
+                    .head_object_part_on_admitted_route(&admission, &object_part_request)
+                    .map(|_| ()),
+            ),
+            (
+                "GetObjectAttributes",
+                coord
+                    .get_object_attributes_on_admitted_route(&admission, &object_attributes_request)
+                    .map(|_| ()),
+            ),
         ] {
             let error = result.expect_err(operation);
             assert!(
@@ -539,6 +610,103 @@ fn head_bucket_warm_policy_cache_uses_loaded_identity_and_captured_deadline() {
             .unwrap_err();
         assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
     });
+}
+
+#[test]
+fn object_snapshot_route_rechecks_deadline_after_warm_bucket_fast_path() {
+    let _serial = BUCKET_POLICY_LOAD_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_process_isolated_cache_coordinator_with_storage_cluster(Arc::clone(&cluster));
+    let bucket = "object-read-admitted-fast-path";
+    let requester = test_requester();
+
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    put_bucket_ownership_controls_test(
+        &coord,
+        bucket,
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+        requester.clone(),
+        None,
+    )
+    .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, "key", requester.clone(), None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let request = GetObjectRequest {
+        object: object_version_request_with_expected_owner(bucket, "key", None, requester, None),
+        cond: NO_READ,
+        sse_customer: None,
+    };
+
+    coord.head_object(&request).unwrap();
+    assert_eq!(
+        coord.bucket_fast_path_is_fresh_for_test(&trusted_bucket_name(bucket)),
+        Some(true)
+    );
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    coord
+        .head_object_on_admitted_route(&admission, &request)
+        .unwrap();
+
+    let bucket_name = trusted_bucket_name(bucket);
+    let key = trusted_object_key("key");
+    let route = admission
+        .active_object_read_route(
+            &bucket_name,
+            &key,
+            None,
+            storage::ObjectReadSnapshotMode::MetadataOnly,
+        )
+        .unwrap();
+    let action_clock = Arc::clone(&clock);
+    let snapshot_error = route
+        .load_object_read_snapshot_if(move |_| {
+            action_clock.set(6_000);
+            Ok::<(), ()>(())
+        })
+        .unwrap_err();
+    assert!(matches!(
+        snapshot_error,
+        storage::ObjectPgActionError::Store(storage::StoreError::RouteMapExpired { .. })
+    ));
+    clock.set(1_000);
+
+    let hook_clock = Arc::clone(&clock);
+    let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
+        bucket: Some(bucket.to_string()),
+        before_storage_load: None,
+        after_policy_fast_path_hit: Some(Arc::new(move || hook_clock.set(6_000))),
+    });
+    let error = coord
+        .head_object_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    cluster
+        .head_bucket_info(&trusted_bucket_name(bucket))
+        .expect("the renewed raw route should remain valid after admitted authority expires");
 }
 
 #[test]
@@ -833,6 +1001,128 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
                         max_uploads: 100,
                     },
                 )
+                .map(|_| ()),
+        ),
+    ] {
+        let error = result.expect_err(operation);
+        assert!(
+            matches!(error, ServerError::OperationAborted),
+            "{operation}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn object_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let foreign_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        local_handle,
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+        BackgroundWorkerMode::none(),
+    )
+    .unwrap();
+    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        foreign_handle,
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+        BackgroundWorkerMode::none(),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&local.storage_node(), &foreign.storage_node()));
+    assert!(!local.shares_storage_route_admission_with(&foreign));
+
+    foreign
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    test_helpers::put_object(
+        &foreign,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let request = GetObjectRequest {
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        cond: NO_READ,
+        sse_customer: None,
+    };
+    let part_request = GetObjectPartRequest {
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        part_number: 1,
+        cond: NO_READ,
+        sse_customer: None,
+    };
+    let attributes_request = GetObjectAttributesRequest {
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        cond: NO_READ,
+        want_parts: false,
+        part_number_marker: None,
+        max_parts: 1_000,
+        sse_customer: None,
+    };
+
+    let foreign_admission = foreign.admit_storage_route_for_request().unwrap();
+    foreign
+        .head_object_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    foreign
+        .head_object_part_on_admitted_route(&foreign_admission, &part_request)
+        .unwrap();
+    foreign
+        .get_object_attributes_on_admitted_route(&foreign_admission, &attributes_request)
+        .unwrap();
+
+    for (operation, result) in [
+        (
+            "HeadObject",
+            local
+                .head_object_on_admitted_route(&foreign_admission, &request)
+                .map(|_| ()),
+        ),
+        (
+            "HeadObjectPart",
+            local
+                .head_object_part_on_admitted_route(&foreign_admission, &part_request)
+                .map(|_| ()),
+        ),
+        (
+            "GetObjectAttributes",
+            local
+                .get_object_attributes_on_admitted_route(&foreign_admission, &attributes_request)
                 .map(|_| ()),
         ),
     ] {
@@ -4959,6 +5249,8 @@ fn head_object_epoch_change_after_read_snapshot_uses_pinned_route() {
     let hook_handle = handle.clone();
     let hook_initial = Arc::clone(&initial);
     let hook_node_root = tmp.path().to_path_buf();
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -4966,11 +5258,18 @@ fn head_object_epoch_change_after_read_snapshot_uses_pinned_route() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some((bucket.to_string(), key.to_string())),
         after_object_read_snapshot: Some(Arc::new(move || {
-            install_next_epoch_runtime_map_with_historical_routes(
-                &hook_handle,
-                &hook_initial,
-                &hook_node_root,
-            );
+            let publishing_handle = hook_handle.clone();
+            let publishing_initial = Arc::clone(&hook_initial);
+            let publishing_node_root = hook_node_root.clone();
+            let thread = thread::spawn(move || {
+                install_next_epoch_runtime_map_with_historical_routes(
+                    &publishing_handle,
+                    &publishing_initial,
+                    &publishing_node_root,
+                );
+            });
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
         })),
         ..ReclamationTestHooks::default()
     });
@@ -4987,6 +5286,13 @@ fn head_object_epoch_change_after_read_snapshot_uses_pinned_route() {
             ),
             cond: NO_READ,
         })
+        .unwrap();
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("HeadObject hook should start route publication")
+        .join()
         .unwrap();
     assert_eq!(result.size, b"head-crosses-epoch-change".len() as u64);
     assert_eq!(result.version_id, VersionId::Null);

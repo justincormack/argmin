@@ -79,15 +79,16 @@ use crate::types::{
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
     ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
     MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot,
-    ObjectSegmentRecord, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
-    PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
-    PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
-    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,
-    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
-    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq, RouteMapValidity,
-    SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
-    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
-    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference,
+    ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectSegmentRecord, PgId, PgState,
+    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
+    PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
+    PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
+    PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,
+    PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
+    PrepareStreamUploadSegmentAppendReq, RouteMapValidity, SegmentStoredBytesRequest, SessionId,
+    ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
+    ShardScavengerObservationReason, ShardScavengerObservationRecord,
+    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference, StoredObject,
     StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
     StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
 };
@@ -1747,6 +1748,26 @@ impl StorageClusterRouteAdmission {
         })
     }
 
+    /// Derive active object-metadata read authority for one object from this
+    /// request's admitted runtime-map generation.
+    pub fn active_object_read_route<'admission>(
+        &'admission self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        snapshot_mode: ObjectReadSnapshotMode,
+    ) -> Result<ActiveObjectReadRoute<'admission>, StoreError> {
+        self.require_valid_now()?;
+        Ok(ActiveObjectReadRoute {
+            admission: self,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id,
+            snapshot_mode,
+            pg_id: self.cluster.object_metadata_pg(bucket, key),
+        })
+    }
+
     /// Narrow this admitted request to cleanup authority for one stream-upload
     /// object. The returned capability can only remove an abandoned session
     /// and its staged state from this admitted route generation; it cannot
@@ -1872,6 +1893,65 @@ impl ActiveBucketMetadataScan<'_> {
 pub struct ActiveObjectMetadataScan<'admission> {
     admission: &'admission StorageClusterRouteAdmission,
     bucket: BucketName,
+}
+
+/// Non-cloneable active authority for one object's metadata snapshot.
+///
+/// The bucket, key, and routed object-metadata PG are fixed at construction.
+/// Snapshot loading rechecks the request admission immediately before every
+/// node access, including stale-subject retries.
+///
+/// ```compile_fail
+/// use storage::ActiveObjectReadRoute;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn cache_route(route: &ActiveObjectReadRoute<'_>) {
+///     require_clone(route);
+/// }
+/// ```
+pub struct ActiveObjectReadRoute<'admission> {
+    admission: &'admission StorageClusterRouteAdmission,
+    bucket: BucketName,
+    key: ObjectKey,
+    version_id: Option<VersionId>,
+    snapshot_mode: ObjectReadSnapshotMode,
+    pg_id: ObjectMetadataPgId,
+}
+
+struct ObjectReadMetadataRoute<'a> {
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
+    version_id: Option<VersionId>,
+    snapshot_mode: ObjectReadSnapshotMode,
+    pg_id: ObjectMetadataPgId,
+}
+
+impl ActiveObjectReadRoute<'_> {
+    pub fn load_object_read_snapshot_if<T, E>(
+        &self,
+        action: impl FnMut(&StoredObject) -> Result<T, E>,
+    ) -> Result<Result<ObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
+        let route = ObjectReadMetadataRoute {
+            bucket: &self.bucket,
+            key: &self.key,
+            version_id: self.version_id,
+            snapshot_mode: self.snapshot_mode,
+            pg_id: self.pg_id,
+        };
+        self.admission
+            .cluster
+            .load_object_read_snapshot_if_on_route(&route, action, || {
+                self.admission.require_valid_now()
+            })
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn try_probe_object_pg_available(&self) -> Result<bool, ObjectPgActionError> {
+        self.admission.require_valid_now()?;
+        self.admission
+            .cluster
+            .try_probe_object_pg_available(&self.bucket, &self.key)
+    }
 }
 
 struct ObjectMetadataScanRoute<'a> {

@@ -2621,6 +2621,36 @@ Fifty-sixth Phase 3 slice:
   boundary checker, and workspace-wide strict Clippy pass. The full parallel
   workspace suite passes (7,562 tests).
 
+Fifty-seventh Phase 3 slice:
+
+- `HeadObject`, part-level `HeadObject`, and `GetObjectAttributes` now consume
+  the buffered request's existing `StorageClusterRouteAdmission`. Their
+  production coordinator entry points can no longer resample the renewable
+  runtime-map handle; crate tests and the `test-utils` feature retain wrappers
+  which acquire admission before entering the same production paths.
+- `ActiveObjectReadRoute` is a non-cloneable capability fixed to one bucket,
+  key, requested version, snapshot mode, and object-metadata PG in the
+  admitted runtime-map generation. Snapshot authorization rechecks the
+  request's immutable deadline immediately before both the subject load and
+  the subject-bound snapshot load, including every stale-subject retry.
+  Lifecycle-expiration header evaluation now loads any required lifecycle
+  configuration through the admitted bucket route as well.
+- adversarial regressions reject same-cluster admissions from a different
+  frontend publication domain and expire an admission between the object
+  subject and snapshot reads after renewing the underlying raw route. A warm
+  BOE fast-path regression separately expires authority after bucket
+  authorization but before the object read. The existing HEAD epoch-change
+  test now starts publication asynchronously, proves it waits behind the
+  admitted read, and joins it after the request releases admission.
+- response-body `GetObject`, ranged GET, and part-level GET paths, object
+  mutations, the remaining buffered coordinator workflows, and capability
+  requirements on the node-client traits remain open in Phase 3.
+- the focused deadline/domain matrix passes (3 tests), as do the 112 focused
+  coordinator/HTTP object-read tests, all 21 endpoint-neutral object-attribute
+  tests, and all 7 focused lifecycle HEAD tests. Formatting, the storage
+  boundary checker, and workspace-wide strict Clippy pass. The full parallel
+  workspace suite passes (7,568 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

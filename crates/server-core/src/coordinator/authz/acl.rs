@@ -984,7 +984,7 @@ impl Coordinator {
 
     pub(super) fn authorize_object_read_snapshot_non_boe(
         &self,
-        storage_node: &Arc<storage::StorageCluster>,
+        route: &ObjectReadSnapshotRoute<'_>,
         req: AuthorizedObjectReadSnapshotRequest<'_>,
         bucket: NonBoeLoadedBucketHandle<'_>,
     ) -> Result<
@@ -1016,17 +1016,15 @@ impl Coordinator {
         )?;
         #[cfg(test)]
         if self.should_probe_object_read_snapshot(bucket.bucket().name.as_str()) {
-            let object_pg_ready = storage_node
-                .try_probe_object_pg_available(&bucket.bucket().name, req.key)
-                .map_err(|error| {
-                    Self::map_object_read_snapshot_error(
-                        &bucket.bucket().name,
-                        req.key,
-                        req.version_id,
-                        can_discover_missing,
-                        error,
-                    )
-                })?;
+            let object_pg_ready = route.try_probe_object_pg_available().map_err(|error| {
+                Self::map_object_read_snapshot_error(
+                    &bucket.bucket().name,
+                    req.key,
+                    req.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })?;
             if !object_pg_ready {
                 return Err(ServerError::InternalError {
                     reason: "test probe: object pg still locked before object read snapshot"
@@ -1034,66 +1032,57 @@ impl Coordinator {
                 });
             }
         }
-        let outcome = storage_node
-            .load_object_read_snapshot_if(
-                &bucket.bucket().name,
-                req.key,
-                req.version_id,
-                req.snapshot_mode,
-                |stored| {
-                    let allowed = match req.modern_action {
-                        ModernReadAction::ReadCurrent | ModernReadAction::ReadVersion => self
-                            .requester_can_read_object_with_bucket_policy(
+        let outcome = route
+            .load(|stored| {
+                let allowed = match req.modern_action {
+                    ModernReadAction::ReadCurrent | ModernReadAction::ReadVersion => self
+                        .requester_can_read_object_with_bucket_policy(
+                            req.requester,
+                            &bucket_info,
+                            bucket_tags.as_deref(),
+                            stored,
+                            req.modern_action.policy_action(),
+                            bucket_policy.as_deref(),
+                        )?,
+                    ModernReadAction::AttributesCurrent | ModernReadAction::AttributesVersion => {
+                        let read_action = match req.modern_action {
+                            ModernReadAction::AttributesCurrent => auth::PolicyAction::GetObject,
+                            ModernReadAction::AttributesVersion => {
+                                auth::PolicyAction::GetObjectVersion
+                            }
+                            _ => unreachable!(),
+                        };
+                        self.requester_can_read_object_with_bucket_policy(
+                            req.requester,
+                            &bucket_info,
+                            bucket_tags.as_deref(),
+                            stored,
+                            read_action,
+                            bucket_policy.as_deref(),
+                        )? && self
+                            .requester_can_read_object_without_existing_tags_with_bucket_policy(
                                 req.requester,
                                 &bucket_info,
                                 bucket_tags.as_deref(),
                                 stored,
                                 req.modern_action.policy_action(),
                                 bucket_policy.as_deref(),
-                            )?,
-                        ModernReadAction::AttributesCurrent
-                        | ModernReadAction::AttributesVersion => {
-                            let read_action = match req.modern_action {
-                                ModernReadAction::AttributesCurrent => {
-                                    auth::PolicyAction::GetObject
-                                }
-                                ModernReadAction::AttributesVersion => {
-                                    auth::PolicyAction::GetObjectVersion
-                                }
-                                _ => unreachable!(),
-                            };
-                            self.requester_can_read_object_with_bucket_policy(
-                                req.requester,
-                                &bucket_info,
-                                bucket_tags.as_deref(),
-                                stored,
-                                read_action,
-                                bucket_policy.as_deref(),
-                            )? && self
-                                .requester_can_read_object_without_existing_tags_with_bucket_policy(
-                                    req.requester,
-                                    &bucket_info,
-                                    bucket_tags.as_deref(),
-                                    stored,
-                                    req.modern_action.policy_action(),
-                                    bucket_policy.as_deref(),
-                                )?
-                        }
-                    };
-                    if allowed {
-                        self.object_attribute_permissions_with_bucket_policy(
-                            req.requester,
-                            &bucket_info,
-                            bucket_tags.as_deref(),
-                            stored,
-                            req.modern_action,
-                            bucket_policy.as_deref(),
-                        )
-                    } else {
-                        Err(ServerError::AccessDenied)
+                            )?
                     }
-                },
-            )
+                };
+                if allowed {
+                    self.object_attribute_permissions_with_bucket_policy(
+                        req.requester,
+                        &bucket_info,
+                        bucket_tags.as_deref(),
+                        stored,
+                        req.modern_action,
+                        bucket_policy.as_deref(),
+                    )
+                } else {
+                    Err(ServerError::AccessDenied)
+                }
+            })
             .map_err(|error| {
                 Self::map_object_read_snapshot_error(
                     &bucket.bucket().name,
@@ -1244,14 +1233,14 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_head_object_with_storage_node(
+    pub(in crate::coordinator) fn authorize_head_object_on_admitted_route(
         &self,
-        storage_node: &Arc<storage::StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &GetObjectRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
         let (bucket, snapshot, attribute_permissions) = self
-            .authorize_object_read_snapshot_with_storage_node(
-                storage_node,
+            .authorize_object_read_snapshot_on_admitted_route(
+                admission,
                 AuthorizedObjectReadSnapshotRequest {
                     requester: req.object.requester(),
                     bucket: req.object.bucket_name_typed(),
@@ -1270,27 +1259,31 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_get_object_attributes(
+    pub(in crate::coordinator) fn authorize_get_object_attributes_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &GetObjectAttributesRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
-        let (bucket, snapshot, attribute_permissions) =
-            self.authorize_object_read_snapshot(AuthorizedObjectReadSnapshotRequest {
-                requester: req.object.requester(),
-                bucket: req.object.bucket_name_typed(),
-                key: req.object.key_typed(),
-                version_id: req.object.version_id,
-                expected_bucket_owner: req.expected_bucket_owner(),
-                missing_discovery: MissingObjectDiscovery::ReadObjectAttributes,
-                modern_action: ModernReadAction::from_get_object_attributes_version(
-                    req.object.version_id,
-                ),
-                snapshot_mode: if req.want_parts {
-                    ObjectReadSnapshotMode::MultipartParts
-                } else {
-                    ObjectReadSnapshotMode::MetadataOnly
+        let (bucket, snapshot, attribute_permissions) = self
+            .authorize_object_read_snapshot_on_admitted_route(
+                admission,
+                AuthorizedObjectReadSnapshotRequest {
+                    requester: req.object.requester(),
+                    bucket: req.object.bucket_name_typed(),
+                    key: req.object.key_typed(),
+                    version_id: req.object.version_id,
+                    expected_bucket_owner: req.expected_bucket_owner(),
+                    missing_discovery: MissingObjectDiscovery::ReadObjectAttributes,
+                    modern_action: ModernReadAction::from_get_object_attributes_version(
+                        req.object.version_id,
+                    ),
+                    snapshot_mode: if req.want_parts {
+                        ObjectReadSnapshotMode::MultipartParts
+                    } else {
+                        ObjectReadSnapshotMode::MetadataOnly
+                    },
                 },
-            })?;
+            )?;
         Ok(AuthorizedObjectRead {
             bucket,
             snapshot,
@@ -1298,14 +1291,14 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_head_object_for_part_with_storage_node(
+    pub(in crate::coordinator) fn authorize_head_object_for_part_on_admitted_route(
         &self,
-        storage_node: &Arc<storage::StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &GetObjectRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
         let (bucket, snapshot, attribute_permissions) = self
-            .authorize_object_read_snapshot_with_storage_node(
-                storage_node,
+            .authorize_object_read_snapshot_on_admitted_route(
+                admission,
                 AuthorizedObjectReadSnapshotRequest {
                     requester: req.object.requester(),
                     bucket: req.object.bucket_name_typed(),

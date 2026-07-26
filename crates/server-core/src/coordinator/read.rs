@@ -430,8 +430,9 @@ impl Coordinator {
     }
 
     /// Head a single part of an object by part number (no body).
-    pub fn head_object_part(
+    pub fn head_object_part_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &GetObjectPartRequest,
     ) -> Result<HeadObjectPartResult, ServerError> {
         observability::trace_scope!(
@@ -448,13 +449,12 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
-        let storage_node = self.storage_node();
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
             attribute_permissions,
-        } = self.authorize_head_object_for_part_with_storage_node(
-            &storage_node,
+        } = self.authorize_head_object_for_part_on_admitted_route(
+            admission,
             &GetObjectRequest {
                 object: ObjectVersionRequest::new(
                     req.object.bucket_name_typed().clone(),
@@ -493,8 +493,8 @@ impl Coordinator {
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             let obj_parts = multipart_parts;
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                self.current_object_lifecycle_expiration_with_storage_node(
-                    &storage_node,
+                self.current_object_lifecycle_expiration_on_admitted_route(
+                    admission,
                     &bucket_summary,
                     key,
                     record.tags.as_deref(),
@@ -569,8 +569,8 @@ impl Coordinator {
                 });
             }
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                self.current_object_lifecycle_expiration_with_storage_node(
-                    &storage_node,
+                self.current_object_lifecycle_expiration_on_admitted_route(
+                    admission,
                     &bucket_summary,
                     key,
                     record.tags.as_deref(),
@@ -611,10 +611,23 @@ impl Coordinator {
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn head_object_part(
+        &self,
+        req: &GetObjectPartRequest,
+    ) -> Result<HeadObjectPartResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.head_object_part_on_admitted_route(&admission, req)
+    }
+
     /// Head object: returns metadata without body.
     ///
     /// Metadata is always read from the DB row (no shard read needed).
-    pub fn head_object(&self, req: &GetObjectRequest) -> Result<HeadObjectResult, ServerError> {
+    pub fn head_object_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &GetObjectRequest,
+    ) -> Result<HeadObjectResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::head_object",
@@ -627,12 +640,11 @@ impl Coordinator {
         let key = req.object.key();
         let version_id = req.object.version_id;
         let cond = req.cond;
-        let storage_node = self.storage_node();
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
             attribute_permissions,
-        } = self.authorize_head_object_with_storage_node(&storage_node, req)?;
+        } = self.authorize_head_object_on_admitted_route(admission, req)?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments: _,
@@ -665,8 +677,8 @@ impl Coordinator {
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
         let emit_lifecycle_expiration = version_id.is_none();
         let lifecycle_expiration = if emit_lifecycle_expiration {
-            self.current_object_lifecycle_expiration_with_storage_node(
-                &storage_node,
+            self.current_object_lifecycle_expiration_on_admitted_route(
+                admission,
                 &bucket_summary,
                 key,
                 record.tags.as_deref(),
@@ -700,10 +712,17 @@ impl Coordinator {
         })
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn head_object(&self, req: &GetObjectRequest) -> Result<HeadObjectResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.head_object_on_admitted_route(&admission, req)
+    }
+
     /// Retrieve object attributes, optionally including multipart ObjectParts
     /// with pagination support.
-    pub fn get_object_attributes(
+    pub fn get_object_attributes_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &GetObjectAttributesRequest,
     ) -> Result<GetObjectAttributesResult, ServerError> {
         observability::trace_scope!(
@@ -725,7 +744,7 @@ impl Coordinator {
             bucket: _,
             snapshot,
             attribute_permissions: _,
-        } = self.authorize_get_object_attributes(req)?;
+        } = self.authorize_get_object_attributes_on_admitted_route(admission, req)?;
         let storage::ObjectReadSnapshot {
             stored,
             object_segments: _,
@@ -831,6 +850,15 @@ impl Coordinator {
             managed_encryption: record.encryption.managed_encryption_algorithm(),
             sse_customer,
         })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn get_object_attributes(
+        &self,
+        req: &GetObjectAttributesRequest,
+    ) -> Result<GetObjectAttributesResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.get_object_attributes_on_admitted_route(&admission, req)
     }
 
     /// Get a byte range of an object from storage (for HTTP Range requests).
