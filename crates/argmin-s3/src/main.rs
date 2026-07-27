@@ -9797,7 +9797,10 @@ mod tests {
             cluster_map_history_route_references: Default::default(),
             pg_observations: Vec::new(),
         };
-        let refresh = client.refresh_node_heartbeat(heartbeat, 2_000).unwrap();
+        let refresh = storage::clock::with_time_override(2_000, || {
+            client.refresh_node_heartbeat(heartbeat, 2_000)
+        })
+        .unwrap();
 
         server.join().unwrap();
         assert_eq!(refresh.lease().node_id(), node_id);

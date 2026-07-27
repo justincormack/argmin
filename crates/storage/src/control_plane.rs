@@ -10366,6 +10366,26 @@ struct VerifiedStorageNodeHeartbeatRefresh {
     response_target: ControlPlaneAuthPrincipal,
 }
 
+fn format_control_plane_auth_rejection(
+    reason: ControlPlaneAuthRejectionReason,
+    envelope: &ControlPlaneAuthEnvelope,
+    authority_now_ms: u64,
+) -> String {
+    if reason != ControlPlaneAuthRejectionReason::ReplayFreshnessFailure {
+        return format!("{reason:?}");
+    }
+    let issued_at_ms = envelope.header().issued_at_ms();
+    let expires_at_ms = envelope.header().expires_at_ms();
+    let issued_delta_ms = issued_at_ms
+        .map(|issued_at_ms| i128::from(issued_at_ms).saturating_sub(i128::from(authority_now_ms)));
+    let expiry_delta_ms = expires_at_ms.map(|expires_at_ms| {
+        i128::from(expires_at_ms).saturating_sub(i128::from(authority_now_ms))
+    });
+    format!(
+        "{reason:?} (issued_at_ms={issued_at_ms:?}, expires_at_ms={expires_at_ms:?}, authority_now_ms={authority_now_ms}, issued_delta_ms={issued_delta_ms:?}, expiry_delta_ms={expiry_delta_ms:?})"
+    )
+}
+
 impl ControlPlaneUnixAuthMetrics {
     fn record_accepted(&self, operation: ControlPlaneAuthOperation) {
         let mut state = self
@@ -11049,6 +11069,24 @@ impl UnixControlPlaneClient {
         deadline: Instant,
         endpoint_pass: &mut ControlPlaneEndpointPass,
     ) -> Result<Vec<u8>, ControlPlaneError> {
+        self.send_liveness_request_raw_response_with_payload_factory_until(
+            kind,
+            deadline,
+            endpoint_pass,
+            || Ok(payload.to_vec()),
+        )
+    }
+
+    fn send_liveness_request_raw_response_with_payload_factory_until<F>(
+        &self,
+        kind: ControlPlaneRpcKind,
+        deadline: Instant,
+        endpoint_pass: &mut ControlPlaneEndpointPass,
+        mut build_payload: F,
+    ) -> Result<Vec<u8>, ControlPlaneError>
+    where
+        F: FnMut() -> Result<Vec<u8>, ControlPlaneError>,
+    {
         debug_assert_eq!(kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
         let mut retry_started = false;
         let mut last_retryable_error = None;
@@ -11074,9 +11112,19 @@ impl UnixControlPlaneClient {
             if endpoint_pass.is_exhausted() {
                 *endpoint_pass = self.endpoint_pass();
             }
+            let payload = build_payload()?;
+            if Instant::now() >= deadline {
+                return match last_retryable_error.take() {
+                    Some(error) => Err(error),
+                    None => Err(ControlPlaneError::RpcUnconfirmed {
+                        message: "heartbeat retry budget expired before the first request"
+                            .to_owned(),
+                    }),
+                };
+            }
             match self.send_request_raw_response_with_endpoint_pass_until(
                 kind,
-                payload,
+                &payload,
                 attempt_deadline,
                 endpoint_pass,
             ) {
@@ -13442,7 +13490,10 @@ impl ControlPlaneUnixAuthVerifier {
             ControlPlaneAuthDecision::Rejected { reason } => {
                 self.metrics.record_rejected(operation, reason);
                 Err(ControlPlaneError::RpcProtocol {
-                    message: format!("control-plane admin command auth rejected: {reason:?}"),
+                    message: format!(
+                        "control-plane admin command auth rejected: {}",
+                        format_control_plane_auth_rejection(reason, &envelope, authority_now_ms)
+                    ),
                 })
             }
         }
@@ -13584,7 +13635,8 @@ impl ControlPlaneUnixAuthVerifier {
                 self.metrics.record_rejected(operation, reason);
                 Err(ControlPlaneError::RpcProtocol {
                     message: format!(
-                        "control-plane frontend runtime-map read auth rejected: {reason:?}"
+                        "control-plane frontend runtime-map read auth rejected: {}",
+                        format_control_plane_auth_rejection(reason, &envelope, authority_now_ms)
                     ),
                 })
             }
@@ -13723,7 +13775,8 @@ impl ControlPlaneUnixAuthVerifier {
                     .record_rejected(ControlPlaneAuthOperation::StorageRuntimeMapRefresh, reason);
                 Err(ControlPlaneError::RpcProtocol {
                     message: format!(
-                        "control-plane storage-node heartbeat auth rejected: {reason:?}"
+                        "control-plane storage-node heartbeat auth rejected: {}",
+                        format_control_plane_auth_rejection(reason, &envelope, authority_now_ms)
                     ),
                 })
             }
@@ -14085,12 +14138,15 @@ impl ControlPlaneHeartbeatRuntimeMapSource for AuthenticatedUnixControlPlaneClie
     fn refresh_node_heartbeat(
         &mut self,
         heartbeat: NodeHeartbeat,
-        authority_now_ms: u64,
+        initial_authority_now_ms: u64,
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
-        let start = Instant::now();
+        // A retry must follow wall-clock corrections instead of projecting the
+        // first sample forward with monotonic elapsed time.
+        let mut first_attempt_now_ms = Some(initial_authority_now_ms);
         self.refresh_node_heartbeat_with_clock(heartbeat, || {
-            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            Ok(authority_now_ms.saturating_add(elapsed_ms))
+            Ok(first_attempt_now_ms
+                .take()
+                .unwrap_or_else(crate::clock::current_time_millis))
         })
     }
 }
@@ -14133,24 +14189,6 @@ impl AuthenticatedUnixControlPlaneClient {
         let deadline = Instant::now() + retry_budget;
         let mut endpoint_pass = self.inner.endpoint_pass();
         let payload = loop {
-            let issued_at_ms = authority_now_ms()?;
-            let expires_at_ms = issued_at_ms
-                .checked_add(heartbeat.requested_lease_duration_ms)
-                .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
-            let envelope = self.credential.sign_envelope(
-                crate::control_plane_auth::ControlPlaneAuthSignInput {
-                    target: ControlPlaneAuthTarget::Service(
-                        crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
-                    ),
-                    operation: ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
-                    issued_at_ms: Some(issued_at_ms),
-                    expires_at_ms: Some(expires_at_ms),
-                    sequence: None,
-                    nonce: Vec::new(),
-                    payload: payload.clone(),
-                },
-            )?;
-            let request = envelope.encode_frame()?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(ControlPlaneError::RpcUnconfirmed {
@@ -14158,13 +14196,35 @@ impl AuthenticatedUnixControlPlaneClient {
                         .to_owned(),
                 });
             }
-            before_dispatch();
-            let response = self.inner.send_liveness_request_raw_response_until(
-                ControlPlaneRpcKind::RefreshNodeHeartbeat,
-                &request,
-                deadline,
-                &mut endpoint_pass,
-            )?;
+            let response = self
+                .inner
+                .send_liveness_request_raw_response_with_payload_factory_until(
+                    ControlPlaneRpcKind::RefreshNodeHeartbeat,
+                    deadline,
+                    &mut endpoint_pass,
+                    || {
+                        let issued_at_ms = authority_now_ms()?;
+                        let expires_at_ms = issued_at_ms
+                            .checked_add(heartbeat.requested_lease_duration_ms)
+                            .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
+                        let envelope = self.credential.sign_envelope(
+                            crate::control_plane_auth::ControlPlaneAuthSignInput {
+                                target: ControlPlaneAuthTarget::Service(
+                                    crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
+                                ),
+                                operation: ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
+                                issued_at_ms: Some(issued_at_ms),
+                                expires_at_ms: Some(expires_at_ms),
+                                sequence: None,
+                                nonce: Vec::new(),
+                                payload: payload.clone(),
+                            },
+                        )?;
+                        let request = envelope.encode_frame()?;
+                        before_dispatch();
+                        Ok(request)
+                    },
+                )?;
             let response = self.verify_runtime_map_response(
                 ControlPlaneRpcKind::RefreshNodeHeartbeat,
                 authority_now_ms()?,
@@ -29114,6 +29174,79 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_unix_control_plane_client_resigns_heartbeat_transport_retry() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let heartbeat_epoch = authority.snapshot().cluster_epoch();
+        let verifier =
+            storage_node_auth_verifier("auth-cluster", vec![storage_node_auth_node_credential(1)]);
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            let first_envelope = ControlPlaneAuthEnvelope::decode_frame(
+                &request.payload,
+                CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+            )
+            .unwrap();
+            assert_eq!(first_envelope.header().issued_at_ms(), Some(2_000));
+            drop(stream);
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            let retry_envelope = ControlPlaneAuthEnvelope::decode_frame(
+                &request.payload,
+                CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+            )
+            .unwrap();
+            assert_eq!(
+                retry_envelope.header().issued_at_ms(),
+                Some(1_900),
+                "transport retry must be re-signed after a wall-clock correction"
+            );
+            let response = build_control_plane_unix_response_with_auth(
+                &mut authority,
+                request,
+                1_900,
+                Some(&verifier),
+            )
+            .unwrap();
+            write_control_plane_unix_response(&mut stream, response).unwrap();
+        });
+
+        let refresh = crate::clock::with_time_override(1_900, || {
+            let mut client = AuthenticatedUnixControlPlaneClient::new(
+                UnixControlPlaneClient::new(&socket_path),
+                storage_node_auth_credential("auth-cluster", 1, 42),
+            );
+            client.refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 42,
+                    endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+                    observed_epoch: heartbeat_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                2_000,
+            )
+        })
+        .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(refresh.lease().lease_deadline_ms(), 2_900);
+    }
+
+    #[test]
     fn authenticated_unix_control_plane_client_does_not_recreate_heartbeat_deadline() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
@@ -29203,8 +29336,8 @@ mod tests {
             UnixControlPlaneClient::new(&socket_path),
             old_signer,
         );
-        let refresh = client
-            .refresh_node_heartbeat(
+        let refresh = crate::clock::with_time_override(2_000, || {
+            client.refresh_node_heartbeat(
                 NodeHeartbeat {
                     node_id: NodeId::new(1),
                     node_incarnation: 42,
@@ -29216,7 +29349,8 @@ mod tests {
                 },
                 2_000,
             )
-            .unwrap();
+        })
+        .unwrap();
 
         server.join().unwrap();
         assert_eq!(refresh.lease().node_id(), NodeId::new(1));
@@ -29641,7 +29775,11 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("ReplayFreshnessFailure")),
+            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+                if message.contains("ReplayFreshnessFailure")
+                    && message.contains("issued_at_ms=None")
+                    && message.contains("expires_at_ms=None")
+                    && message.contains("authority_now_ms=2000")),
             "unexpected error: {error}"
         );
         let metrics = verifier.metrics_snapshot();
@@ -29697,7 +29835,11 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("ReplayFreshnessFailure")),
+            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+                if message.contains("ReplayFreshnessFailure")
+                    && message.contains("issued_at_ms=Some(1999)")
+                    && message.contains("expires_at_ms=Some(12000)")
+                    && message.contains("issued_delta_ms=Some(-1)")),
             "unexpected error: {error}"
         );
         let metrics = verifier.metrics_snapshot();
