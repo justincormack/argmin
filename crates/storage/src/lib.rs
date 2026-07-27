@@ -76,13 +76,15 @@ pub use cluster::{
     LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
     LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
     LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PgMetadataTransferArtifact,
-    PlacedSegmentShardBackfillCopyTarget, PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth,
-    PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk, PlacedSegmentShardValidation,
-    ProcessLocalRegistryKey, ReleasedObjectPayloadLease, RetainedObjectPayloadRead,
-    RetainedStreamUploadCleanup, ShardLocation, StorageCluster, StorageClusterRouteAdmission,
-    StorageClusterRuntimeMapHandle, StorageClusterRuntimeMapRefreshLoop,
-    StorageClusterRuntimeMapRefreshLoopFailure, StorageClusterRuntimeMapRefreshLoopStatus,
-    StorageClusterRuntimeMapRefreshLoopStatusHandle, StorageClusterRuntimeMapRefreshLoopSuccess,
+    PlacedSegmentShardBackfillCandidateEnqueueSummary,
+    PlacedSegmentShardBackfillCandidateScanCursor, PlacedSegmentShardBackfillCopyTarget,
+    PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth, PlacedSegmentShardSetHealth,
+    PlacedSegmentShardSetRisk, PlacedSegmentShardValidation, ProcessLocalRegistryKey,
+    ReleasedObjectPayloadLease, RetainedObjectPayloadRead, RetainedStreamUploadCleanup,
+    ShardLocation, StorageCluster, StorageClusterRouteAdmission, StorageClusterRuntimeMapHandle,
+    StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopFailure,
+    StorageClusterRuntimeMapRefreshLoopStatus, StorageClusterRuntimeMapRefreshLoopStatusHandle,
+    StorageClusterRuntimeMapRefreshLoopSuccess,
 };
 #[cfg(feature = "test-hooks")]
 pub use cluster::{

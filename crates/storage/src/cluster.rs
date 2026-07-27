@@ -1132,6 +1132,39 @@ pub struct PlacedSegmentShardBackfillCandidateEnqueueSummary {
     pub limit_reached: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PlacedSegmentShardBackfillCandidateKey {
+    source_cluster_epoch: ClusterEpoch,
+    data_pg_id: u32,
+    segment_vid: u64,
+    segment_okh: [u8; 16],
+    stored_size: usize,
+    segment_crc64: u64,
+    ec_k: u8,
+    ec_m: u8,
+}
+
+impl PlacedSegmentShardBackfillCandidateKey {
+    fn new(request: SegmentStoredBytesRequest, source_cluster_epoch: ClusterEpoch) -> Self {
+        Self {
+            source_cluster_epoch,
+            data_pg_id: request.data_pg_id,
+            segment_vid: request.segment_vid.get(),
+            segment_okh: request.segment_okh,
+            stored_size: request.stored_size,
+            segment_crc64: request.segment_crc64,
+            ec_k: request.ec.k,
+            ec_m: request.ec.m,
+        }
+    }
+}
+
+/// Resume position for bounded placed-segment backfill candidate verification.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlacedSegmentShardBackfillCandidateScanCursor {
+    after: Option<PlacedSegmentShardBackfillCandidateKey>,
+}
+
 impl PlacedSegmentShardBackfillPlan {
     #[must_use]
     pub fn is_complete(&self) -> bool {
@@ -13619,20 +13652,46 @@ impl StorageCluster {
 
     pub fn enqueue_placed_segment_shard_backfills_from_scavenger_references(
         &self,
+        cursor: &mut PlacedSegmentShardBackfillCandidateScanCursor,
     ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
-        self.enqueue_placed_segment_shard_backfills_from_scavenger_references_with_limit(
+        self.enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
+            cursor,
             PLACED_SEGMENT_SHARD_BACKFILL_CANDIDATE_SCAN_LIMIT,
         )
     }
 
+    #[cfg(test)]
     fn enqueue_placed_segment_shard_backfills_from_scavenger_references_with_limit(
         &self,
         scan_limit: usize,
     ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
+        let mut cursor = PlacedSegmentShardBackfillCandidateScanCursor::default();
+        self.enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
+            &mut cursor,
+            scan_limit,
+        )
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn test_enqueue_placed_segment_shard_backfills_from_scavenger_references_with_limit(
+        &self,
+        cursor: &mut PlacedSegmentShardBackfillCandidateScanCursor,
+        scan_limit: usize,
+    ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
+        self.enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
+            cursor, scan_limit,
+        )
+    }
+
+    fn enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
+        &self,
+        cursor: &mut PlacedSegmentShardBackfillCandidateScanCursor,
+        scan_limit: usize,
+    ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
         let mut summary = PlacedSegmentShardBackfillCandidateEnqueueSummary::default();
         let desired_epoch = self.operation_epoch();
-        let mut seen_candidates = HashSet::new();
-        let mut verified_candidates = 0usize;
+        let mut candidates = BTreeMap::new();
         for route in self.local_pg_routes() {
             if route.state() != PgState::Active {
                 continue;
@@ -13666,98 +13725,111 @@ impl StorageCluster {
                 else {
                     continue;
                 };
-                if !seen_candidates.insert((request, source_epoch)) {
+                candidates
+                    .entry(PlacedSegmentShardBackfillCandidateKey::new(
+                        request,
+                        source_epoch,
+                    ))
+                    .or_insert((request, source_epoch));
+            }
+        }
+
+        let candidates: Vec<_> = candidates.into_iter().collect();
+        let start = cursor.after.as_ref().map_or(0, |after| {
+            candidates.partition_point(|(candidate, _)| candidate <= after)
+        });
+        let mut verified_candidates = 0usize;
+        for offset in 0..candidates.len() {
+            let (candidate_key, (request, source_epoch)) =
+                candidates[(start + offset) % candidates.len()];
+            summary.scanned += 1;
+            if source_epoch == desired_epoch {
+                summary.current_epoch += 1;
+                continue;
+            }
+            let work_item = PlacedSegmentShardBackfillWorkItem {
+                request,
+                source_cluster_epoch: source_epoch,
+                desired_cluster_epoch: desired_epoch,
+            };
+            match self.placed_segment_shard_backfill_exists(&work_item) {
+                Ok(true) => {
+                    summary.already_queued += 1;
                     continue;
                 }
-                summary.scanned += 1;
-                if source_epoch == desired_epoch {
-                    summary.current_epoch += 1;
+                Ok(false) => {}
+                Err(error) => {
+                    note_shard_backfill_candidate_error(&mut summary, &error);
                     continue;
                 }
-                let work_item = PlacedSegmentShardBackfillWorkItem {
-                    request,
-                    source_cluster_epoch: source_epoch,
-                    desired_cluster_epoch: desired_epoch,
-                };
-                match self.placed_segment_shard_backfill_exists(&work_item) {
-                    Ok(true) => {
-                        summary.already_queued += 1;
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        note_shard_backfill_candidate_error(&mut summary, &error);
-                        continue;
-                    }
-                }
-                if verified_candidates >= scan_limit {
-                    summary.limit_reached = true;
-                    return Ok(summary);
-                }
-                verified_candidates += 1;
-                let pg_id = PgId::new(request.data_pg_id);
-                let source_route = match self.reconstructed_pg_route_at_epoch(pg_id, source_epoch) {
-                    Ok(route) => route,
-                    Err(error) => {
-                        note_shard_backfill_candidate_error(&mut summary, &error);
-                        continue;
-                    }
-                };
-                let desired_route = match self.reconstructed_pg_route_at_epoch(pg_id, desired_epoch)
-                {
-                    Ok(route) => route,
-                    Err(error) => {
-                        note_shard_backfill_candidate_error(&mut summary, &error);
-                        continue;
-                    }
-                };
-                match self.placed_segment_payload_shard_locations_are_equal(
-                    &source_route,
-                    &desired_route,
-                    request,
-                ) {
-                    Ok(true) => {
-                        summary.already_complete += 1;
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        note_shard_backfill_candidate_error(&mut summary, &error);
-                        continue;
-                    }
-                }
-                let plan = match self.placed_segment_payload_shard_backfill_plan(
-                    &source_route,
-                    &desired_route,
-                    request,
-                ) {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        note_shard_backfill_candidate_error(&mut summary, &error);
-                        continue;
-                    }
-                };
-                if !plan.unrecoverable_targets.is_empty() {
-                    summary.unrecoverable += 1;
+            }
+            if verified_candidates >= scan_limit {
+                summary.limit_reached = true;
+                return Ok(summary);
+            }
+            verified_candidates += 1;
+            cursor.after = Some(candidate_key);
+            let pg_id = PgId::new(request.data_pg_id);
+            let source_route = match self.reconstructed_pg_route_at_epoch(pg_id, source_epoch) {
+                Ok(route) => route,
+                Err(error) => {
+                    note_shard_backfill_candidate_error(&mut summary, &error);
                     continue;
                 }
-                if plan.is_complete() {
+            };
+            let desired_route = match self.reconstructed_pg_route_at_epoch(pg_id, desired_epoch) {
+                Ok(route) => route,
+                Err(error) => {
+                    note_shard_backfill_candidate_error(&mut summary, &error);
+                    continue;
+                }
+            };
+            match self.placed_segment_payload_shard_locations_are_equal(
+                &source_route,
+                &desired_route,
+                request,
+            ) {
+                Ok(true) => {
                     summary.already_complete += 1;
                     continue;
                 }
-                if self
-                    .record_placed_segment_shard_backfill_with_remaining_tolerance(
-                        &work_item,
-                        plan.source_remaining_tolerance(),
-                        None,
-                    )
-                    .map_err(|error| note_shard_backfill_candidate_error(&mut summary, &error))
-                    .is_err()
-                {
+                Ok(false) => {}
+                Err(error) => {
+                    note_shard_backfill_candidate_error(&mut summary, &error);
                     continue;
                 }
-                summary.enqueued += 1;
             }
+            let plan = match self.placed_segment_payload_shard_backfill_plan(
+                &source_route,
+                &desired_route,
+                request,
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    note_shard_backfill_candidate_error(&mut summary, &error);
+                    continue;
+                }
+            };
+            if !plan.unrecoverable_targets.is_empty() {
+                summary.unrecoverable += 1;
+                continue;
+            }
+            if plan.is_complete() {
+                summary.already_complete += 1;
+                continue;
+            }
+            if self
+                .record_placed_segment_shard_backfill_with_remaining_tolerance(
+                    &work_item,
+                    plan.source_remaining_tolerance(),
+                    None,
+                )
+                .map_err(|error| note_shard_backfill_candidate_error(&mut summary, &error))
+                .is_err()
+            {
+                continue;
+            }
+            summary.enqueued += 1;
         }
         Ok(summary)
     }

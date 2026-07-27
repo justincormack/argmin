@@ -11,9 +11,11 @@ use storage::PgTopology;
 use storage::{
     AuthorizedMultipartUploadRecord, BucketDeleteBeginRoot, BucketDeleteFinalizeRoot, BucketInfo,
     BucketName, EcShape, GenerationId, ObjectEncryption, ObjectKey,
-    PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardRepairClaimAcquireParams,
-    ProcessLocalRegistryKey, ReclaimWorkItem, SegmentStoredBytesRequest, StorageCluster,
-    StorageClusterRuntimeMapHandle, StoreError, UploadId, UploadState, VersionId,
+    PlacedSegmentShardBackfillCandidateEnqueueSummary,
+    PlacedSegmentShardBackfillCandidateScanCursor, PlacedSegmentShardBackfillClaimAcquireParams,
+    PlacedSegmentShardRepairClaimAcquireParams, ProcessLocalRegistryKey, ReclaimWorkItem,
+    SegmentStoredBytesRequest, StorageCluster, StorageClusterRuntimeMapHandle, StoreError,
+    UploadId, UploadState, VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -771,6 +773,36 @@ pub(super) struct ShardScavengerSweeper {
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
 
+#[derive(Default)]
+pub(super) struct ShardBackfillCandidateScanner {
+    cursor: PlacedSegmentShardBackfillCandidateScanCursor,
+}
+
+impl ShardBackfillCandidateScanner {
+    fn scan(
+        &mut self,
+        storage_handle: &StorageClusterRuntimeMapHandle,
+    ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
+        storage_handle
+            .current()
+            .enqueue_placed_segment_shard_backfills_from_scavenger_references(&mut self.cursor)
+    }
+
+    #[cfg(test)]
+    pub(super) fn scan_with_limit(
+        &mut self,
+        storage_handle: &StorageClusterRuntimeMapHandle,
+        scan_limit: usize,
+    ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
+        storage_handle
+            .current()
+            .test_enqueue_placed_segment_shard_backfills_from_scavenger_references_with_limit(
+                &mut self.cursor,
+                scan_limit,
+            )
+    }
+}
+
 pub(super) struct ShardRepairSweeper {
     pub(super) storage_handle: StorageClusterRuntimeMapHandle,
     pub(super) stop: Arc<AtomicBool>,
@@ -1429,6 +1461,7 @@ impl ShardScavengerSweeper {
                 let sweep_interval = shard_scavenger_sweep_interval();
                 let pressure_sample_interval = BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL;
                 let mut next_sweep = Instant::now();
+                let mut backfill_candidate_scanner = ShardBackfillCandidateScanner::default();
                 while !stop.load(Ordering::SeqCst) {
                     let storage_cluster = storage_handle.current();
                     let admission = background_work_admission_for(&storage_cluster);
@@ -1450,9 +1483,7 @@ impl ShardScavengerSweeper {
                         if let Some(_permit) =
                             admission.try_acquire(BackgroundWorkClass::BackfillCandidateScan)
                         {
-                            match storage_cluster
-                                .enqueue_placed_segment_shard_backfills_from_scavenger_references()
-                            {
+                            match backfill_candidate_scanner.scan(&storage_handle) {
                                 Ok(summary) => {
                                     let _ = observability::emit_shard_backfill_candidate_scan(
                                         TRACE_TARGET,

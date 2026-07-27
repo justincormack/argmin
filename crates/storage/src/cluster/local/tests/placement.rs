@@ -2962,9 +2962,10 @@ fn shard_scavenger_backfill_candidate_scan_records_historical_payloads() {
         bucket,
         key,
     );
+    let mut cursor = crate::cluster::PlacedSegmentShardBackfillCandidateScanCursor::default();
     let summary = fixture
         .desired_cluster
-        .enqueue_placed_segment_shard_backfills_from_scavenger_references()
+        .enqueue_placed_segment_shard_backfills_from_scavenger_references(&mut cursor)
         .unwrap();
     assert_eq!(
         summary,
@@ -3041,8 +3042,9 @@ fn shard_scavenger_backfill_candidate_scan_skips_unchanged_effective_placement()
         key,
     );
 
+    let mut cursor = crate::cluster::PlacedSegmentShardBackfillCandidateScanCursor::default();
     let summary = same_placement_cluster
-        .enqueue_placed_segment_shard_backfills_from_scavenger_references()
+        .enqueue_placed_segment_shard_backfills_from_scavenger_references(&mut cursor)
         .unwrap();
     assert_eq!(
         summary,
@@ -3159,6 +3161,98 @@ fn shard_scavenger_backfill_candidate_scan_limit_skips_already_queued_candidates
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().any(|row| row.work_item.request == fixture.req));
     assert!(rows.iter().any(|row| row.work_item.request == second_req));
+}
+
+#[test]
+fn shard_scavenger_backfill_candidate_scan_cursor_advances_past_complete_candidates() {
+    let fixture = backfill_route_fixture(b"phase-eleven-scanner-backfill-cursor-first");
+    fixture
+        .desired_cluster
+        .backfill_placed_segment_payload_shard_direct_copies(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap();
+    let first_bucket =
+        crate::BucketName::try_from("backfill-scan-cursor-bucket-a".to_string()).unwrap();
+    let first_key = crate::ObjectKey::try_from("backfill-scan-cursor-key-a".to_string()).unwrap();
+    record_backfill_scavenger_object_segment_reference_on_pg(
+        &fixture.desired_cluster,
+        PgId::new(1),
+        fixture.source_route.cluster_epoch(),
+        fixture.req,
+        first_bucket,
+        first_key,
+    );
+
+    let second_bucket =
+        crate::BucketName::try_from("backfill-scan-cursor-bucket-b".to_string()).unwrap();
+    let second_key = crate::ObjectKey::try_from("backfill-scan-cursor-key-b".to_string()).unwrap();
+    let second_segment_okh = [0x42; 16];
+    let second_generation_id = crate::GenerationId::new(2).unwrap();
+    let second_payload = b"phase-eleven-scanner-backfill-cursor-second";
+    let second_written = fixture
+        .source_cluster
+        .write_direct_put_segment_payload_shards(
+            &second_bucket,
+            &second_key,
+            second_generation_id,
+            0,
+            &second_segment_okh,
+            second_payload,
+        )
+        .unwrap();
+    fixture
+        .source_cluster
+        .test_register_payload_shard_acks(second_written.data_pg_id, &second_written.written_shards)
+        .unwrap();
+    let second_req = crate::SegmentStoredBytesRequest {
+        data_pg_id: second_written.data_pg_id,
+        segment_okh: second_segment_okh,
+        segment_vid: second_generation_id,
+        stored_size: second_payload.len(),
+        segment_crc64: checksum::crc64::checksum(second_payload),
+        ec: second_written.ec,
+    };
+    assert!(fixture.req.segment_vid.get() < second_req.segment_vid.get());
+    record_backfill_scavenger_object_segment_reference_on_pg(
+        &fixture.desired_cluster,
+        PgId::new(1),
+        fixture.source_route.cluster_epoch(),
+        second_req,
+        second_bucket,
+        second_key,
+    );
+
+    let mut cursor = crate::cluster::PlacedSegmentShardBackfillCandidateScanCursor::default();
+    let first_scan = fixture
+        .desired_cluster
+        .enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
+            &mut cursor,
+            1,
+        )
+        .unwrap();
+    assert_eq!(first_scan.already_complete, 1);
+    assert_eq!(first_scan.enqueued, 0);
+    assert!(first_scan.limit_reached);
+
+    let second_scan = fixture
+        .desired_cluster
+        .enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
+            &mut cursor,
+            1,
+        )
+        .unwrap();
+    assert_eq!(second_scan.enqueued, 1);
+    assert!(fixture
+        .desired_cluster
+        .placed_segment_shard_backfill_exists(&crate::PlacedSegmentShardBackfillWorkItem {
+            request: second_req,
+            source_cluster_epoch: fixture.source_route.cluster_epoch(),
+            desired_cluster_epoch: fixture.desired_route.cluster_epoch(),
+        })
+        .unwrap());
 }
 
 #[test]

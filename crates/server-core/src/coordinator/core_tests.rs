@@ -3309,6 +3309,199 @@ fn shard_backfill_worker_uses_refreshed_runtime_map_handle() {
 }
 
 #[test]
+fn shard_backfill_candidate_scanner_retains_cursor_across_runtime_map_replacement() {
+    let tmp = test_util::tempdir();
+    let ec_shape = EcShape { k: 4, m: 2 };
+    let pg_id = PgId::new(0);
+    let source_epoch = ClusterEpoch::INITIAL;
+    let source_acting_set = (0..6).map(NodeId::new).collect::<Vec<_>>();
+    let desired_acting_set = [0, 2, 3, 4, 5, 6]
+        .into_iter()
+        .map(NodeId::new)
+        .collect::<Vec<_>>();
+    let configs = (0..7)
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                NodeId::new(node_id),
+                tmp.path().join(format!("node-{node_id:04}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let source_route = storage::control_plane::PgRouteSnapshot::reconstructed(
+        source_epoch,
+        pg_id,
+        NodeId::new(0),
+        source_acting_set,
+        PgState::Active,
+    );
+    let source_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs.clone(),
+        &[pg_id.get()],
+        ec_shape,
+        source_epoch,
+        [LocalPgRoute::from(&source_route)],
+    )
+    .unwrap();
+    let source_cluster = StorageCluster::from_local_map(Arc::new(source_map)).unwrap();
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&source_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "backfill-cursor-bucket", false)
+        .unwrap();
+    let bucket = trusted_bucket_name("backfill-cursor-bucket");
+
+    let put_segment = |key: &str, payload: &[u8]| {
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "backfill-cursor-bucket",
+                    key,
+                    test_requester(),
+                    None,
+                ),
+                data: payload,
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        let segment = source_cluster
+            .test_get_object_segments(&bucket, &trusted_object_key(key), put.version_id)
+            .unwrap()
+            .pop()
+            .expect("direct PUT should record one segment");
+        let encryption = match source_cluster
+            .test_get_object_meta(&bucket, &trusted_object_key(key))
+            .unwrap()
+        {
+            StoredObject::Live(object) => object.encryption,
+            StoredObject::DeleteMarker(marker) => {
+                panic!("direct PUT unexpectedly stored delete marker: {marker:?}")
+            }
+        };
+        SegmentStoredBytesRequest {
+            data_pg_id: segment.data_pg_id,
+            segment_okh: segment.segment_okh,
+            segment_vid: segment.segment_vid,
+            stored_size: usize::try_from(segment.size)
+                .unwrap()
+                .checked_add(encryption.segment_ciphertext_extra_len())
+                .unwrap(),
+            segment_crc64: segment.segment_crc64,
+            ec: EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+        }
+    };
+    let first_request = put_segment("first", b"first historical payload");
+    let second_request = put_segment("second", b"second historical payload");
+    let request_order = |request: &SegmentStoredBytesRequest| {
+        (
+            request.segment_vid.get(),
+            request.segment_okh,
+            request.stored_size,
+            request.segment_crc64,
+            request.ec.k,
+            request.ec.m,
+        )
+    };
+    let (complete_request, missing_request) =
+        if request_order(&first_request) < request_order(&second_request) {
+            (first_request, second_request)
+        } else {
+            (second_request, first_request)
+        };
+
+    let desired_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
+    let desired_route = storage::control_plane::PgRouteSnapshot::reconstructed(
+        desired_epoch,
+        pg_id,
+        NodeId::new(0),
+        desired_acting_set.clone(),
+        PgState::Active,
+    );
+    let mut desired_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs.clone(),
+        &[pg_id.get()],
+        ec_shape,
+        desired_epoch,
+        [LocalPgRoute::from(&desired_route)],
+    )
+    .unwrap();
+    desired_map.test_install_historical_pg_routes([source_route.clone()]);
+    desired_map.test_set_route_map_validity(long_lived_test_route_map_validity());
+    let desired_cluster = StorageCluster::from_local_map(Arc::new(desired_map)).unwrap();
+    let complete_source_health = desired_cluster
+        .placed_segment_payload_shard_health_for_pg_route_snapshot(&source_route, complete_request)
+        .unwrap();
+    assert_eq!(
+        complete_source_health.risk,
+        storage::PlacedSegmentShardSetRisk::Healthy,
+        "source payload should be readable through the replacement map: {complete_source_health:?}"
+    );
+    desired_cluster
+        .backfill_placed_segment_payload_shard_direct_copies(
+            &source_route,
+            &desired_route,
+            complete_request,
+        )
+        .unwrap();
+    assert!(!desired_cluster
+        .placed_segment_payload_shard_backfill_plan(&source_route, &desired_route, missing_request,)
+        .unwrap()
+        .is_complete());
+
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&desired_cluster));
+    let mut scanner = super::runtime::ShardBackfillCandidateScanner::default();
+    let first_scan = scanner.scan_with_limit(&handle, 1).unwrap();
+    assert_eq!(first_scan.already_complete, 1);
+    assert_eq!(first_scan.enqueued, 0);
+    assert!(first_scan.limit_reached);
+
+    let replacement_epoch = ClusterEpoch::new(desired_epoch.get() + 1).unwrap();
+    let replacement_route = storage::control_plane::PgRouteSnapshot::reconstructed(
+        replacement_epoch,
+        pg_id,
+        NodeId::new(0),
+        desired_acting_set,
+        PgState::Active,
+    );
+    let mut replacement_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs,
+        &[pg_id.get()],
+        ec_shape,
+        replacement_epoch,
+        [LocalPgRoute::from(&replacement_route)],
+    )
+    .unwrap();
+    replacement_map.test_install_historical_pg_routes([source_route]);
+    replacement_map.test_set_route_map_validity(long_lived_test_route_map_validity());
+    let replacement = StorageCluster::from_local_map(Arc::new(replacement_map)).unwrap();
+    handle.install(Arc::clone(&replacement)).unwrap();
+    assert!(Arc::ptr_eq(&handle.current(), &replacement));
+
+    let second_scan = scanner.scan_with_limit(&handle, 1).unwrap();
+    assert_eq!(second_scan.enqueued, 1);
+    assert!(replacement
+        .placed_segment_shard_backfill_exists(&PlacedSegmentShardBackfillWorkItem {
+            request: missing_request,
+            source_cluster_epoch: source_epoch,
+            desired_cluster_epoch: replacement_epoch,
+        })
+        .unwrap());
+}
+
+#[test]
 fn shard_backfill_worker_executes_remote_storage_node_work() {
     let tmp = test_util::tempdir();
     let source_node_ids = [
