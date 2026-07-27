@@ -246,6 +246,144 @@ old owner's access in the same change. Until then, `storage` exclusively owns th
 control-plane and Raft formats, and `argmin-s3` exclusively owns the static manifest and
 process-identity formats.
 
+### RPC Boundary Inventory (2026-07-27)
+
+This inventory covers the storage-node, control-plane, and Raft peer RPC surfaces. All three
+protocols are owned by `storage`. `argmin-s3` owns process configuration and lifecycle, but it
+must eventually pass typed endpoint/listener and credential configuration to storage-owned
+clients and servers rather than implementing any wire exchange itself. No separate protocol
+crate is justified by the current dependency graph.
+
+The protocols currently assume identical binaries. They have exact current-version rejection,
+but no version negotiation or supported compatibility window:
+
+| Surface | Current wire baseline | Authentication baseline | Negotiation and current disposition |
+| --- | --- | --- | --- |
+| Storage-node RPC | `STORAGE_RPC_FRAME_ENCODING_VERSION = 8` in `storage_rpc.rs`; frame magic, message-kind tags, checksums, and payload codecs are crate-private. | Binding version 2 and transport-envelope version 1 in `storage_rpc_auth.rs`. | Exact versions are required before dispatch. There is no negotiation. Treat any other version as incompatible until mixed-version operation is designed. |
+| Control-plane RPC | `CONTROL_PLANE_RPC_VERSION = 9` in `control_plane.rs`; the frame contains magic, version, request kind, length, checksum, and payload. | Shared control-plane authentication-envelope version 1 in `control_plane_auth.rs`. | The frame and auth decoders reject non-current versions before logical dispatch. There is no negotiation. Treat any other version as incompatible. |
+| Raft peer RPC | `CONTROL_PLANE_RAFT_PEER_RPC_VERSION = 2` in `control_plane_raft.rs`; request, response, snapshot, peer-identity, checksum, and numeric OpenRaft tags share this baseline. | Shared control-plane authentication-envelope version 1, with the authenticated operation and peer identity bound to the inner frame. | The decoder rejects non-current versions before OpenRaft dispatch. There is no negotiation, and OpenRaft peers currently require the same binary. Treat any other version as incompatible. |
+
+These are ephemeral wire formats, so there is no in-place migration or authoritative rebuild
+operation. A mismatch closes the exchange without dispatch. Any future rolling-upgrade support
+must negotiate a compatible protocol before requests are sent; it must not add fallback parsing
+to the current codecs.
+
+The public boundary and containment status for each surface are as follows.
+
+#### Storage-node RPC
+
+- The intended logical client boundary is `StorageCluster` plus its typed operations. Client
+  construction uses `LocalUnixStorageNodeClientConfig`, `StorageRpcClientEndpoint`, admission
+  settings, and typed authentication capabilities. The intended server boundary is
+  `PreparedStorageNodeServer`/`StorageNodeServer` plus `StorageNodeRpcListenerConfig` and
+  `StorageRpcServerAuthConfig`.
+- Storage already owns connection establishment, deadlines, framing, request/response codecs,
+  authentication, dispatch, and server accept loops for both Unix and TLS/TCP transports. The
+  binary supplies endpoint, listener, TLS, credential, and lifecycle configuration and invokes
+  `serve_forever()`; it does not handle storage-node frames.
+- The remaining wire leak is `StorageRpcErrorCode`. `StoreError::StorageRpc` publicly carries
+  that wire discriminant, and both `server-core` and `argmin-s3` match its variants to decide
+  metadata contention, route refresh, background deferral, and transport retry. Those callers
+  also construct wire-coded errors in tests. Wire-to-semantic translation is therefore not
+  complete even though the main codec is crate-private.
+- `storage_rpc_transport` also publicly exposes the protocol ALPN and generic stream traits even
+  though no external production caller uses the stream traits. `argmin-s3` constructs Rustls
+  configurations with `argmin-storage-rpc/1` directly and tests the literal protocol profile.
+  Endpoint/listener configuration is a valid public input, but ALPN selection and validation are
+  protocol representation and must move behind storage-owned TLS endpoint constructors.
+- Retry policy is currently split. Storage maps transport failures and remote codes into
+  `StoreError`, and some storage-internal callers classify them, but equivalent wire-code matches
+  are duplicated in `server-core` and `argmin-s3`. The owner must expose semantic error variants
+  or operation-appropriate classification methods; callers must not infer retryability from a
+  wire code, I/O context string, or remote message.
+- Raw codec, malformed-frame, authentication, client, and server tests are already in `storage`.
+  Cross-crate S3/process tests mostly use logical storage operations. The remaining
+  `argmin-s3` ALPN/endpoint-shape tests should use typed configuration and leave protocol-profile
+  assertions in `storage`.
+
+#### Control-plane RPC
+
+- The intended logical client boundary is `UnixControlPlaneClient` or
+  `AuthenticatedUnixControlPlaneClient` through the control-plane admin, heartbeat, runtime-map,
+  and authority-clock traits. The authority implementations and typed snapshots/results also
+  belong to `storage`.
+- The Unix client path is storage-owned, but the general client extension point is a raw
+  `ControlPlaneRpcFrameTransport`. It gives `argmin-s3` a fully encoded request `Vec<u8>`, frame
+  limit, deadline, and request-sent state and expects a fully encoded response `Vec<u8>`.
+  `static_cluster_config.rs` consequently implements Unix and TLS/TCP connect, deadline, ALPN,
+  complete-frame write/read, size enforcement, and construction of protocol errors.
+- The server boundary is substantially open. `argmin-s3/main.rs` binds Unix and TCP listeners,
+  performs TLS and ALPN handling, manages worker and pre-auth byte budgets, reads raw frames,
+  invokes storage authentication and endpoint-admission helpers, dispatches verified requests,
+  writes framed responses, and classifies response-write I/O errors. Public
+  `ControlPlaneRpcRequest`, `VerifiedControlPlaneRpcRequest`, `ControlPlaneRpcResponse`, raw
+  read/verify/write functions, and `ControlPlaneAuthEnvelope::decode_frame` exist chiefly to
+  support that binary-owned protocol loop.
+- `CONTROL_PLANE_RPC_TLS_ALPN` is public and `argmin-s3` constructs and validates
+  `argmin-control-plane/1` Rustls profiles directly. As with storage-node RPC, the static manifest
+  may specify endpoint and TLS material, but storage must own ALPN and protocol-profile assembly.
+- `ControlPlaneError` currently mixes logical authority failures with public `Io`, `RpcProtocol`,
+  and string-valued `RpcRemote` wire/transport failures. The storage clients own much of the
+  retry logic, including read-only endpoint failover and operation-specific response-loss
+  confirmation, but `argmin-s3` still destructures I/O errors for metrics and parses rendered
+  control-plane and runtime-map messages to make retry decisions. These need owner-defined
+  semantic classifications and a stable server diagnostic surface.
+- Storage contains comprehensive codec, version, authentication, retry, and Unix client/server
+  tests. `argmin-s3` also has raw-frame tests for pre-auth admission, TLS/ALPN, authentication,
+  response publication, and transport failure injection. Process-level lifecycle and durability
+  tests may remain there, but malformed-frame and protocol-profile tests must move to `storage`;
+  process tests should call a logical client or an opaque storage-owned test facility.
+
+#### Raft peer RPC
+
+- The intended logical boundary is `ControlPlaneRaftAuthority` and its typed bootstrap,
+  lifecycle, linearized-command, status, and leader-routed-admin handles. The OpenRaft network,
+  peer server, authentication policy, and durability-before-ack behavior are all storage-owned
+  protocol concerns.
+- Storage owns the Unix peer network and maps transport failures into OpenRaft `Unreachable` or
+  `Network` errors. For configured TLS/TCP peers, however, it exports
+  `ControlPlaneRaftPeerFrameTransport` and `ControlPlaneRaftPeerFrameExchange`, exposing encoded
+  frames, limits, deadlines, context strings, and protocol-error construction.
+  `static_cluster_config.rs` implements the TCP length prefix, frame allocation, TLS/ALPN, and
+  raw response exchange.
+- The inbound server is also binary-owned. `argmin-s3/main.rs` binds listeners, establishes TLS,
+  reads the transport length prefix, decodes the shared authentication envelope, extracts frame
+  kind/identity/operation, validates admission, calls raw OpenRaft frame handlers through
+  `ControlPlaneRaftAuthority::raft()`, signs and writes the response, and coordinates durable
+  checkpoint publication before acknowledgement.
+- The resulting public representation includes peer request/response/snapshot types,
+  `encode_frame`/`decode_frame`, frame-kind and identity decoders, transport read/write helpers,
+  the raw frame handlers, shared auth-envelope codecs, the ALPN constant, and the underlying
+  OpenRaft `Raft` handle. None is an appropriate binary-facing logical API.
+- Retry classification is partly correct inside storage: the network maps typed transport
+  failures to the OpenRaft error categories that drive peer retry. It is nevertheless coupled to
+  public `ControlPlaneError::Io` construction and context strings supplied by `argmin-s3`.
+  Storage must own the concrete TCP/Unix transport errors and their OpenRaft classification.
+- Raw codec, version, identity-binding, authentication, transport, and OpenRaft dispatch tests
+  already exist in `control_plane_raft.rs`. `argmin-s3` duplicates extensive raw-frame,
+  malformed-envelope, TLS/ALPN, admission, and response-publication testing. The protocol cases
+  belong in `storage`; only process lifecycle, crash, and durability-observation tests should
+  remain in the binary crate, using logical or opaque owner-provided facilities.
+
+This completes the RPC inventory only; it does not satisfy Phase 1 containment. The bounded
+implementation order is:
+
+1. Translate storage-node wire errors fully inside `storage`, expose the semantic
+   classifications required by callers, remove the public `StorageRpcErrorCode` re-export, and
+   relocate tests that construct wire-coded `StoreError` values.
+2. Replace the control-plane raw client frame-transport extension with storage-owned Unix and
+   TLS/TCP endpoint configuration. Keep static-manifest parsing in `argmin-s3`, but hide frames,
+   ALPN, request-sent tracking, and transport error construction.
+3. Add a storage-owned control-plane server facade that accepts listener, resource-limit,
+   authentication, authority-clock, and durability-publication configuration while owning TLS,
+   frame admission, verification, dispatch, response framing, and transport diagnostics.
+4. Replace the Raft raw client frame transport with storage-owned peer endpoint configuration,
+   then add a storage-owned peer server facade that preserves the existing pre-auth allocation
+   bound and durability-before-ack invariant.
+5. Make raw control-plane/Raft frame, auth-envelope, ALPN, OpenRaft-handle, and transport-error
+   APIs private after callers and protocol tests have moved. Add repository checks for the
+   concrete leaks only after the replacement facades exist.
+
 Phase 1 exit criteria:
 
 - Every version boundary has one recorded owner crate and a documented public logical API.
@@ -390,28 +528,34 @@ The storage-owned PG layout slice is complete:
 - Native-lock symlink and replacement tests are owned by `storage`; the boundary check rejects
   exposing the constant or literal filename to `argmin-s3`.
 
-Residual containment work includes completing the RPC/control-plane/Raft ownership inventory,
+Residual containment work includes closing the inventoried RPC/control-plane/Raft leaks,
 hiding WAL and restart-format constructors, and replacing any remaining higher-layer
 implementation-error matching. These remain explicit work below.
 
 ## Immediate Next Steps
 
-1. Inventory the storage-node, control-plane, and Raft RPC surfaces by owner crate, including
-   framing, authentication envelopes, error translation, retry classification, and transport
-   setup.
-2. Refactor control-plane and Raft serving toward storage-owned client/server facades so the
-   binary supplies configuration and lifecycle control but never handles protocol frames.
-3. Hide public WAL/restart-format constructors and move direct WAL/impossible-state tests into
+1. Remove the public `StorageRpcErrorCode` boundary by translating wire failures into
+   storage-owned semantic errors and classifications before they reach `server-core` or
+   `argmin-s3`.
+2. Replace the raw control-plane client frame transport with storage-owned Unix and TLS/TCP
+   endpoint configuration.
+3. Move control-plane server framing, authentication, admission, dispatch, and transport
+   diagnostics behind a storage-owned server facade.
+4. Move Raft TLS/TCP client exchange and inbound peer serving behind storage-owned facades,
+   preserving the pre-auth allocation bound and durability-before-ack invariant.
+5. Privatize the raw control-plane/Raft frame, auth-envelope, ALPN, OpenRaft-handle, and
+   transport-error APIs and relocate malformed-wire tests into `storage`.
+6. Hide public WAL/restart-format constructors and move direct WAL/impossible-state tests into
    the owner.
-4. Replace higher-layer matching on database/RPC implementation errors with owner-defined
+7. Replace other higher-layer matching on database/RPC implementation errors with owner-defined
    semantic errors or classification methods.
-5. Inventory and restrict nested durable codecs for metadata, tags, ACLs, and encryption;
+8. Inventory and restrict nested durable codecs for metadata, tags, ACLs, and encryption;
    record how containing formats advance when a nested format changes.
-6. Audit existing version/fallback code and remove unsupported legacy compatibility where it
+9. Audit existing version/fallback code and remove unsupported legacy compatibility where it
    worsens current invariants.
-7. Add or tighten current-version rejection tests for existing versioned formats.
-8. Add boundary checks for the concrete leaks found in this audit, while relying on crate
+10. Add or tighten current-version rejection tests for existing versioned formats.
+11. Add boundary checks for the concrete leaks found in this audit, while relying on crate
    privacy for the durable enforcement.
-9. Remove the trigger-verification item from Phase 11 stabilisation tracking and keep this
+12. Remove the trigger-verification item from Phase 11 stabilisation tracking and keep this
     plan as the upgrade home for it; defer trigger body hashing/recreation until the upgrade
     framework is deliberately started.
