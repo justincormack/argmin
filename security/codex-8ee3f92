@@ -1,0 +1,183 @@
+UAT backfill wait no longer checks target PG
+Link: https://chatgpt.com/codex/cloud/security/findings/a13f83b61640819188c1eada5e474c7b?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 8ee3f92
+Author: justin@specialbusservice.com
+Created: 27/07/2026, 12:00:51
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Resolution
+Fixed in commit [`a69e4b91ec0e2aca7769097483937811da0c8193`](https://github.com/justincormack/argmin/commit/a69e4b91ec0e2aca7769097483937811da0c8193) (`Require target PG backfill outcomes in UAT`).
+
+The finding was valid as a correctness and release-gate issue, but not as a
+production security vulnerability. The generic per-PG/event diagnostic table
+is intentionally best effort and capped at 512 dimensions, so restoring the
+old checks against that table would still have allowed target-PG evidence to
+disappear in long-running UAT processes.
+
+The fix adds a separate bounded per-PG outcome table for the two exact signals
+the migration gate needs: `backfilled` and `complete_succeeded`. It supports
+all 4,096 PGs permitted by the static manifest, remains independent of generic
+diagnostic-dimension exhaustion, and continues updating existing PG entries
+when at capacity. The local debug metrics endpoint exports the retained values
+as `shard_backfill_backfilled_by_pg_total` and
+`shard_backfill_complete_succeeded_by_pg_total`.
+
+The PG migration smoke now snapshots both target-PG counters before changing
+the acting set and requires each exact counter to advance before reporting
+success. Supplying a target PG without both target-specific bounds is rejected,
+and unrelated global or per-PG backfill progress can no longer satisfy the
+wait. Aggregate progress, queue-drain, admission, and hard-failure checks remain
+in place as independent workflow diagnostics.
+
+Regression coverage proves that target outcome retention survives exhaustion
+of the generic dimension table, that the dedicated table is bounded without
+losing updates for existing PGs, and that both exact metric families are
+exported through the debug endpoint. Validation for the fixing commit passed:
+
+- `cargo nextest run`: 7,613 tests passed.
+- `cargo clippy --all-targets --all-features -- -D warnings`.
+- `cargo nextest run -p observability shard_backfill_outcomes`.
+- `cargo nextest run -p server-http local_debug_metrics_endpoint_bypasses_request_admission`.
+- `bash -n scripts/uat-s3-tests`, `cargo fmt --all -- --check`, and
+  `git diff --check`.
+
+# Summary
+Introduced a non-security UAT false-positive risk by removing target-PG-specific backfill completion checks while retaining a target_pg_id parameter that is no longer enforced.
+The Rust changes add fixed AtomicU64 outcome counters for shard backfill events and expose them through the existing metrics snapshot path. I did not find an authentication, authorization, memory-safety, crash, or information-disclosure issue in those runtime changes. However, the UAT script now accepts a target PG id but no longer checks per-PG `backfilled` or `complete_succeeded` metrics for that PG. In `run_pg_backfill_migration_smoke`, the thresholds are derived from global counters and the target data PG is passed only for logging. If another placement group completes backfill during the wait window, the smoke test can return success without proving the intended PG was backfilled. This weakens test coverage and can hide a backfill regression, but it is not a production security vulnerability.
+
+# Validation
+## Rubric
+- [x] Confirm the helper still accepts a target_pg_id parameter.
+- [x] Confirm the success condition no longer requires target-PG-specific backfilled or complete_succeeded metrics.
+- [x] Confirm run_pg_backfill_migration_smoke derives thresholds from global counters only and passes $data_pg only for logging.
+- [x] Reproduce with synthetic metrics where global counters satisfy thresholds but the target PG has no per-PG completion events.
+- [x] Compare with parent behavior to verify the commit removed target-PG enforcement.
+## Report
+Validated the suspected introduced UAT false-positive. The checked-out commit is 8ee3f92ccb3fe36c50a54166dd3713cb2aeb4a56. In scripts/uat-s3-tests, wait_for_shard_backfill_completion_metrics still accepts target_pg_id at line 1722, but the success condition at lines 1760-1762 only checks global counters: scan_total, enqueued, written, completed, queue_depth, routine_admitted, and routine_finished. The target PG is only interpolated into the success log. The commit diff confirms the regression: it removed min_pg_backfilled/min_pg_completed parameters and removed per-target-PG latest_metric_family_label_sum checks for event=backfilled and event=complete_succeeded; the PG migration caller now passes only $data_pg without target-PG thresholds. I built a targeted shell PoC that extracts the actual helper and metric parser functions from scripts/uat-s3-tests, stubs metric sampling, and feeds metrics where global backfill counters meet thresholds but only pg-other has per-PG backfilled/complete_succeeded events. Running /workspace/validation_artifacts/argmin-uat-backfill-poc/uat_backfill_false_positive_poc.sh /workspace/argmin returned: poc_exit=0 target_pg_complete_succeeded=0 other_pg_complete_succeeded=1 and FALSE_POSITIVE_CONFIRMED. The helper printed success with pg_id=pg-target even though the target PG had zero complete_succeeded samples. As counter-evidence for introduction, /workspace/validation_artifacts/argmin-uat-backfill-poc/uat_parent_check.sh exercises HEAD^ with min_pg_backfilled=1 and min_pg_completed=1 in the same wrong-PG scenario; it timed out and exited 2. Crash/valgrind/debugger attempts were considered: this is Bash UAT logic, not a memory-safety path; bash -n scripts/uat-s3-tests succeeded, and valgrind/gdb/bashdb are not installed. The PoC includes a non-interactive bash set -x trace as dynamic evidence of the success branch.
+
+# Evidence
+scripts/uat-s3-tests (L1722 to 1762)
+  Note: The wait helper still accepts target_pg_id, but the success condition only checks global backfill counters; the target PG is used only in the log message.
+```
+    local target_pg_id="${14:-}"
+    local start
+    start="$(date +%s)"
+    while true; do
+        sample_frontend_metrics "$metrics_path"
+        local scan_total
+        local enqueued
+        local written
+        local completed
+        local queue_depth
+        local routine_admitted
+        local routine_finished
+        local candidate_failed
+        local candidate_deferred
+        local scan_error
+        local complete_failed
+        local failed
+        local stale_retry
+        local record_error_failed
+        scan_total="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_total)"
+        enqueued="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_enqueued_total)"
+        written="$(latest_metric_sample_value "$metrics_path" shard_backfill_shards_written_total)"
+        completed="$(latest_metric_sample_value "$metrics_path" shard_backfill_complete_succeeded_total)"
+        queue_depth="$(latest_metric_sample_value "$metrics_path" shard_backfill_queue_depth)"
+        routine_admitted="$(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event admitted class routine_backfill)"
+        routine_finished="$(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event finished class routine_backfill)"
+        candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
+        candidate_deferred="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_deferred_total)"
+        scan_error="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_error_total)"
+        complete_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_complete_failed_total)"
+        failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_failed_total)"
+        stale_retry="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event stale_retry)"
+        record_error_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_record_error_failed_total)"
+        if ((candidate_failed > max_candidate_failed || scan_error > max_scan_error || complete_failed > max_complete_failed || failed > max_failed || record_error_failed > max_record_error_failed)); then
+            print_shard_backfill_debug "$metrics_path"
+            cat "$metrics_path" >&2 || true
+            die "shard backfill worker hard-failure metrics increased: candidate_failed=$candidate_failed scan_error=$scan_error complete_failed=$complete_failed failed=$failed record_error_failed=$record_error_failed"
+        fi
+        if ((scan_total >= min_scan_total && enqueued >= min_enqueued && written >= min_written && completed >= min_completed && queue_depth == 0 && routine_admitted >= min_routine_admitted && routine_finished >= min_routine_finished)); then
+            echo "== argmin-s3 UAT shard backfill metrics: scan_total=$scan_total enqueued=$enqueued written=$written complete_succeeded=$completed candidate_deferred=$candidate_deferred candidate_failed=$candidate_failed scan_error=$scan_error stale_retry=$stale_retry failed=$failed queue_depth=$queue_depth routine_admitted=$routine_admitted routine_finished=$routine_finished pg_id=${target_pg_id:-any} =="
+            return 0
+```
+
+scripts/uat-s3-tests (L2857 to 2862)
+  Note: The PG migration smoke computes minimum thresholds from global counters only, with no per-target-PG backfilled/completed thresholds.
+```
+    min_scan_total="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_total)"
+    min_enqueued="$(($(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_enqueued_total) + 1))"
+    min_written="$(($(latest_metric_sample_value "$metrics_path" shard_backfill_shards_written_total) + 1))"
+    min_completed="$(($(latest_metric_sample_value "$metrics_path" shard_backfill_complete_succeeded_total) + 1))"
+    min_routine_admitted="$(($(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event admitted class routine_backfill) + 1))"
+    min_routine_finished="$(($(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event finished class routine_backfill) + 1))"
+```
+
+scripts/uat-s3-tests (L2898 to 2912)
+  Note: The caller passes the target data PG to the wait helper, but no corresponding per-PG thresholds are passed or enforced.
+```
+    wait_for_shard_backfill_completion_metrics \
+        "$metrics_path" \
+        30 \
+        "$min_scan_total" \
+        "$min_enqueued" \
+        "$min_written" \
+        "$min_completed" \
+        "$min_routine_admitted" \
+        "$min_routine_finished" \
+        "$max_candidate_failed" \
+        "$max_scan_error" \
+        "$max_complete_failed" \
+        "$max_failed" \
+        "$max_record_error_failed" \
+        "$data_pg"
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Adjusted from low to ignore for security triage. The bug is real and validated, but it is confined to scripts/uat-s3-tests, a UAT/developer harness. The only demonstrated effect is a false-positive PG backfill smoke result when unrelated global backfill counters satisfy thresholds. The production S3 service path still uses SigV4 authentication, and the metrics/debug path relevant to the test is disabled by default and loopback/test-gated. There is no realistic in-scope attacker, no public exposure, and no demonstrated security impact.
+## Likelihood
+ignore - The false-positive test condition is plausible in CI or developer testing, but it is not attacker-reachable from the product's network/runtime threat surface. Exploitation requires control over or coincidence within internal UAT execution, not external user input.
+## Impact
+ignore - The direct impact is weakened UAT coverage: a CI/developer smoke test can pass without validating the target placement group. No evidence shows confidentiality loss, integrity violation, privilege escalation, authentication bypass, RCE, or production data exposure.
+## Assumptions
+- Analysis is limited to repository artifacts in /workspace/argmin; no cloud APIs or deployed environments were inspected.
+- scripts/uat-s3-tests is treated as a developer/CI UAT harness, not as part of the production S3 service attack surface.
+- No repository IaC or manifests were found showing this UAT helper exposed as a network service.
+- A developer or CI job runs scripts/uat-s3-tests with the pg-backfill-migration smoke.
+- The UAT metrics wait window sees global shard-backfill counters advance due to some placement group other than the intended target PG.
+- The test result is trusted as coverage for the intended PG backfill behavior.
+## Path
+Developer/CI -> scripts/uat-s3-tests -> local metrics -> global counters meet thresholds -> target PG unchecked -> UAT false positive
+## Path evidence
+- `scripts/uat-s3-tests:1722-1762` - wait_for_shard_backfill_completion_metrics accepts target_pg_id, but the success condition only checks global counters and uses target_pg_id only in the log message.
+- `scripts/uat-s3-tests:2857-2862` - run_pg_backfill_migration_smoke computes minimum thresholds from global counters, with no target-PG-specific backfilled or complete_succeeded threshold.
+- `scripts/uat-s3-tests:2898-2912` - The caller passes $data_pg to the helper, but no corresponding per-PG threshold arguments are passed or enforced.
+- `scripts/uat-s3-tests:7-15` - The script describes itself as a UAT harness that starts argmin-s3 with UAT-only test credentials and runs s3-tests, supporting developer/CI-only scope.
+- `crates/argmin-s3/src/config.rs:617-618` - The product S3 listener defaults to ARGMIN_LISTEN_ADDR or 127.0.0.1:9000; no public repository ingress was found.
+- `crates/argmin-s3/src/config.rs:777-784` - Local debug endpoints are disabled by default and require a test build or local-debug-endpoints feature.
+- `crates/argmin-s3/src/config.rs:1084-1099` - When local debug endpoints are enabled, configuration requires a frontend role and loopback listen address.
+- `crates/server-http/src/http/mod.rs:3641-3665` - Normal HTTP S3 handling authenticates requests through auth::authenticate_request before dispatch.
+- `crates/server-http/src/http/serve.rs:511-524` - Runtime server has connection and in-flight request admission controls, unrelated to the UAT false-positive path.
+- `crates/argmin-s3/src/main.rs:296-303` - The binary rejects running as root, reducing host privilege exposure.
+## Narrative
+The reported defect is real as a UAT/test bug: the helper still accepts target_pg_id, but the success condition only checks global shard-backfill counters and logs the target PG. The pg-backfill-migration smoke derives thresholds from global counters and passes $data_pg without per-PG thresholds. Validation evidence includes an executable shell PoC demonstrating success for pg-target when only pg-other has completion events, and a parent-commit comparison showing the old per-PG checks failed the same scenario. However, this is not a reachable production security vulnerability. The affected file is a UAT harness, not the S3 runtime. The runtime service remains authenticated via SigV4, defaults to 127.0.0.1:9000, rejects root execution, and its local debug metrics path is disabled by default and constrained to test/local-debug loopback use.
+## Controls
+- SigV4 authentication for normal S3 requests
+- Local debug endpoints disabled by default
+- Local debug endpoints require test/local-debug build support and loopback binding
+- Connection and in-flight request semaphores
+- Header read timeout and TLS handshake timeout
+- Secrets redacted from Debug formatting
+- Process refuses to run as root
+## Blindspots
+- Static-only review cannot determine whether downstream CI gates releases on this specific smoke test.
+- No deployment manifests or runtime environment were present to confirm actual production ARGMIN_LISTEN_ADDR or TLS settings.
+- No cloud identities, load balancers, or external ingress could be assessed because cloud APIs were intentionally not called.

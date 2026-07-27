@@ -129,6 +129,7 @@ for the current local security suite.
 | Finding | Status | Local deterministic path | Notes |
 | --- | --- | --- | --- |
 | `security/codex-d9e6a71` UAT forced-overload env data directory can be deleted after passing run | fixed | `bash -n scripts/uat-forced-overload` | Informational local tooling issue; env-provided forced-overload data dirs are now treated as caller-owned like `--data-dir`. |
+| `security/codex-8ee3f92` UAT backfill wait no longer checks target PG | fixed in `a69e4b91` | `cargo nextest run -p observability shard_backfill_outcomes`; `cargo nextest run -p server-http local_debug_metrics_endpoint_bypasses_request_admission`; `bash -n scripts/uat-s3-tests` | Valid non-security UAT correctness finding. A dedicated bounded outcome table retains exact per-PG backfill and completion counters independently of generic metric cardinality limits, and the migration smoke requires both target-PG counters to advance. |
 
 ## Backlog Sync: Regression Path Mapping Needed
 
