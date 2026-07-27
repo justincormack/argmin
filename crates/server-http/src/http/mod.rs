@@ -3248,7 +3248,10 @@ impl HttpFrontend {
                     expected_bucket_owner,
                 )?;
                 self.coordinator
-                    .validate_in_progress_multipart_upload_target(&upload_request)?;
+                    .validate_in_progress_multipart_upload_target_on_admitted_route(
+                        storage_route_admission,
+                        &upload_request,
+                    )?;
                 let part_number = request::parse_upload_part_copy_number_value(&part_number_raw)?;
 
                 let (src_bucket, src_key, src_version_id) = parse_copy_source_header(copy_source)?;
@@ -4749,7 +4752,10 @@ impl HttpFrontend {
             expected_bucket_owner.as_deref(),
         )?;
         self.coordinator
-            .validate_in_progress_multipart_upload_target(&upload)?;
+            .validate_in_progress_multipart_upload_target_on_admitted_route(
+                &storage_route_admission,
+                &upload,
+            )?;
 
         validate_request_checksum_headers(req, false, false, false)?;
         let content_md5 = ContentMd5Claim::from_request(req)?;

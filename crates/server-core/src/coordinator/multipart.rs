@@ -1113,18 +1113,27 @@ impl Coordinator {
     ///
     /// AWS performs this lookup before operation-specific part-number, checksum,
     /// and copy-range validation, but before current-policy authorization.
+    pub fn validate_in_progress_multipart_upload_target_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        upload: &MultipartObjectRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.require_storage_route_admission(admission)?;
+        admission
+            .active_multipart_object_route(upload.bucket_name_typed(), upload.key_typed())
+            .map_err(super::map_store_error)?
+            .load_in_progress_multipart_upload(upload.upload_id())
+            .map(|_| ())
+            .map_err(Self::map_object_pg_action_error)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn validate_in_progress_multipart_upload_target(
         &self,
         upload: &MultipartObjectRequest<'_>,
     ) -> Result<(), ServerError> {
-        self.storage_node()
-            .load_in_progress_multipart_upload(
-                upload.bucket_name_typed(),
-                upload.key_typed(),
-                upload.upload_id(),
-            )
-            .map(|_| ())
-            .map_err(Self::map_object_pg_action_error)
+        let admission = self.admit_storage_route_for_request()?;
+        self.validate_in_progress_multipart_upload_target_on_admitted_route(&admission, upload)
     }
 
     /// Abort an in-progress multipart upload.

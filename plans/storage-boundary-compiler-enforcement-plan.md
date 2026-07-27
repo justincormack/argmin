@@ -3205,6 +3205,34 @@ Sixty-ninth Phase 3 slice:
 - remaining buffered coordinator workflows and capability requirements on
   node-client traits remain open in Phase 3.
 
+Seventieth Phase 3 slice:
+
+- the request-layer active-upload preflight shared by ordinary UploadPart and
+  UploadPartCopy now consumes the request's existing
+  `StorageClusterRouteAdmission`. Both the streaming and buffered HTTP paths
+  use the same `ActiveMultipartObjectRoute` as their later authorization and
+  mutation work instead of resampling the renewable runtime-map handle between
+  authentication and operation-specific part/checksum/copy-range validation.
+- the lookup retains its AWS-compatible ordering and error behavior: it
+  requires a currently in-progress upload before parsing those
+  operation-specific fields and maps a missing, terminal, wrong-key, or
+  invalid upload ID to `NoSuchUpload`. Unlike completion preflight, it does not
+  authenticate a terminal upload ID for possible replay.
+- the shared multipart preflight deadline regression now proves a same-epoch
+  raw-route renewal cannot extend either completion or active-upload lookup
+  authority, preserves the active upload after rejection, and succeeds under
+  a fresh admission. The multipart publication-domain matrix rejects the
+  active-upload lookup through a same-cluster admission minted by another
+  runtime-map handle while retaining an owning-coordinator positive canary.
+  Existing storage coverage independently proves the admitted route cannot
+  load a crossed same-PG key's upload.
+- the focused coordinator preflight/domain tests and the 22-test server-http
+  UploadPart matrix pass. Formatting, diff validation, the storage boundary
+  checker, workspace-wide strict Clippy, and the full parallel workspace suite
+  pass (7,634 tests).
+- remaining buffered coordinator workflows and capability requirements on
+  node-client traits remain open in Phase 3.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

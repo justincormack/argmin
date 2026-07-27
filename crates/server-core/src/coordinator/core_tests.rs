@@ -1547,7 +1547,7 @@ fn list_parts_expires_after_authorization_and_uses_admitted_lifecycle_route() {
 }
 
 #[test]
-fn complete_multipart_preflight_rejects_an_expired_admission_after_same_epoch_renewal() {
+fn multipart_upload_target_preflights_reject_an_expired_admission_after_same_epoch_renewal() {
     let tmp = test_util::tempdir();
     let cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
@@ -1593,6 +1593,10 @@ fn complete_multipart_preflight_rejects_an_expired_admission_after_same_epoch_re
         .validate_complete_multipart_upload_target_on_admitted_route(&admission, &request)
         .unwrap_err();
     assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    let error = coord
+        .validate_in_progress_multipart_upload_target_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
     drop(admission);
     assert_eq!(
         cluster
@@ -1610,6 +1614,9 @@ fn complete_multipart_preflight_rejects_an_expired_admission_after_same_epoch_re
     let fresh_admission = coord.admit_storage_route_for_request().unwrap();
     coord
         .validate_complete_multipart_upload_target_on_admitted_route(&fresh_admission, &request)
+        .unwrap();
+    coord
+        .validate_in_progress_multipart_upload_target_on_admitted_route(&fresh_admission, &request)
         .unwrap();
 }
 
@@ -3440,6 +3447,19 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
     assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
     foreign
         .validate_complete_multipart_upload_target_on_admitted_route(
+            &foreign_admission,
+            &complete_preflight_request,
+        )
+        .unwrap();
+    let error = local
+        .validate_in_progress_multipart_upload_target_on_admitted_route(
+            &foreign_admission,
+            &complete_preflight_request,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    foreign
+        .validate_in_progress_multipart_upload_target_on_admitted_route(
             &foreign_admission,
             &complete_preflight_request,
         )
