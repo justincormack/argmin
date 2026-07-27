@@ -329,30 +329,6 @@ impl Coordinator {
         Ok(Self::bucket_summary(info))
     }
 
-    pub(super) fn checked_active_bucket_summary_for(
-        &self,
-        name: &BucketName,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<ValidatedBucket, ServerError> {
-        self.checked_active_bucket_summary_for_storage_node(
-            &self.storage_node(),
-            name,
-            expected_bucket_owner,
-        )
-    }
-
-    pub(super) fn checked_active_bucket_summary_for_storage_node(
-        &self,
-        storage_node: &Arc<StorageCluster>,
-        name: &BucketName,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<ValidatedBucket, ServerError> {
-        Self::validate_expected_bucket_owner(
-            self.unchecked_active_bucket_summary_for_storage_node(storage_node, name)?,
-            expected_bucket_owner,
-        )
-    }
-
     pub(super) fn checked_active_bucket_summary_for_admitted_route(
         &self,
         admission: &StorageClusterRouteAdmission,

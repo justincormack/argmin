@@ -3333,8 +3333,10 @@ impl HttpFrontend {
                 )?;
                 match self
                     .coordinator
-                    .validate_complete_multipart_upload_target(&upload_request)
-                {
+                    .validate_complete_multipart_upload_target_on_admitted_route(
+                        storage_route_admission,
+                        &upload_request,
+                    ) {
                     Ok(()) => {}
                     Err(ServerError::NoSuchUpload { upload_id }) => {
                         return Ok(S3Response::complete_multipart_no_such_upload(

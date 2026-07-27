@@ -1367,6 +1367,73 @@ fn list_parts_expires_after_authorization_and_uses_admitted_lifecycle_route() {
 }
 
 #[test]
+fn complete_multipart_preflight_rejects_an_expired_admission_after_same_epoch_renewal() {
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let metadata = MetadataBlob::new();
+    let upload_id = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                "bucket",
+                "complete-preflight",
+                test_requester(),
+                None,
+            ),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            encryption: WriteEncryptionRequest::none(),
+        })
+        .unwrap()
+        .upload_id;
+    let request = multipart_object_request_with_expected_owner(
+        "bucket",
+        "complete-preflight",
+        &upload_id,
+        test_requester(),
+        None,
+    );
+
+    let clock = storage::clock::test_time_override_guard(1_000);
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    clock.set(4_500);
+    let error = coord
+        .validate_complete_multipart_upload_target_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(admission);
+    assert_eq!(
+        cluster
+            .load_in_progress_multipart_upload(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("complete-preflight"),
+                &upload_id,
+            )
+            .unwrap()
+            .upload_id,
+        upload_id
+    );
+
+    clock.set(1_000);
+    let fresh_admission = coord.admit_storage_route_for_request().unwrap();
+    coord
+        .validate_complete_multipart_upload_target_on_admitted_route(&fresh_admission, &request)
+        .unwrap();
+}
+
+#[test]
 fn list_parts_pins_runtime_map_after_authorization() {
     let bucket = "list-parts-pinned-bucket";
     let tmp = test_util::tempdir();
@@ -3176,6 +3243,27 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
         .unwrap();
     assert_eq!(uploads.len(), 1);
     assert_eq!(uploads[0].upload_id, created.upload_id);
+
+    let complete_preflight_request = multipart_object_request_with_expected_owner(
+        "bucket",
+        "foreign-domain-multipart",
+        &created.upload_id,
+        test_requester(),
+        None,
+    );
+    let error = local
+        .validate_complete_multipart_upload_target_on_admitted_route(
+            &foreign_admission,
+            &complete_preflight_request,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    foreign
+        .validate_complete_multipart_upload_target_on_admitted_route(
+            &foreign_admission,
+            &complete_preflight_request,
+        )
+        .unwrap();
 
     let list_request = ListPartsRequest {
         upload: multipart_object_request_with_expected_owner(

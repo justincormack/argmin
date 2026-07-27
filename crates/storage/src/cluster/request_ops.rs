@@ -13122,7 +13122,31 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        let pg_id = self.object_metadata_pg(bucket, key);
+        self.load_in_progress_multipart_upload_with_route_validation(
+            super::MultipartObjectMutationEffectRoute {
+                pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            upload_id,
+            || Ok(()),
+        )
+    }
+
+    pub(super) fn load_in_progress_multipart_upload_with_route_validation(
+        &self,
+        route: super::MultipartObjectMutationEffectRoute<'_>,
+        upload_id: &UploadId,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        let super::MultipartObjectMutationEffectRoute {
+            pg_id,
+            bucket,
+            key,
+            effect_fence: _,
+        } = route;
+        require_valid_route().map_err(ObjectPgActionError::Store)?;
         self.object_mutation_metadata_primary_client(bucket, key)?
             .load_in_progress_multipart_upload(pg_id, bucket, key, upload_id)
     }

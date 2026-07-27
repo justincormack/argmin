@@ -2583,6 +2583,20 @@ impl ActiveMultipartObjectRoute<'_> {
             )
     }
 
+    /// Load an in-progress upload through this exact admitted object route.
+    pub fn load_in_progress_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .load_in_progress_multipart_upload_with_route_validation(
+                self.effect_route(),
+                upload_id,
+                || self.admission.require_valid_now(),
+            )
+    }
+
     /// List parts for the exact upload authorized through this admitted
     /// object route.
     pub fn list_multipart_parts_for_authorized_upload(

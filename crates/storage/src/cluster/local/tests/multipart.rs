@@ -128,7 +128,7 @@ fn multipart_abort_route_rejects_a_crossed_object_subject_before_mutation() {
 }
 
 #[test]
-fn list_parts_route_rejects_a_crossed_same_pg_upload_before_node_access() {
+fn multipart_routes_bind_crossed_same_pg_upload_subjects() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2];
@@ -188,6 +188,22 @@ fn list_parts_route_rejects_a_crossed_same_pg_upload_before_node_access() {
     let route = admission
         .active_multipart_object_route(&bucket, &routed_key)
         .unwrap();
+    let crossed_route = admission
+        .active_multipart_object_route(&bucket, &crossed_key)
+        .unwrap();
+    assert_eq!(
+        crossed_route
+            .load_in_progress_multipart_upload(&upload_id)
+            .unwrap()
+            .upload_id,
+        upload_id
+    );
+    assert!(matches!(
+        route.load_in_progress_multipart_upload(&upload_id),
+        Err(crate::ObjectPgActionError::Metadata(
+            crate::MetadataError::NoSuchUpload { .. }
+        ))
+    ));
     let error = route
         .list_multipart_parts_for_authorized_upload(
             &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),

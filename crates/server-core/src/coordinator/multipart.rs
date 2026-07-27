@@ -1036,20 +1036,22 @@ impl Coordinator {
     /// completion XML, while authorization still follows XML validation. The
     /// full completion path repeats this lookup so a concurrent terminal state
     /// transition cannot use a stale existence check.
-    pub fn validate_complete_multipart_upload_target(
+    pub fn validate_complete_multipart_upload_target_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         upload: &MultipartObjectRequest<'_>,
     ) -> Result<(), ServerError> {
-        match self.storage_node().load_in_progress_multipart_upload(
-            upload.bucket_name_typed(),
-            upload.key_typed(),
-            upload.upload_id(),
-        ) {
+        self.require_storage_route_admission(admission)?;
+        let multipart_route = admission
+            .active_multipart_object_route(upload.bucket_name_typed(), upload.key_typed())
+            .map_err(super::map_store_error)?;
+        match multipart_route.load_in_progress_multipart_upload(upload.upload_id()) {
             Ok(_) => Ok(()),
             Err(storage::ObjectPgActionError::Metadata(storage::MetadataError::NoSuchUpload {
                 ..
             })) => {
-                let bucket_info = self.checked_active_bucket_summary_for(
+                let bucket_info = self.checked_active_bucket_summary_for_admitted_route(
+                    admission,
                     upload.bucket_name_typed(),
                     upload.expected_bucket_owner(),
                 )?;
@@ -1067,6 +1069,15 @@ impl Coordinator {
             }
             Err(error) => Err(Self::map_object_pg_action_error(error)),
         }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn validate_complete_multipart_upload_target(
+        &self,
+        upload: &MultipartObjectRequest<'_>,
+    ) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.validate_complete_multipart_upload_target_on_admitted_route(&admission, upload)
     }
 
     /// Resolve an operation that is valid only for an active multipart upload.

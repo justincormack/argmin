@@ -3116,6 +3116,38 @@ Sixty-seventh Phase 3 slice:
   workflows and capability requirements on node-client traits also remain
   open in Phase 3.
 
+Sixty-eighth Phase 3 slice:
+
+- CompleteMultipartUpload's request-layer target preflight now consumes the
+  buffered request's existing `StorageClusterRouteAdmission`. This is the
+  AWS-ordering lookup performed after routing/authentication and upload-ID
+  parsing but before checksum-header and completion-XML validation.
+- `ActiveMultipartObjectRoute` now exposes an admitted in-progress-upload
+  lookup for its fixed bucket, key, object-metadata PG, publication domain,
+  runtime-map generation, and immutable deadline. The raw cluster lookup
+  delegates to the same route-validating implementation with test-independent
+  unbounded authority for callers not yet migrated.
+- the preflight deliberately retains its established semantics: an active row
+  succeeds directly; otherwise the issued upload ID is authenticated against
+  the admitted bucket incarnation. It does not reuse the multipart-management
+  lookup or drain pending commands, so terminal replay convergence cannot
+  change malformed-header/XML precedence.
+- a deterministic same-epoch-renewal regression expires the original
+  admission before the object-PG lookup, requires `OperationAborted`, preserves
+  the active upload, and proves a fresh admission succeeds. A same-cluster/
+  different-publication-domain regression rejects foreign admission, while a
+  same-PG crossed-key storage regression proves the admitted route cannot find
+  another key's upload and retains a correct-route positive canary.
+- obsolete raw checked-bucket-summary helpers were removed after the preflight
+  moved its fallback bucket read to the admitted form.
+- all 88 focused CompleteMultipartUpload/storage/HTTP tests pass. Formatting,
+  diff validation, the storage boundary checker, workspace-wide strict Clippy,
+  and the full parallel workspace suite pass (7,618 tests).
+- the full CompleteMultipartUpload authorization, snapshot, commit, replay,
+  lifecycle-response, and reclaim-enqueue workflow remains open for the next
+  capability slice. Other buffered coordinator workflows and capability
+  requirements on node-client traits also remain open in Phase 3.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
