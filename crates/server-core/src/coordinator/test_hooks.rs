@@ -129,6 +129,7 @@ pub(super) struct BucketWriteHandleTestHooks {
     pub(super) after_bucket_mutation_storage_node_capture: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_loaded: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_object_metadata_policy_context: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(super) after_multipart_create_commit: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) probe_direct_put_commit: bool,
     pub(super) probe_begin_stream_part_session: bool,
     pub(super) probe_finalize_stream_part_commit: bool,
@@ -637,6 +638,20 @@ impl Coordinator {
             .clone();
         if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
             if let Some(hook) = hooks.after_loaded {
+                hook();
+            }
+        }
+    }
+
+    pub(super) fn maybe_run_multipart_create_committed_hook(&self, bucket: &str) {
+        let hooks = self
+            .shared_caches
+            .bucket_write_handle_test_hooks
+            .lock()
+            .unwrap()
+            .clone();
+        if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
+            if let Some(hook) = hooks.after_multipart_create_commit {
                 hook();
             }
         }

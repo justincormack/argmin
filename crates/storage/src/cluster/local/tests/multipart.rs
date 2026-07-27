@@ -1,6 +1,64 @@
 use super::*;
 
 #[test]
+fn multipart_create_route_rejects_a_crossed_object_subject_before_mutation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap());
+    let cluster = Arc::new(crate::StorageCluster::from_local_map(map).unwrap());
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let routed_key = crate::ObjectKey::try_from("routed-key".to_string()).unwrap();
+    let crossed_key = crate::ObjectKey::try_from("crossed-key".to_string()).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let upload_id_key = crate::MultipartUploadIdKey::from_bytes([0x5a; 32]);
+    let upload_id = upload_id_key
+        .issue(&bucket, &crossed_key, "initiator")
+        .unwrap();
+    let crossed_create = crate::CreateMultipartUploadReq {
+        upload_id,
+        bucket: bucket.clone(),
+        key: crossed_key,
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission
+        .active_multipart_object_route(&bucket, &routed_key)
+        .unwrap();
+    let error = route
+        .create_multipart_upload_with_ordered_id(
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing_object| {
+                assert!(existing_object.is_none());
+                Ok::<_, ()>(((), crossed_create.clone(), upload_id_key.clone()))
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::BucketSnapshotLoadError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "create multipart upload",
+        })
+    ));
+    assert!(cluster
+        .test_list_multipart_uploads_for_bucket(&bucket)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn multipart_upload_lookup_fails_closed_while_metadata_pg_is_peering() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

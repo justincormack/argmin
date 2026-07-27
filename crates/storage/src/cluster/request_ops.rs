@@ -12535,6 +12535,7 @@ impl super::StorageCluster {
         }))
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn create_multipart_upload<T, E>(
         &self,
         bucket: &BucketName,
@@ -12545,15 +12546,49 @@ impl super::StorageCluster {
             Option<StoredObject>,
         ) -> Result<(T, CreateMultipartUploadReq), E>,
     ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
-        self.create_multipart_upload_inner(bucket, key, request, |snapshot, existing| {
-            action(snapshot, existing).map(|(value, create)| (value, create, None))
-        })
+        self.create_multipart_upload_inner_with_route_validation(
+            super::MultipartObjectMutationEffectRoute {
+                pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            request,
+            |snapshot, existing| {
+                action(snapshot, existing).map(|(value, create)| (value, create, None))
+            },
+        )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn create_multipart_upload_with_ordered_id<T, E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
+        request: BucketSnapshotRequest,
+        action: impl FnMut(
+            BucketSnapshot,
+            Option<StoredObject>,
+        ) -> Result<(T, CreateMultipartUploadReq, MultipartUploadIdKey), E>,
+    ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
+        self.create_multipart_upload_with_ordered_id_with_route_validation(
+            super::MultipartObjectMutationEffectRoute {
+                pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            request,
+            action,
+        )
+    }
+
+    pub(super) fn create_multipart_upload_with_ordered_id_with_route_validation<T, E>(
+        &self,
+        route: super::MultipartObjectMutationEffectRoute<'_>,
+        require_valid_route: impl FnMut() -> Result<(), StoreError>,
         request: BucketSnapshotRequest,
         mut action: impl FnMut(
             BucketSnapshot,
@@ -12561,16 +12596,21 @@ impl super::StorageCluster {
         )
             -> Result<(T, CreateMultipartUploadReq, MultipartUploadIdKey), E>,
     ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
-        self.create_multipart_upload_inner(bucket, key, request, |snapshot, existing| {
-            action(snapshot, existing)
-                .map(|(value, create, upload_id_key)| (value, create, Some(upload_id_key)))
-        })
+        self.create_multipart_upload_inner_with_route_validation(
+            route,
+            require_valid_route,
+            request,
+            |snapshot, existing| {
+                action(snapshot, existing)
+                    .map(|(value, create, upload_id_key)| (value, create, Some(upload_id_key)))
+            },
+        )
     }
 
-    fn create_multipart_upload_inner<T, E>(
+    fn create_multipart_upload_inner_with_route_validation<T, E>(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
+        route: super::MultipartObjectMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         request: BucketSnapshotRequest,
         mut action: impl FnMut(
             BucketSnapshot,
@@ -12584,16 +12624,24 @@ impl super::StorageCluster {
             Retry,
         }
 
-        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let super::MultipartObjectMutationEffectRoute {
+            pg_id: object_pg_id,
+            bucket,
+            key,
+            effect_fence,
+        } = route;
         let pg_id = object_pg_id.pg_id();
         loop {
+            require_valid_route()?;
             let applied_commands = self
                 .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-            let reservation = match self.acquire_durable_bucket_write_reservation(
+            require_valid_route()?;
+            let reservation = match self.acquire_durable_bucket_write_reservation_with_effect_fence(
                 bucket,
                 CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
                 Some(key.as_str()),
+                Some(effect_fence),
             ) {
                 Ok(reservation) => reservation,
                 Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
@@ -12605,6 +12653,7 @@ impl super::StorageCluster {
             let proof = BucketWriteReservationProof::from(&reservation.record);
             let mut disposition = super::BucketWriteReservationDisposition::ReleaseByCaller;
             let result = (|| {
+                require_valid_route()?;
                 let snapshot = reservation.node.load_bucket_snapshot(
                     self.validated_bucket_metadata_pg(PgId::new(reservation.pg_id)),
                     bucket,
@@ -12612,6 +12661,7 @@ impl super::StorageCluster {
                 )?;
 
                 let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+                require_valid_route()?;
                 let current_object = mutation_client
                     .load_current_object_delete_snapshot(object_pg_id, bucket, key)
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
@@ -12624,6 +12674,14 @@ impl super::StorageCluster {
                     Ok(prepared) => prepared,
                     Err(error) => return Ok(Err(error)),
                 };
+                if create.bucket != *bucket || create.key != *key {
+                    return Err(BucketSnapshotLoadError::Store(
+                        StoreError::RouteCapabilitySubjectMismatch {
+                            operation: "create multipart upload",
+                        },
+                    ));
+                }
+                require_valid_route()?;
                 let applied_create =
                     super::applied_multipart_create_command(&applied_commands, &create);
                 if let Some(initiated_at) = mutation_client
@@ -12686,9 +12744,13 @@ impl super::StorageCluster {
                         MetadataCommandPayload::CreateMultipartUpload(Box::new(ordered_command)),
                     );
                 }
+                require_valid_route()?;
                 match self
                     .install_snapshot_sensitive_metadata_command_or_drain(
-                        pg_id, bucket, &command, None,
+                        pg_id,
+                        bucket,
+                        &command,
+                        Some(effect_fence),
                     )
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
                 {

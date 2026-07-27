@@ -2011,6 +2011,22 @@ impl StorageClusterRouteAdmission {
         })
     }
 
+    /// Derive active multipart-control authority for one object from this
+    /// request's admitted runtime-map generation.
+    pub fn active_multipart_object_route<'admission>(
+        &'admission self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<ActiveMultipartObjectRoute<'admission>, StoreError> {
+        self.require_valid_now()?;
+        Ok(ActiveMultipartObjectRoute {
+            admission: self,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            pg_id: self.cluster.object_metadata_pg(bucket, key),
+        })
+    }
+
     /// Narrow this admitted request to cleanup authority for one stream-upload
     /// object. The returned capability can only remove an abandoned session
     /// and its staged state from this admitted route generation; it cannot
@@ -2191,6 +2207,28 @@ pub struct ActiveObjectMetadataMutationRoute<'admission> {
     pg_id: ObjectMetadataPgId,
 }
 
+/// Non-cloneable active authority for multipart control operations on one
+/// object.
+///
+/// The bucket, key, and routed object-metadata PG are fixed at construction.
+/// Multipart operations do not accept those values again, so a prepared
+/// request for another object cannot be published through this capability.
+///
+/// ```compile_fail
+/// use storage::ActiveMultipartObjectRoute;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn cache_route(route: &ActiveMultipartObjectRoute<'_>) {
+///     require_clone(route);
+/// }
+/// ```
+pub struct ActiveMultipartObjectRoute<'admission> {
+    admission: &'admission StorageClusterRouteAdmission,
+    bucket: BucketName,
+    key: ObjectKey,
+    pg_id: ObjectMetadataPgId,
+}
+
 struct ObjectReadMetadataRoute<'a> {
     bucket: &'a BucketName,
     key: &'a ObjectKey,
@@ -2204,6 +2242,13 @@ struct ObjectMetadataMutationEffectRoute<'a> {
     bucket: &'a BucketName,
     key: &'a ObjectKey,
     requested_version_id: Option<VersionId>,
+    effect_fence: AdmittedRouteEffectFence,
+}
+
+struct MultipartObjectMutationEffectRoute<'a> {
+    pg_id: ObjectMetadataPgId,
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
     effect_fence: AdmittedRouteEffectFence,
 }
 
@@ -2484,6 +2529,42 @@ impl ActiveObjectMetadataMutationRoute<'_> {
         self.admission
             .cluster
             .try_probe_object_pg_available(&self.bucket, &self.key)
+    }
+}
+
+impl ActiveMultipartObjectRoute<'_> {
+    fn effect_route(&self) -> MultipartObjectMutationEffectRoute<'_> {
+        MultipartObjectMutationEffectRoute {
+            pg_id: self.pg_id,
+            bucket: &self.bucket,
+            key: &self.key,
+            effect_fence: self.admission.effect_fence(),
+        }
+    }
+
+    pub fn create_multipart_upload_with_ordered_id<T, E>(
+        &self,
+        request: BucketSnapshotRequest,
+        action: impl FnMut(
+            BucketSnapshot,
+            Option<StoredObject>,
+        ) -> Result<
+            (
+                T,
+                crate::CreateMultipartUploadReq,
+                crate::MultipartUploadIdKey,
+            ),
+            E,
+        >,
+    ) -> Result<Result<crate::CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
+        self.admission
+            .cluster
+            .create_multipart_upload_with_ordered_id_with_route_validation(
+                self.effect_route(),
+                || self.admission.require_valid_now(),
+                request,
+                action,
+            )
     }
 }
 

@@ -585,6 +585,7 @@ impl Coordinator {
         &self,
         req: &CreateMultipartUploadRequest<'_>,
         bucket_info: &ValidatedBucket,
+        lifecycle: Option<s3_types::BucketLifecycleConfiguration>,
     ) -> Result<AuthorizedCreateMultipartUpload, ServerError> {
         Self::ensure_sse_c_allowed(bucket_info, req.encryption.sse_customer_request().is_some())?;
         let write_encryption = self.resolve_write_encryption(bucket_info, req.encryption)?;
@@ -599,6 +600,7 @@ impl Coordinator {
 
         Ok(AuthorizedCreateMultipartUpload {
             bucket_info: bucket_info.clone().into_inner(),
+            lifecycle,
             bucket: req.object.bucket.name_typed().clone(),
             key: req.object.key_typed().clone(),
             tags: req.tags.map(str::to_string),

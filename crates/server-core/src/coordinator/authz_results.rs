@@ -10,7 +10,8 @@ use super::request_types::{CreateBucketAcl, Requester};
 use super::response_types::{BucketSummary, GetBucketAclResult};
 use crate::sse::SseCustomerWriteContext;
 use s3_types::{
-    AclGrants, BucketVersioningState, CanonicalUserId, StoredLegalHoldStatus, VersionId,
+    AclGrants, BucketLifecycleConfiguration, BucketVersioningState, CanonicalUserId,
+    StoredLegalHoldStatus, VersionId,
 };
 use storage::BucketObjectOwnership;
 use storage::{
@@ -275,6 +276,7 @@ pub(super) struct AuthorizedCopyObject {
 #[derive(Debug)]
 pub(super) struct AuthorizedCreateMultipartUpload {
     pub(super) bucket_info: BucketSummary,
+    pub(super) lifecycle: Option<BucketLifecycleConfiguration>,
     pub(super) bucket: BucketName,
     pub(super) key: ObjectKey,
     pub(super) tags: Option<String>,

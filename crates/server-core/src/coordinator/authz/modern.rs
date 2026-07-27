@@ -222,7 +222,8 @@ impl Coordinator {
         {
             return Err(ServerError::AccessDenied);
         }
-        self.finalize_authorized_create_multipart_upload_after_auth(req, &bucket_info)
+        let lifecycle = self.cached_bucket_lifecycle_for_loaded_handle(&bucket)?;
+        self.finalize_authorized_create_multipart_upload_after_auth(req, &bucket_info, lifecycle)
     }
 
     pub(super) fn authorize_upload_part_copy_boe(

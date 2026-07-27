@@ -229,7 +229,7 @@ define_metadata_command_publishers! {
         TerminalSessionRetry
     ),
     CreateMultipartUpload => (
-        "create_multipart_upload",
+        "create_multipart_upload_inner_with_route_validation",
         "CreateMultipartUpload",
         SnapshotSensitive
     ),

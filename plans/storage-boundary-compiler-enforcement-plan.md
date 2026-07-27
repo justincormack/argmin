@@ -2993,6 +2993,54 @@ Sixty-fourth Phase 3 slice:
   workflows, and capability requirements on the node-client traits remain
   open in Phase 3.
 
+Sixty-fifth Phase 3 slice:
+
+- CreateMultipartUpload now consumes the buffered request's existing
+  `StorageClusterRouteAdmission`. Production HTTP and coordinator code cannot
+  resample the renewable runtime-map handle after authentication; the direct
+  test/test-support wrapper acquires an admission before entering the same
+  production method.
+- the non-cloneable `ActiveMultipartObjectRoute` fixes the bucket, object key,
+  object-metadata PG, publication domain, runtime-map generation, and immutable
+  admitted deadline for multipart control work. CreateMultipartUpload no
+  longer accepts its routed subject separately after capability construction,
+  and the storage boundary rejects a prepared create command naming another
+  bucket or key before publication.
+- multipart initiation revalidates the admitted route around bucket and object
+  snapshot loading and after the authorization/action closure. Its durable
+  bucket-write reservation acquisition and snapshot-sensitive pending-command
+  insertion both enforce the admission's portable effect fence at the storage
+  effect boundary. Once a command is durably installed, subsequent apply is
+  convergence and retains the existing reservation-release semantics.
+- lifecycle configuration needed for CreateMultipartUpload response headers is
+  loaded in that same admitted bucket snapshot and parsed only after write
+  authorization succeeds. The parsed configuration travels in the authorized
+  result through durable creation; post-commit response construction now only
+  evaluates that snapshot and cannot resample storage or turn a committed
+  upload into a late route-expiry error.
+- raw CreateMultipartUpload storage entry points are limited to tests and the
+  `test-hooks` feature. The publisher registry, contention guide, bucket-write
+  drain guide, scanner, and temporary semantic inventories identify the
+  route-validating inner publisher as the canonical production entry point.
+- the captured-deadline matrix now covers multipart initiation. A deterministic
+  same-epoch-renewal regression expires the original admission between
+  authorization and pending-slot insertion, proves no upload is published,
+  and then proves a fresh admission succeeds. Same-cluster/different-
+  publication-domain and crossed-object-subject regressions prove rejection
+  before mutation, with exact empty-upload canaries.
+- a separate deterministic regression advances the clock beyond the admitted
+  deadline immediately after durable multipart publication. It requires the
+  response to succeed from the captured lifecycle configuration, including the
+  matching abort-rule header, and verifies exactly one durable upload.
+- focused deadline, publication-domain, and crossed-subject regressions pass.
+  The storage boundary checker, all-target/all-feature build, workspace-wide
+  strict Clippy, formatting, and diff checks pass. The full parallel workspace
+  suite passes (7,609 tests).
+- CompleteMultipartUpload, AbortMultipartUpload, ListParts, and the remaining
+  multipart control/read operations remain open for the same capability
+  family. Other buffered coordinator workflows and capability requirements on
+  node-client traits also remain open in Phase 3.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

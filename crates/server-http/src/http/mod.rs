@@ -3194,7 +3194,8 @@ impl HttpFrontend {
                 )
                 .with_object_creation_operation(false);
 
-                let result = self.coordinator.create_multipart_upload(
+                let result = self.coordinator.create_multipart_upload_on_admitted_route(
+                    storage_route_admission,
                     &crate::coordinator::CreateMultipartUploadRequest {
                         object: object_request(&bucket, &key, requester, expected_bucket_owner)?,
                         metadata: &metadata,

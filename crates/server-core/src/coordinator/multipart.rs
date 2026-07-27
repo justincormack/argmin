@@ -459,8 +459,9 @@ impl Coordinator {
     ///
     /// Generates a random upload ID, serializes the metadata blob, and
     /// inserts a new multipart upload record in the metadata PG for (bucket, key).
-    pub fn create_multipart_upload(
+    pub fn create_multipart_upload_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &CreateMultipartUploadRequest,
     ) -> Result<CreateMultipartUploadResult, ServerError> {
         observability::trace_scope!(
@@ -470,21 +471,23 @@ impl Coordinator {
             req.object.bucket_name(),
             req.object.key
         );
+        self.require_storage_route_admission(admission)?;
+        let multipart_route = admission
+            .active_multipart_object_route(req.object.bucket.name_typed(), req.object.key_typed())
+            .map_err(super::map_store_error)?;
         let metadata_blob = req.metadata.serialize()?;
         let system_metadata_blob = req.system_metadata.serialize()?;
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
+            .requiring_lifecycle_view()
             .requiring_bucket_tags_if_abac_enabled();
         let expected_bucket_owner = req.object.expected_bucket_owner();
         let CreateMultipartUploadOutcome {
             value: authorized,
             upload_id: typed_upload_id,
             initiated_at,
-        } = self
-            .storage_node()
+        } = multipart_route
             .create_multipart_upload_with_ordered_id(
-                req.object.bucket.name_typed(),
-                req.object.key_typed(),
                 request.resolve_to_storage_request(),
                 |snapshot, existing_object| {
                     let bucket_handle = self
@@ -534,14 +537,17 @@ impl Coordinator {
                 },
             )
             .map_err(BucketHandleLoader::map_bucket_snapshot_error)??;
+        #[cfg(test)]
+        self.maybe_run_multipart_create_committed_hook(req.object.bucket_name());
         let AuthorizedCreateMultipartUpload {
-            bucket_info,
+            lifecycle,
             key,
             write_encryption,
             ..
         } = authorized;
-        let lifecycle_abort =
-            self.multipart_lifecycle_abort_headers(&bucket_info, key.as_str(), initiated_at)?;
+        let lifecycle_abort = lifecycle.as_ref().and_then(|config| {
+            Self::evaluate_multipart_lifecycle_abort_headers(config, key.as_str(), initiated_at)
+        });
 
         Ok(CreateMultipartUploadResult {
             upload_id: typed_upload_id,
@@ -550,6 +556,15 @@ impl Coordinator {
                 .managed_encryption_algorithm(),
             lifecycle_abort,
         })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn create_multipart_upload(
+        &self,
+        req: &CreateMultipartUploadRequest,
+    ) -> Result<CreateMultipartUploadResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.create_multipart_upload_on_admitted_route(&admission, req)
     }
 
     /// Complete a multipart upload, committing a manifest object.

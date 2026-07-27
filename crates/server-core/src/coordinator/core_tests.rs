@@ -455,6 +455,23 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
             ownership: BucketObjectOwnership::BucketOwnerEnforced,
             object_lock_enabled: false,
         };
+        let multipart_metadata = MetadataBlob::new();
+        let create_multipart_request = CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                "bucket",
+                "expired-multipart",
+                test_requester(),
+                None,
+            ),
+            metadata: &multipart_metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            encryption: WriteEncryptionRequest::none(),
+        };
         let control_request = BucketTagControlRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
         };
@@ -685,6 +702,15 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
                             upload_id_marker: None,
                             max_uploads: 100,
                         },
+                    )
+                    .map(|_| ()),
+            ),
+            (
+                "CreateMultipartUpload",
+                coord
+                    .create_multipart_upload_on_admitted_route(
+                        &admission,
+                        &create_multipart_request,
                     )
                     .map(|_| ()),
             ),
@@ -975,6 +1001,10 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
                 &trusted_bucket_name("expired-create"),
             )
             .unwrap());
+        assert!(cluster
+            .test_list_multipart_uploads_for_bucket(&trusted_bucket_name("bucket"))
+            .unwrap()
+            .is_empty());
     });
 }
 
@@ -1061,6 +1091,146 @@ fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
             .as_deref(),
         Some(request.tags)
     );
+}
+
+#[test]
+fn multipart_creation_expires_at_pending_install_effect_boundary() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
+    drop(initial_coord);
+    drop(initial);
+    let cluster = open_same_store_cluster_with_route_map_validity(
+        same_store_inputs,
+        RouteMapValidity::until_ms(5_000).unwrap(),
+    );
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+
+    let hook_clock = Arc::clone(&clock);
+    let hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            hook_clock.set(4_500)
+        }));
+    let metadata = MetadataBlob::new();
+    let request = CreateMultipartUploadRequest {
+        object: object_request_with_expected_owner(
+            "bucket",
+            "late-multipart",
+            test_requester(),
+            None,
+        ),
+        metadata: &metadata,
+        system_metadata: &SystemMetadata::EMPTY,
+        tags: None,
+        checksum: None,
+        acl: NO_PUT_OBJECT_ACL.into(),
+        policy_context: PutObjectPolicyContext::default(),
+        object_lock: ObjectLockState::default(),
+        encryption: WriteEncryptionRequest::none(),
+    };
+    let error = coord
+        .create_multipart_upload_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+    assert!(cluster
+        .test_list_multipart_uploads_for_bucket(&trusted_bucket_name("bucket"))
+        .unwrap()
+        .is_empty());
+
+    clock.set(1_000);
+    let fresh_admission = coord.admit_storage_route_for_request().unwrap();
+    let created = coord
+        .create_multipart_upload_on_admitted_route(&fresh_admission, &request)
+        .unwrap();
+    let uploads = cluster
+        .test_list_multipart_uploads_for_bucket(&trusted_bucket_name("bucket"))
+        .unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].upload_id, created.upload_id);
+}
+
+#[test]
+fn multipart_creation_uses_admitted_lifecycle_snapshot_after_commit_deadline() {
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    put_bucket_lifecycle_test(
+        &coord,
+        "bucket",
+        "<LifecycleConfiguration><Rule><ID>abort-mpu</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
+        test_requester(),
+        None,
+    )
+    .unwrap();
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_clock = Arc::clone(&clock);
+    let _hook = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+        bucket: Some("bucket".to_string()),
+        after_multipart_create_commit: Some(Arc::new(move || hook_clock.set(4_500))),
+        ..BucketWriteHandleTestHooks::default()
+    });
+    let metadata = MetadataBlob::new();
+    let result = coord
+        .create_multipart_upload_on_admitted_route(
+            &admission,
+            &CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "logs/archive",
+                    test_requester(),
+                    None,
+                ),
+                metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                encryption: WriteEncryptionRequest::none(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        result
+            .lifecycle_abort
+            .as_ref()
+            .and_then(|headers| headers.rule_id.as_deref()),
+        Some("abort-mpu")
+    );
+    let uploads = cluster
+        .test_list_multipart_uploads_for_bucket(&trusted_bucket_name("bucket"))
+        .unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].upload_id, result.upload_id);
 }
 
 #[test]
@@ -2639,6 +2809,71 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
             .unwrap(),
         baseline_bucket_acl
     );
+}
+
+#[test]
+fn multipart_creation_rejects_admission_from_an_unrelated_coordinator() {
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let foreign_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        local_handle,
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+        BackgroundWorkerMode::none(),
+    )
+    .unwrap();
+    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        foreign_handle,
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+        BackgroundWorkerMode::none(),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&local.storage_node(), &foreign.storage_node()));
+    assert!(!local.shares_storage_route_admission_with(&foreign));
+    foreign
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    let request = CreateMultipartUploadRequest {
+        object: object_request_with_expected_owner(
+            "bucket",
+            "foreign-domain-multipart",
+            test_requester(),
+            None,
+        ),
+        metadata: &metadata,
+        system_metadata: &SystemMetadata::EMPTY,
+        tags: None,
+        checksum: None,
+        acl: NO_PUT_OBJECT_ACL.into(),
+        policy_context: PutObjectPolicyContext::default(),
+        object_lock: ObjectLockState::default(),
+        encryption: WriteEncryptionRequest::none(),
+    };
+    let foreign_admission = foreign.admit_storage_route_for_request().unwrap();
+    let error = local
+        .create_multipart_upload_on_admitted_route(&foreign_admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(cluster
+        .test_list_multipart_uploads_for_bucket(&trusted_bucket_name("bucket"))
+        .unwrap()
+        .is_empty());
+
+    let created = foreign
+        .create_multipart_upload_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    let uploads = cluster
+        .test_list_multipart_uploads_for_bucket(&trusted_bucket_name("bucket"))
+        .unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].upload_id, created.upload_id);
 }
 
 #[test]

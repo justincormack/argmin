@@ -543,7 +543,8 @@ impl Coordinator {
         )? {
             return Err(ServerError::AccessDenied);
         }
-        self.finalize_authorized_create_multipart_upload_after_auth(req, &bucket_info)
+        let lifecycle = self.cached_bucket_lifecycle_for_loaded_handle(&bucket)?;
+        self.finalize_authorized_create_multipart_upload_after_auth(req, &bucket_info, lifecycle)
     }
 
     #[cfg(test)]
@@ -553,6 +554,7 @@ impl Coordinator {
     ) -> Result<AuthorizedCreateMultipartUpload, ServerError> {
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
+            .requiring_lifecycle_view()
             .requiring_bucket_tags_if_abac_enabled();
         self.with_bucket_write_handle_for(&req.object, request, |bucket| {
             let existing_object = self
