@@ -16,7 +16,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use futures_util::{Stream, StreamExt};
-use openraft::errors::{NetworkError, RPCError, ReplicationClosed, StreamingError, Unreachable};
+use openraft::errors::{
+    ClientWriteError, LinearizableReadError, NetworkError, RPCError, RaftError, ReplicationClosed,
+    StreamingError, Unreachable,
+};
 use openraft::impls::leader_id_adv::LeaderId;
 use openraft::impls::BasicNode;
 use openraft::impls::Entry;
@@ -51,10 +54,10 @@ use tokio::sync::{mpsc, oneshot};
 use crate::control_plane::{
     connect_unix_stream_until, AuthorityIncarnation, ClusterControlSnapshot,
     ClusterRuntimeMapSnapshot, ControlPlaneAuthorityClockCheckpointBinding,
-    ControlPlaneAuthorityClockContext, ControlPlaneError, ControlPlaneRuntimeMapDiagnosticSnapshot,
-    ControlPlaneRuntimeMapNodeLeaseDiagnostic, ControlPlaneRuntimeMapStatus, DeadlineUnixStream,
-    NodeAvailabilityState, NodeMembershipState, RuntimeMapContentCertificate,
-    RuntimeMapFreshnessProof,
+    ControlPlaneAuthorityClockContext, ControlPlaneError, ControlPlaneRaftOperationErrorKind,
+    ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneRuntimeMapNodeLeaseDiagnostic,
+    ControlPlaneRuntimeMapStatus, DeadlineUnixStream, NodeAvailabilityState, NodeMembershipState,
+    RuntimeMapContentCertificate, RuntimeMapFreshnessProof,
 };
 use crate::control_plane_auth::{
     ControlPlaneAuthDecision, ControlPlaneAuthEnvelope, ControlPlaneAuthOperation,
@@ -1591,7 +1594,20 @@ fn exchange_unix_raft_peer_frame(
                 },
             )
         })?;
-    let mut stream = DeadlineUnixStream::new(&mut stream, exchange.deadline);
+    let mut stream = DeadlineUnixStream::new(
+        &mut stream,
+        exchange.deadline,
+        "control-plane OpenRaft peer exchange deadline expired",
+    )
+    .map_err(|source| {
+        ControlPlaneRaftPeerFrameExchangeError::new(
+            raft_peer_exchange_context(exchange.context_prefix, "connect"),
+            ControlPlaneError::Io {
+                context: "configure control-plane OpenRaft Unix peer deadline I/O",
+                source,
+            },
+        )
+    })?;
     write_control_plane_raft_peer_transport_frame(&mut stream, &exchange.request_frame).map_err(
         |error| {
             ControlPlaneRaftPeerFrameExchangeError::new(
@@ -4796,11 +4812,21 @@ impl ControlPlaneRaftAuthority {
     ) -> Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError> {
         let status = self.status().await?;
         if !status.linearized_authority_serving() {
-            return Err(ControlPlaneError::RpcRemote {
-                message: format!(
-                    "local OpenRaft authority is not the serving leader: {:?}",
-                    status.linearized_authority_readiness()
-                ),
+            let readiness = status.linearized_authority_readiness();
+            let kind = match readiness {
+                ControlPlaneRaftLinearizedAuthorityReadiness::NotLocalLeader
+                | ControlPlaneRaftLinearizedAuthorityReadiness::NotEffectiveVoter => {
+                    ControlPlaneRaftOperationErrorKind::ForwardToLeader
+                }
+                ControlPlaneRaftLinearizedAuthorityReadiness::NotAppliedToCommitted
+                | ControlPlaneRaftLinearizedAuthorityReadiness::NotCommittedInCurrentTerm => {
+                    ControlPlaneRaftOperationErrorKind::QuorumNotEnough
+                }
+                ControlPlaneRaftLinearizedAuthorityReadiness::Serving => unreachable!(),
+            };
+            return Err(ControlPlaneError::OpenRaftOperation {
+                kind,
+                message: format!("local authority is not the serving leader: {readiness:?}"),
             });
         }
         ControlPlaneRaftTypeConfig::timeout(
@@ -4808,15 +4834,11 @@ impl ControlPlaneRaftAuthority {
             self.raft.ensure_linearizable(ReadPolicy::ReadIndex),
         )
         .await
-        .map_err(|_| ControlPlaneError::RpcRemote {
-            message: "local OpenRaft authority is not the serving leader: command-authority read-index timed out after 1s"
-                .to_owned(),
+        .map_err(|_| ControlPlaneError::OpenRaftOperation {
+            kind: ControlPlaneRaftOperationErrorKind::QuorumNotEnough,
+            message: "command-authority read-index timed out after 1s".to_owned(),
         })?
-        .map_err(|error| ControlPlaneError::RpcRemote {
-            message: format!(
-                "local OpenRaft authority is not the serving leader: command-authority read-index failed: {error}"
-            ),
-        })?;
+        .map_err(|error| openraft_linearizable_read_error("command-authority read-index", error))?;
         Ok(status)
     }
 
@@ -5967,7 +5989,7 @@ pub async fn submit_control_plane_command_via_openraft(
     let response = raft
         .client_write(command)
         .await
-        .map_err(|error| openraft_remote_error("client-write", error))?;
+        .map_err(|error| openraft_client_write_error("client-write", error))?;
     let outcome = match response.data {
         ControlPlaneRaftApplyResponse::Applied(response) => {
             ControlPlaneRaftCommandOutcome::Applied(response)
@@ -6167,6 +6189,44 @@ fn control_plane_error_to_io_error(context: &'static str, error: ControlPlaneErr
 
 fn openraft_remote_error(context: &'static str, error: impl fmt::Display) -> ControlPlaneError {
     ControlPlaneError::RpcRemote {
+        message: format!("OpenRaft {context} failed: {error}"),
+    }
+}
+
+fn openraft_linearizable_read_error(
+    context: &'static str,
+    error: RaftError<ControlPlaneRaftTypeConfig, LinearizableReadError<ControlPlaneRaftTypeConfig>>,
+) -> ControlPlaneError {
+    let kind = match &error {
+        RaftError::APIError(LinearizableReadError::ForwardToLeader(_)) => {
+            ControlPlaneRaftOperationErrorKind::ForwardToLeader
+        }
+        RaftError::APIError(LinearizableReadError::QuorumNotEnough(_)) => {
+            ControlPlaneRaftOperationErrorKind::QuorumNotEnough
+        }
+        RaftError::Fatal(_) => ControlPlaneRaftOperationErrorKind::Fatal,
+    };
+    ControlPlaneError::OpenRaftOperation {
+        kind,
+        message: format!("OpenRaft {context} failed: {error}"),
+    }
+}
+
+fn openraft_client_write_error(
+    context: &'static str,
+    error: RaftError<ControlPlaneRaftTypeConfig, ClientWriteError<ControlPlaneRaftTypeConfig>>,
+) -> ControlPlaneError {
+    let kind = match &error {
+        RaftError::APIError(ClientWriteError::ForwardToLeader(_)) => {
+            ControlPlaneRaftOperationErrorKind::ForwardToLeader
+        }
+        RaftError::APIError(ClientWriteError::ChangeMembershipError(_)) => {
+            ControlPlaneRaftOperationErrorKind::Rejected
+        }
+        RaftError::Fatal(_) => ControlPlaneRaftOperationErrorKind::Fatal,
+    };
+    ControlPlaneError::OpenRaftOperation {
+        kind,
         message: format!("OpenRaft {context} failed: {error}"),
     }
 }
@@ -9305,23 +9365,20 @@ async fn handle_control_plane_raft_peer_unix_stream(
     expected_identity: &ControlPlaneRaftPeerFrameIdentity,
     io_timeout: Duration,
 ) -> Result<(), ControlPlaneError> {
-    stream
-        .set_read_timeout(Some(io_timeout))
-        .map_err(|source| ControlPlaneError::Io {
-            context: "set control-plane OpenRaft peer stream read timeout",
-            source,
-        })?;
-    stream
-        .set_write_timeout(Some(io_timeout))
-        .map_err(|source| ControlPlaneError::Io {
-            context: "set control-plane OpenRaft peer stream write timeout",
-            source,
-        })?;
+    let mut stream = DeadlineUnixStream::new(
+        stream,
+        Instant::now() + io_timeout,
+        "control-plane OpenRaft test peer deadline expired",
+    )
+    .map_err(|source| ControlPlaneError::Io {
+        context: "configure control-plane OpenRaft test peer deadline I/O",
+        source,
+    })?;
     let request_frame =
-        read_control_plane_raft_peer_transport_frame(stream, limits.max_frame_bytes)?;
+        read_control_plane_raft_peer_transport_frame(&mut stream, limits.max_frame_bytes)?;
     handle_control_plane_raft_peer_unix_request_frame(
         raft,
-        stream,
+        &mut stream,
         &request_frame,
         frame_kind,
         limits,
@@ -9338,24 +9395,21 @@ async fn handle_control_plane_raft_peer_unix_stream_detecting_frame_kind(
     expected_identity: &ControlPlaneRaftPeerFrameIdentity,
     io_timeout: Duration,
 ) -> Result<(), ControlPlaneError> {
-    stream
-        .set_read_timeout(Some(io_timeout))
-        .map_err(|source| ControlPlaneError::Io {
-            context: "set control-plane OpenRaft peer stream read timeout",
-            source,
-        })?;
-    stream
-        .set_write_timeout(Some(io_timeout))
-        .map_err(|source| ControlPlaneError::Io {
-            context: "set control-plane OpenRaft peer stream write timeout",
-            source,
-        })?;
+    let mut stream = DeadlineUnixStream::new(
+        stream,
+        Instant::now() + io_timeout,
+        "control-plane OpenRaft test peer deadline expired",
+    )
+    .map_err(|source| ControlPlaneError::Io {
+        context: "configure control-plane OpenRaft test peer deadline I/O",
+        source,
+    })?;
     let request_frame =
-        read_control_plane_raft_peer_transport_frame(stream, limits.max_frame_bytes)?;
+        read_control_plane_raft_peer_transport_frame(&mut stream, limits.max_frame_bytes)?;
     let frame_kind = decode_control_plane_raft_peer_request_frame_kind(&request_frame)?;
     handle_control_plane_raft_peer_unix_request_frame(
         raft,
-        stream,
+        &mut stream,
         &request_frame,
         frame_kind,
         limits,
@@ -9372,20 +9426,17 @@ async fn handle_control_plane_raft_peer_unix_stream_from_configured_peer(
     policy: &ControlPlaneRaftPeerTransportPolicy,
     io_timeout: Duration,
 ) -> Result<(), ControlPlaneError> {
-    stream
-        .set_read_timeout(Some(io_timeout))
-        .map_err(|source| ControlPlaneError::Io {
-            context: "set control-plane OpenRaft peer stream read timeout",
-            source,
-        })?;
-    stream
-        .set_write_timeout(Some(io_timeout))
-        .map_err(|source| ControlPlaneError::Io {
-            context: "set control-plane OpenRaft peer stream write timeout",
-            source,
-        })?;
+    let mut stream = DeadlineUnixStream::new(
+        stream,
+        Instant::now() + io_timeout,
+        "control-plane OpenRaft test peer deadline expired",
+    )
+    .map_err(|source| ControlPlaneError::Io {
+        context: "configure control-plane OpenRaft test peer deadline I/O",
+        source,
+    })?;
     let request_frame =
-        read_control_plane_raft_peer_transport_frame(stream, policy.limits().max_frame_bytes)?;
+        read_control_plane_raft_peer_transport_frame(&mut stream, policy.limits().max_frame_bytes)?;
     let frame_kind = decode_control_plane_raft_peer_request_frame_kind(&request_frame)?;
     let identity = decode_control_plane_raft_peer_request_frame_identity(&request_frame)?;
     policy
@@ -9395,7 +9446,7 @@ async fn handle_control_plane_raft_peer_unix_stream_from_configured_peer(
         })?;
     handle_control_plane_raft_peer_unix_request_frame(
         raft,
-        stream,
+        &mut stream,
         &request_frame,
         frame_kind,
         policy.limits(),
@@ -9405,9 +9456,9 @@ async fn handle_control_plane_raft_peer_unix_stream_from_configured_peer(
 }
 
 #[cfg(test)]
-async fn handle_control_plane_raft_peer_unix_request_frame(
+async fn handle_control_plane_raft_peer_unix_request_frame<Stream: Read + Write>(
     raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
-    stream: &mut UnixStream,
+    stream: &mut Stream,
     request_frame: &[u8],
     frame_kind: ControlPlaneRaftPeerFrameKind,
     limits: ControlPlaneRaftPeerTransportLimits,
@@ -11727,7 +11778,7 @@ mod tests {
     use super::*;
     use futures_util::stream;
     use openraft::errors::{
-        NetworkError, RPCError, ReplicationClosed, StreamingError, Unreachable,
+        Fatal, NetworkError, RPCError, ReplicationClosed, StreamingError, Unreachable,
     };
     use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
     use openraft::raft::{
@@ -11753,6 +11804,25 @@ mod tests {
         ControlPlaneOpenRaftSuiteBuilder,
         (),
     >;
+
+    #[test]
+    fn openraft_linearizable_fatal_error_remains_non_retryable() {
+        let error: RaftError<
+            ControlPlaneRaftTypeConfig,
+            LinearizableReadError<ControlPlaneRaftTypeConfig>,
+        > = RaftError::Fatal(Fatal::Stopped);
+
+        let error = openraft_linearizable_read_error("test read-index", error);
+
+        assert!(matches!(
+            &error,
+            ControlPlaneError::OpenRaftOperation {
+                kind: ControlPlaneRaftOperationErrorKind::Fatal,
+                ..
+            }
+        ));
+        assert!(!error.is_retryable_openraft_leadership_error());
+    }
 
     #[derive(Debug)]
     struct TestPeerFrameTransport {
@@ -20862,8 +20932,10 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(
                 err,
-                ControlPlaneError::RpcRemote { message }
-                    if message.contains("local OpenRaft authority is not the serving leader")
+                ControlPlaneError::OpenRaftOperation {
+                    kind: ControlPlaneRaftOperationErrorKind::ForwardToLeader,
+                    ..
+                }
             ));
 
             authority.shutdown().await.unwrap();
@@ -20982,8 +21054,10 @@ mod tests {
             .await;
             assert!(matches!(
                 &confirmation_error,
-                ControlPlaneError::RpcRemote { message }
-                    if message.contains("local OpenRaft authority is not the serving leader")
+                ControlPlaneError::OpenRaftOperation {
+                    kind: ControlPlaneRaftOperationErrorKind::QuorumNotEnough,
+                    ..
+                }
             ));
 
             let error = expect_bounded_control_plane_raft_error(
@@ -20999,10 +21073,11 @@ mod tests {
             .await;
             assert!(
                 matches!(
-                &error,
-                ControlPlaneError::RpcRemote { message }
-                    if message.contains("local OpenRaft authority is not the serving leader")
-                        && message.contains("command-authority read-index failed")
+                    &error,
+                    ControlPlaneError::OpenRaftOperation {
+                        kind: ControlPlaneRaftOperationErrorKind::QuorumNotEnough,
+                        ..
+                    }
                 ),
                 "stale restarted leader returned unexpected error: {error:?}"
             );
@@ -21044,9 +21119,10 @@ mod tests {
             .unwrap_err();
             assert!(matches!(
                 follower_error,
-                ControlPlaneError::RpcRemote { message }
-                    if message.contains("local OpenRaft authority is not the serving leader")
-                        && message.contains("NotLocalLeader")
+                ControlPlaneError::OpenRaftOperation {
+                    kind: ControlPlaneRaftOperationErrorKind::ForwardToLeader,
+                    message,
+                } if message.contains("NotLocalLeader")
             ));
 
             let write = authority1

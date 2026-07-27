@@ -29,6 +29,8 @@ use server_core::coordinator::Coordinator;
 use server_core::sse::{
     ManagedWrappingKeyConfig, SseCustomerValidatorConfig, StaticManagedKeyProvider,
 };
+#[cfg(test)]
+use storage::control_plane::ControlPlaneRaftOperationErrorKind;
 use storage::control_plane::{
     ensure_control_plane_state_parent_directory, invalidate_authority_clock_restart_checkpoint,
     load_authority_clock_restart_checkpoint, store_authority_clock_restart_checkpoint,
@@ -67,6 +69,9 @@ use storage::control_plane_raft::{
     ControlPlaneRaftPeerFrameKind, ControlPlaneRaftPeerNetworkConfig,
     ControlPlaneRaftPeerTransportPolicy, CONTROL_PLANE_RAFT_TLS_ALPN,
 };
+use storage::deadline_io::DeadlineStream;
+#[cfg(test)]
+use storage::deadline_io::DeadlineTransport;
 use storage::storage_node_server::{
     PreparedStorageNodeServer, StorageNodeBootstrap, StorageNodeControlPlaneRefreshLoop,
     StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeProcessConfigParts, StorageNodeServer,
@@ -3388,12 +3393,6 @@ fn experimental_raft_startup_requires_local_leader(
     }
 }
 
-fn experimental_raft_startup_bootstrap_requires_local_serving(
-    peer_policy: Option<&ControlPlaneRaftPeerTransportPolicy>,
-) -> bool {
-    peer_policy.is_some_and(|policy| policy.peers().len() > 1)
-}
-
 fn experimental_raft_startup_initializes_membership(
     peer_policy: Option<&ControlPlaneRaftPeerTransportPolicy>,
     local_node_id: ControlPlaneRaftNodeId,
@@ -3643,75 +3642,9 @@ impl Drop for ExperimentalRaftPeerPreAuthByteReservation {
     }
 }
 
-trait ExperimentalRaftPeerSocket: Read + Write {
-    fn set_peer_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
-    fn set_peer_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
-}
-
-impl ExperimentalRaftPeerSocket for UnixStream {
-    fn set_peer_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.set_read_timeout(timeout)
-    }
-
-    fn set_peer_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.set_write_timeout(timeout)
-    }
-}
-
-impl ExperimentalRaftPeerSocket for StdTcpStream {
-    fn set_peer_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.set_read_timeout(timeout)
-    }
-
-    fn set_peer_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.set_write_timeout(timeout)
-    }
-}
-
-struct ExperimentalRaftPeerDeadlineStream<Stream> {
-    stream: Stream,
-    deadline: Instant,
-}
-
-impl<Stream> ExperimentalRaftPeerDeadlineStream<Stream> {
-    fn new(stream: Stream, deadline: Instant) -> Self {
-        Self { stream, deadline }
-    }
-
-    fn remaining(&self) -> io::Result<Duration> {
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "control-plane OpenRaft inbound peer connection deadline expired",
-                )
-            })
-    }
-}
-
-impl<Stream: ExperimentalRaftPeerSocket> Read for ExperimentalRaftPeerDeadlineStream<Stream> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let remaining = self.remaining()?;
-        self.stream.set_peer_read_timeout(Some(remaining))?;
-        self.stream.read(buf)
-    }
-}
-
-impl<Stream: ExperimentalRaftPeerSocket> Write for ExperimentalRaftPeerDeadlineStream<Stream> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let remaining = self.remaining()?;
-        self.stream.set_peer_write_timeout(Some(remaining))?;
-        self.stream.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        let remaining = self.remaining()?;
-        self.stream.set_peer_write_timeout(Some(remaining))?;
-        self.stream.flush()
-    }
-}
+const EXPERIMENTAL_RAFT_PEER_DEADLINE_EXPIRED: &str =
+    "control-plane OpenRaft inbound peer connection deadline expired";
+type ExperimentalRaftPeerDeadlineStream<Stream> = DeadlineStream<Stream>;
 
 #[derive(Clone)]
 struct ExperimentalRaftPeerDurabilityContext {
@@ -3850,7 +3783,15 @@ fn spawn_experimental_raft_peer_rpc_worker(
     context: ExperimentalRaftPeerRpcWorkerContext,
 ) {
     spawn_experimental_raft_peer_rpc_worker_with_stream(stream, context, |stream, deadline| {
-        Ok(ExperimentalRaftPeerDeadlineStream::new(stream, deadline))
+        ExperimentalRaftPeerDeadlineStream::new(
+            stream,
+            deadline,
+            EXPERIMENTAL_RAFT_PEER_DEADLINE_EXPIRED,
+        )
+        .map_err(|source| ControlPlaneError::Io {
+            context: "configure control-plane OpenRaft Unix peer deadline I/O",
+            source,
+        })
     });
 }
 
@@ -3863,7 +3804,15 @@ fn spawn_experimental_raft_tcp_peer_rpc_worker(
         stream,
         context,
         move |stream, deadline| {
-            let mut stream = ExperimentalRaftPeerDeadlineStream::new(stream, deadline);
+            let mut stream = ExperimentalRaftPeerDeadlineStream::new(
+                stream,
+                deadline,
+                EXPERIMENTAL_RAFT_PEER_DEADLINE_EXPIRED,
+            )
+            .map_err(|source| ControlPlaneError::Io {
+                context: "configure control-plane OpenRaft TLS/TCP deadline I/O",
+                source,
+            })?;
             let mut connection =
                 rustls::ServerConnection::new(tls_server_config).map_err(|source| {
                     ControlPlaneError::RpcProtocol {
@@ -5006,29 +4955,12 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         #[cfg(test)]
         after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
     };
-    let should_bootstrap_control_plane_state =
-        if experimental_raft_startup_bootstrap_requires_local_serving(raft_peer_policy.as_ref()) {
-            block_on_control_plane_raft(&runtime, async {
-                experimental_raft_local_authority_serving_within(&authority, Duration::from_secs(1))
-                    .await
-        })
-        .unwrap_or_else(|error| {
-            eprintln!(
-                "failed to determine experimental OpenRaft control-plane bootstrap leadership: {error}"
-            );
+    wait_for_initial_experimental_raft_control_plane(&mut control_plane, config).unwrap_or_else(
+        |error| {
+            eprintln!("failed to bootstrap experimental OpenRaft control-plane state: {error}");
             std::process::exit(1);
-        })
-        } else {
-            true
-        };
-    if should_bootstrap_control_plane_state {
-        bootstrap_empty_experimental_raft_control_plane(&mut control_plane, config).unwrap_or_else(
-            |error| {
-                eprintln!("failed to bootstrap experimental OpenRaft control-plane state: {error}");
-                std::process::exit(1);
-            },
-        );
-    }
+        },
+    );
     if config.static_initial_cluster_map.is_some() {
         wait_for_static_initial_control_plane_topology(&mut control_plane, config).unwrap_or_else(
             |error| {
@@ -5333,6 +5265,36 @@ fn bootstrap_empty_experimental_raft_control_plane(
         epoch
     );
     Ok(())
+}
+
+fn wait_for_initial_experimental_raft_control_plane(
+    authority: &mut ExperimentalRaftControlPlane,
+    config: &ServerConfig,
+) -> Result<(), ControlPlaneError> {
+    wait_for_initial_experimental_raft_control_plane_with(
+        || bootstrap_empty_experimental_raft_control_plane(authority, config),
+        || thread::sleep(Duration::from_millis(100)),
+    )
+}
+
+fn wait_for_initial_experimental_raft_control_plane_with(
+    mut bootstrap: impl FnMut() -> Result<(), ControlPlaneError>,
+    mut wait: impl FnMut(),
+) -> Result<(), ControlPlaneError> {
+    loop {
+        match bootstrap() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.is_retryable_openraft_leadership_error() => {
+                // Every voter keeps its peer endpoint available while waiting.
+                // A transient election or quorum gap between leadership
+                // observation and command admission must not terminate the
+                // process; the serving leader will bootstrap and followers
+                // will observe that applied state on a later iteration.
+            }
+            Err(error) => return Err(error),
+        }
+        wait();
+    }
 }
 
 fn initial_control_plane_bootstrap_command(config: &ServerConfig) -> ControlPlaneCommand {
@@ -7656,13 +7618,29 @@ mod tests {
             }
         }
 
-        impl ExperimentalRaftPeerSocket for TrickleSocket {
-            fn set_peer_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-                self.read_timeout.set(timeout);
+        impl DeadlineTransport for TrickleSocket {
+            fn prepare_deadline_io(&self) -> io::Result<()> {
                 Ok(())
             }
 
-            fn set_peer_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+            fn wait_readable_until(
+                &self,
+                deadline: Instant,
+                _timeout_message: &'static str,
+            ) -> io::Result<()> {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "test timeout"))?;
+                self.read_timeout.set(Some(remaining));
+                Ok(())
+            }
+
+            fn wait_writable_until(
+                &self,
+                _deadline: Instant,
+                _timeout_message: &'static str,
+            ) -> io::Result<()> {
                 Ok(())
             }
         }
@@ -7672,14 +7650,18 @@ mod tests {
             reads: 0,
         };
         let started_at = Instant::now();
-        let mut stream =
-            ExperimentalRaftPeerDeadlineStream::new(socket, started_at + Duration::from_millis(30));
+        let mut stream = ExperimentalRaftPeerDeadlineStream::new(
+            socket,
+            started_at + Duration::from_millis(30),
+            EXPERIMENTAL_RAFT_PEER_DEADLINE_EXPIRED,
+        )
+        .unwrap();
         let mut frame_header = [0_u8; 4];
 
         let error = stream.read_exact(&mut frame_header).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(stream.stream.reads <= 2);
+        assert!(stream.get_ref().reads <= 2);
     }
 
     #[test]
@@ -10071,6 +10053,59 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raft_control_plane_bootstrap_retries_transient_quorum_loss() {
+        let mut attempts = 0_u8;
+        let mut waits = 0_u8;
+
+        wait_for_initial_experimental_raft_control_plane_with(
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(ControlPlaneError::OpenRaftOperation {
+                        kind: ControlPlaneRaftOperationErrorKind::QuorumNotEnough,
+                        message: "command-authority read-index failed".to_owned(),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            || waits += 1,
+        )
+        .expect("bootstrap should retry a transient leader-routing failure");
+
+        assert_eq!(attempts, 2);
+        assert_eq!(waits, 1);
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_bootstrap_does_not_retry_fatal_raft_failure() {
+        let mut attempts = 0_u8;
+        let mut waits = 0_u8;
+
+        let error = wait_for_initial_experimental_raft_control_plane_with(
+            || {
+                attempts += 1;
+                Err(ControlPlaneError::OpenRaftOperation {
+                    kind: ControlPlaneRaftOperationErrorKind::Fatal,
+                    message: "durable log store failed".to_owned(),
+                })
+            },
+            || waits += 1,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::OpenRaftOperation {
+                kind: ControlPlaneRaftOperationErrorKind::Fatal,
+                ..
+            }
+        ));
+        assert_eq!(attempts, 1);
+        assert_eq!(waits, 0);
+    }
+
+    #[test]
     fn experimental_raft_bootstrap_concurrent_success_requires_initialized_state() {
         let harness = experimental_raft_test_harness("bootstrap-concurrent-empty-test");
         assert!(
@@ -12181,9 +12216,6 @@ mod tests {
                 UnixStream::pair().expect("test UnixStream pair should create");
             write_control_plane_raft_peer_transport_frame(&mut client_stream, &frame)
                 .unwrap_or_else(|error| panic!("{case_name}: client should write frame: {error}"));
-            client_stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("client stream read timeout should set");
 
             let result = handle_experimental_raft_peer_rpc_before_ack(
                 harness.runtime.handle(),
@@ -12217,6 +12249,12 @@ mod tests {
             );
             drop(server_stream);
 
+            let mut client_stream = DeadlineStream::new(
+                &mut client_stream,
+                Instant::now() + Duration::from_millis(50),
+                "test peer response deadline expired",
+            )
+            .unwrap();
             let response = read_control_plane_raft_peer_transport_frame(
                 &mut client_stream,
                 ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
@@ -12381,9 +12419,6 @@ mod tests {
             UnixStream::pair().expect("test UnixStream pair should create");
         write_control_plane_raft_peer_transport_frame(&mut client_stream, &expired_frame)
             .expect("client should write expired transfer-leader auth frame");
-        client_stream
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .expect("client stream read timeout should set");
 
         let result = handle_experimental_raft_peer_rpc_before_ack(
             harness.runtime.handle(),
@@ -12417,6 +12452,12 @@ mod tests {
         );
         drop(server_stream);
 
+        let mut client_stream = DeadlineStream::new(
+            &mut client_stream,
+            Instant::now() + Duration::from_millis(50),
+            "test peer response deadline expired",
+        )
+        .unwrap();
         let response = read_control_plane_raft_peer_transport_frame(
             &mut client_stream,
             ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,

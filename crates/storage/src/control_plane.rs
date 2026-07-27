@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::io::{ErrorKind, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroU64;
@@ -36,6 +37,7 @@ use crate::control_plane_lease::{
     validate_serving_deadline_bound, BoundRouteMapLease, CommittedLeaseGrantHorizon,
     LeaseClockError, LeaseHorizonError, CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
 };
+use crate::deadline_io::DeadlineStream;
 use crate::durable_journal::{
     DurableJournalAppendError, DurableJournalFile, DurableJournalFormat, DurableJournalIoContexts,
     DurableJournalObserver,
@@ -11208,114 +11210,10 @@ fn wait_for_unix_connect(fd: &OwnedFd, deadline: Instant) -> std::io::Result<()>
     }
 }
 
-pub(crate) struct DeadlineUnixStream<'a> {
-    stream: &'a mut UnixStream,
-    deadline: Instant,
-}
-
-impl DeadlineUnixStream<'_> {
-    pub(crate) fn new(stream: &mut UnixStream, deadline: Instant) -> DeadlineUnixStream<'_> {
-        DeadlineUnixStream { stream, deadline }
-    }
-
-    fn remaining(&self) -> std::io::Result<Duration> {
-        unix_io_remaining(self.deadline)
-    }
-}
-
-impl std::io::Read for DeadlineUnixStream<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
-        self.stream.read(buffer)
-    }
-}
-
-impl std::io::Write for DeadlineUnixStream<'_> {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.write(buffer)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.flush()
-    }
-}
-
-struct ControlPlaneDeadlineTcpSocket {
-    stream: TcpStream,
-    deadline: Instant,
-}
-
-struct ControlPlaneDeadlineUnixSocket {
-    stream: UnixStream,
-    deadline: Instant,
-}
-
-impl ControlPlaneDeadlineUnixSocket {
-    fn apply_deadline(&self) -> std::io::Result<()> {
-        let remaining = control_plane_client_io_remaining(self.deadline)?;
-        self.stream.set_read_timeout(Some(remaining))?;
-        self.stream.set_write_timeout(Some(remaining))
-    }
-}
-
-impl std::io::Read for ControlPlaneDeadlineUnixSocket {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.apply_deadline()?;
-        self.stream.read(buffer)
-    }
-}
-
-impl std::io::Write for ControlPlaneDeadlineUnixSocket {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.apply_deadline()?;
-        self.stream.write(buffer)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.apply_deadline()?;
-        self.stream.flush()
-    }
-}
-
-impl ControlPlaneDeadlineTcpSocket {
-    fn apply_deadline(&self) -> std::io::Result<()> {
-        let remaining = control_plane_client_io_remaining(self.deadline)?;
-        self.stream.set_read_timeout(Some(remaining))?;
-        self.stream.set_write_timeout(Some(remaining))
-    }
-}
-
-impl std::io::Read for ControlPlaneDeadlineTcpSocket {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.apply_deadline()?;
-        self.stream.read(buffer)
-    }
-}
-
-impl std::io::Write for ControlPlaneDeadlineTcpSocket {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.apply_deadline()?;
-        self.stream.write(buffer)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.apply_deadline()?;
-        self.stream.flush()
-    }
-}
-
-fn control_plane_client_io_remaining(deadline: Instant) -> std::io::Result<Duration> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(std::io::Error::new(
-            ErrorKind::TimedOut,
-            "control-plane RPC operation deadline expired",
-        ));
-    }
-    Ok(remaining)
-}
+const CONTROL_PLANE_RPC_DEADLINE_EXPIRED: &str = "control-plane RPC operation deadline expired";
+pub(crate) type DeadlineUnixStream<'a> = DeadlineStream<&'a mut UnixStream>;
+type ControlPlaneDeadlineTcpSocket = DeadlineStream<TcpStream>;
+type ControlPlaneDeadlineUnixSocket = DeadlineStream<UnixStream>;
 
 async fn connect_control_plane_tcp_until_async(
     host: String,
@@ -11403,10 +11301,15 @@ fn connect_control_plane_tls_tcp(
         .map_err(|error| ControlPlaneError::RpcProtocol {
             message: format!("failed to initialize control-plane TLS client: {error}"),
         })?;
-    let socket = ControlPlaneDeadlineTcpSocket {
-        stream: tcp_stream,
+    let socket = ControlPlaneDeadlineTcpSocket::new(
+        tcp_stream,
         deadline,
-    };
+        CONTROL_PLANE_RPC_DEADLINE_EXPIRED,
+    )
+    .map_err(|source| ControlPlaneError::Io {
+        context: "configure control-plane TLS/TCP deadline I/O",
+        source,
+    })?;
     let mut stream = rustls::StreamOwned::new(connection, socket);
     while stream.conn.is_handshaking() {
         stream
@@ -11441,7 +11344,17 @@ impl ControlPlaneRpcClientEndpoint {
                             source,
                         })
                     })?;
-                let mut stream = DeadlineUnixStream::new(&mut stream, deadline);
+                let mut stream = DeadlineUnixStream::new(
+                    &mut stream,
+                    deadline,
+                    CONTROL_PLANE_RPC_DEADLINE_EXPIRED,
+                )
+                .map_err(|source| {
+                    ControlPlaneRpcFrameExchangeError::before_request(ControlPlaneError::Io {
+                        context: "configure control-plane Unix deadline I/O",
+                        source,
+                    })
+                })?;
                 stream.write_all(request_frame).map_err(|source| {
                     ControlPlaneRpcFrameExchangeError::after_request_started(
                         ControlPlaneError::Io {
@@ -16092,10 +16005,15 @@ fn authenticate_and_admit_control_plane_rpc(
 }
 
 trait ControlPlaneRpcServerStream: std::io::Read + std::io::Write + Send {
+    fn begin_response(&mut self, timeout: Duration);
     fn finish_response(&mut self) -> std::io::Result<()>;
 }
 
 impl ControlPlaneRpcServerStream for ControlPlaneDeadlineUnixSocket {
+    fn begin_response(&mut self, timeout: Duration) {
+        self.set_deadline(Instant::now() + timeout);
+    }
+
     fn finish_response(&mut self) -> std::io::Result<()> {
         self.flush()
     }
@@ -16104,6 +16022,10 @@ impl ControlPlaneRpcServerStream for ControlPlaneDeadlineUnixSocket {
 impl ControlPlaneRpcServerStream
     for rustls::StreamOwned<rustls::ServerConnection, ControlPlaneDeadlineTcpSocket>
 {
+    fn begin_response(&mut self, timeout: Duration) {
+        self.sock.set_deadline(Instant::now() + timeout);
+    }
+
     fn finish_response(&mut self) -> std::io::Result<()> {
         self.conn.send_close_notify();
         self.flush()
@@ -16296,10 +16218,16 @@ impl ControlPlaneRpcServerListener {
                                 context: "set control-plane Unix RPC blocking mode",
                                 source,
                             })?;
-                        Ok(
-                            Box::new(ControlPlaneDeadlineUnixSocket { stream, deadline })
-                                as Box<dyn ControlPlaneRpcServerStream>,
+                        ControlPlaneDeadlineUnixSocket::new(
+                            stream,
+                            deadline,
+                            CONTROL_PLANE_RPC_DEADLINE_EXPIRED,
                         )
+                        .map(|stream| Box::new(stream) as Box<dyn ControlPlaneRpcServerStream>)
+                        .map_err(|source| ControlPlaneError::Io {
+                            context: "configure control-plane Unix RPC deadline I/O",
+                            source,
+                        })
                     },
                 ),
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
@@ -16323,7 +16251,17 @@ impl ControlPlaneRpcServerListener {
                         worker_limit,
                         self.io_timeout,
                         move |stream, deadline| {
-                            let socket = ControlPlaneDeadlineTcpSocket { stream, deadline };
+                            let socket = ControlPlaneDeadlineTcpSocket::new(
+                                stream,
+                                deadline,
+                                CONTROL_PLANE_RPC_DEADLINE_EXPIRED,
+                            )
+                            .map_err(|source| {
+                                ControlPlaneError::Io {
+                                    context: "configure control-plane TLS/TCP deadline I/O",
+                                    source,
+                                }
+                            })?;
                             let connection = rustls::ServerConnection::new(tls_server_config)
                                 .map_err(|_| ControlPlaneError::RpcProtocol {
                                     message:
@@ -16440,6 +16378,7 @@ fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
                     *error,
                     policy.authority_now_ms(),
                 );
+                stream.begin_response(io_timeout);
                 write_control_plane_rpc_admission_response(&mut stream, metrics_kind, response);
                 if let Err(error) = stream.finish_response() {
                     eprintln!("control-plane RPC response finalization failed: {error}");
@@ -16591,6 +16530,7 @@ fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
             }
         };
         let response_write_started = Instant::now();
+        stream.begin_response(io_timeout);
         let mut response = Some(response);
         let mut write_response = || {
             let response = response
@@ -16893,6 +16833,11 @@ fn encode_control_plane_rpc_response(
             write_u8(&mut payload, 8);
             write_u32(&mut payload, pg_id);
         }
+        Err(ControlPlaneError::OpenRaftOperation { kind, message }) => {
+            write_u8(&mut payload, 9);
+            write_u8(&mut payload, kind.wire_tag());
+            write_string(&mut payload, &message)?;
+        }
         Err(error) => {
             write_u8(&mut payload, 1);
             write_string(&mut payload, &error.to_string())?;
@@ -17001,6 +16946,12 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
             let pg_id = reader.read_u32()?;
             reader.finish()?;
             Err(ControlPlaneError::UnknownPg { pg_id })
+        }
+        9 => {
+            let kind = ControlPlaneRaftOperationErrorKind::from_wire_tag(reader.read_u8()?)?;
+            let message = reader.read_string()?.to_owned();
+            reader.finish()?;
+            Err(ControlPlaneError::OpenRaftOperation { kind, message })
         }
         _ => Err(ControlPlaneError::RpcProtocol {
             message: format!("invalid control-plane RPC response status {status}"),
@@ -18928,6 +18879,48 @@ impl<'a> PayloadReader<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPlaneRaftOperationErrorKind {
+    ForwardToLeader,
+    QuorumNotEnough,
+    Fatal,
+    Rejected,
+}
+
+impl ControlPlaneRaftOperationErrorKind {
+    fn wire_tag(self) -> u8 {
+        match self {
+            Self::ForwardToLeader => 0,
+            Self::QuorumNotEnough => 1,
+            Self::Fatal => 2,
+            Self::Rejected => 3,
+        }
+    }
+
+    fn from_wire_tag(tag: u8) -> Result<Self, ControlPlaneError> {
+        match tag {
+            0 => Ok(Self::ForwardToLeader),
+            1 => Ok(Self::QuorumNotEnough),
+            2 => Ok(Self::Fatal),
+            3 => Ok(Self::Rejected),
+            _ => Err(ControlPlaneError::RpcProtocol {
+                message: format!("invalid OpenRaft operation error kind {tag}"),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for ControlPlaneRaftOperationErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ForwardToLeader => "forward-to-leader",
+            Self::QuorumNotEnough => "quorum-not-enough",
+            Self::Fatal => "fatal",
+            Self::Rejected => "rejected",
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
     #[error("{context}: {source}")]
@@ -19010,6 +19003,12 @@ pub enum ControlPlaneError {
 
     #[error("control-plane RPC remote error: {message}")]
     RpcRemote { message: String },
+
+    #[error("control-plane OpenRaft operation failed ({kind}): {message}")]
+    OpenRaftOperation {
+        kind: ControlPlaneRaftOperationErrorKind,
+        message: String,
+    },
 
     #[error("control-plane RPC applied-state confirmation failed: {message}")]
     RpcUnconfirmed { message: String },
@@ -19548,7 +19547,22 @@ pub enum ControlPlaneError {
 
 impl ControlPlaneError {
     #[must_use]
+    pub fn is_retryable_openraft_leadership_error(&self) -> bool {
+        matches!(
+            self,
+            Self::OpenRaftOperation {
+                kind: ControlPlaneRaftOperationErrorKind::ForwardToLeader
+                    | ControlPlaneRaftOperationErrorKind::QuorumNotEnough,
+                ..
+            }
+        )
+    }
+
+    #[must_use]
     pub fn is_control_plane_leader_routing_rejection(&self) -> bool {
+        if self.is_retryable_openraft_leadership_error() {
+            return true;
+        }
         matches!(
             self,
             Self::RpcRemote { message }
@@ -22722,6 +22736,32 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn control_plane_rpc_preserves_openraft_operation_error_kind() {
+        for kind in [
+            ControlPlaneRaftOperationErrorKind::ForwardToLeader,
+            ControlPlaneRaftOperationErrorKind::QuorumNotEnough,
+            ControlPlaneRaftOperationErrorKind::Fatal,
+            ControlPlaneRaftOperationErrorKind::Rejected,
+        ] {
+            let payload =
+                encode_control_plane_rpc_response(Err(ControlPlaneError::OpenRaftOperation {
+                    kind,
+                    message: "test OpenRaft failure".to_owned(),
+                }))
+                .unwrap();
+            let error = decode_control_plane_rpc_response(payload).unwrap_err();
+
+            assert!(matches!(
+                error,
+                ControlPlaneError::OpenRaftOperation {
+                    kind: actual_kind,
+                    message,
+                } if actual_kind == kind && message == "test OpenRaft failure"
+            ));
+        }
+    }
+
     fn control_plane_test_tls_certified_key() -> Arc<CertifiedKey> {
         use rustls::pki_types::pem::PemObject as _;
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -23233,6 +23273,56 @@ mod tests {
         wait_for_control_plane_server_workers_to_finish(&policy);
 
         assert_eq!(status.pg_routes(), 0);
+    }
+
+    #[test]
+    fn control_plane_server_response_gets_a_fresh_bounded_io_phase() {
+        let directory = test_util::tempdir();
+        let socket_path = directory.path().join("control-plane.sock");
+        let io_timeout = Duration::from_millis(100);
+        let listener = ControlPlaneRpcServerListener::unix(
+            UnixListener::bind(&socket_path).unwrap(),
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+            io_timeout,
+        )
+        .unwrap();
+        let confirmation_calls = Arc::new(AtomicUsize::new(0));
+        let confirmation_calls_for_policy = Arc::clone(&confirmation_calls);
+        let policy = ControlPlaneRpcServerPolicy::new(
+            ControlPlaneRpcServerRole::Ordinary,
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        )
+        .unwrap()
+        .with_authority_confirmation(Arc::new(move || {
+            confirmation_calls_for_policy.fetch_add(1, Ordering::AcqRel);
+            std::thread::sleep(io_timeout + Duration::from_millis(50));
+            Ok(())
+        }));
+        let authority = Arc::new(Mutex::new(
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+                directory.path().join("control.state"),
+            ))
+            .unwrap(),
+        ));
+        let client = std::thread::spawn(move || {
+            UnixControlPlaneClient::new(socket_path)
+                .runtime_map_status_with_check_applied_timeout()
+                .unwrap()
+        });
+
+        listener
+            .accept_one(
+                &move || ControlPlaneRpcServerAuthority::Shared(Arc::clone(&authority)),
+                &policy,
+            )
+            .unwrap();
+        let status = client.join().unwrap();
+        wait_for_control_plane_server_workers_to_finish(&policy);
+
+        assert_eq!(status.pg_routes(), 0);
+        assert_eq!(confirmation_calls.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -27694,10 +27784,12 @@ mod tests {
     #[test]
     fn unix_control_plane_frame_io_rechecks_expired_aggregate_budget() {
         let (mut write_stream, mut write_peer) = UnixStream::pair().unwrap();
-        let mut write_stream = DeadlineUnixStream {
-            stream: &mut write_stream,
-            deadline: Instant::now() - Duration::from_millis(1),
-        };
+        let mut write_stream = DeadlineUnixStream::new(
+            &mut write_stream,
+            Instant::now() - Duration::from_millis(1),
+            CONTROL_PLANE_RPC_DEADLINE_EXPIRED,
+        )
+        .unwrap();
         let write_error = write_control_plane_rpc_frame(
             &mut write_stream,
             ControlPlaneRpcKind::RuntimeMapSnapshot,
@@ -27718,10 +27810,12 @@ mod tests {
         ));
 
         let (mut read_stream, _read_peer) = UnixStream::pair().unwrap();
-        let mut read_stream = DeadlineUnixStream {
-            stream: &mut read_stream,
-            deadline: Instant::now() - Duration::from_millis(1),
-        };
+        let mut read_stream = DeadlineUnixStream::new(
+            &mut read_stream,
+            Instant::now() - Duration::from_millis(1),
+            CONTROL_PLANE_RPC_DEADLINE_EXPIRED,
+        )
+        .unwrap();
         let read_error = read_control_plane_rpc_frame(&mut read_stream).unwrap_err();
         assert!(matches!(
             read_error,
