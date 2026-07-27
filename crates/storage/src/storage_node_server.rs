@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -347,7 +347,7 @@ use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 #[cfg(test)]
 type MetadataCommandBeforeWaitHook = Arc<dyn Fn(PgId) + Send + Sync>;
 
-pub const STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME: &str = ".argmin-storage-node.lock";
+const STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME: &str = ".argmin-storage-node.lock";
 const STORAGE_NODE_INCARNATION_FILE: &str = "control-plane-node-incarnation";
 const STORAGE_NODE_INCARNATION_TMP_FILE: &str = ".control-plane-node-incarnation.tmp";
 const LOCK_EX: i32 = 2;
@@ -1694,6 +1694,14 @@ pub enum StorageNodeServerError {
         locked_path: PathBuf,
         config_path: PathBuf,
     },
+    #[error("storage-node data directory lock identity changed for {path:?}")]
+    DataDirLockIdentityChanged { path: PathBuf },
+    #[error("storage-node data directory inspection failed for {path:?}: {source}")]
+    DataDirInspectionIo {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("storage-node PG {pg_id} initialized durable state is invalid")]
     InitializedPgStateInvalid {
         pg_id: u32,
@@ -1991,6 +1999,19 @@ impl StorageNodeStateInitializationGuard {
         Ok(Self {
             data_dir_guard: StorageNodeDataDirGuard::acquire(data_dir)?,
         })
+    }
+
+    /// Snapshot data-directory entry names excluding the exact held lock.
+    ///
+    /// This does not classify any other entry by ownership or initialization
+    /// phase. It lets an outer deployment initializer inspect its own markers
+    /// without learning storage's private lock filename.
+    pub fn data_dir_entry_names_excluding_held_lock(
+        &self,
+    ) -> Result<Vec<std::ffi::OsString>, StorageNodeServerError> {
+        self.data_dir_guard
+            .lock
+            .entry_names_excluding_held_lock(&self.data_dir_guard.data_dir)
     }
 
     fn data_dir(&self) -> &Path {
@@ -17988,7 +18009,7 @@ fn persist_storage_node_incarnation(
 }
 
 struct StorageNodeDataDirLock {
-    _file: File,
+    file: File,
 }
 
 impl StorageNodeDataDirLock {
@@ -18040,7 +18061,61 @@ impl StorageNodeDataDirLock {
                 })
             };
         }
-        Ok(Self { _file: file })
+        Ok(Self { file })
+    }
+
+    fn entry_names_excluding_held_lock(
+        &self,
+        data_dir: &Path,
+    ) -> Result<Vec<std::ffi::OsString>, StorageNodeServerError> {
+        let held_metadata =
+            self.file
+                .metadata()
+                .map_err(|source| StorageNodeServerError::DataDirInspectionIo {
+                    path: data_dir.to_path_buf(),
+                    source,
+                })?;
+        let entries = fs::read_dir(data_dir).map_err(|source| {
+            StorageNodeServerError::DataDirInspectionIo {
+                path: data_dir.to_path_buf(),
+                source,
+            }
+        })?;
+        let mut found_held_lock = false;
+        let mut entry_names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| StorageNodeServerError::DataDirInspectionIo {
+                path: data_dir.to_path_buf(),
+                source,
+            })?;
+            if entry.file_name() != STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME {
+                entry_names.push(entry.file_name());
+                continue;
+            }
+            let entry_metadata = fs::symlink_metadata(entry.path()).map_err(|source| {
+                StorageNodeServerError::DataDirInspectionIo {
+                    path: data_dir.to_path_buf(),
+                    source,
+                }
+            })?;
+            if entry_metadata.file_type().is_symlink()
+                || !entry_metadata.is_file()
+                || entry_metadata.dev() != held_metadata.dev()
+                || entry_metadata.ino() != held_metadata.ino()
+            {
+                return Err(StorageNodeServerError::DataDirLockIdentityChanged {
+                    path: data_dir.to_path_buf(),
+                });
+            }
+            found_held_lock = true;
+        }
+        if !found_held_lock {
+            return Err(StorageNodeServerError::DataDirLockIdentityChanged {
+                path: data_dir.to_path_buf(),
+            });
+        }
+        entry_names.sort_unstable();
+        Ok(entry_names)
     }
 }
 
@@ -18811,6 +18886,61 @@ mod tests {
         let reopened =
             SharedStorageNode::open_with_default_ec_shape(&data_dir, &[0, 3], ec_shape).unwrap();
         assert_eq!(reopened.default_ec_shape(), ec_shape);
+    }
+
+    #[test]
+    fn storage_node_state_initialization_guard_rejects_symlinked_native_lock() {
+        let tmp = test_util::tempdir();
+        let data_dir = tmp.path().join("node");
+        let external = tmp.path().join("external-lock-target");
+        prepare_private_data_dir(&data_dir).unwrap();
+        fs::write(&external, b"external").unwrap();
+        std::os::unix::fs::symlink(
+            &external,
+            data_dir.join(STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME),
+        )
+        .unwrap();
+
+        let error = StorageNodeStateInitializationGuard::acquire(&data_dir).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageNodeServerError::Io {
+                context: "open storage-node data-dir lock",
+                ..
+            }
+        ));
+        assert_eq!(fs::read(&external).unwrap(), b"external");
+    }
+
+    #[test]
+    fn storage_node_initialization_entries_hide_and_validate_native_lock() {
+        let tmp = test_util::tempdir();
+        let data_dir = tmp.path().join("node");
+        let guard = StorageNodeStateInitializationGuard::acquire(&data_dir).unwrap();
+        assert!(guard
+            .data_dir_entry_names_excluding_held_lock()
+            .unwrap()
+            .is_empty());
+        fs::write(data_dir.join("outer-b"), b"b").unwrap();
+        fs::write(data_dir.join("outer-a"), b"a").unwrap();
+
+        assert_eq!(
+            guard.data_dir_entry_names_excluding_held_lock().unwrap(),
+            ["outer-a", "outer-b"]
+        );
+
+        fs::remove_file(data_dir.join(STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME)).unwrap();
+        fs::write(
+            data_dir.join(STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME),
+            b"replacement",
+        )
+        .unwrap();
+        assert!(matches!(
+            guard.data_dir_entry_names_excluding_held_lock(),
+            Err(StorageNodeServerError::DataDirLockIdentityChanged { path })
+                if path == data_dir
+        ));
     }
 
     #[test]

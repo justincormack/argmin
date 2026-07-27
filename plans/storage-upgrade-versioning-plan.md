@@ -383,32 +383,35 @@ The storage-owned PG layout slice is complete:
   semantic PG-state error and cannot inspect the underlying `StoreError` or its error chain.
 - `scripts/check-storage-cluster-boundaries` rejects new physical PG, metadata-store, or shard
   layout knowledge in `argmin-s3`.
+- The native storage-node data-directory lock filename is private. Outer deployment
+  initialization receives a snapshot of all directory entry names except the exact held native
+  lock; this API does not classify any other entry by ownership or initialization phase. Storage
+  validates that the omitted directory entry still refers to the exact held lock file.
+- Native-lock symlink and replacement tests are owned by `storage`; the boundary check rejects
+  exposing the constant or literal filename to `argmin-s3`.
 
-Residual containment work includes removing `argmin-s3`'s knowledge of the native
-storage-node data-directory lock filename, completing the RPC/control-plane/Raft ownership
-inventory, hiding WAL and restart-format constructors, and replacing any remaining
-higher-layer implementation-error matching. These remain explicit work below.
+Residual containment work includes completing the RPC/control-plane/Raft ownership inventory,
+hiding WAL and restart-format constructors, and replacing any remaining higher-layer
+implementation-error matching. These remain explicit work below.
 
 ## Immediate Next Steps
 
-1. Remove the native storage-node data-directory lock filename from `argmin-s3`; expose only a
-   semantic storage-owned initialization-directory inspection contract.
-2. Inventory the storage-node, control-plane, and Raft RPC surfaces by owner crate, including
+1. Inventory the storage-node, control-plane, and Raft RPC surfaces by owner crate, including
    framing, authentication envelopes, error translation, retry classification, and transport
    setup.
-3. Refactor control-plane and Raft serving toward storage-owned client/server facades so the
+2. Refactor control-plane and Raft serving toward storage-owned client/server facades so the
    binary supplies configuration and lifecycle control but never handles protocol frames.
-4. Hide public WAL/restart-format constructors and move direct WAL/impossible-state tests into
+3. Hide public WAL/restart-format constructors and move direct WAL/impossible-state tests into
    the owner.
-5. Replace higher-layer matching on database/RPC implementation errors with owner-defined
+4. Replace higher-layer matching on database/RPC implementation errors with owner-defined
    semantic errors or classification methods.
-6. Inventory and restrict nested durable codecs for metadata, tags, ACLs, and encryption;
+5. Inventory and restrict nested durable codecs for metadata, tags, ACLs, and encryption;
    record how containing formats advance when a nested format changes.
-7. Audit existing version/fallback code and remove unsupported legacy compatibility where it
+6. Audit existing version/fallback code and remove unsupported legacy compatibility where it
    worsens current invariants.
-8. Add or tighten current-version rejection tests for existing versioned formats.
-9. Add boundary checks for the concrete leaks found in this audit, while relying on crate
+7. Add or tighten current-version rejection tests for existing versioned formats.
+8. Add boundary checks for the concrete leaks found in this audit, while relying on crate
    privacy for the durable enforcement.
-10. Remove the trigger-verification item from Phase 11 stabilisation tracking and keep this
+9. Remove the trigger-verification item from Phase 11 stabilisation tracking and keep this
     plan as the upgrade home for it; defer trigger body hashing/recreation until the upgrade
     framework is deliberately started.

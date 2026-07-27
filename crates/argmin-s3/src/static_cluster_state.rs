@@ -578,7 +578,7 @@ pub(crate) fn initialize_static_storage(
         sync_identity_file(&marker_path, "sync static storage initialization marker")?;
         sync_directory(data_dir, "sync static storage initialization marker")?;
     } else {
-        publish_initialization_marker(data_dir, &expected)?;
+        publish_initialization_marker(data_dir, &expected, &storage_node_initialization_guard)?;
     }
 
     let node_id = NodeId::new(storage_node_id);
@@ -715,6 +715,7 @@ fn publish_static_storage_identity(
 fn publish_initialization_marker(
     data_dir: &Path,
     expected: &StaticStorageIdentity,
+    storage_guard: &storage::storage_node_server::StorageNodeStateInitializationGuard,
 ) -> Result<(), String> {
     let marker_path = data_dir.join(STORAGE_INITIALIZING_FILE_NAME);
     let next_path = data_dir.join(STORAGE_INITIALIZING_NEXT_FILE_NAME);
@@ -724,7 +725,7 @@ fn publish_initialization_marker(
             next_path.display()
         )
     })? {
-        require_only_directory_entry(data_dir, STORAGE_INITIALIZING_NEXT_FILE_NAME)?;
+        require_only_directory_entry(data_dir, storage_guard, STORAGE_INITIALIZING_NEXT_FILE_NAME)?;
         fs::remove_file(&next_path).map_err(|error| {
             format!(
                 "remove unpublished static storage initialization marker {}: {error}",
@@ -736,7 +737,7 @@ fn publish_initialization_marker(
             "sync removal of unpublished static storage initialization marker",
         )?;
     }
-    require_empty_storage_directory(data_dir)?;
+    require_empty_storage_directory(data_dir, storage_guard)?;
     create_identity_file(&next_path, expected)?;
     sync_directory(
         data_dir,
@@ -777,8 +778,11 @@ fn remove_completed_initialization_marker(
     sync_directory(data_dir, "sync completed static storage initialization")
 }
 
-fn require_empty_storage_directory(data_dir: &Path) -> Result<(), String> {
-    if non_lock_directory_entries(data_dir)?.next().is_some() {
+fn require_empty_storage_directory(
+    data_dir: &Path,
+    storage_guard: &storage::storage_node_server::StorageNodeStateInitializationGuard,
+) -> Result<(), String> {
+    if !static_storage_state_entry_names(data_dir, storage_guard)?.is_empty() {
         return Err(format!(
             "static storage directory {} is nonempty but has no durable identity",
             data_dir.display()
@@ -787,12 +791,16 @@ fn require_empty_storage_directory(data_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn require_only_directory_entry(data_dir: &Path, expected_name: &str) -> Result<(), String> {
-    let mut entries = non_lock_directory_entries(data_dir)?;
-    let Some(entry) = entries.next() else {
+fn require_only_directory_entry(
+    data_dir: &Path,
+    storage_guard: &storage::storage_node_server::StorageNodeStateInitializationGuard,
+    expected_name: &str,
+) -> Result<(), String> {
+    let entries = static_storage_state_entry_names(data_dir, storage_guard)?;
+    let Some(entry_name) = entries.first() else {
         return Err("static storage initialization temporary file disappeared".to_string());
     };
-    if entry.file_name() != expected_name || entries.next().is_some() {
+    if entry_name.as_os_str() != std::ffi::OsStr::new(expected_name) || entries.len() != 1 {
         return Err(format!(
             "static storage directory {} contains state without a published initialization marker",
             data_dir.display()
@@ -801,25 +809,22 @@ fn require_only_directory_entry(data_dir: &Path, expected_name: &str) -> Result<
     Ok(())
 }
 
-fn non_lock_directory_entries(path: &Path) -> Result<impl Iterator<Item = fs::DirEntry>, String> {
-    let entries = fs::read_dir(path)
-        .map_err(|error| format!("read static storage directory {}: {error}", path.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            format!(
-                "read static storage directory entry in {}: {error}",
-                path.display()
-            )
-        })?;
-    Ok(entries.into_iter().filter(|entry| {
-        let name = entry.file_name();
-        if name == STORAGE_INITIALIZATION_LOCK_FILE_NAME
-            || name == storage::storage_node_server::STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME
-        {
-            return !entry.file_type().is_ok_and(|file_type| file_type.is_file());
-        }
-        true
-    }))
+fn static_storage_state_entry_names(
+    data_dir: &Path,
+    storage_guard: &storage::storage_node_server::StorageNodeStateInitializationGuard,
+) -> Result<Vec<std::ffi::OsString>, String> {
+    let entries = storage_guard
+        .data_dir_entry_names_excluding_held_lock()
+        .map_err(|error| format!("inspect static storage directory: {error}"))?;
+    Ok(entries
+        .into_iter()
+        .filter(|name| {
+            if name != STORAGE_INITIALIZATION_LOCK_FILE_NAME {
+                return true;
+            }
+            !fs::symlink_metadata(data_dir.join(name)).is_ok_and(|metadata| metadata.is_file())
+        })
+        .collect())
 }
 
 fn verify_static_storage_pg_state(
@@ -1523,29 +1528,6 @@ mod tests {
     }
 
     #[test]
-    fn static_storage_initialization_rejects_symlinked_native_lock() {
-        let temp = test_util::tempdir();
-        let data_dir = temp.path().join("storage");
-        let external = temp.path().join("external-lock-target");
-        let expected = identity("all-1", "b");
-        ensure_private_data_directory_durable(&data_dir).unwrap();
-        fs::write(&external, b"external").unwrap();
-        std::os::unix::fs::symlink(
-            &external,
-            data_dir.join(storage::storage_node_server::STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME),
-        )
-        .unwrap();
-
-        let error =
-            initialize_storage(&expected, 1, &data_dir, &[0], EcShape { k: 1, m: 0 }).unwrap_err();
-
-        assert!(error.contains("open storage-node data-dir lock"));
-        assert_eq!(fs::read(&external).unwrap(), b"external");
-        assert!(!data_dir.join(STORAGE_INITIALIZING_FILE_NAME).exists());
-        assert!(!data_dir.join(STORAGE_IDENTITY_FILE_NAME).exists());
-    }
-
-    #[test]
     fn static_storage_initialization_rejects_fifo_static_lock() {
         let temp = test_util::tempdir();
         let data_dir = temp.path().join("storage");
@@ -1555,8 +1537,6 @@ mod tests {
         let lock_path_bytes = CString::new(lock_path.as_os_str().as_bytes()).unwrap();
         // SAFETY: `lock_path_bytes` is a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(lock_path_bytes.as_ptr(), 0o600) }, 0);
-        assert_eq!(non_lock_directory_entries(&data_dir).unwrap().count(), 1);
-
         let error =
             initialize_storage(&expected, 1, &data_dir, &[0], EcShape { k: 1, m: 0 }).unwrap_err();
 
