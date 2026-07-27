@@ -3086,7 +3086,7 @@ fn rolled_back_command_record_does_not_mark_digest_revision_clean() {
 }
 
 #[test]
-fn metadata_digest_trigger_bootstrap_repairs_partial_install() {
+fn pg_store_open_rejects_missing_metadata_digest_trigger() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("digest-bucket");
     let key = trusted_object_key("object");
@@ -3109,50 +3109,23 @@ fn metadata_digest_trigger_bootstrap_repairs_partial_install() {
                  DROP TRIGGER metadata_digest_object_version_counters_au;",
             )
             .unwrap();
-        store
-            .conn
-            .execute(
-                "DELETE FROM object_version_counters WHERE bucket = ?1 AND key = ?2",
-                params![bucket.as_str(), key.as_str()],
-            )
-            .unwrap();
-        assert_ne!(
-            store.cached_metadata_state_digest().unwrap(),
-            store.metadata_state_digest().unwrap(),
-            "simulated partial trigger install should leave stale cached digest before reopen",
-        );
     }
 
-    let store = PgStore::open(tmp.path(), 1).unwrap();
-    assert_cached_metadata_digest_matches_materialized(&store);
-    store
-        .conn
-        .execute(
-            "INSERT INTO object_version_counters \
-             (bucket, key, next_version_id) VALUES (?1, ?2, ?3)",
-            params![bucket.as_str(), key.as_str(), 2_i64],
-        )
-        .unwrap();
-    store
-        .conn
-        .execute(
-            "UPDATE object_version_counters SET next_version_id = ?1 \
-             WHERE bucket = ?2 AND key = ?3",
-            params![3_i64, bucket.as_str(), key.as_str()],
-        )
-        .unwrap();
-    store
-        .conn
-        .execute(
-            "DELETE FROM object_version_counters WHERE bucket = ?1 AND key = ?2",
-            params![bucket.as_str(), key.as_str()],
-        )
-        .unwrap();
-    assert_cached_metadata_digest_matches_materialized(&store);
+    let error = match PgStore::open(tmp.path(), 1) {
+        Ok(_) => panic!("store with a missing metadata digest trigger should be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StoreError::MetadataDigestBootstrapInvalid { .. }
+    ));
+    assert!(error
+        .to_string()
+        .contains("missing digest trigger for table object_version_counters"));
 }
 
 #[test]
-fn metadata_digest_bootstrap_marker_repairs_stale_cache_with_complete_triggers() {
+fn pg_store_open_rejects_missing_metadata_digest_bootstrap_marker() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("digest-bucket");
     let key = trusted_object_key("object");
@@ -3170,27 +3143,19 @@ fn metadata_digest_bootstrap_marker_repairs_stale_cache_with_complete_triggers()
 
         store
             .conn
-            .execute(
-                "UPDATE metadata_table_digests \
-                 SET table_digest = 0, row_count = 0, row_hash_xor = 0, row_hash_sum = 0 \
-                 WHERE table_name = ?1",
-                params!["object_version_counters"],
-            )
-            .unwrap();
-        store
-            .conn
             .execute("DELETE FROM metadata_digest_bootstrap_state", [])
             .unwrap();
-        assert_ne!(
-            store.cached_metadata_state_digest().unwrap(),
-            store.metadata_state_digest().unwrap(),
-            "simulated interrupted bootstrap should leave stale cache with all triggers present",
-        );
     }
 
-    let store = PgStore::open(tmp.path(), 1).unwrap();
-    assert_cached_metadata_digest_matches_materialized(&store);
-    assert!(store.metadata_digest_bootstrap_complete().unwrap());
+    let error = match PgStore::open(tmp.path(), 1) {
+        Ok(_) => panic!("store with a missing metadata digest marker should be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        StoreError::MetadataDigestBootstrapInvalid { .. }
+    ));
+    assert!(error.to_string().contains("missing singleton marker"));
 }
 
 #[test]

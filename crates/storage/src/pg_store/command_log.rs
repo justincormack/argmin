@@ -854,7 +854,8 @@ struct MetadataTableDigestStats {
 
 impl PgStore {
     pub(super) fn ensure_metadata_digest_bootstrap(&self) -> Result<(), StoreError> {
-        if !self.metadata_digest_bootstrap_needs_repair()? {
+        if self.metadata_digest_bootstrap_complete()? {
+            self.validate_metadata_digest_bootstrap()?;
             return Ok(());
         }
 
@@ -865,6 +866,9 @@ impl PgStore {
                 source: e,
             })?;
         let result = (|| {
+            if self.metadata_digest_bootstrap_complete()? {
+                return self.validate_metadata_digest_bootstrap();
+            }
             self.install_metadata_digest_triggers()?;
             self.refresh_all_metadata_table_digests()?;
             self.mark_metadata_digest_bootstrap_complete()
@@ -884,19 +888,20 @@ impl PgStore {
         }
     }
 
-    fn metadata_digest_bootstrap_needs_repair(&self) -> Result<bool, StoreError> {
-        if !self.metadata_digest_bootstrap_complete()? {
-            return Ok(true);
-        }
+    fn validate_metadata_digest_bootstrap(&self) -> Result<(), StoreError> {
         for table in METADATA_DIGEST_TABLES {
             if !self.metadata_digest_row_exists(table)? {
-                return Ok(true);
+                return Err(StoreError::MetadataDigestBootstrapInvalid {
+                    reason: format!("missing digest row for table {}", table.name),
+                });
             }
             if !self.metadata_digest_triggers_complete(table)? {
-                return Ok(true);
+                return Err(StoreError::MetadataDigestBootstrapInvalid {
+                    reason: format!("missing digest trigger for table {}", table.name),
+                });
             }
         }
-        Ok(false)
+        Ok(())
     }
 
     pub(super) fn metadata_digest_bootstrap_complete(&self) -> Result<bool, StoreError> {
@@ -906,51 +911,58 @@ impl PgStore {
             "check metadata digest bootstrap state",
             |row| row.get::<_, i64>(0),
         )
-        .map(|completed| completed == Some(1))
+        .and_then(|completed| match completed {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            Some(value) => Err(StoreError::MetadataDigestBootstrapInvalid {
+                reason: format!("invalid completion value {value}"),
+            }),
+            None => Err(StoreError::MetadataDigestBootstrapInvalid {
+                reason: "missing singleton marker".to_string(),
+            }),
+        })
     }
 
     fn mark_metadata_digest_bootstrap_complete(&self) -> Result<(), StoreError> {
-        self.execute_cached(
-            "INSERT INTO metadata_digest_bootstrap_state (singleton, completed) \
-             VALUES (0, 1) \
-             ON CONFLICT(singleton) DO UPDATE SET completed = excluded.completed",
+        let changed = self.execute_cached(
+            "UPDATE metadata_digest_bootstrap_state SET completed = 1 \
+             WHERE singleton = 0 AND completed = 0",
             [],
             "mark metadata digest bootstrap complete",
-        )
-        .map(|_| ())
+        )?;
+        if changed != 1 {
+            return Err(StoreError::MetadataDigestBootstrapInvalid {
+                reason: "bootstrap marker was not incomplete".to_string(),
+            });
+        }
+        Ok(())
     }
 
     fn install_metadata_digest_triggers(&self) -> Result<(), StoreError> {
         for table in METADATA_DIGEST_TABLES {
-            if !self.metadata_digest_row_exists(table)? {
-                self.execute_cached(
-                    "INSERT INTO metadata_table_digests \
-                     (table_name, table_digest, row_count, row_hash_xor, row_hash_sum) \
-                     VALUES (?1, ?2, 0, 0, 0) \
-                     ON CONFLICT(table_name) DO NOTHING",
-                    params![
-                        table.name,
-                        metadata_table_digest_from_stats(
-                            table,
-                            MetadataTableDigestStats {
-                                row_count: 0,
-                                row_hash_xor: 0,
-                                row_hash_sum: 0,
-                            },
-                        ) as i64,
-                    ],
-                    "initialize metadata digest table row",
-                )?;
-            }
-
-            if !self.metadata_digest_triggers_complete(table)? {
-                self.conn
-                    .execute_batch(&self.metadata_digest_trigger_sql(table))
-                    .map_err(|e| StoreError::Db {
-                        context: "install metadata digest triggers",
-                        source: e,
-                    })?;
-            }
+            self.execute_cached(
+                "INSERT INTO metadata_table_digests \
+                 (table_name, table_digest, row_count, row_hash_xor, row_hash_sum) \
+                 VALUES (?1, ?2, 0, 0, 0)",
+                params![
+                    table.name,
+                    metadata_table_digest_from_stats(
+                        table,
+                        MetadataTableDigestStats {
+                            row_count: 0,
+                            row_hash_xor: 0,
+                            row_hash_sum: 0,
+                        },
+                    ) as i64,
+                ],
+                "initialize metadata digest table row",
+            )?;
+            self.conn
+                .execute_batch(&self.metadata_digest_trigger_sql(table))
+                .map_err(|e| StoreError::Db {
+                    context: "install metadata digest triggers",
+                    source: e,
+                })?;
         }
         Ok(())
     }
@@ -991,7 +1003,7 @@ impl PgStore {
         let new_digest = Self::metadata_row_digest_sql_expr(table, "NEW");
         let old_digest = Self::metadata_row_digest_sql_expr(table, "OLD");
         format!(
-			"CREATE TRIGGER IF NOT EXISTS metadata_digest_{name}_ai \
+			"CREATE TRIGGER metadata_digest_{name}_ai \
 			 AFTER INSERT ON {table_name} BEGIN \
 			   UPDATE metadata_table_digests \
 			      SET (row_count, row_hash_xor, row_hash_sum, table_digest) = ( \
@@ -1009,7 +1021,7 @@ impl PgStore {
 				      SET revision = revision + 1 \
 				    WHERE singleton = 0; \
 				 END; \
-				 CREATE TRIGGER IF NOT EXISTS metadata_digest_{name}_ad \
+				 CREATE TRIGGER metadata_digest_{name}_ad \
 				 AFTER DELETE ON {table_name} BEGIN \
 			   UPDATE metadata_table_digests \
 			      SET (row_count, row_hash_xor, row_hash_sum, table_digest) = ( \
@@ -1027,7 +1039,7 @@ impl PgStore {
 				      SET revision = revision + 1 \
 				    WHERE singleton = 0; \
 				 END; \
-				 CREATE TRIGGER IF NOT EXISTS metadata_digest_{name}_au \
+				 CREATE TRIGGER metadata_digest_{name}_au \
 				 AFTER UPDATE ON {table_name} BEGIN \
 			   UPDATE metadata_table_digests \
 			      SET (row_hash_xor, row_hash_sum, table_digest) = ( \

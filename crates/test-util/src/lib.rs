@@ -62,7 +62,9 @@ fn session_dir() -> PathBuf {
 /// Clean up session directories belonging to dead processes.
 ///
 /// Scans the platform test-temp root for subdirectories named after PIDs.
-/// If the PID is no longer running, removes that directory tree.
+/// A directory is removed only when its lock can be inspected and acquired, or
+/// when it has no lock and its PID is no longer running. Inspection failures
+/// leave the directory untouched.
 /// Skips cleanup entirely if `ARGMIN_KEEP_TEST_DIRS=1`.
 fn cleanup_stale_sessions() {
     if std::env::var("ARGMIN_KEEP_TEST_DIRS").as_deref() == Ok("1") {
@@ -70,16 +72,19 @@ fn cleanup_stale_sessions() {
     }
 
     let base = base_dir();
-    let entries = match std::fs::read_dir(&base) {
+    cleanup_stale_sessions_in(&base, std::process::id());
+}
+
+fn cleanup_stale_sessions_in(base: &Path, current_pid: u32) {
+    let entries = match std::fs::read_dir(base) {
         Ok(e) => e,
         Err(_) => return,
     };
 
     for entry in entries.flatten() {
         // The root is private, so newly-created entries can only belong to us.
-        // Upgrade effective-UID-owned legacy directories, but reject symlinks
-        // and foreign-owned entries before constructing paths beneath them or
-        // recursively removing them.
+        // Reject entries that do not satisfy the current directory contract
+        // before constructing paths beneath them or recursively removing them.
         #[cfg(unix)]
         if ensure_private_directory(&entry.path()).is_err() {
             continue;
@@ -95,16 +100,15 @@ fn cleanup_stale_sessions() {
         };
 
         // Skip our own PID.
-        if pid == std::process::id() {
+        if pid == current_pid {
             continue;
         }
 
         let lock_path = entry.path().join(SESSION_LOCK_FILE_NAME);
         if lock_path.exists() {
-            if session_lock_is_held(&lock_path) {
-                continue;
+            if let Ok(false) = session_lock_is_held(&lock_path) {
+                let _ = std::fs::remove_dir_all(entry.path());
             }
-            let _ = std::fs::remove_dir_all(entry.path());
             continue;
         }
 
@@ -170,12 +174,6 @@ fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
         ));
     }
 
-    // Upgrade directories created by older test-util versions only after type
-    // and ownership have been established. Re-read the metadata to verify the
-    // final security boundary before opening lock files or traversing entries.
-    if metadata.permissions().mode() & 0o777 != 0o700 {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
     validate_private_directory(path)
 }
 
@@ -212,10 +210,6 @@ fn open_lock_file(path: &Path) -> std::io::Result<File> {
             ));
         }
         if metadata.permissions().mode() & 0o777 != 0o600 {
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        let metadata = file.metadata()?;
-        if metadata.permissions().mode() & 0o777 != 0o600 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!("test lock is not mode 0600: {}", path.display()),
@@ -246,20 +240,18 @@ fn flock_exclusive(_file: &File, _nonblocking: bool) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn session_lock_is_held(path: &Path) -> bool {
-    let Ok(file) = open_lock_file(path) else {
-        return false;
-    };
+fn session_lock_is_held(path: &Path) -> std::io::Result<bool> {
+    let file = open_lock_file(path)?;
     match flock_exclusive(&file, true) {
-        Ok(()) => false,
-        Err(err) if err.raw_os_error() == Some(libc::EWOULDBLOCK) => true,
-        Err(_) => true,
+        Ok(()) => Ok(false),
+        Err(err) if err.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(true),
+        Err(err) => Err(err),
     }
 }
 
 #[cfg(not(unix))]
-fn session_lock_is_held(_path: &Path) -> bool {
-    true
+fn session_lock_is_held(_path: &Path) -> std::io::Result<bool> {
+    Ok(true)
 }
 
 /// Check if a process with the given PID is still running.
@@ -354,18 +346,24 @@ pub fn tempdir() -> TempDir {
 mod tests {
     #[cfg(unix)]
     #[test]
-    fn private_directory_creation_tightens_legacy_permissions() {
+    fn private_directory_creation_rejects_non_private_permissions() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let parent = tempfile::tempdir().unwrap();
-        let path = parent.path().join("legacy-root");
+        let path = parent.path().join("non-private-root");
         std::fs::create_dir(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        super::ensure_private_directory(&path).unwrap();
-
-        let metadata = std::fs::symlink_metadata(path).unwrap();
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        let error = super::ensure_private_directory(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+        );
     }
 
     #[cfg(unix)]
@@ -384,7 +382,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn lock_file_open_tightens_permissions_and_rejects_symlink() {
+    fn lock_file_open_rejects_non_private_permissions_and_symlink() {
         use std::os::unix::fs::{symlink, PermissionsExt as _};
 
         let parent = tempfile::tempdir().unwrap();
@@ -392,13 +390,60 @@ mod tests {
         std::fs::write(&lock_path, []).unwrap();
         std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let lock = super::open_lock_file(&lock_path).unwrap();
-        assert_eq!(lock.metadata().unwrap().permissions().mode() & 0o777, 0o600);
-        drop(lock);
+        let error = super::open_lock_file(&lock_path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::symlink_metadata(&lock_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+        );
 
         let link_path = parent.path().join("lock-link");
         symlink(&lock_path, &link_path).unwrap();
         assert!(super::open_lock_file(&link_path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_session_cleanup_preserves_live_session_with_wrong_mode_lock() {
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+        let parent = tempfile::tempdir().unwrap();
+        let base = parent.path().join("argmin-tests");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&base)
+            .unwrap();
+
+        let live_pid = std::process::id();
+        let session = base.join(live_pid.to_string());
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&session)
+            .unwrap();
+        let marker = session.join("must-survive");
+        std::fs::write(&marker, []).unwrap();
+
+        let lock_path = session.join(super::SESSION_LOCK_FILE_NAME);
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::flock_exclusive(&lock, false).unwrap();
+
+        let different_current_pid = live_pid.checked_add(1).unwrap_or(live_pid - 1);
+        super::cleanup_stale_sessions_in(&base, different_current_pid);
+
+        assert!(session.is_dir());
+        assert!(marker.is_file());
     }
 
     #[cfg(target_os = "macos")]

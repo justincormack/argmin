@@ -50,7 +50,7 @@ use crate::node_runtime::traits::{
     DurableBucketWriteReservationAcquire, DurableBucketWriteReservationHeartbeat, PgMetadataStore,
     ShardStore,
 };
-use crate::schema::init_pg_schema;
+use crate::schema::{init_pg_schema, require_current_pg_schema};
 use crate::types::*;
 use placement::NodeId;
 
@@ -692,6 +692,7 @@ pub fn verify_pg_durable_identity(
 ) -> Result<(), StoreError> {
     validate_pg_durable_identity_bytes(pg_id, expected_identity_bytes)?;
     let conn = open_existing_pg_database_read_only(pg_dir)?;
+    require_current_pg_schema(&conn)?;
     let quick_check = conn
         .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
         .map_err(|source| StoreError::Db {
@@ -773,6 +774,7 @@ pub fn inspect_pg_shard_inventory(
         });
     }
     let conn = open_existing_pg_database_read_only(pg_dir)?;
+    require_current_pg_schema(&conn)?;
     let store = PgStore {
         pg_id,
         shards_dir,
@@ -909,10 +911,7 @@ impl PgStore {
             context: "register metadata digest SQL functions",
             source: e,
         })?;
-        init_pg_schema(&conn).map_err(|e| StoreError::Db {
-            context: "init pg schema",
-            source: e,
-        })?;
+        init_pg_schema(&conn)?;
         conn.busy_timeout(std::time::Duration::from_millis(0))
             .map_err(|e| StoreError::Db {
                 context: "configure pg database busy timeout",
@@ -1204,7 +1203,7 @@ mod durable_identity_tests {
     const TEST_IDENTITY: &[u8] = b"test-static-cluster-identity";
 
     #[test]
-    fn pg_durable_identity_rejects_valid_empty_sqlite_database() {
+    fn pg_durable_identity_rejects_unversioned_sqlite_database() {
         let temp = test_util::tempdir();
         fs::create_dir(temp.path().join("shards")).unwrap();
         let conn = Connection::open(temp.path().join("metadata.db")).unwrap();
@@ -1214,10 +1213,7 @@ mod durable_identity_tests {
 
         let error = verify_pg_durable_identity(temp.path(), 3, TEST_IDENTITY).unwrap_err();
 
-        assert!(matches!(
-            error,
-            StoreError::PgDurableIdentityInvalid { pg_id: 3, .. }
-        ));
+        assert!(matches!(error, StoreError::PgSchemaInvalid { .. }));
     }
 
     #[test]

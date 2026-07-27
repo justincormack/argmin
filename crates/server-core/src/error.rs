@@ -929,6 +929,8 @@ fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
         StoreError::ShardScavengerObservationInconsistentReason { .. } => {
             "shard_scavenger_observation_inconsistent_reason"
         }
+        StoreError::PgSchemaInvalid { .. } => "pg_schema_invalid",
+        StoreError::MetadataDigestBootstrapInvalid { .. } => "metadata_digest_bootstrap_invalid",
         StoreError::InvalidKeyLength { .. } => "invalid_shard_key_length",
         StoreError::InvalidShardKeyHex => "invalid_shard_key_hex",
         StoreError::ShardScavengerScanIncomplete { .. } => "shard_scavenger_scan_incomplete",

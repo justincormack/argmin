@@ -406,6 +406,12 @@ pub enum StoreError {
         errors: String,
     },
 
+    #[error("PG database schema is invalid: {reason}")]
+    PgSchemaInvalid { reason: String },
+
+    #[error("metadata digest bootstrap state is invalid: {reason}")]
+    MetadataDigestBootstrapInvalid { reason: String },
+
     #[error("IO error: {context}")]
     Io {
         context: &'static str,
@@ -498,6 +504,8 @@ impl StoreError {
             Self::InvalidKeyLength { .. } => "invalid_key_length",
             Self::InvalidShardKeyHex => "invalid_shard_key_hex",
             Self::ShardScavengerScanIncomplete { .. } => "shard_scavenger_scan_incomplete",
+            Self::PgSchemaInvalid { .. } => "pg_schema_invalid",
+            Self::MetadataDigestBootstrapInvalid { .. } => "metadata_digest_bootstrap_invalid",
             Self::Io { context, .. }
                 if matches!(
                     *context,

@@ -81,6 +81,25 @@ Exit criteria:
   legacy-version compatibility.
 - New code review rule: no speculative migration fallback while upgrades are unsupported.
 
+PG SQLite baseline completed 2026-07-27:
+
+- The PG database now records one current `PRAGMA user_version` as part of
+  transactional schema creation. Version zero is accepted only for a database
+  with no user schema objects; existing unversioned and differently versioned
+  databases fail closed.
+- All speculative `ALTER TABLE` migrations and data backfills were removed.
+  Current columns, indexes, constraints, and triggers are created directly as
+  the baseline schema.
+- Metadata-digest bootstrap has a current-format incomplete marker created with
+  the schema. Missing markers, digest rows, or triggers on a completed store are
+  corruption and fail closed rather than being treated as an older store.
+- The unused bucket-subresource discriminants 2 and 3 were removed from the SQL
+  constraint, matching the current typed writer and decoder exactly.
+
+This completes the PG SQLite portion of Phase 0 and its baseline version marker;
+the other durable and cross-process boundaries in Phase 1 remain separate audit
+work.
+
 ## Phase 1: Version Boundary Inventory
 
 Document every durable or cross-process format that needs an explicit baseline version.

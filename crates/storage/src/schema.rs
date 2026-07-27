@@ -1,9 +1,13 @@
 /// SQL schema definitions and initialization.
 use rusqlite::Connection;
 
+use crate::error::StoreError;
+
+const CURRENT_PG_SCHEMA_VERSION: u32 = 1;
+
 /// Per-PG shard tracking table.
 const CREATE_SHARDS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS shards (
+CREATE TABLE shards (
     shard_key       BLOB PRIMARY KEY,
     data_size       INTEGER NOT NULL,
     crc64_nvme      INTEGER NOT NULL,
@@ -18,7 +22,7 @@ CREATE TABLE IF NOT EXISTS shards (
 /// deletion proof; they record only that one scan could not prove a durable
 /// reference for a physical shard location.
 const CREATE_SHARD_SCAVENGER_OBSERVATIONS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS shard_scavenger_observations (
+CREATE TABLE shard_scavenger_observations (
     node_id             INTEGER NOT NULL CHECK (node_id >= 0),
     data_pg_id          INTEGER NOT NULL CHECK (data_pg_id >= 0),
     shard_index         INTEGER NOT NULL CHECK (shard_index >= 0 AND shard_index <= 255),
@@ -38,7 +42,7 @@ CREATE TABLE IF NOT EXISTS shard_scavenger_observations (
 
 /// Durable repair queue for placed segment shards observed missing or corrupt.
 const CREATE_PLACED_SEGMENT_SHARD_REPAIRS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS placed_segment_shard_repairs (
+CREATE TABLE placed_segment_shard_repairs (
     data_pg_id          INTEGER NOT NULL CHECK (data_pg_id >= 0),
     segment_okh         BLOB NOT NULL CHECK (length(segment_okh) = 16),
     segment_vid         INTEGER NOT NULL CHECK (segment_vid > 0),
@@ -69,7 +73,7 @@ CREATE TABLE IF NOT EXISTS placed_segment_shard_repairs (
 /// Durable backfill queue for segment shard sets whose desired PG placement
 /// differs from the historical placement used by existing segment metadata.
 const CREATE_PLACED_SEGMENT_SHARD_BACKFILLS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS placed_segment_shard_backfills (
+CREATE TABLE placed_segment_shard_backfills (
     data_pg_id             INTEGER NOT NULL CHECK (data_pg_id >= 0),
     segment_okh            BLOB NOT NULL CHECK (length(segment_okh) = 16),
     segment_vid            INTEGER NOT NULL CHECK (segment_vid > 0),
@@ -102,7 +106,7 @@ CREATE TABLE IF NOT EXISTS placed_segment_shard_backfills (
 
 /// Per-PG object metadata table.
 const CREATE_OBJECTS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS objects (
+CREATE TABLE objects (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     version_id    INTEGER NOT NULL CHECK (version_id >= 0),
@@ -167,7 +171,7 @@ CREATE TABLE IF NOT EXISTS objects (
 
 /// Per-object-key durable version allocator.
 const CREATE_OBJECT_VERSION_COUNTERS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS object_version_counters (
+CREATE TABLE object_version_counters (
     bucket          TEXT NOT NULL,
     key             TEXT NOT NULL,
     next_version_id INTEGER NOT NULL CHECK (next_version_id > 0),
@@ -176,7 +180,7 @@ CREATE TABLE IF NOT EXISTS object_version_counters (
 
 /// Per-object-key durable write-order fence.
 const CREATE_OBJECT_WRITE_COUNTERS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS object_write_counters (
+CREATE TABLE object_write_counters (
     bucket                    TEXT NOT NULL,
     key                       TEXT NOT NULL,
     next_write_sequence       INTEGER NOT NULL CHECK (next_write_sequence > 0),
@@ -186,7 +190,7 @@ CREATE TABLE IF NOT EXISTS object_write_counters (
 
 /// In-progress multipart upload tracking table.
 const CREATE_MULTIPART_UPLOADS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS multipart_uploads (
+CREATE TABLE multipart_uploads (
     upload_id        TEXT PRIMARY KEY,
     bucket           TEXT NOT NULL,
     key              TEXT NOT NULL,
@@ -216,6 +220,8 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
         object_lock_retain_until IS NULL OR object_lock_retain_until > 0
     ),
     object_lock_legal_hold INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_legal_hold IN (0, 1, 2)),
+    checksum_algorithm INTEGER,
+    checksum_type INTEGER,
     CHECK (
         (initiated_object_kind = 0 AND initiated_object_version_id IS NULL AND initiated_object_generation_or_write_sequence IS NULL)
         OR
@@ -227,12 +233,12 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
 
 /// Index for listing multipart uploads by bucket/key.
 const CREATE_MPU_BUCKET_KEY_INDEX: &str = "\
-CREATE INDEX IF NOT EXISTS idx_mpu_bucket_key \
+CREATE INDEX idx_mpu_bucket_key \
     ON multipart_uploads (bucket, key, listing_cluster_epoch, listing_log_index, upload_id)";
 
 /// In-progress multipart part tracking table.
 const CREATE_MULTIPART_PARTS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS multipart_parts (
+CREATE TABLE multipart_parts (
     upload_id        TEXT NOT NULL,
     part_number      INTEGER NOT NULL,
     generation       INTEGER NOT NULL,
@@ -245,13 +251,14 @@ CREATE TABLE IF NOT EXISTS multipart_parts (
     ec_k             INTEGER NOT NULL,
     ec_m             INTEGER NOT NULL,
     last_modified    INTEGER NOT NULL,
+    checksum         BLOB,
     PRIMARY KEY (upload_id, part_number),
     FOREIGN KEY (upload_id) REFERENCES multipart_uploads(upload_id) ON DELETE CASCADE
 ) STRICT";
 
 /// Committed multipart manifest table for completed objects.
 const CREATE_OBJECT_PARTS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS object_parts (
+CREATE TABLE object_parts (
     bucket           TEXT NOT NULL,
     key              TEXT NOT NULL,
     version_id       INTEGER NOT NULL CHECK (version_id >= 0),
@@ -266,16 +273,17 @@ CREATE TABLE IF NOT EXISTS object_parts (
     ec_k             INTEGER NOT NULL,
     ec_m             INTEGER NOT NULL,
     data_pg_id      INTEGER NOT NULL,
+    checksum         BLOB,
     PRIMARY KEY (bucket, key, version_id, part_number)
 ) STRICT";
 
 const CREATE_OBJECT_PARTS_OFFSET_INDEX: &str = "\
-CREATE INDEX IF NOT EXISTS idx_object_parts_offset \
+CREATE INDEX idx_object_parts_offset \
 ON object_parts (bucket, key, version_id, object_offset_start, part_number)";
 
 /// In-progress streaming upload session table.
 const CREATE_STREAM_UPLOADS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS stream_uploads (
+CREATE TABLE stream_uploads (
     session_id    TEXT PRIMARY KEY,
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
@@ -328,7 +336,7 @@ CREATE TABLE IF NOT EXISTS stream_uploads (
 
 /// Staging segment records for in-progress streaming sessions.
 const CREATE_STREAM_UPLOAD_SEGMENTS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS stream_upload_segments (
+CREATE TABLE stream_upload_segments (
     session_id    TEXT NOT NULL,
     segment_index INTEGER NOT NULL,
     size          INTEGER NOT NULL,
@@ -346,7 +354,7 @@ CREATE TABLE IF NOT EXISTS stream_upload_segments (
 
 /// Committed object segments for normal PutObject.
 const CREATE_STREAM_OBJECT_CHUNKS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS object_segments (
+CREATE TABLE object_segments (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     version_id    INTEGER NOT NULL CHECK (version_id >= 0),
@@ -364,7 +372,7 @@ CREATE TABLE IF NOT EXISTS object_segments (
 
 /// Durable reclaim queue for standard segmented payload generations.
 const CREATE_CHUNK_MANIFEST_RECLAIMS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS object_segments_reclaims (
+CREATE TABLE object_segments_reclaims (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     generation_id INTEGER NOT NULL CHECK (generation_id > 0),
@@ -374,7 +382,7 @@ CREATE TABLE IF NOT EXISTS object_segments_reclaims (
 
 /// Child segment rows for standard segmented reclaim generations.
 const CREATE_CHUNK_MANIFEST_RECLAIM_CHUNKS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS object_segment_reclaim_segments (
+CREATE TABLE object_segment_reclaim_segments (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     generation_id INTEGER NOT NULL CHECK (generation_id > 0),
@@ -392,7 +400,7 @@ CREATE TABLE IF NOT EXISTS object_segment_reclaim_segments (
 
 /// Durable object payload generation reservations for in-flight PutObject writes.
 const CREATE_OBJECT_GENERATION_RESERVATIONS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS object_generation_reservations (
+CREATE TABLE object_generation_reservations (
     reservation_id TEXT PRIMARY KEY,
     bucket         TEXT NOT NULL,
     key            TEXT NOT NULL,
@@ -403,7 +411,7 @@ CREATE TABLE IF NOT EXISTS object_generation_reservations (
 
 /// Durable reclaim queue for multipart payload generations.
 const CREATE_MULTIPART_RECLAIMS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS multipart_reclaims (
+CREATE TABLE multipart_reclaims (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     generation_id INTEGER NOT NULL CHECK (generation_id > 0),
@@ -413,7 +421,7 @@ CREATE TABLE IF NOT EXISTS multipart_reclaims (
 
 /// Per-part reclaim rows for multipart payload generations.
 const CREATE_MULTIPART_RECLAIM_PARTS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS multipart_reclaim_parts (
+CREATE TABLE multipart_reclaim_parts (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     generation_id INTEGER NOT NULL CHECK (generation_id > 0),
@@ -426,7 +434,7 @@ CREATE TABLE IF NOT EXISTS multipart_reclaim_parts (
 
 /// Child segment rows for streamed multipart part reclaim generations.
 const CREATE_MULTIPART_RECLAIM_PART_CHUNKS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS multipart_reclaim_part_segments (
+CREATE TABLE multipart_reclaim_part_segments (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     generation_id INTEGER NOT NULL CHECK (generation_id > 0),
@@ -445,7 +453,7 @@ CREATE TABLE IF NOT EXISTS multipart_reclaim_part_segments (
 
 /// Durable object payload reclaim worker claim.
 const CREATE_OBJECT_PAYLOAD_RECLAIM_CLAIMS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS object_payload_reclaim_claims (
+CREATE TABLE object_payload_reclaim_claims (
     singleton       INTEGER PRIMARY KEY CHECK (singleton = 0),
     bucket          TEXT NOT NULL,
     bucket_incarnation_generation INTEGER NOT NULL CHECK (bucket_incarnation_generation >= 0),
@@ -464,7 +472,7 @@ CREATE TABLE IF NOT EXISTS object_payload_reclaim_claims (
 
 /// Durable bucket delete finalizer worker claim.
 const CREATE_BUCKET_DELETE_FINALIZE_CLAIMS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS bucket_delete_finalize_claims (
+CREATE TABLE bucket_delete_finalize_claims (
     singleton       INTEGER PRIMARY KEY CHECK (singleton = 0),
     bucket          TEXT NOT NULL,
     bucket_incarnation_generation INTEGER NOT NULL CHECK (bucket_incarnation_generation >= 0),
@@ -481,7 +489,7 @@ CREATE TABLE IF NOT EXISTS bucket_delete_finalize_claims (
 
 /// Durable lifecycle sweep worker claims, keyed by bucket incarnation.
 const CREATE_LIFECYCLE_SWEEP_CLAIMS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS lifecycle_sweep_claims (
+CREATE TABLE lifecycle_sweep_claims (
     bucket          TEXT NOT NULL,
     bucket_incarnation_generation INTEGER NOT NULL CHECK (bucket_incarnation_generation >= 0),
     claim_id        TEXT NOT NULL CHECK (length(claim_id) BETWEEN 1 AND 256),
@@ -499,7 +507,7 @@ CREATE TABLE IF NOT EXISTS lifecycle_sweep_claims (
 
 /// Committed multipart part segments.
 const CREATE_MULTIPART_PART_CHUNKS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS multipart_part_segments (
+CREATE TABLE multipart_part_segments (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     upload_id     TEXT NOT NULL,
@@ -519,28 +527,28 @@ CREATE TABLE IF NOT EXISTS multipart_part_segments (
 
 /// Index for reading multipart part segments by version_id after completion.
 const CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX: &str = "\
-CREATE INDEX IF NOT EXISTS idx_mpc_version \
+CREATE INDEX idx_mpc_version \
 ON multipart_part_segments (bucket, key, version_id, part_number)";
 
 /// Index for list operations: bucket + key ordering.
 const CREATE_OBJECTS_LIST_INDEX: &str = "\
-CREATE INDEX IF NOT EXISTS idx_objects_list ON objects (bucket, key)";
+CREATE INDEX idx_objects_list ON objects (bucket, key)";
 
 /// Index for version queries: bucket + key + version_id descending for fast latest-version lookup.
 const CREATE_OBJECTS_VERSIONS_INDEX: &str = "\
-CREATE INDEX IF NOT EXISTS idx_objects_versions ON objects (bucket, key, version_id DESC)";
+CREATE INDEX idx_objects_versions ON objects (bucket, key, version_id DESC)";
 
 /// Index for current-object and version ordering queries.
 const CREATE_OBJECTS_WRITE_SEQUENCE_INDEX: &str = "\
-CREATE INDEX IF NOT EXISTS idx_objects_write_sequence ON objects (bucket, key, write_sequence DESC)";
+CREATE INDEX idx_objects_write_sequence ON objects (bucket, key, write_sequence DESC)";
 
 const CREATE_OBJECTS_MULTIPART_COMPLETION_UPLOAD_INDEX: &str = "\
-CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_multipart_completion_upload \
+CREATE UNIQUE INDEX idx_objects_multipart_completion_upload \
 ON objects (multipart_completion_upload_id) WHERE multipart_completion_upload_id IS NOT NULL";
 
 /// Bucket metadata table.
 const CREATE_BUCKETS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS buckets (
+CREATE TABLE buckets (
     name             TEXT PRIMARY KEY,
     owner_principal  TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
     owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) IN (32, 64)),
@@ -584,7 +592,7 @@ CREATE TABLE IF NOT EXISTS buckets (
 
 /// Durable bucket write reservation records.
 const CREATE_BUCKET_WRITE_RESERVATIONS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS bucket_write_reservations (
+CREATE TABLE bucket_write_reservations (
     bucket_name      TEXT NOT NULL,
     reservation_id   TEXT NOT NULL CHECK (length(reservation_id) BETWEEN 1 AND 256),
     owner_token      TEXT NOT NULL CHECK (length(owner_token) BETWEEN 1 AND 256),
@@ -601,7 +609,7 @@ CREATE TABLE IF NOT EXISTS bucket_write_reservations (
 
 /// Durable bucket delete write-drain records.
 const CREATE_BUCKET_WRITE_DRAINS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS bucket_write_drains (
+CREATE TABLE bucket_write_drains (
     bucket_name      TEXT PRIMARY KEY,
     drain_id         TEXT NOT NULL CHECK (length(drain_id) BETWEEN 1 AND 256),
     owner_token      TEXT NOT NULL CHECK (length(owner_token) BETWEEN 1 AND 256),
@@ -615,7 +623,7 @@ CREATE TABLE IF NOT EXISTS bucket_write_drains (
 
 /// Last durable DeleteBucket attempt outcome per bucket.
 const CREATE_BUCKET_DELETE_ATTEMPT_OUTCOMES_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS bucket_delete_attempt_outcomes (
+CREATE TABLE bucket_delete_attempt_outcomes (
     bucket_name      TEXT PRIMARY KEY,
     drain_id         TEXT NOT NULL CHECK (length(drain_id) BETWEEN 1 AND 256),
     cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
@@ -635,11 +643,11 @@ CREATE TABLE IF NOT EXISTS bucket_delete_attempt_outcomes (
 
 /// Index for bucket listing by owner and bucket name.
 const CREATE_BUCKETS_OWNER_LIST_INDEX: &str = "\
-CREATE INDEX IF NOT EXISTS idx_buckets_owner_list ON buckets (owner_principal, name)";
+CREATE INDEX idx_buckets_owner_list ON buckets (owner_principal, name)";
 
 /// Per-PG monotonic counters for bucket execution freshness.
 const CREATE_PG_COUNTERS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS pg_counters (
+CREATE TABLE pg_counters (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
     next_bucket_execution_generation INTEGER NOT NULL DEFAULT 0 CHECK (next_bucket_execution_generation >= 0)
 ) STRICT";
@@ -651,7 +659,7 @@ CREATE TABLE IF NOT EXISTS pg_counters (
 /// allowing later startup to distinguish the original PG database from an
 /// empty or unrelated SQLite database copied under that root identity.
 const CREATE_PG_DURABLE_IDENTITY_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS pg_durable_identity (
+CREATE TABLE pg_durable_identity (
     singleton      INTEGER PRIMARY KEY CHECK (singleton = 0),
     pg_id          INTEGER NOT NULL CHECK (pg_id >= 0),
     identity_bytes BLOB NOT NULL CHECK (length(identity_bytes) BETWEEN 1 AND 1024)
@@ -659,7 +667,7 @@ CREATE TABLE IF NOT EXISTS pg_durable_identity (
 
 /// Per-PG metadata command log entries accepted by this replica.
 const CREATE_METADATA_COMMAND_LOG_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS metadata_command_log (
+CREATE TABLE metadata_command_log (
     cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
     pg_id            INTEGER NOT NULL CHECK (pg_id >= 0),
     log_index        INTEGER NOT NULL CHECK (log_index > 0),
@@ -679,7 +687,7 @@ CREATE TABLE IF NOT EXISTS metadata_command_log (
 /// applied command bytes, not serving metadata; this table is runtime
 /// coordination state for retry and convergence.
 const CREATE_METADATA_COMMAND_PENDING_SLOT_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS metadata_command_pending_slot (
+CREATE TABLE metadata_command_pending_slot (
     singleton        INTEGER PRIMARY KEY CHECK (singleton = 0),
     cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
     pg_id            INTEGER NOT NULL CHECK (pg_id >= 0),
@@ -691,7 +699,7 @@ CREATE TABLE IF NOT EXISTS metadata_command_pending_slot (
 
 /// Per-PG durable metadata command replay state for this replica.
 const CREATE_METADATA_COMMAND_REPLICA_STATE_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS metadata_command_replica_state (
+CREATE TABLE metadata_command_replica_state (
     singleton         INTEGER PRIMARY KEY CHECK (singleton = 0),
     cluster_epoch     INTEGER NOT NULL CHECK (cluster_epoch > 0),
     applied_log_index INTEGER NOT NULL DEFAULT 0 CHECK (applied_log_index >= 0),
@@ -703,7 +711,7 @@ CREATE TABLE IF NOT EXISTS metadata_command_replica_state (
 /// compaction paths. The payload is a self-verifying canonical checkpoint
 /// encoding; identity columns allow cheap selection without decoding every row.
 const CREATE_METADATA_COMMAND_CHECKPOINTS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS metadata_command_checkpoints (
+CREATE TABLE metadata_command_checkpoints (
     cluster_epoch     INTEGER NOT NULL CHECK (cluster_epoch > 0),
     pg_id             INTEGER NOT NULL CHECK (pg_id >= 0),
     applied_log_index INTEGER NOT NULL CHECK (applied_log_index >= 0),
@@ -715,14 +723,14 @@ CREATE TABLE IF NOT EXISTS metadata_command_checkpoints (
 ) STRICT";
 
 const CREATE_METADATA_COMMAND_CHECKPOINTS_SELECT_INDEX: &str = "\
-CREATE INDEX IF NOT EXISTS idx_metadata_command_checkpoints_select \
+CREATE INDEX idx_metadata_command_checkpoints_select \
 ON metadata_command_checkpoints (cluster_epoch, pg_id, applied_log_index DESC)";
 
 /// Per-table canonical digest cache used to update replica state cheaply after
 /// command apply. Restart validation recomputes the materialized digest from
 /// the command-owned tables and does not trust this cache.
 const CREATE_METADATA_TABLE_DIGESTS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS metadata_table_digests (
+CREATE TABLE metadata_table_digests (
     table_name   TEXT PRIMARY KEY,
     table_digest INTEGER NOT NULL,
     row_count    INTEGER NOT NULL DEFAULT 0 CHECK (row_count >= 0),
@@ -735,25 +743,26 @@ CREATE TABLE IF NOT EXISTS metadata_table_digests (
 /// PgStore handle to skip digest scans only when its clean revision still
 /// matches the database.
 const CREATE_METADATA_DIGEST_REVISION_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS metadata_digest_revision (
+CREATE TABLE metadata_digest_revision (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
     revision  INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)
 ) STRICT";
 
 /// Durable marker proving metadata digest triggers and cache stats were
-/// bootstrapped atomically. Missing marker forces a one-time full refresh on
-/// open, including for stores created before this marker existed.
+/// bootstrapped atomically. Current schema creation writes the incomplete row;
+/// bootstrap changes it to complete in the same transaction as installing the
+/// triggers and cache rows.
 const CREATE_METADATA_DIGEST_BOOTSTRAP_STATE_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS metadata_digest_bootstrap_state (
+CREATE TABLE metadata_digest_bootstrap_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
     completed INTEGER NOT NULL CHECK (completed IN (0, 1))
 ) STRICT";
 
 /// Bucket-scoped opaque subresource storage.
 const CREATE_BUCKET_SUBRESOURCES_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS bucket_subresources (
+CREATE TABLE bucket_subresources (
     bucket_name     TEXT NOT NULL,
-    kind            INTEGER NOT NULL CHECK (kind IN (0, 1, 2, 3, 4, 5)),
+    kind            INTEGER NOT NULL CHECK (kind IN (0, 1, 4, 5)),
     body            TEXT,
     generation      INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
     aux_int_1       INTEGER,
@@ -764,7 +773,7 @@ CREATE TABLE IF NOT EXISTS bucket_subresources (
 
 /// Index for scanning buckets by subresource kind without touching tombstones.
 const CREATE_BUCKET_SUBRESOURCES_KIND_BUCKET_INDEX: &str = "\
-CREATE INDEX IF NOT EXISTS idx_bucket_subresources_kind_bucket \
+CREATE INDEX idx_bucket_subresources_kind_bucket \
 ON bucket_subresources (kind, bucket_name) WHERE body IS NOT NULL";
 
 /// SQLite pragmas for per-PG databases: WAL mode, FULL synchronous.
@@ -775,11 +784,107 @@ PRAGMA temp_store=MEMORY;
 PRAGMA foreign_keys=ON;
 ";
 
-/// Initialize the per-PG database schema (shards + objects + multipart tables).
+/// Configure and initialize a per-PG database with the one supported schema.
 ///
-/// Idempotent — uses `CREATE TABLE IF NOT EXISTS`.
-pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(PG_PRAGMAS)?;
+/// Version zero is accepted only while the database has no user schema objects. Any
+/// existing unversioned or differently versioned schema is unsupported and
+/// fails closed; this project does not currently migrate PG databases.
+pub fn init_pg_schema(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(PG_PRAGMAS)
+        .map_err(|source| StoreError::Db {
+            context: "configure PG database",
+            source,
+        })?;
+
+    let version = pg_schema_version(conn)?;
+    if version == CURRENT_PG_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version != 0 {
+        return Err(StoreError::PgSchemaInvalid {
+            reason: format!("unsupported version {version}; expected {CURRENT_PG_SCHEMA_VERSION}"),
+        });
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|source| StoreError::Db {
+            context: "begin PG schema initialization",
+            source,
+        })?;
+    let result = (|| {
+        let version = pg_schema_version(conn)?;
+        if version == CURRENT_PG_SCHEMA_VERSION {
+            return Ok(());
+        }
+        if version != 0 {
+            return Err(StoreError::PgSchemaInvalid {
+                reason: format!(
+                    "unsupported version {version}; expected {CURRENT_PG_SCHEMA_VERSION}"
+                ),
+            });
+        }
+
+        let user_schema_object_count: u32 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|source| StoreError::Db {
+                context: "inspect unversioned PG database",
+                source,
+            })?;
+        if user_schema_object_count != 0 {
+            return Err(StoreError::PgSchemaInvalid {
+                reason: format!(
+                    "unversioned database contains {user_schema_object_count} user schema objects; migrations are unsupported"
+                ),
+            });
+        }
+
+        create_current_pg_schema(conn).map_err(|source| StoreError::Db {
+            context: "initialize current PG schema",
+            source,
+        })
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT").map_err(|source| {
+            let _ = conn.execute_batch("ROLLBACK");
+            StoreError::Db {
+                context: "commit PG schema initialization",
+                source,
+            }
+        }),
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn require_current_pg_schema(conn: &Connection) -> Result<(), StoreError> {
+    let version = pg_schema_version(conn)?;
+    if version != CURRENT_PG_SCHEMA_VERSION {
+        return Err(StoreError::PgSchemaInvalid {
+            reason: format!("unsupported version {version}; expected {CURRENT_PG_SCHEMA_VERSION}"),
+        });
+    }
+    Ok(())
+}
+
+fn pg_schema_version(conn: &Connection) -> Result<u32, StoreError> {
+    let raw: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|source| StoreError::Db {
+            context: "read PG schema version",
+            source,
+        })?;
+    u32::try_from(raw).map_err(|_| StoreError::PgSchemaInvalid {
+        reason: format!("schema version is outside the supported integer range: {raw}"),
+    })
+}
+
+fn create_current_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_SHARDS_TABLE, [])?;
     conn.execute(CREATE_SHARD_SCAVENGER_OBSERVATIONS_TABLE, [])?;
     conn.execute(CREATE_PLACED_SEGMENT_SHARD_REPAIRS_TABLE, [])?;
@@ -826,66 +931,36 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_METADATA_DIGEST_BOOTSTRAP_STATE_TABLE, [])?;
     conn.execute(
         "INSERT INTO pg_counters (singleton, next_bucket_execution_generation) \
-         VALUES (0, 0) \
-         ON CONFLICT(singleton) DO NOTHING",
+         VALUES (0, 0)",
         [],
     )?;
     conn.execute(
         "INSERT INTO metadata_digest_revision (singleton, revision) \
-         VALUES (0, 0) \
-         ON CONFLICT(singleton) DO NOTHING",
+         VALUES (0, 0)",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO metadata_digest_bootstrap_state (singleton, completed) VALUES (0, 0)",
         [],
     )?;
     conn.execute(CREATE_BUCKET_SUBRESOURCES_TABLE, [])?;
     conn.execute(CREATE_BUCKET_SUBRESOURCES_KIND_BUCKET_INDEX, [])?;
     conn.execute(CREATE_OBJECT_PARTS_OFFSET_INDEX, [])?;
-    migrate_checksum_columns(conn)?;
-    migrate_segment_crc_columns(conn)?;
-    migrate_segment_placement_epoch_columns(conn)?;
-    migrate_part_payload_crc_columns(conn)?;
-    migrate_acl_grant_columns(conn)?;
-    migrate_object_write_sequence_columns(conn)?;
-    migrate_object_became_noncurrent_columns(conn)?;
-    migrate_multipart_upload_tag_columns(conn)?;
-    migrate_multipart_upload_object_generation_columns(conn)?;
-    migrate_metadata_table_digest_columns(conn)?;
+    create_multipart_checksum_triggers(conn)?;
     create_object_lock_triggers(conn)?;
+    conn.pragma_update(None, "user_version", CURRENT_PG_SCHEMA_VERSION)?;
     Ok(())
 }
 
-/// Add checksum columns to multipart tables.
-///
-/// Idempotent — silently ignores "duplicate column name" errors.
-fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let migrations = [
-        "ALTER TABLE multipart_uploads ADD COLUMN checksum_algorithm INTEGER",
-        "ALTER TABLE multipart_uploads ADD COLUMN checksum_type INTEGER",
-        "ALTER TABLE multipart_parts ADD COLUMN checksum BLOB",
-        "ALTER TABLE object_parts ADD COLUMN checksum BLOB",
-        "ALTER TABLE buckets ADD COLUMN public_write INTEGER NOT NULL DEFAULT 0 CHECK (public_write IN (0, 1))",
-    ];
-    for sql in &migrations {
-        match conn.execute(sql, []) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
-                if msg.contains("duplicate column name") =>
-            {
-                // Column already exists, skip.
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    // Enforce valid checksum algorithm + type combinations via trigger.
-    // SQLite cannot add CHECK constraints to existing tables, so we use
-    // BEFORE INSERT/UPDATE triggers instead.
+fn create_multipart_checksum_triggers(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // Enforce valid checksum algorithm + type combinations across columns.
     //
     // Rules:
     //   - SHA1/SHA256/MD5/XXHash/SHA512 + FULL_OBJECT (1) → invalid
     //   - CRC64NVME (4) + COMPOSITE (0) → invalid
     //   - checksum_type without checksum_algorithm → invalid
     conn.execute_batch(
-        "CREATE TRIGGER IF NOT EXISTS check_multipart_checksum_insert
+        "CREATE TRIGGER check_multipart_checksum_insert
          BEFORE INSERT ON multipart_uploads
          WHEN NEW.checksum_algorithm IS NOT NULL OR NEW.checksum_type IS NOT NULL
          BEGIN
@@ -896,7 +971,7 @@ fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
            SELECT RAISE(ABORT, 'CRC64NVME + COMPOSITE is invalid')
              WHERE NEW.checksum_algorithm = 4 AND NEW.checksum_type = 0;
          END;
-         CREATE TRIGGER IF NOT EXISTS check_multipart_checksum_update
+         CREATE TRIGGER check_multipart_checksum_update
          BEFORE UPDATE ON multipart_uploads
          WHEN NEW.checksum_algorithm IS NOT NULL OR NEW.checksum_type IS NOT NULL
          BEGIN
@@ -912,212 +987,9 @@ fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
-fn migrate_object_write_sequence_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    add_column_if_missing(
-        conn,
-        "objects",
-        "write_sequence",
-        "ALTER TABLE objects ADD COLUMN write_sequence INTEGER NOT NULL DEFAULT 0 CHECK (write_sequence >= 0)",
-    )?;
-    conn.execute(CREATE_OBJECTS_WRITE_SEQUENCE_INDEX, [])?;
-
-    let mut stmt = conn.prepare(
-        "SELECT rowid, bucket, key \
-         FROM objects \
-         ORDER BY bucket ASC, key ASC, last_modified ASC, rowid ASC",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-
-    let mut current_bucket = String::new();
-    let mut current_key = String::new();
-    let mut sequence = 0i64;
-    let mut updates = Vec::new();
-    for row in rows {
-        let (rowid, bucket, key) = row?;
-        if bucket != current_bucket || key != current_key {
-            current_bucket = bucket;
-            current_key = key;
-            sequence = 1;
-        } else {
-            sequence += 1;
-        }
-        updates.push((rowid, sequence));
-    }
-
-    for (rowid, write_sequence) in updates {
-        conn.execute(
-            "UPDATE objects SET write_sequence = ?1 WHERE rowid = ?2 AND write_sequence = 0",
-            [write_sequence, rowid],
-        )?;
-    }
-
-    Ok(())
-}
-
-fn migrate_metadata_table_digest_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    add_column_if_missing(
-        conn,
-        "metadata_table_digests",
-        "row_count",
-        "ALTER TABLE metadata_table_digests ADD COLUMN row_count INTEGER NOT NULL DEFAULT 0 CHECK (row_count >= 0)",
-    )?;
-    add_column_if_missing(
-        conn,
-        "metadata_table_digests",
-        "row_hash_xor",
-        "ALTER TABLE metadata_table_digests ADD COLUMN row_hash_xor INTEGER NOT NULL DEFAULT 0",
-    )?;
-    add_column_if_missing(
-        conn,
-        "metadata_table_digests",
-        "row_hash_sum",
-        "ALTER TABLE metadata_table_digests ADD COLUMN row_hash_sum INTEGER NOT NULL DEFAULT 0",
-    )?;
-    Ok(())
-}
-
-fn migrate_object_became_noncurrent_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    add_column_if_missing(
-        conn,
-        "objects",
-        "became_noncurrent_at",
-        "ALTER TABLE objects ADD COLUMN became_noncurrent_at INTEGER",
-    )
-}
-
-fn migrate_segment_crc_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let migrations = [
-        "ALTER TABLE stream_upload_segments ADD COLUMN segment_crc64 INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE object_segments ADD COLUMN segment_crc64 INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE multipart_part_segments ADD COLUMN segment_crc64 INTEGER NOT NULL DEFAULT 0",
-    ];
-    for sql in &migrations {
-        match conn.execute(sql, []) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
-                if msg.contains("duplicate column name") =>
-            {
-                // Column already exists, skip.
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-fn migrate_segment_placement_epoch_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let migrations = [
-        "ALTER TABLE stream_upload_segments ADD COLUMN placement_cluster_epoch INTEGER NOT NULL DEFAULT 1",
-        "ALTER TABLE object_segments ADD COLUMN placement_cluster_epoch INTEGER NOT NULL DEFAULT 1",
-        "ALTER TABLE multipart_part_segments ADD COLUMN placement_cluster_epoch INTEGER NOT NULL DEFAULT 1",
-        "ALTER TABLE multipart_parts ADD COLUMN placement_cluster_epoch INTEGER NOT NULL DEFAULT 1",
-        "ALTER TABLE object_parts ADD COLUMN placement_cluster_epoch INTEGER NOT NULL DEFAULT 1",
-    ];
-    for sql in &migrations {
-        match conn.execute(sql, []) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
-                if msg.contains("duplicate column name") =>
-            {
-                // Column already exists, skip.
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-fn migrate_part_payload_crc_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    add_column_if_missing(
-        conn,
-        "multipart_parts",
-        "payload_crc64",
-        "ALTER TABLE multipart_parts ADD COLUMN payload_crc64 INTEGER NOT NULL DEFAULT 0",
-    )?;
-    add_column_if_missing(
-        conn,
-        "object_parts",
-        "payload_crc64",
-        "ALTER TABLE object_parts ADD COLUMN payload_crc64 INTEGER NOT NULL DEFAULT 0",
-    )?;
-    Ok(())
-}
-
-fn migrate_multipart_upload_tag_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    match conn.execute("ALTER TABLE multipart_uploads ADD COLUMN tags TEXT", []) {
-        Ok(_) => {}
-        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
-            if msg.contains("duplicate column name") => {}
-        Err(e) => return Err(e),
-    }
-    Ok(())
-}
-
-fn migrate_multipart_upload_object_generation_columns(
-    conn: &Connection,
-) -> Result<(), rusqlite::Error> {
-    add_column_if_missing(
-        conn,
-        "multipart_uploads",
-        "object_generation_id",
-        "ALTER TABLE multipart_uploads ADD COLUMN object_generation_id INTEGER NOT NULL DEFAULT 1 CHECK (object_generation_id > 0)",
-    )
-}
-
-fn migrate_acl_grant_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    add_column_if_missing(
-        conn,
-        "buckets",
-        "acl_grants",
-        "ALTER TABLE buckets ADD COLUMN acl_grants TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(
-        conn,
-        "objects",
-        "acl_grants",
-        "ALTER TABLE objects ADD COLUMN acl_grants TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(
-        conn,
-        "multipart_uploads",
-        "acl_grants",
-        "ALTER TABLE multipart_uploads ADD COLUMN acl_grants TEXT NOT NULL DEFAULT ''",
-    )?;
-    Ok(())
-}
-
-fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, rusqlite::Error> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    for col in cols {
-        if col? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn add_column_if_missing(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    sql: &str,
-) -> Result<(), rusqlite::Error> {
-    if !table_has_column(conn, table, column)? {
-        conn.execute(sql, [])?;
-    }
-    Ok(())
-}
-
 fn create_object_lock_triggers(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
-        "CREATE TRIGGER IF NOT EXISTS check_bucket_object_lock_insert
+        "CREATE TRIGGER check_bucket_object_lock_insert
          BEFORE INSERT ON buckets
          BEGIN
            SELECT RAISE(ABORT, 'invalid bucket object lock default mode')
@@ -1153,7 +1025,7 @@ fn create_object_lock_triggers(conn: &Connection) -> Result<(), rusqlite::Error>
              WHERE NEW.object_lock_default_days IS NOT NULL
                AND NEW.object_lock_default_years IS NOT NULL;
          END;
-         CREATE TRIGGER IF NOT EXISTS check_bucket_object_lock_update
+         CREATE TRIGGER check_bucket_object_lock_update
          BEFORE UPDATE ON buckets
          BEGIN
            SELECT RAISE(ABORT, 'invalid bucket object lock default mode')
@@ -1192,7 +1064,7 @@ fn create_object_lock_triggers(conn: &Connection) -> Result<(), rusqlite::Error>
              WHERE NEW.object_lock_default_days IS NOT NULL
                AND NEW.object_lock_default_years IS NOT NULL;
          END;
-         CREATE TRIGGER IF NOT EXISTS check_object_lock_state_insert
+         CREATE TRIGGER check_object_lock_state_insert
          BEFORE INSERT ON objects
          BEGIN
            SELECT RAISE(ABORT, 'invalid object lock retention mode')
@@ -1213,7 +1085,7 @@ fn create_object_lock_triggers(conn: &Connection) -> Result<(), rusqlite::Error>
                  OR NEW.object_lock_legal_hold != 0
                );
          END;
-         CREATE TRIGGER IF NOT EXISTS check_object_lock_state_update
+         CREATE TRIGGER check_object_lock_state_update
          BEFORE UPDATE ON objects
          BEGIN
            SELECT RAISE(ABORT, 'invalid object lock retention mode')
@@ -1234,7 +1106,7 @@ fn create_object_lock_triggers(conn: &Connection) -> Result<(), rusqlite::Error>
                  OR NEW.object_lock_legal_hold != 0
                );
          END;
-         CREATE TRIGGER IF NOT EXISTS check_multipart_object_lock_insert
+         CREATE TRIGGER check_multipart_object_lock_insert
          BEFORE INSERT ON multipart_uploads
          BEGIN
            SELECT RAISE(ABORT, 'invalid multipart object lock retention mode')
@@ -1248,7 +1120,7 @@ fn create_object_lock_triggers(conn: &Connection) -> Result<(), rusqlite::Error>
            SELECT RAISE(ABORT, 'multipart object lock retention mode/date must be set together')
              WHERE (NEW.object_lock_retention_mode IS NULL) != (NEW.object_lock_retain_until IS NULL);
          END;
-         CREATE TRIGGER IF NOT EXISTS check_multipart_object_lock_update
+         CREATE TRIGGER check_multipart_object_lock_update
          BEFORE UPDATE ON multipart_uploads
          BEGIN
            SELECT RAISE(ABORT, 'invalid multipart object lock retention mode')
@@ -1275,6 +1147,63 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_pg_schema(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn init_pg_schema_records_and_accepts_only_the_current_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pg_schema(&conn).unwrap();
+        assert_eq!(pg_schema_version(&conn).unwrap(), CURRENT_PG_SCHEMA_VERSION);
+
+        init_pg_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn init_pg_schema_rejects_an_existing_unversioned_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE obsolete_layout (value INTEGER)", [])
+            .unwrap();
+
+        let error = init_pg_schema(&conn).unwrap_err();
+        assert!(matches!(error, StoreError::PgSchemaInvalid { .. }));
+        assert!(error
+            .to_string()
+            .contains("unversioned database contains 1 user schema objects"));
+        assert_eq!(pg_schema_version(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn init_pg_schema_rejects_an_existing_unversioned_view() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE VIEW legacy_view AS SELECT 1", [])
+            .unwrap();
+
+        let error = init_pg_schema(&conn).unwrap_err();
+        assert!(matches!(error, StoreError::PgSchemaInvalid { .. }));
+        assert!(error
+            .to_string()
+            .contains("unversioned database contains 1 user schema objects"));
+        assert_eq!(pg_schema_version(&conn).unwrap(), 0);
+        let view_count: u32 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'legacy_view'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(view_count, 1, "rejection must leave the view unchanged");
+    }
+
+    #[test]
+    fn init_pg_schema_rejects_an_unsupported_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+
+        let error = init_pg_schema(&conn).unwrap_err();
+        assert!(matches!(error, StoreError::PgSchemaInvalid { .. }));
+        assert!(error
+            .to_string()
+            .contains("unsupported version 2; expected 1"));
     }
 
     #[test]
@@ -1310,6 +1239,27 @@ mod tests {
             non_strict_tables.is_empty(),
             "all schema tables should be STRICT; non-strict tables: {non_strict_tables:?}"
         );
+    }
+
+    #[test]
+    fn bucket_subresource_schema_rejects_unassigned_kind_values() {
+        let conn = in_memory_schema();
+        conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+
+        for kind in [2, 3] {
+            let error = conn
+                .execute(
+                    "INSERT INTO bucket_subresources \
+                     (bucket_name, kind, body, generation, aux_int_1) \
+                     VALUES ('bucket', ?1, NULL, 0, NULL)",
+                    [kind],
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("CHECK constraint failed"),
+                "unexpected error for kind {kind}: {error}"
+            );
+        }
     }
 
     #[test]
