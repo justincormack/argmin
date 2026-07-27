@@ -3233,6 +3233,81 @@ Seventieth Phase 3 slice:
 - remaining buffered coordinator workflows and capability requirements on
   node-client traits remain open in Phase 3.
 
+Seventy-first Phase 3 slice:
+
+- buffered PutObject now consumes the request's existing
+  `StorageClusterRouteAdmission` instead of discarding it after routing and
+  authentication. Direct and promoted-stream paths share the same admitted
+  entry point; direct test wrappers acquire an admission before entering the
+  production workflow.
+- the non-cloneable `ActivePutObjectRoute` fixes the bucket, key,
+  bucket-metadata PG, object-metadata PG, publication domain, and immutable
+  deadline for the whole direct workflow. Authorization subject loading,
+  bucket-write snapshot/reservation, object-generation reservation, staged
+  payload placement, final object publication, lifecycle response data, and
+  displaced-generation reclaim no longer resample the renewable raw cluster.
+- generation reservation and final command installation carry the admission's
+  effect fence to the pending-slot durable boundary. Staged shard writes now
+  carry the same fence through `PlacedShardNodeClient`: embedded nodes validate
+  immediately before writing the shard file, while Unix/TLS requests serialize
+  a portable wall-clock upper bound and bind it to the storage host's own
+  monotonic clock. Process-local monotonic timestamps never enter the wire
+  format. Storage RPC encoding advances to version 9 and explicitly rejects
+  version 8; repair writes cannot accept frontend request authority.
+- deterministic same-epoch-renewal regressions expire the original admission
+  at generation reservation and immediately before the first shard-file
+  effect. They prove no object or staged shard is published, while a fresh
+  admission succeeds. The existing same-cluster/different-handle matrix now
+  rejects PutObject through a foreign publication domain. The TLS/TCP test
+  exercises the production client conversion with deliberately different
+  frontend and storage-node monotonic origins, proving both an admitted shard
+  write and an expired write that creates no shard file.
+- the direct and promoted PUT runtime-map handoff regressions now begin
+  publication on a separate thread, prove it enters draining while request
+  admission is held, and require publication to finish after the pinned
+  request completes. This preserves the intended handoff assertion without
+  synchronously deadlocking publication against the request permit.
+- focused direct-PUT, storage-RPC codec, TLS/TCP deadline, publication-domain,
+  HTTP streaming, and runtime-map handoff regressions pass. Formatting, diff
+  validation, the storage boundary checker, workspace-wide strict Clippy, and
+  the full parallel workspace suite pass (7,636 tests).
+- remaining buffered coordinator workflows and capability requirements on
+  node-client traits remain open in Phase 3.
+
+Seventy-second Phase 3 slice:
+
+- promoted buffered PutObject now retains its non-cloneable
+  `ActivePutObjectRoute` through stream-session creation, each encrypted shard
+  write, segment-append command publication, bucket/lifecycle snapshot loading,
+  and final object publication. The admitted create, append, and finalize APIs
+  carry the immutable request effect fence to their durable reservation,
+  shard-file, and pending-slot boundaries instead of performing a precheck and
+  delegating to the renewable raw cluster.
+- raw and admitted stream workflows share small route interfaces in
+  server-core, preserving the test/copy helpers that intentionally use
+  unbounded internal authority without allowing production admitted PUT or
+  POST Object paths to fall back to them. Metadata-command publisher registry,
+  guide, and checker entries now name the route-validating create/finalize
+  publishers.
+- partial direct-PUT shard placement now treats route expiry exactly like a
+  shard-write failure: every shard already written by the caller is removed
+  before the error escapes. A deterministic second-shard regression proves
+  that the first successful write is removed when the captured admission
+  expires immediately before the second write.
+- deterministic same-epoch-renewal regressions expire admission immediately
+  before stream-create pending installation, after promoted shard writes but
+  before append command allocation, and during finalization command building.
+  They require `OperationAborted`, no object publication, no leaked promoted
+  shard/session state after caller cleanup, and a fresh stream-create canary.
+- the focused four-test effect-boundary matrix, formatting, diff validation,
+  the storage boundary checker, and workspace-wide strict Clippy pass. The
+  full parallel workspace run reached 3,541 passing tests before the known,
+  separately owned experimental Raft heartbeat write-amplification gate failed;
+  the remaining tests were cancelled and that unrelated failure is explicitly
+  excluded from this slice.
+- remaining buffered coordinator workflows and capability requirements on
+  node-client traits remain open in Phase 3.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

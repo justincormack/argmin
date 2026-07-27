@@ -43,6 +43,7 @@ use crate::node_client::{
 use crate::pg_store::PgClusterMapHistoryReferenceSummary;
 use crate::pg_topology::PgTopology;
 use crate::storage_rpc_transport::StorageRpcClientEndpoint;
+use crate::types::AdmittedRouteEffectFence;
 use crate::{
     BucketDeleteFinalizeRoot, BucketName, BucketPgId, ClusterEpoch, DataPgId, EcShape,
     GenerationId, MetadataError, ObjectKey, ObjectMetadataPgId, ObjectMetadataScanPgId, PgId,
@@ -665,6 +666,23 @@ impl LocalShardNodeClient<'_> {
     fn write_shard(&self, key: &ShardKey, data: &[u8]) -> Result<WriteAck, ShardIoError> {
         self.client
             .write_placed_shard(self.data_pg_id, key, data)
+            .map_err(|source| self.store_error(source))
+    }
+
+    fn write_shard_with_effect_fence(
+        &self,
+        key: &ShardKey,
+        data: &[u8],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<WriteAck, ShardIoError> {
+        self.client
+            .write_placed_shard_with_effect_fence(
+                self.cluster_epoch,
+                self.data_pg_id,
+                key,
+                data,
+                effect_fence,
+            )
             .map_err(|source| self.store_error(source))
     }
 
@@ -3869,6 +3887,18 @@ impl LocalClusterMap {
     ) -> Result<WriteAck, ShardIoError> {
         self.shard_node_client(operation_epoch, location, key)?
             .write_shard(key, data)
+    }
+
+    pub(crate) fn write_payload_shard_with_effect_fence(
+        &self,
+        operation_epoch: ClusterEpoch,
+        location: ShardLocation,
+        key: &ShardKey,
+        data: &[u8],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<WriteAck, ShardIoError> {
+        self.shard_node_client(operation_epoch, location, key)?
+            .write_shard_with_effect_fence(key, data, effect_fence)
     }
 
     pub fn repair_payload_shard(

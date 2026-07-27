@@ -44,6 +44,18 @@ impl PlacedShardNodeClient for RecordingPlacedShardClient {
         })
     }
 
+    fn write_placed_shard_with_effect_fence(
+        &self,
+        operation_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        data: &[u8],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<WriteAck, StoreError> {
+        effect_fence.require_valid_for(operation_epoch)?;
+        self.write_placed_shard(data_pg_id, key, data)
+    }
+
     fn repair_placed_shard(
         &self,
         data_pg_id: DataPgId,

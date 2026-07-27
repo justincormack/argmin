@@ -192,7 +192,7 @@ impl Coordinator {
         req: &AuthorizePutObjectRequest<'_>,
     ) -> Result<AuthorizedPutObjectWrite, ServerError> {
         self.require_admitted_storage_effect(admission, storage_node)?;
-        self.prepare_put_object_write_with_storage_node(storage_node, req)
+        self.authorize_put_object_write_on_admitted_route(admission, req)
     }
 
     pub(super) fn bucket_summary(info: BucketInfo) -> BucketSummary {

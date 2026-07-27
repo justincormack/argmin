@@ -111,6 +111,30 @@ impl Coordinator {
         )
     }
 
+    pub(in crate::coordinator) fn authorize_put_object_write_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &AuthorizePutObjectRequest<'_>,
+    ) -> Result<AuthorizedPutObjectWrite, ServerError> {
+        self.require_storage_route_admission(admission)?;
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+        let put_route = admission
+            .active_put_object_route(req.object.bucket.name_typed(), req.object.key_typed())
+            .map_err(super::super::map_store_error)?;
+        self.with_bucket_write_handle_on_admitted_route(admission, &req.object, request, |bucket| {
+            let existing_object = put_route
+                .load_existing_live_object()
+                .map_err(Coordinator::map_object_pg_action_error)?;
+            self.authorize_put_object_write_with_existing_object(
+                req,
+                &bucket,
+                existing_object.as_ref(),
+            )
+        })
+    }
+
     pub(in crate::coordinator) fn authorize_put_object_write_with_existing_object_non_boe(
         &self,
         req: &AuthorizePutObjectRequest<'_>,

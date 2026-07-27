@@ -43,7 +43,7 @@ use crate::metadata_command::{
     MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
     MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimCommand,
     PutObjectMetadataMutation, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
-    ReserveObjectVersionCommand,
+    ReserveObjectVersionCommand, PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
@@ -81,23 +81,25 @@ use crate::types::{
     BucketWriteReservationRecord, CanonicalUserId, ClusterEpoch, CommitDirectPutObjectReq,
     CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest, CreateStreamUploadReq,
     DeleteCurrentObjectOutcome, DeleteSpecificObjectVersionOutcome, DirectPutCommitSnapshot,
-    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
-    InsertCurrentDeleteMarkerOutcome, ListedBucketMultipartUploads, ListedBucketObjectVersions,
-    ListedBucketObjects, ListedMultipartParts, MultipartCompletionSnapshot,
-    MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEncryption, ObjectKey,
-    ObjectLayout, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome,
-    ObjectRetention, ObjectSegmentRecord, OwnerIdentity, PgId, PgState,
+    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, FinalizeStreamPutOutcome,
+    GenerationId, InsertCurrentDeleteMarkerOutcome, ListedBucketMultipartUploads,
+    ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartParts,
+    MultipartCompletionSnapshot, MultipartUploadManagementLookup, MultipartUploadRecord,
+    ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot, ObjectReadSnapshotMode,
+    ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord, OwnerIdentity, PgId, PgState,
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
     PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
     PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
     PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,
     PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
-    PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig, RouteMapValidity,
-    SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
-    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
-    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus,
-    StoredObject, StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, UploadId, VersionId, WriteAck, WrittenShardAck,
+    PrepareStreamUploadSegmentAppendReq, PreparedStreamPutCommit, PublicAccessBlockConfig,
+    RouteMapValidity, SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey,
+    ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
+    ShardScavengerObservationRecord, ShardScavengerPayloadReference,
+    ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus, StoredObject,
+    StreamPutFinalizeSnapshot, StreamUploadCommandRecord, StreamUploadRecord,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, VersionId,
+    WriteAck, WrittenShardAck,
 };
 #[cfg(test)]
 use crate::types::{
@@ -2013,6 +2015,23 @@ impl StorageClusterRouteAdmission {
         })
     }
 
+    /// Derive active authority for one PutObject workflow from this request's
+    /// admitted runtime-map generation.
+    pub fn active_put_object_route<'admission>(
+        &'admission self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<ActivePutObjectRoute<'admission>, StoreError> {
+        self.require_valid_now()?;
+        Ok(ActivePutObjectRoute {
+            admission: self,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            bucket_pg_id: self.cluster.bucket_metadata_pg(bucket),
+            object_pg_id: self.cluster.object_metadata_pg(bucket, key),
+        })
+    }
+
     /// Derive active multipart-control authority for one object from this
     /// request's admitted runtime-map generation.
     pub fn active_multipart_object_route<'admission>(
@@ -2209,6 +2228,29 @@ pub struct ActiveObjectMetadataMutationRoute<'admission> {
     pg_id: ObjectMetadataPgId,
 }
 
+/// Non-cloneable active authority for one complete PutObject workflow.
+///
+/// Bucket authorization, current-object authorization, generation
+/// reservation, staged payload writes, and final metadata publication remain
+/// bound to the same bucket, key, runtime-map generation, publication domain,
+/// and immutable request deadline.
+///
+/// ```compile_fail
+/// use storage::ActivePutObjectRoute;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn cache_route(route: &ActivePutObjectRoute<'_>) {
+///     require_clone(route);
+/// }
+/// ```
+pub struct ActivePutObjectRoute<'admission> {
+    admission: &'admission StorageClusterRouteAdmission,
+    bucket: BucketName,
+    key: ObjectKey,
+    bucket_pg_id: BucketPgId,
+    object_pg_id: ObjectMetadataPgId,
+}
+
 /// Non-cloneable active authority for multipart control operations on one
 /// object.
 ///
@@ -2245,6 +2287,22 @@ struct ObjectMetadataMutationEffectRoute<'a> {
     key: &'a ObjectKey,
     requested_version_id: Option<VersionId>,
     effect_fence: AdmittedRouteEffectFence,
+}
+
+#[derive(Clone, Copy)]
+struct PutObjectMutationEffectRoute<'a> {
+    bucket_pg_id: BucketPgId,
+    object_pg_id: ObjectMetadataPgId,
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
+    effect_fence: AdmittedRouteEffectFence,
+}
+
+#[derive(Clone, Copy)]
+struct PlacedSegmentPayloadWrite<'a> {
+    segment_okh: &'a [u8; 16],
+    segment_vid: GenerationId,
+    data: &'a [u8],
 }
 
 struct MultipartObjectMutationEffectRoute<'a> {
@@ -2515,6 +2573,282 @@ impl ActiveObjectMetadataMutationRoute<'_> {
                 owner,
                 action,
             )
+    }
+
+    pub fn enqueue_object_payload_reclaim(&self, generation_id: GenerationId) {
+        self.admission.cluster.enqueue_object_payload_reclaim(
+            &self.bucket,
+            &self.key,
+            generation_id,
+        );
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn try_probe_object_pg_available(&self) -> Result<bool, ObjectPgActionError> {
+        self.admission.require_valid_now()?;
+        self.admission
+            .cluster
+            .try_probe_object_pg_available(&self.bucket, &self.key)
+    }
+}
+
+impl ActivePutObjectRoute<'_> {
+    fn effect_route(&self) -> PutObjectMutationEffectRoute<'_> {
+        PutObjectMutationEffectRoute {
+            bucket_pg_id: self.bucket_pg_id,
+            object_pg_id: self.object_pg_id,
+            bucket: &self.bucket,
+            key: &self.key,
+            effect_fence: self.admission.effect_fence(),
+        }
+    }
+
+    pub fn load_existing_live_object(&self) -> Result<Option<StoredObject>, ObjectPgActionError> {
+        let route = ObjectReadMetadataRoute {
+            bucket: &self.bucket,
+            key: &self.key,
+            version_id: None,
+            snapshot_mode: ObjectReadSnapshotMode::MetadataOnly,
+            pg_id: self.object_pg_id,
+        };
+        match self.admission.cluster.load_object_if_on_route(
+            &route,
+            |stored| Ok::<_, std::convert::Infallible>(stored.clone()),
+            || self.admission.require_valid_now(),
+        ) {
+            Ok(Ok(stored @ StoredObject::Live(_))) => Ok(Some(stored)),
+            Ok(Ok(StoredObject::DeleteMarker(_)))
+            | Err(ObjectPgActionError::Metadata(MetadataError::ObjectNotFound)) => Ok(None),
+            Ok(Err(never)) => match never {},
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn with_bucket_write_snapshot<T, E>(
+        &self,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(BucketSnapshot) -> Result<T, E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        self.admission
+            .cluster
+            .with_bucket_write_snapshot_with_route_validation(
+                BucketMetadataMutationEffectRoute {
+                    pg_id: self.bucket_pg_id,
+                    bucket: &self.bucket,
+                    effect_fence: self.admission.effect_fence(),
+                },
+                || self.admission.require_valid_now(),
+                request,
+                action,
+            )
+    }
+
+    pub fn with_bucket_write_snapshot_for_command<T, E>(
+        &self,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(
+            BucketSnapshot,
+            BucketWriteReservationProof,
+        ) -> BucketWriteSnapshotAction<T, E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        self.admission
+            .cluster
+            .with_put_object_bucket_write_snapshot_for_command_with_route_validation(
+                self.effect_route(),
+                || self.admission.require_valid_now(),
+                request,
+                action,
+            )
+    }
+
+    pub fn reserve_generation(
+        &self,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .reserve_put_object_generation_with_route_validation(
+                self.effect_route(),
+                reservation_id,
+                || self.admission.require_valid_now(),
+            )
+    }
+
+    pub fn create_stream_session<T, E>(
+        &self,
+        request: BucketSnapshotRequest,
+        cleanup_after: Option<u64>,
+        action: impl FnMut(
+            BucketSnapshot,
+            Option<StoredObject>,
+        ) -> Result<(T, CreateStreamUploadReq), E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        self.admission
+            .cluster
+            .create_put_object_stream_session_with_route_validation(
+                self.effect_route(),
+                || self.admission.require_valid_now(),
+                request,
+                cleanup_after,
+                action,
+            )
+    }
+
+    pub fn create_stream_session_record(
+        &self,
+        session_id: &SessionId,
+        encryption: ObjectEncryption,
+        cleanup_after: Option<u64>,
+    ) -> Result<(), ObjectPgActionError> {
+        self.admission
+            .cluster
+            .create_put_object_stream_session_record_with_route_validation(
+                self.effect_route(),
+                session_id,
+                encryption,
+                cleanup_after,
+                || self.admission.require_valid_now(),
+            )
+    }
+
+    pub fn load_stream_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<StreamUploadRecord, ObjectPgActionError> {
+        self.admission.require_valid_now()?;
+        self.admission
+            .cluster
+            .load_stream_upload_session_on_route(self.effect_route(), session_id)
+    }
+
+    pub fn prepare_stream_segment_append(
+        &self,
+        request: &PrepareStreamUploadSegmentAppendReq,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        self.admission
+            .cluster
+            .prepare_stream_segment_append_with_route_validation(
+                self.effect_route(),
+                request,
+                || self.admission.require_valid_now(),
+            )
+    }
+
+    pub fn write_stream_segment_payload_shards(
+        &self,
+        session_id: &SessionId,
+        segment_record: &StreamUploadSegmentRecord,
+        data: &[u8],
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        if segment_record.session_id != *session_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "write put object stream segment payload",
+            });
+        }
+        self.admission
+            .cluster
+            .write_stream_segment_payload_shards_with_route_validation(
+                segment_record,
+                data,
+                self.admission.effect_fence(),
+                || self.admission.require_valid_now(),
+            )
+    }
+
+    pub fn commit_stream_segment_append(
+        &self,
+        session_id: &SessionId,
+        segment_index: u32,
+        segment_record: &StreamUploadSegmentRecord,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<(), ObjectPgActionError> {
+        self.admission
+            .cluster
+            .commit_stream_segment_append_with_route_validation(
+                self.effect_route(),
+                session_id,
+                segment_index,
+                segment_record,
+                shard_batch,
+                || self.admission.require_valid_now(),
+            )
+    }
+
+    pub fn finalize_stream<T, E>(
+        &self,
+        session_id: &SessionId,
+        total_size: u64,
+        action: impl FnMut(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
+    ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .finalize_put_object_stream_with_route_validation(
+                self.effect_route(),
+                session_id,
+                total_size,
+                || self.admission.require_valid_now(),
+                action,
+            )
+    }
+
+    pub fn write_direct_segment_payload_shards(
+        &self,
+        generation_id: GenerationId,
+        segment_index: u32,
+        segment_okh: &[u8; 16],
+        data: &[u8],
+    ) -> Result<DirectPutWrittenSegment, StoreError> {
+        self.admission
+            .cluster
+            .write_direct_put_segment_payload_shards_with_route_validation(
+                self.effect_route(),
+                generation_id,
+                segment_index,
+                segment_okh,
+                data,
+                || self.admission.require_valid_now(),
+            )
+    }
+
+    pub fn commit_direct_object<E>(
+        &self,
+        req: &CommitDirectPutObjectReq,
+        written_shards: &[WrittenShardAck],
+        action: impl FnMut(DirectPutCommitSnapshot) -> Result<(), E>,
+    ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .commit_direct_put_object_from_payload_shards_with_route_validation(
+                self.effect_route(),
+                req,
+                written_shards,
+                || self.admission.require_valid_now(),
+                action,
+            )
+    }
+
+    pub fn release_generation_reservation(&self, reservation_id: &SessionId) {
+        let _ = self
+            .admission
+            .cluster
+            .release_object_generation_reservation(&self.bucket, &self.key, reservation_id);
+    }
+
+    pub fn delete_direct_segment_payload_shards(
+        &self,
+        written: &DirectPutWrittenSegment,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+    ) {
+        self.admission
+            .cluster
+            .delete_direct_put_segment_payload_shards(
+                written.data_pg_id,
+                written.ec,
+                segment_okh,
+                segment_vid,
+                &written.written_shards,
+            );
     }
 
     pub fn enqueue_object_payload_reclaim(&self, generation_id: GenerationId) {
@@ -9402,6 +9736,23 @@ impl StorageCluster {
             .write_payload_shard(self.operation_epoch(), location, key, data)
     }
 
+    fn write_payload_shard_with_effect_fence(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+        data: &[u8],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<WriteAck, ShardIoError> {
+        self.maybe_run_before_placed_payload_shard_write_hook(location, key)?;
+        self.local_map.write_payload_shard_with_effect_fence(
+            self.operation_epoch(),
+            location,
+            key,
+            data,
+            effect_fence,
+        )
+    }
+
     pub(crate) fn repair_payload_shard(
         &self,
         location: ShardLocation,
@@ -9462,6 +9813,40 @@ impl StorageCluster {
         segment_okh: &[u8; 16],
         data: &[u8],
     ) -> Result<DirectPutWrittenSegment, StoreError> {
+        self.write_direct_put_segment_payload_shards_with_route_validation(
+            PutObjectMutationEffectRoute {
+                bucket_pg_id: self.bucket_metadata_pg(bucket),
+                object_pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            generation_id,
+            segment_index,
+            segment_okh,
+            data,
+            || Ok(()),
+        )
+    }
+
+    fn write_direct_put_segment_payload_shards_with_route_validation(
+        &self,
+        route: PutObjectMutationEffectRoute<'_>,
+        generation_id: GenerationId,
+        segment_index: u32,
+        segment_okh: &[u8; 16],
+        data: &[u8],
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<DirectPutWrittenSegment, StoreError> {
+        let PutObjectMutationEffectRoute {
+            bucket,
+            key,
+            object_pg_id,
+            effect_fence,
+            ..
+        } = route;
+        debug_assert_eq!(object_pg_id, self.object_metadata_pg(bucket, key));
+        require_valid_route()?;
         let ec = self.default_payload_ec_shape();
         let data_pg_id = self
             .local_map
@@ -9469,8 +9854,17 @@ impl StorageCluster {
             .get();
         let data_pg = self.validated_data_pg(PgId::new(data_pg_id))?;
         let segment_vid = generation_id;
-        let written_shards =
-            self.write_placed_segment_payload_shards(data_pg, ec, segment_okh, segment_vid, data)?;
+        let written_shards = self.write_placed_segment_payload_shards_with_route_validation(
+            data_pg,
+            ec,
+            PlacedSegmentPayloadWrite {
+                segment_okh,
+                segment_vid,
+                data,
+            },
+            Some(effect_fence),
+            &mut require_valid_route,
+        )?;
 
         Ok(DirectPutWrittenSegment {
             data_pg_id,
@@ -9487,6 +9881,33 @@ impl StorageCluster {
         segment_vid: GenerationId,
         data: &[u8],
     ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        self.write_placed_segment_payload_shards_with_route_validation(
+            data_pg,
+            ec,
+            PlacedSegmentPayloadWrite {
+                segment_okh,
+                segment_vid,
+                data,
+            },
+            None,
+            &mut || Ok(()),
+        )
+    }
+
+    fn write_placed_segment_payload_shards_with_route_validation(
+        &self,
+        data_pg: DataPgId,
+        ec: EcShape,
+        write: PlacedSegmentPayloadWrite<'_>,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        require_valid_route: &mut impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        let PlacedSegmentPayloadWrite {
+            segment_okh,
+            segment_vid,
+            data,
+        } = write;
+        require_valid_route()?;
         let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
         let locations = self
             .place_payload_shards(data_pg, ec, &placement_key)
@@ -9498,11 +9919,35 @@ impl StorageCluster {
             ec,
             |shard_batch| {
                 let mut written_acks = Vec::with_capacity(shard_batch.len());
-                let mut written_for_cleanup = Vec::with_capacity(shard_batch.len());
+                let mut written_for_cleanup: Vec<WrittenShardAck> =
+                    Vec::with_capacity(shard_batch.len());
                 for (location, (shard_key, shard_payload)) in
                     locations.iter().zip(shard_batch.iter())
                 {
-                    match self.write_payload_shard(*location, shard_key, shard_payload) {
+                    if let Err(error) = require_valid_route() {
+                        self.delete_payload_shard_keys_best_effort(
+                            data_pg.get(),
+                            ec,
+                            segment_okh,
+                            segment_vid,
+                            written_for_cleanup
+                                .iter()
+                                .map(|written| written.key.clone()),
+                        );
+                        return Err(error);
+                    }
+                    let write_result = effect_fence.map_or_else(
+                        || self.write_payload_shard(*location, shard_key, shard_payload),
+                        |effect_fence| {
+                            self.write_payload_shard_with_effect_fence(
+                                *location,
+                                shard_key,
+                                shard_payload,
+                                effect_fence,
+                            )
+                        },
+                    );
+                    match write_result {
                         Ok(ack) => {
                             written_acks.push((shard_key.clone(), ack));
                             written_for_cleanup.push(WrittenShardAck {
@@ -9535,14 +9980,40 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
+        self.reserve_put_object_generation_with_route_validation(
+            PutObjectMutationEffectRoute {
+                bucket_pg_id: self.bucket_metadata_pg(bucket),
+                object_pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            reservation_id,
+            || Ok(()),
+        )
+    }
+
+    fn reserve_put_object_generation_with_route_validation(
+        &self,
+        route: PutObjectMutationEffectRoute<'_>,
+        reservation_id: &SessionId,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<GenerationId, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(ReservePutObjectGeneration);
-        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let PutObjectMutationEffectRoute {
+            object_pg_id,
+            bucket,
+            key,
+            effect_fence,
+            ..
+        } = route;
         let pg_id = object_pg_id.pg_id();
         let mut work_budget =
             RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None)
                 .for_operation("reserve_object_generation")
                 .for_pg(pg_id);
         loop {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             work_budget
                 .check("object generation reservation retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
@@ -9609,11 +10080,12 @@ impl StorageCluster {
                 continue;
             }
             self.maybe_run_before_metadata_command_pending_install_hook();
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             let command = match self.try_install_object_pg_pending_command_with_fresh_id(
                 pg_id,
                 bucket,
                 false,
-                None,
+                Some(effect_fence),
                 |command_id| {
                     MetadataCommandEnvelope::new(
                         command_id,
@@ -9815,22 +10287,6 @@ impl StorageCluster {
             false,
             Some(effect_fence),
             require_valid_route,
-        )
-    }
-
-    fn reserve_next_object_version_for_completion(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<VersionId, ObjectPgActionError> {
-        self.reserve_next_object_version_with_completion_admission(
-            pg_id,
-            bucket,
-            key,
-            true,
-            None,
-            || Ok(()),
         )
     }
 
@@ -11538,12 +11994,46 @@ impl StorageCluster {
         &self,
         req: &CommitDirectPutObjectReq,
         written_shards: &[WrittenShardAck],
+        action: impl FnMut(DirectPutCommitSnapshot) -> Result<(), E>,
+    ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
+        self.commit_direct_put_object_from_payload_shards_with_route_validation(
+            PutObjectMutationEffectRoute {
+                bucket_pg_id: self.bucket_metadata_pg(&req.bucket),
+                object_pg_id: self.object_metadata_pg(&req.bucket, &req.key),
+                bucket: &req.bucket,
+                key: &req.key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            req,
+            written_shards,
+            || Ok(()),
+            action,
+        )
+    }
+
+    fn commit_direct_put_object_from_payload_shards_with_route_validation<E>(
+        &self,
+        route: PutObjectMutationEffectRoute<'_>,
+        req: &CommitDirectPutObjectReq,
+        written_shards: &[WrittenShardAck],
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut action: impl FnMut(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(
             CommitDirectPutObjectFromPayloadShards
         );
-        let object_pg_id = self.object_metadata_pg(&req.bucket, &req.key);
+        let PutObjectMutationEffectRoute {
+            object_pg_id,
+            bucket,
+            key,
+            effect_fence,
+            ..
+        } = route;
+        if &req.bucket != bucket || &req.key != key {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "direct PUT request does not match admitted object route".to_string(),
+            });
+        }
         let pg_id = object_pg_id.pg_id();
         let effective_bucket_write_reservation = req.bucket_write_reservation.clone();
         let mut bucket_write_proof_command_owned = false;
@@ -11596,25 +12086,36 @@ impl StorageCluster {
                 }
             }};
         }
+        macro_rules! require_direct_put_route_before_command_ownership {
+            () => {{
+                if let Err(error) = require_valid_route() {
+                    cleanup_direct_put_attempt_before_command_ownership!();
+                    return Err(ObjectPgActionError::Store(error));
+                }
+            }};
+        }
         let shard_batch: Vec<(&ShardKey, WriteAck)> = written_shards
             .iter()
             .map(|written| (&written.key, written.ack))
             .collect();
-        let direct_put_metadata_client =
-            match self.direct_put_metadata_primary_client(&req.bucket, &req.key) {
-                Ok(client) => client,
-                Err(error) => {
-                    cleanup_direct_put_attempt_before_command_ownership!();
-                    return Err(error.into());
-                }
-            };
+        require_direct_put_route_before_command_ownership!();
+        let direct_put_metadata_client = match self.direct_put_metadata_primary_client(bucket, key)
+        {
+            Ok(client) => client,
+            Err(error) => {
+                cleanup_direct_put_attempt_before_command_ownership!();
+                return Err(error.into());
+            }
+        };
 
         let stale_commit_snapshot_deadline = Instant::now() + DIRECT_PUT_STALE_COMMIT_RETRY_BUDGET;
         let (command, new_pending_command) = loop {
+            require_direct_put_route_before_command_ownership!();
             check_direct_put_work_before_command_ownership!(
                 "direct PUT metadata retry budget exhausted"
             );
             let (command, new_pending_command, payload_acks_registered) = loop {
+                require_direct_put_route_before_command_ownership!();
                 check_direct_put_work_before_command_ownership!(
                     "direct PUT metadata pending retry budget exhausted"
                 );
@@ -11653,10 +12154,12 @@ impl StorageCluster {
                     }
 
                     let version_id = if req.versioning == crate::BucketVersioningState::Enabled {
-                        match self.reserve_next_object_version_for_completion(
+                        match self.reserve_next_object_version_for_completion_with_effect_fence(
                             pg_id,
                             &req.bucket,
                             &req.key,
+                            effect_fence,
+                            &mut require_valid_route,
                         ) {
                             Ok(version_id) => version_id,
                             Err(error) => {
@@ -11668,6 +12171,10 @@ impl StorageCluster {
                         VersionId::Null
                     };
                     self.maybe_run_before_direct_put_command_id_hook();
+                    if let Err(error) = require_valid_route() {
+                        cleanup_direct_put_attempt_before_command_ownership!();
+                        return Err(ObjectPgActionError::Store(error));
+                    }
                     if let Err(error) =
                         self.register_payload_shard_acks(req.data_pg_id, &shard_batch)
                     {
@@ -11862,29 +12369,28 @@ impl StorageCluster {
                 return Err(error);
             }
             if new_pending_command {
-                let installed = match self.try_install_object_pg_pending_command_or_drain(
-                    pg_id,
-                    &req.bucket,
-                    &command,
-                ) {
+                self.maybe_run_before_metadata_command_pending_install_hook();
+                let installed = match self
+                    .try_install_pending_metadata_command_for_bucket_with_effect_fence(
+                        pg_id,
+                        &req.bucket,
+                        &command,
+                        Some(effect_fence),
+                    ) {
                     Ok(installed) => installed,
+                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                        ..
+                    })) => {
+                        if let Err(error) =
+                            self.drain_one_pending_object_metadata_command(pg_id, &req.bucket)
+                        {
+                            cleanup_direct_put_attempt_before_command_ownership!();
+                            return Err(error);
+                        }
+                        false
+                    }
                     Err(error) => {
-                        let release_result =
-                            self.release_metadata_command_bucket_write_reservation(&command);
-                        self.release_object_generation_reservation_after_pending_drain_best_effort(
-                            pg_id,
-                            &req.bucket,
-                            &req.key,
-                            &req.generation_reservation_id,
-                        );
-                        self.delete_direct_put_segment_payload_shards(
-                            req.data_pg_id,
-                            req.ec,
-                            &req.segment_okh,
-                            req.segment_vid,
-                            written_shards,
-                        );
-                        release_result.map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+                        cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
                 };
@@ -12444,17 +12950,51 @@ impl StorageCluster {
         encryption: ObjectEncryption,
         cleanup_after: Option<u64>,
     ) -> Result<(), ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        self.create_put_object_stream_session_record_with_route_validation(
+            PutObjectMutationEffectRoute {
+                bucket_pg_id: self.bucket_metadata_pg(bucket),
+                object_pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            session_id,
+            encryption,
+            cleanup_after,
+            || Ok(()),
+        )
+    }
+
+    fn create_put_object_stream_session_record_with_route_validation(
+        &self,
+        route: PutObjectMutationEffectRoute<'_>,
+        session_id: &SessionId,
+        encryption: ObjectEncryption,
+        cleanup_after: Option<u64>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<(), ObjectPgActionError> {
+        let PutObjectMutationEffectRoute {
+            bucket,
+            key,
+            effect_fence,
+            object_pg_id,
+            ..
+        } = route;
+        let pg_id = object_pg_id.pg_id();
         let mut work_budget = RequestWorkBudget::new(PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET, None)
             .for_operation("create_put_object_stream_session")
             .for_pg(pg_id);
         loop {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             work_budget
                 .check("put object stream create retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
-            let reservation = match self
-                .acquire_durable_put_object_stream_write_reservation(bucket, key)
-            {
+            let reservation = match self.acquire_durable_bucket_write_reservation_with_effect_fence(
+                bucket,
+                PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+                Some(key.as_str()),
+                Some(effect_fence),
+            ) {
                 Ok(reservation) => reservation,
                 Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
                     self.wait_for_durable_bucket_write_drain(bucket)
@@ -12475,6 +13015,8 @@ impl StorageCluster {
                 request,
                 cleanup_after,
                 proof.clone(),
+                route,
+                &mut require_valid_route,
                 &mut work_budget,
             );
             let release_result = match &result {
@@ -12508,6 +13050,8 @@ impl StorageCluster {
         request: CreateStreamUploadReq,
         cleanup_after: Option<u64>,
         bucket_write_reservation: BucketWriteReservationProof,
+        route: PutObjectMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         work_budget: &mut RequestWorkBudget,
     ) -> Result<BucketWriteReservationDisposition, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(
@@ -12516,10 +13060,18 @@ impl StorageCluster {
         let bucket = &request.bucket;
         let key = &request.key;
         let session_id = &request.session_id;
-        let object_pg_id = self.object_metadata_pg(bucket, key);
+        if request.bucket != *route.bucket || request.key != *route.key {
+            return Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "create put object stream session record",
+                },
+            ));
+        }
+        let object_pg_id = route.object_pg_id;
         let pg_id = object_pg_id.pg_id();
         debug_assert_eq!(request.target, StreamUploadTarget::PutObject);
         loop {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             work_budget
                 .check("put object stream create retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
@@ -12527,6 +13079,7 @@ impl StorageCluster {
                 self.drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)?;
             let expected_command = applied_stream_create_command(&applied_commands, &request);
             let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             if mutation_client.matching_stream_upload_exists(
                 object_pg_id,
                 &request,
@@ -12534,7 +13087,15 @@ impl StorageCluster {
             )? {
                 return Ok(BucketWriteReservationDisposition::ReleaseByCaller);
             }
-            self.reserve_put_object_generation(bucket, key, session_id)?;
+            self.reserve_put_object_generation_with_route_validation(
+                route,
+                session_id,
+                &mut require_valid_route,
+            )?;
+            if let Err(error) = require_valid_route() {
+                let _ = self.release_object_generation_reservation(bucket, key, session_id);
+                return Err(ObjectPgActionError::Store(error));
+            }
             let command = match mutation_client.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
                     pg_id: object_pg_id,
@@ -12574,7 +13135,25 @@ impl StorageCluster {
                     return Err(error);
                 }
             };
-            if !self.try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
+            if let Err(error) = require_valid_route() {
+                let _ = self.release_object_generation_reservation(bucket, key, session_id);
+                return Err(ObjectPgActionError::Store(error));
+            }
+            self.maybe_run_before_metadata_command_pending_install_hook();
+            let installed = match self
+                .try_install_pending_metadata_command_for_bucket_with_effect_fence(
+                    pg_id,
+                    bucket,
+                    &command,
+                    Some(route.effect_fence),
+                ) {
+                Ok(installed) => installed,
+                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                    ..
+                })) => false,
+                Err(error) => return Err(error),
+            };
+            if !installed {
                 let cleanup = self
                     .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
                     .and_then(|_| {
@@ -12614,6 +13193,15 @@ impl StorageCluster {
         mutation_client.load_stream_upload_session(object_pg_id, bucket, key, session_id)
     }
 
+    fn load_stream_upload_session_on_route(
+        &self,
+        route: PutObjectMutationEffectRoute<'_>,
+        session_id: &SessionId,
+    ) -> Result<StreamUploadRecord, ObjectPgActionError> {
+        self.object_mutation_metadata_primary_client(route.bucket, route.key)?
+            .load_stream_upload_session(route.object_pg_id, route.bucket, route.key, session_id)
+    }
+
     pub fn prepare_stream_segment_append(
         &self,
         bucket: &BucketName,
@@ -12626,6 +13214,28 @@ impl StorageCluster {
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let (target, mut segment_record) =
             mutation_client.prepare_stream_segment_append(object_pg_id, bucket, key, request)?;
+        segment_record.placement_cluster_epoch = self.operation_epoch();
+        Ok((target, segment_record))
+    }
+
+    fn prepare_stream_segment_append_with_route_validation(
+        &self,
+        route: PutObjectMutationEffectRoute<'_>,
+        request: &PrepareStreamUploadSegmentAppendReq,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        let pg_id = route.object_pg_id.pg_id();
+        require_valid_route().map_err(ObjectPgActionError::Store)?;
+        self.drain_pending_object_metadata_commands_for_bucket(pg_id, route.bucket)?;
+        require_valid_route().map_err(ObjectPgActionError::Store)?;
+        let mutation_client =
+            self.object_mutation_metadata_primary_client(route.bucket, route.key)?;
+        let (target, mut segment_record) = mutation_client.prepare_stream_segment_append(
+            route.object_pg_id,
+            route.bucket,
+            route.key,
+            request,
+        )?;
         segment_record.placement_cluster_epoch = self.operation_epoch();
         Ok((target, segment_record))
     }
@@ -12648,6 +13258,35 @@ impl StorageCluster {
         )
     }
 
+    fn write_stream_segment_payload_shards_with_route_validation(
+        &self,
+        segment_record: &StreamUploadSegmentRecord,
+        data: &[u8],
+        effect_fence: AdmittedRouteEffectFence,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        if segment_record.placement_cluster_epoch != self.operation_epoch() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "write put object stream segment from another placement epoch",
+            });
+        }
+        let ec = EcShape {
+            k: segment_record.ec_k,
+            m: segment_record.ec_m,
+        };
+        self.write_placed_segment_payload_shards_with_route_validation(
+            self.validated_data_pg(PgId::new(segment_record.data_pg_id))?,
+            ec,
+            PlacedSegmentPayloadWrite {
+                segment_okh: &segment_record.segment_okh,
+                segment_vid: segment_record.segment_vid,
+                data,
+            },
+            Some(effect_fence),
+            &mut require_valid_route,
+        )
+    }
+
     pub fn commit_stream_segment_append(
         &self,
         bucket: &BucketName,
@@ -12666,10 +13305,45 @@ impl StorageCluster {
             shard_batch,
         };
         self.commit_stream_segment_append_with_work_budget(
+            PutObjectMutationEffectRoute {
+                bucket_pg_id: self.bucket_metadata_pg(bucket),
+                object_pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
             request,
+            || Ok(()),
             RequestWorkBudget::new(STREAM_SEGMENT_APPEND_RETRY_BUDGET, None)
                 .for_operation("commit_stream_segment_append")
                 .for_pg(PgId::new(self.object_metadata_pg_id(bucket, key))),
+        )
+    }
+
+    fn commit_stream_segment_append_with_route_validation(
+        &self,
+        route: PutObjectMutationEffectRoute<'_>,
+        session_id: &SessionId,
+        segment_index: u32,
+        segment_record: &StreamUploadSegmentRecord,
+        shard_batch: &[(&ShardKey, WriteAck)],
+        require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<(), ObjectPgActionError> {
+        let request = StreamAppendCommitRequest {
+            bucket: route.bucket,
+            key: route.key,
+            session_id,
+            segment_index,
+            segment_record,
+            shard_batch,
+        };
+        self.commit_stream_segment_append_with_work_budget(
+            route,
+            request,
+            require_valid_route,
+            RequestWorkBudget::new(STREAM_SEGMENT_APPEND_RETRY_BUDGET, None)
+                .for_operation("commit_stream_segment_append")
+                .for_pg(route.object_pg_id.pg_id()),
         )
     }
 
@@ -12681,7 +13355,15 @@ impl StorageCluster {
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(request.bucket, request.key));
         self.commit_stream_segment_append_with_work_budget(
+            PutObjectMutationEffectRoute {
+                bucket_pg_id: self.bucket_metadata_pg(request.bucket),
+                object_pg_id: self.object_metadata_pg(request.bucket, request.key),
+                bucket: request.bucket,
+                key: request.key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
             request,
+            || Ok(()),
             RequestWorkBudget::new(STREAM_SEGMENT_APPEND_RETRY_BUDGET, Some(max_attempts))
                 .for_operation("commit_stream_segment_append")
                 .for_pg(pg_id),
@@ -12690,7 +13372,9 @@ impl StorageCluster {
 
     fn commit_stream_segment_append_with_work_budget(
         &self,
+        route: PutObjectMutationEffectRoute<'_>,
         request: StreamAppendCommitRequest<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut work_budget: RequestWorkBudget,
     ) -> Result<(), ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(CommitStreamSegmentAppend);
@@ -12702,7 +13386,14 @@ impl StorageCluster {
             segment_record,
             shard_batch,
         } = request;
-        let object_pg_id = self.object_metadata_pg(bucket, key);
+        if bucket != route.bucket || key != route.key {
+            return Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "commit put object stream segment append",
+                },
+            ));
+        }
+        let object_pg_id = route.object_pg_id;
         let pg_id = object_pg_id.pg_id();
         let ec = EcShape {
             k: segment_record.ec_k,
@@ -12734,6 +13425,10 @@ impl StorageCluster {
             }
         };
         loop {
+            if let Err(error) = require_valid_route() {
+                cleanup_stream_append_payload!();
+                return Err(ObjectPgActionError::Store(error));
+            }
             if let Err(error) = work_budget.check("stream append metadata retry budget exhausted") {
                 cleanup_stream_append_payload!();
                 return Err(ObjectPgActionError::Store(error));
@@ -12801,6 +13496,10 @@ impl StorageCluster {
             }
 
             self.maybe_run_before_stream_append_command_id_hook();
+            if let Err(error) = require_valid_route() {
+                cleanup_stream_append_payload!();
+                return Err(ObjectPgActionError::Store(error));
+            }
             if let Err(error) =
                 self.register_payload_shard_acks(segment_record.data_pg_id, shard_batch)
             {
@@ -12824,11 +13523,15 @@ impl StorageCluster {
             // can prove that these shard keys remain exclusively ours.
             payload_cleanup = StreamAppendPayloadCleanup::ReferenceCheckRequired;
             self.maybe_run_before_metadata_command_pending_install_hook();
+            if let Err(error) = require_valid_route() {
+                cleanup_stream_append_payload!();
+                return Err(ObjectPgActionError::Store(error));
+            }
             let command = match self.try_install_object_pg_pending_command_with_fresh_id(
                 pg_id,
                 bucket,
                 false,
-                None,
+                Some(route.effect_fence),
                 |command_id| {
                     self.maybe_run_after_stream_append_command_id_allocated_hook(command_id);
                     MetadataCommandEnvelope::new(
@@ -15979,6 +16682,40 @@ impl StorageCluster {
                     && reference.okh == segment.segment_okh
                     && reference.generation_id == segment.segment_vid
             }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_placed_payload_shard_file_exists(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+    ) -> Result<bool, StoreError> {
+        if location.shard_index() != key.shard_index() {
+            return Err(StoreError::Io {
+                context: "validate placed payload shard test identity",
+                source: std::io::Error::other(format!(
+                    "location shard index {} does not match key shard index {}",
+                    location.shard_index().get(),
+                    key.shard_index().get()
+                )),
+            });
+        }
+        let node = self
+            .local_map
+            .node(location.node_id())
+            .ok_or(StoreError::NodeNotFound {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+            })?;
+        match node
+            .test_node()
+            .read_shard_file(location.data_pg_id().get(), key)
+        {
+            Ok(_) => Ok(true),
+            Err(StoreError::NotFound) => Ok(false),
+            Err(error) => Err(error),
         }
     }
 

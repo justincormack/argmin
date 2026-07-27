@@ -108,6 +108,19 @@ impl PlacedShardNodeClient for LocalStorageNodeClient {
             .write_shard_file(data_pg_id.get(), key, data)
     }
 
+    fn write_placed_shard_with_effect_fence(
+        &self,
+        operation_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        data: &[u8],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<WriteAck, StoreError> {
+        effect_fence.require_valid_for(operation_epoch)?;
+        self.storage_node
+            .write_shard_file(data_pg_id.get(), key, data)
+    }
+
     fn repair_placed_shard(
         &self,
         data_pg_id: DataPgId,

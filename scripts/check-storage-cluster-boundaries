@@ -558,6 +558,7 @@ migrated_bucket_snapshot_read_bypasses=$(
         pending_test_cfg = 0
         pending_storage_client = 0
         pending_bucket_metadata_client = 0
+        pending_reservation_node = 0
         in_test_hook = 0
         in_test_module = 0
     }
@@ -600,6 +601,11 @@ migrated_bucket_snapshot_read_bypasses=$(
             || $0 ~ /bucket_metadata_client[[:space:]]*$/) {
             pending_bucket_metadata_client = 1
         }
+        if ($0 ~ /reservation[[:space:]]*$/) {
+            pending_reservation_node = 1
+        } else if (pending_reservation_node && $0 ~ /^[[:space:]]*\.node[[:space:]]*$/) {
+            pending_reservation_node = 2
+        }
         if ($0 ~ /\.(load_bucket_execution_generations|load_bucket_fast_path_identities|load_bucket_execution_generations_for_pg|load_bucket_fast_path_identities_for_pg)\(/) {
             if (pending_bucket_metadata_client \
                 || $0 ~ /\.bucket_metadata_client\(\)/ \
@@ -620,18 +626,21 @@ migrated_bucket_snapshot_read_bypasses=$(
                 || $0 ~ /self\.load_bucket_snapshot_pair\(/) {
                 pending_storage_client = 0
                 pending_bucket_metadata_client = 0
+                pending_reservation_node = 0
                 next
             }
             print FILENAME ":" FNR ":" $0
         }
         if ($0 ~ /\.load_bucket_snapshot\(/) {
             if (pending_bucket_metadata_client \
+                || pending_reservation_node == 2 \
                 || $0 ~ /\.bucket_metadata_client\(\)/ \
                 || $0 ~ /bucket_metadata_client\./ \
                 || $0 ~ /storage_client\.load_bucket_snapshot\(/ \
                 || $0 ~ /reservation\.node\.load_bucket_snapshot\(/) {
                 pending_storage_client = 0
                 pending_bucket_metadata_client = 0
+                pending_reservation_node = 0
                 next
             }
             if ($0 ~ /self\.load_bucket_snapshot\(/) {
@@ -642,6 +651,7 @@ migrated_bucket_snapshot_read_bypasses=$(
         if ($0 ~ /;/) {
             pending_storage_client = 0
             pending_bucket_metadata_client = 0
+            pending_reservation_node = 0
         }
     }
     ' crates/storage/src/cluster.rs \
@@ -1031,7 +1041,7 @@ migrated_simple_object_read_bypasses=$(
                 || $0 ~ /CreateMultipartUploadCommand::from_request/)) {
             print FILENAME ":" FNR ":" $0
         }
-        if (current_fn == "commit_direct_put_object_from_payload_shards" \
+        if (current_fn == "commit_direct_put_object_from_payload_shards_with_route_validation" \
             && ($0 ~ /PgMetadataStore::get_object_meta\(/ \
                 || $0 ~ /PgMetadataStore::get_object_version\(/ \
                 || $0 ~ /PgMetadataStore::get_object_segments\(/ \
@@ -1376,7 +1386,7 @@ object_generation_reservation_bypasses=$(
     }
     {
         update_function_context()
-        if (current_fn == "reserve_put_object_generation" \
+        if (current_fn == "reserve_put_object_generation_with_route_validation" \
             && ($0 ~ /PgMetadataStore::get_object_generation_reservation\(/ \
                 || $0 ~ /\.get_object_generation_reservation\(/)) {
             print FILENAME ":" FNR ":" $0
@@ -1855,13 +1865,13 @@ fi
 # permitted low-level helper for each registered publisher a Rust-level choice.
 expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:abort_stream_upload_session:AbortStreamUploadSession:try_install_object_pg_pending_command_or_drain
-1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards:CommitDirectPutObjectFromPayloadShards:try_install_object_pg_pending_command_or_drain
+1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards_with_route_validation:CommitDirectPutObjectFromPayloadShards:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:commit_stream_segment_append:CommitStreamSegmentAppend:try_install_object_pg_pending_command_with_fresh_id
-1 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:CreatePutObjectStreamSessionRecordUnderReservation:try_install_object_pg_pending_command_or_drain
+1 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:CreatePutObjectStreamSessionRecordUnderReservation:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster.rs:release_object_generation_reservation:ReleaseObjectGenerationReservation:try_set_object_pg_pending_command_or_drain
 1 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:ReleaseObjectGenerationReservationCommandRequired:try_install_object_pg_pending_command_with_fresh_id
 1 crates/storage/src/cluster.rs:reserve_next_object_version:ReserveNextObjectVersion:try_install_object_pg_pending_command_with_fresh_id
-1 crates/storage/src/cluster.rs:reserve_put_object_generation:ReservePutObjectGeneration:try_install_object_pg_pending_command_with_fresh_id
+1 crates/storage/src/cluster.rs:reserve_put_object_generation_with_route_validation:ReservePutObjectGeneration:try_install_object_pg_pending_command_with_fresh_id
 1 crates/storage/src/cluster/request_ops.rs:abort_authorized_multipart_upload_locked:AbortAuthorizedMultipartUploadLocked:try_set_pending_metadata_command_for_bucket_with_effect_fence
 1 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:AbortMultipartUploadLocked:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete_if_current_with_route_validation:BeginBucketDelete:try_set_bucket_pg_pending_command_or_retry
@@ -1869,7 +1879,7 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized_with_route_validation:CompleteMultipartUploadCommitSerialized:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:create_bucket_with_config_and_load_info_with_route_validation:CreateBucket:try_set_bucket_pg_pending_command_or_retry
 1 crates/storage/src/cluster/request_ops.rs:create_multipart_upload_inner_with_route_validation:CreateMultipartUpload:install_snapshot_sensitive_metadata_command_or_drain
-1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session_with_cleanup_deadline:CreatePutObjectStreamSession:try_install_object_pg_pending_command_or_drain
+1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session_with_route_validation:CreatePutObjectStreamSession:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:create_upload_part_stream_session:CreateUploadPartStreamSession:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:delete_bucket_from_acting_set:DeleteBucketFromActingSet:try_set_bucket_pg_pending_command_or_retry
 1 crates/storage/src/cluster/request_ops.rs:delete_current_object_if_with_route_validation:DeleteCurrentObjectIf:install_snapshot_sensitive_metadata_command_or_drain
@@ -1878,7 +1888,7 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:delete_specific_object_version_if_with_route_validation:DeleteSpecificObjectVersionIf:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:establish_multipart_completion_barrier:EstablishMultipartCompletionBarrier:try_set_bucket_pg_pending_command_or_retry
 1 crates/storage/src/cluster/request_ops.rs:expire_current_object_if_due:ExpireCurrentObjectIfDue:install_snapshot_sensitive_metadata_command_or_drain
-1 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream:FinalizePutObjectStream:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream_with_route_validation:FinalizePutObjectStream:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream:FinalizeUploadPartStream:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:insert_current_delete_marker_if_with_route_validation:InsertCurrentDeleteMarkerIf:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_acl_and_load_info_with_route_validation:PutBucketAcl:try_set_bucket_control_pending_command_or_retry
@@ -1957,9 +1967,9 @@ metadata_command_conflict_uses=$(
 expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:abort_stream_upload_session:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:apply_new_stream_append_command:exact-command-match
-1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards:exact-command-match
-2 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards:metadata-command-log-conflict
-1 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:metadata-command-log-conflict
+1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards_with_route_validation:exact-command-match
+3 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards_with_route_validation:metadata-command-log-conflict
+2 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:metadata-command-log-conflict
 2 crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:exact-command-match
 1 crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:install_snapshot_sensitive_metadata_command_or_drain:metadata-command-log-conflict
@@ -1972,8 +1982,8 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:reissue_pending_metadata_command:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:release_object_generation_reservation:exact-command-match
 1 crates/storage/src/cluster.rs:release_object_generation_reservation_command_required:exact-command-match
-2 crates/storage/src/cluster.rs:reserve_put_object_generation:exact-command-match
-1 crates/storage/src/cluster.rs:reserve_put_object_generation:metadata-command-log-conflict
+2 crates/storage/src/cluster.rs:reserve_put_object_generation_with_route_validation:exact-command-match
+1 crates/storage/src/cluster.rs:reserve_put_object_generation_with_route_validation:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes:exact-command-match
 2 crates/storage/src/cluster.rs:try_install_object_pg_pending_command_with_fresh_id:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:try_set_object_pg_pending_command_or_drain:metadata-command-log-conflict
@@ -1985,14 +1995,14 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session_with_cleanup_deadline:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized_with_route_validation:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:create_multipart_upload_inner_with_route_validation:metadata-command-log-conflict
-1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session_with_cleanup_deadline:metadata-command-log-conflict
+2 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session_with_route_validation:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:create_upload_part_stream_session:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:delete_current_object_if_with_route_validation:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:delete_expired_delete_marker_if_due:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:delete_noncurrent_live_versions_if_due:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:delete_specific_object_version_if_with_route_validation:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:expire_current_object_if_due:metadata-command-log-conflict
-2 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream:metadata-command-log-conflict
+2 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream_with_route_validation:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:exact-command-match
 1 crates/storage/src/cluster/request_ops.rs:insert_current_delete_marker_if_with_route_validation:metadata-command-log-conflict

@@ -2082,30 +2082,30 @@ impl HttpFrontend {
                         acl.policy_condition_value(),
                         sse_s3.then_some(ManagedEncryptionAlgorithm::Aes256),
                     );
-                    let result =
-                        self.coordinator
-                            .put_object(&crate::coordinator::PutObjectRequest {
-                                object: object_request(
-                                    &bucket,
-                                    &key,
-                                    requester,
-                                    expected_bucket_owner,
+                    let result = self.coordinator.put_object_on_admitted_route(
+                        storage_route_admission,
+                        &crate::coordinator::PutObjectRequest {
+                            object: object_request(
+                                &bucket,
+                                &key,
+                                requester,
+                                expected_bucket_owner,
+                            )?,
+                            data: &req.body,
+                            metadata: &metadata_blob,
+                            system_metadata: &system_metadata,
+                            tags: inline_tags_xml.as_deref(),
+                            cond: &cond,
+                            acl,
+                            policy_context,
+                            object_lock,
+                            encryption:
+                                crate::coordinator::WriteEncryptionRequest::from_request_parts(
+                                    sse_customer.as_ref(),
+                                    sse_s3.then_some(storage::ManagedEncryptionAlgorithm::Aes256),
                                 )?,
-                                data: &req.body,
-                                metadata: &metadata_blob,
-                                system_metadata: &system_metadata,
-                                tags: inline_tags_xml.as_deref(),
-                                cond: &cond,
-                                acl,
-                                policy_context,
-                                object_lock,
-                                encryption:
-                                    crate::coordinator::WriteEncryptionRequest::from_request_parts(
-                                        sse_customer.as_ref(),
-                                        sse_s3
-                                            .then_some(storage::ManagedEncryptionAlgorithm::Aes256),
-                                    )?,
-                            })?;
+                        },
+                    )?;
                     let mut resp = S3Response::put_object(&result);
                     apply_sse_customer_write_response_headers(&mut resp, sse_customer.as_ref());
                     for (_, header) in checksum_headers() {

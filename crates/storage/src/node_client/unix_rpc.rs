@@ -8,7 +8,43 @@ impl UnixStorageNodeClient {
         key: &ShardKey,
         data: &[u8],
     ) -> Result<WriteAck, StoreError> {
-        self.write_placed_shard_with_kind(StorageRpcMessageKind::ShardWrite, data_pg_id, key, data)
+        self.write_placed_shard_with_kind(
+            StorageRpcMessageKind::ShardWrite,
+            data_pg_id,
+            key,
+            data,
+            None,
+        )
+    }
+
+    pub(crate) fn write_placed_shard_with_effect_fence(
+        &self,
+        operation_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        data: &[u8],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<WriteAck, StoreError> {
+        if operation_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: data_pg_id.get(),
+                operation_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        effect_fence.require_valid_for(operation_epoch)?;
+        self.write_placed_shard_with_kind(
+            StorageRpcMessageKind::ShardWrite,
+            data_pg_id,
+            key,
+            data,
+            effect_fence
+                .deadline()
+                .map(|deadline| StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }),
+        )
     }
 
     pub(crate) fn repair_placed_shard(
@@ -22,6 +58,7 @@ impl UnixStorageNodeClient {
             data_pg_id,
             key,
             data,
+            None,
         )
     }
 
@@ -31,6 +68,7 @@ impl UnixStorageNodeClient {
         data_pg_id: DataPgId,
         key: &ShardKey,
         data: &[u8],
+        effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
     ) -> Result<WriteAck, StoreError> {
         let rpc_permit = self.acquire_rpc_admission(kind)?;
         let expected_size = data.len() as u64;
@@ -40,6 +78,7 @@ impl UnixStorageNodeClient {
             shard_key: key.clone(),
             expected_size,
             expected_crc64,
+            effect_deadline,
             payload: data.to_vec(),
         };
         let payload = encode_shard_write_request(&request).map_err(|error| {
@@ -876,6 +915,24 @@ impl PlacedShardNodeClient for UnixStorageNodeClient {
         data: &[u8],
     ) -> Result<WriteAck, StoreError> {
         UnixStorageNodeClient::write_placed_shard(self, data_pg_id, key, data)
+    }
+
+    fn write_placed_shard_with_effect_fence(
+        &self,
+        operation_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        data: &[u8],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<WriteAck, StoreError> {
+        UnixStorageNodeClient::write_placed_shard_with_effect_fence(
+            self,
+            operation_epoch,
+            data_pg_id,
+            key,
+            data,
+            effect_fence,
+        )
     }
 
     fn repair_placed_shard(

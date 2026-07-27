@@ -76,7 +76,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU32;
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 8;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 9;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -1406,6 +1406,8 @@ pub(crate) enum StorageRpcPayloadError {
     ShardWriteChecksumMismatch,
     #[error("shard location shard index does not match shard key")]
     ShardLocationMismatch,
+    #[error("invalid shard write request: {0}")]
+    InvalidShardWriteRequest(&'static str),
     #[error("invalid read handle acquire request: {0}")]
     InvalidReadHandleAcquireRequest(&'static str),
     #[error("invalid read handle release request: {0}")]
@@ -3167,6 +3169,7 @@ pub(crate) struct StorageRpcShardWriteRequest {
     pub(crate) shard_key: ShardKey,
     pub(crate) expected_size: u64,
     pub(crate) expected_crc64: u64,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
     pub(crate) payload: Vec<u8>,
 }
 
@@ -10116,6 +10119,14 @@ pub(crate) fn encode_shard_write_request(
     request: &StorageRpcShardWriteRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
     validate_shard_location_matches_key(&request.location, &request.shard_key)?;
+    if request
+        .effect_deadline
+        .is_some_and(|deadline| !admitted_route_effect_deadline_is_conservative(deadline))
+    {
+        return Err(StorageRpcPayloadError::InvalidShardWriteRequest(
+            "shard write effect deadline must not exceed authority deadline",
+        ));
+    }
     validate_shard_write_payload(
         request.expected_size,
         request.expected_crc64,
@@ -10126,6 +10137,14 @@ pub(crate) fn encode_shard_write_request(
     put_bytes(&mut out, request.shard_key.as_bytes());
     put_u64(&mut out, request.expected_size);
     put_u64(&mut out, request.expected_crc64);
+    match request.effect_deadline {
+        None => put_u8(&mut out, 0),
+        Some(deadline) => {
+            put_u8(&mut out, 1);
+            put_u64(&mut out, deadline.authority_valid_until_ms);
+            put_u64(&mut out, deadline.portable_wall_valid_until_ms);
+        }
+    }
     put_bytes(&mut out, &request.payload);
     Ok(out)
 }
@@ -10138,15 +10157,35 @@ pub(crate) fn decode_shard_write_request(
     let shard_key = decoder.read_shard_key()?;
     let expected_size = decoder.read_u64()?;
     let expected_crc64 = decoder.read_u64()?;
+    let effect_deadline = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(StorageRpcAdmittedRouteEffectDeadline {
+            authority_valid_until_ms: decoder.read_u64()?,
+            portable_wall_valid_until_ms: decoder.read_u64()?,
+        }),
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidShardWriteRequest(
+                "unknown shard write effect deadline tag",
+            ));
+        }
+    };
     let payload = decoder.read_bytes()?.to_vec();
     decoder.finish()?;
     validate_shard_location_matches_key(&location, &shard_key)?;
+    if effect_deadline
+        .is_some_and(|deadline| !admitted_route_effect_deadline_is_conservative(deadline))
+    {
+        return Err(StorageRpcPayloadError::InvalidShardWriteRequest(
+            "shard write effect deadline must not exceed authority deadline",
+        ));
+    }
     validate_shard_write_payload(expected_size, expected_crc64, &payload)?;
     Ok(StorageRpcShardWriteRequest {
         location,
         shard_key,
         expected_size,
         expected_crc64,
+        effect_deadline,
         payload,
     })
 }
@@ -17566,7 +17605,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&8u16.to_le_bytes());
+        expected.extend_from_slice(&9u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -17577,15 +17616,15 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_rejects_version_seven_fixture() {
+    fn storage_rpc_frame_rejects_version_eight_fixture() {
         let mut bytes =
             encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
         let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&7_u16.to_le_bytes());
+        bytes[version_offset..version_offset + 2].copy_from_slice(&8_u16.to_le_bytes());
 
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnsupportedVersion(7))
+            Err(StorageRpcFrameError::UnsupportedVersion(8))
         );
     }
 
@@ -18969,6 +19008,10 @@ mod tests {
             shard_key: test_shard_key(2),
             expected_size: payload.len() as u64,
             expected_crc64: checksum::crc64::checksum(&payload),
+            effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                authority_valid_until_ms: 7_000,
+                portable_wall_valid_until_ms: 6_000,
+            }),
             payload,
         };
 
@@ -18986,6 +19029,7 @@ mod tests {
             shard_key: test_shard_key(2),
             expected_size: payload.len() as u64,
             expected_crc64: checksum::crc64::checksum(&payload),
+            effect_deadline: None,
             payload,
         };
 

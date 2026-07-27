@@ -139,7 +139,7 @@ define_metadata_command_publishers! {
         SnapshotSensitive
     ),
     ReservePutObjectGeneration => (
-        "reserve_put_object_generation",
+        "reserve_put_object_generation_with_route_validation",
         "ReserveObjectGeneration",
         AllocatorCleanup
     ),
@@ -159,7 +159,7 @@ define_metadata_command_publishers! {
         AllocatorCleanup
     ),
     CommitDirectPutObjectFromPayloadShards => (
-        "commit_direct_put_object_from_payload_shards",
+        "commit_direct_put_object_from_payload_shards_with_route_validation",
         "CommitDirectPutObject",
         SnapshotSensitive
     ),
@@ -219,12 +219,12 @@ define_metadata_command_publishers! {
         SnapshotSensitive
     ),
     CreatePutObjectStreamSession => (
-        "create_put_object_stream_session_with_cleanup_deadline",
+        "create_put_object_stream_session_with_route_validation",
         "CreateStreamUpload",
         SnapshotSensitive
     ),
     FinalizePutObjectStream => (
-        "finalize_put_object_stream",
+        "finalize_put_object_stream_with_route_validation",
         "CommitDirectPutObject",
         TerminalSessionRetry
     ),

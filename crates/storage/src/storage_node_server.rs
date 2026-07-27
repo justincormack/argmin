@@ -6505,9 +6505,16 @@ impl StorageNodeActiveShardRoute<'_> {
         )
     }
 
-    fn write_if_absent(&self, payload: &[u8]) -> Result<WriteAck, StorageNodeDataRouteError> {
+    fn write_if_absent(
+        &self,
+        payload: &[u8],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<WriteAck, StorageNodeDataRouteError> {
         self.require_valid_now()
             .map_err(StorageNodeDataRouteError::Route)?;
+        effect_fence
+            .require_valid_for(self.location.cluster_epoch())
+            .map_err(|error| StorageNodeDataRouteError::Route(store_error_response(error)))?;
         self.handler
             .node
             .write_shard_file_if_absent(self.location.data_pg_id().get(), self.shard_key, payload)
@@ -12331,6 +12338,8 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcShardWriteRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let effect_fence =
+            admitted_route_effect_fence(request.location.cluster_epoch, request.effect_deadline);
         let route = match self.active_shard_route(
             route_permit,
             request.location,
@@ -12340,7 +12349,7 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        let response = match route.write_if_absent(&request.payload) {
+        let response = match route.write_if_absent(&request.payload, effect_fence) {
             Ok(ack) => {
                 let payload = encode_shard_write_ack(ack);
                 encode_storage_rpc_success_response(&payload)
@@ -12360,6 +12369,12 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcShardWriteRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if request.effect_deadline.is_some() {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "shard repair write must not carry a frontend effect deadline".to_string(),
+            });
+        }
         let route = match self.active_shard_route(
             route_permit,
             request.location,
@@ -22490,6 +22505,8 @@ mod tests {
         let bucket = command.bucket_name().clone();
         let drain_bucket = BucketName::try_from("tcp-portable-drain-bucket").unwrap();
         let expired_drain_bucket = BucketName::try_from("tcp-expired-drain-bucket").unwrap();
+        let shard_key = test_shard_key(0);
+        let expired_shard_key = test_shard_key(1);
         let pg = server._node.get_pg(0).unwrap();
         create_probe_bucket_direct(&pg, &bucket);
         create_probe_bucket_direct(&pg, &drain_bucket);
@@ -22502,6 +22519,12 @@ mod tests {
                 server.accept_one().unwrap()
             });
             crate::clock::with_time_and_monotonic_override(2_800, 901_800, || {
+                server.accept_one().unwrap()
+            });
+            crate::clock::with_time_and_monotonic_override(2_800, 901_800, || {
+                server.accept_one().unwrap()
+            });
+            crate::clock::with_time_and_monotonic_override(4_500, 903_500, || {
                 server.accept_one().unwrap()
             });
             crate::clock::with_time_and_monotonic_override(4_500, 903_500, || {
@@ -22566,6 +22589,21 @@ mod tests {
         });
         assert_eq!(drain.bucket, drain_bucket);
 
+        let shard_payload = b"portable fenced shard";
+        let shard_ack = crate::clock::with_time_and_monotonic_override(2_600, 10_100, || {
+            client
+                .write_placed_shard_with_effect_fence(
+                    config.cluster_epoch,
+                    DataPgId::new_for_test(PgId::new(0)),
+                    &shard_key,
+                    shard_payload,
+                    effect_fence,
+                )
+                .unwrap()
+        });
+        assert_eq!(shard_ack.stored_size, shard_payload.len() as u64);
+        assert_eq!(node.read_shard_file(0, &shard_key).unwrap(), shard_payload);
+
         let drain_error = crate::clock::with_time_and_monotonic_override(3_500, 11_000, || {
             BucketWriteReservationNodeClient::begin_durable_bucket_write_drain_with_effect_fence(
                 &client,
@@ -22611,8 +22649,35 @@ mod tests {
             ),
             "{pending_error:?}"
         );
+
+        let shard_error = crate::clock::with_time_and_monotonic_override(3_500, 11_000, || {
+            client
+                .write_placed_shard_with_effect_fence(
+                    config.cluster_epoch,
+                    DataPgId::new_for_test(PgId::new(0)),
+                    &expired_shard_key,
+                    b"must not be written",
+                    effect_fence,
+                )
+                .unwrap_err()
+        });
+        assert!(
+            matches!(
+                &shard_error,
+                StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                }
+            ),
+            "{shard_error:?}"
+        );
         join.join().unwrap();
 
+        assert_eq!(node.read_shard_file(0, &shard_key).unwrap(), shard_payload);
+        assert!(matches!(
+            node.read_shard_file(0, &expired_shard_key),
+            Err(StoreError::NotFound)
+        ));
         let pg = node.get_pg(0).unwrap();
         assert!(
             PgMetadataStore::durable_bucket_write_drain(&*pg, &expired_drain_bucket)
@@ -27024,6 +27089,7 @@ mod tests {
             shard_key: shard_key.clone(),
             expected_size: payload.len() as u64,
             expected_crc64: checksum::crc64::checksum(&payload),
+            effect_deadline: None,
             payload: payload.clone(),
         };
         let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -27068,6 +27134,7 @@ mod tests {
             shard_key: shard_key.clone(),
             expected_size: different.len() as u64,
             expected_crc64: checksum::crc64::checksum(&different),
+            effect_deadline: None,
             payload: different,
         };
         let mismatch = send_frame(
@@ -27117,6 +27184,7 @@ mod tests {
             shard_key: shard_key.clone(),
             expected_size: repaired.len() as u64,
             expected_crc64: checksum::crc64::checksum(&repaired),
+            effect_deadline: None,
             payload: repaired.clone(),
         };
         let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -27162,6 +27230,7 @@ mod tests {
             shard_key: shard_key.clone(),
             expected_size: payload.len() as u64,
             expected_crc64: checksum::crc64::checksum(&payload),
+            effect_deadline: None,
             payload,
         };
         let mut request_payload = encode_shard_write_request(&request).unwrap();
@@ -27657,7 +27726,12 @@ mod tests {
                 .unwrap()
         });
         crate::clock::with_time_override(1_000, || {
-            shard_route.write_if_absent(payload).unwrap();
+            shard_route
+                .write_if_absent(
+                    payload,
+                    AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                )
+                .unwrap();
             assert_eq!(shard_route.read().unwrap(), payload);
             assert_eq!(
                 shard_route.repair_write(repaired_payload).unwrap(),

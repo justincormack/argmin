@@ -270,8 +270,8 @@ type MetadataCommandApplyTestHook =
 #[cfg(test)]
 type AbortMultipartPendingInstallTestHook = Arc<dyn Fn() + Send + Sync>;
 
-#[cfg(test)]
-type StreamPutCreatePendingInstallTestHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(any(test, feature = "test-hooks"))]
+pub type StreamPutCreatePendingInstallTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
 type StreamPutCreateCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
@@ -331,7 +331,7 @@ static BEFORE_ABORT_MULTIPART_PENDING_INSTALL_HOOKS: OnceLock<
     Mutex<HashMap<usize, AbortMultipartPendingInstallTestHook>>,
 > = OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 static BEFORE_STREAM_PUT_CREATE_PENDING_INSTALL_HOOKS: OnceLock<
     Mutex<HashMap<usize, StreamPutCreatePendingInstallTestHook>>,
 > = OnceLock::new();
@@ -406,8 +406,8 @@ pub(crate) struct AbortMultipartPendingInstallTestHookGuard {
     scope_id: usize,
 }
 
-#[cfg(test)]
-pub(crate) struct StreamPutCreatePendingInstallTestHookGuard {
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct StreamPutCreatePendingInstallTestHookGuard {
     scope_id: usize,
 }
 
@@ -489,7 +489,7 @@ impl Drop for AbortMultipartPendingInstallTestHookGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl Drop for StreamPutCreatePendingInstallTestHookGuard {
     fn drop(&mut self) {
         let hooks = BEFORE_STREAM_PUT_CREATE_PENDING_INSTALL_HOOKS
@@ -690,7 +690,7 @@ fn maybe_run_before_abort_multipart_pending_install_hook(_scope_id: usize) {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 fn maybe_run_before_stream_put_create_pending_install_hook(_scope_id: usize) {
     let hook = BEFORE_STREAM_PUT_CREATE_PENDING_INSTALL_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -1214,8 +1214,8 @@ impl super::StorageCluster {
         AbortMultipartPendingInstallTestHookGuard { scope_id }
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_install_before_stream_put_create_pending_install_hook(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_stream_put_create_pending_install_hook(
         &self,
         hook: StreamPutCreatePendingInstallTestHook,
     ) -> StreamPutCreatePendingInstallTestHookGuard {
@@ -3372,6 +3372,69 @@ impl super::StorageCluster {
         }
     }
 
+    pub(super) fn with_put_object_bucket_write_snapshot_for_command_with_route_validation<T, E>(
+        &self,
+        route: super::PutObjectMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(
+            BucketSnapshot,
+            BucketWriteReservationProof,
+        ) -> super::BucketWriteSnapshotAction<T, E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        let super::PutObjectMutationEffectRoute {
+            bucket_pg_id,
+            bucket,
+            effect_fence,
+            ..
+        } = route;
+        let pg_id = bucket_pg_id.pg_id();
+        let mut work_budget =
+            super::RequestWorkBudget::new(super::BUCKET_WRITE_DRAIN_RETRY_BUDGET, None)
+                .for_operation("put_object_bucket_write_snapshot_for_command")
+                .for_pg(pg_id);
+        loop {
+            work_budget.check("put object bucket write snapshot retry budget exhausted")?;
+            require_valid_route()?;
+            let reservation = match self.acquire_durable_bucket_write_reservation_with_effect_fence(
+                bucket,
+                "bucket-write-snapshot",
+                None,
+                Some(effect_fence),
+            ) {
+                Ok(reservation) => reservation,
+                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
+                    self.wait_for_durable_bucket_write_drain(bucket)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let proof = BucketWriteReservationProof::from(&reservation.record);
+
+            let result = (|| {
+                require_valid_route()?;
+                let storage_client = &reservation.node;
+                let snapshot =
+                    storage_client.load_bucket_snapshot(bucket_pg_id, bucket, request)?;
+                Ok(action(snapshot, proof))
+            })();
+            let (result, release_result) = match result {
+                Ok(super::BucketWriteSnapshotAction::Release(result)) => (
+                    Ok(result),
+                    self.release_durable_bucket_write_reservation(reservation),
+                ),
+                Ok(super::BucketWriteSnapshotAction::TransferredToCommand(result)) => {
+                    (Ok(result), Ok(()))
+                }
+                Err(error) => (
+                    Err(error),
+                    self.release_durable_bucket_write_reservation(reservation),
+                ),
+            };
+            return Self::finish_bucket_write_snapshot_operation(result, release_result);
+        }
+    }
+
     fn with_bucket_write_reservation_snapshot_with_route_validation<T, E>(
         &self,
         route: super::BucketMetadataMutationEffectRoute<'_>,
@@ -3432,7 +3495,7 @@ impl super::StorageCluster {
         )
     }
 
-    fn acquire_durable_bucket_write_reservation_with_effect_fence(
+    pub(super) fn acquire_durable_bucket_write_reservation_with_effect_fence(
         &self,
         bucket: &BucketName,
         operation_kind: &'static str,
@@ -3538,39 +3601,6 @@ impl super::StorageCluster {
                     target_context,
                 },
                 effect_fence,
-            )?;
-        Ok(super::DurableBucketWriteReservation {
-            node: Arc::clone(node.bucket_metadata_client()),
-            pg_id,
-            record,
-        })
-    }
-
-    pub(super) fn acquire_durable_put_object_stream_write_reservation(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<super::DurableBucketWriteReservation, BucketSnapshotLoadError> {
-        let pg_id = self.bucket_metadata_pg_id(bucket);
-        let node = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        let reservation_id = self.next_bucket_write_reservation_id()?;
-        let owner_token = self.bucket_write_owner_token();
-        let record = node
-            .bucket_write_reservation_client()
-            .acquire_durable_bucket_write_reservation(
-                self.validated_bucket_metadata_pg(PgId::new(pg_id)),
-                DurableBucketWriteReservationAcquire {
-                    name: bucket,
-                    reservation_id: &reservation_id,
-                    owner_token: &owner_token,
-                    cluster_epoch: self.operation_epoch(),
-                    operation_kind: PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
-                    created_at: crate::clock::current_time_millis(),
-                    lease_deadline: self.put_object_stream_create_lease_deadline(),
-                    target_context: Some(key.as_str()),
-                },
             )?;
         Ok(super::DurableBucketWriteReservation {
             node: Arc::clone(node.bucket_metadata_client()),
@@ -12240,6 +12270,32 @@ impl super::StorageCluster {
         key: &ObjectKey,
         request: BucketSnapshotRequest,
         cleanup_after: Option<u64>,
+        action: impl FnMut(
+            BucketSnapshot,
+            Option<StoredObject>,
+        ) -> Result<(T, CreateStreamUploadReq), E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        self.create_put_object_stream_session_with_route_validation(
+            super::PutObjectMutationEffectRoute {
+                bucket_pg_id: self.bucket_metadata_pg(bucket),
+                object_pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            request,
+            cleanup_after,
+            action,
+        )
+    }
+
+    pub(super) fn create_put_object_stream_session_with_route_validation<T, E>(
+        &self,
+        route: super::PutObjectMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+        request: BucketSnapshotRequest,
+        cleanup_after: Option<u64>,
         mut action: impl FnMut(
             BucketSnapshot,
             Option<StoredObject>,
@@ -12251,31 +12307,44 @@ impl super::StorageCluster {
             Retry,
         }
 
-        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let super::PutObjectMutationEffectRoute {
+            bucket_pg_id,
+            object_pg_id,
+            bucket,
+            key,
+            effect_fence,
+        } = route;
         let pg_id = object_pg_id.pg_id();
         loop {
+            require_valid_route()?;
             let applied_commands = self
                 .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
-            let reservation =
-                match self.acquire_durable_put_object_stream_write_reservation(bucket, key) {
-                    Ok(reservation) => reservation,
-                    Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
-                        self.wait_for_durable_bucket_write_drain(bucket)?;
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
+            require_valid_route()?;
+            let reservation = match self.acquire_durable_bucket_write_reservation_with_effect_fence(
+                bucket,
+                PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+                Some(key.as_str()),
+                Some(effect_fence),
+            ) {
+                Ok(reservation) => reservation,
+                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
+                    self.wait_for_durable_bucket_write_drain(bucket)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let proof = BucketWriteReservationProof::from(&reservation.record);
             let mut disposition = super::BucketWriteReservationDisposition::ReleaseByCaller;
             let result = (|| {
-                let snapshot = reservation.node.load_bucket_snapshot(
-                    self.validated_bucket_metadata_pg(PgId::new(reservation.pg_id)),
-                    bucket,
-                    request,
-                )?;
+                require_valid_route()?;
+                let snapshot =
+                    reservation
+                        .node
+                        .load_bucket_snapshot(bucket_pg_id, bucket, request)?;
 
                 let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+                require_valid_route()?;
                 let current_object = mutation_client
                     .load_current_object_delete_snapshot(object_pg_id, bucket, key)
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
@@ -12288,6 +12357,14 @@ impl super::StorageCluster {
                     Ok(prepared) => prepared,
                     Err(error) => return Ok(Err(error)),
                 };
+                if create.bucket != *bucket || create.key != *key {
+                    return Err(BucketSnapshotLoadError::Store(
+                        StoreError::RouteCapabilitySubjectMismatch {
+                            operation: "create put object stream session",
+                        },
+                    ));
+                }
+                require_valid_route()?;
                 if mutation_client
                     .matching_stream_upload_exists(
                         object_pg_id,
@@ -12298,13 +12375,22 @@ impl super::StorageCluster {
                 {
                     return Ok(Ok(Attempt::Complete(value)));
                 }
-                self.reserve_put_object_generation(bucket, key, &create.session_id)
-                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                self.reserve_put_object_generation_with_route_validation(
+                    route,
+                    &create.session_id,
+                    &mut require_valid_route,
+                )
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
 
                 #[cfg(test)]
                 maybe_run_before_stream_put_create_command_id_hook(
                     self.metadata_command_apply_test_hook_scope_id(),
                 );
+                if let Err(error) = require_valid_route() {
+                    let _ =
+                        self.release_object_generation_reservation(bucket, key, &create.session_id);
+                    return Err(error.into());
+                }
                 let command = match mutation_client.build_create_stream_upload_command(
                     BuildCreateStreamUploadCommandReq {
                         pg_id: object_pg_id,
@@ -12362,14 +12448,43 @@ impl super::StorageCluster {
                         ));
                     }
                 };
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 maybe_run_before_stream_put_create_pending_install_hook(
                     self.metadata_command_apply_test_hook_scope_id(),
                 );
+                if let Err(error) = require_valid_route() {
+                    let _ =
+                        self.release_object_generation_reservation(bucket, key, &create.session_id);
+                    return Err(error.into());
+                }
+                self.maybe_run_before_metadata_command_pending_install_hook();
                 let installed = match self
-                    .try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command)
-                {
+                    .try_install_pending_metadata_command_for_bucket_with_effect_fence(
+                        pg_id,
+                        bucket,
+                        &command,
+                        Some(effect_fence),
+                    ) {
                     Ok(installed) => installed,
+                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                        ..
+                    })) => {
+                        let cleanup = self
+                            .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
+                            .and_then(|_| {
+                                self.release_object_generation_reservation(
+                                    bucket,
+                                    key,
+                                    &create.session_id,
+                                )
+                            });
+                        if let Err(cleanup_error) = cleanup {
+                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                                cleanup_error,
+                            ));
+                        }
+                        return Ok(Ok(Attempt::Retry));
+                    }
                     Err(error) => {
                         let _ = self.release_object_generation_reservation(
                             bucket,
@@ -12454,10 +12569,39 @@ impl super::StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
         total_size: u64,
+        action: impl FnMut(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
+    ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
+        self.finalize_put_object_stream_with_route_validation(
+            super::PutObjectMutationEffectRoute {
+                bucket_pg_id: self.bucket_metadata_pg(bucket),
+                object_pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            session_id,
+            total_size,
+            || Ok(()),
+            action,
+        )
+    }
+
+    pub(super) fn finalize_put_object_stream_with_route_validation<T, E>(
+        &self,
+        route: super::PutObjectMutationEffectRoute<'_>,
+        session_id: &SessionId,
+        total_size: u64,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut action: impl FnMut(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(FinalizePutObjectStream);
-        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let super::PutObjectMutationEffectRoute {
+            object_pg_id,
+            bucket,
+            key,
+            effect_fence,
+            ..
+        } = route;
         let pg_id = object_pg_id.pg_id();
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let mut stale_snapshot_work_budget =
@@ -12466,6 +12610,7 @@ impl super::StorageCluster {
                 .for_pg(pg_id);
 
         let (command, new_pending_command, prepared) = loop {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 let is_matching_stream_commit = matches!(
                     command.payload(),
@@ -12511,6 +12656,7 @@ impl super::StorageCluster {
                 }
                 Err(error) => return Err(error),
             };
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             let Some(effective_bucket_write_reservation) =
                 storage_snapshot.session.bucket_write_reservation.as_ref()
             else {
@@ -12542,7 +12688,13 @@ impl super::StorageCluster {
                 Some(command) => (command, false),
                 None => {
                     let version_id = if prepared.versioning == BucketVersioningState::Enabled {
-                        self.reserve_next_object_version_for_completion(pg_id, bucket, key)?
+                        self.reserve_next_object_version_for_completion_with_effect_fence(
+                            pg_id,
+                            bucket,
+                            key,
+                            effect_fence,
+                            &mut require_valid_route,
+                        )?
                     } else {
                         VersionId::Null
                     };
@@ -12564,6 +12716,7 @@ impl super::StorageCluster {
                     maybe_run_before_stream_put_finalize_command_id_hook(
                         self.metadata_command_apply_test_hook_scope_id(),
                     );
+                    require_valid_route().map_err(ObjectPgActionError::Store)?;
                     let command = match mutation_client.build_stream_put_commit_command(
                         BuildStreamPutCommitCommandReq {
                             pg_id: object_pg_id,
@@ -12594,9 +12747,14 @@ impl super::StorageCluster {
                         }
                         Err(error) => return Err(error),
                     };
+                    require_valid_route().map_err(ObjectPgActionError::Store)?;
                     let installed = match self
-                        .try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)
-                    {
+                        .try_install_pending_metadata_command_for_bucket_with_effect_fence(
+                            pg_id,
+                            bucket,
+                            &command,
+                            Some(effect_fence),
+                        ) {
                         Ok(installed) => installed,
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },

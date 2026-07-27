@@ -1094,6 +1094,541 @@ fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
 }
 
 #[test]
+fn direct_put_expires_at_generation_reservation_effect_boundary() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
+    drop(initial_coord);
+    drop(initial);
+    let cluster = open_same_store_cluster_with_route_map_validity(
+        same_store_inputs,
+        RouteMapValidity::until_ms(5_000).unwrap(),
+    );
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+
+    let hook_clock = Arc::clone(&clock);
+    let hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            hook_clock.set(4_500)
+        }));
+    let request = PutObjectRequest {
+        encryption: WriteEncryptionRequest::none(),
+        policy_context: PutObjectPolicyContext::default(),
+        object_lock: ObjectLockState::default(),
+        object: object_request_with_expected_owner("bucket", "late-put", test_requester(), None),
+        data: b"must not publish",
+        metadata: &MetadataBlob::new(),
+        system_metadata: &SystemMetadata::EMPTY,
+        tags: None,
+        cond: NO_WRITE,
+        acl: NO_PUT_OBJECT_ACL.into(),
+    };
+    let error = coord
+        .put_object_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+
+    assert!(cluster
+        .load_existing_live_object(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-put"),
+        )
+        .unwrap()
+        .is_none());
+
+    clock.set(1_000);
+    let fresh_admission = coord.admit_storage_route_for_request().unwrap();
+    coord
+        .put_object_on_admitted_route(&fresh_admission, &request)
+        .unwrap();
+    assert!(cluster
+        .load_existing_live_object(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-put"),
+        )
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn direct_put_expiring_at_staged_shard_effect_writes_no_payload() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
+    drop(initial_coord);
+    drop(initial);
+    let cluster = open_same_store_cluster_with_route_map_validity(
+        same_store_inputs,
+        RouteMapValidity::until_ms(5_000).unwrap(),
+    );
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+
+    let hook_clock = Arc::clone(&clock);
+    let attempted_shard = Arc::new(Mutex::new(None));
+    let hook_attempted_shard = Arc::clone(&attempted_shard);
+    let hook = cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(
+        move |location, key| {
+            *hook_attempted_shard.lock().unwrap() = Some((*location, key.clone()));
+            hook_clock.set(4_500);
+            Ok(())
+        },
+    ));
+    let request = PutObjectRequest {
+        encryption: WriteEncryptionRequest::none(),
+        policy_context: PutObjectPolicyContext::default(),
+        object_lock: ObjectLockState::default(),
+        object: object_request_with_expected_owner(
+            "bucket",
+            "late-payload",
+            test_requester(),
+            None,
+        ),
+        data: b"must not publish",
+        metadata: &MetadataBlob::new(),
+        system_metadata: &SystemMetadata::EMPTY,
+        tags: None,
+        cond: NO_WRITE,
+        acl: NO_PUT_OBJECT_ACL.into(),
+    };
+    let error = coord
+        .put_object_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+
+    let (attempted_location, attempted_key) = attempted_shard
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("direct PUT must reach the first staged-shard effect boundary");
+    assert!(!cluster
+        .test_placed_payload_shard_file_exists(attempted_location, &attempted_key)
+        .unwrap());
+
+    assert!(cluster
+        .load_existing_live_object(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-payload"),
+        )
+        .unwrap()
+        .is_none());
+
+    clock.set(1_000);
+    let fresh_admission = coord.admit_storage_route_for_request().unwrap();
+    coord
+        .put_object_on_admitted_route(&fresh_admission, &request)
+        .unwrap();
+}
+
+#[test]
+fn direct_put_expiring_after_first_staged_shard_cleans_partial_payload() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
+    drop(initial_coord);
+    drop(initial);
+    let cluster = open_same_store_cluster_with_route_map_validity(
+        same_store_inputs,
+        RouteMapValidity::until_ms(5_000).unwrap(),
+    );
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+
+    let hook_clock = Arc::clone(&clock);
+    let attempted_shards = Arc::new(Mutex::new(Vec::new()));
+    let hook_attempted_shards = Arc::clone(&attempted_shards);
+    let hook = cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(
+        move |location, key| {
+            let mut attempted = hook_attempted_shards.lock().unwrap();
+            attempted.push((*location, key.clone()));
+            if attempted.len() == 2 {
+                hook_clock.set(4_500);
+            }
+            Ok(())
+        },
+    ));
+    let request = PutObjectRequest {
+        encryption: WriteEncryptionRequest::none(),
+        policy_context: PutObjectPolicyContext::default(),
+        object_lock: ObjectLockState::default(),
+        object: object_request_with_expected_owner(
+            "bucket",
+            "partial-late-payload",
+            test_requester(),
+            None,
+        ),
+        data: b"must not publish",
+        metadata: &MetadataBlob::new(),
+        system_metadata: &SystemMetadata::EMPTY,
+        tags: None,
+        cond: NO_WRITE,
+        acl: NO_PUT_OBJECT_ACL.into(),
+    };
+    let error = coord
+        .put_object_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+
+    let attempted = attempted_shards.lock().unwrap().clone();
+    assert_eq!(
+        attempted.len(),
+        2,
+        "the first shard must be written before the second write expires"
+    );
+    for (location, key) in attempted {
+        assert!(
+            !cluster
+                .test_placed_payload_shard_file_exists(location, &key)
+                .unwrap(),
+            "route expiry must remove every partially written direct-PUT shard"
+        );
+    }
+    assert!(cluster
+        .load_existing_live_object(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("partial-late-payload"),
+        )
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn stream_put_creation_expires_at_pending_install_effect_boundary() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
+    drop(initial_coord);
+    drop(initial);
+    let cluster = open_same_store_cluster_with_route_map_validity(
+        same_store_inputs,
+        RouteMapValidity::until_ms(5_000).unwrap(),
+    );
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let storage_node = coord.storage_node();
+
+    let hook_clock = Arc::clone(&clock);
+    let hook =
+        cluster.test_install_before_stream_put_create_pending_install_hook(Arc::new(move || {
+            hook_clock.set(4_500)
+        }));
+    let error = match coord.begin_stream_put_with_storage_admission_and_cleanup_deadline(
+        &admission,
+        &storage_node,
+        &AuthorizePutObjectRequest {
+            object: object_request_with_expected_owner(
+                "bucket",
+                "late-stream-create",
+                test_requester(),
+                None,
+            ),
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            tags: None,
+            encryption: WriteEncryptionRequest::none(),
+        },
+        admission.authority_valid_until_ms(),
+    ) {
+        Ok(_) => panic!("expired stream creation unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+    assert!(
+        cluster
+            .list_stream_upload_sessions_best_effort()
+            .into_iter()
+            .all(|session| session.bucket.as_str() != "bucket"
+                || session.key.as_str() != "late-stream-create"),
+        "expired creation must not publish a stream session"
+    );
+
+    clock.set(1_000);
+    let fresh_admission = coord.admit_storage_route_for_request().unwrap();
+    let prepared = coord
+        .begin_stream_put_with_storage_admission_and_cleanup_deadline(
+            &fresh_admission,
+            &storage_node,
+            &AuthorizePutObjectRequest {
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "late-stream-create",
+                    test_requester(),
+                    None,
+                ),
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                tags: None,
+                encryption: WriteEncryptionRequest::none(),
+            },
+            fresh_admission.authority_valid_until_ms(),
+        )
+        .unwrap();
+    drop(fresh_admission);
+    coord
+        .abort_stream_put_session_with_storage_node(
+            &storage_node,
+            prepared.authorized_write.bucket_typed(),
+            prepared.authorized_write.key_typed(),
+            &prepared.session_id,
+        )
+        .unwrap();
+}
+
+#[test]
+fn promoted_put_expires_inside_stream_append_and_cleans_staged_payload() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
+    drop(initial_coord);
+    drop(initial);
+    let cluster = open_same_store_cluster_with_route_map_validity(
+        same_store_inputs,
+        RouteMapValidity::until_ms(5_000).unwrap(),
+    );
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+
+    let attempted_shards = Arc::new(Mutex::new(Vec::new()));
+    let hook_attempted_shards = Arc::clone(&attempted_shards);
+    let shard_hook = cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(
+        move |location, key| {
+            hook_attempted_shards
+                .lock()
+                .unwrap()
+                .push((*location, key.clone()));
+            Ok(())
+        },
+    ));
+    let hook_clock = Arc::clone(&clock);
+    let append_hook = cluster
+        .test_install_before_stream_append_command_id_hook(Arc::new(move || hook_clock.set(4_500)));
+    let data = vec![0x5a; INTERNAL_SEGMENT_SIZE + 1];
+    let request = PutObjectRequest {
+        encryption: WriteEncryptionRequest::none(),
+        policy_context: PutObjectPolicyContext::default(),
+        object_lock: ObjectLockState::default(),
+        object: object_request_with_expected_owner(
+            "bucket",
+            "late-promoted-put",
+            test_requester(),
+            None,
+        ),
+        data: &data,
+        metadata: &MetadataBlob::new(),
+        system_metadata: &SystemMetadata::EMPTY,
+        tags: None,
+        cond: NO_WRITE,
+        acl: NO_PUT_OBJECT_ACL.into(),
+    };
+    let error = coord
+        .put_object_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(append_hook);
+    drop(shard_hook);
+    drop(admission);
+
+    let attempted = attempted_shards.lock().unwrap().clone();
+    assert!(
+        !attempted.is_empty(),
+        "promoted PUT must stage shards before the append-publication hook"
+    );
+    for (location, key) in attempted {
+        assert!(
+            !cluster
+                .test_placed_payload_shard_file_exists(location, &key)
+                .unwrap(),
+            "expired promoted PUT must remove staged shards"
+        );
+    }
+    assert!(cluster
+        .load_existing_live_object(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-promoted-put"),
+        )
+        .unwrap()
+        .is_none());
+    assert!(
+        cluster
+            .list_stream_upload_sessions_best_effort()
+            .into_iter()
+            .all(|session| session.bucket.as_str() != "bucket"
+                || session.key.as_str() != "late-promoted-put"),
+        "the failed buffered PUT must abort its promoted stream session"
+    );
+}
+
+#[test]
+fn stream_put_finalization_expires_inside_command_build() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
+    drop(initial_coord);
+    drop(initial);
+    let cluster = open_same_store_cluster_with_route_map_validity(
+        same_store_inputs,
+        RouteMapValidity::until_ms(5_000).unwrap(),
+    );
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let storage_node = coord.storage_node();
+    let prepared = coord
+        .begin_stream_put_with_storage_admission_and_cleanup_deadline(
+            &admission,
+            &storage_node,
+            &AuthorizePutObjectRequest {
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "late-stream-finalize",
+                    test_requester(),
+                    None,
+                ),
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                tags: None,
+                encryption: WriteEncryptionRequest::none(),
+            },
+            admission.authority_valid_until_ms(),
+        )
+        .unwrap();
+
+    let hook_clock = Arc::clone(&clock);
+    let hook =
+        cluster.test_install_before_stream_put_finalize_command_id_hook(Arc::new(move || {
+            hook_clock.set(4_500)
+        }));
+    let error = coord
+        .finalize_authorized_stream_put_with_storage_admission(
+            &admission,
+            &storage_node,
+            &AuthorizedFinalizeStreamPutRequest {
+                session_id: &prepared.session_id,
+                crc64: checksum::crc64::checksum(b""),
+                total_size: 0,
+                metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                write_encryption: ActiveWriteEncryptionRef::None,
+                cond: NO_WRITE,
+            },
+            &prepared.authorized_write,
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    assert!(cluster
+        .load_existing_live_object(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-stream-finalize"),
+        )
+        .unwrap()
+        .is_none());
+    assert!(cluster
+        .list_stream_upload_sessions_best_effort()
+        .iter()
+        .any(|session| session.session_id == prepared.session_id));
+    drop(admission);
+    coord
+        .abort_stream_put_session_with_storage_node(
+            &storage_node,
+            prepared.authorized_write.bucket_typed(),
+            prepared.authorized_write.key_typed(),
+            &prepared.session_id,
+        )
+        .unwrap();
+}
+
+#[test]
 fn multipart_creation_expires_at_pending_install_effect_boundary() {
     let tmp = test_util::tempdir();
     let initial = open_test_storage_cluster(tmp.path(), &[0]);
@@ -3776,8 +4311,31 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
         policy_context: PutObjectPolicyContext::default()
             .with_default_canned_acl(PutObjectAcl::PublicRead.policy_condition_value()),
     };
+    let rejected_put = PutObjectRequest {
+        encryption: WriteEncryptionRequest::none(),
+        policy_context: PutObjectPolicyContext::default(),
+        object_lock: ObjectLockState::default(),
+        object: object_request_with_expected_owner(
+            "bucket",
+            "foreign-domain-put",
+            test_requester(),
+            None,
+        ),
+        data: b"must not publish",
+        metadata: &MetadataBlob::new(),
+        system_metadata: &SystemMetadata::EMPTY,
+        tags: None,
+        cond: NO_WRITE,
+        acl: NO_PUT_OBJECT_ACL.into(),
+    };
 
     for (operation, result) in [
+        (
+            "PutObject",
+            local
+                .put_object_on_admitted_route(&foreign_admission, &rejected_put)
+                .map(|_| ()),
+        ),
         (
             "HeadObject",
             local
@@ -3891,6 +4449,13 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
             .acl_grants,
         baseline_acl.acl_grants
     );
+    assert!(cluster
+        .load_existing_live_object(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("foreign-domain-put"),
+        )
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -6314,6 +6879,8 @@ fn put_object_pins_runtime_map_after_bucket_write_reservation() {
         candidate_tmp.path(),
         &[0, 1],
     ));
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -6322,7 +6889,13 @@ fn put_object_pins_runtime_map_after_bucket_write_reservation() {
     let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some(bucket.to_string()),
         after_loaded: Some(Arc::new(move || {
-            hook_handle.install(Arc::clone(&candidate)).unwrap();
+            let publishing_handle = hook_handle.clone();
+            let publishing_candidate = Arc::clone(&candidate);
+            let thread = thread::spawn(move || {
+                publishing_handle.install(publishing_candidate).unwrap();
+            });
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
         })),
         ..BucketWriteHandleTestHooks::default()
     });
@@ -6344,6 +6917,13 @@ fn put_object_pins_runtime_map_after_bucket_write_reservation() {
         },
     )
     .unwrap();
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("PutObject hook should start route publication")
+        .join()
+        .unwrap();
 
     handle
         .install(make_dynamic_runtime_map_candidate(initial))
@@ -6876,10 +7456,15 @@ fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() 
         "direct PUT should have applied only the generation-reservation command before the pre-commit gate"
     );
 
-    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
+        &handle,
+        &initial,
+        tmp.path(),
+    );
 
     gate.release();
     let put_result = put_thread.join().unwrap().unwrap();
+    publication_thread.join().unwrap();
     assert_eq!(put_result.version_id, VersionId::Null);
     let after_object_pg_proof = initial
         .test_object_pg_metadata_proof(&bucket_name, &object_key)
@@ -7009,10 +7594,15 @@ fn overwrite_object_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
         "overwrite should have applied only the generation-reservation command before the pre-commit gate"
     );
 
-    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
+        &handle,
+        &initial,
+        tmp.path(),
+    );
 
     gate.release();
     let put_result = put_thread.join().unwrap().unwrap();
+    publication_thread.join().unwrap();
     assert_eq!(put_result.version_id, VersionId::Null);
     let after_object_pg_proof = initial
         .test_object_pg_metadata_proof(&bucket_name, &object_key)
@@ -9351,6 +9941,8 @@ fn large_put_object_pins_runtime_map_after_stream_session_create() {
         candidate_tmp.path(),
         &[0, 1],
     ));
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -9359,7 +9951,13 @@ fn large_put_object_pins_runtime_map_after_stream_session_create() {
     let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some(bucket.to_string()),
         after_loaded: Some(Arc::new(move || {
-            hook_handle.install(Arc::clone(&candidate)).unwrap();
+            let publishing_handle = hook_handle.clone();
+            let publishing_candidate = Arc::clone(&candidate);
+            let thread = thread::spawn(move || {
+                publishing_handle.install(publishing_candidate).unwrap();
+            });
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
         })),
         ..BucketWriteHandleTestHooks::default()
     });
@@ -9382,6 +9980,13 @@ fn large_put_object_pins_runtime_map_after_stream_session_create() {
         },
     )
     .unwrap();
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("large PutObject hook should start route publication")
+        .join()
+        .unwrap();
 
     handle
         .install(make_dynamic_runtime_map_candidate(initial))

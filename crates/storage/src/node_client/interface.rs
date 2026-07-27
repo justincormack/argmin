@@ -972,6 +972,15 @@ pub(crate) trait PlacedShardNodeClient: Send + Sync {
         data: &[u8],
     ) -> Result<WriteAck, StoreError>;
 
+    fn write_placed_shard_with_effect_fence(
+        &self,
+        operation_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        data: &[u8],
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<WriteAck, StoreError>;
+
     fn repair_placed_shard(
         &self,
         data_pg_id: DataPgId,
