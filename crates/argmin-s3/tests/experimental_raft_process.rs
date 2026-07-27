@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 #[cfg(target_os = "linux")]
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
@@ -1337,15 +1337,114 @@ fn static_tcp_process_test_mount() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn reserve_loopback_ports(count: usize) -> (Vec<u16>, Vec<TcpListener>) {
-    let listeners = (0..count)
-        .map(|_| TcpListener::bind("127.0.0.1:0").expect("test TCP port should reserve"))
-        .collect::<Vec<_>>();
+fn reserve_loopback_ports(count: usize) -> (Vec<u16>, Vec<Option<TcpListener>>) {
+    let ephemeral_range = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .expect("Linux ephemeral port range should be readable");
+    let mut bounds = ephemeral_range.split_ascii_whitespace();
+    let ephemeral_start = bounds
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .expect("Linux ephemeral port range start should parse");
+    let ephemeral_end = bounds
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .expect("Linux ephemeral port range end should parse");
+    assert!(
+        bounds.next().is_none() && ephemeral_start <= ephemeral_end,
+        "Linux ephemeral port range should contain exactly two ordered ports"
+    );
+
+    let mut candidates = (1024..ephemeral_start).collect::<Vec<_>>();
+    if ephemeral_end < u16::MAX {
+        candidates.extend((ephemeral_end + 1)..=u16::MAX);
+    }
+    assert!(
+        candidates.len() >= count,
+        "Linux host must expose at least {count} unprivileged non-ephemeral ports"
+    );
+    let seed = usize::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .subsec_nanos(),
+    )
+    .unwrap()
+        ^ usize::try_from(std::process::id()).unwrap();
+    let candidate_count = candidates.len();
+    candidates.rotate_left(seed % candidate_count);
+
+    let mut listeners = Vec::with_capacity(count);
+    for port in candidates {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => {
+                listeners.push(listener);
+                if listeners.len() == count {
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                ) => {}
+            Err(error) => panic!("test TCP port {port} should reserve: {error}"),
+        }
+    }
+    assert_eq!(
+        listeners.len(),
+        count,
+        "Linux host did not have {count} available non-ephemeral loopback ports"
+    );
     let ports = listeners
         .iter()
         .map(|listener| listener.local_addr().unwrap().port())
         .collect();
-    (ports, listeners)
+    (ports, listeners.into_iter().map(Some).collect())
+}
+
+#[cfg(target_os = "linux")]
+fn release_static_authority_port_reservations(
+    reservations: &mut [Option<TcpListener>],
+    authority_number: usize,
+) {
+    assert!((1..=3).contains(&authority_number));
+    let index = authority_number - 1;
+    for port_index in [index, index + 3, index + 6] {
+        drop(
+            reservations[port_index]
+                .take()
+                .expect("authority port reservation should still be held"),
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_static_authority_raft_listener(
+    ports: &[u16],
+    authority_number: usize,
+    child: &mut ChildGuard,
+) {
+    assert!((1..=3).contains(&authority_number));
+    let index = authority_number - 1;
+    let raft_port = ports[index];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        child.assert_running();
+        if TcpStream::connect_timeout(
+            &format!("127.0.0.1:{raft_port}").parse().unwrap(),
+            Duration::from_millis(100),
+        )
+        .is_ok()
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "static authority {authority_number} did not bind its Raft TCP listener\n{}",
+            process_logs(&child.test_dir)
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1665,7 +1764,7 @@ fn static_manifest_tcp_three_authorities_bootstrap_route_admin_and_restart() {
     };
     let test_dir = TestDir::new_under(&mount);
     let bin = argmin_s3_bin();
-    let (ports, reservations) = reserve_loopback_ports(12);
+    let (ports, mut reservations) = reserve_loopback_ports(12);
     let manifest_path = write_static_tcp_process_manifest(test_dir.path(), &ports);
     for number in 1..=3_u64 {
         let output = Command::new(&bin)
@@ -1680,14 +1779,18 @@ fn static_manifest_tcp_three_authorities_bootstrap_route_admin_and_restart() {
             format_admin_failure(output.status, &output)
         );
     }
-    drop(reservations);
-
+    release_static_authority_port_reservations(&mut reservations, 2);
     let mut node102 =
         ChildGuard::spawn_static(&bin, test_dir.path(), &manifest_path, "control-2", 102);
+    wait_for_static_authority_raft_listener(&ports, 2, &mut node102);
+    release_static_authority_port_reservations(&mut reservations, 3);
     let mut node103 =
         ChildGuard::spawn_static(&bin, test_dir.path(), &manifest_path, "control-3", 103);
+    wait_for_static_authority_raft_listener(&ports, 3, &mut node103);
+    release_static_authority_port_reservations(&mut reservations, 1);
     let mut node101 =
         ChildGuard::spawn_static(&bin, test_dir.path(), &manifest_path, "control-1", 101);
+    wait_for_static_authority_raft_listener(&ports, 1, &mut node101);
     let unused_socket = test_dir.path().join("unused.sock");
     let unused_socket_arg = unused_socket.to_str().unwrap();
 
