@@ -2033,6 +2033,15 @@ fn spawn_standalone_control_plane_checkpoint_loop(
     })
 }
 
+fn initialize_standalone_control_plane_before_binding<Ready, Listeners>(
+    initialize: impl FnOnce() -> Ready,
+    bind_listeners: impl FnOnce() -> Listeners,
+) -> (Ready, Listeners) {
+    let ready = initialize();
+    let listeners = bind_listeners();
+    (ready, listeners)
+}
+
 fn run_control_plane_process(config: &ServerConfig) -> ! {
     if config.control_plane_experimental_raft {
         run_experimental_raft_control_plane_process(config);
@@ -2056,84 +2065,108 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| control_plane_clock_recovery_socket_path(Path::new(socket_path)));
-    let listeners = bind_configured_control_plane_rpc_listeners(
-        &config.control_plane_rpc_listeners,
-        Path::new(socket_path),
-        "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
-        CONTROL_PLANE_RPC_WORKER_LIMIT,
-    )
-    .unwrap_or_else(|error| {
-        eprintln!("{error}");
-        std::process::exit(1);
-    });
-    let recovery_listeners = bind_configured_control_plane_rpc_listeners(
-        &config.control_plane_clock_recovery_rpc_listeners,
-        &recovery_socket_path,
-        "derived control-plane clock recovery socket",
-        CONTROL_PLANE_CLOCK_RECOVERY_RPC_WORKER_LIMIT,
-    )
-    .unwrap_or_else(|error| {
-        eprintln!("{error}");
-        std::process::exit(1);
-    });
-    let store = FileControlPlaneStore::new(state_path);
-    let authority_clock_checkpoint_binding = store
-        .load_or_create_authority_clock_checkpoint_binding()
-        .unwrap_or_else(|error| {
-            eprintln!("failed to load control-plane durable identity: {error}");
-            std::process::exit(1);
-        });
-    let restart_clock_checkpoint = load_process_authority_clock_restart_checkpoint(
-        store.path(),
-        authority_clock_checkpoint_binding,
-    )
-    .unwrap_or_else(|error| {
-        eprintln!("failed to load control-plane authority clock checkpoint: {error}");
-        std::process::exit(1);
-    });
-    let mut authority = SingleAuthorityControlPlane::open(store).unwrap_or_else(|error| {
-        eprintln!("failed to open control-plane state {state_path}: {error}");
-        std::process::exit(1);
-    });
-    bootstrap_empty_control_plane(&mut authority, config).unwrap_or_else(|error| {
-        eprintln!("failed to bootstrap control-plane state: {error}");
-        std::process::exit(1);
-    });
-    let mut authority_clock =
-        ControlPlaneAuthorityClock::new_from_process_clock_with_restart_checkpoint(
-            authority.snapshot().max_committed_timestamp_ms(),
-            restart_clock_checkpoint,
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("failed to initialize control-plane authority clock: {error}");
-            std::process::exit(1);
-        });
-    if !authority_clock.is_established() {
-        invalidate_authority_clock_restart_checkpoint(Path::new(state_path)).unwrap_or_else(
-            |error| {
-                eprintln!("failed to invalidate blocked authority clock checkpoint: {error}");
-                std::process::exit(1);
-            },
-        );
-    }
-    if let Some(previous_authority) = authority.snapshot().lease_grant_horizon_authority() {
-        if !authority_clock.resume_single_authority_lease_horizon_generation(previous_authority) {
-            authority_clock
-                .advance_generation_past_lease_horizon(previous_authority)
+    let (
+        (authority, authority_clock, authority_clock_checkpoint_target, auth_verifier),
+        (listeners, recovery_listeners),
+    ) = initialize_standalone_control_plane_before_binding(
+        || {
+            let store = FileControlPlaneStore::new(state_path);
+            let authority_clock_checkpoint_binding = store
+                .load_or_create_authority_clock_checkpoint_binding()
                 .unwrap_or_else(|error| {
-                    eprintln!(
-                        "failed to advance restarted control-plane clock generation: {error}"
-                    );
+                    eprintln!("failed to load control-plane durable identity: {error}");
                     std::process::exit(1);
                 });
-        }
-    }
-    let authority_clock = Arc::new(Mutex::new(authority_clock));
-    let authority_clock_checkpoint_target = Arc::new(AuthorityClockCheckpointTarget {
-        path: PathBuf::from(state_path),
-        binding: authority_clock_checkpoint_binding,
-    });
-    let authority = Arc::new(Mutex::new(authority));
+            let restart_clock_checkpoint = load_process_authority_clock_restart_checkpoint(
+                store.path(),
+                authority_clock_checkpoint_binding,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("failed to load control-plane authority clock checkpoint: {error}");
+                std::process::exit(1);
+            });
+            let mut authority = SingleAuthorityControlPlane::open(store).unwrap_or_else(|error| {
+                eprintln!("failed to open control-plane state {state_path}: {error}");
+                std::process::exit(1);
+            });
+            bootstrap_empty_control_plane(&mut authority, config).unwrap_or_else(|error| {
+                eprintln!("failed to bootstrap control-plane state: {error}");
+                std::process::exit(1);
+            });
+            let mut authority_clock =
+                ControlPlaneAuthorityClock::new_from_process_clock_with_restart_checkpoint(
+                    authority.snapshot().max_committed_timestamp_ms(),
+                    restart_clock_checkpoint,
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("failed to initialize control-plane authority clock: {error}");
+                    std::process::exit(1);
+                });
+            if !authority_clock.is_established() {
+                invalidate_authority_clock_restart_checkpoint(Path::new(state_path))
+                    .unwrap_or_else(|error| {
+                        eprintln!(
+                            "failed to invalidate blocked authority clock checkpoint: {error}"
+                        );
+                        std::process::exit(1);
+                    });
+            }
+            if let Some(previous_authority) = authority.snapshot().lease_grant_horizon_authority() {
+                if !authority_clock
+                    .resume_single_authority_lease_horizon_generation(previous_authority)
+                {
+                    authority_clock
+                        .advance_generation_past_lease_horizon(previous_authority)
+                        .unwrap_or_else(|error| {
+                            eprintln!(
+                                "failed to advance restarted control-plane clock generation: {error}"
+                            );
+                            std::process::exit(1);
+                        });
+                }
+            }
+            let auth_verifier = build_control_plane_unix_auth_verifier(config)
+                .unwrap_or_else(|error| {
+                    eprintln!("failed to configure control-plane auth verifier: {error}");
+                    std::process::exit(1);
+                })
+                .map(Arc::new);
+            (
+                Arc::new(Mutex::new(authority)),
+                Arc::new(Mutex::new(authority_clock)),
+                Arc::new(AuthorityClockCheckpointTarget {
+                    path: PathBuf::from(state_path),
+                    binding: authority_clock_checkpoint_binding,
+                }),
+                auth_verifier,
+            )
+        },
+        || {
+            // Requests are timestamped before connect. Binding before replay completes would
+            // accumulate stale authenticated requests in the accept backlog.
+            let listeners = bind_configured_control_plane_rpc_listeners(
+                &config.control_plane_rpc_listeners,
+                Path::new(socket_path),
+                "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+                CONTROL_PLANE_RPC_WORKER_LIMIT,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(1);
+            });
+            let recovery_listeners = bind_configured_control_plane_rpc_listeners(
+                &config.control_plane_clock_recovery_rpc_listeners,
+                &recovery_socket_path,
+                "derived control-plane clock recovery socket",
+                CONTROL_PLANE_CLOCK_RECOVERY_RPC_WORKER_LIMIT,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(1);
+            });
+            (listeners, recovery_listeners)
+        },
+    );
     let _checkpoint_loop = spawn_standalone_control_plane_checkpoint_loop(Arc::clone(&authority));
     let active_rpc_workers = Arc::new(AtomicUsize::new(0));
     let active_recovery_rpc_workers = Arc::new(AtomicUsize::new(0));
@@ -2143,12 +2176,6 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
     let recovery_rpc_pre_auth_byte_budget = Arc::new(ControlPlaneRpcPreAuthByteBudget::new(
         CONTROL_PLANE_CLOCK_RECOVERY_RPC_PRE_AUTH_BYTE_BUDGET,
     ));
-    let auth_verifier = build_control_plane_unix_auth_verifier(config)
-        .unwrap_or_else(|error| {
-            eprintln!("failed to configure control-plane auth verifier: {error}");
-            std::process::exit(1);
-        })
-        .map(Arc::new);
     process_info!(
         "argmin-s3 control-plane manager using state {} on {} (clock recovery {}, lease scan {} ms)",
         state_path,
@@ -8790,6 +8817,186 @@ mod tests {
         assert!(client.join().unwrap().unwrap().established());
         assert_eq!(ordinary_workers.load(Ordering::Acquire), 64);
         drop(incomplete_clients);
+    }
+
+    #[test]
+    fn standalone_control_plane_binds_rpc_endpoints_only_after_replay() {
+        use storage::control_plane::ControlPlaneStore;
+
+        #[derive(Clone)]
+        struct ReplayBlockedStore {
+            inner: FileControlPlaneStore,
+            replay_gate: Arc<(Mutex<(bool, bool)>, Condvar)>,
+        }
+
+        impl ControlPlaneStore for ReplayBlockedStore {
+            fn load(&self) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
+                let (state, wake) = &*self.replay_gate;
+                let mut state = state.lock().expect("replay gate should not be poisoned");
+                state.0 = true;
+                wake.notify_all();
+                while !state.1 {
+                    state = wake
+                        .wait(state)
+                        .expect("replay gate should not be poisoned while blocked");
+                }
+                drop(state);
+                self.inner.load()
+            }
+
+            fn checkpoint(
+                &self,
+                previous_snapshot: Option<&ClusterControlSnapshot>,
+                next_snapshot: &ClusterControlSnapshot,
+            ) -> Result<(), ControlPlaneError> {
+                self.inner.checkpoint(previous_snapshot, next_snapshot)
+            }
+        }
+
+        let tmp = test_util::tempdir();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ordinary_path = tmp.path().join("control-plane.sock");
+        let recovery_path = tmp.path().join("clock-recovery.sock");
+        let inner_store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut seeded = SingleAuthorityControlPlane::open(inner_store.clone()).unwrap();
+        seeded
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        drop(seeded);
+
+        let replay_gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let replay_store = ReplayBlockedStore {
+            inner: inner_store,
+            replay_gate: Arc::clone(&replay_gate),
+        };
+        let ordinary_path_for_startup = ordinary_path.clone();
+        let recovery_path_for_startup = recovery_path.clone();
+        let startup = thread::spawn(move || {
+            initialize_standalone_control_plane_before_binding(
+                || {
+                    Arc::new(Mutex::new(
+                        SingleAuthorityControlPlane::open(replay_store).unwrap(),
+                    ))
+                },
+                || {
+                    let ordinary = bind_configured_control_plane_rpc_listeners(
+                        &[],
+                        &ordinary_path_for_startup,
+                        "test ordinary control-plane socket",
+                        CONTROL_PLANE_RPC_WORKER_LIMIT,
+                    )
+                    .unwrap();
+                    let recovery = bind_configured_control_plane_rpc_listeners(
+                        &[],
+                        &recovery_path_for_startup,
+                        "test recovery control-plane socket",
+                        CONTROL_PLANE_CLOCK_RECOVERY_RPC_WORKER_LIMIT,
+                    )
+                    .unwrap();
+                    (ordinary, recovery)
+                },
+            )
+        });
+
+        let (state, wake) = &*replay_gate;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut state = state.lock().expect("replay gate should not be poisoned");
+        while !state.0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "control-plane replay did not block");
+            let (next_state, timeout) = wake
+                .wait_timeout(state, remaining)
+                .expect("replay gate should not be poisoned while waiting");
+            state = next_state;
+            assert!(
+                !timeout.timed_out() || state.0,
+                "control-plane replay did not block"
+            );
+        }
+        for path in [&ordinary_path, &recovery_path] {
+            let error = UnixStream::connect(path)
+                .expect_err("control-plane endpoint must not accept before replay completes");
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ));
+        }
+        state.1 = true;
+        wake.notify_all();
+        drop(state);
+
+        let (authority, (mut ordinary_listeners, recovery_listeners)) = startup.join().unwrap();
+        assert_eq!(ordinary_listeners.len(), 1);
+        assert_eq!(recovery_listeners.len(), 1);
+        UnixStream::connect(&recovery_path)
+            .expect("recovery endpoint should bind after replay completes");
+        drop(recovery_listeners);
+
+        let frontend_credential =
+            ControlPlaneFrontendAuthCredential::new(ControlPlaneFrontendAuthCredentialInput {
+                instance_id: "frontend-1".to_owned(),
+                credential_id: "frontend-1".to_owned(),
+                credential_version: 1,
+                secret: b"frontend-secret".to_vec(),
+            })
+            .unwrap();
+        let admin_credential =
+            ControlPlaneAdminAuthCredential::new(ControlPlaneAdminAuthCredentialInput {
+                instance_id: "admin-1".to_owned(),
+                credential_id: "admin-1".to_owned(),
+                credential_version: 1,
+                secret: b"admin-secret".to_vec(),
+            })
+            .unwrap();
+        let verifier = Arc::new(
+            ControlPlaneUnixAuthVerifier::new_empty("startup-order-cluster")
+                .unwrap()
+                .with_frontend_credentials(vec![frontend_credential.clone()])
+                .unwrap()
+                .with_admin_credentials(vec![admin_credential])
+                .unwrap(),
+        );
+        let client_credential = frontend_credential
+            .scoped_for_cluster("startup-order-cluster")
+            .unwrap();
+        let ordinary_listener = ordinary_listeners.pop().unwrap();
+        ordinary_listener.enter_blocking_accept_mode().unwrap();
+        let BoundControlPlaneRpcListener::Unix { listener, .. } = ordinary_listener else {
+            panic!("test ordinary control-plane listener should be Unix")
+        };
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            spawn_control_plane_rpc_worker(
+                stream,
+                ControlPlaneRpcWorkerAuthority::Shared(authority),
+                None,
+                None,
+                ControlPlaneRpcWorkerPolicy {
+                    gate_request_time_with_authority_clock: false,
+                    require_authentication: false,
+                    active_rpc_workers: Arc::new(AtomicUsize::new(0)),
+                    worker_limit: CONTROL_PLANE_RPC_WORKER_LIMIT,
+                    max_frame_bytes: CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+                    io_timeout: CONTROL_PLANE_RPC_IO_TIMEOUT,
+                    pre_auth_byte_budget: Arc::new(ControlPlaneRpcPreAuthByteBudget::new(
+                        CONTROL_PLANE_RPC_PRE_AUTH_BYTE_BUDGET,
+                    )),
+                    endpoint: ControlPlaneRpcEndpoint::Ordinary,
+                    auth_verifier: Some(verifier),
+                    raft_authority_admission: None,
+                    durable_response_publication: None,
+                },
+            );
+        });
+        let now_ms = storage::clock::current_time_millis();
+        let status = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(ordinary_path),
+            client_credential,
+        )
+        .runtime_map_status(now_ms)
+        .expect("freshly signed request should succeed after replay and binding");
+        assert_eq!(status.pg_routes(), 0);
+        server.join().unwrap();
     }
 
     #[test]

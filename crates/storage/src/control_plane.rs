@@ -8224,8 +8224,7 @@ impl ControlPlaneStore for FileControlPlaneStore {
                         .to_owned(),
                 });
             }
-            let previous_snapshot = snapshot;
-            let applied = previous_snapshot
+            let applied = snapshot
                 .apply_control_plane_command(command.clone())
                 .map_err(|error| ControlPlaneError::CommandDecode {
                     message: format!(
@@ -8240,11 +8239,8 @@ impl ControlPlaneStore for FileControlPlaneStore {
                 });
             }
             snapshot = applied.into_snapshot();
-            snapshot.record_history_from(&previous_snapshot);
-            validate_control_plane_snapshot(
-                "single-authority control-plane journal replay produced invalid state",
-                &snapshot,
-            )?;
+            // Command application records history and validates the resulting publication.
+            // Repeating either operation here is both redundant and O(retained history).
             chain_digest = record.resulting_chain_digest;
         }
         if frames.truncated_tail {
@@ -9621,18 +9617,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         }
         let response = live_applied.response().clone();
         let changed = live_applied.changed();
-        let mut next_live_snapshot = live_applied.into_snapshot();
-        let mut next_durable_snapshot = durable_applied.into_snapshot();
-        next_live_snapshot.record_history_from(&self.snapshot);
-        next_durable_snapshot.record_history_from(&self.durable_snapshot);
-        validate_control_plane_snapshot(
-            "attempted to commit invalid control-plane snapshot",
-            &next_live_snapshot,
-        )?;
-        validate_control_plane_snapshot(
-            "attempted to commit invalid durable control-plane snapshot",
-            &next_durable_snapshot,
-        )?;
+        // Both applications already record history and validate their resulting snapshots.
+        let next_live_snapshot = live_applied.into_snapshot();
+        let next_durable_snapshot = durable_applied.into_snapshot();
         self.store
             .commit_command(&self.durable_snapshot, &command, &next_durable_snapshot)?;
         self.durable_snapshot = next_durable_snapshot;
