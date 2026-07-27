@@ -84,12 +84,16 @@ fn trace_multipart_reclaim(
         key: object_key,
         generation_id,
         created_at,
-        parts: vec![MultipartReclaimPartRecord::ShardSet {
+        parts: vec![MultipartReclaimPartRecord {
             part_number: 1,
-            part_okh: object_key_hash(bucket, key),
-            part_vid: generation_id,
-            data_pg_id,
-            ec: EcShape { k: 4, m: 2 },
+            segments: vec![storage::MultipartReclaimPartSegmentRecord {
+                part_number: 1,
+                segment_index: 0,
+                segment_okh: object_key_hash(bucket, key),
+                segment_vid: generation_id,
+                data_pg_id,
+                ec: EcShape { k: 4, m: 2 },
+            }],
         }],
     }
 }

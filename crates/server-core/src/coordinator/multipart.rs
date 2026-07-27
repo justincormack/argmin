@@ -1498,7 +1498,6 @@ impl Coordinator {
                         payload_crc64: crc64,
                         etag: crc64_to_etag_bytes(crc64),
                         etag_kind: storage::EtagKind::Crc64,
-                        part_okh: [0u8; 16],
                         part_vid: GenerationId::new(u64::from(generation) + 1)
                             .expect("multipart part generation must be nonzero"),
                         placement_cluster_epoch: staging_segments

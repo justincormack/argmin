@@ -2462,23 +2462,6 @@ pub struct ObjectSegmentsReclaimRecord {
     pub segments: Vec<ObjectSegmentsReclaimSegmentRecord>,
 }
 
-/// Part storage kind for a multipart reclaim record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MultipartReclaimPartKind {
-    ShardSet = 0,
-    Segments = 1,
-}
-
-impl MultipartReclaimPartKind {
-    pub fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0 => Some(Self::ShardSet),
-            1 => Some(Self::Segments),
-            _ => None,
-        }
-    }
-}
-
 /// Segment entry for a multipart part reclaim record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartReclaimPartSegmentRecord {
@@ -2492,18 +2475,9 @@ pub struct MultipartReclaimPartSegmentRecord {
 
 /// Part entry for a durable multipart reclaim record.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MultipartReclaimPartRecord {
-    ShardSet {
-        part_number: u32,
-        part_okh: [u8; 16],
-        part_vid: GenerationId,
-        data_pg_id: u32,
-        ec: EcShape,
-    },
-    Segments {
-        part_number: u32,
-        segments: Vec<MultipartReclaimPartSegmentRecord>,
-    },
+pub struct MultipartReclaimPartRecord {
+    pub part_number: u32,
+    pub segments: Vec<MultipartReclaimPartSegmentRecord>,
 }
 
 /// Durable reclaim record for a multipart payload generation.
@@ -2557,26 +2531,11 @@ impl MultipartReclaimRecord {
             created_at,
             parts: parts
                 .iter()
-                .map(|part| {
-                    if part.part_okh == [0u8; 16] {
-                        MultipartReclaimPartRecord::Segments {
-                            part_number: part.part_number,
-                            segments: segments_by_part
-                                .remove(&part.part_number)
-                                .unwrap_or_default(),
-                        }
-                    } else {
-                        MultipartReclaimPartRecord::ShardSet {
-                            part_number: part.part_number,
-                            part_okh: part.part_okh,
-                            part_vid: part.part_vid,
-                            data_pg_id: part.data_pg_id,
-                            ec: EcShape {
-                                k: part.ec_k,
-                                m: part.ec_m,
-                            },
-                        }
-                    }
+                .map(|part| MultipartReclaimPartRecord {
+                    part_number: part.part_number,
+                    segments: segments_by_part
+                        .remove(&part.part_number)
+                        .unwrap_or_default(),
                 })
                 .collect(),
         }
@@ -2608,27 +2567,11 @@ pub(crate) struct ShardScavengerReclaimShardSetReference {
     pub ec: EcShape,
 }
 
-/// A non-streamed MPU part whose data PG is derived from object topology.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ShardScavengerRoutedMultipartPartReference {
-    pub bucket: BucketName,
-    pub key: ObjectKey,
-    pub object_generation_id: GenerationId,
-    pub part_number: u32,
-    pub stored_size: u64,
-    pub crc64: u64,
-    pub part_okh: [u8; 16],
-    pub part_vid: GenerationId,
-    pub placement_cluster_epoch: ClusterEpoch,
-    pub ec: EcShape,
-}
-
 /// Durable metadata reference to a payload shard set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ShardScavengerPayloadReference {
     Placed(ShardScavengerPlacedShardSetReference),
     ReclaimOnly(ShardScavengerReclaimShardSetReference),
-    RoutedMultipartPart(ShardScavengerRoutedMultipartPartReference),
 }
 
 /// Public access block configuration for a bucket.
@@ -3991,11 +3934,9 @@ pub struct MultipartPartRecord {
     pub payload_crc64: u64,
     pub etag: Vec<u8>,
     pub etag_kind: EtagKind,
-    /// 16-byte object key hash for shard keys.
-    pub part_okh: [u8; 16],
-    /// Per-part payload generation for shard keys.
+    /// Stable identity for this replacement generation of the part.
     pub part_vid: GenerationId,
-    /// Cluster-map epoch used when this direct part shard set was written.
+    /// Cluster-map epoch recorded when this part generation was committed.
     pub placement_cluster_epoch: ClusterEpoch,
     pub ec_k: u8,
     pub ec_m: u8,
@@ -4117,7 +4058,6 @@ pub struct ObjectPartRecord {
     pub payload_crc64: u64,
     pub etag: Vec<u8>,
     pub etag_kind: EtagKind,
-    pub part_okh: [u8; 16],
     pub part_vid: GenerationId,
     pub placement_cluster_epoch: ClusterEpoch,
     pub ec_k: u8,

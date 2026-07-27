@@ -1288,7 +1288,6 @@ fn assert_streamed_multipart_completion_on_acting_nodes_with_write_sequence(
         )
         .unwrap();
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].part_okh, [0u8; 16]);
         assert_eq!(parts[0].part_vid, req.part_records[0].part_vid);
 
         let segments = crate::PgMetadataStore::get_multipart_part_segments(
@@ -1469,7 +1468,6 @@ fn upload_streamed_test_multipart_part(
                     payload_crc64,
                     etag: vec![session_seed; 8],
                     etag_kind: crate::EtagKind::Crc64,
-                    part_okh: [0u8; 16],
                     part_vid: crate::GenerationId::new(u64::from(generation) + 1).unwrap(),
                     placement_cluster_epoch: segment.placement_cluster_epoch,
                     ec_k: segment.ec_k,

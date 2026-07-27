@@ -52,12 +52,11 @@ use crate::{
         ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
         ShardScavengerObservationRecord, ShardScavengerPayloadReference,
         ShardScavengerPlacedShardSetReference, ShardScavengerReclaimShardSetReference,
-        ShardScavengerRoutedMultipartPartReference, StorageClass, StoredLegalHoldStatus,
-        StoredObject, StreamPutCommitInput, StreamPutFinalizeStorageSnapshot,
-        StreamUploadPartSnapshot, StreamUploadPartStorageSnapshot, StreamUploadRecord,
-        StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
-        TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, WriteAck,
-        BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN,
+        StorageClass, StoredLegalHoldStatus, StoredObject, StreamPutCommitInput,
+        StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
+        StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
+        StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
+        VersionId, WriteAck, BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN,
         PLACED_SEGMENT_SHARD_BACKFILL_CLAIM_ID_MAX_LEN,
         PLACED_SEGMENT_SHARD_BACKFILL_LAST_ERROR_MAX_LEN, PLACED_SEGMENT_SHARD_BACKFILL_LIST_LIMIT,
         PLACED_SEGMENT_SHARD_BACKFILL_OWNER_TOKEN_MAX_LEN,
@@ -77,7 +76,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU32;
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 6;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 7;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -449,13 +448,13 @@ const STORAGE_RPC_MAX_MULTIPART_ABORT_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN: usize =
     4 + 4 + 8 + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 8 + 2;
 const STORAGE_RPC_MIN_OBJECT_PART_RECORD_LEN: usize =
-    4 + 4 + 8 + 4 + 8 + 8 + 4 + 1 + 4 + 16 + 8 + 8 + 2 + 4 + 1;
+    4 + 4 + 8 + 4 + 8 + 8 + 4 + 1 + 8 + 8 + 2 + 4 + 1;
 const STORAGE_RPC_MIN_STREAM_UPLOAD_SEGMENT_RECORD_LEN: usize =
     4 + SESSION_ID_LEN + 4 + 8 + 8 + 8 + 4 + 16 + 8 + 4 + 8 + 2;
 const STORAGE_RPC_MIN_STREAM_UPLOAD_RECORD_LEN: usize =
     4 + SESSION_ID_LEN + 4 + 4 + 1 + 1 + 8 + 1 + 1;
 const STORAGE_RPC_MIN_MULTIPART_PART_RECORD_LEN: usize =
-    4 + UPLOAD_ID_LEN + 4 + 4 + 8 + 8 + 4 + 1 + 16 + 8 + 8 + 2 + 8 + 1;
+    4 + UPLOAD_ID_LEN + 4 + 4 + 8 + 8 + 4 + 1 + 8 + 8 + 2 + 8 + 1;
 const STORAGE_RPC_MIN_MULTIPART_PART_SEGMENT_RECORD_LEN: usize =
     4 + 4 + 4 + UPLOAD_ID_LEN + 8 + 4 + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 8 + 2;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN: usize =
@@ -13849,7 +13848,7 @@ impl<'a> StorageRpcDecoder<'a> {
     fn read_multipart_reclaim_record(
         &mut self,
     ) -> Result<MultipartReclaimRecord, StorageRpcPayloadError> {
-        const MIN_PART_LEN: usize = 1 + 4;
+        const MIN_PART_LEN: usize = 4;
         const MIN_SEGMENT_LEN: usize = 4 + 4 + 16 + 8 + 4 + 2;
 
         let bucket = self.read_bucket_name()?;
@@ -13862,42 +13861,25 @@ impl<'a> StorageRpcDecoder<'a> {
         )?;
         let mut parts = Vec::new();
         for _ in 0..part_count {
-            parts.push(match self.read_u8()? {
-                0 => MultipartReclaimPartRecord::ShardSet {
-                    part_number: self.read_u32()?,
-                    part_okh: self.read_fixed_16_bytes("multipart reclaim part OKH")?,
-                    part_vid: self.read_generation_id()?,
+            let part_number = self.read_u32()?;
+            let segment_count = self.read_bounded_remaining_count(
+                MIN_SEGMENT_LEN,
+                "multipart reclaim segment count exceeds payload",
+            )?;
+            let mut segments = Vec::new();
+            for _ in 0..segment_count {
+                segments.push(MultipartReclaimPartSegmentRecord {
+                    part_number,
+                    segment_index: self.read_u32()?,
+                    segment_okh: self.read_fixed_16_bytes("multipart reclaim segment OKH")?,
+                    segment_vid: self.read_generation_id()?,
                     data_pg_id: self.read_u32()?,
                     ec: self.read_ec_shape()?,
-                },
-                1 => {
-                    let part_number = self.read_u32()?;
-                    let segment_count = self.read_bounded_remaining_count(
-                        MIN_SEGMENT_LEN,
-                        "multipart reclaim segment count exceeds payload",
-                    )?;
-                    let mut segments = Vec::new();
-                    for _ in 0..segment_count {
-                        segments.push(MultipartReclaimPartSegmentRecord {
-                            part_number,
-                            segment_index: self.read_u32()?,
-                            segment_okh: self
-                                .read_fixed_16_bytes("multipart reclaim segment OKH")?,
-                            segment_vid: self.read_generation_id()?,
-                            data_pg_id: self.read_u32()?,
-                            ec: self.read_ec_shape()?,
-                        });
-                    }
-                    MultipartReclaimPartRecord::Segments {
-                        part_number,
-                        segments,
-                    }
-                }
-                _ => {
-                    return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
-                        "invalid multipart reclaim part tag",
-                    ));
-                }
+                });
+            }
+            parts.push(MultipartReclaimPartRecord {
+                part_number,
+                segments,
             });
         }
         Ok(MultipartReclaimRecord {
@@ -14803,7 +14785,6 @@ impl<'a> StorageRpcDecoder<'a> {
             etag_kind: EtagKind::from_u8(self.read_u8()?).ok_or(
                 StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid etag kind"),
             )?,
-            part_okh: self.read_fixed_16_bytes("multipart part OKH")?,
             part_vid: self.read_generation_id()?,
             placement_cluster_epoch: self.read_cluster_epoch()?,
             ec_k: self.read_u8()?,
@@ -14991,7 +14972,6 @@ impl<'a> StorageRpcDecoder<'a> {
             etag_kind: EtagKind::from_u8(self.read_u8()?).ok_or(
                 StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid etag kind"),
             )?,
-            part_okh: self.read_fixed_16_bytes("object part OKH")?,
             part_vid: self.read_generation_id()?,
             placement_cluster_epoch: self.read_cluster_epoch()?,
             ec_k: self.read_u8()?,
@@ -15500,21 +15480,7 @@ impl<'a> StorageRpcDecoder<'a> {
                     ec: self.read_ec_shape()?,
                 },
             )),
-            1 => Ok(ShardScavengerPayloadReference::RoutedMultipartPart(
-                ShardScavengerRoutedMultipartPartReference {
-                    bucket: self.read_bucket_name()?,
-                    key: self.read_object_key()?,
-                    object_generation_id: self.read_generation_id()?,
-                    part_number: self.read_u32()?,
-                    stored_size: self.read_u64()?,
-                    crc64: self.read_u64()?,
-                    part_okh: self.read_16_bytes()?,
-                    part_vid: self.read_generation_id()?,
-                    placement_cluster_epoch: self.read_cluster_epoch()?,
-                    ec: self.read_ec_shape()?,
-                },
-            )),
-            2 => Ok(ShardScavengerPayloadReference::ReclaimOnly(
+            1 => Ok(ShardScavengerPayloadReference::ReclaimOnly(
                 ShardScavengerReclaimShardSetReference {
                     data_pg_id: self.read_u32()?,
                     okh: self.read_16_bytes()?,
@@ -16250,36 +16216,14 @@ fn put_multipart_reclaim_record(out: &mut Vec<u8>, reclaim: &MultipartReclaimRec
     put_u64(out, reclaim.created_at);
     put_u32(out, reclaim.parts.len() as u32);
     for part in &reclaim.parts {
-        match part {
-            MultipartReclaimPartRecord::ShardSet {
-                part_number,
-                part_okh,
-                part_vid,
-                data_pg_id,
-                ec,
-            } => {
-                put_u8(out, 0);
-                put_u32(out, *part_number);
-                put_bytes(out, part_okh);
-                put_u64(out, part_vid.get());
-                put_u32(out, *data_pg_id);
-                put_ec_shape(out, *ec);
-            }
-            MultipartReclaimPartRecord::Segments {
-                part_number,
-                segments,
-            } => {
-                put_u8(out, 1);
-                put_u32(out, *part_number);
-                put_u32(out, segments.len() as u32);
-                for segment in segments {
-                    put_u32(out, segment.segment_index);
-                    put_bytes(out, &segment.segment_okh);
-                    put_u64(out, segment.segment_vid.get());
-                    put_u32(out, segment.data_pg_id);
-                    put_ec_shape(out, segment.ec);
-                }
-            }
+        put_u32(out, part.part_number);
+        put_u32(out, part.segments.len() as u32);
+        for segment in &part.segments {
+            put_u32(out, segment.segment_index);
+            put_bytes(out, &segment.segment_okh);
+            put_u64(out, segment.segment_vid.get());
+            put_u32(out, segment.data_pg_id);
+            put_ec_shape(out, segment.ec);
         }
     }
 }
@@ -16741,7 +16685,6 @@ fn put_multipart_part_record(out: &mut Vec<u8>, part: &MultipartPartRecord) {
     put_u64(out, part.payload_crc64);
     put_bytes(out, &part.etag);
     put_u8(out, part.etag_kind as u8);
-    put_bytes(out, &part.part_okh);
     put_u64(out, part.part_vid.get());
     put_u64(out, part.placement_cluster_epoch.get());
     put_u8(out, part.ec_k);
@@ -17038,7 +16981,6 @@ fn put_object_part_record(out: &mut Vec<u8>, part: &ObjectPartRecord) {
     put_u64(out, part.payload_crc64);
     put_bytes(out, &part.etag);
     put_u8(out, part.etag_kind as u8);
-    put_bytes(out, &part.part_okh);
     put_u64(out, part.part_vid.get());
     put_u64(out, part.placement_cluster_epoch.get());
     put_u8(out, part.ec_k);
@@ -17262,21 +17204,8 @@ fn put_scavenger_payload_reference(out: &mut Vec<u8>, reference: &ShardScavenger
             put_u64(out, reference.crc64);
             put_ec_shape(out, reference.ec);
         }
-        ShardScavengerPayloadReference::RoutedMultipartPart(reference) => {
-            put_u8(out, 1);
-            put_string(out, reference.bucket.as_str());
-            put_string(out, reference.key.as_str());
-            put_u64(out, reference.object_generation_id.get());
-            put_u32(out, reference.part_number);
-            put_u64(out, reference.stored_size);
-            put_u64(out, reference.crc64);
-            out.extend_from_slice(&reference.part_okh);
-            put_u64(out, reference.part_vid.get());
-            put_u64(out, reference.placement_cluster_epoch.get());
-            put_ec_shape(out, reference.ec);
-        }
         ShardScavengerPayloadReference::ReclaimOnly(reference) => {
-            put_u8(out, 2);
+            put_u8(out, 1);
             put_u32(out, reference.data_pg_id);
             out.extend_from_slice(&reference.okh);
             put_u64(out, reference.generation_id.get());
@@ -17520,7 +17449,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&6u16.to_le_bytes());
+        expected.extend_from_slice(&7u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -17531,15 +17460,15 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_rejects_version_five_fixture() {
+    fn storage_rpc_frame_rejects_version_six_fixture() {
         let mut bytes =
             encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
         let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&5_u16.to_le_bytes());
+        bytes[version_offset..version_offset + 2].copy_from_slice(&6_u16.to_le_bytes());
 
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnsupportedVersion(5))
+            Err(StorageRpcFrameError::UnsupportedVersion(6))
         );
     }
 
@@ -17633,7 +17562,7 @@ mod tests {
             ),
             (
                 STORAGE_RPC_MIN_OBJECT_PART_RECORD_LEN,
-                4 + 4 + 8 + 4 + 8 + 8 + 4 + 1 + 4 + 16 + 8 + 2 + 4 + 1,
+                4 + 4 + 8 + 4 + 8 + 8 + 4 + 1 + 8 + 2 + 4 + 1,
                 "object part count exceeds payload",
             ),
             (
@@ -17643,7 +17572,7 @@ mod tests {
             ),
             (
                 STORAGE_RPC_MIN_MULTIPART_PART_RECORD_LEN,
-                4 + UPLOAD_ID_LEN + 4 + 4 + 8 + 8 + 4 + 1 + 16 + 8 + 2 + 8 + 1,
+                4 + UPLOAD_ID_LEN + 4 + 4 + 8 + 8 + 4 + 1 + 8 + 2 + 8 + 1,
                 "multipart part count exceeds payload",
             ),
             (
@@ -18252,7 +18181,7 @@ mod tests {
             applied_log_index: 7,
             applied_log_hash: 0x1234,
             state_digest: 0x5678,
-            canonical_state_encoding_version: 3,
+            canonical_state_encoding_version: METADATA_CANONICAL_STATE_ENCODING_VERSION,
             table_digests: vec![MetadataCheckpointTableDigest {
                 table_name: "buckets".to_string(),
                 row_count: 1,
@@ -18313,27 +18242,29 @@ mod tests {
 
         assert_eq!(decoded, request.checkpoint);
 
-        let mut version_two_request = request.clone();
-        version_two_request
+        let mut previous_version_request = request.clone();
+        previous_version_request
             .checkpoint
-            .canonical_state_encoding_version = 2;
+            .canonical_state_encoding_version = 3;
         let bytes =
-            encode_metadata_command_transfer_checkpoint_base_request(&version_two_request).unwrap();
+            encode_metadata_command_transfer_checkpoint_base_request(&previous_version_request)
+                .unwrap();
         assert_eq!(
             decode_metadata_command_transfer_checkpoint_base_request(&bytes),
             Err(
                 StorageRpcPayloadError::UnsupportedMetadataCanonicalStateEncodingVersion {
-                    actual: 2,
+                    actual: 3,
                 }
             )
         );
         let bytes =
-            encode_metadata_command_checkpoint_payload(&version_two_request.checkpoint).unwrap();
+            encode_metadata_command_checkpoint_payload(&previous_version_request.checkpoint)
+                .unwrap();
         assert_eq!(
             decode_metadata_command_checkpoint_payload(&bytes),
             Err(
                 StorageRpcPayloadError::UnsupportedMetadataCanonicalStateEncodingVersion {
-                    actual: 2,
+                    actual: 3,
                 }
             )
         );
@@ -19524,20 +19455,6 @@ mod tests {
                 generation_id: GenerationId::new(10).unwrap(),
                 ec: EcShape { k: 2, m: 1 },
             }),
-            ShardScavengerPayloadReference::RoutedMultipartPart(
-                ShardScavengerRoutedMultipartPartReference {
-                    bucket: crate::tests::bucket_name("scavenger-codec-bucket"),
-                    key: crate::tests::object_key("scavenger-codec-key"),
-                    object_generation_id: GenerationId::new(6).unwrap(),
-                    part_number: 7,
-                    stored_size: 8192,
-                    crc64: 0xCAFE,
-                    part_okh: [8; 16],
-                    part_vid: GenerationId::new(9).unwrap(),
-                    placement_cluster_epoch: ClusterEpoch::new(12).unwrap(),
-                    ec: EcShape { k: 4, m: 2 },
-                },
-            ),
         ];
         assert_eq!(
             decode_scavenger_payload_references_response(
@@ -21559,7 +21476,6 @@ mod tests {
             payload_crc64: 99,
             etag: vec![8; 16],
             etag_kind: EtagKind::MultipartComposite,
-            part_okh: [3; 16],
             part_vid: GenerationId::new(11).unwrap(),
             placement_cluster_epoch: ClusterEpoch::new(10).unwrap(),
             ec_k: 4,

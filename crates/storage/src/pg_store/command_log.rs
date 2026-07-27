@@ -4,7 +4,7 @@ use crate::storage_rpc::{
     decode_metadata_command_checkpoint_payload, encode_metadata_command_checkpoint_payload,
 };
 
-pub(crate) const METADATA_CANONICAL_STATE_ENCODING_VERSION: u8 = 3;
+pub(crate) const METADATA_CANONICAL_STATE_ENCODING_VERSION: u8 = 4;
 const METADATA_CANONICAL_PG_STATE_DOMAIN: &[u8] = b"argmin.metadata.pg-state";
 const METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION: u8 = 1;
 const METADATA_COMMAND_CHECKPOINT_DOMAIN: &[u8] = b"argmin.metadata.command-checkpoint";
@@ -421,7 +421,6 @@ pub(super) const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "payload_crc64",
             "etag",
             "etag_kind",
-            "part_okh",
             "part_vid",
             "placement_cluster_epoch",
             "ec_k",
@@ -457,18 +456,7 @@ pub(super) const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
     },
     MetadataDigestTable {
         name: "multipart_reclaim_parts",
-        columns: &[
-            "bucket",
-            "key",
-            "generation_id",
-            "part_number",
-            "storage_kind",
-            "part_okh",
-            "part_vid",
-            "data_pg_id",
-            "ec_k",
-            "ec_m",
-        ],
+        columns: &["bucket", "key", "generation_id", "part_number"],
         order_columns: &["bucket", "key", "generation_id", "part_number"],
         filter: MetadataDigestFilter::AllRows,
     },
@@ -551,7 +539,6 @@ pub(super) const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "payload_crc64",
             "etag",
             "etag_kind",
-            "part_okh",
             "part_vid",
             "placement_cluster_epoch",
             "ec_k",

@@ -1,6 +1,5 @@
 use super::test_helpers::{self, UploadPartRequest};
 use super::test_support::*;
-use super::test_topology::*;
 use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
 use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
@@ -1684,7 +1683,6 @@ fn upload_part_first_upload() {
     assert_eq!(part.part_number, 1);
     assert_eq!(part.generation, 0);
     assert_eq!(part.size, 11); // "hello world".len()
-    assert_eq!(part.part_okh, [0u8; 16]);
     assert_eq!(part.part_vid, GenerationId::MIN);
 
     let segments = coord
@@ -2431,7 +2429,16 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
         .unwrap();
 
     let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part")]);
-    let result = coord
+    let segments_to_reclaim = coord
+        .storage_node()
+        .test_get_all_multipart_part_segments_for_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &upload_id,
+        )
+        .unwrap();
+    assert!(!segments_to_reclaim.is_empty());
+    coord
         .complete_multipart_upload(&CompleteMultipartUploadRequest {
             upload: multipart_object_request_with_expected_owner(
                 "bucket",
@@ -2451,26 +2458,15 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
         })
         .unwrap();
 
-    let (generation_id, parts_to_reclaim) = {
-        let generation_id = match coord
-            .storage_node()
-            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-            .unwrap()
-        {
-            StoredObject::Live(record) => record.generation_id,
-            other @ StoredObject::DeleteMarker(_) => {
-                panic!("expected live multipart object, got {other:?}")
-            }
-        };
-        let parts = coord
-            .storage_node()
-            .test_get_object_parts(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                result.version_id,
-            )
-            .unwrap();
-        (generation_id, parts)
+    let generation_id = match coord
+        .storage_node()
+        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+        .unwrap()
+    {
+        StoredObject::Live(record) => record.generation_id,
+        other @ StoredObject::DeleteMarker(_) => {
+            panic!("expected live multipart object, got {other:?}")
+        }
     };
 
     coord
@@ -2485,15 +2481,15 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
         .unwrap();
 
     reclaim_object_payload(&coord, "bucket", "key", generation_id);
-    for part in parts_to_reclaim {
+    for segment in segments_to_reclaim {
         assert_shard_set_deleted(
             &coord,
-            part.data_pg_id,
-            &part.part_okh,
-            part.part_vid,
+            segment.data_pg_id,
+            &segment.segment_okh,
+            segment.segment_vid,
             EcShape {
-                k: part.ec_k,
-                m: part.ec_m,
+                k: segment.ec_k,
+                m: segment.ec_m,
             },
         );
     }
@@ -3147,7 +3143,7 @@ fn complete_multipart_upload_rejects_non_in_progress_upload() {
 }
 
 #[test]
-fn abort_multipart_upload_reclaims_uploaded_and_streamed_part_shards() {
+fn abort_multipart_upload_reclaims_part_shards() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     coord
@@ -3209,23 +3205,6 @@ fn abort_multipart_upload_reclaims_uploaded_and_streamed_part_shards() {
         })
         .unwrap();
 
-    let uploaded_part = coord
-        .storage_node()
-        .test_get_multipart_part(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            &create.upload_id,
-            1,
-        )
-        .unwrap();
-    let upload_record = coord
-        .storage_node()
-        .test_get_multipart_upload(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            &create.upload_id,
-        )
-        .unwrap();
     let streamed_segments = coord
         .storage_node()
         .test_get_all_multipart_part_segments_for_upload(
@@ -3260,22 +3239,6 @@ fn abort_multipart_upload_reclaims_uploaded_and_streamed_part_shards() {
         ))
         .unwrap();
 
-    assert_shard_set_deleted(
-        &coord,
-        multipart_part_data_pg_id(
-            &coord,
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            upload_record.object_generation_id,
-            uploaded_part.part_number,
-        ),
-        &uploaded_part.part_okh,
-        uploaded_part.part_vid,
-        EcShape {
-            k: uploaded_part.ec_k,
-            m: uploaded_part.ec_m,
-        },
-    );
     for segment in streamed_segments {
         assert_shard_set_deleted(
             &coord,

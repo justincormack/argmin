@@ -1997,7 +1997,6 @@ fn test_multipart_part(upload_id: UploadId, part_number: u32) -> MultipartPartRe
         payload_crc64: 0x5678 + u64::from(part_number),
         etag: format!("part-{part_number}").into_bytes(),
         etag_kind: EtagKind::Crc64,
-        part_okh: [part_number as u8; 16],
         part_vid: GenerationId::new(u64::from(part_number) + 10).unwrap(),
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 2,
@@ -2022,7 +2021,6 @@ fn test_object_part(
         payload_crc64: 0xabcd + u64::from(part_number),
         etag: format!("object-part-{part_number}").into_bytes(),
         etag_kind: EtagKind::Crc64,
-        part_okh: [part_number as u8; 16],
         part_vid: GenerationId::new(u64::from(part_number) + 30).unwrap(),
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 2,
@@ -2555,12 +2553,9 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                     key: trusted_object_key("object"),
                     generation_id: GenerationId::new(5).unwrap(),
                     created_at: 51,
-                    parts: vec![MultipartReclaimPartRecord::ShardSet {
+                    parts: vec![MultipartReclaimPartRecord {
                         part_number: 1,
-                        part_okh: [4; 16],
-                        part_vid: GenerationId::new(6).unwrap(),
-                        data_pg_id: 1,
-                        ec: EcShape { k: 2, m: 1 },
+                        segments: Vec::new(),
                     }],
                 },
             )
@@ -2675,7 +2670,6 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
             let bucket = trusted_bucket_name("commit-fail-part-segments");
             let key = trusted_object_key("object");
             let part = MultipartPartRecord {
-                part_okh: [0; 16],
                 ..test_multipart_part(upload_id.clone(), 1)
             };
             let segments = vec![test_multipart_part_segment(bucket, key, upload_id, 1, 0)];
@@ -4165,16 +4159,19 @@ fn metadata_command_checkpoint_exports_checked_table_digest_summary() {
     assert_eq!(checkpoint.applied_log_index, state.applied_log_index);
     assert_eq!(checkpoint.applied_log_hash, state.applied_log_hash);
     assert_eq!(checkpoint.state_digest, state.state_digest);
-    assert_eq!(checkpoint.canonical_state_encoding_version, 3);
+    assert_eq!(
+        checkpoint.canonical_state_encoding_version,
+        METADATA_CANONICAL_STATE_ENCODING_VERSION
+    );
     assert_eq!(checkpoint.table_digests.len(), METADATA_DIGEST_TABLES.len());
     assert_eq!(checkpoint.table_blocks.len(), METADATA_DIGEST_TABLES.len());
     assert_ne!(checkpoint.checkpoint_crc64, 0);
     checkpoint.verify().unwrap();
-    let mut version_two_checkpoint = checkpoint.clone();
-    version_two_checkpoint.canonical_state_encoding_version = 2;
+    let mut previous_version_checkpoint = checkpoint.clone();
+    previous_version_checkpoint.canonical_state_encoding_version = 3;
     assert_eq!(
-        version_two_checkpoint.verify(),
-        Err(MetadataCommandCheckpointValidationError::UnsupportedStateEncoding { actual: 2 })
+        previous_version_checkpoint.verify(),
+        Err(MetadataCommandCheckpointValidationError::UnsupportedStateEncoding { actual: 3 })
     );
     assert_eq!(
         checkpoint
@@ -4357,53 +4354,31 @@ fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_co
         .execute(
             "INSERT INTO object_parts \
              (bucket, key, version_id, part_number, object_offset_start, size, payload_crc64, \
-              etag, etag_kind, part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id) \
-             VALUES (?1, ?2, 1, 1, 0, 2048, ?3, ?4, 0, ?5, 11, ?6, 4, 2, 7)",
+              etag, etag_kind, part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id) \
+             VALUES (?1, ?2, 1, 1, 0, 2048, ?3, ?4, 0, 11, ?5, 4, 2, 7)",
             rusqlite::params![
                 "history-floor-bucket",
                 "multipart-object",
                 0x5678_i64,
                 [0x22_u8; 16].as_slice(),
-                [0x33_u8; 16].as_slice(),
                 4_i64,
-             ],
-        )
-        .unwrap();
-
-    let multipart_upload_id = "u".repeat(128);
-    store
-        .connection()
-        .execute(
-            "INSERT INTO multipart_uploads \
-             (upload_id, bucket, key, initiated_at, state, metadata_blob, system_metadata_blob, \
-              owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id, \
-              acl_grants, public_read, object_generation_id, object_lock_legal_hold, encryption_type) \
-             VALUES (?1, ?2, ?3, 10, 0, ?4, ?5, ?6, ?7, ?8, ?9, '', 0, 22, 0, 0)",
-            rusqlite::params![
-                multipart_upload_id,
-                "history-floor-bucket",
-                "direct-multipart-object",
-                b"".as_slice(),
-                b"".as_slice(),
-                "owner",
-                "c".repeat(32),
-                "owner",
-                "c".repeat(32),
             ],
         )
         .unwrap();
     store
         .connection()
         .execute(
-            "INSERT INTO multipart_parts \
-             (upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, \
-              part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified) \
-             VALUES (?1, 2, 0, 4096, ?2, ?3, 0, ?4, 12, 5, 4, 2, 11)",
+            "INSERT INTO multipart_part_segments \
+             (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, \
+              segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+             VALUES (?1, ?2, ?3, 1, 1, 0, 2048, ?4, ?5, 11, 7, ?6, 4, 2)",
             rusqlite::params![
+                "history-floor-bucket",
+                "multipart-object",
                 "u".repeat(128),
-                0x9abc_i64,
-                b"etag".as_slice(),
-                [0x44_u8; 16].as_slice(),
+                0x5678_i64,
+                [0x22_u8; 16].as_slice(),
+                4_i64,
             ],
         )
         .unwrap();
@@ -4490,14 +4465,6 @@ fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_co
     );
 
     let topology = PgTopology::new(&[7, 8, 9]).unwrap();
-    let routed_multipart_pg = topology
-        .object_generation_multipart_part_data_pg(
-            &trusted_bucket_name("history-floor-bucket"),
-            &trusted_object_key("direct-multipart-object"),
-            GenerationId::new(22).unwrap(),
-            2,
-        )
-        .get();
     let references = store
         .cluster_map_history_route_references(&topology)
         .unwrap();
@@ -4531,11 +4498,6 @@ fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_co
             PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
             ClusterEpoch::new(1).unwrap(),
             PgId::new(7),
-        ),
-        PgClusterMapHistoryRouteReference::new(
-            PgClusterMapHistoryRouteReferenceKind::LivePlacement,
-            ClusterEpoch::new(5).unwrap(),
-            PgId::new(routed_multipart_pg),
         ),
     ];
     expected.sort_unstable();
@@ -6232,15 +6194,14 @@ fn metadata_state_digest_covers_multipart_upload_and_part_state() {
     assert_metadata_state_digest_covers_mutation(
         |store| {
             let upload_id = UploadId::new("p".repeat(UPLOAD_ID_LEN)).unwrap();
-            let okh = [4_u8; 16];
             insert_digest_multipart_upload(store, &upload_id);
             store
                 .conn
                 .execute(
                     "INSERT INTO multipart_parts \
-                     (upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, part_okh, \
+                     (upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, \
                       part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         upload_id.as_str(),
                         1_i64,
@@ -6249,7 +6210,6 @@ fn metadata_state_digest_covers_multipart_upload_and_part_state() {
                         0x1234_i64,
                         b"etag".as_slice(),
                         EtagKind::Crc64 as u8,
-                        okh.as_slice(),
                         1_i64,
                         1_i64,
                         4_i64,
@@ -6661,7 +6621,6 @@ fn metadata_state_digest_covers_reclaim_and_reservation_state() {
         |store| {
             let bucket = trusted_bucket_name("digest-bucket");
             let key = trusted_object_key("object");
-            let okh = [7_u8; 16];
             let segment_okh = [8_u8; 16];
             store
                 .conn
@@ -6675,21 +6634,9 @@ fn metadata_state_digest_covers_reclaim_and_reservation_state() {
                 .conn
                 .execute(
                     "INSERT INTO multipart_reclaim_parts \
-                     (bucket, key, generation_id, part_number, storage_kind, part_okh, \
-                      part_vid, data_pg_id, ec_k, ec_m) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    params![
-                        bucket.as_str(),
-                        key.as_str(),
-                        1_i64,
-                        1_i64,
-                        0_i64,
-                        okh.as_slice(),
-                        1_i64,
-                        1_i64,
-                        4_i64,
-                        2_i64,
-                    ],
+                     (bucket, key, generation_id, part_number) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![bucket.as_str(), key.as_str(), 1_i64, 1_i64,],
                 )
                 .unwrap();
             store
@@ -6732,7 +6679,6 @@ fn metadata_state_digest_covers_reclaim_and_reservation_state() {
         |store| {
             let bucket = trusted_bucket_name("digest-bucket");
             let key = trusted_object_key("object");
-            let okh = [9_u8; 16];
             store
                 .conn
                 .execute(
@@ -6745,21 +6691,9 @@ fn metadata_state_digest_covers_reclaim_and_reservation_state() {
                 .conn
                 .execute(
                     "INSERT INTO multipart_reclaim_parts \
-                     (bucket, key, generation_id, part_number, storage_kind, part_okh, \
-                      part_vid, data_pg_id, ec_k, ec_m) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    params![
-                        bucket.as_str(),
-                        key.as_str(),
-                        2_i64,
-                        1_i64,
-                        0_i64,
-                        okh.as_slice(),
-                        1_i64,
-                        1_i64,
-                        4_i64,
-                        2_i64,
-                    ],
+                     (bucket, key, generation_id, part_number) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![bucket.as_str(), key.as_str(), 2_i64, 1_i64,],
                 )
                 .unwrap();
         },
@@ -6769,9 +6703,9 @@ fn metadata_state_digest_covers_reclaim_and_reservation_state() {
             store
                 .conn
                 .execute(
-                    "UPDATE multipart_reclaim_parts SET ec_m = ?1 \
+                    "UPDATE multipart_reclaim_parts SET part_number = ?1 \
                      WHERE bucket = ?2 AND key = ?3 AND generation_id = ?4",
-                    params![3_i64, bucket.as_str(), key.as_str(), 2_i64],
+                    params![2_i64, bucket.as_str(), key.as_str(), 2_i64],
                 )
                 .unwrap();
         },

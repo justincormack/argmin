@@ -121,7 +121,7 @@ pub use pg_store::{
 pub use pg_topology::PgTopology;
 pub use placement::NodeId;
 pub use shard_key_hash::{
-    direct_put_segment_key_hash, multipart_part_segment_key_hash, object_key_hash, part_key_hash,
+    direct_put_segment_key_hash, multipart_part_segment_key_hash, object_key_hash,
     segment_key_hash, stream_segment_key_hash,
 };
 pub use storage_rpc::StorageRpcErrorCode;
@@ -166,17 +166,17 @@ pub use types::{
     ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource, ManagedEncryptionAlgorithm,
     MultipartChecksumConfig, MultipartCompletionFingerprint, MultipartCompletionPreflight,
     MultipartCompletionReplay, MultipartCompletionSnapshot, MultipartObjectIdentity,
-    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartKind,
-    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-    MultipartUploadIdKey, MultipartUploadListMarker, MultipartUploadManagementLookup,
-    MultipartUploadRecord, ObjectEncryption, ObjectEncryptionDecodeError, ObjectEncryptionType,
-    ObjectEtag, ObjectKey, ObjectKeyError, ObjectLayout, ObjectLockDefaultRetention,
-    ObjectLockMode, ObjectLockState, ObjectPartRangeRecord, ObjectPartRecord,
-    ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
-    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode,
-    ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, ObjectState, OwnerIdentity, PayloadReclaimRoot, PgId,
-    PgState, PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
+    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadIdKey,
+    MultipartUploadListMarker, MultipartUploadManagementLookup, MultipartUploadRecord,
+    ObjectEncryption, ObjectEncryptionDecodeError, ObjectEncryptionType, ObjectEtag, ObjectKey,
+    ObjectKeyError, ObjectLayout, ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState,
+    ObjectPartRangeRecord, ObjectPartRecord, ObjectPayloadReclaimClaimRecord,
+    ObjectPayloadReclaimKind, ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity,
+    ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention,
+    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
+    ObjectState, OwnerIdentity, PayloadReclaimRoot, PgId, PgState,
+    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
     PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
     PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
     PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,

@@ -755,15 +755,13 @@ Phase 4 implementation notes:
    - multipart manifest, staged-part, object-part, and reclaim rows now refer to
      placed payload files; the metadata-primary shard rows are only the Phase 4
      ack bridge
-   - multipart reads route direct part shard sets and streamed part segments
-     through placed shard IO
+   - multipart reads route committed part segments through placed shard IO
    - abort, reupload replacement cleanup, and completion cleanup for omitted
      streamed parts delete placed shard files and metadata-primary bridge rows
      best-effort
-   - there is no separate direct UploadPart request path at this point; the
-     public/test UploadPart helper already uses begin, append, and finalize
-     streaming calls, while the direct multipart shard-set metadata shape is
-     ready if that path is introduced later
+   - there is no separate direct UploadPart request path; the public/test
+     UploadPart helper uses begin, append, and finalize streaming calls, and the
+     obsolete direct multipart shard-set metadata shape has been removed
    - sparse topology tests keep explicit PG sets such as `[0, 2, 5]`
    - placement and shard IO tests use one PG unless the test checks
      PG-dependent placement
@@ -7939,14 +7937,13 @@ PG backfill and migration design notes:
   This is still not a per-segment placement vector: scanners and backfill
   workers must reconstruct locations from data PG, EC shape, stable shard
   identity, the recorded epoch hint, and retained cluster-map history. Streamed
-  multipart parts still use their `multipart_part_segments` rows as placement
-  truth; the zero-sentinel multipart part row only carries a valid epoch for
-  command replay and uniform metadata shape. Scanner/candidate integration can
-  now consume direct part rows and segmented rows through the same historical
-  placement reconstruction model.
+  multipart parts use their `multipart_part_segments` rows as the sole payload
+  placement truth; the obsolete direct-part layout and its zero sentinel have
+  been removed. Scanner/candidate integration consumes those segment rows
+  through the historical placement reconstruction model.
 - Integrated shard-scavenger live-reference output with durable backfill
   candidate production. Scavenger payload references now carry the placement
-  epoch for placed segment rows and routed multipart parts, and local
+  epoch for placed segment rows, and local
   reference accounting reconstructs historical placement from that epoch rather
   than treating all live payload as current-route payload. The opportunistic
   shard-scavenger sweep now deduplicates live references by segment identity
@@ -10897,11 +10894,10 @@ Required production shape and implementation order:
    redesign is implemented.
    The storage-owned source boundary now also computes a canonical bounded set
    of typed `(kind, epoch, data/metadata PG)` route references instead of
-   discarding identity into minima. Direct object/segment rows use their
-   persisted data PG; legacy direct multipart parts are resolved from their
-   durable bucket/key/generation/part identity through `PgTopology`; durable
-   backfill reports source and desired routes separately; and pending metadata
-   commands report their metadata PG route. Node aggregation and the Unix
+   discarding identity into minima. Object segment and multipart part-segment
+   rows use their persisted data PG; durable backfill reports source and
+   desired routes separately; and pending metadata commands report their
+   metadata PG route. Node aggregation and the Unix
    storage RPC preserve this exact set, deduplicate it deterministically, and
    fail closed above 4,096 references or on non-canonical wire input. The
    existing heartbeat still derives the three scalar minima from this exact

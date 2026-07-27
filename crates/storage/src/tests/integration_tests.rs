@@ -6,6 +6,7 @@ use crate::metadata_command::{
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::*;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 fn test_owner() -> OwnerIdentity {
     OwnerIdentity::from_principal("owner")
@@ -232,99 +233,160 @@ fn pg_store_persistence() {
 
 // ── 1. Multipart upload lifecycle ──────────────────────────────────────
 
-/// Full multipart flow: create upload → upsert parts with shards →
-/// commit_object_parts → complete_multipart_commit → read back everything.
+/// Full multipart flow: create upload → write placed segment shards → upsert
+/// segmented parts → complete multipart commit → read through a retained
+/// full-payload snapshot.
 #[test]
 fn multipart_upload_lifecycle() {
     let dir = test_util::tempdir();
-    let pg_dir = dir.path().join("pg-0000");
-    let store = crate::PgStore::open(&pg_dir, 0).unwrap();
+    let node_ids = [
+        crate::NodeId::new(0),
+        crate::NodeId::new(1),
+        crate::NodeId::new(2),
+        crate::NodeId::new(3),
+        crate::NodeId::new(4),
+        crate::NodeId::new(5),
+    ];
+    let ec = EcShape { k: 4, m: 2 };
+    let map = Arc::new(crate::LocalClusterMap::open(dir.path(), &node_ids, &[0], ec).unwrap());
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let metadata_node = Arc::clone(map.node(crate::NodeId::new(0)).unwrap().test_node());
+    let bucket = bucket_name("bucket");
+    let key = object_key("k");
+    let upload_id = multipart_upload_id("mpu-1");
 
-    store
-        .create_bucket(
-            &bucket_name("bucket"),
-            "owner",
-            &CanonicalUserId::from_principal("owner"),
-            &AclGrants::default(),
-            false,
-            false,
-        )
-        .unwrap();
+    {
+        let store = metadata_node.get_pg(0).unwrap();
+        store
+            .create_bucket(
+                &bucket,
+                "owner",
+                &CanonicalUserId::from_principal("owner"),
+                &AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
 
-    // Create multipart upload.
-    store
-        .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: multipart_upload_id("mpu-1"),
-            bucket: bucket_name("bucket"),
-            key: object_key("k"),
-            tags: None,
-            metadata_blob: vec![].into(),
-            system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: test_owner(),
+        // Create multipart upload.
+        store
+            .create_multipart_upload(&CreateMultipartUploadReq {
+                upload_id: upload_id.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                tags: None,
+                metadata_blob: vec![].into(),
+                system_metadata_blob: SerializedSystemMetadataBlob::default(),
+                initiator: test_owner(),
 
-            owner: test_owner(),
-            acl_grants: AclGrants::default(),
-            public_read: false,
-            object_lock: ObjectLockState::default(),
-            checksum: None,
-            encryption: ObjectEncryption::None,
-        })
-        .unwrap();
+                owner: test_owner(),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                object_lock: ObjectLockState::default(),
+                checksum: None,
+                encryption: ObjectEncryption::None,
+            })
+            .unwrap();
+    }
 
-    // Write shard data for two parts.
+    // Write the two parts through the placed EC payload path and persist the
+    // corresponding staging segment descriptors.
     let part1_data = b"part-one-data-here";
     let part2_data = b"part-two-data-here";
+    let mut committed_parts = Vec::new();
+    for (part_number, data, segment_okh, segment_vid) in [
+        (1, part1_data.as_slice(), [0x11; 16], GenerationId::MIN),
+        (
+            2,
+            part2_data.as_slice(),
+            [0x22; 16],
+            GenerationId::new(2).unwrap(),
+        ),
+    ] {
+        let segment_crc64 = checksum::crc64::checksum(data);
+        let segment = MultipartPartSegmentRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+            version_id: MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
+            part_number,
+            segment_index: 0,
+            size: data.len() as u64,
+            segment_crc64,
+            segment_okh,
+            segment_vid,
+            data_pg_id: 0,
+            placement_cluster_epoch: ClusterEpoch::INITIAL,
+            ec_k: ec.k,
+            ec_m: ec.m,
+        };
+        let written = cluster
+            .write_stream_segment_payload_shards(
+                &StreamUploadSegmentRecord {
+                    session_id: stream_session_id(format!("mpu-part-{part_number}")),
+                    segment_index: 0,
+                    size: data.len() as u64,
+                    segment_crc64,
+                    payload_crc64: segment_crc64,
+                    segment_okh,
+                    segment_vid,
+                    data_pg_id: 0,
+                    placement_cluster_epoch: ClusterEpoch::INITIAL,
+                    ec_k: ec.k,
+                    ec_m: ec.m,
+                },
+                data,
+            )
+            .unwrap();
+        assert_eq!(written.len(), usize::from(ec.k + ec.m));
+        cluster
+            .test_register_payload_shard_acks(0, &written)
+            .unwrap();
 
-    let hash1 = [0x11u8; 16];
-    let shard_key1 = ShardKey::new(&hash1, 1, 0);
-    let ack1 = store.write_shard(&shard_key1, part1_data).unwrap();
-
-    let hash2 = [0x22u8; 16];
-    let shard_key2 = ShardKey::new(&hash2, 1, 0);
-    let ack2 = store.write_shard(&shard_key2, part2_data).unwrap();
-
-    // Upsert parts.
-    store
-        .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: multipart_upload_id("mpu-1"),
-            part_number: 1,
+        let part = MultipartPartRecord {
+            upload_id: upload_id.clone(),
+            part_number,
             generation: 0,
-            size: part1_data.len() as u64,
-            payload_crc64: 0,
-            etag: ack1.crc64.to_be_bytes().to_vec(),
+            size: data.len() as u64,
+            payload_crc64: segment_crc64,
+            etag: segment_crc64.to_be_bytes().to_vec(),
             etag_kind: EtagKind::Crc64,
-            part_okh: hash1,
             part_vid: GenerationId::MIN,
             placement_cluster_epoch: ClusterEpoch::INITIAL,
-            ec_k: 4,
-            ec_m: 2,
+            ec_k: ec.k,
+            ec_m: ec.m,
             last_modified: 0,
             checksum: None,
-        })
-        .unwrap();
-    store
-        .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: multipart_upload_id("mpu-1"),
-            part_number: 2,
-            generation: 0,
-            size: part2_data.len() as u64,
-            payload_crc64: 0,
-            etag: ack2.crc64.to_be_bytes().to_vec(),
-            etag_kind: EtagKind::Crc64,
-            part_okh: hash2,
-            part_vid: GenerationId::MIN,
-            placement_cluster_epoch: ClusterEpoch::INITIAL,
-            ec_k: 4,
-            ec_m: 2,
-            last_modified: 0,
+        };
+        metadata_node
+            .get_pg(0)
+            .unwrap()
+            .upsert_multipart_part_segments(&part, &[segment])
+            .unwrap();
+        committed_parts.push(ObjectPartRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            part_number,
+            size: part.size,
+            payload_crc64: part.payload_crc64,
+            etag: part.etag,
+            etag_kind: part.etag_kind,
+            part_vid: part.part_vid,
+            placement_cluster_epoch: part.placement_cluster_epoch,
+            ec_k: part.ec_k,
+            ec_m: part.ec_m,
+            data_pg_id: 0,
             checksum: None,
-        })
-        .unwrap();
+        });
+    }
 
     // Verify parts are listed.
-    let parts = store
+    let parts = metadata_node
+        .get_pg(0)
+        .unwrap()
         .list_multipart_parts(&ListPartsReq {
-            upload_id: multipart_upload_id("mpu-1"),
+            upload_id: upload_id.clone(),
             part_number_marker: None,
             max_parts: 10,
         })
@@ -334,8 +396,8 @@ fn multipart_upload_lifecycle() {
     // Complete multipart: commit object + parts.
     let total_size = (part1_data.len() + part2_data.len()) as u64;
     let obj = CommitMultipartReq {
-        bucket: bucket_name("bucket"),
-        key: object_key("k"),
+        bucket: bucket.clone(),
+        key: key.clone(),
         version_id: VersionId::Null,
         owner: test_owner(),
         acl_grants: AclGrants::default(),
@@ -343,77 +405,74 @@ fn multipart_upload_lifecycle() {
         generation_id: GenerationId::MIN,
         size: total_size,
         etag_crc64: [0xCC, 0, 0, 0, 0, 0, 0, 0],
-        ec: EcShape { k: 4, m: 2 },
+        ec,
         tags: None,
         metadata_blob: Some(vec![].into()),
         system_metadata_blob: None,
         object_lock: ObjectLockState::default(),
         encryption: ObjectEncryption::None,
     };
-    let committed_parts = vec![
-        ObjectPartRecord {
-            bucket: bucket_name("bucket"),
-            key: object_key("k"),
-            version_id: VersionId::Null,
-            part_number: 1,
-            size: part1_data.len() as u64,
-            payload_crc64: 0,
-            etag: ack1.crc64.to_be_bytes().to_vec(),
-            etag_kind: EtagKind::Crc64,
-            part_okh: hash1,
-            part_vid: GenerationId::MIN,
-            placement_cluster_epoch: ClusterEpoch::INITIAL,
-            ec_k: 4,
-            ec_m: 2,
-            data_pg_id: 0,
-            checksum: None,
-        },
-        ObjectPartRecord {
-            bucket: bucket_name("bucket"),
-            key: object_key("k"),
-            version_id: VersionId::Null,
-            part_number: 2,
-            size: part2_data.len() as u64,
-            payload_crc64: 0,
-            etag: ack2.crc64.to_be_bytes().to_vec(),
-            etag_kind: EtagKind::Crc64,
-            part_okh: hash2,
-            part_vid: GenerationId::MIN,
-            placement_cluster_epoch: ClusterEpoch::INITIAL,
-            ec_k: 4,
-            ec_m: 2,
-            data_pg_id: 0,
-            checksum: None,
-        },
-    ];
+    {
+        let store = metadata_node.get_pg(0).unwrap();
+        store
+            .set_upload_state(&upload_id, UploadState::Completing)
+            .unwrap();
+        store
+            .complete_multipart_commit(&upload_id, &obj, &committed_parts)
+            .unwrap();
+    }
 
-    store
-        .set_upload_state(&multipart_upload_id("mpu-1"), UploadState::Completing)
+    // Load and retain the same full-payload snapshot consumed by normal object
+    // reads, then reconstruct each part through its committed segment rows.
+    let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission
+        .active_object_read_route(
+            &bucket,
+            &key,
+            None,
+            ObjectReadSnapshotMode::FullPayloadLayout,
+        )
         .unwrap();
-    store
-        .complete_multipart_commit(&multipart_upload_id("mpu-1"), &obj, &committed_parts)
+    let outcome = route
+        .load_leased_object_read_snapshot_if(|_| Ok::<_, ()>(()))
+        .unwrap()
         .unwrap();
-
-    // Read back the committed object.
-    let read_obj = store
-        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
-        .unwrap();
-    let live = read_obj.as_live().unwrap();
+    let live = outcome.snapshot().stored.as_live().unwrap();
     assert_eq!(live.size, total_size);
-
-    // Read back committed parts.
-    let read_parts = store
-        .get_object_parts(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
-        .unwrap();
-    assert_eq!(read_parts.len(), 2);
-    assert_eq!(read_parts[0].part_number, 1);
-    assert_eq!(read_parts[1].part_number, 2);
-
-    // Verify shards are still readable.
-    let r1 = store.read_shard(&shard_key1).unwrap();
-    assert_eq!(r1.data, part1_data);
-    let r2 = store.read_shard(&shard_key2).unwrap();
-    assert_eq!(r2.data, part2_data);
+    assert_eq!(outcome.snapshot().multipart_parts.len(), 2);
+    let mut segments = outcome.snapshot().multipart_part_segments.clone();
+    assert_eq!(segments.len(), 2);
+    segments.sort_by_key(|segment| (segment.part_number, segment.segment_index));
+    let (_, _, leased_snapshot) = outcome.into_parts();
+    let retained = route
+        .retain_object_payload_read(leased_snapshot)
+        .unwrap()
+        .expect("multipart object should retain payload authority");
+    let mut read_payload = Vec::new();
+    for segment in segments {
+        let part_number = segment.part_number;
+        let mut segment_payload = Vec::new();
+        retained
+            .read_segment_payload_stored_bytes_into(
+                segment.placement_cluster_epoch,
+                SegmentStoredBytesRequest {
+                    data_pg_id: segment.data_pg_id,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    stored_size: segment.size as usize,
+                    segment_crc64: segment.segment_crc64,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                },
+                &mut segment_payload,
+            )
+            .unwrap_or_else(|error| panic!("read multipart part {part_number}: {error:?}"));
+        read_payload.extend_from_slice(&segment_payload);
+    }
+    assert_eq!(read_payload, [part1_data.as_slice(), part2_data].concat());
 }
 
 // ── 2. Streaming UploadPart lifecycle ──────────────────────────────────
@@ -512,7 +571,6 @@ fn streaming_upload_part_lifecycle() {
                 payload_crc64: 0,
                 etag: ack.crc64.to_be_bytes().to_vec(),
                 etag_kind: EtagKind::Crc64,
-                part_okh: [0u8; 16], // zero sentinel for segmented parts
                 part_vid: GenerationId::MIN,
                 placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,
@@ -945,7 +1003,6 @@ fn multipart_abort_cleanup() {
         payload_crc64: 0,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
-        part_okh: [0u8; 16], // zero sentinel for segmented parts
         part_vid: GenerationId::MIN,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
@@ -1233,7 +1290,6 @@ fn persistence_complex_state_through_reopen() {
                 payload_crc64: 0,
                 etag: vec![0xBB],
                 etag_kind: EtagKind::Crc64,
-                part_okh: [0xFF; 16],
                 part_vid: GenerationId::MIN,
                 placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,

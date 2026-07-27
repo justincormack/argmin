@@ -1816,7 +1816,6 @@ fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
                 payload_crc64,
                 etag: vec![0x55; 8],
                 etag_kind: crate::EtagKind::Crc64,
-                part_okh: [0u8; 16],
                 part_vid: crate::GenerationId::new(u64::from(generation) + 1).unwrap(),
                 placement_cluster_epoch: segment.placement_cluster_epoch,
                 ec_k: segment.ec_k,

@@ -1023,7 +1023,7 @@ fn multipart_abort_partial_apply_retry_cleans_uploaded_part_payload() {
         b"uploaded part payload",
     );
     let data_pg_id = uploaded_segment.data_pg_id;
-    let part_okh = uploaded_segment.segment_okh;
+    let segment_okh = uploaded_segment.segment_okh;
     let part_vid = uploaded_segment.segment_vid;
 
     let _serial = lock_metadata_command_apply_hook_test();
@@ -1087,7 +1087,13 @@ fn multipart_abort_partial_apply_retry_cleans_uploaded_part_payload() {
     }
     for shard_index in 0..ec_shape.k + ec_shape.m {
         assert!(cluster
-            .test_payload_shard_file_exists(data_pg_id, ec_shape, &part_okh, part_vid, shard_index)
+            .test_payload_shard_file_exists(
+                data_pg_id,
+                ec_shape,
+                &segment_okh,
+                part_vid,
+                shard_index
+            )
             .unwrap());
     }
 
@@ -1109,7 +1115,7 @@ fn multipart_abort_partial_apply_retry_cleans_uploaded_part_payload() {
                 .test_payload_shard_file_exists(
                     data_pg_id,
                     ec_shape,
-                    &part_okh,
+                    &segment_okh,
                     part_vid,
                     shard_index as u8
                 )
@@ -1188,7 +1194,7 @@ fn multipart_abort_committed_response_loss_retry_sees_terminal_abort() {
         b"uploaded part payload for committed abort retry",
     );
     let data_pg_id = uploaded_segment.data_pg_id;
-    let part_okh = uploaded_segment.segment_okh;
+    let segment_okh = uploaded_segment.segment_okh;
     let part_vid = uploaded_segment.segment_vid;
 
     let _serial = lock_metadata_command_apply_hook_test();
@@ -1229,7 +1235,7 @@ fn multipart_abort_committed_response_loss_retry_sees_terminal_abort() {
                 .test_payload_shard_file_exists(
                     data_pg_id,
                     ec_shape,
-                    &part_okh,
+                    &segment_okh,
                     part_vid,
                     shard_index as u8
                 )
@@ -2430,7 +2436,6 @@ fn multipart_abort_pending_install_conflict_cleans_committed_stream_part() {
                 payload_crc64,
                 etag: vec![0x3b; 8],
                 etag_kind: crate::EtagKind::Crc64,
-                part_okh: [0u8; 16],
                 part_vid: crate::GenerationId::MIN,
                 placement_cluster_epoch: staging_segments[0].placement_cluster_epoch,
                 ec_k: staging_segments[0].ec_k,
@@ -3593,7 +3598,7 @@ fn lifecycle_multipart_abort_uses_command_and_cleans_uploaded_part_payload() {
         b"lifecycle uploaded part payload",
     );
     let data_pg_id = uploaded_segment.data_pg_id;
-    let part_okh = uploaded_segment.segment_okh;
+    let segment_okh = uploaded_segment.segment_okh;
     let part_vid = uploaded_segment.segment_vid;
 
     let aborted = cluster
@@ -3626,7 +3631,7 @@ fn lifecycle_multipart_abort_uses_command_and_cleans_uploaded_part_payload() {
                 .test_payload_shard_file_exists(
                     data_pg_id,
                     ec_shape,
-                    &part_okh,
+                    &segment_okh,
                     part_vid,
                     shard_index as u8
                 )

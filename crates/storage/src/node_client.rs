@@ -446,7 +446,6 @@ pub(crate) fn complete_multipart_expected_object_parts(
             payload_crc64: part.payload_crc64,
             etag: part.etag.clone(),
             etag_kind: part.etag_kind,
-            part_okh: part.part_okh,
             part_vid: part.part_vid,
             placement_cluster_epoch: part.placement_cluster_epoch,
             ec_k: part.ec_k,
@@ -1079,15 +1078,13 @@ fn snapshot_live_object_payload_reclaim_command(
             let parts = PgMetadataStore::get_object_parts(pg, bucket, key, record.version_id)?;
             let mut streaming_segments = Vec::new();
             for part in &parts {
-                if part.part_okh == [0u8; 16] {
-                    streaming_segments.extend(PgMetadataStore::get_multipart_part_segments(
-                        pg,
-                        bucket,
-                        key,
-                        record.version_id,
-                        part.part_number,
-                    )?);
-                }
+                streaming_segments.extend(PgMetadataStore::get_multipart_part_segments(
+                    pg,
+                    bucket,
+                    key,
+                    record.version_id,
+                    part.part_number,
+                )?);
             }
             Ok(ObjectPayloadReclaimCommand::Multipart(
                 MultipartReclaimRecord::from_object_parts(

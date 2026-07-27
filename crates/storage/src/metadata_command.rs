@@ -25,7 +25,7 @@ use crate::types::{
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
-const METADATA_COMMAND_ENCODING_VERSION: u16 = 4;
+const METADATA_COMMAND_ENCODING_VERSION: u16 = 5;
 const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
 const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 const METADATA_COMMAND_CREATE_BUCKET: u16 = 1;
@@ -1019,7 +1019,6 @@ impl CommitMultipartObjectCommand {
                         && stored.size == requested.size
                         && stored.etag == requested.etag
                         && stored.etag_kind == requested.etag_kind
-                        && stored.part_okh == requested.part_okh
                         && stored.part_vid == requested.part_vid
                         && stored.ec_k == requested.ec_k
                         && stored.ec_m == requested.ec_m
@@ -2522,7 +2521,6 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u64()?;
         self.read_bytes()?;
         self.read_valid_u8("etag kind", 0..=1)?;
-        self.read_bytes()?;
         self.read_nonzero_u64("object part VID")?;
         self.read_cluster_epoch("object part placement epoch")?;
         self.read_u8()?;
@@ -2542,7 +2540,6 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             etag: self.read_bytes()?.to_vec(),
             etag_kind: EtagKind::from_u8(self.read_u8()?)
                 .ok_or_else(|| "invalid etag kind".to_string())?,
-            part_okh: self.read_fixed_bytes("object part OKH")?,
             part_vid: self.read_generation_id("object part VID")?,
             placement_cluster_epoch: self.read_cluster_epoch("object part placement epoch")?,
             ec_k: self.read_u8()?,
@@ -2560,7 +2557,6 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u64()?;
         self.read_bytes()?;
         self.read_valid_u8("etag kind", 0..=1)?;
-        self.read_bytes()?;
         self.read_nonzero_u64("multipart part VID")?;
         self.read_cluster_epoch("multipart part placement epoch")?;
         self.read_u8()?;
@@ -2579,7 +2575,6 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             etag: self.read_bytes()?.to_vec(),
             etag_kind: EtagKind::from_u8(self.read_u8()?)
                 .ok_or_else(|| "invalid etag kind".to_string())?,
-            part_okh: self.read_fixed_bytes("multipart part OKH")?,
             part_vid: self.read_generation_id("multipart part VID")?,
             placement_cluster_epoch: self.read_cluster_epoch("multipart part placement epoch")?,
             ec_k: self.read_u8()?,
@@ -2933,30 +2928,18 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_str()?;
         self.read_nonzero_u64("multipart reclaim generation")?;
         self.read_u64()?;
-        self.skip_repeated(|decoder| match decoder.read_u8()? {
-            1 => {
+        self.skip_repeated(|decoder| {
+            decoder.read_u32()?;
+            decoder.skip_repeated(|decoder| {
+                decoder.read_u32()?;
                 decoder.read_u32()?;
                 decoder.read_bytes()?;
-                decoder.read_nonzero_u64("multipart reclaim part VID")?;
+                decoder.read_nonzero_u64("multipart reclaim segment VID")?;
                 decoder.read_u32()?;
                 decoder.read_u8()?;
                 decoder.read_u8()?;
                 Ok(())
-            }
-            2 => {
-                decoder.read_u32()?;
-                decoder.skip_repeated(|decoder| {
-                    decoder.read_u32()?;
-                    decoder.read_u32()?;
-                    decoder.read_bytes()?;
-                    decoder.read_nonzero_u64("multipart reclaim segment VID")?;
-                    decoder.read_u32()?;
-                    decoder.read_u8()?;
-                    decoder.read_u8()?;
-                    Ok(())
-                })
-            }
-            tag => Err(format!("invalid multipart reclaim part tag {tag}")),
+            })
         })
     }
 
@@ -2966,15 +2949,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             key: self.read_object_key()?,
             generation_id: self.read_generation_id("multipart reclaim generation")?,
             created_at: self.read_u64()?,
-            parts: self.read_repeated(|decoder| match decoder.read_u8()? {
-                1 => Ok(MultipartReclaimPartRecord::ShardSet {
-                    part_number: decoder.read_u32()?,
-                    part_okh: decoder.read_fixed_bytes("multipart reclaim part OKH")?,
-                    part_vid: decoder.read_generation_id("multipart reclaim part VID")?,
-                    data_pg_id: decoder.read_u32()?,
-                    ec: decoder.read_ec_shape()?,
-                }),
-                2 => Ok(MultipartReclaimPartRecord::Segments {
+            parts: self.read_repeated(|decoder| {
+                Ok(MultipartReclaimPartRecord {
                     part_number: decoder.read_u32()?,
                     segments: decoder.read_repeated(|decoder| {
                         Ok(MultipartReclaimPartSegmentRecord {
@@ -2988,8 +2964,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                             ec: decoder.read_ec_shape()?,
                         })
                     })?,
-                }),
-                tag => Err(format!("invalid multipart reclaim part tag {tag}")),
+                })
             })?,
         })
     }
@@ -3893,7 +3868,6 @@ fn encode_object_part(out: &mut Vec<u8>, part: &ObjectPartRecord) {
     put_u64(out, part.payload_crc64);
     put_bytes(out, &part.etag);
     put_u8(out, part.etag_kind as u8);
-    put_bytes(out, &part.part_okh);
     put_u64(out, part.part_vid.get());
     put_u64(out, part.placement_cluster_epoch.get());
     put_u8(out, part.ec_k);
@@ -3913,7 +3887,6 @@ fn encode_multipart_part(out: &mut Vec<u8>, part: &MultipartPartRecord) {
     put_u64(out, part.payload_crc64);
     put_bytes(out, &part.etag);
     put_u8(out, part.etag_kind as u8);
-    put_bytes(out, &part.part_okh);
     put_u64(out, part.part_vid.get());
     put_u64(out, part.placement_cluster_epoch.get());
     put_u8(out, part.ec_k);
@@ -3993,39 +3966,16 @@ fn encode_multipart_reclaim(out: &mut Vec<u8>, reclaim: &MultipartReclaimRecord)
     put_u64(out, reclaim.created_at);
     put_u32(out, reclaim.parts.len() as u32);
     for part in &reclaim.parts {
-        match part {
-            MultipartReclaimPartRecord::ShardSet {
-                part_number,
-                part_okh,
-                part_vid,
-                data_pg_id,
-                ec,
-            } => {
-                put_u8(out, 1);
-                put_u32(out, *part_number);
-                put_bytes(out, part_okh);
-                put_u64(out, part_vid.get());
-                put_u32(out, *data_pg_id);
-                put_u8(out, ec.k);
-                put_u8(out, ec.m);
-            }
-            MultipartReclaimPartRecord::Segments {
-                part_number,
-                segments,
-            } => {
-                put_u8(out, 2);
-                put_u32(out, *part_number);
-                put_u32(out, segments.len() as u32);
-                for segment in segments {
-                    put_u32(out, segment.part_number);
-                    put_u32(out, segment.segment_index);
-                    put_bytes(out, &segment.segment_okh);
-                    put_u64(out, segment.segment_vid.get());
-                    put_u32(out, segment.data_pg_id);
-                    put_u8(out, segment.ec.k);
-                    put_u8(out, segment.ec.m);
-                }
-            }
+        put_u32(out, part.part_number);
+        put_u32(out, part.segments.len() as u32);
+        for segment in &part.segments {
+            put_u32(out, segment.part_number);
+            put_u32(out, segment.segment_index);
+            put_bytes(out, &segment.segment_okh);
+            put_u64(out, segment.segment_vid.get());
+            put_u32(out, segment.data_pg_id);
+            put_u8(out, segment.ec.k);
+            put_u8(out, segment.ec.m);
         }
     }
 }
@@ -4872,7 +4822,7 @@ mod tests {
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
-        assert_eq!(envelope.checksum_crc64(), 0xd1a22a0be38facfd);
+        assert_eq!(envelope.checksum_crc64(), 0x5c18d46d1b44c1b8);
     }
 
     #[test]
@@ -4913,14 +4863,14 @@ mod tests {
 
         let mut old_version = envelope.command_bytes();
         let version_offset = 4 + METADATA_COMMAND_MAGIC.len();
-        old_version[version_offset..version_offset + 2].copy_from_slice(&3_u16.to_le_bytes());
+        old_version[version_offset..version_offset + 2].copy_from_slice(&4_u16.to_le_bytes());
         assert_eq!(
             decode_metadata_command_envelope(&old_version),
-            Err("unsupported metadata command encoding version 3".to_string())
+            Err("unsupported metadata command encoding version 4".to_string())
         );
         assert_eq!(
             decode_metadata_command_log_entry_header(&old_version),
-            Err("unsupported metadata command encoding version 3".to_string())
+            Err("unsupported metadata command encoding version 4".to_string())
         );
 
         let mut applied_with_trailing_bytes = envelope.command_bytes();
@@ -4972,7 +4922,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x7909c3cbd7e48aee);
+        assert_eq!(envelope.checksum_crc64(), 0xf4b33dad2f2fe7ab);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5000,7 +4950,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xa11f229e60cc45de);
+        assert_eq!(envelope.checksum_crc64(), 0x2ca5dcf89807289b);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5065,7 +5015,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x8766b489ba43b242);
+        assert_eq!(envelope.checksum_crc64(), 0x0adc4aef4288df07);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5146,13 +5096,13 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0xdcbba49b1f6edab2,
-                0x669237fa05b26184,
-                0xc26a15efa8011034,
-                0x19fdfda93e9026c1,
-                0x3ea2c7f8cb1f8eb2,
-                0x3d668f26077ad62b,
-                0x55f6c77c55699749,
+                0x8f6560ed5eb81fe8,
+                0x6b8641242aa0618b,
+                0xa4932ef1f7aa0365,
+                0x782688518a72ff35,
+                0x5f79b2007ffd5746,
+                0xb0dc7140ffb1bb6e,
+                0x342db284e18b4ebd,
             ]
         );
     }
@@ -5228,14 +5178,14 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0xf99a23e7c7dbf1c1,
-                0x8d385918b38eb90d,
-                0x5f714340121e9bea,
-                0xd1a325f80a439cc2,
-                0x1ecce4060d9f9c01,
-                0x426484b6ce8f555c,
-                0xbebf29527ff5742e,
-                0xbc0219392333aaa2,
+                0x2e4f6ebfe974d377,
+                0xbc9268439216fef5,
+                0x82e64761ce767a9b,
+                0xe00914a32bdbdb3a,
+                0xe3469668f851fda5,
+                0x73ceb5edef1712a4,
+                0x47130a2c52ed262c,
+                0x8da8286202abed5a,
             ]
         );
     }
@@ -5320,7 +5270,6 @@ mod tests {
             payload_crc64: 99,
             etag: vec![4; 8],
             etag_kind: crate::types::EtagKind::Crc64,
-            part_okh: [0; 16],
             part_vid: generation_id,
             placement_cluster_epoch: ClusterEpoch::new(10).unwrap(),
             ec_k: 2,
@@ -5374,7 +5323,6 @@ mod tests {
             payload_crc64: 99,
             etag: vec![4; 8],
             etag_kind: crate::types::EtagKind::Crc64,
-            part_okh: [0; 16],
             part_vid: generation_id,
             placement_cluster_epoch: ClusterEpoch::new(11).unwrap(),
             ec_k: 2,
@@ -5437,7 +5385,7 @@ mod tests {
             key: key.clone(),
             generation_id,
             created_at: 333,
-            parts: vec![MultipartReclaimPartRecord::Segments {
+            parts: vec![MultipartReclaimPartRecord {
                 part_number: 1,
                 segments: vec![MultipartReclaimPartSegmentRecord {
                     part_number: 1,
@@ -5818,36 +5766,36 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0xe6e9702e798439d7,
-                0x2b473262c236c93c,
-                0xb1a4c18f99321674,
-                0xd0ac1dee93867277,
-                0x9cc3f0ab4b6567b0,
-                0x9e548d67965d9412,
-                0x8bf3eb212f25c644,
-                0xa20752aaa6934862,
-                0x01db3c4fc9f3f0e0,
-                0xde6097cf102c5bc7,
-                0x355c40debbaeab86,
-                0x5b00fefb00b15186,
-                0x5dd34bf2a7b009ee,
-                0x13be8ab4ceb534f9,
-                0x701320a932b2ee85,
-                0x0bbc901316940e04,
-                0xb0aae20d8a032766,
-                0x928ca850986716fc,
-                0x10ed5a7db79ade46,
-                0x6701cd8445cfe8e3,
-                0x94fdcd9d6617eb8c,
-                0x6957ed2f4f7ef220,
-                0xf0eca11e9ad7f739,
-                0x57bea7e100ee87af,
-                0x2b7ea60c11738900,
-                0xb1ec8810700ac401,
-                0xceb57ea44698d642,
-                0x2f8dc0173b130399,
-                0x6b42c8e45ba2c4fc,
-                0x11f512cc986933c0,
+                0xc14b590a90ce111e,
+                0xde23c28766ddf2c5,
+                0x750e5efbd834e68d,
+                0xb7d35dfaa3070526,
+                0x21d3f25a6e3b9063,
+                0x43ed610ff4c32339,
+                0x91eb7f48ebd52269,
+                0x058f24b811d059a2,
+                0xe08a2efdb0590890,
+                0xa264c0be34b003c1,
+                0x4064ab351da5ec23,
+                0x3a91a3f997d103e7,
+                0x7f7289dfb1e4f15f,
+                0xe5b35e4b9f7c4107,
+                0xd6f465d9206340d3,
+                0xfdb144ec475d7bfa,
+                0x20f184c613eb69d4,
+                0x8ccbd75a7a73b309,
+                0x8ac901084f1d05f6,
+                0xb7b3e1f199758867,
+                0x81ab01dd33c13239,
+                0x51a1b4869d63136a,
+                0xd0c7bd9974fc9c90,
+                0x6593ee7f4757cef9,
+                0x00d8b7771aff75c4,
+                0xd31016e32f5ab5f3,
+                0x8b19b1d4d3975f49,
+                0xd98014e86ada7667,
+                0x76e336df3825e159,
+                0x48bda65fdac5a190,
             ]
         );
     }

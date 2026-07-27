@@ -2043,7 +2043,6 @@ fn mpu_part_checksum_round_trip() {
             payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
-            part_okh: [1u8; 16],
             part_vid: GenerationId::MIN,
             placement_cluster_epoch: ClusterEpoch::new(13).unwrap(),
             ec_k: 4,
@@ -2069,7 +2068,6 @@ fn mpu_part_checksum_round_trip() {
             payload_crc64: 0,
             etag: vec![0xBB],
             etag_kind: EtagKind::Crc64,
-            part_okh: [2u8; 16],
             part_vid: GenerationId::new(1).unwrap(),
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
@@ -2101,7 +2099,6 @@ fn mpu_object_part_checksum_round_trip() {
                 payload_crc64: 0,
                 etag: vec![0xAA],
                 etag_kind: EtagKind::Crc64,
-                part_okh: [1u8; 16],
                 part_vid: GenerationId::MIN,
                 placement_cluster_epoch: ClusterEpoch::new(14).unwrap(),
                 ec_k: 4,
@@ -2118,7 +2115,6 @@ fn mpu_object_part_checksum_round_trip() {
                 payload_crc64: 0,
                 etag: vec![0xBB],
                 etag_kind: EtagKind::Crc64,
-                part_okh: [2u8; 16],
                 part_vid: GenerationId::new(1).unwrap(),
                 placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,
@@ -2205,7 +2201,6 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
-            part_okh: [1u8; 16],
             part_vid: GenerationId::MIN,
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
@@ -2222,7 +2217,6 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             payload_crc64: 0,
             etag: vec![0xBB],
             etag_kind: EtagKind::Crc64,
-            part_okh: [2u8; 16],
             part_vid: GenerationId::new(1).unwrap(),
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
@@ -2357,7 +2351,6 @@ fn mpu_delete_upload_cascades_parts() {
             payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
-            part_okh: [1u8; 16],
             part_vid: GenerationId::MIN,
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
@@ -2430,7 +2423,6 @@ fn mpu_upsert_part_and_get() {
             payload_crc64: 0,
             etag: vec![0xBB],
             etag_kind: EtagKind::Crc64,
-            part_okh: [2u8; 16],
             part_vid: GenerationId::MIN,
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
@@ -2448,7 +2440,6 @@ fn mpu_upsert_part_and_get() {
     assert_eq!(part.generation, 0);
     assert_eq!(part.size, 5 * 1024 * 1024);
     assert_eq!(part.etag, vec![0xBB]);
-    assert_eq!(part.part_okh, [2u8; 16]);
 
     // Re-upload same part: returns previous generation
     let prev = store
@@ -2460,7 +2451,6 @@ fn mpu_upsert_part_and_get() {
             payload_crc64: 0,
             etag: vec![0xCC],
             etag_kind: EtagKind::Crc64,
-            part_okh: [3u8; 16],
             part_vid: GenerationId::new(1).unwrap(),
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
@@ -2512,7 +2502,6 @@ fn mpu_list_parts_pagination() {
                 payload_crc64: 0,
                 etag: vec![i as u8],
                 etag_kind: EtagKind::Crc64,
-                part_okh: [i as u8; 16],
                 part_vid: GenerationId::MIN,
                 placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,
@@ -2855,115 +2844,6 @@ fn mpu_list_uploads_stale_marker_advances_across_cluster_epochs() {
 }
 
 #[test]
-fn mpu_corrupted_part_okh_returns_error() {
-    let (_dir, store) = make_pg_store();
-    store
-        .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: multipart_upload_id("uid-okh"),
-            bucket: bucket_name("bucket"),
-            key: object_key("k"),
-            tags: None,
-            metadata_blob: vec![].into(),
-            system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: test_owner(),
-
-            owner: test_owner(),
-            acl_grants: AclGrants::default(),
-            public_read: false,
-            object_lock: ObjectLockState::default(),
-            checksum: None,
-            encryption: ObjectEncryption::None,
-        })
-        .unwrap();
-
-    // Insert a part with valid okh
-    store
-        .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: multipart_upload_id("uid-okh"),
-            part_number: 1,
-            generation: 0,
-            size: 1024,
-            payload_crc64: 0,
-            etag: vec![0xAA],
-            etag_kind: EtagKind::Crc64,
-            part_okh: [1u8; 16],
-            part_vid: GenerationId::MIN,
-            placement_cluster_epoch: ClusterEpoch::INITIAL,
-            ec_k: 4,
-            ec_m: 2,
-            last_modified: 0,
-            checksum: None,
-        })
-        .unwrap();
-
-    // Corrupt the part_okh via raw SQL (wrong length blob)
-    store
-        .connection()
-        .execute(
-            "UPDATE multipart_parts SET part_okh = X'AABB' \
-             WHERE upload_id = ?1 AND part_number = 1",
-            [multipart_upload_id("uid-okh").into_string()],
-        )
-        .unwrap();
-
-    // Reading should fail, not silently zero the okh
-    let err = store
-        .get_multipart_part(&multipart_upload_id("uid-okh"), 1)
-        .unwrap_err();
-    assert!(
-        matches!(err, crate::error::MetadataError::Db { .. }),
-        "expected Db error for corrupted part_okh, got: {err:?}"
-    );
-}
-
-#[test]
-fn mpu_corrupted_object_part_okh_returns_error() {
-    let (_dir, store) = make_pg_store();
-
-    store
-        .commit_object_parts(&[ObjectPartRecord {
-            bucket: bucket_name("bucket"),
-            key: object_key("k"),
-            version_id: VersionId::from_u64(1),
-            part_number: 1,
-            size: 1024,
-            payload_crc64: 0,
-            etag: vec![0xAA],
-            etag_kind: EtagKind::Crc64,
-            part_okh: [1u8; 16],
-            part_vid: GenerationId::MIN,
-            placement_cluster_epoch: ClusterEpoch::INITIAL,
-            ec_k: 4,
-            ec_m: 2,
-            data_pg_id: 0,
-            checksum: None,
-        }])
-        .unwrap();
-
-    // Corrupt the part_okh
-    store
-        .connection()
-        .execute(
-            "UPDATE object_parts SET part_okh = X'AABB' \
-             WHERE bucket = 'bucket' AND key = 'k' AND version_id = 1",
-            [],
-        )
-        .unwrap();
-
-    let err = store
-        .get_object_parts(
-            &bucket_name("bucket"),
-            &object_key("k"),
-            VersionId::from_u64(1),
-        )
-        .unwrap_err();
-    assert!(
-        matches!(err, crate::error::MetadataError::Db { .. }),
-        "expected Db error for corrupted object part_okh, got: {err:?}"
-    );
-}
-
-#[test]
 fn mpu_get_missing_part_returns_part_not_found() {
     let (_dir, store) = make_pg_store();
     store
@@ -3080,7 +2960,6 @@ fn mpu_upsert_part_nonexistent_upload_returns_no_such_upload() {
             payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
-            part_okh: [1u8; 16],
             part_vid: GenerationId::MIN,
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
@@ -3124,7 +3003,6 @@ fn mpu_commit_object_parts_rollback_on_duplicate() {
         payload_crc64: 0,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
-        part_okh: [1u8; 16],
         part_vid: GenerationId::MIN,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
@@ -3170,7 +3048,6 @@ fn mpu_commit_and_get_object_parts() {
             payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
-            part_okh: [1u8; 16],
             part_vid: GenerationId::MIN,
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
@@ -3187,7 +3064,6 @@ fn mpu_commit_and_get_object_parts() {
             payload_crc64: 0,
             etag: vec![0xBB],
             etag_kind: EtagKind::Crc64,
-            part_okh: [2u8; 16],
             part_vid: GenerationId::new(1).unwrap(),
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
@@ -3209,7 +3085,6 @@ fn mpu_commit_and_get_object_parts() {
     assert_eq!(committed.len(), 2);
     assert_eq!(committed[0].part_number, 1);
     assert_eq!(committed[0].size, 5 * 1024 * 1024);
-    assert_eq!(committed[0].part_okh, [1u8; 16]);
     assert_eq!(committed[1].part_number, 2);
     assert_eq!(committed[1].size, 3 * 1024 * 1024);
 
@@ -3239,7 +3114,6 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
             payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
-            part_okh: [1u8; 16],
             part_vid: GenerationId::MIN,
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
@@ -3256,7 +3130,6 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
             payload_crc64: 0,
             etag: vec![0xBB],
             etag_kind: EtagKind::Crc64,
-            part_okh: [2u8; 16],
             part_vid: GenerationId::new(2).unwrap(),
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
@@ -3273,7 +3146,6 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
             payload_crc64: 0,
             etag: vec![0xCC],
             etag_kind: EtagKind::Crc64,
-            part_okh: [3u8; 16],
             part_vid: GenerationId::new(3).unwrap(),
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
@@ -3328,7 +3200,6 @@ fn mpu_delete_object_parts() {
             payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
-            part_okh: [1u8; 16],
             part_vid: GenerationId::MIN,
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
@@ -3398,7 +3269,6 @@ fn make_part(upload_id: &str, part_number: u32, generation: u32) -> MultipartPar
         payload_crc64: 0,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
-        part_okh: [part_number as u8; 16],
         part_vid: GenerationId::new(generation as u64 + 1).unwrap(),
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
@@ -3468,7 +3338,6 @@ fn mpu_commit_partial_batch_failure_rolls_back_all() {
         payload_crc64: 0,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
-        part_okh: [1u8; 16],
         part_vid: GenerationId::MIN,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
@@ -3669,7 +3538,6 @@ fn mpu_commit_object_parts_connection_usable_after_multiple_failures() {
         payload_crc64: 0,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
-        part_okh: [1u8; 16],
         part_vid: GenerationId::MIN,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
@@ -3853,7 +3721,6 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
         payload_crc64: 0,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
-        part_okh: [1u8; 16],
         part_vid: GenerationId::MIN,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
@@ -5457,7 +5324,6 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         payload_crc64: 0,
         etag: vec![1],
         etag_kind: EtagKind::Crc64,
-        part_okh: [0u8; 16],
         part_vid: GenerationId::MIN,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
@@ -5505,7 +5371,6 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         .get_multipart_part(&multipart_upload_id("mpu-1"), 1)
         .unwrap();
     assert_eq!(part.generation, 1);
-    assert_eq!(part.part_okh, [0u8; 16]);
 
     let segments = store
         .get_all_multipart_part_segments_for_upload(&multipart_upload_id("mpu-1"))
@@ -5547,7 +5412,6 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
         payload_crc64: 0,
         etag: vec![1],
         etag_kind: EtagKind::Crc64,
-        part_okh: [0xAA; 16],
         part_vid: GenerationId::new(1).unwrap(),
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
@@ -5712,7 +5576,6 @@ fn commit_stream_part_rejects_wrong_upload_id() {
                 payload_crc64: 0,
                 etag: vec![1],
                 etag_kind: EtagKind::Crc64,
-                part_okh: [0xAA; 16],
                 part_vid: GenerationId::new(1).unwrap(),
                 placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,
@@ -5779,7 +5642,6 @@ fn commit_stream_part_zero_segments_clears_prior() {
                 payload_crc64: 0,
                 etag: vec![1],
                 etag_kind: EtagKind::Crc64,
-                part_okh: [0xAA; 16],
                 part_vid: GenerationId::new(1).unwrap(),
                 placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,
@@ -5861,7 +5723,6 @@ fn commit_stream_part_zero_segments_clears_prior() {
                 payload_crc64: 0,
                 etag: vec![2],
                 etag_kind: EtagKind::Crc64,
-                part_okh: [0xBB; 16],
                 part_vid: GenerationId::new(2).unwrap(),
                 placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,
@@ -6050,14 +5911,18 @@ fn multipart_reclaim_round_trip() {
         generation_id,
         created_at: 4321,
         parts: vec![
-            MultipartReclaimPartRecord::ShardSet {
+            MultipartReclaimPartRecord {
                 part_number: 1,
-                part_okh: [0x44; 16],
-                part_vid: GenerationId::new(21).unwrap(),
-                data_pg_id: 3,
-                ec: EcShape { k: 4, m: 2 },
+                segments: vec![MultipartReclaimPartSegmentRecord {
+                    part_number: 1,
+                    segment_index: 0,
+                    segment_okh: [0x44; 16],
+                    segment_vid: GenerationId::new(21).unwrap(),
+                    data_pg_id: 3,
+                    ec: EcShape { k: 4, m: 2 },
+                }],
             },
-            MultipartReclaimPartRecord::Segments {
+            MultipartReclaimPartRecord {
                 part_number: 2,
                 segments: vec![
                     MultipartReclaimPartSegmentRecord {
@@ -6108,12 +5973,9 @@ fn next_generation_id_skips_multipart_reclaim_generation() {
             key: object_key("k"),
             generation_id: GenerationId::new(11).unwrap(),
             created_at: 1,
-            parts: vec![MultipartReclaimPartRecord::ShardSet {
+            parts: vec![MultipartReclaimPartRecord {
                 part_number: 1,
-                part_okh: [0x77; 16],
-                part_vid: GenerationId::new(24).unwrap(),
-                data_pg_id: 0,
-                ec: EcShape { k: 4, m: 2 },
+                segments: Vec::new(),
             }],
         })
         .unwrap();
@@ -6136,12 +5998,9 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
             key: object_key("z"),
             generation_id: GenerationId::new(9).unwrap(),
             created_at: 1,
-            parts: vec![MultipartReclaimPartRecord::ShardSet {
+            parts: vec![MultipartReclaimPartRecord {
                 part_number: 1,
-                part_okh: [0x11; 16],
-                part_vid: GenerationId::new(21).unwrap(),
-                data_pg_id: 0,
-                ec: EcShape { k: 4, m: 2 },
+                segments: Vec::new(),
             }],
         })
         .unwrap();
@@ -6180,12 +6039,9 @@ fn get_payload_reclaim_root_returns_first_pg_root() {
             key: object_key("z"),
             generation_id: GenerationId::new(9).unwrap(),
             created_at: 1,
-            parts: vec![MultipartReclaimPartRecord::ShardSet {
+            parts: vec![MultipartReclaimPartRecord {
                 part_number: 1,
-                part_okh: [0x11; 16],
-                part_vid: GenerationId::new(21).unwrap(),
-                data_pg_id: 0,
-                ec: EcShape { k: 4, m: 2 },
+                segments: Vec::new(),
             }],
         })
         .unwrap();
@@ -6265,12 +6121,9 @@ fn payload_reclaim_exists_checks_segment_and_multipart_reclaims() {
             key: object_key("k"),
             generation_id: multipart_generation,
             created_at: 1,
-            parts: vec![MultipartReclaimPartRecord::ShardSet {
+            parts: vec![MultipartReclaimPartRecord {
                 part_number: 1,
-                part_okh: [0x34; 16],
-                part_vid: GenerationId::new(22).unwrap(),
-                data_pg_id: 0,
-                ec: EcShape { k: 4, m: 2 },
+                segments: Vec::new(),
             }],
         })
         .unwrap();
@@ -6346,7 +6199,6 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
                 payload_crc64: 0,
                 etag: vec![1],
                 etag_kind: EtagKind::Crc64,
-                part_okh: [0xAA; 16],
                 part_vid: GenerationId::new(1).unwrap(),
                 placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,
@@ -6429,7 +6281,6 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
                 payload_crc64: 0,
                 etag: vec![1],
                 etag_kind: EtagKind::Crc64,
-                part_okh: [0xAA; 16],
                 part_vid: GenerationId::new(1).unwrap(),
                 placement_cluster_epoch: ClusterEpoch::INITIAL,
                 ec_k: 4,
@@ -7717,10 +7568,6 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
             payload_crc64: 0,
             etag: vec![0xAA],
             etag_kind: EtagKind::Crc64,
-            part_okh: [
-                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
-                0xEE, 0xFF,
-            ],
             part_vid: GenerationId::MIN,
             placement_cluster_epoch: ClusterEpoch::INITIAL,
             ec_k: 4,
@@ -8247,7 +8094,6 @@ fn complete_multipart_commit_no_such_upload() {
         payload_crc64: 0,
         etag: vec![0xAA],
         etag_kind: EtagKind::Crc64,
-        part_okh: [1u8; 16],
         part_vid: GenerationId::MIN,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
@@ -8577,7 +8423,6 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
         payload_crc64: 0,
         etag: vec![5; 8],
         etag_kind: EtagKind::Crc64,
-        part_okh: [9; 16],
         part_vid: GenerationId::MIN,
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,

@@ -1507,14 +1507,12 @@ impl PgStore {
         }
         let mut streaming_segments = Vec::new();
         for part in &parts {
-            if part.part_okh == [0u8; 16] {
-                streaming_segments.extend(self.get_multipart_part_segments(
-                    &command.object.bucket,
-                    &command.object.key,
-                    command.object.version_id,
-                    part.part_number,
-                )?);
-            }
+            streaming_segments.extend(self.get_multipart_part_segments(
+                &command.object.bucket,
+                &command.object.key,
+                command.object.version_id,
+                part.part_number,
+            )?);
         }
         Ok(streaming_segments == command.selected_streaming_segments)
     }
@@ -2589,12 +2587,6 @@ impl PgStore {
                 source: rusqlite::Error::InvalidQuery,
             });
         }
-        if command.part.part_okh != [0u8; 16] {
-            return Err(MetadataError::Db {
-                context: "commit stream part command non-streamed part",
-                source: rusqlite::Error::InvalidQuery,
-            });
-        }
         let expected_generation = match command.existing_part.as_ref() {
             Some(existing) => {
                 if existing.upload_id != command.upload.upload_id
@@ -2741,8 +2733,8 @@ impl PgStore {
             .execute(
                 "INSERT OR REPLACE INTO multipart_parts \
                  (upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, \
-                  part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     part.upload_id,
                     part.part_number,
@@ -2751,7 +2743,6 @@ impl PgStore {
                     part.payload_crc64 as i64,
                     part.etag,
                     part.etag_kind as u8,
-                    part.part_okh.as_slice(),
                     part.part_vid.get() as i64,
                     part.placement_cluster_epoch.get() as i64,
                     part.ec_k,
@@ -4456,87 +4447,47 @@ impl PgStore {
             })?;
 
         for part in &reclaim.parts {
-            match part {
-                MultipartReclaimPartRecord::ShardSet {
-                    part_number,
-                    part_okh,
-                    part_vid,
-                    data_pg_id,
-                    ec,
-                } => {
-                    self.conn
-                        .execute(
-                            "INSERT OR REPLACE INTO multipart_reclaim_parts \
-                             (bucket, key, generation_id, part_number, storage_kind, part_okh, \
-                              part_vid, data_pg_id, ec_k, ec_m) \
-                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                            params![
-                                reclaim.bucket,
-                                reclaim.key,
-                                reclaim.generation_id.get() as i64,
-                                *part_number as i64,
-                                MultipartReclaimPartKind::ShardSet as u8,
-                                &part_okh[..],
-                                part_vid.get() as i64,
-                                *data_pg_id as i64,
-                                ec.k,
-                                ec.m,
-                            ],
-                        )
-                        .map_err(|e| MetadataError::Db {
-                            context: "put multipart reclaim (part shard set)",
-                            source: e,
-                        })?;
-                }
-                MultipartReclaimPartRecord::Segments {
-                    part_number,
-                    segments,
-                } => {
-                    self.conn
-                        .execute(
-                            "INSERT OR REPLACE INTO multipart_reclaim_parts \
-                             (bucket, key, generation_id, part_number, storage_kind, part_okh, \
-                              part_vid, data_pg_id, ec_k, ec_m) \
-                             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL)",
-                            params![
-                                reclaim.bucket,
-                                reclaim.key,
-                                reclaim.generation_id.get() as i64,
-                                *part_number as i64,
-                                MultipartReclaimPartKind::Segments as u8,
-                            ],
-                        )
-                        .map_err(|e| MetadataError::Db {
-                            context: "put multipart reclaim (part segments)",
-                            source: e,
-                        })?;
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO multipart_reclaim_parts \
+                     (bucket, key, generation_id, part_number) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        reclaim.bucket,
+                        reclaim.key,
+                        reclaim.generation_id.get() as i64,
+                        part.part_number as i64,
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "put multipart reclaim (part)",
+                    source: e,
+                })?;
 
-                    for segment in segments {
-                        self.conn
-                            .execute(
-                                "INSERT OR REPLACE INTO multipart_reclaim_part_segments \
-                                 (bucket, key, generation_id, part_number, segment_index, \
-                                  segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                                params![
-                                    reclaim.bucket,
-                                    reclaim.key,
-                                    reclaim.generation_id.get() as i64,
-                                    segment.part_number as i64,
-                                    segment.segment_index as i64,
-                                    &segment.segment_okh[..],
-                                    segment.segment_vid.get() as i64,
-                                    segment.data_pg_id as i64,
-                                    segment.ec.k,
-                                    segment.ec.m,
-                                ],
-                            )
-                            .map_err(|e| MetadataError::Db {
-                                context: "put multipart reclaim (part segment)",
-                                source: e,
-                            })?;
-                    }
-                }
+            for segment in &part.segments {
+                self.conn
+                    .execute(
+                        "INSERT OR REPLACE INTO multipart_reclaim_part_segments \
+                         (bucket, key, generation_id, part_number, segment_index, \
+                          segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        params![
+                            reclaim.bucket,
+                            reclaim.key,
+                            reclaim.generation_id.get() as i64,
+                            segment.part_number as i64,
+                            segment.segment_index as i64,
+                            &segment.segment_okh[..],
+                            segment.segment_vid.get() as i64,
+                            segment.data_pg_id as i64,
+                            segment.ec.k,
+                            segment.ec.m,
+                        ],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "put multipart reclaim (part segment)",
+                        source: e,
+                    })?;
             }
         }
         Ok(())
@@ -4844,8 +4795,8 @@ impl PgStore {
             .prepare_cached(
                 "INSERT INTO object_parts \
                  (bucket, key, version_id, part_number, object_offset_start, size, payload_crc64, etag, etag_kind, \
-                  part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id, checksum) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )
             .map_err(|e| MetadataError::Db {
                 context: "put explicit multipart object (prepare insert parts)",
@@ -4872,7 +4823,6 @@ impl PgStore {
                 part.payload_crc64 as i64,
                 &part.etag,
                 part.etag_kind as u8,
-                part.part_okh.as_slice(),
                 part.part_vid.get() as i64,
                 part.placement_cluster_epoch.get() as i64,
                 part.ec_k,
@@ -7761,87 +7711,47 @@ impl PgMetadataStore for PgStore {
                 })?;
 
             for part in &reclaim.parts {
-                match part {
-                    MultipartReclaimPartRecord::ShardSet {
-                        part_number,
-                        part_okh,
-                        part_vid,
-                        data_pg_id,
-                        ec,
-                    } => {
-                        self.conn
-                            .execute(
-                                "INSERT OR REPLACE INTO multipart_reclaim_parts \
-                                 (bucket, key, generation_id, part_number, storage_kind, part_okh, \
-                                  part_vid, data_pg_id, ec_k, ec_m) \
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                                params![
-                                    reclaim.bucket,
-                                    reclaim.key,
-                                    reclaim.generation_id.get() as i64,
-                                    *part_number as i64,
-                                    MultipartReclaimPartKind::ShardSet as u8,
-                                    &part_okh[..],
-                                    part_vid.get() as i64,
-                                    *data_pg_id as i64,
-                                    ec.k,
-                                    ec.m,
-                                ],
-                            )
-                            .map_err(|e| MetadataError::Db {
-                                context: "put multipart reclaim (part shard set)",
-                                source: e,
-                            })?;
-                    }
-                    MultipartReclaimPartRecord::Segments {
-                        part_number,
-                        segments,
-                    } => {
-                        self.conn
-                            .execute(
-                                "INSERT OR REPLACE INTO multipart_reclaim_parts \
-                                 (bucket, key, generation_id, part_number, storage_kind, part_okh, \
-                                  part_vid, data_pg_id, ec_k, ec_m) \
-                                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL)",
-                                params![
-                                    reclaim.bucket,
-                                    reclaim.key,
-                                    reclaim.generation_id.get() as i64,
-                                    *part_number as i64,
-                                    MultipartReclaimPartKind::Segments as u8,
-                                ],
-                            )
-                            .map_err(|e| MetadataError::Db {
-                                context: "put multipart reclaim (part segments)",
-                                source: e,
-                            })?;
+                self.conn
+                    .execute(
+                        "INSERT OR REPLACE INTO multipart_reclaim_parts \
+                         (bucket, key, generation_id, part_number) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            reclaim.bucket,
+                            reclaim.key,
+                            reclaim.generation_id.get() as i64,
+                            part.part_number as i64,
+                        ],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "put multipart reclaim (part)",
+                        source: e,
+                    })?;
 
-                        for segment in segments {
-                            self.conn
-                                .execute(
-                                    "INSERT OR REPLACE INTO multipart_reclaim_part_segments \
+                for segment in &part.segments {
+                    self.conn
+                        .execute(
+                            "INSERT OR REPLACE INTO multipart_reclaim_part_segments \
                                      (bucket, key, generation_id, part_number, segment_index, \
                                       segment_okh, segment_vid, data_pg_id, ec_k, ec_m) \
                                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                                    params![
-                                        reclaim.bucket,
-                                        reclaim.key,
-                                        reclaim.generation_id.get() as i64,
-                                        segment.part_number as i64,
-                                        segment.segment_index as i64,
-                                        &segment.segment_okh[..],
-                                        segment.segment_vid.get() as i64,
-                                        segment.data_pg_id as i64,
-                                        segment.ec.k,
-                                        segment.ec.m,
-                                    ],
-                                )
-                                .map_err(|e| MetadataError::Db {
-                                    context: "put multipart reclaim (part segment)",
-                                    source: e,
-                                })?;
-                        }
-                    }
+                            params![
+                                reclaim.bucket,
+                                reclaim.key,
+                                reclaim.generation_id.get() as i64,
+                                segment.part_number as i64,
+                                segment.segment_index as i64,
+                                &segment.segment_okh[..],
+                                segment.segment_vid.get() as i64,
+                                segment.data_pg_id as i64,
+                                segment.ec.k,
+                                segment.ec.m,
+                            ],
+                        )
+                        .map_err(|e| MetadataError::Db {
+                            context: "put multipart reclaim (part segment)",
+                            source: e,
+                        })?;
                 }
             }
             Ok(())
@@ -7894,7 +7804,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT part_number, storage_kind, part_okh, part_vid, data_pg_id, ec_k, ec_m \
+                "SELECT part_number \
                  FROM multipart_reclaim_parts \
                  WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3 \
                  ORDER BY part_number ASC",
@@ -7906,20 +7816,7 @@ impl PgMetadataStore for PgStore {
 
         let rows = stmt
             .query_map(params![bucket, key, generation_id.get() as i64], |row| {
-                Ok((
-                    row.get::<_, i64>(0)? as u32,
-                    Self::parse_enum(
-                        row.get::<_, u8>(1)?,
-                        1,
-                        "storage_kind",
-                        MultipartReclaimPartKind::from_u8,
-                    )?,
-                    row.get::<_, Option<Vec<u8>>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, Option<u8>>(5)?,
-                    row.get::<_, Option<u8>>(6)?,
-                ))
+                row.get::<_, i64>(0).map(|value| value as u32)
             })
             .map_err(|e| MetadataError::Db {
                 context: "get multipart reclaim (query parts)",
@@ -7928,73 +7825,11 @@ impl PgMetadataStore for PgStore {
 
         let mut parts = Vec::new();
         for row in rows {
-            let (part_number, kind, part_okh, part_vid, data_pg_id, ec_k, ec_m) =
-                row.map_err(|e| MetadataError::Db {
-                    context: "get multipart reclaim (part row)",
-                    source: e,
-                })?;
-            match kind {
-                MultipartReclaimPartKind::ShardSet => {
-                    let part_okh = part_okh.ok_or_else(|| MetadataError::Db {
-                        context: "get multipart reclaim (missing part_okh)",
-                        source: rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Null,
-                            Box::from("shard-set reclaim part missing part_okh"),
-                        ),
-                    })?;
-                    let part_okh =
-                        Self::parse_okh_blob(&part_okh, 2).map_err(|e| MetadataError::Db {
-                            context: "get multipart reclaim (invalid part_okh)",
-                            source: e,
-                        })?;
-                    let part_vid = part_vid.ok_or_else(|| MetadataError::Db {
-                        context: "get multipart reclaim (missing part_vid)",
-                        source: rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Null,
-                            Box::from("shard-set reclaim part missing part_vid"),
-                        ),
-                    })?;
-                    let data_pg_id = data_pg_id.ok_or_else(|| MetadataError::Db {
-                        context: "get multipart reclaim (missing data_pg_id)",
-                        source: rusqlite::Error::FromSqlConversionFailure(
-                            4,
-                            rusqlite::types::Type::Null,
-                            Box::from("shard-set reclaim part missing data_pg_id"),
-                        ),
-                    })?;
-                    let ec_k = ec_k.ok_or_else(|| MetadataError::Db {
-                        context: "get multipart reclaim (missing ec_k)",
-                        source: rusqlite::Error::FromSqlConversionFailure(
-                            5,
-                            rusqlite::types::Type::Null,
-                            Box::from("shard-set reclaim part missing ec_k"),
-                        ),
-                    })?;
-                    let ec_m = ec_m.ok_or_else(|| MetadataError::Db {
-                        context: "get multipart reclaim (missing ec_m)",
-                        source: rusqlite::Error::FromSqlConversionFailure(
-                            6,
-                            rusqlite::types::Type::Null,
-                            Box::from("shard-set reclaim part missing ec_m"),
-                        ),
-                    })?;
-                    parts.push(MultipartReclaimPartRecord::ShardSet {
-                        part_number,
-                        part_okh,
-                        part_vid: Self::parse_generation_id(part_vid, 3, "part_vid").map_err(
-                            |e| MetadataError::Db {
-                                context: "get multipart reclaim (invalid part_vid)",
-                                source: e,
-                            },
-                        )?,
-                        data_pg_id: data_pg_id as u32,
-                        ec: EcShape { k: ec_k, m: ec_m },
-                    });
-                }
-                MultipartReclaimPartKind::Segments => {
-                    let mut segment_stmt = self
+            let part_number = row.map_err(|e| MetadataError::Db {
+                context: "get multipart reclaim (part row)",
+                source: e,
+            })?;
+            let mut segment_stmt = self
                         .conn
                         .prepare_cached(
                             "SELECT part_number, segment_index, segment_okh, segment_vid, data_pg_id, ec_k, ec_m \
@@ -8007,44 +7842,42 @@ impl PgMetadataStore for PgStore {
                             source: e,
                         })?;
 
-                    let segments = segment_stmt
-                        .query_map(
-                            params![bucket, key, generation_id.get() as i64, part_number],
-                            |row| {
-                                let segment_okh = Self::blob_to_okh(row.get(2)?, 2)?;
-                                Ok(MultipartReclaimPartSegmentRecord {
-                                    part_number: row.get::<_, i64>(0)? as u32,
-                                    segment_index: row.get::<_, i64>(1)? as u32,
-                                    segment_okh,
-                                    segment_vid: Self::parse_generation_id(
-                                        row.get::<_, i64>(3)?,
-                                        3,
-                                        "segment_vid",
-                                    )?,
-                                    data_pg_id: row.get::<_, i64>(4)? as u32,
-                                    ec: EcShape {
-                                        k: row.get(5)?,
-                                        m: row.get(6)?,
-                                    },
-                                })
+            let segments = segment_stmt
+                .query_map(
+                    params![bucket, key, generation_id.get() as i64, part_number],
+                    |row| {
+                        let segment_okh = Self::blob_to_okh(row.get(2)?, 2)?;
+                        Ok(MultipartReclaimPartSegmentRecord {
+                            part_number: row.get::<_, i64>(0)? as u32,
+                            segment_index: row.get::<_, i64>(1)? as u32,
+                            segment_okh,
+                            segment_vid: Self::parse_generation_id(
+                                row.get::<_, i64>(3)?,
+                                3,
+                                "segment_vid",
+                            )?,
+                            data_pg_id: row.get::<_, i64>(4)? as u32,
+                            ec: EcShape {
+                                k: row.get(5)?,
+                                m: row.get(6)?,
                             },
-                        )
-                        .map_err(|e| MetadataError::Db {
-                            context: "get multipart reclaim (query part segments)",
-                            source: e,
-                        })?
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| MetadataError::Db {
-                            context: "get multipart reclaim (collect part segments)",
-                            source: e,
-                        })?;
+                        })
+                    },
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "get multipart reclaim (query part segments)",
+                    source: e,
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| MetadataError::Db {
+                    context: "get multipart reclaim (collect part segments)",
+                    source: e,
+                })?;
 
-                    parts.push(MultipartReclaimPartRecord::Segments {
-                        part_number,
-                        segments,
-                    });
-                }
-            }
+            parts.push(MultipartReclaimPartRecord {
+                part_number,
+                segments,
+            });
         }
 
         Ok(Some(MultipartReclaimRecord {
@@ -9989,8 +9822,8 @@ impl PgMetadataStore for PgStore {
             self.conn.execute(
                 "INSERT OR REPLACE INTO multipart_parts \
                  (upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, \
-                  part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     part.upload_id,
                     part.part_number,
@@ -9999,7 +9832,6 @@ impl PgMetadataStore for PgStore {
                     part.payload_crc64 as i64,
                     part.etag,
                     part.etag_kind as u8,
-                    part.part_okh.as_slice(),
                     part.part_vid.get() as i64,
                     part.placement_cluster_epoch.get() as i64,
                     part.ec_k,
@@ -10041,17 +9873,6 @@ impl PgMetadataStore for PgStore {
         part: &MultipartPartRecord,
         segments: &[MultipartPartSegmentRecord],
     ) -> Result<(Option<u32>, Vec<MultipartPartSegmentRecord>), MetadataError> {
-        if part.part_okh != [0u8; 16] {
-            return Err(MetadataError::Db {
-                context: "upsert multipart part segments (non-segment part)",
-                source: rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Null,
-                    Box::from("segmented multipart parts must use zero part_okh sentinel"),
-                ),
-            });
-        }
-
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
@@ -10118,8 +9939,8 @@ impl PgMetadataStore for PgStore {
                 self.conn.execute(
                     "INSERT OR REPLACE INTO multipart_parts \
                  (upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, \
-                  part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         part.upload_id,
                         part.part_number,
@@ -10128,7 +9949,6 @@ impl PgMetadataStore for PgStore {
                         part.payload_crc64 as i64,
                         part.etag,
                         part.etag_kind as u8,
-                        part.part_okh.as_slice(),
                         part.part_vid.get() as i64,
                         part.placement_cluster_epoch.get() as i64,
                         part.ec_k,
@@ -10216,7 +10036,7 @@ impl PgMetadataStore for PgStore {
         self.conn
             .query_row(
                 "SELECT upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, \
-                 part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum \
+                 part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum \
                  FROM multipart_parts WHERE upload_id = ?1 AND part_number = ?2",
                 params![upload_id.as_str(), part_number],
                 Self::row_to_multipart_part,
@@ -10267,7 +10087,7 @@ impl PgMetadataStore for PgStore {
             params_vec.push(Box::new(marker));
             params_vec.push(Box::new(limit));
             "SELECT upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, \
-             part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum \
+             part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum \
              FROM multipart_parts \
              WHERE upload_id = ?1 AND part_number > ?2 \
              ORDER BY part_number ASC LIMIT ?3"
@@ -10275,7 +10095,7 @@ impl PgMetadataStore for PgStore {
         } else {
             params_vec.push(Box::new(limit));
             "SELECT upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, \
-             part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum \
+             part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum \
              FROM multipart_parts \
              WHERE upload_id = ?1 \
              ORDER BY part_number ASC LIMIT ?2"
@@ -10337,8 +10157,8 @@ impl PgMetadataStore for PgStore {
             let mut stmt = self.conn.prepare_cached(
                 "INSERT INTO object_parts \
                  (bucket, key, version_id, part_number, object_offset_start, size, payload_crc64, etag, etag_kind, \
-                  part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id, checksum) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id, checksum) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )?;
 
             let mut ordered_parts: Vec<&ObjectPartRecord> = parts.iter().collect();
@@ -10355,7 +10175,6 @@ impl PgMetadataStore for PgStore {
                     part.payload_crc64 as i64,
                     part.etag,
                     part.etag_kind as u8,
-                    part.part_okh.as_slice(),
                     part.part_vid.get() as i64,
                     part.placement_cluster_epoch.get() as i64,
                     part.ec_k,
@@ -10393,7 +10212,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT bucket, key, version_id, part_number, size, payload_crc64, etag, etag_kind, \
-                 part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id, checksum \
+                 part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id, checksum \
                  FROM object_parts \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                  ORDER BY part_number ASC",
@@ -10440,7 +10259,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT bucket, key, version_id, part_number, size, payload_crc64, etag, etag_kind, \
-                 part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id, checksum, object_offset_start \
+                 part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id, checksum, object_offset_start \
                  FROM object_parts \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                    AND object_offset_start <= ?4 \
@@ -10479,7 +10298,7 @@ impl PgMetadataStore for PgStore {
             .conn
             .prepare_cached(
                 "SELECT bucket, key, version_id, part_number, size, payload_crc64, etag, etag_kind, \
-                 part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id, checksum, object_offset_start \
+                 part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id, checksum, object_offset_start \
                  FROM object_parts \
                  WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
                    AND part_number > ?4 \
@@ -10633,7 +10452,7 @@ impl PgMetadataStore for PgStore {
             let omitted_parts = {
                 let mut stmt = self.conn.prepare_cached(
                     "SELECT upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, \
-                     part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum \
+                     part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum \
                      FROM multipart_parts WHERE upload_id = ?1 ORDER BY part_number ASC",
                 )?;
                 let rows =
@@ -10795,8 +10614,8 @@ impl PgMetadataStore for PgStore {
                 let mut stmt = self.conn.prepare_cached(
                     "INSERT INTO object_parts \
                      (bucket, key, version_id, part_number, object_offset_start, size, payload_crc64, etag, etag_kind, \
-                      part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id, checksum) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                      part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id, checksum) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 )?;
                 let mut ordered_parts: Vec<&ObjectPartRecord> = parts.iter().collect();
                 ordered_parts.sort_by_key(|part| part.part_number);
@@ -10812,7 +10631,6 @@ impl PgMetadataStore for PgStore {
                         part.payload_crc64 as i64,
                         part.etag,
                         part.etag_kind as u8,
-                        part.part_okh.as_slice(),
                         part.part_vid.get() as i64,
                         part.placement_cluster_epoch.get() as i64,
                         part.ec_k,
@@ -11551,8 +11369,8 @@ impl PgMetadataStore for PgStore {
                 .execute(
                     "INSERT OR REPLACE INTO multipart_parts \
                      (upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, \
-                      part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                      part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified, checksum) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         part.upload_id,
                         part.part_number,
@@ -11561,7 +11379,6 @@ impl PgMetadataStore for PgStore {
                         part.payload_crc64 as i64,
                         part.etag,
                         part.etag_kind as u8,
-                        part.part_okh.as_slice(),
                         part.part_vid.get() as i64,
                         part.placement_cluster_epoch.get() as i64,
                         part.ec_k,

@@ -131,18 +131,3 @@ pub(crate) fn stream_put_session_has_cross_pg_segments(
             .test_data_pg_id_for(&bucket_name, &object_key, generation_id);
     data_pg_id != meta_pg_id
 }
-
-pub(crate) fn multipart_part_data_pg_id(
-    coord: &Coordinator,
-    bucket: &BucketName,
-    key: &ObjectKey,
-    object_generation_id: GenerationId,
-    part_number: u32,
-) -> u32 {
-    coord.storage_node().test_multipart_part_data_pg_id_for(
-        bucket,
-        key,
-        object_generation_id,
-        part_number,
-    )
-}

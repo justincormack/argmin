@@ -200,17 +200,15 @@ impl SharedStorageNode {
                         PgMetadataStore::get_object_parts(pg, bucket, key, record.version_id)?;
                     let mut multipart_part_segments = Vec::new();
                     for part in &multipart_parts {
-                        if part.part_okh == [0u8; 16] {
-                            multipart_part_segments.extend(
-                                PgMetadataStore::get_multipart_part_segments(
-                                    pg,
-                                    bucket,
-                                    key,
-                                    record.version_id,
-                                    part.part_number,
-                                )?,
-                            );
-                        }
+                        multipart_part_segments.extend(
+                            PgMetadataStore::get_multipart_part_segments(
+                                pg,
+                                bucket,
+                                key,
+                                record.version_id,
+                                part.part_number,
+                            )?,
+                        );
                     }
                     (Vec::new(), multipart_parts, multipart_part_segments)
                 }

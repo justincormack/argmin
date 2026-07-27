@@ -53,13 +53,6 @@ pub fn segment_key_hash(
     )
 }
 
-/// Compute the 16-byte part key hash for multipart upload shard keys.
-///
-/// `part_okh = SHA-256("mpu/" + upload_id + "/" + part_number + "/" + generation)[:16]`
-pub fn part_key_hash(upload_id: &UploadId, part_number: u32, generation: u32) -> [u8; 16] {
-    sha256_truncated_16(format!("mpu/{upload_id}/{part_number}/{generation}").as_bytes())
-}
-
 /// Compute the 16-byte segment key hash for multipart part segment shard keys.
 ///
 /// `segment_okh = SHA-256("mpu-segment/" + upload_id + "/" + part_number + "/" + generation +
@@ -218,30 +211,6 @@ mod tests {
     #[test]
     fn multipart_part_segment_key_hash_length() {
         let hash = multipart_part_segment_key_hash(&upload_id(), 1, 0, 0);
-        assert_eq!(hash.len(), 16);
-    }
-
-    #[test]
-    fn part_key_hash_deterministic() {
-        let upload_id = upload_id();
-        let a = part_key_hash(&upload_id, 1, 2);
-        let b = part_key_hash(&upload_id, 1, 2);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn part_key_hash_distinguishes_part_and_generation() {
-        let upload_id = upload_id();
-        let a = part_key_hash(&upload_id, 1, 2);
-        let b = part_key_hash(&upload_id, 2, 2);
-        let c = part_key_hash(&upload_id, 1, 3);
-        assert_ne!(a, b);
-        assert_ne!(a, c);
-    }
-
-    #[test]
-    fn part_key_hash_length() {
-        let hash = part_key_hash(&upload_id(), 1, 2);
         assert_eq!(hash.len(), 16);
     }
 }

@@ -809,38 +809,23 @@ pub(super) fn snapshotted_multipart_parts_from_storage(
     let mut object_offset_start = 0usize;
     for part in parts {
         let part_size = part.size as usize;
-        let segments = if part.part_okh != [0u8; 16] {
-            vec![SegmentPayloadRecord {
-                segment_index: 0,
-                size: part.size,
-                segment_crc64: part.payload_crc64,
-                segment_okh: part.part_okh,
-                segment_vid: part.part_vid,
-                data_pg_id: part.data_pg_id,
-                placement_cluster_epoch: part.placement_cluster_epoch,
-                ec_k: part.ec_k,
-                ec_m: part.ec_m,
+        let segments = segments_by_part
+            .remove(&part.part_number)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|segment| SegmentPayloadRecord {
+                segment_index: segment.segment_index,
+                size: segment.size,
+                segment_crc64: segment.segment_crc64,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                data_pg_id: segment.data_pg_id,
+                placement_cluster_epoch: segment.placement_cluster_epoch,
+                ec_k: segment.ec_k,
+                ec_m: segment.ec_m,
                 encryption: encryption.clone(),
-            }]
-        } else {
-            segments_by_part
-                .remove(&part.part_number)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|segment| SegmentPayloadRecord {
-                    segment_index: segment.segment_index,
-                    size: segment.size,
-                    segment_crc64: segment.segment_crc64,
-                    segment_okh: segment.segment_okh,
-                    segment_vid: segment.segment_vid,
-                    data_pg_id: segment.data_pg_id,
-                    placement_cluster_epoch: segment.placement_cluster_epoch,
-                    ec_k: segment.ec_k,
-                    ec_m: segment.ec_m,
-                    encryption: encryption.clone(),
-                })
-                .collect()
-        };
+            })
+            .collect();
         snapshotted.push(SnapshottedMultipartPart {
             record: part,
             object_offset_start,

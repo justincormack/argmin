@@ -1,0 +1,237 @@
+Retained reads break legacy multipart part payloads
+Link: https://chatgpt.com/codex/cloud/security/findings/2c11f190b4f081918d9fd505d9aea15e?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed by removal
+
+# Metadata
+Repo: justincormack/argmin
+Commit: d6f7516
+Author: justin@specialbusservice.com
+Created: 26/07/2026, 13:33:43
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+
+The reported direct-part layout was not produced by any supported current
+request path: UploadPart and UploadPartCopy store payload exclusively in
+`multipart_part_segments`. The PoC manufactured an obsolete pre-segment layout
+through test-only metadata rewriting, while Argmin is pre-release and does not
+support old storage formats.
+
+Rather than retain a zero sentinel and unreachable compatibility branches,
+the obsolete representation has now been removed. `part_okh` is absent from
+in-progress and committed part records, the SQLite schema, metadata-command and
+storage-RPC encodings, canonical checkpoint state, reclaim records, scavenger
+references, and object-read reconstruction. Multipart payloads now have one
+representable layout: every part's payload is described by its segment rows.
+The incompatible metadata-command, storage-RPC, and canonical-state encoding
+versions were advanced so old layouts fail closed.
+
+Tests that previously synthesized direct parts were removed or converted to
+create and inspect the segmented layout emitted by production UploadPart paths.
+`cargo nextest run -p storage` passes with 2,273 tests.
+
+# Summary
+Introduced: the new retained-payload authorization path is incomplete for direct multipart part shard-set records. The fix should add multipart_parts with nonzero part_okh to the retained segment set, with the same stored-size/encryption and placement-epoch fields used by snapshotted_multipart_parts_from_storage.
+Full-payload object reads now require a retained payload-read capability. The retained capability is populated from standard object segments and segmented multipart part rows, but it omits direct multipart part payloads represented by ObjectPartRecord.part_okh != [0;16]. Those direct part records are still a valid on-disk/object metadata format: snapshot loading includes them in multipart_parts, and read_core converts them into SegmentPayloadRecord values for reading. Because the retained set does not include those descriptors, prepare_object_payload_read rejects the body as outside the retained snapshot, causing GET Object, ranged/part reads, CopyObject, and UploadPartCopy from such objects to fail with an internal error. This does not bypass authentication, but it can make existing valid multipart object data unavailable after this change.
+
+# Validation
+## Rubric
+- [x] Confirm retained-payload handoff construction includes standard object segments and segmented multipart part segments but omits nonzero ObjectPartRecord.part_okh direct parts.
+- [x] Confirm full multipart snapshots preserve direct object_parts rows while only loading multipart_part_segments for zero-sentinel part_okh rows.
+- [x] Confirm read_core converts nonzero part_okh object parts into SegmentPayloadRecord values used for object reads.
+- [x] Confirm retained ReadRuntime rejects any body SegmentPayloadRecord not present in the retained set and maps this to InternalError.
+- [x] Dynamically reproduce with a real Coordinator GET path using a direct multipart part row, and capture debugger evidence at the rejection point.
+## Report
+Validated the finding with a targeted Rust unit-test PoC against commit d6f7516679cd72113c90ca3c275a9af23464cdcb. Code review confirmed the retained payload set is populated from snapshot.object_segments and snapshot.multipart_part_segments only, not direct multipart object_parts rows: crates/storage/src/cluster.rs:4383-4429. Snapshot loading for MultipartManifest/FullPayloadLayout reads all object_parts but only loads multipart_part_segments when part.part_okh == [0;16]: crates/storage/src/node/object_read_ops.rs:199-215. The read path still treats nonzero part_okh object parts as direct SegmentPayloadRecord entries: crates/server-core/src/coordinator/read_core.rs:812-824. Retained reads reject any segment absent from the retained set with InternalError: crates/server-core/src/coordinator/runtime.rs:3188-3209. GET Object uses the retained payload runtime: crates/server-core/src/coordinator/read.rs:98-111.
+
+I added PoC test poc_direct_multipart_part_retained_get_should_succeed to crates/server-core/src/coordinator/multipart_tests.rs. It creates a multipart object, rewrites the committed object_parts row to the direct part format with part_okh != [0;16], writes matching shard payload bytes, then calls Coordinator::get_object expecting the valid object to read. Reproduction command failed as expected on the vulnerable commit: cargo test -p server-core poc_direct_multipart_part_retained_get_should_succeed -- --nocapture. Key output: called `Result::unwrap()` on an `Err` value: InternalError { reason: "object body is outside its retained payload-read snapshot" }.
+
+Valgrind was attempted but not available in the container; this is also a Rust authorization/availability logic bug, not a memory-safety bug. I then used lldb non-interactively with a breakpoint at runtime.rs:3209. The debugger stopped exactly at the InternalError return and showed the chain prepare_object_payload_read -> ReadHandle::from_multipart -> get_object_on_admitted_route -> get_object -> PoC test, confirming the retained-set mismatch is what makes GET fail.
+
+# Evidence
+crates/server-core/src/coordinator/read_core.rs (L812 to 824)
+  Note: Reads of multipart parts with nonzero part_okh construct SegmentPayloadRecord directly from ObjectPartRecord, so these descriptors must be present in the retained capability.
+```
+        let segments = if part.part_okh != [0u8; 16] {
+            vec![SegmentPayloadRecord {
+                segment_index: 0,
+                size: part.size,
+                segment_crc64: part.payload_crc64,
+                segment_okh: part.part_okh,
+                segment_vid: part.part_vid,
+                data_pg_id: part.data_pg_id,
+                placement_cluster_epoch: part.placement_cluster_epoch,
+                ec_k: part.ec_k,
+                ec_m: part.ec_m,
+                encryption: encryption.clone(),
+            }]
+```
+
+crates/server-core/src/coordinator/read.rs (L98 to 111)
+  Note: GET Object now uses the retained payload handoff for full payload reads, so the incomplete retained segment set affects normal object reads.
+```
+        let AuthorizedObjectRead {
+            bucket: bucket_summary,
+            snapshot,
+            attribute_permissions,
+            payload_handoff,
+        } = self.authorize_get_object_on_admitted_route(admission, req)?;
+        #[cfg(test)]
+        maybe_run_object_read_snapshot_hook(bucket, key);
+        let mut read_runtime = self.retained_read_runtime_for_snapshot(
+            admission,
+            &req.object,
+            &snapshot,
+            payload_handoff,
+        )?;
+```
+
+crates/server-core/src/coordinator/runtime.rs (L3188 to 3210)
+  Note: The new retained read runtime rejects any body segment not present in the retained set, turning the omitted direct multipart parts into an InternalError.
+```
+        let segments = segments.into_iter().collect::<Vec<_>>();
+        if let ReadStorage::Retained(retained) = &self.storage {
+            if !retained.matches_subject(bucket, key, generation_id)
+                || segments.iter().any(|segment| {
+                    !retained.contains_segment(
+                        segment.placement_cluster_epoch,
+                        SegmentStoredBytesRequest {
+                            data_pg_id: segment.data_pg_id,
+                            segment_okh: segment.segment_okh,
+                            segment_vid: segment.segment_vid,
+                            stored_size: segment.stored_size(),
+                            segment_crc64: segment.segment_crc64,
+                            ec: EcShape {
+                                k: segment.ec_k,
+                                m: segment.ec_m,
+                            },
+                        },
+                    )
+                })
+            {
+                return Err(ServerError::InternalError {
+                    reason: "object body is outside its retained payload-read snapshot".to_string(),
+                });
+```
+
+crates/storage/src/cluster.rs (L4383 to 4429)
+  Note: The retained payload segment set is built only from object_segments and multipart_part_segments; it omits multipart_parts entries with direct part_okh payload coordinates.
+```
+        let stored_size_extra = live.encryption.segment_ciphertext_extra_len();
+        let mut segments = HashSet::new();
+        for segment in &snapshot.object_segments {
+            if segment.bucket != bucket
+                || segment.key != key
+                || segment.version_id != live.version_id
+            {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: "object segment does not match leased snapshot subject".to_string(),
+                });
+            }
+            segments.insert(RetainedObjectPayloadSegment {
+                placement_cluster_epoch: segment.placement_cluster_epoch,
+                request: SegmentStoredBytesRequest {
+                    data_pg_id: segment.data_pg_id,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    stored_size: segment.size as usize + stored_size_extra,
+                    segment_crc64: segment.segment_crc64,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                },
+            });
+        }
+        for segment in &snapshot.multipart_part_segments {
+            if segment.bucket != bucket || segment.key != key {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: "multipart segment does not match leased snapshot subject".to_string(),
+                });
+            }
+            segments.insert(RetainedObjectPayloadSegment {
+                placement_cluster_epoch: segment.placement_cluster_epoch,
+                request: SegmentStoredBytesRequest {
+                    data_pg_id: segment.data_pg_id,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    stored_size: segment.size as usize + stored_size_extra,
+                    segment_crc64: segment.segment_crc64,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                },
+            });
+        }
+```
+
+crates/storage/src/node/object_read_ops.rs (L199 to 215)
+  Note: Full multipart snapshots load object_parts for every part, but only load multipart_part_segments when part_okh is the zero sentinel, proving nonzero part_okh parts have no corresponding segment rows.
+```
+                    let multipart_parts =
+                        PgMetadataStore::get_object_parts(pg, bucket, key, record.version_id)?;
+                    let mut multipart_part_segments = Vec::new();
+                    for part in &multipart_parts {
+                        if part.part_okh == [0u8; 16] {
+                            multipart_part_segments.extend(
+                                PgMetadataStore::get_multipart_part_segments(
+                                    pg,
+                                    bucket,
+                                    key,
+                                    record.version_id,
+                                    part.part_number,
+                                )?,
+                            );
+                        }
+                    }
+                    (Vec::new(), multipart_parts, multipart_part_segments)
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+No upward adjustment is warranted: this is a real in-scope runtime availability bug validated by code review and an executable unit-test PoC, but it remains bounded to affected legacy/direct multipart objects and requires read authorization or public-read exposure. No evidence supports high/critical impact such as auth bypass, data disclosure, unauthorized write/delete, RCE, or fleet-wide DoS. Medium is appropriate for limited availability loss of valid stored object data.
+## Likelihood
+high - The HTTP read/copy path is reachable, but practical triggering requires pre-existing legacy/direct multipart metadata or public-readable affected objects. Current multipart upload code appears to create zero-sentinel segmented parts, so a remote attacker cannot generally manufacture the affected state through normal current uploads. | Remote network vector
+## Impact
+medium - Valid legacy/direct multipart object payloads can become unreadable through GET, range/part reads, CopyObject, and UploadPartCopy. The impact is availability-only and object-format-specific; no confidentiality, integrity, authentication, or privilege boundary is compromised.
+## Assumptions
+- Static review was limited to repository artifacts in /workspace/argmin; no cloud APIs or deployment inventory were queried.
+- The vulnerable path is relevant when argmin-s3 is deployed with a frontend role and reachable S3 HTTP endpoint.
+- Triggering the bug requires an existing valid multipart object stored in the legacy/direct part format where object_parts.part_okh is nonzero.
+- The attacker can only exercise the failing read/copy path if they are authorized to read the object, or if the bucket/object is intentionally public-read.
+- argmin-s3 frontend running the vulnerable commit
+- existing multipart object using direct object_parts.part_okh payload coordinates
+- attacker has object read permission, copy-source read permission, or the object is public-read
+- attacker sends GET Object, ranged/part read, CopyObject, or UploadPartCopy for that object
+## Path
+Client -> HTTP S3 listener -> authz/read admission -> legacy multipart snapshot -> retained set missing direct part -> read_core direct SegmentPayloadRecord -> retained check fails -> 500/object unavailable
+## Path evidence
+- `crates/argmin-s3/src/config.rs:517-618` - Frontend deployments require S3 credentials and default to ARGMIN_LISTEN_ADDR 127.0.0.1:9000 with optional TLS; this maps the service exposure and secret handling.
+- `crates/argmin-s3/src/main.rs:8149-8226` - The main product binds the configured TCP listener and starts the HTTP or HTTPS S3 frontend.
+- `crates/server-http/src/http/mod.rs:3620-3633` - HTTP requests are authenticated with authenticate_request; missing auth becomes anonymous, which is later constrained by ACL/public-read authorization.
+- `crates/server-http/src/http/mod.rs:2108-2235` - GET Object, Range GET, and partNumber GET are normal HTTP S3 entrypoints that dispatch to coordinator read methods.
+- `crates/server-core/src/coordinator/authz.rs:693-715` - Object read authorization requires owner/ACL read or object public-read; this limits reachability to authorized or public-readable objects.
+- `crates/storage/src/cluster.rs:4383-4429` - The retained payload segment set is built from snapshot.object_segments and snapshot.multipart_part_segments only, omitting direct multipart object_parts with nonzero part_okh.
+- `crates/storage/src/node/object_read_ops.rs:199-215` - Full multipart snapshots load all object_parts but only load multipart_part_segments when part.part_okh is the zero sentinel, leaving direct nonzero part_okh parts without segment rows.
+- `crates/server-core/src/coordinator/read_core.rs:812-824` - The read path still converts nonzero part_okh object parts directly into SegmentPayloadRecord entries that must be accepted by the retained set.
+- `crates/server-core/src/coordinator/runtime.rs:3188-3209` - Retained reads reject any payload segment absent from the retained snapshot and return InternalError.
+- `crates/server-core/src/coordinator/read.rs:98-111` - GET Object now uses retained_read_runtime_for_snapshot, making the incomplete retained set reachable on normal object reads.
+- `crates/server-core/src/coordinator/multipart.rs:1493-1502` - Current multipart upload code writes new multipart part records with zero part_okh, which reduces attacker ability to create the affected legacy/direct format through the current public API.
+## Narrative
+The finding is real and in-scope. The S3 frontend is a normal runtime network surface, and GET Object routes through authorization into a retained read runtime. Static evidence shows the retained set is populated from object_segments and multipart_part_segments, while snapshot loading still includes multipart object_parts and only fetches multipart_part_segments for zero-sentinel part_okh parts. read_core still treats nonzero part_okh object parts as direct payload segments. The runtime then rejects any segment absent from the retained set with InternalError, matching the provided executable PoC result. Severity should remain medium rather than high/critical because there is no authentication bypass, data exposure, write/tamper primitive, or service-wide DoS; impact is limited availability loss for affected legacy/direct multipart objects and requires read authorization or public-read exposure.
+## Controls
+- AWS SigV4 authentication for authenticated S3 requests
+- Anonymous access constrained by bucket/object public-read ACL behavior and PublicAccessBlock settings
+- Default frontend bind address is 127.0.0.1:9000 unless ARGMIN_LISTEN_ADDR is changed
+- Optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Connection and in-flight request limits plus header/body idle timeouts in the HTTP serve layer
+- Process refuses to run as root
+## Blindspots
+- Static-only review did not inventory real deployments or confirm whether ARGMIN_LISTEN_ADDR is internet-facing.
+- Static-only review cannot estimate how many production objects use the legacy/direct part_okh format.
+- The validation PoC represented legacy metadata by rewriting rows; this supports compatibility reachability but does not prove current public HTTP APIs can create new affected direct-part objects.
+- No Kubernetes, Terraform, or cloud load balancer manifests were found or queried in this analysis scope.

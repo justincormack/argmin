@@ -10850,9 +10850,6 @@ impl StorageCluster {
                     );
                 }
                 self.delete_complete_multipart_cleanup_best_effort(
-                    &commit.object.bucket,
-                    &commit.object.key,
-                    commit.object.generation_id,
                     &Self::complete_multipart_command_cleanup(commit),
                 );
             }
@@ -11916,15 +11913,13 @@ impl StorageCluster {
                 let parts = PgMetadataStore::get_object_parts(pg, bucket, key, record.version_id)?;
                 let mut streaming_segments = Vec::new();
                 for part in &parts {
-                    if part.part_okh == [0u8; 16] {
-                        streaming_segments.extend(PgMetadataStore::get_multipart_part_segments(
-                            pg,
-                            bucket,
-                            key,
-                            record.version_id,
-                            part.part_number,
-                        )?);
-                    }
+                    streaming_segments.extend(PgMetadataStore::get_multipart_part_segments(
+                        pg,
+                        bucket,
+                        key,
+                        record.version_id,
+                        part.part_number,
+                    )?);
                 }
                 Ok(ObjectPayloadReclaimCommand::Multipart(
                     MultipartReclaimRecord::from_object_parts(
@@ -12814,27 +12809,6 @@ impl StorageCluster {
                     ShardScavengerPayloadReference::ReclaimOnly(reference) => {
                         self.extend_reclaim_referenced_shard_set(&mut scan, &reference)?;
                     }
-                    ShardScavengerPayloadReference::RoutedMultipartPart(reference) => {
-                        let data_pg_id = self
-                            .local_map
-                            .object_generation_multipart_part_data_pg(
-                                &reference.bucket,
-                                &reference.key,
-                                reference.object_generation_id,
-                                reference.part_number,
-                            )
-                            .get();
-                        let reference = ShardScavengerPlacedShardSetReference {
-                            data_pg_id,
-                            okh: reference.part_okh,
-                            generation_id: reference.part_vid,
-                            placement_cluster_epoch: reference.placement_cluster_epoch,
-                            stored_size: reference.stored_size,
-                            crc64: reference.crc64,
-                            ec: reference.ec,
-                        };
-                        self.extend_referenced_shard_set(&mut scan, &reference)?;
-                    }
                 }
             }
         }
@@ -13637,28 +13611,6 @@ impl StorageCluster {
                 },
                 reference.placement_cluster_epoch,
             )),
-            ShardScavengerPayloadReference::RoutedMultipartPart(reference) => {
-                let data_pg_id = self
-                    .local_map
-                    .object_generation_multipart_part_data_pg(
-                        &reference.bucket,
-                        &reference.key,
-                        reference.object_generation_id,
-                        reference.part_number,
-                    )
-                    .get();
-                Some((
-                    SegmentStoredBytesRequest {
-                        data_pg_id,
-                        segment_okh: reference.part_okh,
-                        segment_vid: reference.part_vid,
-                        stored_size: reference.stored_size as usize,
-                        segment_crc64: reference.crc64,
-                        ec: reference.ec,
-                    },
-                    reference.placement_cluster_epoch,
-                ))
-            }
             ShardScavengerPayloadReference::ReclaimOnly(_) => None,
         }
     }
@@ -15537,20 +15489,6 @@ impl StorageCluster {
                 reference.data_pg_id == segment.data_pg_id
                     && reference.okh == segment.segment_okh
                     && reference.generation_id == segment.segment_vid
-            }
-            ShardScavengerPayloadReference::RoutedMultipartPart(reference) => {
-                self.local_map
-                    .object_generation_multipart_part_data_pg(
-                        &reference.bucket,
-                        &reference.key,
-                        reference.object_generation_id,
-                        reference.part_number,
-                    )
-                    .get()
-                    == segment.data_pg_id
-                    && reference.part_okh == segment.segment_okh
-                    && reference.part_vid == segment.segment_vid
-                    && reference.placement_cluster_epoch == segment.placement_cluster_epoch
             }
         }
     }

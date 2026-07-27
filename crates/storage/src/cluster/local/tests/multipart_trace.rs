@@ -434,7 +434,6 @@ fn upload_copied_test_multipart_part(
                     payload_crc64,
                     etag: vec![payload_seed; 8],
                     etag_kind: crate::EtagKind::Crc64,
-                    part_okh: [0u8; 16],
                     part_vid: crate::GenerationId::new(u64::from(generation) + 1).unwrap(),
                     placement_cluster_epoch: snapshot
                         .staging_segments

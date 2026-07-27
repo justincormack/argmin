@@ -11292,33 +11292,14 @@ impl super::StorageCluster {
                 }
                 ObjectPayloadReclaimCommand::Multipart(reclaim) => {
                     for part in &reclaim.parts {
-                        match part {
-                            MultipartReclaimPartRecord::ShardSet {
-                                part_okh,
-                                part_vid,
-                                data_pg_id,
-                                ec,
-                                ..
-                            } => {
-                                payload_delete_started = true;
-                                self.delete_payload_shard_set(
-                                    *data_pg_id,
-                                    *ec,
-                                    part_okh,
-                                    *part_vid,
-                                )?;
-                            }
-                            MultipartReclaimPartRecord::Segments { segments, .. } => {
-                                for segment in segments {
-                                    payload_delete_started = true;
-                                    self.delete_payload_shard_set(
-                                        segment.data_pg_id,
-                                        segment.ec,
-                                        &segment.segment_okh,
-                                        segment.segment_vid,
-                                    )?;
-                                }
-                            }
+                        for segment in &part.segments {
+                            payload_delete_started = true;
+                            self.delete_payload_shard_set(
+                                segment.data_pg_id,
+                                segment.ec,
+                                &segment.segment_okh,
+                                segment.segment_vid,
+                            )?;
                         }
                     }
                 }
@@ -11782,35 +11763,8 @@ impl super::StorageCluster {
 
     pub(super) fn delete_complete_multipart_cleanup_best_effort(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
         cleanup: &CompleteMultipartCommitCleanup,
     ) {
-        for part in &cleanup.omitted_parts {
-            if part.part_okh == [0u8; 16] {
-                continue;
-            }
-            let data_pg_id = self
-                .local_map
-                .object_generation_multipart_part_data_pg(
-                    bucket,
-                    key,
-                    generation_id,
-                    part.part_number,
-                )
-                .get();
-            self.delete_multipart_shard_set_best_effort(
-                part.placement_cluster_epoch,
-                data_pg_id,
-                &part.part_okh,
-                part.part_vid,
-                EcShape {
-                    k: part.ec_k,
-                    m: part.ec_m,
-                },
-            );
-        }
         self.delete_multipart_part_segments_best_effort(&cleanup.omitted_streaming_segments);
         self.delete_staged_stream_segment_payload_shards_best_effort(
             &cleanup.stream_upload_segments,
@@ -11821,31 +11775,6 @@ impl super::StorageCluster {
         &self,
         cleanup: &FinalizeStreamPartCleanup,
     ) {
-        if let Some(part) = cleanup
-            .existing_part
-            .as_ref()
-            .filter(|part| part.part_okh != [0u8; 16])
-        {
-            let data_pg_id = self
-                .local_map
-                .object_generation_multipart_part_data_pg(
-                    &cleanup.upload.bucket,
-                    &cleanup.upload.key,
-                    cleanup.upload.object_generation_id,
-                    part.part_number,
-                )
-                .get();
-            self.delete_multipart_shard_set_best_effort(
-                part.placement_cluster_epoch,
-                data_pg_id,
-                &part.part_okh,
-                part.part_vid,
-                EcShape {
-                    k: part.ec_k,
-                    m: part.ec_m,
-                },
-            );
-        }
         self.delete_multipart_part_segments_best_effort(&cleanup.displaced_segments);
     }
 
@@ -11853,30 +11782,6 @@ impl super::StorageCluster {
         &self,
         cleanup: &AbortMultipartUploadCleanup,
     ) {
-        for part in &cleanup.parts {
-            if part.part_okh == [0u8; 16] {
-                continue;
-            }
-            let data_pg_id = self
-                .local_map
-                .object_generation_multipart_part_data_pg(
-                    &cleanup.upload.bucket,
-                    &cleanup.upload.key,
-                    cleanup.upload.object_generation_id,
-                    part.part_number,
-                )
-                .get();
-            self.delete_multipart_shard_set_best_effort(
-                part.placement_cluster_epoch,
-                data_pg_id,
-                &part.part_okh,
-                part.part_vid,
-                EcShape {
-                    k: part.ec_k,
-                    m: part.ec_m,
-                },
-            );
-        }
         self.delete_multipart_part_segments_best_effort(&cleanup.streaming_segments);
         self.delete_staged_stream_segment_payload_shards_best_effort(
             &cleanup.stream_upload_segments,

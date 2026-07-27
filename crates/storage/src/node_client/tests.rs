@@ -278,7 +278,6 @@ fn test_multipart_part_record(upload_id: UploadId, part_number: u32) -> Multipar
         payload_crc64: 0,
         etag: vec![part_number as u8; 8],
         etag_kind: EtagKind::Crc64,
-        part_okh: [part_number as u8; 16],
         part_vid: GenerationId::new(40 + u64::from(part_number)).unwrap(),
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,
@@ -298,7 +297,6 @@ fn test_object_read_multipart_part(
     bucket: &BucketName,
     key: &ObjectKey,
     part_number: u32,
-    part_okh: [u8; 16],
 ) -> ObjectPartRecord {
     ObjectPartRecord {
         bucket: bucket.clone(),
@@ -309,7 +307,6 @@ fn test_object_read_multipart_part(
         payload_crc64: 0,
         etag: vec![part_number as u8; 16],
         etag_kind: EtagKind::Crc64,
-        part_okh,
         part_vid: GenerationId::new(20 + u64::from(part_number)).unwrap(),
         placement_cluster_epoch: ClusterEpoch::INITIAL,
         ec_k: 4,

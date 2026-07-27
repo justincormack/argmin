@@ -240,7 +240,6 @@ CREATE TABLE IF NOT EXISTS multipart_parts (
     payload_crc64    INTEGER NOT NULL,
     etag             BLOB NOT NULL,
     etag_kind        INTEGER NOT NULL CHECK (etag_kind IN (0, 1)),
-    part_okh         BLOB NOT NULL,
     part_vid         INTEGER NOT NULL CHECK (part_vid > 0),
     placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
     ec_k             INTEGER NOT NULL,
@@ -262,7 +261,6 @@ CREATE TABLE IF NOT EXISTS object_parts (
     payload_crc64    INTEGER NOT NULL,
     etag             BLOB NOT NULL,
     etag_kind        INTEGER NOT NULL CHECK (etag_kind IN (0, 1)),
-    part_okh         BLOB NOT NULL,
     part_vid         INTEGER NOT NULL CHECK (part_vid > 0),
     placement_cluster_epoch INTEGER NOT NULL CHECK (placement_cluster_epoch > 0),
     ec_k             INTEGER NOT NULL,
@@ -420,20 +418,10 @@ CREATE TABLE IF NOT EXISTS multipart_reclaim_parts (
     key           TEXT NOT NULL,
     generation_id INTEGER NOT NULL CHECK (generation_id > 0),
     part_number   INTEGER NOT NULL,
-    storage_kind  INTEGER NOT NULL CHECK (storage_kind IN (0, 1)),
-    part_okh      BLOB,
-    part_vid      INTEGER,
-    data_pg_id   INTEGER,
-    ec_k          INTEGER,
-    ec_m          INTEGER,
     PRIMARY KEY (bucket, key, generation_id, part_number),
     FOREIGN KEY (bucket, key, generation_id)
         REFERENCES multipart_reclaims(bucket, key, generation_id)
-        ON DELETE CASCADE,
-    CHECK (
-        (storage_kind = 0 AND part_okh IS NOT NULL AND part_vid IS NOT NULL AND data_pg_id IS NOT NULL AND ec_k IS NOT NULL AND ec_m IS NOT NULL) OR
-        (storage_kind = 1 AND part_okh IS NULL AND part_vid IS NULL AND data_pg_id IS NULL AND ec_k IS NULL AND ec_m IS NULL)
-    )
+        ON DELETE CASCADE
 ) STRICT";
 
 /// Child segment rows for streamed multipart part reclaim generations.

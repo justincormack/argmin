@@ -1705,16 +1705,10 @@ impl UnixStorageNodeClient {
 
         let mut segment_counts_by_part = BTreeMap::<u32, usize>::new();
         for segment in &snapshot.multipart_part_segments {
-            let Some(part) = parts_by_number.get(&segment.part_number) else {
+            if !parts_by_number.contains_key(&segment.part_number) {
                 return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                     "validate object read snapshot response",
                     "multipart segment has no matching part row".to_string(),
-                )));
-            };
-            if part.part_okh != [0u8; 16] {
-                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                    "validate object read snapshot response",
-                    "multipart segment belongs to shard-set part row".to_string(),
                 )));
             }
             *segment_counts_by_part
@@ -1724,10 +1718,7 @@ impl UnixStorageNodeClient {
 
         if require_segment_layout {
             for part in &snapshot.multipart_parts {
-                if part.part_okh == [0u8; 16]
-                    && part.size > 0
-                    && !segment_counts_by_part.contains_key(&part.part_number)
-                {
+                if part.size > 0 && !segment_counts_by_part.contains_key(&part.part_number) {
                     return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                         "validate object read snapshot response",
                         "segmented multipart part has no segment rows".to_string(),

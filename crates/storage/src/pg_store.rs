@@ -970,21 +970,19 @@ impl PgStore {
 
     pub fn cluster_map_history_route_references(
         &self,
-        pg_topology: &crate::pg_topology::PgTopology,
+        _pg_topology: &crate::pg_topology::PgTopology,
     ) -> Result<PgClusterMapHistoryRouteReferences, StoreError> {
         let mut references = PgClusterMapHistoryRouteReferences::default();
         self.extend_direct_cluster_map_history_route_references(
             &mut references,
             "SELECT DISTINCT data_pg_id, placement_cluster_epoch FROM ( \
                  SELECT data_pg_id, placement_cluster_epoch FROM object_segments \
-                 UNION ALL SELECT data_pg_id, placement_cluster_epoch FROM object_parts \
                  UNION ALL SELECT data_pg_id, placement_cluster_epoch FROM multipart_part_segments \
                  UNION ALL SELECT data_pg_id, placement_cluster_epoch FROM stream_upload_segments \
              )",
             PgClusterMapHistoryRouteReferenceKind::LivePlacement,
             "list live payload cluster-map history route references",
         )?;
-        self.extend_routed_multipart_history_route_references(&mut references, pg_topology)?;
         self.extend_direct_cluster_map_history_route_references(
             &mut references,
             "SELECT DISTINCT data_pg_id, source_cluster_epoch \
@@ -1040,60 +1038,10 @@ impl PgStore {
         Ok(())
     }
 
-    fn extend_routed_multipart_history_route_references(
-        &self,
-        references: &mut PgClusterMapHistoryRouteReferences,
-        pg_topology: &crate::pg_topology::PgTopology,
-    ) -> Result<(), StoreError> {
-        let context = "list routed multipart cluster-map history route references";
-        let mut stmt = self
-            .conn
-            .prepare_cached(
-                "SELECT DISTINCT u.bucket, u.key, u.object_generation_id, p.part_number, \
-                 p.placement_cluster_epoch \
-                 FROM multipart_parts p \
-                 JOIN multipart_uploads u ON u.upload_id = p.upload_id \
-                 WHERE p.part_okh != zeroblob(16)",
-            )
-            .map_err(|source| StoreError::Db { context, source })?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, BucketName>(0)?,
-                    row.get::<_, ObjectKey>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, u32>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            })
-            .map_err(|source| StoreError::Db { context, source })?;
-        for row in rows {
-            let (bucket, key, raw_generation, part_number, raw_epoch) =
-                row.map_err(|source| StoreError::Db { context, source })?;
-            let generation_id =
-                Self::parse_generation_id(raw_generation, 2, "multipart upload object generation")
-                    .map_err(|source| StoreError::Db { context, source })?;
-            let cluster_epoch =
-                Self::parse_cluster_epoch(raw_epoch, 4, "cluster-map history route epoch")
-                    .map_err(|source| StoreError::Db { context, source })?;
-            let pg_id = pg_topology
-                .object_generation_multipart_part_data_pg(&bucket, &key, generation_id, part_number)
-                .get();
-            references.insert(PgClusterMapHistoryRouteReference::new(
-                PgClusterMapHistoryRouteReferenceKind::LivePlacement,
-                cluster_epoch,
-                PgId::new(pg_id),
-            ))?;
-        }
-        Ok(())
-    }
-
     fn oldest_live_payload_placement_epoch(&self) -> Result<Option<ClusterEpoch>, StoreError> {
         let raw_epoch = self.query_row_cached(
             "SELECT MIN(placement_cluster_epoch) FROM ( \
                  SELECT placement_cluster_epoch FROM object_segments \
-                 UNION ALL SELECT placement_cluster_epoch FROM object_parts \
-                 UNION ALL SELECT placement_cluster_epoch FROM multipart_parts \
                  UNION ALL SELECT placement_cluster_epoch FROM multipart_part_segments \
                  UNION ALL SELECT placement_cluster_epoch FROM stream_upload_segments \
              )",

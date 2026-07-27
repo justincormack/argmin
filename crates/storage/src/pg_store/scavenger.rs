@@ -1154,15 +1154,6 @@ impl PgStore {
         )?;
         self.extend_scavenger_encrypted_placed_references(
             &mut references,
-            "SELECT p.data_pg_id, p.part_okh, p.part_vid, p.size, p.payload_crc64, \
-                    p.placement_cluster_epoch, p.ec_k, p.ec_m, o.encryption_type \
-             FROM object_parts p \
-             JOIN objects o ON o.bucket = p.bucket AND o.key = p.key AND o.version_id = p.version_id \
-             WHERE p.part_okh != zeroblob(16)",
-            "list object part shard scavenger references",
-        )?;
-        self.extend_scavenger_encrypted_placed_references(
-            &mut references,
             "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
                     s.placement_cluster_epoch, s.ec_k, s.ec_m, u.encryption_type \
              FROM stream_upload_segments s \
@@ -1185,17 +1176,10 @@ impl PgStore {
         )?;
         self.extend_scavenger_reclaim_references(
             &mut references,
-            "SELECT data_pg_id, part_okh, part_vid, ec_k, ec_m \
-             FROM multipart_reclaim_parts WHERE storage_kind = 0",
-            "list multipart reclaim part shard scavenger references",
-        )?;
-        self.extend_scavenger_reclaim_references(
-            &mut references,
             "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m \
              FROM multipart_reclaim_part_segments",
             "list multipart reclaim segment shard scavenger references",
         )?;
-        self.extend_scavenger_routed_multipart_part_references(&mut references)?;
         self.extend_scavenger_pending_command_references(&mut references)?;
         Ok(references)
     }
@@ -1239,22 +1223,9 @@ impl PgStore {
                 }
             }
             MetadataCommandPayload::CommitMultipartObject(command) => {
-                Self::extend_object_part_references(
-                    references,
-                    &command.parts,
-                    &command.object.encryption,
-                );
                 Self::extend_multipart_part_segment_references(
                     references,
                     &command.selected_streaming_segments,
-                    &command.object.encryption,
-                );
-                Self::extend_routed_multipart_part_references(
-                    references,
-                    &command.object.bucket,
-                    &command.object.key,
-                    command.object.generation_id,
-                    &command.omitted_parts,
                     &command.object.encryption,
                 );
                 Self::extend_multipart_part_segment_references(
@@ -1309,16 +1280,6 @@ impl PgStore {
                     &command.segments,
                     &command.upload.encryption,
                 );
-                if let Some(existing_part) = &command.existing_part {
-                    Self::extend_routed_multipart_part_references(
-                        references,
-                        &command.upload.bucket,
-                        &command.upload.key,
-                        command.upload.object_generation_id,
-                        std::slice::from_ref(existing_part),
-                        &command.upload.encryption,
-                    );
-                }
                 Self::extend_multipart_part_segment_references(
                     references,
                     &command.displaced_segments,
@@ -1326,14 +1287,6 @@ impl PgStore {
                 );
             }
             MetadataCommandPayload::AbortMultipartUpload(command) => {
-                Self::extend_routed_multipart_part_references(
-                    references,
-                    &command.cleanup.upload.bucket,
-                    &command.cleanup.upload.key,
-                    command.cleanup.upload.object_generation_id,
-                    &command.cleanup.parts,
-                    &command.cleanup.upload.encryption,
-                );
                 Self::extend_multipart_part_segment_references(
                     references,
                     &command.cleanup.streaming_segments,
@@ -1384,33 +1337,6 @@ impl PgStore {
                     ec: EcShape {
                         k: segment.ec_k,
                         m: segment.ec_m,
-                    },
-                },
-            );
-        }
-    }
-
-    fn extend_object_part_references(
-        references: &mut Vec<ShardScavengerPayloadReference>,
-        parts: &[ObjectPartRecord],
-        encryption: &ObjectEncryption,
-    ) {
-        for part in parts {
-            if part.part_okh == [0; 16] {
-                continue;
-            }
-            Self::push_placed_reference(
-                references,
-                ShardScavengerPlacedShardSetReference {
-                    data_pg_id: part.data_pg_id,
-                    okh: part.part_okh,
-                    generation_id: part.part_vid,
-                    placement_cluster_epoch: part.placement_cluster_epoch,
-                    stored_size: Self::stored_segment_size_for_encryption(part.size, encryption),
-                    crc64: part.payload_crc64,
-                    ec: EcShape {
-                        k: part.ec_k,
-                        m: part.ec_m,
                     },
                 },
             );
@@ -1489,38 +1415,6 @@ impl PgStore {
         }
     }
 
-    fn extend_routed_multipart_part_references(
-        references: &mut Vec<ShardScavengerPayloadReference>,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        object_generation_id: GenerationId,
-        parts: &[MultipartPartRecord],
-        encryption: &ObjectEncryption,
-    ) {
-        for part in parts {
-            if part.part_okh == [0; 16] {
-                continue;
-            }
-            references.push(ShardScavengerPayloadReference::RoutedMultipartPart(
-                ShardScavengerRoutedMultipartPartReference {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    object_generation_id,
-                    part_number: part.part_number,
-                    stored_size: Self::stored_segment_size_for_encryption(part.size, encryption),
-                    crc64: part.payload_crc64,
-                    part_okh: part.part_okh,
-                    part_vid: part.part_vid,
-                    placement_cluster_epoch: part.placement_cluster_epoch,
-                    ec: EcShape {
-                        k: part.ec_k,
-                        m: part.ec_m,
-                    },
-                },
-            ));
-        }
-    }
-
     fn extend_reclaim_payload_references(
         references: &mut Vec<ShardScavengerPayloadReference>,
         payload: &ObjectPayloadReclaimCommand,
@@ -1539,31 +1433,14 @@ impl PgStore {
             }
             ObjectPayloadReclaimCommand::Multipart(reclaim) => {
                 for part in &reclaim.parts {
-                    match part {
-                        MultipartReclaimPartRecord::ShardSet {
-                            part_okh,
-                            part_vid,
-                            data_pg_id,
-                            ec,
-                            ..
-                        } => Self::push_reclaim_reference(
+                    for segment in &part.segments {
+                        Self::push_reclaim_reference(
                             references,
-                            *data_pg_id,
-                            *part_okh,
-                            *part_vid,
-                            *ec,
-                        ),
-                        MultipartReclaimPartRecord::Segments { segments, .. } => {
-                            for segment in segments {
-                                Self::push_reclaim_reference(
-                                    references,
-                                    segment.data_pg_id,
-                                    segment.segment_okh,
-                                    segment.segment_vid,
-                                    segment.ec,
-                                );
-                            }
-                        }
+                            segment.data_pg_id,
+                            segment.segment_okh,
+                            segment.segment_vid,
+                            segment.ec,
+                        );
                     }
                 }
             }
@@ -1778,65 +1655,6 @@ impl PgStore {
                         ec: EcShape {
                             k: row.get(3)?,
                             m: row.get(4)?,
-                        },
-                    },
-                ))
-            })
-            .map_err(|source| StoreError::Db { context, source })?;
-        for row in rows {
-            references.push(row.map_err(|source| StoreError::Db { context, source })?);
-        }
-        Ok(())
-    }
-
-    fn extend_scavenger_routed_multipart_part_references(
-        &self,
-        references: &mut Vec<ShardScavengerPayloadReference>,
-    ) -> Result<(), StoreError> {
-        let context = "list routed multipart part shard scavenger references";
-        let mut stmt = self
-            .conn
-            .prepare_cached(
-                "SELECT u.bucket, u.key, u.object_generation_id, p.part_number, \
-                 p.size, p.payload_crc64, p.part_okh, p.part_vid, p.placement_cluster_epoch, p.ec_k, p.ec_m, \
-                 u.encryption_type \
-                 FROM multipart_parts p \
-                 JOIN multipart_uploads u ON u.upload_id = p.upload_id \
-                 WHERE p.part_okh != zeroblob(16)",
-            )
-            .map_err(|source| StoreError::Db { context, source })?;
-        let rows = stmt
-            .query_map([], |row| {
-                let okh_blob: Vec<u8> = row.get(6)?;
-                Ok(ShardScavengerPayloadReference::RoutedMultipartPart(
-                    ShardScavengerRoutedMultipartPartReference {
-                        bucket: row.get(0)?,
-                        key: row.get(1)?,
-                        object_generation_id: PgStore::parse_generation_id(
-                            row.get::<_, i64>(2)?,
-                            2,
-                            "multipart upload object generation",
-                        )?,
-                        part_number: row.get(3)?,
-                        stored_size: Self::stored_segment_size_for_encryption_type(
-                            row.get::<_, i64>(4)? as u64,
-                            row.get(11)?,
-                        )?,
-                        crc64: row.get::<_, i64>(5)? as u64,
-                        part_okh: PgStore::parse_okh_blob(&okh_blob, 6)?,
-                        part_vid: PgStore::parse_generation_id(
-                            row.get::<_, i64>(7)?,
-                            7,
-                            "multipart part payload generation",
-                        )?,
-                        placement_cluster_epoch: PgStore::parse_cluster_epoch(
-                            row.get::<_, i64>(8)?,
-                            8,
-                            "placement_cluster_epoch",
-                        )?,
-                        ec: EcShape {
-                            k: row.get(9)?,
-                            m: row.get(10)?,
                         },
                     },
                 ))
@@ -2712,7 +2530,7 @@ mod tests {
     }
 
     #[test]
-    fn shard_scavenger_payload_references_include_part_size_crc_and_epoch() {
+    fn shard_scavenger_payload_references_include_segment_size_crc_and_epoch() {
         let tmp = test_util::tempdir();
         let store = PgStore::open(tmp.path(), 7).unwrap();
 
@@ -2750,8 +2568,8 @@ mod tests {
             .execute(
                 "INSERT INTO object_parts \
                  (bucket, key, version_id, part_number, object_offset_start, size, payload_crc64, \
-                  etag, etag_kind, part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                  etag, etag_kind, part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 rusqlite::params![
                     "bucket",
                     "object",
@@ -2762,12 +2580,36 @@ mod tests {
                     0xAABB_i64,
                     b"etag".as_slice(),
                     0i64,
-                    [0x11u8; 16].as_slice(),
                     9i64,
                     3i64,
                     4i64,
                     2i64,
                     7i64,
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO multipart_part_segments \
+                 (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, \
+                  segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    "bucket",
+                    "object",
+                    "u".repeat(128),
+                    0i64,
+                    1i64,
+                    0i64,
+                    1234i64,
+                    0xAABB_i64,
+                    [0x11u8; 16].as_slice(),
+                    9i64,
+                    7i64,
+                    3i64,
+                    4i64,
+                    2i64,
                 ],
             )
             .unwrap();
@@ -2819,58 +2661,6 @@ mod tests {
                     6i64,
                     4i64,
                     2i64,
-                ],
-            )
-            .unwrap();
-        store
-            .conn
-            .execute(
-                "INSERT INTO multipart_uploads \
-                 (upload_id, bucket, key, initiated_at, state, metadata_blob, system_metadata_blob, \
-                  owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id, \
-                  acl_grants, public_read, object_generation_id, object_lock_legal_hold, encryption_type) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-                rusqlite::params![
-                    "u".repeat(128),
-                    "bucket",
-                    "multipart",
-                    10i64,
-                    0i64,
-                    b"".as_slice(),
-                    b"".as_slice(),
-                    "owner",
-                    "c".repeat(32),
-                    "owner",
-                    "c".repeat(32),
-                    "",
-                    0i64,
-                    22i64,
-                    0i64,
-                    2i64,
-                ],
-            )
-            .unwrap();
-        store
-            .conn
-            .execute(
-                "INSERT INTO multipart_parts \
-                 (upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, \
-                  part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                rusqlite::params![
-                    "u".repeat(128),
-                    2i64,
-                    0i64,
-                    5678i64,
-                    0xCCDD_i64,
-                    b"etag".as_slice(),
-                    0i64,
-                    [0x22u8; 16].as_slice(),
-                    10i64,
-                    5i64,
-                    4i64,
-                    2i64,
-                    11i64,
                 ],
             )
             .unwrap();
@@ -2931,34 +2721,6 @@ mod tests {
         assert_eq!(
             object_part.placement_cluster_epoch,
             ClusterEpoch::new(3).unwrap()
-        );
-
-        let routed_part = references
-            .iter()
-            .find_map(|reference| match reference {
-                ShardScavengerPayloadReference::RoutedMultipartPart(reference)
-                    if reference.part_okh == [0x22; 16] =>
-                {
-                    Some(reference)
-                }
-                _ => None,
-            })
-            .expect("multipart part routed reference should be listed");
-        assert_eq!(routed_part.bucket.as_str(), "bucket");
-        assert_eq!(routed_part.key.as_str(), "multipart");
-        assert_eq!(
-            routed_part.object_generation_id,
-            GenerationId::new(22).unwrap()
-        );
-        assert_eq!(routed_part.part_number, 2);
-        assert_eq!(
-            routed_part.stored_size,
-            5678 + OBJECT_ENCRYPTION_SEGMENT_TAG_LEN as u64
-        );
-        assert_eq!(routed_part.crc64, 0xCCDD);
-        assert_eq!(
-            routed_part.placement_cluster_epoch,
-            ClusterEpoch::new(5).unwrap()
         );
 
         let reclaim = references
