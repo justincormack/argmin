@@ -9945,13 +9945,24 @@ fn bucket_write_drain_contention_maps_to_operation_aborted() {
 }
 
 #[test]
+fn retryable_contention_selects_storage_node_failure_classes() {
+    for failure in [
+        storage::StorageNodeFailureClass::ShardLocationStale,
+        storage::StorageNodeFailureClass::PgRouteUnavailable,
+        storage::StorageNodeFailureClass::MetadataCommandContention,
+        storage::StorageNodeFailureClass::TransportInterrupted,
+    ] {
+        assert!(super::storage_node_failure_is_retryable_contention(failure));
+    }
+    assert!(!super::storage_node_failure_is_retryable_contention(
+        storage::StorageNodeFailureClass::MetadataTransferHistoricalRouteActive
+    ));
+}
+
+#[test]
 fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
     fn resource_exhausted() -> storage::StoreError {
-        storage::StoreError::StorageRpcResourceExhausted {
-            node_id: 1,
-            operation: "test operation",
-            message: "active read handles exceed limit".to_string(),
-        }
+        storage::StoreError::storage_node_resource_exhausted(1, "test operation")
     }
 
     fn nested_resource_exhausted() -> storage::StoreError {
@@ -9968,11 +9979,10 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
             node_id: 1,
             pg_id: 2,
             cluster_epoch: storage::ClusterEpoch::INITIAL,
-            source: Box::new(storage::StoreError::StorageRpcShardDeleteInProgress {
-                node_id: 1,
-                operation: "shard delete",
-                message: "shard delete fenced by read handle".to_string(),
-            }),
+            source: Box::new(storage::StoreError::storage_node_shard_delete_in_progress(
+                1,
+                "shard delete",
+            )),
         }
     }
 
@@ -10059,30 +10069,6 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
         cluster_epoch: storage::ClusterEpoch::INITIAL,
         state: PgState::Peering,
     });
-    assert_maps_to_operation_aborted(storage::StoreError::StorageRpc {
-        node_id: 1,
-        operation: "test operation",
-        code: storage::StorageRpcErrorCode::InactivePgRoute,
-        message: "PG 2 is Peering".to_string(),
-    });
-    assert_maps_to_operation_aborted(storage::StoreError::StorageRpc {
-        node_id: 1,
-        operation: "test operation",
-        code: storage::StorageRpcErrorCode::MetadataCommandContention,
-        message: "metadata command contention during bucket delete begin".to_string(),
-    });
-    assert_maps_to_operation_aborted(storage::StoreError::StorageRpc {
-        node_id: 1,
-        operation: "read storage RPC response",
-        code: storage::StorageRpcErrorCode::TransportTimeout,
-        message: "storage RPC stream I/O error: timed out".to_string(),
-    });
-    assert_maps_to_operation_aborted(storage::StoreError::StorageRpc {
-        node_id: 1,
-        operation: "read storage RPC response",
-        code: storage::StorageRpcErrorCode::TransportClosed,
-        message: "storage RPC stream I/O error: early eof".to_string(),
-    });
     assert_maps_to_operation_aborted(storage::StoreError::ShardStore {
         node_id: 1,
         pg_id: 2,
@@ -10099,17 +10085,6 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
             cluster_epoch: storage::ClusterEpoch::INITIAL,
             valid_until_ms: 1_000,
             now_ms: 1_001,
-        }),
-    });
-    assert_maps_to_operation_aborted(storage::StoreError::ShardStore {
-        node_id: 1,
-        pg_id: 2,
-        cluster_epoch: storage::ClusterEpoch::INITIAL,
-        source: Box::new(storage::StoreError::StorageRpc {
-            node_id: 1,
-            operation: "shard write",
-            code: storage::StorageRpcErrorCode::StaleShardLocation,
-            message: "request route epoch is stale".to_string(),
         }),
     });
     assert!(matches!(
@@ -10145,11 +10120,11 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
 }
 
 fn injected_stale_shard_location() -> storage::StoreError {
-    storage::StoreError::StorageRpc {
+    storage::StoreError::StaleShardLocation {
         node_id: 0,
-        operation: "injected payload shard write",
-        code: storage::StorageRpcErrorCode::StaleShardLocation,
-        message: "injected stale shard location".to_string(),
+        pg_id: 0,
+        location_epoch: storage::ClusterEpoch::INITIAL,
+        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
     }
 }
 
@@ -10245,11 +10220,10 @@ fn get_object_payload_read_resource_exhaustion_maps_to_slow_down() {
 
     let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
         |location, _shard_key| {
-            Err(storage::StoreError::StorageRpcResourceExhausted {
-                node_id: location.node_id().as_u32(),
-                operation: "read payload shard",
-                message: "test injected shard-read overload".to_string(),
-            })
+            Err(storage::StoreError::storage_node_resource_exhausted(
+                location.node_id().as_u32(),
+                "read payload shard",
+            ))
         },
     ));
 
@@ -10303,11 +10277,10 @@ fn get_object_range_payload_read_resource_exhaustion_maps_to_slow_down() {
 
     let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
         |location, _shard_key| {
-            Err(storage::StoreError::StorageRpcResourceExhausted {
-                node_id: location.node_id().as_u32(),
-                operation: "read payload shard",
-                message: "test injected range shard-read overload".to_string(),
-            })
+            Err(storage::StoreError::storage_node_resource_exhausted(
+                location.node_id().as_u32(),
+                "read payload shard",
+            ))
         },
     ));
 
@@ -10364,11 +10337,10 @@ fn get_object_part_payload_read_resource_exhaustion_maps_to_slow_down() {
 
     let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
         |location, _shard_key| {
-            Err(storage::StoreError::StorageRpcResourceExhausted {
-                node_id: location.node_id().as_u32(),
-                operation: "read payload shard",
-                message: "test injected multipart-part shard-read overload".to_string(),
-            })
+            Err(storage::StoreError::storage_node_resource_exhausted(
+                location.node_id().as_u32(),
+                "read payload shard",
+            ))
         },
     ));
 
@@ -10423,11 +10395,10 @@ fn copy_object_source_payload_read_resource_exhaustion_maps_to_slow_down() {
 
     let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
         |location, _shard_key| {
-            Err(storage::StoreError::StorageRpcResourceExhausted {
-                node_id: location.node_id().as_u32(),
-                operation: "read payload shard",
-                message: "test injected copy source overload".to_string(),
-            })
+            Err(storage::StoreError::storage_node_resource_exhausted(
+                location.node_id().as_u32(),
+                "read payload shard",
+            ))
         },
     ));
 
@@ -10500,11 +10471,10 @@ fn upload_part_copy_source_payload_read_resource_exhaustion_maps_to_slow_down() 
 
     let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
         |location, _shard_key| {
-            Err(storage::StoreError::StorageRpcResourceExhausted {
-                node_id: location.node_id().as_u32(),
-                operation: "read payload shard",
-                message: "test injected upload-part-copy source overload".to_string(),
-            })
+            Err(storage::StoreError::storage_node_resource_exhausted(
+                location.node_id().as_u32(),
+                "read payload shard",
+            ))
         },
     ));
 
@@ -10574,11 +10544,10 @@ fn upload_part_copy_range_source_payload_read_resource_exhaustion_maps_to_slow_d
 
     let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
         |location, _shard_key| {
-            Err(storage::StoreError::StorageRpcResourceExhausted {
-                node_id: location.node_id().as_u32(),
-                operation: "read payload shard",
-                message: "test injected upload-part-copy range source overload".to_string(),
-            })
+            Err(storage::StoreError::storage_node_resource_exhausted(
+                location.node_id().as_u32(),
+                "read payload shard",
+            ))
         },
     ));
 
@@ -18418,11 +18387,10 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
         Arc::new(move |location, _shard_key| {
             if hook_fail_once.swap(false, Ordering::SeqCst) {
                 hook_failure_injected.store(true, Ordering::SeqCst);
-                return Err(storage::StoreError::StorageRpcResourceExhausted {
-                    node_id: location.node_id().as_u32(),
-                    operation: "repair read payload shard",
-                    message: "test injected transient shard repair read failure".to_string(),
-                });
+                return Err(storage::StoreError::storage_node_resource_exhausted(
+                    location.node_id().as_u32(),
+                    "repair read payload shard",
+                ));
             }
             Ok(())
         }),
@@ -18437,7 +18405,10 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
             .unwrap();
         if repairs.iter().any(|repair| {
             repair.last_error.as_deref().is_some_and(|error| {
-                error.contains("test injected transient shard repair read failure")
+                error.contains(
+                    "storage-node repair read payload shard on node 0 exhausted resources: \
+                     storage-node diagnostic redacted",
+                )
             })
         }) {
             break;

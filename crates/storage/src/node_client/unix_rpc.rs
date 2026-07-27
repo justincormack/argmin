@@ -1658,11 +1658,11 @@ impl UnixStorageNodeClient {
                 Err(StoreError::StorageRpcResourceExhausted {
                     node_id: self.node_id.as_u32(),
                     operation: kind.operation_name(),
-                    message: format!(
+                    detail: crate::StorageNodeFailureDetail::new(format!(
                     "storage-node client RPC admission limit {} is exhausted after waiting {} ms",
                     self.rpc_admission.limit,
                     wait_timeout.as_millis()
-                ),
+                )),
                 })
             }
         }
@@ -1724,8 +1724,8 @@ impl UnixStorageNodeClient {
         StoreError::StorageRpc {
             node_id: self.node_id.as_u32(),
             operation,
-            code: StorageRpcErrorCode::PayloadDecode,
-            message,
+            failure: StorageRpcErrorCode::PayloadDecode,
+            detail: crate::StorageNodeFailureDetail::new(message),
         }
     }
 }
@@ -1813,8 +1813,10 @@ impl UnixStorageNodeClient {
         let limit = u32::try_from(limit).map_err(|_| StoreError::StorageRpc {
             operation: "metadata command checkpoint candidates",
             node_id: self.node_id.as_u32(),
-            code: StorageRpcErrorCode::PayloadDecode,
-            message: format!("checkpoint candidate limit {limit} exceeds u32::MAX"),
+            failure: StorageRpcErrorCode::PayloadDecode,
+            detail: crate::StorageNodeFailureDetail::new(format!(
+                "checkpoint candidate limit {limit} exceeds u32::MAX"
+            )),
         })?;
         let request = StorageRpcMetadataCommandCheckpointCandidatesRequest {
             node_id: self.node_id,

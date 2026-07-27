@@ -229,7 +229,7 @@ Initial ownership assessment:
 | --- | --- | --- |
 | PG schema and physical PG/shard layout | `storage` | SQL and the driver are now private to `PgStore`; remove SQLite magic, `metadata.db`, `pg-NNNN`, direct fsync, and raw shard-layout knowledge from `argmin-s3`. |
 | Metadata command log, checkpoints, and canonical metadata digests | `storage` | Codecs are largely crate-private; inventory every embedded nested format and keep recovery/corruption tests local. |
-| Storage-node RPC | `storage` | The main codec is crate-private and `StorageNodeServer` is the model facade; stop exporting `StorageRpcErrorCode` for higher-layer retry matching. |
+| Storage-node RPC | `storage` | The main codec and wire error codes are private; `StorageNodeServer`, `StoreError`, and `StorageNodeFailureClass` form the logical facade. Remaining work is ALPN/TLS profile containment. |
 | Control-plane durable state, RPC, and auth envelope | `storage` | Replace raw frame transports and binary-owned request verification/response framing with a storage-controlled client/server facade. |
 | Raft peer protocol, restart artifact, and WAL | `storage` | Hide raw frame decoders, framing helpers, WAL records/files, and layout helpers; move direct WAL construction tests into storage. |
 | Object user/system metadata blobs | `server-core` | Keep storage's carriers opaque; make serialization entry points crate-private unless another owner has a demonstrated need to interpret them. |
@@ -281,21 +281,25 @@ The public boundary and containment status for each surface are as follows.
   authentication, dispatch, and server accept loops for both Unix and TLS/TCP transports. The
   binary supplies endpoint, listener, TLS, credential, and lifecycle configuration and invokes
   `serve_forever()`; it does not handle storage-node frames.
-- The remaining wire leak is `StorageRpcErrorCode`. `StoreError::StorageRpc` publicly carries
-  that wire discriminant, and both `server-core` and `argmin-s3` match its variants to decide
-  metadata contention, route refresh, background deferral, and transport retry. Those callers
-  also construct wire-coded errors in tests. Wire-to-semantic translation is therefore not
-  complete even though the main codec is crate-private.
+- The wire-error containment slice is complete. `StorageRpcErrorCode` is now a crate-private
+  alias for the opaque `StorageNodeFailure`; only storage can construct or match its protocol
+  values. `StoreError::storage_node_failure_class()` maps transient cases to the public semantic
+  `StorageNodeFailureClass`, leaving `server-core` and `argmin-s3` to select their own retry
+  policies without knowing wire codes. Remote diagnostic text is retained only in the opaque
+  `StorageNodeFailureDetail`; its public `Debug` and `Display` are redacted, and generic storage
+  failures expose one bounded diagnostic kind rather than their wire-specific identity.
+  Raw-code mapping and redaction tests are storage-owned, caller policies use exhaustive matches
+  over the semantic enum, and the repository boundary check prevents wire types, opaque
+  diagnostic values, or their fields from being used outside storage.
 - `storage_rpc_transport` also publicly exposes the protocol ALPN and generic stream traits even
   though no external production caller uses the stream traits. `argmin-s3` constructs Rustls
   configurations with `argmin-storage-rpc/1` directly and tests the literal protocol profile.
   Endpoint/listener configuration is a valid public input, but ALPN selection and validation are
   protocol representation and must move behind storage-owned TLS endpoint constructors.
-- Retry policy is currently split. Storage maps transport failures and remote codes into
-  `StoreError`, and some storage-internal callers classify them, but equivalent wire-code matches
-  are duplicated in `server-core` and `argmin-s3`. The owner must expose semantic error variants
-  or operation-appropriate classification methods; callers must not infer retryability from a
-  wire code, I/O context string, or remote message.
+- Retry policy remains intentionally caller-owned while representation translation is
+  storage-owned. `server-core` and `argmin-s3` make exhaustive decisions over
+  `StorageNodeFailureClass`; storage-internal protocol handling alone may inspect wire codes or
+  retained remote diagnostic text.
 - Raw codec, malformed-frame, authentication, client, and server tests are already in `storage`.
   Cross-crate S3/process tests mostly use logical storage operations. The remaining
   `argmin-s3` ALPN/endpoint-shape tests should use typed configuration and leave protocol-profile
@@ -368,19 +372,16 @@ The public boundary and containment status for each surface are as follows.
 This completes the RPC inventory only; it does not satisfy Phase 1 containment. The bounded
 implementation order is:
 
-1. Translate storage-node wire errors fully inside `storage`, expose the semantic
-   classifications required by callers, remove the public `StorageRpcErrorCode` re-export, and
-   relocate tests that construct wire-coded `StoreError` values.
-2. Replace the control-plane raw client frame-transport extension with storage-owned Unix and
+1. Replace the control-plane raw client frame-transport extension with storage-owned Unix and
    TLS/TCP endpoint configuration. Keep static-manifest parsing in `argmin-s3`, but hide frames,
    ALPN, request-sent tracking, and transport error construction.
-3. Add a storage-owned control-plane server facade that accepts listener, resource-limit,
+2. Add a storage-owned control-plane server facade that accepts listener, resource-limit,
    authentication, authority-clock, and durability-publication configuration while owning TLS,
    frame admission, verification, dispatch, response framing, and transport diagnostics.
-4. Replace the Raft raw client frame transport with storage-owned peer endpoint configuration,
+3. Replace the Raft raw client frame transport with storage-owned peer endpoint configuration,
    then add a storage-owned peer server facade that preserves the existing pre-auth allocation
    bound and durability-before-ack invariant.
-5. Make raw control-plane/Raft frame, auth-envelope, ALPN, OpenRaft-handle, and transport-error
+4. Make raw control-plane/Raft frame, auth-envelope, ALPN, OpenRaft-handle, and transport-error
    APIs private after callers and protocol tests have moved. Add repository checks for the
    concrete leaks only after the replacement facades exist.
 
@@ -534,20 +535,17 @@ implementation-error matching. These remain explicit work below.
 
 ## Immediate Next Steps
 
-1. Remove the public `StorageRpcErrorCode` boundary by translating wire failures into
-   storage-owned semantic errors and classifications before they reach `server-core` or
-   `argmin-s3`.
-2. Replace the raw control-plane client frame transport with storage-owned Unix and TLS/TCP
+1. Replace the raw control-plane client frame transport with storage-owned Unix and TLS/TCP
    endpoint configuration.
-3. Move control-plane server framing, authentication, admission, dispatch, and transport
+2. Move control-plane server framing, authentication, admission, dispatch, and transport
    diagnostics behind a storage-owned server facade.
-4. Move Raft TLS/TCP client exchange and inbound peer serving behind storage-owned facades,
+3. Move Raft TLS/TCP client exchange and inbound peer serving behind storage-owned facades,
    preserving the pre-auth allocation bound and durability-before-ack invariant.
-5. Privatize the raw control-plane/Raft frame, auth-envelope, ALPN, OpenRaft-handle, and
+4. Privatize the raw control-plane/Raft frame, auth-envelope, ALPN, OpenRaft-handle, and
    transport-error APIs and relocate malformed-wire tests into `storage`.
-6. Hide public WAL/restart-format constructors and move direct WAL/impossible-state tests into
+5. Hide public WAL/restart-format constructors and move direct WAL/impossible-state tests into
    the owner.
-7. Replace other higher-layer matching on database/RPC implementation errors with owner-defined
+6. Replace other higher-layer matching on database/RPC implementation errors with owner-defined
    semantic errors or classification methods.
 8. Inventory and restrict nested durable codecs for metadata, tags, ACLs, and encryption;
    record how containing formats advance when a nested format changes.

@@ -255,7 +255,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
     assert!(matches!(
         active_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::StaleShardLocation,
+            failure: StorageRpcErrorCode::StaleShardLocation,
             ..
         })
     ));
@@ -270,7 +270,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
             &session_id,
         ),
         Err(ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         }))
     ));
@@ -281,7 +281,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
             &wrong_command,
         ),
         Err(BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         }))
     ));
@@ -292,7 +292,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
             &wrong_command,
         ),
         Err(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -615,7 +615,7 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
     assert!(matches!(
         object_error,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::UnknownPg,
+            failure: StorageRpcErrorCode::UnknownPg,
             ..
         })
     ));
@@ -637,7 +637,7 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
     assert!(matches!(
         version_error,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::UnknownPg,
+            failure: StorageRpcErrorCode::UnknownPg,
             ..
         })
     ));
@@ -657,7 +657,7 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
     assert!(matches!(
         upload_error,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::UnknownPg,
+            failure: StorageRpcErrorCode::UnknownPg,
             ..
         })
     ));
@@ -695,7 +695,7 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
     assert!(matches!(
         bucket_stream_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::UnknownPg,
+            failure: StorageRpcErrorCode::UnknownPg,
             ..
         })
     ));
@@ -710,7 +710,7 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
     assert!(matches!(
         all_stream_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::UnknownPg,
+            failure: StorageRpcErrorCode::UnknownPg,
             ..
         })
     ));
@@ -750,7 +750,7 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
         assert!(matches!(
             error,
             BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-                code: StorageRpcErrorCode::UnknownPg,
+                failure: StorageRpcErrorCode::UnknownPg,
                 ..
             })
         ));
@@ -770,7 +770,7 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
         )
         .unwrap_err(),
         StoreError::StorageRpc {
-            code: StorageRpcErrorCode::UnknownPg,
+            failure: StorageRpcErrorCode::UnknownPg,
             ..
         }
     ));
@@ -997,7 +997,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         reservation_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1012,7 +1012,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         version_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1048,7 +1048,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         read_subject_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1066,7 +1066,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         read_snapshot_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1084,7 +1084,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         read_tags_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1109,7 +1109,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         metadata_snapshot_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1157,7 +1157,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         current_delete_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1205,7 +1205,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         specific_delete_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1229,7 +1229,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         lifecycle_list_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1261,7 +1261,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         stream_match_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1284,7 +1284,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         stream_command_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1326,7 +1326,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         multipart_match_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1347,12 +1347,14 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         .unwrap_err();
     match multipart_command_error {
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
-            message,
+            failure: StorageRpcErrorCode::PayloadDecode,
+            detail,
             ..
         }) => {
-            assert!(message.contains("multipart upload command build PG"));
-            assert!(message.contains("does not match object"));
+            assert!(detail
+                .as_str()
+                .contains("multipart upload command build PG"));
+            assert!(detail.as_str().contains("does not match object"));
         }
         other => panic!("wrong-PG multipart command build must fail placement: {other:?}"),
     }
@@ -1374,7 +1376,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         delete_current_command_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1398,7 +1400,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         delete_specific_command_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1424,7 +1426,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         insert_delete_marker_command_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1457,7 +1459,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         mismatched_stale_payload_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1482,7 +1484,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         null_marker_without_snapshot_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1509,7 +1511,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         numbered_marker_with_snapshot_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1534,7 +1536,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         numbered_marker_with_source_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1566,7 +1568,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         null_marker_with_versioned_source_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1601,7 +1603,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
             matches!(
                 error,
                 ObjectPgActionError::Store(StoreError::StorageRpc {
-                    code: StorageRpcErrorCode::PayloadDecode,
+                    failure: StorageRpcErrorCode::PayloadDecode,
                     ..
                 })
             ),
@@ -1628,7 +1630,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         metadata_command_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1645,7 +1647,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         snapshot_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1713,7 +1715,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     assert!(matches!(
         command_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1911,7 +1913,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     assert!(matches!(
         wrong_part_create_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1933,7 +1935,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     assert!(matches!(
         crossed_part_create_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1959,7 +1961,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     assert!(matches!(
         wrong_session_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -1986,7 +1988,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     assert!(matches!(
         wrong_segments_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2011,7 +2013,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     assert!(matches!(
         wrong_snapshot_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2040,7 +2042,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     assert!(matches!(
         wrong_update_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2106,7 +2108,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     assert!(matches!(
         wrong_command_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2129,7 +2131,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     assert!(matches!(
         crossed_put_proof_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2152,7 +2154,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     assert!(matches!(
         substituted_put_proof_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2183,7 +2185,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     assert!(matches!(
         wrong_append_error,
         StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         }
     ));
@@ -2217,7 +2219,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     assert!(matches!(
         wrong_part_snapshot_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2279,7 +2281,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     assert!(matches!(
         wrong_part_command_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2304,7 +2306,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     assert!(matches!(
         crossed_part_proof_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2321,7 +2323,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
             assert!(matches!(
                 $result.unwrap_err(),
                 ObjectPgActionError::Store(StoreError::StorageRpc {
-                    code: StorageRpcErrorCode::PayloadDecode,
+                    failure: StorageRpcErrorCode::PayloadDecode,
                     ..
                 })
             ));
@@ -2332,7 +2334,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
             assert!(matches!(
                 $result.unwrap_err(),
                 BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-                    code: StorageRpcErrorCode::PayloadDecode,
+                    failure: StorageRpcErrorCode::PayloadDecode,
                     ..
                 })
             ));
@@ -3463,11 +3465,11 @@ fn unix_object_mutation_client_rejects_stale_upload_part_stream_command_epoch() 
             err,
             ObjectPgActionError::Store(StoreError::StorageRpc {
                 operation: "object stream upload command build",
-                code: StorageRpcErrorCode::StaleShardLocation,
-                ref message,
+                failure: StorageRpcErrorCode::StaleShardLocation,
+                ref detail,
                 ..
-            }) if message.contains(&format!("request route epoch {stale_epoch}"))
-                && message.contains(&format!("storage-node epoch {}", config.cluster_epoch))
+            }) if detail.as_str().contains(&format!("request route epoch {stale_epoch}"))
+                && detail.as_str().contains(&format!("storage-node epoch {}", config.cluster_epoch))
         ),
         "stale UploadPart stream command-build RPC should fail route validation, got {err:?}"
     );
@@ -3736,7 +3738,7 @@ fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
             assert!(matches!(
                 $result.unwrap_err(),
                 ObjectPgActionError::Store(StoreError::StorageRpc {
-                    code: StorageRpcErrorCode::PayloadDecode,
+                    failure: StorageRpcErrorCode::PayloadDecode,
                     ..
                 })
             ));
@@ -3747,7 +3749,7 @@ fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
             assert!(matches!(
                 $result.unwrap_err(),
                 BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-                    code: StorageRpcErrorCode::PayloadDecode,
+                    failure: StorageRpcErrorCode::PayloadDecode,
                     ..
                 })
             ));
@@ -5185,11 +5187,11 @@ fn unix_object_mutation_client_rejects_stale_stream_part_commit_command_epoch() 
             err,
             ObjectPgActionError::Store(StoreError::StorageRpc {
                 operation: "object stream part commit command build",
-                code: StorageRpcErrorCode::StaleShardLocation,
-                ref message,
+                failure: StorageRpcErrorCode::StaleShardLocation,
+                ref detail,
                 ..
-            }) if message.contains(&format!("request route epoch {stale_epoch}"))
-                && message.contains(&format!("storage-node epoch {}", config.cluster_epoch))
+            }) if detail.as_str().contains(&format!("request route epoch {stale_epoch}"))
+                && detail.as_str().contains(&format!("storage-node epoch {}", config.cluster_epoch))
         ),
         "stale stream-part commit command-build RPC should fail route validation, got {err:?}"
     );

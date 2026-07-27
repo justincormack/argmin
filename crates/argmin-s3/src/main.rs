@@ -84,7 +84,7 @@ use storage::{
     CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgId,
     PgMetadataTransferArtifact, PgMetadataTransferError, PgState, RouteMapValidity, StorageCluster,
-    StorageClusterRuntimeMapHandle, StorageRpcErrorCode, StoreError,
+    StorageClusterRuntimeMapHandle, StorageNodeFailureClass, StoreError,
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
@@ -1686,22 +1686,33 @@ fn metadata_transfer_error_is_transient_route_refresh(error: &PgMetadataTransfer
 }
 
 fn store_error_is_transient_route_refresh_for_metadata_transfer(error: &StoreError) -> bool {
+    if error
+        .storage_node_failure_class()
+        .is_some_and(storage_node_failure_refreshes_metadata_transfer_route)
+    {
+        return true;
+    }
     match error {
         StoreError::RouteMapExpired { .. }
         | StoreError::StaleMetadataOperation { .. }
         | StoreError::StaleMetadataRoute { .. }
         | StoreError::StaleShardLocation { .. } => true,
-        StoreError::StorageRpc { code, .. } => {
-            *code == StorageRpcErrorCode::StaleShardLocation
-                || *code == StorageRpcErrorCode::MetadataTransferHistoricalRouteActive
-                || *code == StorageRpcErrorCode::MetadataCommandContention
-                || *code == StorageRpcErrorCode::TransportTimeout
-                || *code == StorageRpcErrorCode::TransportClosed
-        }
         StoreError::ShardStore { source, .. } => {
             store_error_is_transient_route_refresh_for_metadata_transfer(source)
         }
         _ => false,
+    }
+}
+
+fn storage_node_failure_refreshes_metadata_transfer_route(
+    failure: StorageNodeFailureClass,
+) -> bool {
+    match failure {
+        StorageNodeFailureClass::ShardLocationStale
+        | StorageNodeFailureClass::MetadataCommandContention
+        | StorageNodeFailureClass::MetadataTransferHistoricalRouteActive
+        | StorageNodeFailureClass::TransportInterrupted => true,
+        StorageNodeFailureClass::PgRouteUnavailable => false,
     }
 }
 
@@ -16953,51 +16964,20 @@ mod tests {
     }
 
     #[test]
-    fn metadata_transfer_retry_treats_active_peering_inspection_as_transient() {
-        let error = PgMetadataTransferError::Store(StoreError::StorageRpc {
-            node_id: 0,
-            operation: "metadata command replica state",
-            code: StorageRpcErrorCode::MetadataTransferHistoricalRouteActive,
-            message: "historical peering inspection for PG 0 at epoch 28 requires Peering route, got active".to_string(),
-        });
-
-        assert!(metadata_transfer_error_is_transient_route_refresh(&error));
-    }
-
-    #[test]
-    fn metadata_transfer_retry_treats_transport_timeout_as_transient() {
-        let error = PgMetadataTransferError::Store(StoreError::StorageRpc {
-            node_id: 0,
-            operation: "read storage RPC response",
-            code: StorageRpcErrorCode::TransportTimeout,
-            message: "storage RPC stream I/O error: timed out".to_string(),
-        });
-
-        assert!(metadata_transfer_error_is_transient_route_refresh(&error));
-    }
-
-    #[test]
-    fn metadata_transfer_retry_treats_transport_closed_as_transient() {
-        let error = PgMetadataTransferError::Store(StoreError::StorageRpc {
-            node_id: 0,
-            operation: "read storage RPC response",
-            code: StorageRpcErrorCode::TransportClosed,
-            message: "storage RPC stream I/O error: early eof".to_string(),
-        });
-
-        assert!(metadata_transfer_error_is_transient_route_refresh(&error));
-    }
-
-    #[test]
-    fn metadata_transfer_retry_treats_metadata_command_contention_as_transient() {
-        let error = PgMetadataTransferError::Store(StoreError::StorageRpc {
-            node_id: 2,
-            operation: "metadata command pending envelope",
-            code: StorageRpcErrorCode::MetadataCommandContention,
-            message: "metadata command lock wait for PG 9 exceeded 500ms".to_string(),
-        });
-
-        assert!(metadata_transfer_error_is_transient_route_refresh(&error));
+    fn metadata_transfer_retry_selects_storage_failure_classes() {
+        for failure in [
+            StorageNodeFailureClass::ShardLocationStale,
+            StorageNodeFailureClass::MetadataCommandContention,
+            StorageNodeFailureClass::MetadataTransferHistoricalRouteActive,
+            StorageNodeFailureClass::TransportInterrupted,
+        ] {
+            assert!(storage_node_failure_refreshes_metadata_transfer_route(
+                failure
+            ));
+        }
+        assert!(!storage_node_failure_refreshes_metadata_transfer_route(
+            StorageNodeFailureClass::PgRouteUnavailable
+        ));
     }
 
     #[test]
@@ -17205,18 +17185,6 @@ mod tests {
         assert_eq!(attempts, 2);
         drop(authority);
         std::fs::remove_dir_all(&tmp).unwrap();
-    }
-
-    #[test]
-    fn metadata_transfer_retry_does_not_treat_active_route_mismatch_as_transient() {
-        let error = PgMetadataTransferError::Store(StoreError::StorageRpc {
-            node_id: 0,
-            operation: "metadata command replica state",
-            code: StorageRpcErrorCode::InactivePgRoute,
-            message: "historical peering inspection for PG 0 at epoch 28 requires Peering route, got peering".to_string(),
-        });
-
-        assert!(!metadata_transfer_error_is_transient_route_refresh(&error));
     }
 
     #[test]

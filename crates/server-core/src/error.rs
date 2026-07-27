@@ -530,9 +530,10 @@ impl ServerError {
 
     /// Server-side diagnostic detail for storage RPC failures.
     ///
-    /// Unlike the stable cause labels, this may include the storage RPC
-    /// operation and message. It is intended for local/server logs only, not
-    /// response bodies or customer-visible errors.
+    /// Unlike the stable cause labels, this may include the storage operation.
+    /// Storage-owned wire codes and remote messages remain opaque. This is
+    /// intended for local/server logs only, not response bodies or
+    /// customer-visible errors.
     pub fn server_storage_rpc_detail(&self) -> Option<String> {
         match self {
             Self::Store(error) => store_error_storage_rpc_detail(error),
@@ -964,26 +965,20 @@ fn store_error_storage_rpc_detail(error: &StoreError) -> Option<String> {
             )
         }),
         StoreError::StorageRpc {
-            node_id,
-            operation,
-            code,
-            message,
+            node_id, operation, ..
         } => Some(format!(
-            "storage_rpc node_id={node_id} operation={operation:?} code={code:?} message={message:?}"
+            "storage_node_failure node_id={node_id} operation={operation:?} kind={:?}",
+            error.diagnostic_kind()
         )),
         StoreError::StorageRpcResourceExhausted {
-            node_id,
-            operation,
-            message,
+            node_id, operation, ..
         } => Some(format!(
-            "storage_rpc_resource_exhausted node_id={node_id} operation={operation:?} message={message:?}"
+            "storage_node_resource_exhausted node_id={node_id} operation={operation:?}"
         )),
         StoreError::StorageRpcShardDeleteInProgress {
-            node_id,
-            operation,
-            message,
+            node_id, operation, ..
         } => Some(format!(
-            "storage_rpc_shard_delete_in_progress node_id={node_id} operation={operation:?} message={message:?}"
+            "storage_node_shard_delete_in_progress node_id={node_id} operation={operation:?}"
         )),
         _ => None,
     }
@@ -1150,11 +1145,10 @@ mod tests {
             node_id: 1,
             pg_id: 2,
             cluster_epoch: storage::ClusterEpoch::INITIAL,
-            source: Box::new(StoreError::StorageRpcResourceExhausted {
-                node_id: 1,
-                operation: "ReadHandlesAcquire",
-                message: "limit exceeded".to_string(),
-            }),
+            source: Box::new(StoreError::storage_node_resource_exhausted(
+                1,
+                "ReadHandlesAcquire",
+            )),
         });
         assert_eq!(
             shard_overload.diagnostic_cause_label(),
@@ -1167,19 +1161,20 @@ mod tests {
         let server_detail = shard_overload
             .server_storage_rpc_detail()
             .expect("storage RPC detail should be available server-side");
-        assert!(server_detail.contains("shard_store node_id=1 pg_id=2"));
-        assert!(server_detail.contains("storage_rpc_resource_exhausted"));
-        assert!(server_detail.contains("operation=\"ReadHandlesAcquire\""));
-        assert!(server_detail.contains("message=\"limit exceeded\""));
+        assert_eq!(
+            server_detail,
+            "shard_store node_id=1 pg_id=2 cluster_epoch=1 \
+             source=(storage_node_resource_exhausted node_id=1 \
+             operation=\"ReadHandlesAcquire\")"
+        );
         let converted_overload = ServerError::from(StoreError::ShardStore {
             node_id: 1,
             pg_id: 2,
             cluster_epoch: storage::ClusterEpoch::INITIAL,
-            source: Box::new(StoreError::StorageRpcResourceExhausted {
-                node_id: 1,
-                operation: "ReadHandlesAcquire",
-                message: "limit exceeded".to_string(),
-            }),
+            source: Box::new(StoreError::storage_node_resource_exhausted(
+                1,
+                "ReadHandlesAcquire",
+            )),
         });
         assert!(matches!(converted_overload, ServerError::SlowDown));
 

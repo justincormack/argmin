@@ -128,14 +128,16 @@ pub(super) fn metadata_error_is_command_contention(error: &storage::MetadataErro
 }
 
 fn store_error_is_metadata_command_contention(error: &storage::StoreError) -> bool {
+    if error.storage_node_failure_class()
+        == Some(storage::StorageNodeFailureClass::MetadataCommandContention)
+    {
+        return true;
+    }
     match error {
         storage::StoreError::MetadataCommandContention { .. }
         | storage::StoreError::MetadataCommandLogConflict { .. }
         | storage::StoreError::MetadataCommandLogGap { .. }
         | storage::StoreError::MetadataCommandPendingConflict { .. } => true,
-        storage::StoreError::StorageRpc { code, .. } => {
-            *code == storage::StorageRpcErrorCode::MetadataCommandContention
-        }
         storage::StoreError::ShardStore { source, .. } => {
             store_error_is_metadata_command_contention(source)
         }
@@ -158,6 +160,12 @@ pub(super) fn object_pg_action_error_is_metadata_command_contention(
 }
 
 fn store_error_is_retryable_contention(error: &storage::StoreError) -> bool {
+    if error
+        .storage_node_failure_class()
+        .is_some_and(storage_node_failure_is_retryable_contention)
+    {
+        return true;
+    }
     match error {
         storage::StoreError::MetadataCommandContention { .. }
         | storage::StoreError::MetadataCommandLogConflict { .. }
@@ -173,9 +181,6 @@ fn store_error_is_retryable_contention(error: &storage::StoreError) -> bool {
         | storage::StoreError::StaleShardLocation { .. }
         | storage::StoreError::PgNotActive { .. }
         | storage::StoreError::ShardPgNotActive { .. } => true,
-        storage::StoreError::StorageRpc { code, .. } => {
-            storage_rpc_code_is_retryable_route_state(*code)
-        }
         storage::StoreError::ShardStore { source, .. } => {
             store_error_is_retryable_contention(source)
         }
@@ -183,17 +188,14 @@ fn store_error_is_retryable_contention(error: &storage::StoreError) -> bool {
     }
 }
 
-fn storage_rpc_code_is_retryable_route_state(code: storage::StorageRpcErrorCode) -> bool {
-    matches!(
-        code,
-        storage::StorageRpcErrorCode::StaleShardLocation
-            | storage::StorageRpcErrorCode::InactivePgRoute
-            | storage::StorageRpcErrorCode::NonActingSetAccess
-            | storage::StorageRpcErrorCode::WrongClusterEpoch
-            | storage::StorageRpcErrorCode::MetadataCommandContention
-            | storage::StorageRpcErrorCode::TransportTimeout
-            | storage::StorageRpcErrorCode::TransportClosed
-    )
+fn storage_node_failure_is_retryable_contention(failure: storage::StorageNodeFailureClass) -> bool {
+    match failure {
+        storage::StorageNodeFailureClass::ShardLocationStale
+        | storage::StorageNodeFailureClass::PgRouteUnavailable
+        | storage::StorageNodeFailureClass::MetadataCommandContention
+        | storage::StorageNodeFailureClass::TransportInterrupted => true,
+        storage::StorageNodeFailureClass::MetadataTransferHistoricalRouteActive => false,
+    }
 }
 
 fn store_error_is_resource_exhausted(error: &storage::StoreError) -> bool {

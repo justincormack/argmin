@@ -2730,7 +2730,7 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
     assert!(matches!(
         head_error,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2755,7 +2755,7 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
     assert!(matches!(
         snapshot_error,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2771,7 +2771,7 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
     assert!(matches!(
         pair_error,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2786,7 +2786,7 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
     assert!(matches!(
         destination_pair_error,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2820,7 +2820,7 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
     assert!(matches!(
         create_error,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2845,7 +2845,7 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
         matches!(
             reservation_error,
             BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-                code: StorageRpcErrorCode::PayloadDecode,
+                failure: StorageRpcErrorCode::PayloadDecode,
                 ..
             })
         ),
@@ -2862,7 +2862,7 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
         matches!(
             release_error,
             BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-                code: StorageRpcErrorCode::PayloadDecode,
+                failure: StorageRpcErrorCode::PayloadDecode,
                 ..
             })
         ),
@@ -3001,7 +3001,7 @@ fn unix_bucket_metadata_client_rejects_proof_release_wrong_bucket_pg() {
         err,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
             operation: "proof release",
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -3115,7 +3115,7 @@ fn unix_bucket_write_drain_operations_reject_wrong_bucket_pg_before_access() {
             matches!(
                 &error,
                 BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-                    code: StorageRpcErrorCode::PayloadDecode,
+                    failure: StorageRpcErrorCode::PayloadDecode,
                     ..
                 })
             ),
@@ -3299,7 +3299,7 @@ fn unix_bucket_delete_finalize_claim_operations_reject_wrong_bucket_pg_before_ac
             matches!(
                 &error,
                 BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-                    code: StorageRpcErrorCode::PayloadDecode,
+                    failure: StorageRpcErrorCode::PayloadDecode,
                     ..
                 })
             ),
@@ -3475,7 +3475,7 @@ fn unix_lifecycle_sweep_claim_operations_reject_wrong_bucket_pg_before_access() 
             matches!(
                 &error,
                 BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-                    code: StorageRpcErrorCode::PayloadDecode,
+                    failure: StorageRpcErrorCode::PayloadDecode,
                     ..
                 })
             ),
@@ -3695,7 +3695,7 @@ fn unix_bucket_delete_replica_head_reads_non_primary_acting_replica() {
     assert!(matches!(
         ordinary_error,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::NonActingSetAccess,
+            failure: StorageRpcErrorCode::NonActingSetAccess,
             ..
         })
     ));
@@ -3723,7 +3723,7 @@ fn unix_bucket_delete_replica_head_rejects_missing_historical_authorization() {
     assert!(matches!(
         error,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::StaleShardLocation,
+            failure: StorageRpcErrorCode::StaleShardLocation,
             ..
         })
     ));
@@ -3737,7 +3737,7 @@ fn unix_bucket_delete_replica_head_rejects_wrong_historical_authorization() {
     assert!(matches!(
         error,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            code: StorageRpcErrorCode::StaleShardLocation,
+            failure: StorageRpcErrorCode::StaleShardLocation,
             ..
         })
     ));

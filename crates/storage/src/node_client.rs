@@ -378,19 +378,19 @@ fn storage_rpc_response_error(
         StorageRpcErrorCode::ShardDeleteInProgress => StoreError::StorageRpcShardDeleteInProgress {
             node_id: node_id.as_u32(),
             operation: kind.operation_name(),
-            message: error.message,
+            detail: crate::StorageNodeFailureDetail::new(error.message),
         },
         StorageRpcErrorCode::ResourceExhausted => StoreError::StorageRpcResourceExhausted {
             node_id: node_id.as_u32(),
             operation: kind.operation_name(),
-            message: error.message,
+            detail: crate::StorageNodeFailureDetail::new(error.message),
         },
         StorageRpcErrorCode::NotFound => StoreError::NotFound,
         code => StoreError::StorageRpc {
             node_id: node_id.as_u32(),
             operation: kind.operation_name(),
-            code,
-            message: error.message,
+            failure: code,
+            detail: crate::StorageNodeFailureDetail::new(error.message),
         },
     }
 }
@@ -424,8 +424,8 @@ fn storage_rpc_stream_error(
     StoreError::StorageRpc {
         node_id: node_id.as_u32(),
         operation,
-        code,
-        message: error.to_string(),
+        failure: code,
+        detail: crate::StorageNodeFailureDetail::new(error.to_string()),
     }
 }
 
@@ -1300,8 +1300,10 @@ fn storage_rpc_auth_store_error(
     StoreError::StorageRpc {
         node_id: node_id.as_u32(),
         operation,
-        code: StorageRpcErrorCode::PayloadDecode,
-        message: format!("storage RPC authentication failed: {error:?}"),
+        failure: StorageRpcErrorCode::PayloadDecode,
+        detail: crate::StorageNodeFailureDetail::new(format!(
+            "storage RPC authentication failed: {error:?}"
+        )),
     }
 }
 

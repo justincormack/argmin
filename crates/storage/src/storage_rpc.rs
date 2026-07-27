@@ -798,9 +798,17 @@ pub(crate) enum StorageRpcMessageKind {
     ShardAckHistoricalLoad = 144,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Opaque diagnostic identifying a failure reported by a storage node.
+///
+/// Its wire representation and concrete protocol codes are private to the
+/// storage crate. Callers use [`crate::StorageNodeFailureClass`] when they need
+/// a semantic classification.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct StorageNodeFailure(StorageRpcWireErrorCode);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
-pub enum StorageRpcErrorCode {
+pub(crate) enum StorageRpcWireErrorCode {
     FrameDecode = 1,
     PayloadDecode = 2,
     UnknownNode = 3,
@@ -828,7 +836,47 @@ pub enum StorageRpcErrorCode {
     MultipartConditionalRequestConflict = 25,
 }
 
-impl StorageRpcErrorCode {
+pub(crate) type StorageRpcErrorCode = StorageNodeFailure;
+
+#[allow(non_upper_case_globals)]
+impl StorageNodeFailure {
+    pub(crate) const FrameDecode: Self = Self(StorageRpcWireErrorCode::FrameDecode);
+    pub(crate) const PayloadDecode: Self = Self(StorageRpcWireErrorCode::PayloadDecode);
+    pub(crate) const UnknownNode: Self = Self(StorageRpcWireErrorCode::UnknownNode);
+    pub(crate) const UnknownPg: Self = Self(StorageRpcWireErrorCode::UnknownPg);
+    pub(crate) const WrongClusterEpoch: Self = Self(StorageRpcWireErrorCode::WrongClusterEpoch);
+    pub(crate) const InactivePgRoute: Self = Self(StorageRpcWireErrorCode::InactivePgRoute);
+    pub(crate) const StaleShardLocation: Self = Self(StorageRpcWireErrorCode::StaleShardLocation);
+    pub(crate) const NonActingSetAccess: Self = Self(StorageRpcWireErrorCode::NonActingSetAccess);
+    pub(crate) const UnsupportedOperation: Self =
+        Self(StorageRpcWireErrorCode::UnsupportedOperation);
+    pub(crate) const Internal: Self = Self(StorageRpcWireErrorCode::Internal);
+    pub(crate) const ResourceExhausted: Self = Self(StorageRpcWireErrorCode::ResourceExhausted);
+    pub(crate) const ReclaimClaimNotFound: Self =
+        Self(StorageRpcWireErrorCode::ReclaimClaimNotFound);
+    pub(crate) const ShardDeleteInProgress: Self =
+        Self(StorageRpcWireErrorCode::ShardDeleteInProgress);
+    pub(crate) const BucketWriteDrainConflict: Self =
+        Self(StorageRpcWireErrorCode::BucketWriteDrainConflict);
+    pub(crate) const BucketWriteDrainNotFound: Self =
+        Self(StorageRpcWireErrorCode::BucketWriteDrainNotFound);
+    pub(crate) const ReclaimClaimConflict: Self =
+        Self(StorageRpcWireErrorCode::ReclaimClaimConflict);
+    pub(crate) const NotFound: Self = Self(StorageRpcWireErrorCode::NotFound);
+    pub(crate) const BucketWriteReservationConflict: Self =
+        Self(StorageRpcWireErrorCode::BucketWriteReservationConflict);
+    pub(crate) const BucketWriteReservationNotFound: Self =
+        Self(StorageRpcWireErrorCode::BucketWriteReservationNotFound);
+    pub(crate) const MetadataCommandContention: Self =
+        Self(StorageRpcWireErrorCode::MetadataCommandContention);
+    pub(crate) const MetadataTransferHistoricalRouteActive: Self =
+        Self(StorageRpcWireErrorCode::MetadataTransferHistoricalRouteActive);
+    pub(crate) const TransportTimeout: Self = Self(StorageRpcWireErrorCode::TransportTimeout);
+    pub(crate) const ShardIntegrity: Self = Self(StorageRpcWireErrorCode::ShardIntegrity);
+    pub(crate) const TransportClosed: Self = Self(StorageRpcWireErrorCode::TransportClosed);
+    pub(crate) const MultipartConditionalRequestConflict: Self =
+        Self(StorageRpcWireErrorCode::MultipartConditionalRequestConflict);
+
     fn from_u16(value: u16) -> Result<Self, StorageRpcPayloadError> {
         match value {
             1 => Ok(Self::FrameDecode),
@@ -860,6 +908,26 @@ impl StorageRpcErrorCode {
                 "unknown storage RPC error code",
             )),
         }
+    }
+
+    fn as_u16(self) -> u16 {
+        self.0 as u16
+    }
+
+    pub(crate) fn wire_code(self) -> StorageRpcWireErrorCode {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for StorageNodeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StorageNodeFailure")
+    }
+}
+
+impl std::fmt::Display for StorageNodeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("storage-node failure")
     }
 }
 
@@ -4026,7 +4094,7 @@ pub(crate) fn encode_storage_rpc_error_response(
     }
     let mut out = Vec::new();
     put_u8(&mut out, 1);
-    put_u16(&mut out, error.code as u16);
+    put_u16(&mut out, error.code.as_u16());
     put_string(&mut out, &error.message);
     Ok(out)
 }

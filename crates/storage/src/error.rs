@@ -1,7 +1,9 @@
 /// Storage layer error types.
 use std::path::PathBuf;
 
+#[cfg(test)]
 use crate::storage_rpc::StorageRpcErrorCode;
+use crate::storage_rpc::{StorageNodeFailure, StorageRpcWireErrorCode};
 use crate::types::{ClusterEpoch, PgState};
 
 /// Opaque diagnostic for a failure inside the metadata database implementation.
@@ -37,6 +39,52 @@ impl std::fmt::Display for DatabaseError {
 }
 
 impl std::error::Error for DatabaseError {}
+
+/// Semantic classification of a transient failure reported by a storage node.
+///
+/// The storage RPC wire error code is deliberately not part of this API. Higher
+/// layers may use this classification to make their own retry decisions without
+/// depending on the protocol representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageNodeFailureClass {
+    ShardLocationStale,
+    PgRouteUnavailable,
+    MetadataCommandContention,
+    MetadataTransferHistoricalRouteActive,
+    TransportInterrupted,
+}
+
+/// Opaque diagnostic detail reported by a storage node.
+///
+/// The remote text is retained for storage-owned diagnosis, but its public
+/// formatting is deliberately redacted so it cannot become an API or leak
+/// through an outer error renderer.
+pub struct StorageNodeFailureDetail(Box<str>);
+
+impl StorageNodeFailureDetail {
+    pub(crate) fn new(detail: impl Into<Box<str>>) -> Self {
+        Self(detail.into())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for StorageNodeFailureDetail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self(_retained_detail) = self;
+        formatter.write_str("StorageNodeFailureDetail(<redacted>)")
+    }
+}
+
+impl std::fmt::Display for StorageNodeFailureDetail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self(_retained_detail) = self;
+        formatter.write_str("storage-node diagnostic redacted")
+    }
+}
 
 /// Shard-level storage errors.
 #[derive(Debug, thiserror::Error)]
@@ -118,28 +166,28 @@ pub enum StoreError {
         source: Box<StoreError>,
     },
 
-    #[error("storage RPC {operation} failed on node {node_id} with {code:?}: {message}")]
+    #[error("storage-node {operation} failed on node {node_id}: {detail}")]
     StorageRpc {
         node_id: u32,
         operation: &'static str,
-        code: StorageRpcErrorCode,
-        message: String,
+        failure: StorageNodeFailure,
+        detail: StorageNodeFailureDetail,
     },
 
-    #[error("storage RPC {operation} on node {node_id} exhausted resources: {message}")]
+    #[error("storage-node {operation} on node {node_id} exhausted resources: {detail}")]
     StorageRpcResourceExhausted {
         node_id: u32,
         operation: &'static str,
-        message: String,
+        detail: StorageNodeFailureDetail,
     },
 
     #[error(
-        "storage RPC {operation} on node {node_id} found shard deletion in progress: {message}"
+        "storage-node {operation} on node {node_id} found shard deletion in progress: {detail}"
     )]
     StorageRpcShardDeleteInProgress {
         node_id: u32,
         operation: &'static str,
-        message: String,
+        detail: StorageNodeFailureDetail,
     },
 
     #[error(
@@ -471,6 +519,77 @@ pub enum StoreError {
 }
 
 impl StoreError {
+    /// Construct the semantic resource-exhaustion state without exposing a
+    /// remote storage-node diagnostic.
+    #[must_use]
+    pub fn storage_node_resource_exhausted(node_id: u32, operation: &'static str) -> Self {
+        Self::StorageRpcResourceExhausted {
+            node_id,
+            operation,
+            detail: StorageNodeFailureDetail::new("semantic resource exhaustion"),
+        }
+    }
+
+    /// Construct the semantic shard-deletion state without exposing a remote
+    /// storage-node diagnostic.
+    #[must_use]
+    pub fn storage_node_shard_delete_in_progress(node_id: u32, operation: &'static str) -> Self {
+        Self::StorageRpcShardDeleteInProgress {
+            node_id,
+            operation,
+            detail: StorageNodeFailureDetail::new("semantic shard deletion in progress"),
+        }
+    }
+
+    /// Classify a transient storage-node failure without exposing its wire code.
+    ///
+    /// Nested shard-store failures are unwrapped because callers make retry
+    /// decisions for the logical operation, not for the internal adapter layer.
+    #[must_use]
+    pub fn storage_node_failure_class(&self) -> Option<StorageNodeFailureClass> {
+        match self {
+            Self::ShardStore { source, .. } => source.storage_node_failure_class(),
+            Self::StorageRpc { failure, .. } => match failure.wire_code() {
+                StorageRpcWireErrorCode::StaleShardLocation => {
+                    Some(StorageNodeFailureClass::ShardLocationStale)
+                }
+                StorageRpcWireErrorCode::InactivePgRoute
+                | StorageRpcWireErrorCode::NonActingSetAccess
+                | StorageRpcWireErrorCode::WrongClusterEpoch => {
+                    Some(StorageNodeFailureClass::PgRouteUnavailable)
+                }
+                StorageRpcWireErrorCode::MetadataCommandContention => {
+                    Some(StorageNodeFailureClass::MetadataCommandContention)
+                }
+                StorageRpcWireErrorCode::MetadataTransferHistoricalRouteActive => {
+                    Some(StorageNodeFailureClass::MetadataTransferHistoricalRouteActive)
+                }
+                StorageRpcWireErrorCode::TransportTimeout
+                | StorageRpcWireErrorCode::TransportClosed => {
+                    Some(StorageNodeFailureClass::TransportInterrupted)
+                }
+                StorageRpcWireErrorCode::FrameDecode
+                | StorageRpcWireErrorCode::PayloadDecode
+                | StorageRpcWireErrorCode::UnknownNode
+                | StorageRpcWireErrorCode::UnknownPg
+                | StorageRpcWireErrorCode::UnsupportedOperation
+                | StorageRpcWireErrorCode::Internal
+                | StorageRpcWireErrorCode::ResourceExhausted
+                | StorageRpcWireErrorCode::ReclaimClaimNotFound
+                | StorageRpcWireErrorCode::ShardDeleteInProgress
+                | StorageRpcWireErrorCode::BucketWriteDrainConflict
+                | StorageRpcWireErrorCode::BucketWriteDrainNotFound
+                | StorageRpcWireErrorCode::ReclaimClaimConflict
+                | StorageRpcWireErrorCode::NotFound
+                | StorageRpcWireErrorCode::BucketWriteReservationConflict
+                | StorageRpcWireErrorCode::BucketWriteReservationNotFound
+                | StorageRpcWireErrorCode::ShardIntegrity
+                | StorageRpcWireErrorCode::MultipartConditionalRequestConflict => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Return a bounded diagnostic category suitable for metrics labels.
     #[must_use]
     pub fn diagnostic_kind(&self) -> &'static str {
@@ -493,7 +612,7 @@ impl StoreError {
             Self::PgNotActive { .. } => "pg_not_active",
             Self::ShardPgNotActive { .. } => "shard_pg_not_active",
             Self::ShardStore { source, .. } => source.diagnostic_kind(),
-            Self::StorageRpc { code, .. } => storage_rpc_error_diagnostic_kind(*code),
+            Self::StorageRpc { .. } => "storage_node_failure",
             Self::StorageRpcResourceExhausted { .. } => "storage_rpc_resource_exhausted",
             Self::StorageRpcShardDeleteInProgress { .. } => "storage_rpc_shard_delete_in_progress",
             Self::StalePayloadOperation { .. } => "stale_payload_operation",
@@ -555,44 +674,6 @@ impl StoreError {
             Self::Io { .. } => "io",
             Self::Db { .. } => "db",
             Self::ErasureCoding { .. } => "erasure_coding",
-        }
-    }
-}
-
-fn storage_rpc_error_diagnostic_kind(code: StorageRpcErrorCode) -> &'static str {
-    match code {
-        StorageRpcErrorCode::FrameDecode => "storage_rpc_frame_decode",
-        StorageRpcErrorCode::PayloadDecode => "storage_rpc_payload_decode",
-        StorageRpcErrorCode::UnknownNode => "storage_rpc_unknown_node",
-        StorageRpcErrorCode::UnknownPg => "storage_rpc_unknown_pg",
-        StorageRpcErrorCode::WrongClusterEpoch => "storage_rpc_wrong_cluster_epoch",
-        StorageRpcErrorCode::InactivePgRoute => "storage_rpc_inactive_pg_route",
-        StorageRpcErrorCode::StaleShardLocation => "storage_rpc_stale_shard_location",
-        StorageRpcErrorCode::NonActingSetAccess => "storage_rpc_non_acting_set_access",
-        StorageRpcErrorCode::UnsupportedOperation => "storage_rpc_unsupported_operation",
-        StorageRpcErrorCode::Internal => "storage_rpc_internal",
-        StorageRpcErrorCode::ResourceExhausted => "storage_rpc_resource_exhausted",
-        StorageRpcErrorCode::ReclaimClaimNotFound => "storage_rpc_reclaim_claim_not_found",
-        StorageRpcErrorCode::ShardDeleteInProgress => "storage_rpc_shard_delete_in_progress",
-        StorageRpcErrorCode::BucketWriteDrainConflict => "storage_rpc_bucket_write_drain_conflict",
-        StorageRpcErrorCode::BucketWriteDrainNotFound => "storage_rpc_bucket_write_drain_not_found",
-        StorageRpcErrorCode::ReclaimClaimConflict => "storage_rpc_reclaim_claim_conflict",
-        StorageRpcErrorCode::NotFound => "storage_rpc_not_found",
-        StorageRpcErrorCode::BucketWriteReservationConflict => {
-            "storage_rpc_bucket_write_reservation_conflict"
-        }
-        StorageRpcErrorCode::BucketWriteReservationNotFound => {
-            "storage_rpc_bucket_write_reservation_not_found"
-        }
-        StorageRpcErrorCode::MetadataCommandContention => "storage_rpc_metadata_command_contention",
-        StorageRpcErrorCode::MetadataTransferHistoricalRouteActive => {
-            "storage_rpc_metadata_transfer_historical_route_active"
-        }
-        StorageRpcErrorCode::TransportTimeout => "storage_rpc_transport_timeout",
-        StorageRpcErrorCode::TransportClosed => "storage_rpc_transport_closed",
-        StorageRpcErrorCode::ShardIntegrity => "storage_rpc_shard_integrity",
-        StorageRpcErrorCode::MultipartConditionalRequestConflict => {
-            "storage_rpc_multipart_conditional_request_conflict"
         }
     }
 }
@@ -1119,4 +1200,121 @@ pub enum ObjectPgActionError {
     StaleMultipartCompletionSnapshot,
     #[error("conditional multipart completion conflicts with an object write after initiation")]
     MultipartConditionalRequestConflict,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remote_failure(code: StorageRpcErrorCode) -> StoreError {
+        StoreError::StorageRpc {
+            node_id: 7,
+            operation: "test operation",
+            failure: code,
+            detail: StorageNodeFailureDetail::new("wire diagnostic must not drive caller policy"),
+        }
+    }
+
+    #[test]
+    fn storage_rpc_codes_map_to_semantic_failure_classes_inside_storage() {
+        assert_eq!(
+            remote_failure(StorageRpcErrorCode::StaleShardLocation).storage_node_failure_class(),
+            Some(StorageNodeFailureClass::ShardLocationStale)
+        );
+        for code in [
+            StorageRpcErrorCode::InactivePgRoute,
+            StorageRpcErrorCode::NonActingSetAccess,
+            StorageRpcErrorCode::WrongClusterEpoch,
+        ] {
+            assert_eq!(
+                remote_failure(code).storage_node_failure_class(),
+                Some(StorageNodeFailureClass::PgRouteUnavailable)
+            );
+        }
+        assert_eq!(
+            remote_failure(StorageRpcErrorCode::MetadataCommandContention)
+                .storage_node_failure_class(),
+            Some(StorageNodeFailureClass::MetadataCommandContention)
+        );
+        assert_eq!(
+            remote_failure(StorageRpcErrorCode::MetadataTransferHistoricalRouteActive)
+                .storage_node_failure_class(),
+            Some(StorageNodeFailureClass::MetadataTransferHistoricalRouteActive)
+        );
+        for code in [
+            StorageRpcErrorCode::TransportTimeout,
+            StorageRpcErrorCode::TransportClosed,
+        ] {
+            assert_eq!(
+                remote_failure(code).storage_node_failure_class(),
+                Some(StorageNodeFailureClass::TransportInterrupted)
+            );
+        }
+        for code in [
+            StorageRpcErrorCode::FrameDecode,
+            StorageRpcErrorCode::PayloadDecode,
+            StorageRpcErrorCode::UnknownNode,
+            StorageRpcErrorCode::UnknownPg,
+            StorageRpcErrorCode::UnsupportedOperation,
+            StorageRpcErrorCode::Internal,
+            StorageRpcErrorCode::ResourceExhausted,
+            StorageRpcErrorCode::ReclaimClaimNotFound,
+            StorageRpcErrorCode::ShardDeleteInProgress,
+            StorageRpcErrorCode::BucketWriteDrainConflict,
+            StorageRpcErrorCode::BucketWriteDrainNotFound,
+            StorageRpcErrorCode::ReclaimClaimConflict,
+            StorageRpcErrorCode::NotFound,
+            StorageRpcErrorCode::BucketWriteReservationConflict,
+            StorageRpcErrorCode::BucketWriteReservationNotFound,
+            StorageRpcErrorCode::ShardIntegrity,
+            StorageRpcErrorCode::MultipartConditionalRequestConflict,
+        ] {
+            assert_eq!(remote_failure(code).storage_node_failure_class(), None);
+        }
+    }
+
+    #[test]
+    fn semantic_failure_classification_unwraps_shard_store_context() {
+        let failure = StoreError::ShardStore {
+            node_id: 7,
+            pg_id: 11,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            source: Box::new(remote_failure(StorageRpcErrorCode::TransportClosed)),
+        };
+
+        assert_eq!(
+            failure.storage_node_failure_class(),
+            Some(StorageNodeFailureClass::TransportInterrupted)
+        );
+    }
+
+    #[test]
+    fn storage_node_failure_formatting_and_diagnostics_are_redacted() {
+        const SECRET: &str = "remote storage-node secret diagnostic";
+        let failure = StoreError::StorageRpc {
+            node_id: 7,
+            operation: "test operation",
+            failure: StorageRpcErrorCode::Internal,
+            detail: StorageNodeFailureDetail::new(SECRET),
+        };
+
+        let display = failure.to_string();
+        let debug = format!("{failure:?}");
+        assert!(!display.contains(SECRET));
+        assert!(!debug.contains(SECRET));
+        assert!(!debug.contains("Internal"));
+        assert_eq!(failure.diagnostic_kind(), "storage_node_failure");
+        assert_eq!(
+            remote_failure(StorageRpcErrorCode::TransportClosed).diagnostic_kind(),
+            "storage_node_failure"
+        );
+
+        let exhausted = StoreError::StorageRpcResourceExhausted {
+            node_id: 7,
+            operation: "test operation",
+            detail: StorageNodeFailureDetail::new(SECRET),
+        };
+        assert!(!exhausted.to_string().contains(SECRET));
+        assert!(!format!("{exhausted:?}").contains(SECRET));
+    }
 }

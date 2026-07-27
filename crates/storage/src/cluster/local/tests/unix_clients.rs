@@ -490,7 +490,7 @@ fn unix_object_payload_reclaim_fence_rejects_crossed_claim_authority() {
     assert!(matches!(
         error,
         StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         }
     ));
@@ -517,7 +517,7 @@ fn unix_object_payload_reclaim_fence_rejects_crossed_claim_authority() {
     assert!(matches!(
         error,
         StoreError::StorageRpc {
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         }
     ));

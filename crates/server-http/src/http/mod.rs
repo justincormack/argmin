@@ -8183,11 +8183,7 @@ mod tests {
         );
 
         trace.emit_error(&ServerError::Store(
-            storage::StoreError::StorageRpcResourceExhausted {
-                node_id: 1,
-                operation: "ReadHandlesAcquire",
-                message: "limit exceeded".to_string(),
-            },
+            storage::StoreError::storage_node_resource_exhausted(1, "ReadHandlesAcquire"),
         ));
 
         assert_eq!(trace.status_code, 206);

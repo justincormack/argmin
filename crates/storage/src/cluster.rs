@@ -16154,7 +16154,7 @@ fn metadata_command_checkpoint_record_error_is_stale(error: &StoreError) -> bool
             context: "connect storage-node RPC socket",
             ..
         } => true,
-        StoreError::StorageRpc { code, .. } => {
+        StoreError::StorageRpc { failure: code, .. } => {
             storage_rpc_code_is_retryable_pg_route_error(*code)
                 // Background checkpoint scans can observe intermediate route-map states
                 // while PG metadata transfer is moving between Peering and Active routes.
@@ -16185,41 +16185,46 @@ mod metadata_command_checkpoint_record_error_tests {
             &StoreError::StorageRpc {
                 node_id: 0,
                 operation: "metadata command checkpoint record current",
-                code: StorageRpcErrorCode::MetadataCommandContention,
-                message: "metadata command contention during export metadata command checkpoint"
-                    .to_string(),
+                failure: StorageRpcErrorCode::MetadataCommandContention,
+                detail: crate::StorageNodeFailureDetail::new(
+                    "metadata command contention during export metadata command checkpoint",
+                ),
             },
         ));
         assert!(metadata_command_checkpoint_record_error_is_stale(
             &StoreError::StorageRpc {
                 node_id: 0,
                 operation: "metadata command checkpoint record current",
-                code: StorageRpcErrorCode::UnknownPg,
-                message: "PG 7 is not configured on this storage node".to_string(),
+                failure: StorageRpcErrorCode::UnknownPg,
+                detail: crate::StorageNodeFailureDetail::new(
+                    "PG 7 is not configured on this storage node",
+                ),
             },
         ));
         assert!(metadata_command_checkpoint_record_error_is_stale(
             &StoreError::StorageRpc {
                 node_id: 0,
                 operation: "metadata command replica state",
-                code: StorageRpcErrorCode::MetadataTransferHistoricalRouteActive,
-                message: "historical peering inspection for PG 7 at epoch 42 requires Peering route, got active".to_string(),
+                failure: StorageRpcErrorCode::MetadataTransferHistoricalRouteActive,
+                detail: crate::StorageNodeFailureDetail::new("historical peering inspection for PG 7 at epoch 42 requires Peering route, got active"),
             },
         ));
         assert!(metadata_command_checkpoint_record_error_is_stale(
             &StoreError::StorageRpc {
                 node_id: 0,
                 operation: "metadata command checkpoint record current",
-                code: StorageRpcErrorCode::TransportClosed,
-                message: "storage RPC stream I/O error: early eof".to_string(),
+                failure: StorageRpcErrorCode::TransportClosed,
+                detail: crate::StorageNodeFailureDetail::new(
+                    "storage RPC stream I/O error: early eof",
+                ),
             },
         ));
         assert!(!metadata_command_checkpoint_record_error_is_stale(
             &StoreError::StorageRpc {
                 node_id: 0,
                 operation: "metadata command checkpoint record current",
-                code: StorageRpcErrorCode::Internal,
-                message: "metadata state digest mismatch".to_string(),
+                failure: StorageRpcErrorCode::Internal,
+                detail: crate::StorageNodeFailureDetail::new("metadata state digest mismatch"),
             },
         ));
     }
@@ -16307,16 +16312,18 @@ mod metadata_command_checkpoint_record_error_tests {
             &StoreError::StorageRpc {
                 node_id: 0,
                 operation: "list shard scavenger payload references",
-                code: StorageRpcErrorCode::TransportClosed,
-                message: "storage RPC stream I/O error: early eof".to_string(),
+                failure: StorageRpcErrorCode::TransportClosed,
+                detail: crate::StorageNodeFailureDetail::new(
+                    "storage RPC stream I/O error: early eof",
+                ),
             },
         ));
         assert!(!shard_backfill_candidate_error_is_deferred(
             &StoreError::StorageRpc {
                 node_id: 0,
                 operation: "list shard scavenger payload references",
-                code: StorageRpcErrorCode::PayloadDecode,
-                message: "storage RPC frame checksum mismatch".to_string(),
+                failure: StorageRpcErrorCode::PayloadDecode,
+                detail: crate::StorageNodeFailureDetail::new("storage RPC frame checksum mismatch",),
             },
         ));
     }
@@ -16379,7 +16386,9 @@ fn shard_backfill_candidate_error_is_deferred(error: &StoreError) -> bool {
             context: "connect storage-node RPC socket",
             ..
         } => true,
-        StoreError::StorageRpc { code, .. } => storage_rpc_code_is_retryable_pg_route_error(*code),
+        StoreError::StorageRpc { failure: code, .. } => {
+            storage_rpc_code_is_retryable_pg_route_error(*code)
+        }
         _ => false,
     }
 }
@@ -16571,9 +16580,12 @@ fn placed_segment_recoverable_shard_error(error: ShardIoError) -> Result<(), Sto
             ..
         } => Ok(()),
         ShardIoError::Store {
-            source: StoreError::StorageRpc {
-                operation, code, ..
-            },
+            source:
+                StoreError::StorageRpc {
+                    operation,
+                    failure: code,
+                    ..
+                },
             ..
         } if is_recoverable_remote_shard_read_error(operation, code) => Ok(()),
         ShardIoError::Store {
@@ -16899,7 +16911,7 @@ mod reissue_decision_tests {
             source: StoreError::StorageRpcShardDeleteInProgress {
                 node_id: 5,
                 operation: "read handles acquire",
-                message: "shard is being deleted".to_string(),
+                detail: crate::StorageNodeFailureDetail::new("shard is being deleted"),
             },
         };
 
@@ -16915,7 +16927,7 @@ mod reissue_decision_tests {
             source: StoreError::StorageRpcShardDeleteInProgress {
                 node_id: 5,
                 operation: "shard delete",
-                message: "shard is being deleted".to_string(),
+                detail: crate::StorageNodeFailureDetail::new("shard is being deleted"),
             },
         };
 
@@ -16942,8 +16954,8 @@ mod reissue_decision_tests {
                     source: StoreError::StorageRpc {
                         node_id: 5,
                         operation,
-                        code,
-                        message,
+                        failure: code,
+                        detail: crate::StorageNodeFailureDetail::new(message),
                     },
                 };
 
@@ -16978,8 +16990,8 @@ mod reissue_decision_tests {
                 source: StoreError::StorageRpc {
                     node_id: 5,
                     operation,
-                    code,
-                    message: message.to_string(),
+                    failure: code,
+                    detail: crate::StorageNodeFailureDetail::new(message),
                 },
             };
 

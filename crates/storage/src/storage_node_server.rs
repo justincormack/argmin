@@ -1487,7 +1487,7 @@ fn maybe_emit_storage_rpc_error(node_id: NodeId, kind: StorageRpcMessageKind, pa
         return;
     };
     let rpc_kind = format!("{kind:?}");
-    let error_code = format!("{:?}", error.code);
+    let error_code = format!("{:?}", error.code.wire_code());
     let _ = observability::emit_storage_rpc_error(
         "storage",
         observability::StorageRpcErrorSummary {
@@ -22194,7 +22194,7 @@ mod tests {
             matches!(
                 &drain_error,
                 BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-                    code: StorageRpcErrorCode::StaleShardLocation,
+                    failure: StorageRpcErrorCode::StaleShardLocation,
                     ..
                 })
             ),
@@ -22215,7 +22215,7 @@ mod tests {
             matches!(
                 &pending_error,
                 StoreError::StorageRpc {
-                    code: StorageRpcErrorCode::StaleShardLocation,
+                    failure: StorageRpcErrorCode::StaleShardLocation,
                     ..
                 }
             ),

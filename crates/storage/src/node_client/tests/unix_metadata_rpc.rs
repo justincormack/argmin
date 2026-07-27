@@ -83,7 +83,7 @@ fn unix_storage_node_client_times_out_waiting_for_response() {
         err,
         StoreError::StorageRpc {
             operation: "read storage RPC response",
-            code: StorageRpcErrorCode::TransportTimeout,
+            failure: StorageRpcErrorCode::TransportTimeout,
             ..
         }
     ));
@@ -105,7 +105,7 @@ fn storage_rpc_stream_closed_maps_to_transport_closed() {
         StoreError::StorageRpc {
             node_id: 7,
             operation: "read storage RPC response",
-            code: StorageRpcErrorCode::TransportClosed,
+            failure: StorageRpcErrorCode::TransportClosed,
             ..
         }
     ));
@@ -120,7 +120,7 @@ fn storage_rpc_stream_closed_maps_to_transport_closed() {
         StoreError::StorageRpc {
             node_id: 7,
             operation: "read storage RPC response",
-            code: StorageRpcErrorCode::PayloadDecode,
+            failure: StorageRpcErrorCode::PayloadDecode,
             ..
         }
     ));
@@ -154,7 +154,7 @@ fn unix_storage_node_metadata_session_times_out_waiting_for_response() {
         err,
         StoreError::StorageRpc {
             operation: "read metadata command session RPC response",
-            code: StorageRpcErrorCode::TransportTimeout,
+            failure: StorageRpcErrorCode::TransportTimeout,
             ..
         }
     ));
@@ -849,9 +849,9 @@ fn unix_storage_node_client_rejects_active_metadata_transfer_checkpoint_base_ins
         err,
         StoreError::StorageRpc {
             operation: "metadata command transfer checkpoint base install",
-            message,
+            detail,
             ..
-        } if message.contains("route is active")
+        } if detail.as_str().contains("route is active")
     ));
 }
 
@@ -901,9 +901,9 @@ fn unix_storage_node_client_rejects_empty_metadata_transfer_adoption() {
         err,
         StoreError::StorageRpc {
             operation: "metadata command transfer state adopt",
-            message,
+            detail,
             ..
-        } if message.contains("requires at least one retained command")
+        } if detail.as_str().contains("requires at least one retained command")
     ));
     let reopened = SharedStorageNode::open_with_default_ec_shape(
         &config.data_dir,
@@ -2251,9 +2251,9 @@ fn unix_storage_node_client_read_into_requires_full_shard_buffer() {
         err,
         StoreError::StorageRpc {
             operation: "shard read range",
-            ref message,
+            ref detail,
             ..
-        } if message.contains("expected")
+        } if detail.as_str().contains("expected")
     ));
     let ranged = client
         .read_placed_shard_range(data_pg_id, &key, ack, 0, short.len() as u64)
@@ -2350,9 +2350,9 @@ fn unix_storage_node_delete_fails_while_read_handle_active() {
         err,
         StoreError::StorageRpcResourceExhausted {
             operation: "shard delete",
-            ref message,
+            ref detail,
             ..
-        } if message.contains("active read handles")
+        } if detail.as_str().contains("active read handles")
     ));
 
     session.release_read_handles("protected-read").unwrap();
@@ -2393,8 +2393,8 @@ fn unix_storage_node_rpc_admission_exhaustion_is_typed_before_connect() {
         StoreError::StorageRpcResourceExhausted {
             node_id: 7,
             operation: "shard write",
-            ref message,
-        } if message.contains("admission limit 1")
+            ref detail,
+        } if detail.as_str().contains("admission limit 1")
     ));
     assert!(after.storage_rpc_admission_total > before.storage_rpc_admission_total);
     assert!(after.storage_rpc_admission_timeout_total > before.storage_rpc_admission_timeout_total);
@@ -2463,8 +2463,8 @@ fn unix_storage_node_rpc_admission_is_shared_by_node_and_socket() {
         StoreError::StorageRpcResourceExhausted {
             node_id: 7,
             operation: "shard write",
-            ref message,
-        } if message.contains("admission limit")
+            ref detail,
+        } if detail.as_str().contains("admission limit")
     ));
 }
 
@@ -2485,8 +2485,8 @@ fn unix_storage_node_shard_write_admission_exhausts_before_socket_write() {
         StoreError::StorageRpcResourceExhausted {
             node_id: 7,
             operation: "shard write",
-            ref message,
-        } if message.contains("admission limit 1")
+            ref detail,
+        } if detail.as_str().contains("admission limit 1")
     ));
 }
 
@@ -2507,8 +2507,8 @@ fn unix_storage_node_read_handle_session_admission_exhausts_before_connect() {
         StoreError::StorageRpcResourceExhausted {
             node_id: 7,
             operation: "read handles acquire",
-            ref message,
-        } if message.contains("admission limit 1")
+            ref detail,
+        } if detail.as_str().contains("admission limit 1")
     ));
 }
 
@@ -2529,8 +2529,8 @@ fn unix_storage_node_metadata_session_admission_exhausts_before_connect() {
         StoreError::StorageRpcResourceExhausted {
             node_id: 7,
             operation: "metadata command PG lock acquire",
-            ref message,
-        } if message.contains("admission limit 1")
+            ref detail,
+        } if detail.as_str().contains("admission limit 1")
     ));
 }
 
@@ -2568,7 +2568,7 @@ fn unix_storage_node_metadata_session_lock_contention_returns_typed_error() {
         StoreError::StorageRpc {
             node_id: 7,
             operation: "metadata command PG lock acquire",
-            code: StorageRpcErrorCode::MetadataCommandContention,
+            failure: StorageRpcErrorCode::MetadataCommandContention,
             ..
         }
     ));

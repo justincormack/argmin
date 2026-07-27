@@ -41,6 +41,7 @@ use crate::node_client::{
     BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
     InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
 };
+use crate::storage_rpc::StorageRpcErrorCode;
 use crate::traits::DurableBucketWriteReservationAcquire;
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::traits::PgMetadataStore;
@@ -147,8 +148,8 @@ fn durable_reclaim_scan_requires_route_refresh(error: &StoreError) -> bool {
         StoreError::ShardStore { source, .. } => {
             durable_reclaim_scan_requires_route_refresh(source)
         }
-        StoreError::StorageRpc { code, .. } => matches!(
-            code,
+        StoreError::StorageRpc { failure: code, .. } => matches!(
+            *code,
             StorageRpcErrorCode::StaleShardLocation | StorageRpcErrorCode::WrongClusterEpoch
         ),
         _ => false,
@@ -6538,7 +6539,7 @@ impl super::StorageCluster {
                 | StoreError::StaleMetadataOperation { .. }
                 | StoreError::StaleMetadataRoute { .. },
             ) => false,
-            BucketWriteDrainError::Store(StoreError::StorageRpc { code, .. })
+            BucketWriteDrainError::Store(StoreError::StorageRpc { failure: code, .. })
                 if super::storage_rpc_code_is_retryable_pg_route_error(*code) =>
             {
                 false
@@ -7132,9 +7133,10 @@ impl super::StorageCluster {
             return Err(BucketWriteDrainError::Store(StoreError::StorageRpc {
                 node_id: node_id.as_u32(),
                 operation: "object bucket payload reclaim root",
-                code: StorageRpcErrorCode::Internal,
-                message: "payload reclaim root does not belong to requested object metadata PG"
-                    .to_string(),
+                failure: StorageRpcErrorCode::Internal,
+                detail: crate::StorageNodeFailureDetail::new(
+                    "payload reclaim root does not belong to requested object metadata PG",
+                ),
             }));
         }
         Ok(())
@@ -7943,13 +7945,13 @@ impl super::StorageCluster {
                 return Err(ObjectPgActionError::Store(StoreError::StorageRpc {
                     node_id: node_id.as_u32(),
                     operation: "validate bucket list response",
-                    code: StorageRpcErrorCode::Internal,
-                    message: format!(
+                    failure: StorageRpcErrorCode::Internal,
+                    detail: crate::StorageNodeFailureDetail::new(format!(
                         "bucket {} belongs to bucket PG {}, not response PG {}",
                         bucket.name.as_str(),
                         expected_pg_id,
                         pg_id.get()
-                    ),
+                    )),
                 }));
             }
         }

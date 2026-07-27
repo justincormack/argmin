@@ -125,11 +125,11 @@ impl UnixStorageNodeClient {
                             "shard object payload lease acquire"
                         }
                     },
-                    message: format!(
+                    detail: crate::StorageNodeFailureDetail::new(format!(
                         "storage-node client object-payload lease session limit {} is exhausted after waiting {} ms",
                         self.rpc_admission.limit,
                         wait_timeout.as_millis()
-                    ),
+                    )),
                 })
             }
         }
@@ -343,8 +343,8 @@ impl UnixStorageNodeReadHandleSession {
         StoreError::StorageRpc {
             node_id: self.node_id.as_u32(),
             operation,
-            code: StorageRpcErrorCode::PayloadDecode,
-            message,
+            failure: StorageRpcErrorCode::PayloadDecode,
+            detail: crate::StorageNodeFailureDetail::new(message),
         }
     }
 }
@@ -461,8 +461,8 @@ impl UnixStorageNodeMetadataCommandSession {
         StoreError::StorageRpc {
             node_id: self.node_id.as_u32(),
             operation,
-            code: StorageRpcErrorCode::PayloadDecode,
-            message,
+            failure: StorageRpcErrorCode::PayloadDecode,
+            detail: crate::StorageNodeFailureDetail::new(message),
         }
     }
 
@@ -1156,8 +1156,10 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
         let limit = u32::try_from(limit).map_err(|_| StoreError::StorageRpc {
             operation: "metadata command checkpoint candidates",
             node_id: self.node_id.as_u32(),
-            code: StorageRpcErrorCode::PayloadDecode,
-            message: format!("checkpoint candidate limit {limit} exceeds u32::MAX"),
+            failure: StorageRpcErrorCode::PayloadDecode,
+            detail: crate::StorageNodeFailureDetail::new(format!(
+                "checkpoint candidate limit {limit} exceeds u32::MAX"
+            )),
         })?;
         let payload = encode_metadata_command_checkpoint_candidates_request(
             &StorageRpcMetadataCommandCheckpointCandidatesRequest {
@@ -2060,8 +2062,8 @@ mod tests {
             StoreError::StorageRpcResourceExhausted {
                 node_id: 7,
                 operation: "shard delete",
-                ref message,
-            } if message.contains("active read handles")
+                ref detail,
+            } if detail.as_str().contains("active read handles")
         ));
 
         let (read_stream, _read_peer) = UnixStream::pair().unwrap();
@@ -2085,8 +2087,8 @@ mod tests {
             StoreError::StorageRpcResourceExhausted {
                 node_id: 8,
                 operation: "read handles acquire",
-                ref message,
-            } if message.contains("session limit")
+                ref detail,
+            } if detail.as_str().contains("session limit")
         ));
 
         let (metadata_stream, _metadata_peer) = UnixStream::pair().unwrap();
@@ -2114,8 +2116,8 @@ mod tests {
             StoreError::StorageRpcResourceExhausted {
                 node_id: 9,
                 operation: "metadata command PG lock acquire",
-                ref message,
-            } if message.contains("session limit")
+                ref detail,
+            } if detail.as_str().contains("session limit")
         ));
 
         let err = StorageRpcErrorResponse {
@@ -2128,8 +2130,8 @@ mod tests {
             StoreError::StorageRpcShardDeleteInProgress {
                 node_id: 9,
                 operation: "metadata command PG lock acquire",
-                ref message,
-            } if message.contains("being deleted")
+                ref detail,
+            } if detail.as_str().contains("being deleted")
         ));
     }
 }

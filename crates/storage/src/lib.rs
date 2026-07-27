@@ -93,7 +93,8 @@ pub use cluster::{
 };
 pub use error::{
     BucketSnapshotLoadError, BucketWriteDrainError, ClusterBuildError, MetadataError,
-    ObjectPgActionError, PgMetadataTransferError, ShardIoError, StoreError,
+    ObjectPgActionError, PgMetadataTransferError, ShardIoError, StorageNodeFailureClass,
+    StorageNodeFailureDetail, StoreError,
 };
 pub use metadata_command::BucketWriteReservationProof;
 #[cfg(test)]
@@ -123,7 +124,7 @@ pub use shard_key_hash::{
     direct_put_segment_key_hash, multipart_part_segment_key_hash, object_key_hash,
     segment_key_hash, stream_segment_key_hash,
 };
-pub use storage_rpc::StorageRpcErrorCode;
+pub use storage_rpc::StorageNodeFailure;
 pub(crate) use storage_rpc_auth::StorageRpcClientAuthConfig;
 pub use storage_rpc_auth::{
     AdminStorageRpcClientCapability, FrontendStorageRpcClientCapability,

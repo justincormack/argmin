@@ -2266,6 +2266,12 @@ fn shard_backfill_admission_class(remaining_tolerance: u8, ec_m: u8) -> Backgrou
 }
 
 fn shard_backfill_error_is_stale_retry(error: &StoreError) -> bool {
+    if error
+        .storage_node_failure_class()
+        .is_some_and(storage_node_failure_is_shard_backfill_stale_retry)
+    {
+        return true;
+    }
     match error {
         StoreError::ShardStore { source, .. } => shard_backfill_error_is_stale_retry(source),
         StoreError::StalePayloadOperation { .. }
@@ -2276,8 +2282,19 @@ fn shard_backfill_error_is_stale_retry(error: &StoreError) -> bool {
         | StoreError::StaleShardOperation { .. }
         | StoreError::StaleShardLocation { .. }
         | StoreError::StorageRpcResourceExhausted { .. } => true,
-        StoreError::StorageRpc { code, .. } => shard_backfill_remote_error_is_stale_retry(*code),
         _ => false,
+    }
+}
+
+fn storage_node_failure_is_shard_backfill_stale_retry(
+    failure: storage::StorageNodeFailureClass,
+) -> bool {
+    match failure {
+        storage::StorageNodeFailureClass::ShardLocationStale
+        | storage::StorageNodeFailureClass::PgRouteUnavailable
+        | storage::StorageNodeFailureClass::TransportInterrupted => true,
+        storage::StorageNodeFailureClass::MetadataCommandContention
+        | storage::StorageNodeFailureClass::MetadataTransferHistoricalRouteActive => false,
     }
 }
 
@@ -2295,18 +2312,6 @@ fn shard_backfill_record_error_event(error: &StoreError) -> &'static str {
     } else {
         "record_error_failed"
     }
-}
-
-fn shard_backfill_remote_error_is_stale_retry(code: storage::StorageRpcErrorCode) -> bool {
-    matches!(
-        code,
-        storage::StorageRpcErrorCode::StaleShardLocation
-            | storage::StorageRpcErrorCode::InactivePgRoute
-            | storage::StorageRpcErrorCode::NonActingSetAccess
-            | storage::StorageRpcErrorCode::TransportTimeout
-            | storage::StorageRpcErrorCode::TransportClosed
-            | storage::StorageRpcErrorCode::WrongClusterEpoch
-    )
 }
 
 fn shard_backfill_queue_depth(storage_cluster: &StorageCluster) -> Option<usize> {
@@ -3863,15 +3868,24 @@ mod tests {
                 }),
             }
         ));
-        assert!(shard_backfill_error_is_stale_retry(
-            &StoreError::StorageRpc {
-                node_id: 2,
-                operation: "shard repair write",
-                code: storage::StorageRpcErrorCode::StaleShardLocation,
-                message: "request route epoch 10 does not match storage-node epoch 11".to_string(),
-            }
-        ));
         assert!(!shard_backfill_error_is_stale_retry(&StoreError::NotFound));
+    }
+
+    #[test]
+    fn shard_backfill_retry_selects_storage_node_failure_classes() {
+        for failure in [
+            storage::StorageNodeFailureClass::ShardLocationStale,
+            storage::StorageNodeFailureClass::PgRouteUnavailable,
+            storage::StorageNodeFailureClass::TransportInterrupted,
+        ] {
+            assert!(storage_node_failure_is_shard_backfill_stale_retry(failure));
+        }
+        for failure in [
+            storage::StorageNodeFailureClass::MetadataCommandContention,
+            storage::StorageNodeFailureClass::MetadataTransferHistoricalRouteActive,
+        ] {
+            assert!(!storage_node_failure_is_shard_backfill_stale_retry(failure));
+        }
     }
 
     #[test]
@@ -3888,34 +3902,16 @@ mod tests {
             shard_backfill_completion_error_event(&StoreError::NotFound),
             "complete_failed"
         );
-        assert_eq!(
-            shard_backfill_completion_error_event(&StoreError::StorageRpc {
-                node_id: 2,
-                operation: "complete placed segment shard backfill claim",
-                code: storage::StorageRpcErrorCode::TransportTimeout,
-                message: "storage RPC stream I/O error: timed out".to_string(),
-            }),
-            "complete_stale"
-        );
-        assert_eq!(
-            shard_backfill_completion_error_event(&StoreError::StorageRpc {
-                node_id: 2,
-                operation: "complete placed segment shard backfill claim",
-                code: storage::StorageRpcErrorCode::TransportClosed,
-                message: "storage RPC stream I/O error: early eof".to_string(),
-            }),
-            "complete_stale"
-        );
     }
 
     #[test]
     fn shard_backfill_record_error_classifies_stale_as_retry() {
         assert_eq!(
-            shard_backfill_record_error_event(&StoreError::StorageRpc {
+            shard_backfill_record_error_event(&StoreError::StaleShardLocation {
                 node_id: 2,
-                operation: "record placed segment shard backfill claim error",
-                code: storage::StorageRpcErrorCode::StaleShardLocation,
-                message: "request route epoch 10 does not match storage-node epoch 11".to_string(),
+                pg_id: 7,
+                location_epoch: storage::ClusterEpoch::INITIAL,
+                current_epoch: storage::ClusterEpoch::new(2).unwrap(),
             }),
             "record_retry"
         );

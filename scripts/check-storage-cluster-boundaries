@@ -2557,6 +2557,26 @@ fail_with_matches \
     "Physical PG directories, metadata-store files, shard trees, and native locks are private to storage" \
     "$storage_layout_leaks"
 
+storage_rpc_wire_error_leaks=$(
+    {
+        rg -n --color=never \
+            '\bStorageRpc(Wire)?ErrorCode\b|\bStorageNodeFailure(Detail)?\b' \
+            . \
+            -g 'crates/**/*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n -U --color=never \
+            'StoreError::StorageRpc(ResourceExhausted|ShardDeleteInProgress)?\s*\{[^}]*(failure|message|detail)\b' \
+            . \
+            -g 'crates/**/*.rs' \
+            -g '!crates/storage/**' \
+            || true
+    }
+)
+fail_with_matches \
+    "Storage-node wire errors and opaque diagnostics are private to storage; use StorageNodeFailureClass" \
+    "$storage_rpc_wire_error_leaks"
+
 if [[ "$failed" -ne 0 ]]; then
     echo
     echo "storage cluster boundary checks failed" >&2
