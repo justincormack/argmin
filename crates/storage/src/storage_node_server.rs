@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -17,7 +17,7 @@ use super::engine::SharedStorageNode;
 use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneHeartbeatRuntimeMapSource,
     ControlPlaneHeartbeatSink, HeartbeatLease, NodeHeartbeat, PendingMetadataCommandObservation,
-    PendingMetadataCommandRecovery, PgRouteSnapshot,
+    PendingMetadataCommandRecovery, PgRouteSnapshot, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
 };
 use crate::control_plane_lease::{
     validate_process_lease_clock, BoundRouteMapLease, CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
@@ -356,6 +356,10 @@ const STORAGE_NODE_MAX_ACTIVE_SESSIONS: usize = 1024;
 const STORAGE_NODE_MAX_READ_OPERATIONS_PER_SESSION: usize = 4096;
 const STORAGE_NODE_MAX_LIVE_READ_OPERATIONS: usize = 16 * 1024;
 const STORAGE_NODE_MAX_LIVE_READ_HANDLE_LOCATIONS: usize = 64 * 1024;
+// The persisted text expands the bounded binary runtime-map representation.
+// Eight times the control-plane frame bound leaves ample room for decimal and
+// hex encoding while keeping corrupt durable input bounded before parsing.
+const CONTROL_PLANE_RUNTIME_CONFIG_MAX_BYTES: usize = CONTROL_PLANE_RPC_MAX_FRAME_BYTES * 8;
 
 extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
@@ -667,10 +671,8 @@ impl StorageNodeProcessConfig {
     ) -> Result<Option<Self>, StorageNodeServerError> {
         let data_dir = data_dir.as_ref();
         let path = control_plane_runtime_config_path(data_dir);
-        let raw = match fs::read_to_string(&path) {
-            Ok(raw) => raw,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(StorageNodeServerError::RuntimeConfigRead { path, source }),
+        let Some(raw) = read_control_plane_runtime_config(&path)? else {
+            return Ok(None);
         };
         let config = decode_control_plane_runtime_config(
             &path,
@@ -730,12 +732,22 @@ impl StorageNodeProcessConfig {
         let path = control_plane_runtime_config_path(&self.data_dir);
         let tmp_path = path.with_extension("tmp");
         let contents = encode_control_plane_runtime_config(self);
-        fs::write(&tmp_path, contents).map_err(|source| {
+        if contents.len() > CONTROL_PLANE_RUNTIME_CONFIG_MAX_BYTES {
+            return Err(runtime_config_invalid(
+                &path,
+                format!(
+                    "encoded runtime config exceeds {CONTROL_PLANE_RUNTIME_CONFIG_MAX_BYTES} bytes"
+                ),
+            ));
+        }
+        let mut tmp_file = create_control_plane_runtime_config_staging_file(&tmp_path)?;
+        tmp_file.write_all(contents.as_bytes()).map_err(|source| {
             StorageNodeServerError::RuntimeConfigWrite {
                 path: tmp_path.clone(),
                 source,
             }
         })?;
+        drop(tmp_file);
         post_write();
         Ok(StagedControlPlaneRuntimeConfig {
             tmp_path,
@@ -899,6 +911,105 @@ fn control_plane_runtime_config_path(data_dir: &Path) -> PathBuf {
     data_dir.join(StorageNodeProcessConfig::CONTROL_PLANE_RUNTIME_CONFIG_FILE)
 }
 
+fn create_control_plane_runtime_config_staging_file(
+    path: &Path,
+) -> Result<File, StorageNodeServerError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::remove_file(path).map_err(|source| StorageNodeServerError::RuntimeConfigWrite {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        }
+        Ok(_) => {
+            return Err(StorageNodeServerError::RuntimeConfigWrite {
+                path: path.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "runtime config staging path is not a regular file",
+                ),
+            });
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(StorageNodeServerError::RuntimeConfigWrite {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    options
+        .open(path)
+        .map_err(|source| StorageNodeServerError::RuntimeConfigWrite {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+fn read_control_plane_runtime_config(
+    path: &Path,
+) -> Result<Option<String>, StorageNodeServerError> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(StorageNodeServerError::RuntimeConfigRead {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|source| StorageNodeServerError::RuntimeConfigRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !metadata.is_file() {
+        return Err(runtime_config_invalid(
+            path,
+            "runtime config is not a regular file",
+        ));
+    }
+    let max_bytes = u64::try_from(CONTROL_PLANE_RUNTIME_CONFIG_MAX_BYTES)
+        .expect("runtime config byte bound fits u64");
+    if metadata.len() > max_bytes {
+        return Err(runtime_config_invalid(
+            path,
+            format!("runtime config exceeds {CONTROL_PLANE_RUNTIME_CONFIG_MAX_BYTES} bytes"),
+        ));
+    }
+    let initial_capacity =
+        usize::try_from(metadata.len()).expect("bounded runtime config file length fits usize");
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| StorageNodeServerError::RuntimeConfigRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > CONTROL_PLANE_RUNTIME_CONFIG_MAX_BYTES {
+        return Err(runtime_config_invalid(
+            path,
+            format!("runtime config exceeds {CONTROL_PLANE_RUNTIME_CONFIG_MAX_BYTES} bytes"),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| runtime_config_invalid(path, "runtime config is not UTF-8"))
+}
+
 fn validate_process_config_matches_persisted_runtime_config(
     config: &StorageNodeProcessConfig,
 ) -> Result<(), StorageNodeServerError> {
@@ -1014,7 +1125,8 @@ fn decode_control_plane_runtime_config(
     }
     let socket_path = parse_labeled_hex_path(path, lines.next(), "socket_path")?;
     let pg_id_count = parse_labeled_usize(path, lines.next(), "pg_ids")?;
-    let mut pg_ids = Vec::with_capacity(pg_id_count);
+    validate_runtime_config_count(path, "pg_ids", pg_id_count, lines.clone().count())?;
+    let mut pg_ids = Vec::new();
     for _ in 0..pg_id_count {
         let line = lines
             .next()
@@ -1026,33 +1138,49 @@ fn decode_control_plane_runtime_config(
         decode_storage_node_routes(path, &mut lines, "historical_pg_routes")?;
     let recovery_count =
         parse_labeled_usize(path, lines.next(), "pending_metadata_command_recoveries")?;
-    let mut pending_metadata_command_recoveries = Vec::with_capacity(recovery_count);
+    validate_runtime_config_count(
+        path,
+        "pending_metadata_command_recoveries",
+        recovery_count,
+        lines.clone().count(),
+    )?;
+    let mut pending_metadata_command_recoveries = Vec::new();
     for _ in 0..recovery_count {
         let line = lines.next().ok_or_else(|| {
             runtime_config_invalid(path, "missing pending metadata command recovery")
         })?;
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() != 5 {
+        let mut fields = line.split_whitespace();
+        let invalid = "invalid pending metadata command recovery";
+        let pg_id = next_runtime_config_field(path, &mut fields, invalid)?;
+        let reporting_node_id = next_runtime_config_field(path, &mut fields, invalid)?;
+        let cluster_epoch = next_runtime_config_field(path, &mut fields, invalid)?;
+        let log_index = next_runtime_config_field(path, &mut fields, invalid)?;
+        let command_checksum = next_runtime_config_field(path, &mut fields, invalid)?;
+        if fields.next().is_some() {
             return Err(runtime_config_invalid(
                 path,
                 "invalid pending metadata command recovery",
             ));
         }
         pending_metadata_command_recoveries.push((
-            PgId::new(parse_u32_field(path, fields[0], "recovery PG id")?),
+            PgId::new(parse_u32_field(path, pg_id, "recovery PG id")?),
             PendingMetadataCommandRecovery::new(
-                NodeId::new(parse_u32_field(path, fields[1], "recovery reporting node")?),
+                NodeId::new(parse_u32_field(
+                    path,
+                    reporting_node_id,
+                    "recovery reporting node",
+                )?),
                 PendingMetadataCommandObservation::new(
-                    parse_cluster_epoch_field(path, fields[2], "recovery command epoch")?,
+                    parse_cluster_epoch_field(path, cluster_epoch, "recovery command epoch")?,
                     std::num::NonZeroU64::new(parse_u64_field(
                         path,
-                        fields[3],
+                        log_index,
                         "recovery command log index",
                     )?)
                     .ok_or_else(|| {
                         runtime_config_invalid(path, "recovery command log index must be nonzero")
                     })?,
-                    parse_u64_field(path, fields[4], "recovery command checksum")?,
+                    parse_u64_field(path, command_checksum, "recovery command checksum")?,
                 ),
             ),
         ));
@@ -1076,47 +1204,79 @@ fn decode_control_plane_runtime_config(
 
 fn decode_storage_node_routes<'a>(
     path: &Path,
-    lines: &mut impl Iterator<Item = &'a str>,
+    lines: &mut std::str::Lines<'a>,
     label: &str,
 ) -> Result<Vec<StorageNodePgRoute>, StorageNodeServerError> {
     let count = parse_labeled_usize(path, lines.next(), label)?;
-    let mut routes = Vec::with_capacity(count);
+    validate_runtime_config_count(path, label, count, lines.clone().count())?;
+    let mut routes = Vec::new();
     for _ in 0..count {
         let line = lines
             .next()
             .ok_or_else(|| runtime_config_invalid(path, format!("missing {label} route")))?;
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() < 5 {
-            return Err(runtime_config_invalid(
-                path,
-                format!("{label} route has too few fields"),
-            ));
-        }
-        let acting_len = parse_usize_field(path, fields[4], "acting set length")?;
-        if fields.len() != 5 + acting_len {
-            return Err(runtime_config_invalid(
-                path,
-                format!("{label} route acting set length mismatch"),
-            ));
-        }
-        let mut acting_set = Vec::with_capacity(acting_len);
-        for field in &fields[5..] {
+        let mut fields = line.split_whitespace();
+        let too_few = format!("{label} route has too few fields");
+        let pg_id = next_runtime_config_field(path, &mut fields, &too_few)?;
+        let cluster_epoch = next_runtime_config_field(path, &mut fields, &too_few)?;
+        let state = next_runtime_config_field(path, &mut fields, &too_few)?;
+        let primary_node_id = next_runtime_config_field(path, &mut fields, &too_few)?;
+        let acting_len = next_runtime_config_field(path, &mut fields, &too_few)?;
+        let acting_len = parse_usize_field(path, acting_len, "acting set length")?;
+        let mut acting_set = Vec::new();
+        for field in fields {
+            if acting_set.len() == acting_len {
+                return Err(runtime_config_invalid(
+                    path,
+                    format!("{label} route acting set length mismatch"),
+                ));
+            }
             acting_set.push(NodeId::new(parse_u32_field(
                 path,
                 field,
                 "acting set node",
             )?));
         }
+        if acting_set.len() != acting_len {
+            return Err(runtime_config_invalid(
+                path,
+                format!("{label} route acting set length mismatch"),
+            ));
+        }
         routes.push(StorageNodePgRoute {
-            pg_id: parse_u32_field(path, fields[0], "route PG id")?,
-            cluster_epoch: parse_cluster_epoch_field(path, fields[1], "route cluster epoch")?,
-            state: pg_state_from_code(parse_u8_field(path, fields[2], "route PG state")?)
+            pg_id: parse_u32_field(path, pg_id, "route PG id")?,
+            cluster_epoch: parse_cluster_epoch_field(path, cluster_epoch, "route cluster epoch")?,
+            state: pg_state_from_code(parse_u8_field(path, state, "route PG state")?)
                 .ok_or_else(|| runtime_config_invalid(path, "invalid route PG state"))?,
-            primary_node_id: NodeId::new(parse_u32_field(path, fields[3], "primary node")?),
+            primary_node_id: NodeId::new(parse_u32_field(path, primary_node_id, "primary node")?),
             acting_set,
         });
     }
     Ok(routes)
+}
+
+fn next_runtime_config_field<'a>(
+    path: &Path,
+    fields: &mut std::str::SplitWhitespace<'a>,
+    missing_message: &str,
+) -> Result<&'a str, StorageNodeServerError> {
+    fields
+        .next()
+        .ok_or_else(|| runtime_config_invalid(path, missing_message))
+}
+
+fn validate_runtime_config_count(
+    path: &Path,
+    label: &str,
+    count: usize,
+    remaining_lines: usize,
+) -> Result<(), StorageNodeServerError> {
+    if count > remaining_lines {
+        return Err(runtime_config_invalid(
+            path,
+            format!("{label} count exceeds remaining runtime config records"),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_labeled_u32(
@@ -18695,6 +18855,26 @@ mod tests {
         assert_eq!(actual.historical_pg_routes, expected.historical_pg_routes);
     }
 
+    fn replace_runtime_config_count(raw: &str, label: &str, count: usize) -> String {
+        let prefix = format!("{label} ");
+        let mut replaced = false;
+        let mut lines: Vec<_> = raw
+            .lines()
+            .map(|line| {
+                if line.starts_with(&prefix) {
+                    assert!(!replaced, "runtime config label must be unique");
+                    replaced = true;
+                    format!("{label} {count}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect();
+        assert!(replaced, "runtime config label must exist");
+        lines.push(String::new());
+        lines.join("\n")
+    }
+
     #[test]
     fn storage_node_process_config_new_rejects_invalid_route_table() {
         let tmp = test_util::tempdir();
@@ -18789,6 +18969,216 @@ mod tests {
             Err(StorageNodeServerError::RuntimeConfigInvalid { message, .. })
                 if message.contains("reserved unbounded sentinel")
         ));
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_rejects_counts_beyond_remaining_records() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let raw = encode_control_plane_runtime_config(&config);
+        let path = tmp.path().join("runtime-config");
+
+        for label in [
+            "pg_ids",
+            "pg_routes",
+            "historical_pg_routes",
+            "pending_metadata_command_recoveries",
+        ] {
+            let malformed = replace_runtime_config_count(&raw, label, usize::MAX);
+            assert!(matches!(
+                decode_control_plane_runtime_config(
+                    &path,
+                    tmp.path().join("node"),
+                    config.default_ec_shape,
+                    &malformed,
+                ),
+                Err(StorageNodeServerError::RuntimeConfigInvalid { message, .. })
+                    if message.contains("count exceeds remaining runtime config records")
+            ));
+        }
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_rejects_overflowing_acting_set_count() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let raw = encode_control_plane_runtime_config(&config);
+        let mut lines: Vec<_> = raw.lines().map(str::to_owned).collect();
+        let route_header = lines.iter().position(|line| line == "pg_routes 1").unwrap();
+        lines[route_header + 1] = format!("0 1 1 7 {} 7", usize::MAX);
+        lines.push(String::new());
+        let malformed = lines.join("\n");
+
+        assert!(matches!(
+            decode_control_plane_runtime_config(
+                &tmp.path().join("runtime-config"),
+                tmp.path().join("node"),
+                config.default_ec_shape,
+                &malformed,
+            ),
+            Err(StorageNodeServerError::RuntimeConfigInvalid { message, .. })
+                if message.contains("acting set length mismatch")
+        ));
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_load_rejects_oversized_file() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        prepare_private_data_dir(&config.data_dir).unwrap();
+        let path = control_plane_runtime_config_path(&config.data_dir);
+        let file = File::create(&path).unwrap();
+        file.set_len(CONTROL_PLANE_RUNTIME_CONFIG_MAX_BYTES as u64 + 1)
+            .unwrap();
+
+        assert!(matches!(
+            StorageNodeProcessConfig::load_control_plane_runtime_config(
+                &config.data_dir,
+                config.node_id,
+                config.default_ec_shape,
+                &config.socket_path,
+            ),
+            Err(StorageNodeServerError::RuntimeConfigInvalid { message, .. })
+                if message.contains("runtime config exceeds")
+        ));
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_load_rejects_symlink() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        prepare_private_data_dir(&config.data_dir).unwrap();
+        let target = tmp.path().join("runtime-config-target");
+        fs::write(&target, encode_control_plane_runtime_config(&config)).unwrap();
+        let path = control_plane_runtime_config_path(&config.data_dir);
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(matches!(
+            StorageNodeProcessConfig::load_control_plane_runtime_config(
+                &config.data_dir,
+                config.node_id,
+                config.default_ec_shape,
+                &config.socket_path,
+            ),
+            Err(StorageNodeServerError::RuntimeConfigRead { .. })
+        ));
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_load_rejects_non_regular_file() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        prepare_private_data_dir(&config.data_dir).unwrap();
+        let path = control_plane_runtime_config_path(&config.data_dir);
+        fs::create_dir(&path).unwrap();
+
+        assert!(matches!(
+            StorageNodeProcessConfig::load_control_plane_runtime_config(
+                &config.data_dir,
+                config.node_id,
+                config.default_ec_shape,
+                &config.socket_path,
+            ),
+            Err(StorageNodeServerError::RuntimeConfigInvalid { message, .. })
+                if message.contains("not a regular file")
+        ));
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_load_rejects_fifo_without_blocking() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        prepare_private_data_dir(&config.data_dir).unwrap();
+        let path = control_plane_runtime_config_path(&config.data_dir);
+        let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path_bytes` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) }, 0);
+        let data_dir = config.data_dir.clone();
+        let socket_path = config.socket_path.clone();
+        let node_id = config.node_id;
+        let default_ec_shape = config.default_ec_shape;
+        let (result_tx, result_rx) = mpsc::channel();
+        let loader = thread::spawn(move || {
+            result_tx
+                .send(StorageNodeProcessConfig::load_control_plane_runtime_config(
+                    data_dir,
+                    node_id,
+                    default_ec_shape,
+                    socket_path,
+                ))
+                .unwrap();
+        });
+
+        let (blocked, result) = match result_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => (false, result),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Unblock a regressed blocking read so the test process can join cleanly.
+                drop(OpenOptions::new().write(true).open(&path).unwrap());
+                (
+                    true,
+                    result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                )
+            }
+            Err(error) => panic!("runtime config loader disconnected: {error}"),
+        };
+        loader.join().unwrap();
+
+        assert!(
+            !blocked,
+            "runtime config FIFO open blocked before validation"
+        );
+        assert!(matches!(
+            result,
+            Err(StorageNodeServerError::RuntimeConfigInvalid { message, .. })
+                if message.contains("not a regular file")
+        ));
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_persistence_rejects_staging_symlink() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        prepare_private_data_dir(&config.data_dir).unwrap();
+        let target = tmp.path().join("staging-symlink-target");
+        fs::write(&target, b"preserve this target").unwrap();
+        let staging_path =
+            control_plane_runtime_config_path(&config.data_dir).with_extension("tmp");
+        std::os::unix::fs::symlink(&target, &staging_path).unwrap();
+
+        let error = config.persist_control_plane_runtime_config().unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageNodeServerError::RuntimeConfigWrite { source, .. }
+                if source.kind() == io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"preserve this target");
+        assert!(fs::symlink_metadata(staging_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_persistence_replaces_stale_regular_staging_file() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        prepare_private_data_dir(&config.data_dir).unwrap();
+        let path = control_plane_runtime_config_path(&config.data_dir);
+        let staging_path = path.with_extension("tmp");
+        fs::write(&staging_path, b"stale crash residue").unwrap();
+
+        config.persist_control_plane_runtime_config().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            encode_control_plane_runtime_config(&config)
+        );
+        assert!(!staging_path.exists());
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
