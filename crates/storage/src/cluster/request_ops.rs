@@ -14257,13 +14257,38 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
-        let object_pg_id = self.object_metadata_pg(bucket, key);
+        self.lookup_multipart_upload_management_with_route_validation(
+            super::MultipartObjectMutationEffectRoute {
+                pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            upload_id,
+            || Ok(()),
+        )
+    }
+
+    pub(super) fn lookup_multipart_upload_management_with_route_validation(
+        &self,
+        route: super::MultipartObjectMutationEffectRoute<'_>,
+        upload_id: &UploadId,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
+        let super::MultipartObjectMutationEffectRoute {
+            pg_id: object_pg_id,
+            bucket,
+            key,
+            effect_fence: _,
+        } = route;
         let pg_id = object_pg_id.pg_id();
+        require_valid_route().map_err(ObjectPgActionError::Store)?;
         // A concurrent terminal command may have removed the active upload on
         // part of the acting set before its object-scoped completion replay is
         // visible everywhere. Finish the durable command before classifying
         // the upload for CompleteMultipartUpload or AbortMultipartUpload.
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+        require_valid_route().map_err(ObjectPgActionError::Store)?;
         self.object_mutation_metadata_primary_client(bucket, key)?
             .lookup_multipart_upload_management(object_pg_id, bucket, key, upload_id)
     }
@@ -14438,27 +14463,49 @@ impl super::StorageCluster {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn abort_authorized_multipart_upload(
         &self,
         authorized_upload: &AuthorizedMultipartUploadRecord,
     ) -> Result<bool, ObjectPgActionError> {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
-        let pg_id = self.object_metadata_pg(bucket, key);
-        self.abort_authorized_multipart_upload_locked(pg_id, authorized_upload)
+        self.abort_authorized_multipart_upload_locked(
+            super::MultipartObjectMutationEffectRoute {
+                pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            authorized_upload,
+            || Ok(()),
+        )
     }
 
-    fn abort_authorized_multipart_upload_locked(
+    pub(super) fn abort_authorized_multipart_upload_locked(
         &self,
-        object_pg_id: ObjectMetadataPgId,
+        route: super::MultipartObjectMutationEffectRoute<'_>,
         authorized_upload: &AuthorizedMultipartUploadRecord,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<bool, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(AbortAuthorizedMultipartUploadLocked);
+        let super::MultipartObjectMutationEffectRoute {
+            pg_id: object_pg_id,
+            bucket,
+            key,
+            effect_fence,
+        } = route;
+        if authorized_upload.record().bucket != *bucket || authorized_upload.record().key != *key {
+            return Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "abort multipart upload",
+                },
+            ));
+        }
         let pg_id = object_pg_id.pg_id();
-        let bucket = &authorized_upload.record().bucket;
-        let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;
         'retry_after_pending_conflict: loop {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if metadata_command_is_matching_multipart_abort(&command, bucket, key, upload_id) {
                     self.apply_exact_pending_object_metadata_command(
@@ -14470,15 +14517,21 @@ impl super::StorageCluster {
                 self.drain_pending_object_metadata_command(pg_id, &command)?;
             }
 
-            let proof = match self.try_acquire_bucket_write_proof_for_object_metadata_command(
-                bucket,
-                key,
-                ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
-                true,
-            )? {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
+            let proof = match self
+                .acquire_bucket_write_proof_for_object_metadata_command_with_effect_fence(
+                    bucket,
+                    key,
+                    ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                    effect_fence,
+                )? {
                 Some(proof) => proof,
                 None => continue 'retry_after_pending_conflict,
             };
+            if let Err(error) = require_valid_route() {
+                self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
+                return Err(ObjectPgActionError::Store(error));
+            }
             let command = match self.prepare_authorized_abort_multipart_upload_command(
                 object_pg_id,
                 authorized_upload,
@@ -14513,7 +14566,12 @@ impl super::StorageCluster {
                 self.metadata_command_apply_test_hook_scope_id(),
             );
             self.maybe_run_before_metadata_command_pending_install_hook();
-            match self.try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command) {
+            match self.try_set_pending_metadata_command_for_bucket_with_effect_fence(
+                pg_id,
+                bucket,
+                &command,
+                Some(effect_fence),
+            ) {
                 Ok(Some(())) => {}
                 Ok(None) | Err(StoreError::MetadataCommandLogConflict { .. }) => {
                     self.release_bucket_write_proof_for_object_metadata_command(&proof)?;

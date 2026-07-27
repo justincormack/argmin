@@ -209,6 +209,9 @@ function update_function_context(line) {
 }
 
 function publisher_helper(line) {
+    if (line ~ /try_set_pending_metadata_command_for_bucket_with_effect_fence\(/) {
+        return "try_set_pending_metadata_command_for_bucket_with_effect_fence"
+    }
     if (line ~ /try_set_pending_metadata_command_for_bucket\(/) {
         return "try_set_pending_metadata_command_for_bucket"
     }
@@ -242,6 +245,7 @@ function publisher_helper(line) {
 function is_install_helper(name) {
     return name == "set_pending_metadata_command_for_bucket" \
         || name == "try_install_pending_metadata_command_for_bucket" \
+        || name == "try_install_pending_metadata_command_for_bucket_with_effect_fence" \
         || name == "try_install_object_pg_pending_command_with_fresh_id" \
         || name == "try_set_object_pg_pending_command_or_drain" \
         || name == "try_install_object_pg_pending_command_or_drain" \
@@ -251,7 +255,8 @@ function is_install_helper(name) {
         || name == "try_set_bucket_control_pending_command_or_retry" \
         || name == "try_set_bucket_control_pending_command_or_retry_with_work_budget" \
         || name == "install_snapshot_sensitive_metadata_command_or_drain" \
-        || name == "try_set_pending_metadata_command_for_bucket"
+        || name == "try_set_pending_metadata_command_for_bucket" \
+        || name == "try_set_pending_metadata_command_for_bucket_with_effect_fence"
 }
 
 FNR == 1 {

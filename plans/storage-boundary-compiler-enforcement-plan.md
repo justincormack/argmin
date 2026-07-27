@@ -3041,6 +3041,46 @@ Sixty-fifth Phase 3 slice:
   family. Other buffered coordinator workflows and capability requirements on
   node-client traits also remain open in Phase 3.
 
+Sixty-sixth Phase 3 slice:
+
+- AbortMultipartUpload now consumes the buffered request's existing
+  `StorageClusterRouteAdmission` from HTTP dispatch through bucket/upload
+  authorization and terminal mutation. Production coordinator code cannot
+  resample the renewable runtime-map handle; direct test/test-support wrappers
+  acquire an admission before entering the same path.
+- `ActiveMultipartObjectRoute` now owns multipart-management lookup and the
+  authorized abort publisher for its fixed bucket, key, object-metadata PG,
+  publication domain, runtime-map generation, and immutable admitted deadline.
+  A crossed-object authorized upload is rejected before mutation.
+- foreground authorized abort acquires its durable bucket-write reservation
+  through the admitted effect fence and carries that same fence to the deepest
+  pending-slot insertion. The current upload row is still compared with the
+  authorized row before command construction; exact installed abort
+  application remains convergence. The unbounded raw authorized-abort wrapper
+  is test/test-hook only, while lifecycle abort retains its distinct recovery
+  authority.
+- the captured-deadline regression renews the same raw route, expires the
+  original admission at pending installation, proves the upload and
+  reservation ownership remain intact, and then proves a fresh admission can
+  abort it. Same-cluster/different-publication-domain and crossed-object
+  regressions prove rejection without mutation.
+- the two existing runtime-map publication races now publish asynchronously,
+  prove publication reaches draining behind the admitted abort at both the
+  bucket-summary and upload-lookup boundaries, and join after the request
+  releases admission. This preserves the original captured-route assertions
+  without a synchronous hook deadlock.
+- the publisher scanner and semantic inventory distinguish effect-fenced
+  pending-slot insertion from the unbounded helper, and the metadata-command
+  and bucket-write-drain guides record the foreground abort boundary.
+- all 1,256 server-core tests, the 58-test storage multipart matrix, focused
+  deadline/domain/crossed-subject tests, formatting, diff validation, the
+  storage boundary checker, and workspace-wide strict Clippy pass. The full
+  parallel workspace suite passes (7,614 tests).
+- CompleteMultipartUpload, ListParts, and the remaining multipart control/read
+  operations remain open for the same capability family. Other buffered
+  coordinator workflows and capability requirements on node-client traits
+  also remain open in Phase 3.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

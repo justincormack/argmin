@@ -3434,14 +3434,16 @@ impl HttpFrontend {
                 let upload_id =
                     parse_required_upload_id(req.query_param_lossy("uploadId").as_deref())?;
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator
-                    .abort_multipart_upload(&multipart_object_request(
+                self.coordinator.abort_multipart_upload_on_admitted_route(
+                    storage_route_admission,
+                    &multipart_object_request(
                         &bucket,
                         &key,
                         upload_id,
                         requester,
                         expected_bucket_owner,
-                    )?)?;
+                    )?,
+                )?;
                 Ok(S3Response::abort_multipart_upload())
             }
             S3Operation::ListMultipartUploads { bucket } => {

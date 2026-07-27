@@ -1166,6 +1166,96 @@ fn multipart_creation_expires_at_pending_install_effect_boundary() {
 }
 
 #[test]
+fn multipart_abort_expires_at_pending_install_effect_boundary() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let metadata = MetadataBlob::new();
+    let create_request = CreateMultipartUploadRequest {
+        object: object_request_with_expected_owner("bucket", "late-abort", test_requester(), None),
+        metadata: &metadata,
+        system_metadata: &SystemMetadata::EMPTY,
+        tags: None,
+        checksum: None,
+        acl: NO_PUT_OBJECT_ACL.into(),
+        policy_context: PutObjectPolicyContext::default(),
+        object_lock: ObjectLockState::default(),
+        encryption: WriteEncryptionRequest::none(),
+    };
+    let upload_id = initial_coord
+        .create_multipart_upload(&create_request)
+        .unwrap()
+        .upload_id;
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
+    drop(initial_coord);
+    drop(initial);
+    let cluster = open_same_store_cluster_with_route_map_validity(
+        same_store_inputs,
+        RouteMapValidity::until_ms(5_000).unwrap(),
+    );
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let request = multipart_object_request_with_expected_owner(
+        "bucket",
+        "late-abort",
+        &upload_id,
+        test_requester(),
+        None,
+    );
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+
+    let hook_clock = Arc::clone(&clock);
+    let hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            hook_clock.set(4_500)
+        }));
+    let error = coord
+        .abort_multipart_upload_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+    assert_eq!(
+        cluster
+            .load_in_progress_multipart_upload(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("late-abort"),
+                &upload_id,
+            )
+            .unwrap()
+            .upload_id,
+        upload_id
+    );
+
+    clock.set(1_000);
+    let fresh_admission = coord.admit_storage_route_for_request().unwrap();
+    coord
+        .abort_multipart_upload_on_admitted_route(&fresh_admission, &request)
+        .unwrap();
+    assert!(matches!(
+        cluster.load_in_progress_multipart_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-abort"),
+            &upload_id,
+        ),
+        Err(storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::NoSuchUpload { .. }
+        ))
+    ));
+}
+
+#[test]
 fn multipart_creation_uses_admitted_lifecycle_snapshot_after_commit_deadline() {
     let tmp = test_util::tempdir();
     let cluster = open_test_storage_cluster(tmp.path(), &[0]);
@@ -2812,7 +2902,7 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
 }
 
 #[test]
-fn multipart_creation_rejects_admission_from_an_unrelated_coordinator() {
+fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator() {
     let tmp = test_util::tempdir();
     let cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
@@ -2874,6 +2964,32 @@ fn multipart_creation_rejects_admission_from_an_unrelated_coordinator() {
         .unwrap();
     assert_eq!(uploads.len(), 1);
     assert_eq!(uploads[0].upload_id, created.upload_id);
+
+    let abort_request = multipart_object_request_with_expected_owner(
+        "bucket",
+        "foreign-domain-multipart",
+        &created.upload_id,
+        test_requester(),
+        None,
+    );
+    let error = local
+        .abort_multipart_upload_on_admitted_route(&foreign_admission, &abort_request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert_eq!(
+        cluster
+            .load_in_progress_multipart_upload(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("foreign-domain-multipart"),
+                &created.upload_id,
+            )
+            .unwrap()
+            .upload_id,
+        created.upload_id
+    );
+    foreign
+        .abort_multipart_upload_on_admitted_route(&foreign_admission, &abort_request)
+        .unwrap();
 }
 
 #[test]
@@ -9011,6 +9127,8 @@ fn abort_multipart_upload_pins_runtime_map_after_auth_lookup() {
         candidate_tmp.path(),
         &[0, 1],
     ));
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -9019,7 +9137,13 @@ fn abort_multipart_upload_pins_runtime_map_after_auth_lookup() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some((bucket.to_string(), "key".to_string())),
         after_abort_multipart_auth_lookup: Some(Arc::new(move || {
-            hook_handle.install(Arc::clone(&candidate)).unwrap();
+            let publishing_handle = hook_handle.clone();
+            let publishing_candidate = Arc::clone(&candidate);
+            let thread = thread::spawn(move || {
+                publishing_handle.install(publishing_candidate).unwrap();
+            });
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
         })),
         ..ReclamationTestHooks::default()
     });
@@ -9032,6 +9156,13 @@ fn abort_multipart_upload_pins_runtime_map_after_auth_lookup() {
             test_requester(),
             None,
         ))
+        .unwrap();
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("AbortMultipartUpload hook should start route publication")
+        .join()
         .unwrap();
 
     handle
@@ -9095,6 +9226,8 @@ fn abort_multipart_upload_pins_runtime_map_after_bucket_summary() {
         candidate_tmp.path(),
         &[0, 1],
     ));
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -9103,7 +9236,13 @@ fn abort_multipart_upload_pins_runtime_map_after_bucket_summary() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some((bucket.to_string(), "key".to_string())),
         after_abort_multipart_bucket_summary: Some(Arc::new(move || {
-            hook_handle.install(Arc::clone(&candidate)).unwrap();
+            let publishing_handle = hook_handle.clone();
+            let publishing_candidate = Arc::clone(&candidate);
+            let thread = thread::spawn(move || {
+                publishing_handle.install(publishing_candidate).unwrap();
+            });
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
         })),
         ..ReclamationTestHooks::default()
     });
@@ -9116,6 +9255,13 @@ fn abort_multipart_upload_pins_runtime_map_after_bucket_summary() {
             test_requester(),
             None,
         ))
+        .unwrap();
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("AbortMultipartUpload hook should start route publication")
+        .join()
         .unwrap();
 
     handle

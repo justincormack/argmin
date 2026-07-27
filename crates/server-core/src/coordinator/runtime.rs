@@ -9,9 +9,8 @@ use s3_types::BucketLifecycleConfiguration;
 #[cfg(test)]
 use storage::PgTopology;
 use storage::{
-    AuthorizedMultipartUploadRecord, BucketDeleteBeginRoot, BucketDeleteFinalizeRoot, BucketInfo,
-    BucketName, EcShape, GenerationId, ObjectEncryption, ObjectKey,
-    PlacedSegmentShardBackfillCandidateEnqueueSummary,
+    BucketDeleteBeginRoot, BucketDeleteFinalizeRoot, BucketInfo, BucketName, EcShape, GenerationId,
+    ObjectEncryption, ObjectKey, PlacedSegmentShardBackfillCandidateEnqueueSummary,
     PlacedSegmentShardBackfillCandidateScanCursor, PlacedSegmentShardBackfillClaimAcquireParams,
     PlacedSegmentShardRepairClaimAcquireParams, ProcessLocalRegistryKey, ReclaimWorkItem,
     SegmentStoredBytesRequest, StorageCluster, StorageClusterRuntimeMapHandle, StoreError,
@@ -3183,15 +3182,6 @@ impl ReadRuntime {
                 upload_id,
                 expected_bucket_incarnation_generation,
             )
-            .map_err(Coordinator::map_object_pg_action_error)
-    }
-
-    pub(super) fn abort_authorized_multipart_upload_internal(
-        &self,
-        upload: &AuthorizedMultipartUploadRecord,
-    ) -> Result<bool, ServerError> {
-        self.storage_node()
-            .abort_authorized_multipart_upload(upload)
             .map_err(Coordinator::map_object_pg_action_error)
     }
 

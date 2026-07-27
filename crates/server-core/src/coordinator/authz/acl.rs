@@ -859,26 +859,31 @@ impl Coordinator {
         &self,
         req: &MultipartObjectRequest<'_>,
     ) -> Result<AuthorizedAbortMultipartUpload, ServerError> {
-        self.authorize_abort_multipart_upload_with_storage_node(&self.storage_node(), req)
+        let admission = self.admit_storage_route_for_request()?;
+        self.authorize_abort_multipart_upload_on_admitted_route(&admission, req)
     }
 
-    pub(in crate::coordinator) fn authorize_abort_multipart_upload_with_storage_node(
+    pub(in crate::coordinator) fn authorize_abort_multipart_upload_on_admitted_route(
         &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &MultipartObjectRequest<'_>,
     ) -> Result<AuthorizedAbortMultipartUpload, ServerError> {
         let bucket = req.object.bucket_name_typed();
         let key = req.object.key_typed();
         let upload_id = req.upload_id();
-        let bucket_info = self.checked_active_bucket_summary_for_storage_node(
-            storage_node,
+        self.require_storage_route_admission(admission)?;
+        let multipart_route = admission
+            .active_multipart_object_route(bucket, key)
+            .map_err(super::super::map_store_error)?;
+        let bucket_info = self.checked_active_bucket_summary_for_admitted_route(
+            admission,
             bucket,
             req.expected_bucket_owner(),
         )?;
         #[cfg(test)]
         super::maybe_run_abort_multipart_bucket_summary_hook(bucket.as_str(), key.as_str());
-        let authorized = match storage_node
-            .lookup_multipart_upload_management(bucket, key, upload_id)
+        let authorized = match multipart_route
+            .lookup_multipart_upload_management(upload_id)
             .map_err(Self::map_object_pg_action_error)?
         {
             storage::MultipartUploadManagementLookup::InProgress(upload) => {

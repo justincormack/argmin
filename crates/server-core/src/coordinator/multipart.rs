@@ -1091,8 +1091,11 @@ impl Coordinator {
     ///
     /// Publishes an abort metadata command, best-effort deletes all part shard
     /// sets, then deletes the upload and part metadata rows.
-    pub fn abort_multipart_upload(&self, req: &MultipartObjectRequest) -> Result<(), ServerError> {
-        let storage_node = self.storage_node();
+    pub fn abort_multipart_upload_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &MultipartObjectRequest,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::abort_multipart_upload",
@@ -1101,12 +1104,16 @@ impl Coordinator {
             req.object.key,
             req.upload_id()
         );
-        match self.authorize_abort_multipart_upload_with_storage_node(&storage_node, req)? {
+        self.require_storage_route_admission(admission)?;
+        let multipart_route = admission
+            .active_multipart_object_route(req.bucket_name_typed(), req.key_typed())
+            .map_err(super::map_store_error)?;
+        match self.authorize_abort_multipart_upload_on_admitted_route(admission, req)? {
             AuthorizedAbortMultipartUpload::Terminal => Ok(()),
             AuthorizedAbortMultipartUpload::InProgress { upload } => {
-                if self
-                    .read_runtime_for_storage_node(std::sync::Arc::clone(&storage_node))
-                    .abort_authorized_multipart_upload_internal(&upload)?
+                if multipart_route
+                    .abort_authorized_multipart_upload(&upload)
+                    .map_err(Self::map_object_pg_action_error)?
                 {
                     Ok(())
                 } else {
@@ -1116,6 +1123,12 @@ impl Coordinator {
                 }
             }
         }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn abort_multipart_upload(&self, req: &MultipartObjectRequest) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.abort_multipart_upload_on_admitted_route(&admission, req)
     }
 
     /// List parts of an in-progress multipart upload.

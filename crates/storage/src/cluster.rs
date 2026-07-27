@@ -74,14 +74,15 @@ use crate::storage_rpc::{
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
 use crate::types::{
-    AclGrants, AdmittedRouteEffectFence, BucketAclSummary, BucketEncryptionConfig, BucketInfo,
-    BucketName, BucketObjectLockConfig, BucketOwnershipControls, BucketSnapshot,
-    BucketSnapshotPair, BucketSnapshotRequest, BucketSubresourceKind, BucketVersioningState,
-    BucketWriteDrainRecord, BucketWriteReservationRecord, CanonicalUserId, ClusterEpoch,
-    CommitDirectPutObjectReq, CreateStreamUploadReq, DeleteCurrentObjectOutcome,
-    DeleteSpecificObjectVersionOutcome, DirectPutCommitSnapshot, DirectPutWrittenSegment, EcShape,
-    FinalizeDirectPutObjectOutcome, GenerationId, InsertCurrentDeleteMarkerOutcome,
-    ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
+    AclGrants, AdmittedRouteEffectFence, AuthorizedMultipartUploadRecord, BucketAclSummary,
+    BucketEncryptionConfig, BucketInfo, BucketName, BucketObjectLockConfig,
+    BucketOwnershipControls, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
+    BucketSubresourceKind, BucketVersioningState, BucketWriteDrainRecord,
+    BucketWriteReservationRecord, CanonicalUserId, ClusterEpoch, CommitDirectPutObjectReq,
+    CreateStreamUploadReq, DeleteCurrentObjectOutcome, DeleteSpecificObjectVersionOutcome,
+    DirectPutCommitSnapshot, DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome,
+    GenerationId, InsertCurrentDeleteMarkerOutcome, ListedBucketMultipartUploads,
+    ListedBucketObjectVersions, ListedBucketObjects, MultipartUploadManagementLookup,
     MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot,
     ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord,
     OwnerIdentity, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
@@ -95,7 +96,7 @@ use crate::types::{
     ShardScavengerObservationRecord, ShardScavengerPayloadReference,
     ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus, StoredObject,
     StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
-    StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
+    StreamUploadTarget, UploadId, VersionId, WriteAck, WrittenShardAck,
 };
 #[cfg(test)]
 use crate::types::{
@@ -2564,6 +2565,35 @@ impl ActiveMultipartObjectRoute<'_> {
                 || self.admission.require_valid_now(),
                 request,
                 action,
+            )
+    }
+
+    /// Resolve one multipart upload for request authorization on this exact
+    /// admitted object route.
+    pub fn lookup_multipart_upload_management(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .lookup_multipart_upload_management_with_route_validation(
+                self.effect_route(),
+                upload_id,
+                || self.admission.require_valid_now(),
+            )
+    }
+
+    /// Abort the exact upload authorized through this admitted object route.
+    pub fn abort_authorized_multipart_upload(
+        &self,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+    ) -> Result<bool, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .abort_authorized_multipart_upload_locked(
+                self.effect_route(),
+                authorized_upload,
+                || self.admission.require_valid_now(),
             )
     }
 }

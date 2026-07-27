@@ -211,7 +211,7 @@ Current production pending-command publishers:
 | `complete_multipart_upload_commit_serialized` | `CommitMultipartObject` | `MatchingOutcomeRetry` | Rebuild completion parts, cleanup snapshot, stale payload, and bucket-PG barrier after unrelated contention. If the contender is the same completion request, finish that exact command through the matching-pending branch and return its computed outcome. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `finalize_upload_part_stream` | `CommitStreamPart` | `TerminalSessionRetry` | Rebuild stream session, MPU row, staged segments, and displaced part refs after unrelated contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching branch can finish it. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `abort_multipart_upload_locked` | `AbortMultipartUpload` | `TerminalSessionRetry` | Rebuild upload, part, active stream session, staged segment, and cleanup snapshots after unrelated contention. If an equivalent abort wins the pending slot, restart without draining so the matching branch returns the successful abort outcome. |
-| `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `TerminalSessionRetry` | Rebuild authorized upload cleanup snapshot after unrelated contention and compare the current upload row to the authorized row before install. If an equivalent abort wins the pending slot, restart without draining so the matching branch returns the successful abort outcome. |
+| `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `TerminalSessionRetry` | Rebuild authorized upload cleanup snapshot after unrelated contention and compare the current upload row to the authorized row before install. The foreground S3 path acquires its reservation and installs its pending command through the request admission's immutable effect fence. If an equivalent abort wins the pending slot, restart without draining so the matching branch returns the successful abort outcome. |
 
 Adding a production call site that creates or installs a pending metadata
 command requires updating this table and the boundary check allowlist. Direct
@@ -317,7 +317,9 @@ Multipart publisher rules:
   Authorized abort must compare the current upload row with the already
   authorized row before publishing; if the row changed, storage returns the
   normal missing/non-abortable outcome instead of applying a stale
-  authorization snapshot.
+  authorization snapshot. Foreground authorized abort also binds reservation
+  acquisition and pending-slot installation to its request admission; raw
+  unbounded authority remains test-only.
 - `complete_multipart_upload_commit_serialized` must reserve completed-MPU
   order through a terminal bucket-PG command before constructing the object-PG
   commit, then reload the object-PG completion snapshot after that order is
