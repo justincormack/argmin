@@ -802,7 +802,10 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
 fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
     let tmp = test_util::tempdir();
     let initial = open_test_storage_cluster(tmp.path(), &[0]);
-    let initial_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    let initial_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
     initial_coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
@@ -824,9 +827,11 @@ fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
     .unwrap();
 
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let cluster = same_store_cluster_with_route_map_validity(
-        &initial,
-        tmp.path(),
+    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
+    drop(initial_coord);
+    drop(initial);
+    let cluster = open_same_store_cluster_with_route_map_validity(
+        same_store_inputs,
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
@@ -4765,6 +4770,24 @@ fn same_store_cluster_with_route_map_validity(
     node_root: &std::path::Path,
     route_map_validity: RouteMapValidity,
 ) -> Arc<StorageCluster> {
+    open_same_store_cluster_with_route_map_validity(
+        capture_same_store_cluster_inputs(initial, node_root),
+        route_map_validity,
+    )
+}
+
+struct SameStoreClusterInputs {
+    configs: Vec<LocalNodeStoreConfig>,
+    routes: Vec<LocalPgRoute>,
+    pg_ids: Vec<u32>,
+    ec_shape: storage::EcShape,
+    cluster_epoch: ClusterEpoch,
+}
+
+fn capture_same_store_cluster_inputs(
+    initial: &StorageCluster,
+    node_root: &std::path::Path,
+) -> SameStoreClusterInputs {
     let node_count = u32::from(initial.default_payload_ec_shape().k)
         + u32::from(initial.default_payload_ec_shape().m);
     let configs = (0..node_count)
@@ -4788,13 +4811,26 @@ fn same_store_cluster_with_route_map_validity(
             LocalPgRoute::from(&route)
         })
         .collect::<Vec<_>>();
+    SameStoreClusterInputs {
+        configs,
+        routes,
+        pg_ids: initial.test_pg_ids().to_vec(),
+        ec_shape: initial.default_payload_ec_shape(),
+        cluster_epoch: initial.cluster_epoch(),
+    }
+}
+
+fn open_same_store_cluster_with_route_map_validity(
+    inputs: SameStoreClusterInputs,
+    route_map_validity: RouteMapValidity,
+) -> Arc<StorageCluster> {
     let mut local_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
         NodeId::new(0),
-        configs,
-        initial.test_pg_ids(),
-        initial.default_payload_ec_shape(),
-        initial.cluster_epoch(),
-        routes,
+        inputs.configs,
+        &inputs.pg_ids,
+        inputs.ec_shape,
+        inputs.cluster_epoch,
+        inputs.routes,
     )
     .unwrap();
     local_map.test_set_route_map_validity(route_map_validity);
