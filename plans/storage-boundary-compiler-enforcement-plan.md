@@ -2927,6 +2927,72 @@ Sixty-third Phase 3 slice:
   validation, the storage boundary checker, and workspace-wide strict Clippy
   pass. The full parallel workspace suite passes (7,592 tests).
 
+Sixty-fourth Phase 3 slice:
+
+- CreateBucket and DeleteBucket now consume the buffered request's existing
+  `StorageClusterRouteAdmission`. Their production HTTP and coordinator paths
+  cannot resample the renewable runtime-map handle after authentication;
+  direct test/test-support wrappers acquire an admission before entering the
+  same production methods.
+- `ActiveBucketRoute` now owns the lifecycle authority for its fixed bucket and
+  bucket-metadata PG. CreateBucket command construction and publication,
+  DeleteBucket's ordinary and preserved-attempt authorization snapshots, its
+  durable bucket-write drain, and its `MarkBucketDeleting` command all remain
+  on that admitted route. The post-mark finalizer enqueue is subject-bound
+  convergence and does not resample a storage route.
+- CreateBucket's legacy-region `AlreadyOwned` ACL rewrite now uses the same
+  admitted route and ordinary fenced ACL publisher. The transitional raw ACL
+  entry point has been removed. Create retries against a deleting bucket use a
+  subject-bound finalization operation before retrying publication.
+- both lifecycle publishers revalidate the admitted route during snapshot and
+  command construction and carry its immutable `AdmittedRouteEffectFence` to
+  pending-slot insertion. DeleteBucket also carries that fence to its earlier
+  durable write-drain acquisition. Expiry before drain insertion leaves no
+  drain or pending command; expiry after a valid drain but before the marker
+  retains the already-authorized drain for the established retry/convergence
+  path while publishing no delete marker.
+- bucket-write-drain begin RPCs now carry the same portable wall-clock effect
+  deadline as reservation and pending-slot insertion RPCs. Storage RPC frame
+  encoding advances to version 8 and rejects version 7. Local, Unix, and
+  TLS/TCP paths validate the fence at the storage effect boundary; the TLS
+  regression uses distinct frontend/storage monotonic origins, proves a valid
+  drain is admitted, and proves an expired request creates no drain row. The
+  per-kind request cap includes the complete optional deadline encoding and an
+  exact maximum-length framed request proves admission at that bound. The
+  lifecycle-claim cap no longer derives from the now-different drain layout;
+  its independent maximum-length framed request is pinned too.
+- the captured-deadline and same-cluster/different-publication-domain matrices
+  now cover both lifecycle operations. Deterministic tests independently expire
+  CreateBucket at pending insertion and DeleteBucket at its drain and marker
+  boundaries, with exact absent-bucket, active-bucket, drain, and pending-slot
+  canaries. A crossed-subject CreateBucket regression also proves that a route
+  for one bucket cannot publish a configuration naming another bucket. The
+  existing DeleteBucket publication race now publishes on a separate thread
+  and proves replacement remains pending until the admitted lifecycle request
+  finishes, avoiding a synchronous test-hook self-deadlock.
+- the new bucket-PG pending-install hook point is limited to callers carrying an
+  admitted effect fence. This preserves the earlier object-PG race-hook timing:
+  an unfenced multipart completion cannot consume its hook during the preceding
+  bucket completion barrier. The publisher registry, contention guide, scanner,
+  and temporary semantic inventories use the route-validating canonical entry
+  points.
+- background recovery continues previously authorized durable DeleteBucket
+  attempts through an explicitly named production convergence entry point.
+  Its adopted-attempt root is opaque outside `storage`: only durable recovery
+  decoding and storage-owned queueing can construct one, while server-core has
+  read-only subject/generation accessors. The raw begin-root enqueue operation
+  is crate-private, with a separately named `test-hooks` wrapper for recovery
+  fixtures, so ordinary callers cannot turn known bucket generations into
+  convergence authority. The unadmitted generic frontend-shaped wrapper
+  remains test-only.
+- focused lifecycle deadline, crossed-subject, portable TLS deadline, and
+  multipart hook-isolation regressions pass. The storage boundary checker,
+  all-target/all-feature build, workspace-wide strict Clippy, formatting, and
+  diff checks pass. The full parallel workspace suite passes (7,603 tests).
+- multipart control operations, other remaining buffered coordinator
+  workflows, and capability requirements on the node-client traits remain
+  open in Phase 3.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

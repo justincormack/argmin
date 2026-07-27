@@ -694,7 +694,7 @@ migrated_bucket_raw_read_bypasses=$(
         if (in_test_hook) {
             next
         }
-        if (current_fn == "load_bucket_delete_authorization_snapshot") {
+        if (current_fn == "load_bucket_delete_authorization_snapshot_with_route_validation") {
             next
         }
         if ($0 ~ /\.storage_client\(\)/) {
@@ -1864,10 +1864,10 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:reserve_put_object_generation:ReservePutObjectGeneration:try_install_object_pg_pending_command_with_fresh_id
 1 crates/storage/src/cluster/request_ops.rs:abort_authorized_multipart_upload_locked:AbortAuthorizedMultipartUploadLocked:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:AbortMultipartUploadLocked:try_set_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete:BeginBucketDelete:try_set_bucket_pg_pending_command_or_retry
+1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete_if_current_with_route_validation:BeginBucketDelete:try_set_bucket_pg_pending_command_or_retry
 1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session_with_cleanup_deadline:BeginUploadPartStreamSession:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized:CompleteMultipartUploadCommitSerialized:try_install_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:create_bucket_with_config_and_load_info:CreateBucket:try_set_bucket_pg_pending_command_or_retry
+1 crates/storage/src/cluster/request_ops.rs:create_bucket_with_config_and_load_info_with_route_validation:CreateBucket:try_set_bucket_pg_pending_command_or_retry
 1 crates/storage/src/cluster/request_ops.rs:create_multipart_upload:CreateMultipartUpload:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session_with_cleanup_deadline:CreatePutObjectStreamSession:try_install_object_pg_pending_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:create_upload_part_stream_session:CreateUploadPartStreamSession:install_snapshot_sensitive_metadata_command_or_drain
@@ -1920,6 +1920,9 @@ metadata_command_conflict_uses=$(
             return "reissue_pending_metadata_command"
         }
         if (name == "try_set_bucket_pg_pending_command_or_retry_with_work_budget") {
+            return "try_set_bucket_pg_pending_command_or_retry"
+        }
+        if (name == "try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence") {
             return "try_set_bucket_pg_pending_command_or_retry"
         }
         if (name == "try_set_bucket_control_pending_command_or_retry_with_work_budget") {
@@ -1981,7 +1984,7 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 2 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:apply_multipart_completion_command:exact-command-match
 1 crates/storage/src/cluster/request_ops.rs:apply_new_object_metadata_command_for_bucket:exact-command-match
-1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete_if_current_with_route_validation:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session_with_cleanup_deadline:metadata-command-log-conflict
 2 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:create_multipart_upload:metadata-command-log-conflict

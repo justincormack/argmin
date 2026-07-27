@@ -83,7 +83,11 @@ impl Coordinator {
         map_bucket_write_drain_error(err)
     }
 
-    pub fn create_bucket(&self, req: &CreateBucketRequest) -> Result<(), ServerError> {
+    pub fn create_bucket_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &CreateBucketRequest,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::create_bucket",
@@ -91,12 +95,14 @@ impl Coordinator {
             req.name,
             req.object_lock_enabled
         );
+        self.require_storage_route_admission(admission)?;
         let authorized = self.authorize_create_bucket(req)?;
-        let storage_node = self.storage_node();
-        let create_outcome = self.create_bucket_with_acl_grants_for_storage_node(
-            &storage_node,
+        let route = admission
+            .active_bucket_route(&authorized.name)
+            .map_err(super::map_store_error)?;
+        let create_outcome = self.create_bucket_with_acl_grants_on_admitted_route(
+            &route,
             &authorized.owner,
-            &authorized.name,
             authorized.acl_grants,
             authorized.ownership,
             authorized.object_lock_enabled,
@@ -117,10 +123,15 @@ impl Coordinator {
                 {
                     return Err(ServerError::BucketAlreadyOwnedByYou);
                 }
-                let existing = self.unchecked_active_bucket_summary_for_storage_node(
-                    &storage_node,
-                    &authorized.name,
-                )?;
+                let existing = route
+                    .head_bucket_info()
+                    .map_err(Self::map_bucket_snapshot_load_error)?;
+                if existing.state != BucketState::Active {
+                    return Err(ServerError::BucketNotFound {
+                        name: authorized.name.to_string(),
+                    });
+                }
+                let existing = Self::bucket_summary(existing);
                 if !Self::is_bucket_owner_enforced(existing.ownership_controls.as_ref()) {
                     return Err(ServerError::BucketAlreadyOwnedByYou);
                 }
@@ -129,12 +140,15 @@ impl Coordinator {
                     &authorized.owner,
                     &authorized.acl,
                 )?;
-                self.apply_authorized_bucket_acl_update_for_storage_node(
-                    &storage_node,
-                    &authorized_acl,
-                )
+                self.apply_authorized_bucket_acl_update_on_route(&route, &authorized_acl)
             }
         }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn create_bucket(&self, req: &CreateBucketRequest) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.create_bucket_on_admitted_route(&admission, req)
     }
 
     pub(super) fn validate_create_bucket_namespace(
@@ -222,25 +236,28 @@ impl Coordinator {
         acl_grants: AclGrants,
         object_lock_enabled: bool,
     ) -> Result<BucketCreateOutcome, ServerError> {
-        self.create_bucket_with_acl_grants_for_storage_node(
-            &self.storage_node(),
+        let admission = self.admit_storage_route_for_request()?;
+        let route = admission
+            .active_bucket_route(&trusted_bucket_name(name))
+            .map_err(super::map_store_error)?;
+        self.create_bucket_with_acl_grants_on_admitted_route(
+            &route,
             owner,
-            &trusted_bucket_name(name),
             acl_grants,
             BucketObjectOwnership::ObjectWriter,
             object_lock_enabled,
         )
     }
 
-    fn create_bucket_with_acl_grants_for_storage_node(
+    fn create_bucket_with_acl_grants_on_admitted_route(
         &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        route: &storage::ActiveBucketRoute<'_>,
         owner: &OwnerIdentity,
-        name: &BucketName,
         acl_grants: AclGrants,
         ownership: BucketObjectOwnership,
         object_lock_enabled: bool,
     ) -> Result<BucketCreateOutcome, ServerError> {
+        let name = route.bucket();
         let public_read = Self::acl_grants_public_read(&acl_grants);
         let public_write = Self::acl_grants_public_write(&acl_grants);
         let initial_versioning = if object_lock_enabled {
@@ -253,7 +270,7 @@ impl Coordinator {
             default_retention: None,
         };
         loop {
-            match storage_node
+            match route
                 .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
                     name: name.as_str(),
                     owner_principal: owner.principal.as_str(),
@@ -287,7 +304,7 @@ impl Coordinator {
                             "bucket_create_finalize_deleting_start",
                             Some(format_args!("bucket={:?}", name)),
                         );
-                        match storage_node.try_finalize_bucket_delete(name) {
+                        match route.try_finalize_bucket_delete() {
                             Ok(
                                 storage::BucketDeleteFinalizeOutcome::Finalized
                                 | storage::BucketDeleteFinalizeOutcome::NotFound,
@@ -364,7 +381,11 @@ impl Coordinator {
         })
     }
 
-    pub fn delete_bucket(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+    pub fn delete_bucket_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
         let request_started = std::time::Instant::now();
         observability::trace_scope!(
             TRACE_TARGET,
@@ -377,18 +398,18 @@ impl Coordinator {
             "bucket_delete_request_start",
             format!("bucket={:?}", req.name),
         );
+        self.require_storage_route_admission(admission)?;
         let authorize_started = std::time::Instant::now();
         let _ = observability::emit_flight_event(
             TRACE_TARGET,
             "bucket_delete_authorize_start",
             format!("bucket={:?}", req.name),
         );
-        let storage_node = self.storage_node();
         let AuthorizedDeleteBucket {
             name,
             bucket_execution_generation,
             bucket_incarnation_generation,
-        } = match self.authorize_delete_bucket_with_storage_node(&storage_node, req) {
+        } = match self.authorize_delete_bucket_on_admitted_route(admission, req) {
             Ok(authorized) => {
                 let _ = observability::emit_flight_event(
                     TRACE_TARGET,
@@ -426,6 +447,9 @@ impl Coordinator {
                 request_started.elapsed().as_micros()
             ),
         );
+        let route = admission
+            .active_bucket_route(&name)
+            .map_err(super::map_store_error)?;
         let begin_started = std::time::Instant::now();
         let _ = observability::emit_flight_event(
             TRACE_TARGET,
@@ -436,13 +460,12 @@ impl Coordinator {
                 request_started.elapsed().as_micros()
             ),
         );
-        if let Err(err) = storage_node.begin_bucket_delete_if_current(
-            &name,
-            storage::cluster::BucketIdentityGenerations {
+        if let Err(err) =
+            route.begin_bucket_delete_if_current(storage::cluster::BucketIdentityGenerations {
                 bucket_execution_generation,
                 bucket_incarnation_generation,
-            },
-        ) {
+            })
+        {
             let _ = observability::emit_flight_event(
                 TRACE_TARGET,
                 "bucket_delete_begin_failed",
@@ -476,11 +499,7 @@ impl Coordinator {
             ),
         );
         self.remove_bucket_fast_path(&name);
-        self.read_runtime_for_storage_node(storage_node)
-            .enqueue_bucket_delete_finalize_for(storage::BucketDeleteFinalizeRoot {
-                bucket: name.clone(),
-                bucket_incarnation_generation,
-            });
+        route.enqueue_bucket_delete_finalize(bucket_incarnation_generation);
         let _ = observability::emit_flight_event(
             TRACE_TARGET,
             "bucket_delete_finalize_enqueued",
@@ -491,6 +510,12 @@ impl Coordinator {
             ),
         );
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn delete_bucket(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.delete_bucket_on_admitted_route(&admission, req)
     }
 
     pub fn head_bucket_on_admitted_route(
@@ -1675,17 +1700,13 @@ impl Coordinator {
         Ok(())
     }
 
-    fn apply_authorized_bucket_acl_update_for_storage_node(
+    fn apply_authorized_bucket_acl_update_on_route(
         &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        route: &storage::ActiveBucketRoute<'_>,
         authorized: &AuthorizedPutBucketAcl,
     ) -> Result<(), ServerError> {
-        let info = storage_node
-            .put_bucket_acl_for_create_bucket_recreate_and_load_info(
-                &authorized.bucket,
-                &authorized.acl_grants,
-                authorized.summary,
-            )
+        let info = route
+            .put_bucket_acl_and_load_info(&authorized.acl_grants, authorized.summary)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())

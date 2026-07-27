@@ -2541,12 +2541,60 @@ impl ActiveObjectMetadataScan<'_> {
 }
 
 impl ActiveBucketRoute<'_> {
+    pub fn bucket(&self) -> &BucketName {
+        &self.bucket
+    }
+
     fn mutation_effect_route(&self) -> BucketMetadataMutationEffectRoute<'_> {
         BucketMetadataMutationEffectRoute {
             pg_id: self.pg_id,
             bucket: &self.bucket,
             effect_fence: self.admission.effect_fence(),
         }
+    }
+
+    pub fn create_bucket_with_config_and_load_info(
+        &self,
+        config: &crate::CreateBucketConfig<'_>,
+    ) -> Result<crate::BucketCreateAttemptOutcome, BucketSnapshotLoadError> {
+        self.admission
+            .cluster
+            .create_bucket_with_config_and_load_info_with_route_validation(
+                self.mutation_effect_route(),
+                || self.admission.require_valid_now(),
+                config,
+            )
+    }
+
+    pub fn try_finalize_bucket_delete(
+        &self,
+    ) -> Result<crate::BucketDeleteFinalizeOutcome, crate::BucketWriteDrainError> {
+        self.admission.require_valid_now()?;
+        self.admission
+            .cluster
+            .try_finalize_bucket_delete(&self.bucket)
+    }
+
+    pub fn begin_bucket_delete_if_current(
+        &self,
+        bucket_identity: crate::cluster::BucketIdentityGenerations,
+    ) -> Result<(), crate::BucketWriteDrainError> {
+        self.admission
+            .cluster
+            .begin_bucket_delete_if_current_with_route_validation(
+                self.mutation_effect_route(),
+                || self.admission.require_valid_now(),
+                bucket_identity,
+            )
+    }
+
+    pub fn enqueue_bucket_delete_finalize(&self, bucket_incarnation_generation: u64) {
+        self.admission
+            .cluster
+            .enqueue_bucket_delete_finalize(crate::BucketDeleteFinalizeRoot {
+                bucket: self.bucket.clone(),
+                bucket_incarnation_generation,
+            });
     }
 
     pub fn head_bucket_info(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
@@ -2583,6 +2631,32 @@ impl ActiveBucketRoute<'_> {
             .metadata_pg_primary_node(cluster.operation_epoch(), self.pg_id.pg_id())?
             .bucket_metadata_client()
             .load_bucket_snapshot(self.pg_id, &self.bucket, request)
+    }
+
+    pub fn load_bucket_delete_authorization_snapshot(
+        &self,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        self.admission
+            .cluster
+            .load_bucket_delete_authorization_snapshot_with_route_validation(
+                self.mutation_effect_route(),
+                || self.admission.require_valid_now(),
+                request,
+            )
+    }
+
+    pub fn load_active_bucket_delete_attempt_authorization_snapshot(
+        &self,
+        request: BucketSnapshotRequest,
+    ) -> Result<Option<BucketSnapshot>, BucketSnapshotLoadError> {
+        self.admission
+            .cluster
+            .load_active_bucket_delete_attempt_authorization_snapshot_with_route_validation(
+                self.mutation_effect_route(),
+                || self.admission.require_valid_now(),
+                request,
+            )
     }
 
     pub fn with_bucket_write_snapshot<T, E>(
@@ -4138,6 +4212,42 @@ mod runtime_map_refresh_invalidation_tests {
                     valid_until_ms: 5_000,
                     now_ms: 6_000,
                 })) if cluster_epoch == ClusterEpoch::INITIAL
+            ));
+        });
+    }
+
+    #[test]
+    fn active_bucket_route_rejects_a_create_config_for_another_bucket() {
+        crate::clock::with_time_override(1_000, || {
+            let cluster = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
+            cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+            let handle = StorageClusterRuntimeMapHandle::new(cluster);
+            let admission = handle.admit_current_route().unwrap();
+            let routed_bucket = BucketName::try_from("create-route-subject").unwrap();
+            let other_bucket = BucketName::try_from("create-config-subject").unwrap();
+            let route = admission.active_bucket_route(&routed_bucket).unwrap();
+            let owner = CanonicalUserId::from_principal("owner");
+            let acl_grants = AclGrants::default();
+
+            assert!(matches!(
+                route.create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+                    name: other_bucket.as_str(),
+                    owner_principal: "owner",
+                    owner_canonical_id: &owner,
+                    acl_grants: &acl_grants,
+                    public_read: false,
+                    public_write: false,
+                    versioning: BucketVersioningState::Disabled,
+                    object_lock: BucketObjectLockConfig::default(),
+                    ownership_controls: BucketOwnershipControls {
+                        object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                    },
+                }),
+                Err(BucketSnapshotLoadError::Store(
+                    StoreError::RouteCapabilitySubjectMismatch {
+                        operation: "create bucket",
+                    }
+                ))
             ));
         });
     }

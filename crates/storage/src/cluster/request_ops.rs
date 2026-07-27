@@ -1427,8 +1427,31 @@ impl super::StorageCluster {
             .try_probe_object_pg_available(bucket, key)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn create_bucket_with_config_and_load_info(
         &self,
+        config: &CreateBucketConfig<'_>,
+    ) -> Result<BucketCreateAttemptOutcome, BucketSnapshotLoadError> {
+        let bucket = BucketName::try_from(config.name).map_err(|reason| {
+            MetadataError::InvalidBucketName {
+                reason: reason.to_string(),
+            }
+        })?;
+        self.create_bucket_with_config_and_load_info_with_route_validation(
+            super::BucketMetadataMutationEffectRoute {
+                pg_id: self.bucket_metadata_pg(&bucket),
+                bucket: &bucket,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            config,
+        )
+    }
+
+    pub(super) fn create_bucket_with_config_and_load_info_with_route_validation(
+        &self,
+        route: super::BucketMetadataMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         config: &CreateBucketConfig<'_>,
     ) -> Result<BucketCreateAttemptOutcome, BucketSnapshotLoadError> {
         crate::metadata_command::metadata_command_publisher!(CreateBucket);
@@ -1437,11 +1460,21 @@ impl super::StorageCluster {
                 reason: reason.to_string(),
             }
         })?;
-        let pg_id = self.bucket_metadata_pg_id(&bucket);
+        let super::BucketMetadataMutationEffectRoute {
+            pg_id: bucket_pg_id,
+            bucket: routed_bucket,
+            effect_fence,
+        } = route;
+        if bucket != *routed_bucket {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "create bucket",
+            }
+            .into());
+        }
+        let pg_id = bucket_pg_id.pg_id();
         let primary_store = self
             .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        let pg_id = PgId::new(pg_id);
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let mut work_budget = super::RequestWorkBudget::new(
             std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
             None,
@@ -1450,6 +1483,7 @@ impl super::StorageCluster {
         .for_pg(pg_id);
         loop {
             work_budget.check("create bucket metadata command budget exhausted")?;
+            require_valid_route()?;
             let (command, clear_pending_on_zero_apply) = match self
                 .pending_metadata_command_for_bucket(pg_id, &bucket)?
             {
@@ -1480,9 +1514,10 @@ impl super::StorageCluster {
                     }
                 }
                 None => {
+                    require_valid_route()?;
                     match primary_store
                         .bucket_metadata_client()
-                        .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), &bucket)
+                        .head_bucket_raw(bucket_pg_id, &bucket)
                     {
                         Ok(info) => {
                             return Ok(BucketCreateAttemptOutcome::Exists(info));
@@ -1501,23 +1536,22 @@ impl super::StorageCluster {
                     else {
                         continue;
                     };
+                    require_valid_route()?;
                     let command = match primary_store
                         .bucket_metadata_client()
-                        .build_create_bucket_command(
-                            self.validated_bucket_metadata_pg(pg_id),
-                            &bucket,
-                            command_id,
-                            config,
-                        )? {
+                        .build_create_bucket_command(bucket_pg_id, &bucket, command_id, config)?
+                    {
                         CreateBucketCommandBuild::Exists(info) => {
                             return Ok(BucketCreateAttemptOutcome::Exists(info));
                         }
                         CreateBucketCommandBuild::Command(command) => *command,
                     };
-                    if !self.try_set_bucket_pg_pending_command_or_retry_with_work_budget(
+                    if !self
+                        .try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence(
                         pg_id,
                         &bucket,
                         &command,
+                        Some(effect_fence),
                         &mut work_budget,
                     )? {
                         continue;
@@ -1544,7 +1578,7 @@ impl super::StorageCluster {
 
             let info = primary_store
                 .bucket_metadata_client()
-                .head_bucket_info(self.validated_bucket_metadata_pg(pg_id), &bucket)?;
+                .head_bucket_info(bucket_pg_id, &bucket)?;
             return Ok(BucketCreateAttemptOutcome::Created(info));
         }
     }
@@ -2456,7 +2490,32 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<bool, BucketSnapshotLoadError> {
-        match self.try_set_pending_metadata_command_for_bucket(pg_id, bucket, command) {
+        self.try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence(
+            pg_id,
+            bucket,
+            command,
+            None,
+            work_budget,
+        )
+    }
+
+    fn try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        if effect_fence.is_some() {
+            self.maybe_run_before_metadata_command_pending_install_hook();
+        }
+        match self.try_set_pending_metadata_command_for_bucket_with_effect_fence(
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+        ) {
             Ok(Some(())) => Ok(true),
             Ok(None) => {
                 if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -2930,13 +2989,37 @@ impl super::StorageCluster {
         bucket: &BucketName,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
-        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        self.load_bucket_delete_authorization_snapshot_with_route_validation(
+            super::BucketMetadataMutationEffectRoute {
+                pg_id: self.bucket_metadata_pg(bucket),
+                bucket,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            request,
+        )
+    }
+
+    pub(super) fn load_bucket_delete_authorization_snapshot_with_route_validation(
+        &self,
+        route: super::BucketMetadataMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        let super::BucketMetadataMutationEffectRoute {
+            pg_id: bucket_pg_id,
+            bucket,
+            effect_fence: _,
+        } = route;
+        require_valid_route()?;
+        let pg_id = bucket_pg_id.pg_id();
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let client = node.bucket_metadata_client();
-        let bucket_pg_id = self.validated_bucket_metadata_pg(pg_id);
+        require_valid_route()?;
         let bucket_info = client.head_bucket_raw(bucket_pg_id, bucket)?;
+        require_valid_route()?;
         let policy = Self::load_bucket_delete_authorization_subresource(
             &**client,
             bucket_pg_id,
@@ -2944,6 +3027,7 @@ impl super::StorageCluster {
             request.policy,
             BucketSubresourceKind::Policy,
         )?;
+        require_valid_route()?;
         let tags = Self::load_bucket_delete_authorization_subresource(
             &**client,
             bucket_pg_id,
@@ -2951,6 +3035,7 @@ impl super::StorageCluster {
             request.tags.should_load(&bucket_info),
             BucketSubresourceKind::Tagging,
         )?;
+        require_valid_route()?;
         let lifecycle = Self::load_bucket_delete_authorization_subresource(
             &**client,
             bucket_pg_id,
@@ -2958,6 +3043,7 @@ impl super::StorageCluster {
             request.lifecycle,
             BucketSubresourceKind::Lifecycle,
         )?;
+        require_valid_route()?;
         let cors = Self::load_bucket_delete_authorization_subresource(
             &**client,
             bucket_pg_id,
@@ -2988,12 +3074,35 @@ impl super::StorageCluster {
         bucket: &BucketName,
         request: BucketSnapshotRequest,
     ) -> Result<Option<BucketSnapshot>, BucketSnapshotLoadError> {
-        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        self.load_active_bucket_delete_attempt_authorization_snapshot_with_route_validation(
+            super::BucketMetadataMutationEffectRoute {
+                pg_id: self.bucket_metadata_pg(bucket),
+                bucket,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            request,
+        )
+    }
+
+    pub(super) fn load_active_bucket_delete_attempt_authorization_snapshot_with_route_validation(
+        &self,
+        route: super::BucketMetadataMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+        request: BucketSnapshotRequest,
+    ) -> Result<Option<BucketSnapshot>, BucketSnapshotLoadError> {
+        let super::BucketMetadataMutationEffectRoute {
+            pg_id: bucket_pg_id,
+            bucket,
+            effect_fence,
+        } = route;
+        require_valid_route()?;
+        let pg_id = bucket_pg_id.pg_id();
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let reservation_client = node.bucket_write_reservation_client();
-        let bucket_pg_id = self.validated_bucket_metadata_pg(pg_id);
+        require_valid_route()?;
         let Some(drain) = reservation_client.durable_bucket_write_drain(bucket_pg_id, bucket)?
         else {
             return Ok(None);
@@ -3007,6 +3116,7 @@ impl super::StorageCluster {
         {
             return Ok(None);
         }
+        require_valid_route()?;
         let pending = self.pending_metadata_command_for_bucket(pg_id, bucket)?;
         if pending.is_some_and(|command| {
             !matches!(
@@ -3017,7 +3127,15 @@ impl super::StorageCluster {
             return Ok(None);
         }
 
-        let snapshot = match self.load_bucket_delete_authorization_snapshot(bucket, request) {
+        let snapshot = match self.load_bucket_delete_authorization_snapshot_with_route_validation(
+            super::BucketMetadataMutationEffectRoute {
+                pg_id: bucket_pg_id,
+                bucket,
+                effect_fence,
+            },
+            &mut require_valid_route,
+            request,
+        ) {
             Ok(snapshot) => snapshot,
             Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { .. })) => {
                 return Ok(None);
@@ -3551,10 +3669,27 @@ impl super::StorageCluster {
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn begin_durable_bucket_delete_drain_with_budget(
         &self,
         bucket: &BucketName,
         started: Option<std::time::Instant>,
+    ) -> Result<super::DurableBucketDeleteDrainBegin, BucketWriteDrainError> {
+        let mut require_valid_route = || Ok(());
+        self.begin_durable_bucket_delete_drain_with_budget_and_route_validation(
+            bucket,
+            started,
+            None,
+            &mut require_valid_route,
+        )
+    }
+
+    fn begin_durable_bucket_delete_drain_with_budget_and_route_validation(
+        &self,
+        bucket: &BucketName,
+        started: Option<std::time::Instant>,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        require_valid_route: &mut impl FnMut() -> Result<(), StoreError>,
     ) -> Result<super::DurableBucketDeleteDrainBegin, BucketWriteDrainError> {
         loop {
             self.check_bucket_delete_begin_work_budget(
@@ -3562,6 +3697,7 @@ impl super::StorageCluster {
                 started,
                 "bucket delete durable drain acquisition budget exhausted",
             )?;
+            require_valid_route()?;
             let pg_id = self.bucket_metadata_pg_id(bucket);
             let node = self
                 .local_map
@@ -3573,17 +3709,34 @@ impl super::StorageCluster {
             // grace window, but make an abandoned Active-bucket drain
             // recoverable by later write-snapshot waiters and delete retries.
             let lease_deadline = now.saturating_add(BUCKET_DELETE_DRAIN_LEASE_MILLIS);
-            match node
-                .bucket_write_reservation_client()
-                .begin_durable_bucket_write_drain(
-                    self.validated_bucket_metadata_pg(PgId::new(pg_id)),
-                    bucket,
-                    &drain_id,
-                    &owner_token,
-                    self.operation_epoch(),
-                    now,
-                    lease_deadline,
-                ) {
+            require_valid_route()?;
+            crate::node::maybe_run_before_begin_bucket_delete_drain_hook(bucket);
+            let begin_result = match effect_fence {
+                Some(effect_fence) => node
+                    .bucket_write_reservation_client()
+                    .begin_durable_bucket_write_drain_with_effect_fence(
+                        self.validated_bucket_metadata_pg(PgId::new(pg_id)),
+                        bucket,
+                        &drain_id,
+                        &owner_token,
+                        self.operation_epoch(),
+                        now,
+                        lease_deadline,
+                        effect_fence,
+                    ),
+                None => node
+                    .bucket_write_reservation_client()
+                    .begin_durable_bucket_write_drain(
+                        self.validated_bucket_metadata_pg(PgId::new(pg_id)),
+                        bucket,
+                        &drain_id,
+                        &owner_token,
+                        self.operation_epoch(),
+                        now,
+                        lease_deadline,
+                    ),
+            };
+            match begin_result {
                 Ok(record) => {
                     return Ok(super::DurableBucketDeleteDrainBegin::Acquired(
                         super::DurableBucketWriteDrain { pg_id, record },
@@ -4773,22 +4926,63 @@ impl super::StorageCluster {
         })
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn begin_bucket_delete_if_current(
         &self,
         bucket: &BucketName,
         bucket_identity: BucketIdentityGenerations,
     ) -> Result<(), BucketWriteDrainError> {
-        self.begin_bucket_delete_inner(bucket, bucket_identity)
+        self.begin_bucket_delete_if_current_with_route_validation(
+            super::BucketMetadataMutationEffectRoute {
+                pg_id: self.bucket_metadata_pg(bucket),
+                bucket,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            bucket_identity,
+        )
     }
 
-    fn begin_bucket_delete_inner(
+    /// Continue a durably recorded DeleteBucket attempt adopted by background
+    /// recovery on the currently installed route.
+    ///
+    /// This is convergence authority for an already authorized attempt, not a
+    /// frontend request entry point. New DeleteBucket requests must use an
+    /// admitted [`super::ActiveBucketRoute`].
+    pub fn continue_adopted_bucket_delete(
         &self,
-        bucket: &BucketName,
+        root: &crate::BucketDeleteBeginRoot,
+    ) -> Result<(), BucketWriteDrainError> {
+        let bucket = &root.bucket;
+        self.begin_bucket_delete_if_current_with_route_validation(
+            super::BucketMetadataMutationEffectRoute {
+                pg_id: self.bucket_metadata_pg(bucket),
+                bucket,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            BucketIdentityGenerations {
+                bucket_execution_generation: root.bucket_execution_generation,
+                bucket_incarnation_generation: root.bucket_incarnation_generation,
+            },
+        )
+    }
+
+    pub(super) fn begin_bucket_delete_if_current_with_route_validation(
+        &self,
+        route: super::BucketMetadataMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         expected_bucket_identity: BucketIdentityGenerations,
     ) -> Result<(), BucketWriteDrainError> {
         crate::metadata_command::metadata_command_publisher!(BeginBucketDelete);
+        let super::BucketMetadataMutationEffectRoute {
+            pg_id: bucket_pg_id,
+            bucket,
+            effect_fence,
+        } = route;
+        require_valid_route()?;
         let started = std::time::Instant::now();
-        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let pg_id = bucket_pg_id.pg_id();
         let _ = observability::emit_flight_event(
             super::TRACE_TARGET,
             "bucket_delete_begin_start",
@@ -4817,6 +5011,7 @@ impl super::StorageCluster {
         let current_bucket_execution_generation;
         let current_bucket_incarnation_generation;
         {
+            require_valid_route()?;
             let raw_snapshot_started = std::time::Instant::now();
             let _ = observability::emit_flight_event(
                 super::TRACE_TARGET,
@@ -4830,7 +5025,7 @@ impl super::StorageCluster {
             );
             let current = match node_store
                 .bucket_metadata_client()
-                .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)
+                .head_bucket_raw(bucket_pg_id, bucket)
             {
                 Ok(current) => {
                     let _ = observability::emit_flight_event(
@@ -5037,62 +5232,67 @@ impl super::StorageCluster {
                 started.elapsed().as_micros()
             ),
         );
-        let mut durable_drain =
-            match self.begin_durable_bucket_delete_drain_with_budget(bucket, Some(started)) {
-                Ok(super::DurableBucketDeleteDrainBegin::Acquired(drain)) => {
-                    let _ = observability::emit_flight_event(
-                        super::TRACE_TARGET,
-                        "bucket_delete_begin_durable_drain_acquired",
-                        format!(
-                            "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={}",
-                            bucket,
-                            pg_id.get(),
-                            durable_drain_started.elapsed().as_micros(),
-                            started.elapsed().as_micros()
-                        ),
-                    );
-                    drain
-                }
-                Ok(super::DurableBucketDeleteDrainBegin::AlreadyDeleting) => {
-                    let _ = observability::emit_flight_event(
-                        super::TRACE_TARGET,
-                        "bucket_delete_begin_durable_drain_already_deleting",
-                        format!(
-                            "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={}",
-                            bucket,
-                            pg_id.get(),
-                            durable_drain_started.elapsed().as_micros(),
-                            started.elapsed().as_micros()
-                        ),
-                    );
-                    let _ = observability::emit_flight_event(
-                        super::TRACE_TARGET,
-                        "bucket_delete_begin_done",
-                        format!(
-                            "bucket={:?} pg_id={} elapsed_us={}",
-                            bucket,
-                            pg_id.get(),
-                            started.elapsed().as_micros()
-                        ),
-                    );
-                    return Ok(());
-                }
-                Err(error) => {
-                    let _ = observability::emit_flight_event(
-                        super::TRACE_TARGET,
-                        "bucket_delete_begin_durable_drain_failed",
-                        format!(
-                            "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={} error={:?}",
-                            bucket,
-                            pg_id.get(),
-                            durable_drain_started.elapsed().as_micros(),
-                            started.elapsed().as_micros(),
-                            error
-                        ),
-                    );
-                    return Err(error);
-                }
-            };
+        let mut durable_drain = match self
+            .begin_durable_bucket_delete_drain_with_budget_and_route_validation(
+                bucket,
+                Some(started),
+                Some(effect_fence),
+                &mut require_valid_route,
+            ) {
+            Ok(super::DurableBucketDeleteDrainBegin::Acquired(drain)) => {
+                let _ = observability::emit_flight_event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_begin_durable_drain_acquired",
+                    format!(
+                        "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={}",
+                        bucket,
+                        pg_id.get(),
+                        durable_drain_started.elapsed().as_micros(),
+                        started.elapsed().as_micros()
+                    ),
+                );
+                drain
+            }
+            Ok(super::DurableBucketDeleteDrainBegin::AlreadyDeleting) => {
+                let _ = observability::emit_flight_event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_begin_durable_drain_already_deleting",
+                    format!(
+                        "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={}",
+                        bucket,
+                        pg_id.get(),
+                        durable_drain_started.elapsed().as_micros(),
+                        started.elapsed().as_micros()
+                    ),
+                );
+                let _ = observability::emit_flight_event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_begin_done",
+                    format!(
+                        "bucket={:?} pg_id={} elapsed_us={}",
+                        bucket,
+                        pg_id.get(),
+                        started.elapsed().as_micros()
+                    ),
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = observability::emit_flight_event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_begin_durable_drain_failed",
+                    format!(
+                        "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={} error={:?}",
+                        bucket,
+                        pg_id.get(),
+                        durable_drain_started.elapsed().as_micros(),
+                        started.elapsed().as_micros(),
+                        error
+                    ),
+                );
+                return Err(error);
+            }
+        };
         crate::node::maybe_run_after_begin_bucket_delete_drain_hook(bucket);
 
         let mut metadata_contention_retries = 0usize;
@@ -5104,7 +5304,6 @@ impl super::StorageCluster {
         .for_pg(pg_id);
         let mut loop_iteration = 0u64;
         let mut attempt_phase = BucketDeleteAttemptPhase::Initial;
-        let bucket_pg_id = self.validated_bucket_metadata_pg(pg_id);
         let mut can_resume_at_mark_deleting = self
             .bucket_delete_matching_attempt_outcome(
                 node_store.bucket_write_reservation_client().as_ref(),
@@ -5158,6 +5357,7 @@ impl super::StorageCluster {
         let result = (|| loop {
             loop_iteration += 1;
             attempt_phase = BucketDeleteAttemptPhase::Initial;
+            require_valid_route()?;
             Self::emit_bucket_delete_begin_loop_step(
                 bucket,
                 pg_id,
@@ -6056,11 +6256,13 @@ impl super::StorageCluster {
                     "pending_install_start",
                     format!("iteration={loop_iteration} command_id={command_id:?}"),
                 );
+                require_valid_route()?;
                 if !self
-                    .try_set_bucket_pg_pending_command_or_retry_with_work_budget(
+                    .try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence(
                         pg_id,
                         bucket,
                         &command,
+                        Some(effect_fence),
                         &mut work_budget,
                     )
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
@@ -7203,24 +7405,6 @@ impl super::StorageCluster {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn put_bucket_acl_and_load_info(
-        &self,
-        bucket: &BucketName,
-        acl_grants: &AclGrants,
-        summary: BucketAclSummary,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.put_bucket_acl_and_load_info_with_route_validation(
-            super::BucketMetadataMutationEffectRoute {
-                pg_id: self.bucket_metadata_pg(bucket),
-                bucket,
-                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
-            },
-            || Ok(()),
-            acl_grants,
-            summary,
-        )
-    }
-
-    pub fn put_bucket_acl_for_create_bucket_recreate_and_load_info(
         &self,
         bucket: &BucketName,
         acl_grants: &AclGrants,
@@ -11081,7 +11265,7 @@ impl super::StorageCluster {
             .enqueue_bucket_delete_finalize(root);
     }
 
-    pub fn enqueue_bucket_delete_begin(
+    pub(crate) fn enqueue_bucket_delete_begin(
         &self,
         bucket: &BucketName,
         bucket_execution_generation: u64,
@@ -11099,6 +11283,20 @@ impl super::StorageCluster {
             .local_map
             .runtime_state()
             .enqueue_bucket_delete_begin(root);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_enqueue_bucket_delete_begin(
+        &self,
+        bucket: &BucketName,
+        bucket_execution_generation: u64,
+        bucket_incarnation_generation: u64,
+    ) {
+        self.enqueue_bucket_delete_begin(
+            bucket,
+            bucket_execution_generation,
+            bucket_incarnation_generation,
+        );
     }
 
     pub fn finish_bucket_delete_finalize_work(&self, root: &BucketDeleteFinalizeRoot) {

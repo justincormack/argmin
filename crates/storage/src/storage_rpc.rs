@@ -76,7 +76,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU32;
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 7;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 8;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -496,6 +496,9 @@ const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_BEGIN_PAYLOAD_LEN: usize =
         + 4
         + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
         + 8
+        + 8
+        + 1
+        + 8
         + 8;
 const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
@@ -576,7 +579,16 @@ const STORAGE_RPC_MAX_BUCKET_SUBRESOURCE_GET_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_ACQUIRE_PAYLOAD_LEN: usize =
-    STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_BEGIN_PAYLOAD_LEN + 8 + 8;
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        + 8
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+        + 8
+        + 1
+        + 8
+        + 8;
 const STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_RECORD_PAYLOAD_LEN: usize =
     STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN + 8 + 4 + 4096;
 const STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_ERROR_PAYLOAD_LEN: usize =
@@ -1429,6 +1441,7 @@ pub(crate) struct StorageRpcBucketWriteDrainBeginRequest {
     pub(crate) owner_token: String,
     pub(crate) created_at: u64,
     pub(crate) lease_deadline: u64,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11663,12 +11676,28 @@ pub(crate) fn decode_bucket_write_reservation_record_response(
 pub(crate) fn encode_bucket_write_drain_begin_request(
     request: &StorageRpcBucketWriteDrainBeginRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request
+        .effect_deadline
+        .is_some_and(|deadline| !admitted_route_effect_deadline_is_conservative(deadline))
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "effect deadline is not conservatively delegated",
+        ));
+    }
     validate_bucket_write_drain_identity(&request.drain_id, &request.owner_token)?;
     let mut out = encode_bucket_request(&request.bucket);
     put_string(&mut out, &request.drain_id);
     put_string(&mut out, &request.owner_token);
     put_u64(&mut out, request.created_at);
     put_u64(&mut out, request.lease_deadline);
+    match request.effect_deadline {
+        None => put_u8(&mut out, 0),
+        Some(deadline) => {
+            put_u8(&mut out, 1);
+            put_u64(&mut out, deadline.authority_valid_until_ms);
+            put_u64(&mut out, deadline.portable_wall_valid_until_ms);
+        }
+    }
     Ok(out)
 }
 
@@ -11691,7 +11720,26 @@ pub(crate) fn decode_bucket_write_drain_begin_request(
     )?;
     let created_at = decoder.read_u64()?;
     let lease_deadline = decoder.read_u64()?;
+    let effect_deadline = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(StorageRpcAdmittedRouteEffectDeadline {
+            authority_valid_until_ms: decoder.read_u64()?,
+            portable_wall_valid_until_ms: decoder.read_u64()?,
+        }),
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "invalid optional effect deadline tag",
+            ));
+        }
+    };
     decoder.finish()?;
+    if effect_deadline
+        .is_some_and(|deadline| !admitted_route_effect_deadline_is_conservative(deadline))
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "effect deadline is not conservatively delegated",
+        ));
+    }
     validate_bucket_write_drain_identity(&drain_id, &owner_token)?;
     Ok(StorageRpcBucketWriteDrainBeginRequest {
         bucket,
@@ -11699,6 +11747,7 @@ pub(crate) fn decode_bucket_write_drain_begin_request(
         owner_token,
         created_at,
         lease_deadline,
+        effect_deadline,
     })
 }
 
@@ -17449,7 +17498,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&7u16.to_le_bytes());
+        expected.extend_from_slice(&8u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -17460,15 +17509,41 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_rejects_version_six_fixture() {
+    fn storage_rpc_frame_rejects_version_seven_fixture() {
         let mut bytes =
             encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
         let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&6_u16.to_le_bytes());
+        bytes[version_offset..version_offset + 2].copy_from_slice(&7_u16.to_le_bytes());
 
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnsupportedVersion(6))
+            Err(StorageRpcFrameError::UnsupportedVersion(7))
+        );
+    }
+
+    #[test]
+    fn bucket_write_drain_begin_request_round_trips_effect_deadline() {
+        let request = StorageRpcBucketWriteDrainBeginRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: NodeId::new(3),
+                cluster_epoch: ClusterEpoch::new(9).unwrap(),
+                pg_id: PgId::new(4),
+                bucket: BucketName::try_from("bucket").unwrap(),
+            },
+            drain_id: "drain".to_string(),
+            owner_token: "owner".to_string(),
+            created_at: 1_000,
+            lease_deadline: 8_000,
+            effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                authority_valid_until_ms: 7_000,
+                portable_wall_valid_until_ms: 6_000,
+            }),
+        };
+
+        let encoded = encode_bucket_write_drain_begin_request(&request).unwrap();
+        assert_eq!(
+            decode_bucket_write_drain_begin_request(&encoded).unwrap(),
+            request
         );
     }
 
@@ -20272,7 +20347,7 @@ mod tests {
     }
 
     #[test]
-    fn bucket_delete_coordination_max_record_requests_fit_kind_caps() {
+    fn bucket_delete_coordination_max_requests_fit_kind_caps() {
         let bucket = BucketName::try_from("a".repeat(STORAGE_RPC_MAX_BUCKET_NAME_LEN)).unwrap();
         let cluster_epoch = ClusterEpoch::INITIAL;
         let route_cluster_epoch = ClusterEpoch::new(cluster_epoch.get() + 1).unwrap();
@@ -20280,6 +20355,43 @@ mod tests {
         let pg_id = PgId::new(2);
         let drain_id = "d".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN);
         let owner_token = "o".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN);
+
+        let drain_begin_request = StorageRpcBucketWriteDrainBeginRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id,
+                cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+            },
+            drain_id: drain_id.clone(),
+            owner_token: owner_token.clone(),
+            created_at: 1,
+            lease_deadline: 2,
+            effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                authority_valid_until_ms: 10_000,
+                portable_wall_valid_until_ms: 10_000_u64
+                    .saturating_sub(crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS),
+            }),
+        };
+        let drain_begin_payload =
+            encode_bucket_write_drain_begin_request(&drain_begin_request).unwrap();
+        assert_eq!(
+            drain_begin_payload.len(),
+            STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_BEGIN_PAYLOAD_LEN
+        );
+        let drain_begin_frame = encode_storage_rpc_frame(
+            10,
+            StorageRpcMessageKind::BucketWriteDrainBegin,
+            &drain_begin_payload,
+        )
+        .unwrap();
+        let decoded =
+            read_storage_rpc_request_frame_from(&mut Cursor::new(drain_begin_frame)).unwrap();
+        assert_eq!(decoded.payload, drain_begin_payload);
+        assert_eq!(
+            decode_bucket_write_drain_begin_request(&decoded.payload).unwrap(),
+            drain_begin_request
+        );
 
         let drain_payload =
             encode_bucket_write_drain_record_request(&StorageRpcBucketWriteDrainRecordRequest {
@@ -20447,6 +20559,41 @@ mod tests {
             )) if len == STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_PAYLOAD_LEN + 1
                 && limit == STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_PAYLOAD_LEN
         ));
+    }
+
+    #[test]
+    fn maximum_lifecycle_sweep_claim_acquire_request_fits_kind_cap() {
+        let request = StorageRpcLifecycleSweepClaimAcquireRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: NodeId::new(1),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                pg_id: PgId::new(2),
+                bucket: BucketName::try_from("b".repeat(STORAGE_RPC_MAX_BUCKET_NAME_LEN)).unwrap(),
+            },
+            bucket_incarnation_generation: 3,
+            claim_id: "c".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN),
+            owner_token: "o".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN),
+            claimed_at: 4,
+            lease_deadline: Some(5),
+            now: 4,
+        };
+        let payload = encode_lifecycle_sweep_claim_acquire_request(&request).unwrap();
+        assert_eq!(
+            payload.len(),
+            STORAGE_RPC_MAX_LIFECYCLE_SWEEP_CLAIM_ACQUIRE_PAYLOAD_LEN
+        );
+        let frame = encode_storage_rpc_frame(
+            15,
+            StorageRpcMessageKind::LifecycleSweepClaimAcquire,
+            &payload,
+        )
+        .unwrap();
+        let decoded = read_storage_rpc_request_frame_from(&mut Cursor::new(frame)).unwrap();
+        assert_eq!(decoded.payload, payload);
+        assert_eq!(
+            decode_lifecycle_sweep_claim_acquire_request(&decoded.payload).unwrap(),
+            request
+        );
     }
 
     #[test]

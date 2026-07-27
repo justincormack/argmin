@@ -3822,6 +3822,7 @@ impl StorageNodeActiveBucketRoute<'_> {
         cluster_epoch: ClusterEpoch,
         created_at: u64,
         lease_deadline: u64,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteDrainRecord, StorageNodeBucketRouteError> {
         self.require_valid_now()?;
         if cluster_epoch != self.fence.cluster_epoch {
@@ -3837,7 +3838,7 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
+        BucketWriteReservationNodeClient::begin_durable_bucket_write_drain_with_effect_fence(
             &local_client,
             self.pg_id,
             self.bucket,
@@ -3846,6 +3847,7 @@ impl StorageNodeActiveBucketRoute<'_> {
             cluster_epoch,
             created_at,
             lease_deadline,
+            effect_fence,
         )
         .map_err(StorageNodeBucketRouteError::Bucket)
     }
@@ -8958,6 +8960,7 @@ impl StorageNodeConnectionHandler {
             request.bucket.cluster_epoch,
             request.created_at,
             request.lease_deadline,
+            admitted_route_effect_fence(request.bucket.cluster_epoch, request.effect_deadline),
         ) {
             Ok(record) => {
                 let payload = encode_bucket_write_drain_begin_response(
@@ -19058,6 +19061,7 @@ mod tests {
                     config.cluster_epoch,
                     1_000,
                     4_000,
+                    AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                 )
                 .unwrap();
             let drain = route.heartbeat_write_drain(&drain, 4_500).unwrap();
@@ -19090,6 +19094,7 @@ mod tests {
                             config.cluster_epoch,
                             6_000,
                             9_000,
+                            AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                         )
                         .map(|_| ()),
                 ),
@@ -21789,8 +21794,12 @@ mod tests {
         });
         let command = test_metadata_command(0, 1);
         let bucket = command.bucket_name().clone();
+        let drain_bucket = BucketName::try_from("tcp-portable-drain-bucket").unwrap();
+        let expired_drain_bucket = BucketName::try_from("tcp-expired-drain-bucket").unwrap();
         let pg = server._node.get_pg(0).unwrap();
         create_probe_bucket_direct(&pg, &bucket);
+        create_probe_bucket_direct(&pg, &drain_bucket);
+        create_probe_bucket_direct(&pg, &expired_drain_bucket);
         drop(pg);
         let node = Arc::clone(&server._node);
         let address = server.tcp_listener_addr_for_test();
@@ -21798,7 +21807,13 @@ mod tests {
             crate::clock::with_time_and_monotonic_override(2_500, 901_500, || {
                 server.accept_one().unwrap()
             });
-            crate::clock::with_time_and_monotonic_override(3_500, 902_500, || {
+            crate::clock::with_time_and_monotonic_override(2_800, 901_800, || {
+                server.accept_one().unwrap()
+            });
+            crate::clock::with_time_and_monotonic_override(4_500, 903_500, || {
+                server.accept_one().unwrap()
+            });
+            crate::clock::with_time_and_monotonic_override(4_500, 903_500, || {
                 server.accept_one().unwrap()
             });
         });
@@ -21841,6 +21856,47 @@ mod tests {
         });
         assert_eq!(reservation.bucket, bucket);
 
+        let drain = crate::clock::with_time_and_monotonic_override(2_600, 10_100, || {
+            BucketWriteReservationNodeClient::begin_durable_bucket_write_drain_with_effect_fence(
+                &client,
+                BucketPgId::new_for_test(PgId::new(0)),
+                &drain_bucket,
+                "tcp-portable-drain",
+                "tcp-portable-drain-owner",
+                config.cluster_epoch,
+                1_000,
+                9_000,
+                effect_fence,
+            )
+            .unwrap()
+        });
+        assert_eq!(drain.bucket, drain_bucket);
+
+        let drain_error = crate::clock::with_time_and_monotonic_override(3_500, 11_000, || {
+            BucketWriteReservationNodeClient::begin_durable_bucket_write_drain_with_effect_fence(
+                &client,
+                BucketPgId::new_for_test(PgId::new(0)),
+                &expired_drain_bucket,
+                "tcp-expired-drain",
+                "tcp-expired-drain-owner",
+                config.cluster_epoch,
+                1_000,
+                9_000,
+                effect_fence,
+            )
+            .unwrap_err()
+        });
+        assert!(
+            matches!(
+                &drain_error,
+                BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                    code: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                })
+            ),
+            "{drain_error:?}"
+        );
+
         let pending_error = crate::clock::with_time_and_monotonic_override(3_500, 11_000, || {
             MetadataCommandNodeClient::try_insert_pending_metadata_command_slot_with_effect_fence(
                 &client,
@@ -21864,6 +21920,11 @@ mod tests {
         join.join().unwrap();
 
         let pg = node.get_pg(0).unwrap();
+        assert!(
+            PgMetadataStore::durable_bucket_write_drain(&*pg, &expired_drain_bucket)
+                .unwrap()
+                .is_none()
+        );
         assert!(pg
             .pending_metadata_command_slot(config.node_id.as_u32(), config.cluster_epoch)
             .unwrap()

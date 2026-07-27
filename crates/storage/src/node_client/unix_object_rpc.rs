@@ -624,7 +624,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         Ok(())
     }
 
-    fn begin_durable_bucket_write_drain(
+    fn begin_durable_bucket_write_drain_with_effect_fence(
         &self,
         pg_id: BucketPgId,
         bucket: &BucketName,
@@ -633,7 +633,9 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         cluster_epoch: ClusterEpoch,
         created_at: u64,
         lease_deadline: u64,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
+        effect_fence.require_valid_for(cluster_epoch)?;
         let request = StorageRpcBucketWriteDrainBeginRequest {
             bucket: StorageRpcBucketRequest {
                 node_id: self.node_id,
@@ -645,6 +647,12 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             owner_token: owner_token.to_string(),
             created_at,
             lease_deadline,
+            effect_deadline: effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
         };
         let payload =
             encode_bucket_write_drain_begin_request(&request).map_err(|error| {

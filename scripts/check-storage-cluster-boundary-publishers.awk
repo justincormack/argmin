@@ -224,7 +224,7 @@ function publisher_helper(line) {
     if (line ~ /try_install_object_pg_pending_command_or_drain\(/) {
         return "try_install_object_pg_pending_command_or_drain"
     }
-    if (line ~ /try_set_bucket_pg_pending_command_or_retry(_with_work_budget)?\(/) {
+    if (line ~ /try_set_bucket_pg_pending_command_or_retry(_with_work_budget(_and_effect_fence)?)?\(/) {
         return "try_set_bucket_pg_pending_command_or_retry"
     }
     if (line ~ /try_set_bucket_control_pending_command_or_retry(_with_work_budget)?\(/) {
@@ -247,6 +247,7 @@ function is_install_helper(name) {
         || name == "try_install_object_pg_pending_command_or_drain" \
         || name == "try_set_bucket_pg_pending_command_or_retry" \
         || name == "try_set_bucket_pg_pending_command_or_retry_with_work_budget" \
+        || name == "try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence" \
         || name == "try_set_bucket_control_pending_command_or_retry" \
         || name == "try_set_bucket_control_pending_command_or_retry_with_work_budget" \
         || name == "install_snapshot_sensitive_metadata_command_or_drain" \

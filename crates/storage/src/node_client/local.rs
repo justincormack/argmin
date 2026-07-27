@@ -930,6 +930,30 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn begin_durable_bucket_write_drain_with_effect_fence(
+        &self,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+        drain_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        created_at: u64,
+        lease_deadline: u64,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
+        effect_fence.require_valid_for(cluster_epoch)?;
+        <Self as StorageNodeClient>::begin_durable_bucket_write_drain(
+            self,
+            pg_id,
+            bucket,
+            drain_id,
+            owner_token,
+            cluster_epoch,
+            created_at,
+            lease_deadline,
+        )
+    }
+
     fn clear_durable_bucket_write_drain(
         &self,
         pg_id: BucketPgId,

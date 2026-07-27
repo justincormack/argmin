@@ -639,10 +639,10 @@ fn bucket_delete_begin_root_is_stale(
     storage_node: &StorageCluster,
     root: &BucketDeleteBeginRoot,
 ) -> bool {
-    match storage_node.head_bucket_info(&root.bucket) {
+    match storage_node.head_bucket_info(root.bucket()) {
         Ok(info) => {
-            info.bucket_execution_generation != root.bucket_execution_generation
-                || info.bucket_incarnation_generation != root.bucket_incarnation_generation
+            info.bucket_execution_generation != root.bucket_execution_generation()
+                || info.bucket_incarnation_generation != root.bucket_incarnation_generation()
         }
         Err(storage::BucketSnapshotLoadError::Metadata(
             storage::MetadataError::BucketNotFound { .. },
@@ -1093,18 +1093,18 @@ impl ReclaimSweeper {
                                         queue_owner.finish_bucket_delete_finalize_work(&root);
                                         bucket_delete_finalize_retry_after.remove(&root);
                                         bucket_delete_begin_retry_after.retain(|begin, _| {
-                                            begin.bucket != root.bucket
-                                                || begin.bucket_incarnation_generation
+                                            begin.bucket() != &root.bucket
+                                                || begin.bucket_incarnation_generation()
                                                     != root.bucket_incarnation_generation
                                         });
                                         deferred_bucket_delete_begin_roots.retain(|begin| {
-                                            begin.bucket != root.bucket
-                                                || begin.bucket_incarnation_generation
+                                            begin.bucket() != &root.bucket
+                                                || begin.bucket_incarnation_generation()
                                                     != root.bucket_incarnation_generation
                                         });
                                         deferred_bucket_delete_begin.retain(|begin| {
-                                            begin.bucket != root.bucket
-                                                || begin.bucket_incarnation_generation
+                                            begin.bucket() != &root.bucket
+                                                || begin.bucket_incarnation_generation()
                                                     != root.bucket_incarnation_generation
                                         });
                                     }
@@ -1141,22 +1141,15 @@ impl ReclaimSweeper {
                             } else {
                                 match current_runtime
                                     .storage_node()
-                                    .begin_bucket_delete_if_current(
-                                        &root.bucket,
-                                        storage::cluster::BucketIdentityGenerations {
-                                            bucket_execution_generation: root
-                                                .bucket_execution_generation,
-                                            bucket_incarnation_generation: root
-                                                .bucket_incarnation_generation,
-                                        },
-                                    ) {
+                                    .continue_adopted_bucket_delete(&root)
+                                {
                                     Ok(()) => {
                                         bucket_delete_begin_retry_after.remove(&root);
                                         queue_owner.enqueue_bucket_delete_finalize(
                                             BucketDeleteFinalizeRoot {
-                                                bucket: root.bucket.clone(),
+                                                bucket: root.bucket().clone(),
                                                 bucket_incarnation_generation: root
-                                                    .bucket_incarnation_generation,
+                                                    .bucket_incarnation_generation(),
                                             },
                                         );
                                     }
@@ -2460,10 +2453,6 @@ impl ReadRuntime {
             &trusted_object_key(key),
             generation_id,
         );
-    }
-
-    pub(super) fn enqueue_bucket_delete_finalize_for(&self, root: BucketDeleteFinalizeRoot) {
-        self.storage_node().enqueue_bucket_delete_finalize(root);
     }
 
     fn lifecycle_config_for_bucket_info(

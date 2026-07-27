@@ -905,6 +905,7 @@ fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
         },
         StoreError::RouteMapExpired { .. } => "route_map_expired",
         StoreError::RouteAdmissionClusterMismatch { .. } => "route_admission_cluster_mismatch",
+        StoreError::RouteCapabilitySubjectMismatch { .. } => "route_capability_subject_mismatch",
         StoreError::StalePayloadOperation { .. } => "stale_payload_operation",
         StoreError::StaleMetadataPrimaryBridge { .. } => "stale_metadata_primary_bridge",
         StoreError::StaleMetadataOperation { .. } => "stale_metadata_operation",

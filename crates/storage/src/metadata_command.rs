@@ -104,12 +104,12 @@ macro_rules! define_metadata_command_publishers {
 
 define_metadata_command_publishers! {
     CreateBucket => (
-        "create_bucket_with_config_and_load_info",
+        "create_bucket_with_config_and_load_info_with_route_validation",
         "CreateBucket",
         ApplyValidated
     ),
     BeginBucketDelete => (
-        "begin_bucket_delete",
+        "begin_bucket_delete_if_current_with_route_validation",
         "MarkBucketDeleting",
         SnapshotSensitive
     ),

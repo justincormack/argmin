@@ -163,6 +163,7 @@ pub(super) mod node_facade {
         maybe_run_after_begin_bucket_delete_drain_hook,
         maybe_run_after_bucket_delete_finalize_claim_hook,
         maybe_run_after_bucket_delete_finalize_hook,
+        maybe_run_before_begin_bucket_delete_drain_hook,
         maybe_run_before_lifecycle_bucket_write_proof_acquire_hook,
         maybe_run_before_lifecycle_context_load_hook, maybe_run_bucket_write_drain_wait_hook,
         LocalNodeRuntime, ReclaimQueueInsert, OBJECT_PAYLOAD_RECLAIM_MAX_OUTSTANDING_PER_PG,

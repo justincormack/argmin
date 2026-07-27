@@ -2047,7 +2047,7 @@ fn stale_bucket_delete_follow_on_does_not_skip_new_object_reclaim() {
         }
         Some(ReclaimWorkItem::BucketDeleteBegin(root)) => panic!(
             "expected bucket-delete follow-on for the trace bucket, got bucket delete begin for {}",
-            root.bucket
+            root.bucket()
         ),
         None => panic!("expected stale bucket-delete follow-on before new object reclaim work"),
         Some(ReclaimWorkItem::ObjectPayload(_)) => {
@@ -2069,7 +2069,7 @@ fn stale_bucket_delete_follow_on_does_not_skip_new_object_reclaim() {
         ),
         Some(ReclaimWorkItem::BucketDeleteBegin(root)) => panic!(
             "bucket-delete follow-on must leave queued object reclaim visible, got bucket delete begin for {}",
-            root.bucket
+            root.bucket()
         ),
         None => panic!("expected object reclaim work after bucket-delete follow-on observes root"),
         Some(ReclaimWorkItem::ObjectPayload(_)) => {
@@ -2122,7 +2122,7 @@ fn deleting_bucket_finalize_advances_from_old_generation_to_new_generation_root(
         ),
         Some(ReclaimWorkItem::BucketDeleteBegin(root)) => panic!(
             "expected stale object reclaim hint after inline bucket-delete finalization, got bucket delete begin for {}",
-            root.bucket
+            root.bucket()
         ),
         None => panic!("expected stale object reclaim hint from the pre-existing queue"),
     }

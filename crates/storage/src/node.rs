@@ -156,6 +156,7 @@ pub struct BucketScopedTestHooks {
     pub before_bucket_write_drain_wait: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_lifecycle_context_load: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_lifecycle_bucket_write_proof_acquire: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub before_begin_bucket_delete_drain: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_begin_bucket_delete_drain: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_bucket_delete_finalize_claim: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_bucket_delete_finalize: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -248,6 +249,14 @@ pub(crate) fn maybe_run_before_lifecycle_bucket_write_proof_acquire_hook(_: &Buc
 pub(crate) fn maybe_run_after_begin_bucket_delete_drain_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.after_begin_bucket_delete_drain)
 }
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn maybe_run_before_begin_bucket_delete_drain_hook(bucket: &BucketName) {
+    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_begin_bucket_delete_drain)
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) fn maybe_run_before_begin_bucket_delete_drain_hook(_: &BucketName) {}
 
 #[cfg(not(any(test, feature = "test-hooks")))]
 pub(crate) fn maybe_run_after_begin_bucket_delete_drain_hook(_: &BucketName) {}
@@ -548,11 +557,31 @@ impl LocalNodeRuntime {
 
 type ReclaimRoot = (BucketName, ObjectKey, GenerationId);
 
+/// Opaque authority to continue a DeleteBucket begin attempt that storage has
+/// already authorized or recovered from durable attempt state.
+///
+/// The subject fields are intentionally private. Ordinary callers may inspect
+/// them for scheduling and stale-work detection, but only storage-owned
+/// recovery and enqueue paths can mint this authority.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BucketDeleteBeginRoot {
-    pub bucket: BucketName,
-    pub bucket_execution_generation: u64,
-    pub bucket_incarnation_generation: u64,
+    pub(crate) bucket: BucketName,
+    pub(crate) bucket_execution_generation: u64,
+    pub(crate) bucket_incarnation_generation: u64,
+}
+
+impl BucketDeleteBeginRoot {
+    pub fn bucket(&self) -> &BucketName {
+        &self.bucket
+    }
+
+    pub fn bucket_execution_generation(&self) -> u64 {
+        self.bucket_execution_generation
+    }
+
+    pub fn bucket_incarnation_generation(&self) -> u64 {
+        self.bucket_incarnation_generation
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1847,7 +1876,7 @@ impl SharedStorageNode {
     }
 
     /// Queue an active-bucket DeleteBucket begin attempt for background retry.
-    pub fn enqueue_bucket_delete_begin(&self, root: BucketDeleteBeginRoot) -> bool {
+    pub(crate) fn enqueue_bucket_delete_begin(&self, root: BucketDeleteBeginRoot) -> bool {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
         if state.queued_bucket_delete_begins.insert(root.clone()) {

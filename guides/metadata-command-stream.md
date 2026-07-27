@@ -179,8 +179,8 @@ Current production pending-command publishers:
 
 | Publisher path | Command kind | Class | Required contention shape |
 | --- | --- | --- | --- |
-| `create_bucket_with_config_and_load_info` | `CreateBucket` | `ApplyValidated` | Drain competing PG slot during pending-slot checks and command-id allocation; exact-row apply handles idempotence/conflict. |
-| `begin_bucket_delete` | `MarkBucketDeleting` | `SnapshotSensitive` | Rebuild from current bucket/delete preconditions after contention. |
+| `create_bucket_with_config_and_load_info_with_route_validation` | `CreateBucket` | `ApplyValidated` | Revalidate the admitted bucket route before command construction and carry its immutable effect fence to pending-slot insertion; drain competing PG slot during pending-slot checks and command-id allocation, while exact-row apply handles idempotence/conflict. |
+| `begin_bucket_delete_if_current_with_route_validation` | `MarkBucketDeleting` | `SnapshotSensitive` | Revalidate the admitted bucket route before the durable write drain and pending-slot insertion, then rebuild from current bucket/delete preconditions after contention. |
 | `delete_bucket_from_acting_set` | `DeleteFinalizedBucket` | `SnapshotSensitive` | Rebuild from the current deleting-bucket generations after unrelated contention; an equivalent pending finalization may be finished only after its exact bucket identity is matched. |
 | `put_bucket_versioning_and_load_info_with_route_validation` | `PutBucketVersioning` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
 | `put_bucket_acl_and_load_info_with_route_validation` | `PutBucketAcl` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
@@ -368,12 +368,12 @@ outcome is only valid after an exact matching predicate has succeeded.
 
 | Finish caller/path | Command scope | Finish classification | Notes |
 | --- | --- | --- | --- |
-| `create_bucket_with_config_and_load_info` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Create is not reported successful until the command converges and the primary row is reloaded. |
+| `create_bucket_with_config_and_load_info_with_route_validation` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Create is not reported successful until the command converges and the primary row is reloaded. |
 | `put_bucket_versioning_and_load_info_with_route_validation` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Request retries re-enter the bucket snapshot path. |
 | `put_bucket_acl_and_load_info_with_route_validation` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Request retries re-enter the bucket snapshot path. |
 | `put_bucket_property_command_and_load_info_with_route_validation` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Request retries re-enter the bucket snapshot path. |
 | `put_bucket_subresource_command_and_load_info_with_route_validation` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Request retries re-enter the bucket snapshot path. |
-| `begin_bucket_delete` | bucket PG | Partial exact-command conflicts are retryable only after validating exact command bytes plus matching `previous_log_hash` and `log_hash` across applied rows. Divergent same-index rows fail closed. | Bucket deletion is special because a failed finish can make the bucket visible as `Deleting` and allow a queued finalizer to remove it before an SDK retry. |
+| `begin_bucket_delete_if_current_with_route_validation` | bucket PG | Partial exact-command conflicts are retryable only after validating exact command bytes plus matching `previous_log_hash` and `log_hash` across applied rows. Divergent same-index rows fail closed. | Bucket deletion is special because a failed finish can make the bucket visible as `Deleting` and allow a queued finalizer to remove it before an SDK retry. |
 | `establish_multipart_completion_barrier` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | The returned idempotence sequence must come from a fresh terminal bucket-PG barrier built after all pre-existing pending commands are drained under the current request. |
 | `drain_pending_metadata_command_pg_slot` and `drain_pending_multipart_completion_barrier_command` | bucket PG drain | Fail closed on unsafe finish conflicts. | These are generic drain helpers; they must not hide divergent command-log state from the caller. |
 | `finish_pending_command_for_multipart_completion_barrier` | bucket/object PG drain | Follows the command family finisher. | Multi-PG MPU completion must not hold ambiguous pending state across PGs; Phase 9.3 pins the multipart serialization rules. |

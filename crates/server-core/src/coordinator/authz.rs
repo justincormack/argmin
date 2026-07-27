@@ -2191,42 +2191,6 @@ impl Coordinator {
         Ok(bucket)
     }
 
-    fn authorize_loaded_bucket_write_action_for_storage_node<R>(
-        &self,
-        storage_node: &Arc<StorageCluster>,
-        req: &R,
-        action: auth::PolicyAction,
-        default_allowed: impl FnOnce(&Requester, &BucketSummary) -> bool,
-    ) -> Result<LoadedBucketHandle, ServerError>
-    where
-        R: BucketScopedAuthorizationRequest + ?Sized,
-    {
-        self.with_bucket_write_handle_for_storage_node(
-            storage_node,
-            req,
-            BucketHandleRequest::new()
-                .requiring_policy_view()
-                .requiring_bucket_tags_if_abac_enabled(),
-            |bucket| {
-                let default_allowed = default_allowed(req.requester(), bucket.bucket());
-                let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
-                let allowed = self
-                    .requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
-                        req.requester(),
-                        bucket.bucket(),
-                        Self::loaded_bucket_tags_for_policy(&bucket)?.as_deref(),
-                        action,
-                        bucket_policy.as_deref(),
-                        default_allowed,
-                    )?;
-                if !allowed {
-                    return Err(ServerError::AccessDenied);
-                }
-                Ok(bucket)
-            },
-        )
-    }
-
     fn authorize_loaded_bucket_write_action_on_admitted_route<R>(
         &self,
         admission: &storage::StorageClusterRouteAdmission,

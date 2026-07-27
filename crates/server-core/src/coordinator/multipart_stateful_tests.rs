@@ -2085,7 +2085,7 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
         Some(ReclaimWorkItem::BucketDeleteBegin(root)) => {
             panic!(
                 "{invariant}: expected object reclaim work, got bucket delete begin for {}",
-                root.bucket
+                root.bucket()
             )
         }
         None => panic!("{invariant}: expected initial reclaim work, got none"),

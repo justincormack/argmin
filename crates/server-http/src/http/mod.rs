@@ -1783,24 +1783,25 @@ impl HttpFrontend {
                 let namespace = parse_bucket_namespace(req, &bucket)?;
                 let ownership = parse_bucket_ownership(req.header("x-amz-object-ownership"))?;
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator
-                    .create_bucket(&crate::coordinator::CreateBucketRequest {
+                self.coordinator.create_bucket_on_admitted_route(
+                    storage_route_admission,
+                    &crate::coordinator::CreateBucketRequest {
                         name: bucket.clone(),
                         requester,
                         namespace,
                         acl,
                         ownership,
                         object_lock_enabled,
-                    })?;
+                    },
+                )?;
                 Ok(S3Response::create_bucket(bucket.as_str()))
             }
             S3Operation::DeleteBucket { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator.delete_bucket(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)?;
+                self.coordinator.delete_bucket_on_admitted_route(
+                    storage_route_admission,
+                    &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                )?;
                 Ok(S3Response::delete_bucket())
             }
             S3Operation::HeadBucket { bucket } => {

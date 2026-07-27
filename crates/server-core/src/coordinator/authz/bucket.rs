@@ -111,16 +111,18 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedDeleteBucket, ServerError> {
-        self.authorize_delete_bucket_with_storage_node(&self.storage_node(), req)
+        let admission = self.admit_storage_route_for_request()?;
+        self.authorize_delete_bucket_on_admitted_route(&admission, req)
     }
 
-    pub(in crate::coordinator) fn authorize_delete_bucket_with_storage_node(
+    pub(in crate::coordinator) fn authorize_delete_bucket_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedDeleteBucket, ServerError> {
-        let bucket = match self.authorize_loaded_bucket_write_action_for_storage_node(
-            storage_node,
+        self.require_storage_route_admission(admission)?;
+        let bucket = match self.authorize_loaded_bucket_write_action_on_admitted_route(
+            admission,
             req,
             auth::PolicyAction::DeleteBucket,
             Self::requester_can_bucket_owner_account_admin,
@@ -128,7 +130,7 @@ impl Coordinator {
             Ok(bucket) => bucket,
             Err(ServerError::OperationAborted) => {
                 if let Some(authorized) =
-                    self.authorize_delete_bucket_from_active_attempt_snapshot(storage_node, req)?
+                    self.authorize_delete_bucket_from_active_attempt_snapshot(admission, req)?
                 {
                     return Ok(authorized);
                 }
@@ -136,7 +138,7 @@ impl Coordinator {
             }
             Err(ServerError::BucketNotFound { name }) => {
                 if let Some(authorized) =
-                    self.authorize_delete_bucket_from_raw_snapshot(storage_node, req)?
+                    self.authorize_delete_bucket_from_raw_snapshot(admission, req)?
                 {
                     return Ok(authorized);
                 }
@@ -153,18 +155,25 @@ impl Coordinator {
 
     fn authorize_delete_bucket_from_raw_snapshot(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<Option<AuthorizedDeleteBucket>, ServerError> {
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
-        let snapshot = match storage_node.load_bucket_delete_authorization_snapshot(
-            req.name_typed(),
-            request.resolve_to_storage_request(),
-        ) {
+        let snapshot = match admission
+            .active_bucket_route(req.name_typed())
+            .map_err(crate::coordinator::map_store_error)?
+            .load_bucket_delete_authorization_snapshot(request.resolve_to_storage_request())
+        {
             Ok(snapshot) => snapshot,
-            Err(_) => return Ok(None),
+            Err(error) => {
+                let error = BucketHandleLoader::map_bucket_snapshot_error(error);
+                if matches!(error, ServerError::OperationAborted) {
+                    return Err(error);
+                }
+                return Ok(None);
+            }
         };
         if snapshot.bucket.state != BucketState::Deleting {
             return Ok(None);
@@ -180,15 +189,16 @@ impl Coordinator {
 
     fn authorize_delete_bucket_from_active_attempt_snapshot(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<Option<AuthorizedDeleteBucket>, ServerError> {
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
-        let Some(snapshot) = storage_node
+        let Some(snapshot) = admission
+            .active_bucket_route(req.name_typed())
+            .map_err(crate::coordinator::map_store_error)?
             .load_active_bucket_delete_attempt_authorization_snapshot(
-                req.name_typed(),
                 request.resolve_to_storage_request(),
             )
             .map_err(BucketHandleLoader::map_bucket_snapshot_error)?

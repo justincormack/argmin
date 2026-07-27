@@ -447,6 +447,14 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
             policy_context: PutObjectPolicyContext::default()
                 .with_default_canned_acl(Some("public-read")),
         };
+        let create_bucket_request = CreateBucketRequest {
+            name: trusted_bucket_name("expired-create"),
+            requester: test_requester(),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::BucketOwnerEnforced,
+            object_lock_enabled: false,
+        };
         let control_request = BucketTagControlRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
         };
@@ -518,6 +526,14 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
             .get_object_acl_on_admitted_route(&fresh_admission, &object_metadata_request)
             .unwrap();
         for (operation, result) in [
+            (
+                "CreateBucket",
+                coord.create_bucket_on_admitted_route(&admission, &create_bucket_request),
+            ),
+            (
+                "DeleteBucket",
+                coord.delete_bucket_on_admitted_route(&admission, &request),
+            ),
             (
                 "ListBuckets",
                 coord
@@ -953,6 +969,12 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
                 .unwrap(),
             baseline_bucket_acl
         );
+        assert!(!coord
+            .bucket_exists_on_admitted_route(
+                &fresh_admission,
+                &trusted_bucket_name("expired-create"),
+            )
+            .unwrap());
     });
 }
 
@@ -1261,6 +1283,115 @@ fn bucket_property_versioning_and_acl_mutations_expire_at_pending_install_effect
         .get_bucket_acl_on_admitted_route(&admission, &acl_request.bucket)
         .unwrap();
     assert!(Coordinator::acl_grants_public_read(&updated_acl.acl_grants));
+}
+
+#[test]
+fn create_bucket_expires_at_pending_install_effect_boundary() {
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let request = CreateBucketRequest {
+        name: trusted_bucket_name("late-create"),
+        requester: test_requester(),
+        namespace: BucketNamespace::Global,
+        acl: CreateBucketAcl::DefaultPrivate,
+        ownership: BucketObjectOwnership::BucketOwnerEnforced,
+        object_lock_enabled: false,
+    };
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let hook_clock = Arc::clone(&clock);
+    let hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            hook_clock.set(4_500)
+        }));
+    let error = coord
+        .create_bucket_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+
+    clock.set(1_000);
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    assert!(!coord
+        .bucket_exists_on_admitted_route(&admission, &request.name)
+        .unwrap());
+    coord
+        .create_bucket_on_admitted_route(&admission, &request)
+        .unwrap();
+    assert!(coord
+        .bucket_exists_on_admitted_route(&admission, &request.name)
+        .unwrap());
+}
+
+#[test]
+fn delete_bucket_expires_at_drain_and_pending_install_effect_boundaries() {
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    for bucket in ["delete-drain", "delete-mark"] {
+        coord
+            .create_bucket_for_owner("default-owner", bucket, false)
+            .unwrap();
+    }
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let hook_clock = Arc::clone(&clock);
+    let hook = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+        target: Some(trusted_bucket_name("delete-drain")),
+        before_begin_bucket_delete_drain: Some(Arc::new(move || hook_clock.set(4_500))),
+        ..BucketScopedTestHooks::default()
+    });
+    let request = bucket_request_with_expected_owner("delete-drain", test_requester(), None);
+    let error = coord
+        .delete_bucket_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+    let snapshot = cluster
+        .bucket_delete_debug_snapshot(&trusted_bucket_name("delete-drain"))
+        .unwrap();
+    assert_eq!(snapshot.bucket_row.unwrap().state, BucketState::Active);
+    assert!(snapshot.durable_write_drain.is_none());
+    assert!(snapshot.pending_metadata_command.is_none());
+
+    clock.set(1_000);
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let hook_clock = Arc::clone(&clock);
+    let hook = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+        target: Some(trusted_bucket_name("delete-mark")),
+        after_begin_bucket_delete_drain: Some(Arc::new(move || hook_clock.set(4_500))),
+        ..BucketScopedTestHooks::default()
+    });
+    let request = bucket_request_with_expected_owner("delete-mark", test_requester(), None);
+    let error = coord
+        .delete_bucket_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+    let snapshot = cluster
+        .bucket_delete_debug_snapshot(&trusted_bucket_name("delete-mark"))
+        .unwrap();
+    let bucket_row = snapshot.bucket_row.unwrap();
+    assert_eq!(bucket_row.state, BucketState::Active);
+    assert!(snapshot.durable_write_drain.is_some());
+    assert!(snapshot.pending_metadata_command.is_none());
 }
 
 #[test]
@@ -2066,6 +2197,14 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         config: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"default-owner"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
         confirm_remove_self_bucket_access: false,
     };
+    let rejected_create_request = CreateBucketRequest {
+        name: trusted_bucket_name("foreign-domain-create"),
+        requester: test_requester(),
+        namespace: BucketNamespace::Global,
+        acl: CreateBucketAcl::DefaultPrivate,
+        ownership: BucketObjectOwnership::BucketOwnerEnforced,
+        object_lock_enabled: false,
+    };
     let rejected_object_lock_request = PutBucketObjectLockConfigurationRequest {
         bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
         config: BucketObjectLockConfigurationUpdate {
@@ -2130,6 +2269,14 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
     };
 
     for (operation, result) in [
+        (
+            "CreateBucket",
+            local.create_bucket_on_admitted_route(&foreign_admission, &rejected_create_request),
+        ),
+        (
+            "DeleteBucket",
+            local.delete_bucket_on_admitted_route(&foreign_admission, &request),
+        ),
         (
             "ListBuckets",
             local
@@ -2417,6 +2564,15 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
             "{operation}: {error:?}"
         );
     }
+    assert!(!foreign
+        .bucket_exists_on_admitted_route(&foreign_admission, &rejected_create_request.name)
+        .unwrap());
+    foreign
+        .create_bucket_on_admitted_route(&foreign_admission, &rejected_create_request)
+        .unwrap();
+    assert!(foreign
+        .bucket_exists_on_admitted_route(&foreign_admission, &rejected_create_request.name)
+        .unwrap());
     assert_eq!(
         foreign
             .get_bucket_cors_on_admitted_route(&foreign_admission, &request)
@@ -3807,6 +3963,8 @@ fn delete_bucket_pins_runtime_map_after_authorization() {
         &[0, 1],
     ));
     let hook_handle = handle.clone();
+    let publication_threads = Arc::new(Mutex::new(Vec::new()));
+    let hook_publication_threads = Arc::clone(&publication_threads);
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -3814,12 +3972,25 @@ fn delete_bucket_pins_runtime_map_after_authorization() {
     let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_loaded: Some(Arc::new(move || {
-            hook_handle.install(Arc::clone(&candidate)).unwrap();
+            let publishing_handle = hook_handle.clone();
+            let publishing_candidate = Arc::clone(&candidate);
+            let thread = thread::spawn(move || {
+                publishing_handle.install(publishing_candidate).unwrap();
+            });
+            hook_publication_threads.lock().unwrap().push(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
         })),
         ..BucketWriteHandleTestHooks::default()
     });
 
     delete_bucket_test(&coord, "bucket").unwrap();
+    publication_threads
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("DeleteBucket hook should start route publication")
+        .join()
+        .unwrap();
 
     handle
         .install(make_dynamic_runtime_map_candidate(initial))
@@ -4204,7 +4375,7 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&expired));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&expired));
 
-    expired.enqueue_bucket_delete_begin(
+    expired.test_enqueue_bucket_delete_begin(
         &bucket,
         bucket_identity.bucket_execution_generation,
         bucket_identity.bucket_incarnation_generation,
@@ -4451,7 +4622,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_stream_cleanup_phase() {
 
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
-    initial.enqueue_bucket_delete_begin(
+    initial.test_enqueue_bucket_delete_begin(
         &bucket,
         bucket_identity.bucket_execution_generation,
         bucket_identity.bucket_incarnation_generation,
@@ -4541,7 +4712,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_reservation_wait_phase() {
 
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
-    initial.enqueue_bucket_delete_begin(
+    initial.test_enqueue_bucket_delete_begin(
         &bucket,
         bucket_identity.bucket_execution_generation,
         bucket_identity.bucket_incarnation_generation,
@@ -4620,7 +4791,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_phase() {
 
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
-    initial.enqueue_bucket_delete_begin(
+    initial.test_enqueue_bucket_delete_begin(
         &bucket,
         bucket_identity.bucket_execution_generation,
         bucket_identity.bucket_incarnation_generation,
@@ -4692,7 +4863,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_proven_phase(
 
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
-    initial.enqueue_bucket_delete_begin(
+    initial.test_enqueue_bucket_delete_begin(
         &bucket,
         bucket_identity.bucket_execution_generation,
         bucket_identity.bucket_incarnation_generation,
@@ -4751,7 +4922,7 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&expired));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&expired));
 
-    expired.enqueue_bucket_delete_begin(
+    expired.test_enqueue_bucket_delete_begin(
         &bucket,
         old_identity.bucket_execution_generation,
         old_identity.bucket_incarnation_generation,
