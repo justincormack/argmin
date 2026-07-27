@@ -2890,6 +2890,43 @@ Sixty-second Phase 3 slice:
   boundary checker, workspace-wide strict Clippy, and the full parallel
   workspace suite pass (7,593 tests).
 
+Sixty-third Phase 3 slice:
+
+- PutBucketVersioning, PutBucketObjectLockConfiguration, Put/Delete
+  BucketEncryption, PutBucketAbac, Put/Delete BucketPublicAccessBlock,
+  Put/Delete BucketOwnershipControls, and PutBucketAcl now consume the
+  buffered request's existing `StorageClusterRouteAdmission` for both bucket
+  authorization and mutation. Their production HTTP paths cannot resample the
+  renewable runtime-map handle; direct test/test-support wrappers acquire an
+  admission before entering the same production methods.
+- `ActiveBucketRoute` now owns the versioning, bucket-property, and bucket-ACL
+  publishers for its fixed bucket and bucket-metadata PG. Each publisher
+  revalidates request authority during snapshot/command construction and
+  carries the admission's immutable `AdmittedRouteEffectFence` to the deepest
+  bucket-control pending-slot insertion. Exact installed-command application
+  remains convergence after that authorized effect boundary.
+- the generic raw bucket-property/versioning/ACL storage publishers are now
+  test/test-hook only. CreateBucket's legacy-region `AlreadyOwned` ACL rewrite
+  retains one explicitly named transitional storage entry point; it remains
+  coupled to CreateBucket and will migrate with that operation rather than
+  leaving a general production PutBucketAcl bypass.
+- the captured-deadline and same-cluster/different-publication-domain matrices
+  cover all ten operations, with positive local canaries and exact versioning,
+  object-lock, encryption, ABAC, public-access-block, ownership-control, and
+  ACL state checks after rejection. A deterministic pending-install regression
+  independently expires each of the three command families—property,
+  versioning, and ACL—after same-epoch raw-route renewal and proves no durable
+  mutation before a fresh positive retry.
+- the publisher registry, contention/convergence guide, and temporary boundary
+  inventory now name the route-validating canonical entry points.
+- CreateBucket/DeleteBucket, multipart control operations, other remaining
+  buffered coordinator workflows, and capability requirements on the
+  node-client traits remain open in Phase 3.
+- the three focused deadline/domain/effect-boundary regressions, 23 focused
+  HTTP bucket-mutation tests, all 1,248 server-core tests, formatting, diff
+  validation, the storage boundary checker, and workspace-wide strict Clippy
+  pass. The full parallel workspace suite passes (7,592 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

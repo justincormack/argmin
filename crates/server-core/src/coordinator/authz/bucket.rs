@@ -493,13 +493,13 @@ impl Coordinator {
         )
     }
 
-    pub(in crate::coordinator) fn authorize_put_bucket_abac_with_storage_node(
+    pub(in crate::coordinator) fn authorize_put_bucket_abac_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketAbacRequest<'_>,
     ) -> Result<AuthorizedPutBucketAbac, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_owner_account_admin_write_for_storage_node(
-            storage_node,
+        let _bucket = self.authorize_loaded_bucket_owner_account_admin_write_on_admitted_route(
+            admission,
             &req.bucket,
         )?;
         Ok(AuthorizedPutBucketAbac {
@@ -638,13 +638,13 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_put_bucket_public_access_block_with_storage_node(
+    pub(in crate::coordinator) fn authorize_put_bucket_public_access_block_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketPublicAccessBlockRequest<'_>,
     ) -> Result<AuthorizedPutBucketPublicAccessBlock, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_write_action_for_storage_node(
-            storage_node,
+        let _bucket = self.authorize_loaded_bucket_write_action_on_admitted_route(
+            admission,
             &req.bucket,
             auth::PolicyAction::PutBucketPublicAccessBlock,
             Self::requester_can_bucket_owner_account_admin,
@@ -690,13 +690,13 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_delete_bucket_public_access_block_with_storage_node(
+    pub(in crate::coordinator) fn authorize_delete_bucket_public_access_block_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_write_action_for_storage_node(
-            storage_node,
+        let _bucket = self.authorize_loaded_bucket_write_action_on_admitted_route(
+            admission,
             req,
             auth::PolicyAction::PutBucketPublicAccessBlock,
             Self::requester_can_bucket_owner_account_admin,
@@ -711,16 +711,17 @@ impl Coordinator {
         &self,
         req: &PutBucketOwnershipControlsRequest<'_>,
     ) -> Result<AuthorizedPutBucketOwnershipControls, ServerError> {
-        self.authorize_put_bucket_ownership_controls_with_storage_node(&self.storage_node(), req)
+        let admission = self.admit_storage_route_for_request()?;
+        self.authorize_put_bucket_ownership_controls_on_admitted_route(&admission, req)
     }
 
-    pub(in crate::coordinator) fn authorize_put_bucket_ownership_controls_with_storage_node(
+    pub(in crate::coordinator) fn authorize_put_bucket_ownership_controls_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketOwnershipControlsRequest<'_>,
     ) -> Result<AuthorizedPutBucketOwnershipControls, ServerError> {
-        let bucket = self.with_bucket_write_handle_for_storage_node(
-            storage_node,
+        let bucket = self.with_bucket_write_handle_on_admitted_route(
+            admission,
             &req.bucket,
             BucketHandleRequest::new()
                 .requiring_policy_view()
@@ -800,13 +801,13 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_delete_bucket_ownership_controls_with_storage_node(
+    pub(in crate::coordinator) fn authorize_delete_bucket_ownership_controls_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_write_action_for_storage_node(
-            storage_node,
+        let _bucket = self.authorize_loaded_bucket_write_action_on_admitted_route(
+            admission,
             req,
             auth::PolicyAction::PutBucketOwnershipControls,
             Self::requester_can_bucket_owner_account_admin,
@@ -929,13 +930,13 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_put_bucket_encryption_with_storage_node(
+    pub(in crate::coordinator) fn authorize_put_bucket_encryption_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketEncryptionRequest<'_>,
     ) -> Result<AuthorizedPutBucketEncryption, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_write_action_for_storage_node(
-            storage_node,
+        let _bucket = self.authorize_loaded_bucket_write_action_on_admitted_route(
+            admission,
             &req.bucket,
             auth::PolicyAction::PutEncryptionConfiguration,
             Self::requester_can_bucket_owner_account_admin,
@@ -951,16 +952,17 @@ impl Coordinator {
         &self,
         req: &PutBucketVersioningRequest<'_>,
     ) -> Result<AuthorizedPutBucketVersioning, ServerError> {
-        self.authorize_put_bucket_versioning_with_storage_node(&self.storage_node(), req)
+        let admission = self.admit_storage_route_for_request()?;
+        self.authorize_put_bucket_versioning_on_admitted_route(&admission, req)
     }
 
-    pub(in crate::coordinator) fn authorize_put_bucket_versioning_with_storage_node(
+    pub(in crate::coordinator) fn authorize_put_bucket_versioning_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketVersioningRequest<'_>,
     ) -> Result<AuthorizedPutBucketVersioning, ServerError> {
-        let bucket = self.authorize_loaded_bucket_write_action_for_storage_node(
-            storage_node,
+        let bucket = self.authorize_loaded_bucket_write_action_on_admitted_route(
+            admission,
             &req.bucket,
             auth::PolicyAction::PutBucketVersioning,
             Self::requester_can_bucket_owner_account_admin,
@@ -1242,19 +1244,17 @@ impl Coordinator {
         &self,
         req: &PutBucketObjectLockConfigurationRequest<'_>,
     ) -> Result<AuthorizedPutBucketObjectLockConfiguration, ServerError> {
-        self.authorize_put_bucket_object_lock_configuration_with_storage_node(
-            &self.storage_node(),
-            req,
-        )
+        let admission = self.admit_storage_route_for_request()?;
+        self.authorize_put_bucket_object_lock_configuration_on_admitted_route(&admission, req)
     }
 
-    pub(in crate::coordinator) fn authorize_put_bucket_object_lock_configuration_with_storage_node(
+    pub(in crate::coordinator) fn authorize_put_bucket_object_lock_configuration_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketObjectLockConfigurationRequest<'_>,
     ) -> Result<AuthorizedPutBucketObjectLockConfiguration, ServerError> {
-        let bucket = self.authorize_loaded_bucket_write_action_for_storage_node(
-            storage_node,
+        let bucket = self.authorize_loaded_bucket_write_action_on_admitted_route(
+            admission,
             &req.bucket,
             auth::PolicyAction::PutBucketObjectLockConfiguration,
             Self::requester_can_bucket_owner_account_admin,
@@ -1315,13 +1315,13 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_delete_bucket_encryption_with_storage_node(
+    pub(in crate::coordinator) fn authorize_delete_bucket_encryption_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedDeleteBucketEncryption, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_write_action_for_storage_node(
-            storage_node,
+        let _bucket = self.authorize_loaded_bucket_write_action_on_admitted_route(
+            admission,
             req,
             auth::PolicyAction::PutEncryptionConfiguration,
             Self::requester_can_bucket_owner_account_admin,
@@ -1491,16 +1491,17 @@ impl Coordinator {
         &self,
         req: &PutBucketAclRequest<'_>,
     ) -> Result<AuthorizedPutBucketAcl, ServerError> {
-        self.authorize_put_bucket_acl_with_storage_node(&self.storage_node(), req)
+        let admission = self.admit_storage_route_for_request()?;
+        self.authorize_put_bucket_acl_on_admitted_route(&admission, req)
     }
 
-    pub(in crate::coordinator) fn authorize_put_bucket_acl_with_storage_node(
+    pub(in crate::coordinator) fn authorize_put_bucket_acl_on_admitted_route(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketAclRequest<'_>,
     ) -> Result<AuthorizedPutBucketAcl, ServerError> {
-        let bucket = self.with_bucket_write_handle_for_storage_node(
-            storage_node,
+        let bucket = self.with_bucket_write_handle_on_admitted_route(
+            admission,
             &req.bucket,
             BucketHandleRequest::new()
                 .requiring_policy_view()

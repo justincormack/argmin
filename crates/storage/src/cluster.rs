@@ -38,11 +38,12 @@ use crate::error::{ClusterBuildError, PgMetadataTransferError, ShardIoError, Sto
 use crate::metadata_command::CommitDirectPutObjectCommand;
 use crate::metadata_command::{
     metadata_command_log_hash, AbortStreamUploadCommand, AppendStreamSegmentCommand,
-    BucketWriteReservationProof, CreateMultipartUploadCommand, CreateStreamUploadCommand,
-    DeleteObjectVersionTarget, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-    MetadataCommandPayload, MetadataCommandReplicaState, MetadataTransferCommand,
-    ObjectPayloadReclaimCommand, PutObjectMetadataMutation, ReleaseObjectGenerationCommand,
-    ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+    BucketPropertyMutation, BucketWriteReservationProof, CreateMultipartUploadCommand,
+    CreateStreamUploadCommand, DeleteObjectVersionTarget, MetadataCommandEnvelope,
+    MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
+    MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimCommand,
+    PutObjectMetadataMutation, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
+    ReserveObjectVersionCommand,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
@@ -73,7 +74,8 @@ use crate::storage_rpc::{
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
 use crate::types::{
-    AclGrants, AdmittedRouteEffectFence, BucketInfo, BucketName, BucketSnapshot,
+    AclGrants, AdmittedRouteEffectFence, BucketAclSummary, BucketEncryptionConfig, BucketInfo,
+    BucketName, BucketObjectLockConfig, BucketOwnershipControls, BucketSnapshot,
     BucketSnapshotPair, BucketSnapshotRequest, BucketSubresourceKind, BucketVersioningState,
     BucketWriteDrainRecord, BucketWriteReservationRecord, CanonicalUserId, ClusterEpoch,
     CommitDirectPutObjectReq, CreateStreamUploadReq, DeleteCurrentObjectOutcome,
@@ -87,12 +89,13 @@ use crate::types::{
     PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,
     PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
-    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq, RouteMapValidity,
-    SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
-    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
-    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus,
-    StoredObject, StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
+    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig,
+    RouteMapValidity, SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey,
+    ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
+    ShardScavengerObservationRecord, ShardScavengerPayloadReference,
+    ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus, StoredObject,
+    StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
+    StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
 };
 #[cfg(test)]
 use crate::types::{
@@ -2594,6 +2597,98 @@ impl ActiveBucketRoute<'_> {
                 || self.admission.require_valid_now(),
                 request,
                 action,
+            )
+    }
+
+    pub fn put_bucket_versioning_and_load_info(
+        &self,
+        state: BucketVersioningState,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.admission
+            .cluster
+            .put_bucket_versioning_and_load_info_with_route_validation(
+                self.mutation_effect_route(),
+                || self.admission.require_valid_now(),
+                state,
+            )
+    }
+
+    fn put_bucket_property_and_load_info(
+        &self,
+        mutation: BucketPropertyMutation,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.admission
+            .cluster
+            .put_bucket_property_command_and_load_info_with_route_validation(
+                self.mutation_effect_route(),
+                || self.admission.require_valid_now(),
+                mutation,
+            )
+    }
+
+    pub fn put_bucket_object_lock_and_load_info(
+        &self,
+        config: BucketObjectLockConfig,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.put_bucket_property_and_load_info(BucketPropertyMutation::ObjectLock(config))
+    }
+
+    pub fn put_bucket_encryption_and_load_info(
+        &self,
+        config: BucketEncryptionConfig,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.put_bucket_property_and_load_info(BucketPropertyMutation::Encryption(config))
+    }
+
+    pub fn put_bucket_public_access_block_and_load_info(
+        &self,
+        config: PublicAccessBlockConfig,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.put_bucket_property_and_load_info(BucketPropertyMutation::PublicAccessBlock(Some(
+            config,
+        )))
+    }
+
+    pub fn delete_bucket_public_access_block_and_load_info(
+        &self,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.put_bucket_property_and_load_info(BucketPropertyMutation::PublicAccessBlock(None))
+    }
+
+    pub fn put_bucket_ownership_controls_and_load_info(
+        &self,
+        config: BucketOwnershipControls,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.put_bucket_property_and_load_info(BucketPropertyMutation::OwnershipControls(Some(
+            config,
+        )))
+    }
+
+    pub fn delete_bucket_ownership_controls_and_load_info(
+        &self,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.put_bucket_property_and_load_info(BucketPropertyMutation::OwnershipControls(None))
+    }
+
+    pub fn put_bucket_abac_enabled_and_load_info(
+        &self,
+        enabled: bool,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.put_bucket_property_and_load_info(BucketPropertyMutation::AbacEnabled(enabled))
+    }
+
+    pub fn put_bucket_acl_and_load_info(
+        &self,
+        acl_grants: &AclGrants,
+        summary: BucketAclSummary,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.admission
+            .cluster
+            .put_bucket_acl_and_load_info_with_route_validation(
+                self.mutation_effect_route(),
+                || self.admission.require_valid_now(),
+                acl_grants,
+                summary,
             )
     }
 

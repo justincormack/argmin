@@ -2504,7 +2504,8 @@ impl HttpFrontend {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let versioning_state = xml::parse_versioning_config_xml(&req.body)?;
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator.put_bucket_versioning(
+                self.coordinator.put_bucket_versioning_on_admitted_route(
+                    storage_route_admission,
                     &crate::coordinator::PutBucketVersioningRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                         state: versioning_state,
@@ -2527,12 +2528,14 @@ impl HttpFrontend {
                 )?;
                 let config = xml::parse_bucket_object_lock_configuration_xml(&req.body)?;
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator.put_bucket_object_lock_configuration(
-                    &crate::coordinator::PutBucketObjectLockConfigurationRequest {
-                        bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
-                        config,
-                    },
-                )?;
+                self.coordinator
+                    .put_bucket_object_lock_configuration_on_admitted_route(
+                        storage_route_admission,
+                        &crate::coordinator::PutBucketObjectLockConfigurationRequest {
+                            bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
+                            config,
+                        },
+                    )?;
                 Ok(S3Response::put_bucket_object_lock_configuration())
             }
             S3Operation::GetBucketObjectLockConfiguration { bucket } => {
@@ -2549,7 +2552,8 @@ impl HttpFrontend {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let config = xml::parse_bucket_encryption_xml(&req.body)?;
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator.put_bucket_encryption(
+                self.coordinator.put_bucket_encryption_on_admitted_route(
+                    storage_route_admission,
                     &crate::coordinator::PutBucketEncryptionRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                         config,
@@ -2567,11 +2571,11 @@ impl HttpFrontend {
             }
             S3Operation::DeleteBucketEncryption { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator.delete_bucket_encryption(&bucket_request(
-                    &bucket,
-                    requester,
-                    expected_bucket_owner,
-                )?)?;
+                self.coordinator
+                    .delete_bucket_encryption_on_admitted_route(
+                        storage_route_admission,
+                        &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                    )?;
                 Ok(S3Response::delete_bucket_encryption())
             }
             S3Operation::PostObject { .. } => {
@@ -2662,11 +2666,13 @@ impl HttpFrontend {
                 )?;
                 let enabled = xml::parse_bucket_abac_xml(&req.body)?;
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator
-                    .put_bucket_abac(&crate::coordinator::PutBucketAbacRequest {
+                self.coordinator.put_bucket_abac_on_admitted_route(
+                    storage_route_admission,
+                    &crate::coordinator::PutBucketAbacRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                         enabled,
-                    })?;
+                    },
+                )?;
                 Ok(S3Response::put_bucket_abac())
             }
             S3Operation::GetBucketAbac { bucket } => {
@@ -2912,12 +2918,14 @@ impl HttpFrontend {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let config = xml::parse_public_access_block_xml(&req.body)?;
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator.put_bucket_public_access_block(
-                    &crate::coordinator::PutBucketPublicAccessBlockRequest {
-                        bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
-                        config,
-                    },
-                )?;
+                self.coordinator
+                    .put_bucket_public_access_block_on_admitted_route(
+                        storage_route_admission,
+                        &crate::coordinator::PutBucketPublicAccessBlockRequest {
+                            bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
+                            config,
+                        },
+                    )?;
                 Ok(S3Response::put_bucket_public_access_block())
             }
             S3Operation::GetBucketPublicAccessBlock { bucket } => {
@@ -2939,23 +2947,24 @@ impl HttpFrontend {
             S3Operation::DeleteBucketPublicAccessBlock { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator
-                    .delete_bucket_public_access_block(&bucket_request(
-                        &bucket,
-                        requester,
-                        expected_bucket_owner,
-                    )?)?;
+                    .delete_bucket_public_access_block_on_admitted_route(
+                        storage_route_admission,
+                        &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                    )?;
                 Ok(S3Response::delete_bucket_public_access_block())
             }
             S3Operation::PutBucketOwnershipControls { bucket } => {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let value = xml::parse_ownership_controls_xml(&req.body)?;
                 let requester = self.requester_from_auth(auth, req)?;
-                self.coordinator.put_bucket_ownership_controls(
-                    &crate::coordinator::PutBucketOwnershipControlsRequest {
-                        bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
-                        config: value,
-                    },
-                )?;
+                self.coordinator
+                    .put_bucket_ownership_controls_on_admitted_route(
+                        storage_route_admission,
+                        &crate::coordinator::PutBucketOwnershipControlsRequest {
+                            bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
+                            config: value,
+                        },
+                    )?;
                 Ok(S3Response::put_bucket_ownership_controls())
             }
             S3Operation::GetBucketOwnershipControls { bucket } => {
@@ -2977,11 +2986,10 @@ impl HttpFrontend {
             S3Operation::DeleteBucketOwnershipControls { bucket } => {
                 let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator
-                    .delete_bucket_ownership_controls(&bucket_request(
-                        &bucket,
-                        requester,
-                        expected_bucket_owner,
-                    )?)?;
+                    .delete_bucket_ownership_controls_on_admitted_route(
+                        storage_route_admission,
+                        &bucket_request(&bucket, requester, expected_bucket_owner)?,
+                    )?;
                 Ok(S3Response::delete_bucket_ownership_controls())
             }
             S3Operation::PutBucketPolicy { bucket } => {
@@ -3098,9 +3106,14 @@ impl HttpFrontend {
                             )
                     },
                 };
-                self.coordinator.validate_put_bucket_acl_request(&acl_req)?;
+                self.coordinator
+                    .validate_put_bucket_acl_request_on_admitted_route(
+                        storage_route_admission,
+                        &acl_req,
+                    )?;
                 validate_request_checksum_headers(req, true, false, true)?;
-                self.coordinator.put_bucket_acl(&acl_req)?;
+                self.coordinator
+                    .put_bucket_acl_on_admitted_route(storage_route_admission, &acl_req)?;
                 Ok(S3Response::put_bucket_acl())
             }
             S3Operation::CreateMultipartUpload { bucket, key } => {

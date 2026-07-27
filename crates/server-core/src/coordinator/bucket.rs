@@ -129,7 +129,10 @@ impl Coordinator {
                     &authorized.owner,
                     &authorized.acl,
                 )?;
-                self.apply_authorized_bucket_acl_update(&storage_node, &authorized_acl)
+                self.apply_authorized_bucket_acl_update_for_storage_node(
+                    &storage_node,
+                    &authorized_acl,
+                )
             }
         }
     }
@@ -573,8 +576,9 @@ impl Coordinator {
         self.list_buckets_on_admitted_route(&admission, req)
     }
 
-    pub fn put_bucket_versioning(
+    pub fn put_bucket_versioning_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketVersioningRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
@@ -584,11 +588,12 @@ impl Coordinator {
             req.bucket.name,
             req.state
         );
-        let storage_node = self.storage_node();
-        let authorized =
-            self.authorize_put_bucket_versioning_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .put_bucket_versioning_and_load_info(&authorized.bucket, authorized.state)
+        self.require_storage_route_admission(admission)?;
+        let authorized = self.authorize_put_bucket_versioning_on_admitted_route(admission, req)?;
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .put_bucket_versioning_and_load_info(authorized.state)
             .map_err(|e| match e {
                 storage::BucketSnapshotLoadError::Metadata(
                     storage::MetadataError::InvalidVersioningTransition { from, to },
@@ -599,6 +604,15 @@ impl Coordinator {
             })?;
         self.clear_bucket_fast_path(&info);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn put_bucket_versioning(
+        &self,
+        req: &PutBucketVersioningRequest<'_>,
+    ) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.put_bucket_versioning_on_admitted_route(&admission, req)
     }
 
     pub fn get_bucket_versioning_on_admitted_route(
@@ -646,8 +660,9 @@ impl Coordinator {
         self.get_bucket_location_on_admitted_route(&admission, req)
     }
 
-    pub fn put_bucket_object_lock_configuration(
+    pub fn put_bucket_object_lock_configuration_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketObjectLockConfigurationRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
@@ -658,14 +673,25 @@ impl Coordinator {
             req.config.object_lock_enabled.unwrap_or(false),
             req.config.default_retention.is_some()
         );
-        let storage_node = self.storage_node();
-        let authorized = self
-            .authorize_put_bucket_object_lock_configuration_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .put_bucket_object_lock_and_load_info(&authorized.bucket, authorized.config)
+        self.require_storage_route_admission(admission)?;
+        let authorized =
+            self.authorize_put_bucket_object_lock_configuration_on_admitted_route(admission, req)?;
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .put_bucket_object_lock_and_load_info(authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn put_bucket_object_lock_configuration(
+        &self,
+        req: &PutBucketObjectLockConfigurationRequest<'_>,
+    ) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.put_bucket_object_lock_configuration_on_admitted_route(&admission, req)
     }
 
     pub fn get_bucket_object_lock_configuration_on_admitted_route(
@@ -693,8 +719,9 @@ impl Coordinator {
         self.get_bucket_object_lock_configuration_on_admitted_route(&admission, req)
     }
 
-    pub fn put_bucket_encryption(
+    pub fn put_bucket_encryption_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketEncryptionRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
@@ -704,14 +731,24 @@ impl Coordinator {
             req.bucket.name,
             req.config.sse_c_blocked
         );
-        let storage_node = self.storage_node();
-        let authorized =
-            self.authorize_put_bucket_encryption_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .put_bucket_encryption_and_load_info(&authorized.bucket, authorized.config)
+        self.require_storage_route_admission(admission)?;
+        let authorized = self.authorize_put_bucket_encryption_on_admitted_route(admission, req)?;
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .put_bucket_encryption_and_load_info(authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn put_bucket_encryption(
+        &self,
+        req: &PutBucketEncryptionRequest<'_>,
+    ) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.put_bucket_encryption_on_admitted_route(&admission, req)
     }
 
     pub fn get_bucket_encryption_on_admitted_route(
@@ -738,24 +775,33 @@ impl Coordinator {
         self.get_bucket_encryption_on_admitted_route(&admission, req)
     }
 
-    pub fn delete_bucket_encryption(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+    pub fn delete_bucket_encryption_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_encryption",
             "bucket={:?}",
             req.name
         );
-        let storage_node = self.storage_node();
+        self.require_storage_route_admission(admission)?;
         let authorized =
-            self.authorize_delete_bucket_encryption_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .put_bucket_encryption_and_load_info(
-                &authorized.bucket,
-                BucketEncryptionConfig::default(),
-            )
+            self.authorize_delete_bucket_encryption_on_admitted_route(admission, req)?;
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .put_bucket_encryption_and_load_info(BucketEncryptionConfig::default())
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn delete_bucket_encryption(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.delete_bucket_encryption_on_admitted_route(&admission, req)
     }
 
     pub fn put_bucket_cors_on_admitted_route(
@@ -1090,7 +1136,11 @@ impl Coordinator {
         self.delete_bucket_tags_for_untag_resource_on_admitted_route(&admission, req)
     }
 
-    pub fn put_bucket_abac(&self, req: &PutBucketAbacRequest<'_>) -> Result<(), ServerError> {
+    pub fn put_bucket_abac_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &PutBucketAbacRequest<'_>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_abac",
@@ -1098,13 +1148,21 @@ impl Coordinator {
             req.bucket.name,
             req.enabled
         );
-        let storage_node = self.storage_node();
-        let authorized = self.authorize_put_bucket_abac_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .put_bucket_abac_enabled_and_load_info(&authorized.bucket, authorized.enabled)
+        self.require_storage_route_admission(admission)?;
+        let authorized = self.authorize_put_bucket_abac_on_admitted_route(admission, req)?;
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .put_bucket_abac_enabled_and_load_info(authorized.enabled)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn put_bucket_abac(&self, req: &PutBucketAbacRequest<'_>) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.put_bucket_abac_on_admitted_route(&admission, req)
     }
 
     pub fn get_bucket_abac_on_admitted_route(
@@ -1340,8 +1398,9 @@ impl Coordinator {
         self.delete_bucket_lifecycle_on_admitted_route(&admission, req)
     }
 
-    pub fn put_bucket_public_access_block(
+    pub fn put_bucket_public_access_block_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketPublicAccessBlockRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
@@ -1351,14 +1410,25 @@ impl Coordinator {
             req.bucket.name,
             req.config
         );
-        let storage_node = self.storage_node();
+        self.require_storage_route_admission(admission)?;
         let authorized =
-            self.authorize_put_bucket_public_access_block_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .put_bucket_public_access_block_and_load_info(&authorized.bucket, authorized.config)
+            self.authorize_put_bucket_public_access_block_on_admitted_route(admission, req)?;
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .put_bucket_public_access_block_and_load_info(authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn put_bucket_public_access_block(
+        &self,
+        req: &PutBucketPublicAccessBlockRequest<'_>,
+    ) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.put_bucket_public_access_block_on_admitted_route(&admission, req)
     }
 
     pub fn get_bucket_public_access_block_on_admitted_route(
@@ -1386,8 +1456,9 @@ impl Coordinator {
         self.get_bucket_public_access_block_on_admitted_route(&admission, req)
     }
 
-    pub fn delete_bucket_public_access_block(
+    pub fn delete_bucket_public_access_block_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
@@ -1396,18 +1467,30 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let storage_node = self.storage_node();
+        self.require_storage_route_admission(admission)?;
         let authorized =
-            self.authorize_delete_bucket_public_access_block_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .delete_bucket_public_access_block_and_load_info(&authorized.bucket)
+            self.authorize_delete_bucket_public_access_block_on_admitted_route(admission, req)?;
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .delete_bucket_public_access_block_and_load_info()
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
     }
 
-    pub fn put_bucket_ownership_controls(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn delete_bucket_public_access_block(
         &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.delete_bucket_public_access_block_on_admitted_route(&admission, req)
+    }
+
+    pub fn put_bucket_ownership_controls_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &PutBucketOwnershipControlsRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
@@ -1417,14 +1500,25 @@ impl Coordinator {
             req.bucket.name,
             req.config
         );
-        let storage_node = self.storage_node();
+        self.require_storage_route_admission(admission)?;
         let authorized =
-            self.authorize_put_bucket_ownership_controls_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .put_bucket_ownership_controls_and_load_info(&authorized.bucket, authorized.config)
+            self.authorize_put_bucket_ownership_controls_on_admitted_route(admission, req)?;
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .put_bucket_ownership_controls_and_load_info(authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn put_bucket_ownership_controls(
+        &self,
+        req: &PutBucketOwnershipControlsRequest<'_>,
+    ) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.put_bucket_ownership_controls_on_admitted_route(&admission, req)
     }
 
     pub fn get_bucket_ownership_controls_on_admitted_route(
@@ -1452,8 +1546,9 @@ impl Coordinator {
         self.get_bucket_ownership_controls_on_admitted_route(&admission, req)
     }
 
-    pub fn delete_bucket_ownership_controls(
+    pub fn delete_bucket_ownership_controls_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
@@ -1462,14 +1557,25 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let storage_node = self.storage_node();
+        self.require_storage_route_admission(admission)?;
         let authorized =
-            self.authorize_delete_bucket_ownership_controls_with_storage_node(&storage_node, req)?;
-        let info = storage_node
-            .delete_bucket_ownership_controls_and_load_info(&authorized.bucket)
+            self.authorize_delete_bucket_ownership_controls_on_admitted_route(admission, req)?;
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .delete_bucket_ownership_controls_and_load_info()
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn delete_bucket_ownership_controls(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.delete_bucket_ownership_controls_on_admitted_route(&admission, req)
     }
 
     pub fn get_bucket_acl_on_admitted_route(
@@ -1496,7 +1602,11 @@ impl Coordinator {
         self.get_bucket_acl_on_admitted_route(&admission, req)
     }
 
-    pub fn put_bucket_acl(&self, req: &PutBucketAclRequest<'_>) -> Result<(), ServerError> {
+    pub fn put_bucket_acl_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &PutBucketAclRequest<'_>,
+    ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_acl",
@@ -1507,29 +1617,47 @@ impl Coordinator {
                 PutBucketAclInput::Grants(_) => "grants",
             }
         );
-        let storage_node = self.storage_node();
-        let authorized = self.authorize_put_bucket_acl_with_storage_node(&storage_node, req)?;
-        self.apply_authorized_bucket_acl_update(&storage_node, &authorized)
+        self.require_storage_route_admission(admission)?;
+        let authorized = self.authorize_put_bucket_acl_on_admitted_route(admission, req)?;
+        self.apply_authorized_bucket_acl_update_on_admitted_route(admission, &authorized)
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn put_bucket_acl(&self, req: &PutBucketAclRequest<'_>) -> Result<(), ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.put_bucket_acl_on_admitted_route(&admission, req)
+    }
+
+    pub fn validate_put_bucket_acl_request_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &PutBucketAclRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.require_storage_route_admission(admission)?;
+        self.authorize_put_bucket_acl_on_admitted_route(admission, req)
+            .map(|_| ())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn validate_put_bucket_acl_request(
         &self,
         req: &PutBucketAclRequest<'_>,
     ) -> Result<(), ServerError> {
-        let storage_node = self.storage_node();
-        self.authorize_put_bucket_acl_with_storage_node(&storage_node, req)
-            .map(|_| ())
+        let admission = self.admit_storage_route_for_request()?;
+        self.validate_put_bucket_acl_request_on_admitted_route(&admission, req)
     }
 
-    fn apply_authorized_bucket_acl_update(
+    fn apply_authorized_bucket_acl_update_on_admitted_route(
         &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         authorized: &AuthorizedPutBucketAcl,
     ) -> Result<(), ServerError> {
         #[cfg(test)]
         if self.should_probe_bucket_mutation_write(authorized.bucket.as_str()) {
-            let bucket_pg_ready = storage_node
-                .try_probe_bucket_pg_available(&authorized.bucket)
+            let bucket_pg_ready = admission
+                .active_bucket_route(&authorized.bucket)
+                .map_err(super::map_store_error)?
+                .try_probe_bucket_pg_available()
                 .map_err(Self::map_bucket_snapshot_load_error)?;
             if !bucket_pg_ready {
                 return Err(ServerError::InternalError {
@@ -1538,8 +1666,22 @@ impl Coordinator {
                 });
             }
         }
+        let info = admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .put_bucket_acl_and_load_info(&authorized.acl_grants, authorized.summary)
+            .map_err(Self::map_bucket_snapshot_load_error)?;
+        self.clear_bucket_fast_path(&info);
+        Ok(())
+    }
+
+    fn apply_authorized_bucket_acl_update_for_storage_node(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        authorized: &AuthorizedPutBucketAcl,
+    ) -> Result<(), ServerError> {
         let info = storage_node
-            .put_bucket_acl_and_load_info(
+            .put_bucket_acl_for_create_bucket_recreate_and_load_info(
                 &authorized.bucket,
                 &authorized.acl_grants,
                 authorized.summary,

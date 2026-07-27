@@ -6961,20 +6961,44 @@ impl super::StorageCluster {
             .get_bucket_subresource(self.validated_bucket_metadata_pg(pg_id), bucket, kind)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn put_bucket_versioning_and_load_info(
         &self,
         bucket: &BucketName,
         state: BucketVersioningState,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.put_bucket_versioning_and_load_info_with_route_validation(
+            super::BucketMetadataMutationEffectRoute {
+                pg_id: self.bucket_metadata_pg(bucket),
+                bucket,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            state,
+        )
+    }
+
+    pub(super) fn put_bucket_versioning_and_load_info_with_route_validation(
+        &self,
+        route: super::BucketMetadataMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+        state: BucketVersioningState,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         crate::metadata_command::metadata_command_publisher!(PutBucketVersioning);
-        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let super::BucketMetadataMutationEffectRoute {
+            pg_id: bucket_pg_id,
+            bucket,
+            effect_fence,
+        } = route;
+        let pg_id = bucket_pg_id.pg_id();
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         {
+            require_valid_route()?;
             let info = primary_store
                 .bucket_metadata_client()
-                .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)?;
+                .head_bucket_raw(bucket_pg_id, bucket)?;
             if state == BucketVersioningState::Disabled
                 && info.versioning != BucketVersioningState::Disabled
             {
@@ -6994,6 +7018,7 @@ impl super::StorageCluster {
         .for_pg(pg_id);
         loop {
             work_budget.check("put bucket versioning command budget exhausted")?;
+            require_valid_route()?;
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
@@ -7064,17 +7089,13 @@ impl super::StorageCluster {
                 };
                 let command = primary_store
                     .bucket_metadata_client()
-                    .build_put_bucket_versioning_command(
-                        self.validated_bucket_metadata_pg(pg_id),
-                        bucket,
-                        command_id,
-                        state,
-                    )?;
+                    .build_put_bucket_versioning_command(bucket_pg_id, bucket, command_id, state)?;
+                require_valid_route()?;
                 if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
                     pg_id,
                     bucket,
                     &command,
-                    None,
+                    Some(effect_fence),
                     &mut work_budget,
                 )? {
                     continue;
@@ -7093,11 +7114,12 @@ impl super::StorageCluster {
 
             let info = primary_store
                 .bucket_metadata_client()
-                .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)?;
+                .head_bucket_raw(bucket_pg_id, bucket)?;
             return Ok(info);
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn put_bucket_object_lock_and_load_info(
         &self,
         bucket: &BucketName,
@@ -7109,6 +7131,7 @@ impl super::StorageCluster {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn put_bucket_encryption_and_load_info(
         &self,
         bucket: &BucketName,
@@ -7120,6 +7143,7 @@ impl super::StorageCluster {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn put_bucket_public_access_block_and_load_info(
         &self,
         bucket: &BucketName,
@@ -7131,6 +7155,7 @@ impl super::StorageCluster {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn delete_bucket_public_access_block_and_load_info(
         &self,
         bucket: &BucketName,
@@ -7141,6 +7166,7 @@ impl super::StorageCluster {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn put_bucket_ownership_controls_and_load_info(
         &self,
         bucket: &BucketName,
@@ -7152,6 +7178,7 @@ impl super::StorageCluster {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn delete_bucket_ownership_controls_and_load_info(
         &self,
         bucket: &BucketName,
@@ -7162,6 +7189,7 @@ impl super::StorageCluster {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn put_bucket_abac_enabled_and_load_info(
         &self,
         bucket: &BucketName,
@@ -7173,21 +7201,65 @@ impl super::StorageCluster {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn put_bucket_acl_and_load_info(
         &self,
         bucket: &BucketName,
         acl_grants: &AclGrants,
         summary: BucketAclSummary,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.put_bucket_acl_and_load_info_with_route_validation(
+            super::BucketMetadataMutationEffectRoute {
+                pg_id: self.bucket_metadata_pg(bucket),
+                bucket,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            acl_grants,
+            summary,
+        )
+    }
+
+    pub fn put_bucket_acl_for_create_bucket_recreate_and_load_info(
+        &self,
+        bucket: &BucketName,
+        acl_grants: &AclGrants,
+        summary: BucketAclSummary,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.put_bucket_acl_and_load_info_with_route_validation(
+            super::BucketMetadataMutationEffectRoute {
+                pg_id: self.bucket_metadata_pg(bucket),
+                bucket,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            acl_grants,
+            summary,
+        )
+    }
+
+    pub(super) fn put_bucket_acl_and_load_info_with_route_validation(
+        &self,
+        route: super::BucketMetadataMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+        acl_grants: &AclGrants,
+        summary: BucketAclSummary,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         crate::metadata_command::metadata_command_publisher!(PutBucketAcl);
-        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let super::BucketMetadataMutationEffectRoute {
+            pg_id: bucket_pg_id,
+            bucket,
+            effect_fence,
+        } = route;
+        let pg_id = bucket_pg_id.pg_id();
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         {
+            require_valid_route()?;
             primary_store
                 .bucket_metadata_client()
-                .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)?;
+                .head_bucket_raw(bucket_pg_id, bucket)?;
         }
 
         let mut work_budget = super::RequestWorkBudget::new(
@@ -7198,6 +7270,7 @@ impl super::StorageCluster {
         .for_pg(pg_id);
         loop {
             work_budget.check("put bucket acl command budget exhausted")?;
+            require_valid_route()?;
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
@@ -7270,17 +7343,18 @@ impl super::StorageCluster {
                 let command = primary_store
                     .bucket_metadata_client()
                     .build_put_bucket_acl_command(
-                        self.validated_bucket_metadata_pg(pg_id),
+                        bucket_pg_id,
                         bucket,
                         command_id,
                         acl_grants,
                         summary,
                     )?;
+                require_valid_route()?;
                 if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
                     pg_id,
                     bucket,
                     &command,
-                    None,
+                    Some(effect_fence),
                     &mut work_budget,
                 )? {
                     continue;
@@ -7299,25 +7373,49 @@ impl super::StorageCluster {
 
             let info = primary_store
                 .bucket_metadata_client()
-                .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)?;
+                .head_bucket_raw(bucket_pg_id, bucket)?;
             return Ok(info);
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     fn put_bucket_property_command_and_load_info(
         &self,
         bucket: &BucketName,
         mutation: BucketPropertyMutation,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.put_bucket_property_command_and_load_info_with_route_validation(
+            super::BucketMetadataMutationEffectRoute {
+                pg_id: self.bucket_metadata_pg(bucket),
+                bucket,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            mutation,
+        )
+    }
+
+    pub(super) fn put_bucket_property_command_and_load_info_with_route_validation(
+        &self,
+        route: super::BucketMetadataMutationEffectRoute<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+        mutation: BucketPropertyMutation,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         crate::metadata_command::metadata_command_publisher!(PutBucketProperty);
-        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let super::BucketMetadataMutationEffectRoute {
+            pg_id: bucket_pg_id,
+            bucket,
+            effect_fence,
+        } = route;
+        let pg_id = bucket_pg_id.pg_id();
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         {
+            require_valid_route()?;
             primary_store
                 .bucket_metadata_client()
-                .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)?;
+                .head_bucket_raw(bucket_pg_id, bucket)?;
         }
 
         let mut work_budget = super::RequestWorkBudget::new(
@@ -7328,6 +7426,7 @@ impl super::StorageCluster {
         .for_pg(pg_id);
         loop {
             work_budget.check("put bucket property command budget exhausted")?;
+            require_valid_route()?;
             let (command, clear_pending_on_zero_apply) = if let Some(command) =
                 self.pending_metadata_command_for_bucket(pg_id, bucket)?
             {
@@ -7394,16 +7493,17 @@ impl super::StorageCluster {
                 let command = primary_store
                     .bucket_metadata_client()
                     .build_put_bucket_property_command(
-                        self.validated_bucket_metadata_pg(pg_id),
+                        bucket_pg_id,
                         bucket,
                         command_id,
                         &mutation,
                     )?;
+                require_valid_route()?;
                 if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
                     pg_id,
                     bucket,
                     &command,
-                    None,
+                    Some(effect_fence),
                     &mut work_budget,
                 )? {
                     continue;
@@ -7422,7 +7522,7 @@ impl super::StorageCluster {
 
             let info = primary_store
                 .bucket_metadata_client()
-                .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)?;
+                .head_bucket_raw(bucket_pg_id, bucket)?;
             return Ok(info);
         }
     }

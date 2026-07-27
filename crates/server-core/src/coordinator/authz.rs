@@ -2301,16 +2301,16 @@ impl Coordinator {
         )
     }
 
-    fn authorize_loaded_bucket_owner_account_admin_write_for_storage_node<R>(
+    fn authorize_loaded_bucket_owner_account_admin_write_on_admitted_route<R>(
         &self,
-        storage_node: &Arc<StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &R,
     ) -> Result<LoadedBucketHandle, ServerError>
     where
         R: BucketScopedAuthorizationRequest + ?Sized,
     {
-        self.with_bucket_write_handle_for_storage_node(
-            storage_node,
+        self.with_bucket_write_handle_on_admitted_route(
+            admission,
             req,
             BucketHandleRequest::new(),
             |bucket| {

@@ -401,6 +401,52 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
             config: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"default-owner"},"Action":"s3:GetBucketPolicy","Resource":"arn:aws:s3:::bucket"}]}"#,
             confirm_remove_self_bucket_access: false,
         };
+        let put_versioning_request = PutBucketVersioningRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            state: BucketVersioningState::Enabled,
+        };
+        let put_object_lock_request = PutBucketObjectLockConfigurationRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            config: BucketObjectLockConfigurationUpdate {
+                object_lock_enabled: Some(true),
+                default_retention: Some(ObjectLockDefaultRetention {
+                    mode: ObjectLockMode::Governance,
+                    period: s3_types::RetentionPeriod::days(1).unwrap(),
+                }),
+            },
+        };
+        let put_encryption_request = PutBucketEncryptionRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            config: BucketEncryptionConfig {
+                default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
+                sse_c_blocked: true,
+            },
+        };
+        let put_abac_request = PutBucketAbacRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            enabled: true,
+        };
+        let put_public_access_block_request = PutBucketPublicAccessBlockRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            config: PublicAccessBlockConfig {
+                block_public_acls: true,
+                ignore_public_acls: true,
+                block_public_policy: false,
+                restrict_public_buckets: false,
+            },
+        };
+        let put_ownership_controls_request = PutBucketOwnershipControlsRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            config: BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
+            },
+        };
+        let put_bucket_acl_request = PutBucketAclRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            acl: PutBucketAclInput::Canned(BucketAcl::PublicRead),
+            policy_context: PutObjectPolicyContext::default()
+                .with_default_canned_acl(Some("public-read")),
+        };
         let control_request = BucketTagControlRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
         };
@@ -437,6 +483,27 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
             .unwrap();
         let baseline_policy = coord
             .get_bucket_policy_on_admitted_route(&fresh_admission, &request)
+            .unwrap();
+        let baseline_versioning = coord
+            .get_bucket_versioning_on_admitted_route(&fresh_admission, &request)
+            .unwrap();
+        let baseline_object_lock = coord
+            .get_bucket_object_lock_configuration_on_admitted_route(&fresh_admission, &request)
+            .unwrap();
+        let baseline_encryption = coord
+            .get_bucket_encryption_on_admitted_route(&fresh_admission, &request)
+            .unwrap();
+        let baseline_abac = coord
+            .get_bucket_abac_on_admitted_route(&fresh_admission, &request)
+            .unwrap();
+        let baseline_public_access_block = coord
+            .get_bucket_public_access_block_on_admitted_route(&fresh_admission, &request)
+            .unwrap();
+        let baseline_ownership_controls = coord
+            .get_bucket_ownership_controls_on_admitted_route(&fresh_admission, &request)
+            .unwrap();
+        let baseline_bucket_acl = coord
+            .get_bucket_acl_on_admitted_route(&fresh_admission, &request)
             .unwrap();
         let baseline_tags = coord
             .get_object_tags_on_admitted_route(&fresh_admission, &object_metadata_request)
@@ -706,6 +773,55 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
                 coord.delete_bucket_policy_on_admitted_route(&admission, &request),
             ),
             (
+                "PutBucketVersioning",
+                coord.put_bucket_versioning_on_admitted_route(&admission, &put_versioning_request),
+            ),
+            (
+                "PutBucketObjectLockConfiguration",
+                coord.put_bucket_object_lock_configuration_on_admitted_route(
+                    &admission,
+                    &put_object_lock_request,
+                ),
+            ),
+            (
+                "PutBucketEncryption",
+                coord.put_bucket_encryption_on_admitted_route(&admission, &put_encryption_request),
+            ),
+            (
+                "DeleteBucketEncryption",
+                coord.delete_bucket_encryption_on_admitted_route(&admission, &request),
+            ),
+            (
+                "PutBucketAbac",
+                coord.put_bucket_abac_on_admitted_route(&admission, &put_abac_request),
+            ),
+            (
+                "PutBucketPublicAccessBlock",
+                coord.put_bucket_public_access_block_on_admitted_route(
+                    &admission,
+                    &put_public_access_block_request,
+                ),
+            ),
+            (
+                "DeleteBucketPublicAccessBlock",
+                coord.delete_bucket_public_access_block_on_admitted_route(&admission, &request),
+            ),
+            (
+                "PutBucketOwnershipControls",
+                coord.put_bucket_ownership_controls_on_admitted_route(
+                    &admission,
+                    &put_ownership_controls_request,
+                ),
+            ),
+            (
+                "DeleteBucketOwnershipControls",
+                coord.delete_bucket_ownership_controls_on_admitted_route(&admission, &request),
+            ),
+            (
+                "PutBucketAcl",
+                coord.put_bucket_acl_on_admitted_route(&admission, &put_bucket_acl_request),
+            ),
+            (
                 "ListTagsForResource",
                 coord
                     .get_bucket_tags_for_control_action_on_admitted_route(
@@ -794,6 +910,48 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
                 .get_bucket_policy_on_admitted_route(&fresh_admission, &request)
                 .unwrap(),
             baseline_policy
+        );
+        assert_eq!(
+            coord
+                .get_bucket_versioning_on_admitted_route(&fresh_admission, &request)
+                .unwrap(),
+            baseline_versioning
+        );
+        assert_eq!(
+            coord
+                .get_bucket_object_lock_configuration_on_admitted_route(&fresh_admission, &request,)
+                .unwrap(),
+            baseline_object_lock
+        );
+        assert_eq!(
+            coord
+                .get_bucket_encryption_on_admitted_route(&fresh_admission, &request)
+                .unwrap(),
+            baseline_encryption
+        );
+        assert_eq!(
+            coord
+                .get_bucket_abac_on_admitted_route(&fresh_admission, &request)
+                .unwrap(),
+            baseline_abac
+        );
+        assert_eq!(
+            coord
+                .get_bucket_public_access_block_on_admitted_route(&fresh_admission, &request)
+                .unwrap(),
+            baseline_public_access_block
+        );
+        assert_eq!(
+            coord
+                .get_bucket_ownership_controls_on_admitted_route(&fresh_admission, &request)
+                .unwrap(),
+            baseline_ownership_controls
+        );
+        assert_eq!(
+            coord
+                .get_bucket_acl_on_admitted_route(&fresh_admission, &request)
+                .unwrap(),
+            baseline_bucket_acl
         );
     });
 }
@@ -961,6 +1119,148 @@ fn bucket_subresource_mutation_expires_at_pending_install_effect_boundary() {
             .as_deref(),
         Some(put_request.config)
     );
+}
+
+#[test]
+fn bucket_property_versioning_and_acl_mutations_expire_at_pending_install_effect_boundary() {
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    for bucket in ["property", "versioning", "acl"] {
+        coord
+            .create_bucket_for_owner("default-owner", bucket, false)
+            .unwrap();
+    }
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let public_access_block = PublicAccessBlockConfig {
+        block_public_acls: true,
+        ignore_public_acls: true,
+        block_public_policy: false,
+        restrict_public_buckets: false,
+    };
+    let property_request = PutBucketPublicAccessBlockRequest {
+        bucket: bucket_request_with_expected_owner("property", test_requester(), None),
+        config: public_access_block,
+    };
+
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let hook_clock = Arc::clone(&clock);
+    let hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            hook_clock.set(4_500)
+        }));
+    let error = coord
+        .put_bucket_public_access_block_on_admitted_route(&admission, &property_request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+
+    clock.set(1_000);
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    assert_eq!(
+        coord
+            .get_bucket_public_access_block_on_admitted_route(&admission, &property_request.bucket,)
+            .unwrap(),
+        None
+    );
+    coord
+        .put_bucket_public_access_block_on_admitted_route(&admission, &property_request)
+        .unwrap();
+    assert_eq!(
+        coord
+            .get_bucket_public_access_block_on_admitted_route(&admission, &property_request.bucket,)
+            .unwrap(),
+        Some(public_access_block)
+    );
+    drop(admission);
+
+    let versioning_request = PutBucketVersioningRequest {
+        bucket: bucket_request_with_expected_owner("versioning", test_requester(), None),
+        state: BucketVersioningState::Enabled,
+    };
+    clock.set(1_000);
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let hook_clock = Arc::clone(&clock);
+    let hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            hook_clock.set(4_500)
+        }));
+    let error = coord
+        .put_bucket_versioning_on_admitted_route(&admission, &versioning_request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+
+    clock.set(1_000);
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    assert_eq!(
+        coord
+            .get_bucket_versioning_on_admitted_route(&admission, &versioning_request.bucket)
+            .unwrap(),
+        BucketVersioningState::Disabled
+    );
+    coord
+        .put_bucket_versioning_on_admitted_route(&admission, &versioning_request)
+        .unwrap();
+    assert_eq!(
+        coord
+            .get_bucket_versioning_on_admitted_route(&admission, &versioning_request.bucket)
+            .unwrap(),
+        BucketVersioningState::Enabled
+    );
+    drop(admission);
+
+    let acl_request = PutBucketAclRequest {
+        bucket: bucket_request_with_expected_owner("acl", test_requester(), None),
+        acl: PutBucketAclInput::Canned(BucketAcl::PublicRead),
+        policy_context: PutObjectPolicyContext::default()
+            .with_default_canned_acl(Some("public-read")),
+    };
+    clock.set(1_000);
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    let baseline_acl = coord
+        .get_bucket_acl_on_admitted_route(&admission, &acl_request.bucket)
+        .unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let hook_clock = Arc::clone(&clock);
+    let hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            hook_clock.set(4_500)
+        }));
+    let error = coord
+        .put_bucket_acl_on_admitted_route(&admission, &acl_request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+
+    clock.set(1_000);
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    assert_eq!(
+        coord
+            .get_bucket_acl_on_admitted_route(&admission, &acl_request.bucket)
+            .unwrap(),
+        baseline_acl
+    );
+    coord
+        .put_bucket_acl_on_admitted_route(&admission, &acl_request)
+        .unwrap();
+    let updated_acl = coord
+        .get_bucket_acl_on_admitted_route(&admission, &acl_request.bucket)
+        .unwrap();
+    assert!(Coordinator::acl_grants_public_read(&updated_acl.acl_grants));
 }
 
 #[test]
@@ -1636,6 +1936,47 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
         config: "<LifecycleConfiguration><Rule><ID>domain-baseline</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
     };
+    let baseline_versioning_request = PutBucketVersioningRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        state: BucketVersioningState::Enabled,
+    };
+    let baseline_object_lock_request = PutBucketObjectLockConfigurationRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: BucketObjectLockConfigurationUpdate {
+            object_lock_enabled: Some(true),
+            default_retention: Some(ObjectLockDefaultRetention {
+                mode: ObjectLockMode::Governance,
+                period: s3_types::RetentionPeriod::days(1).unwrap(),
+            }),
+        },
+    };
+    let baseline_encryption_request = PutBucketEncryptionRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: BucketEncryptionConfig {
+            default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
+            sse_c_blocked: true,
+        },
+    };
+    let baseline_abac_request = PutBucketAbacRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        enabled: true,
+    };
+    let baseline_public_access_block_request = PutBucketPublicAccessBlockRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: PublicAccessBlockConfig::default(),
+    };
+    let baseline_ownership_controls_request = PutBucketOwnershipControlsRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: BucketOwnershipControls {
+            object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
+        },
+    };
+    let baseline_bucket_acl_request = PutBucketAclRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        acl: PutBucketAclInput::Canned(BucketAcl::PublicRead),
+        policy_context: PutObjectPolicyContext::default()
+            .with_default_canned_acl(Some("public-read")),
+    };
     foreign
         .put_bucket_cors_on_admitted_route(&foreign_admission, &baseline_cors_request)
         .unwrap();
@@ -1644,6 +1985,36 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         .unwrap();
     foreign
         .put_bucket_lifecycle_on_admitted_route(&foreign_admission, &baseline_lifecycle_request)
+        .unwrap();
+    foreign
+        .put_bucket_versioning_on_admitted_route(&foreign_admission, &baseline_versioning_request)
+        .unwrap();
+    foreign
+        .put_bucket_object_lock_configuration_on_admitted_route(
+            &foreign_admission,
+            &baseline_object_lock_request,
+        )
+        .unwrap();
+    foreign
+        .put_bucket_encryption_on_admitted_route(&foreign_admission, &baseline_encryption_request)
+        .unwrap();
+    foreign
+        .put_bucket_public_access_block_on_admitted_route(
+            &foreign_admission,
+            &baseline_public_access_block_request,
+        )
+        .unwrap();
+    foreign
+        .put_bucket_ownership_controls_on_admitted_route(
+            &foreign_admission,
+            &baseline_ownership_controls_request,
+        )
+        .unwrap();
+    foreign
+        .put_bucket_acl_on_admitted_route(&foreign_admission, &baseline_bucket_acl_request)
+        .unwrap();
+    foreign
+        .put_bucket_abac_on_admitted_route(&foreign_admission, &baseline_abac_request)
         .unwrap();
     let baseline_cors = foreign
         .get_bucket_cors_on_admitted_route(&foreign_admission, &request)
@@ -1656,6 +2027,27 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         .unwrap();
     let baseline_policy = foreign
         .get_bucket_policy_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    let baseline_versioning = foreign
+        .get_bucket_versioning_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    let baseline_object_lock = foreign
+        .get_bucket_object_lock_configuration_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    let baseline_encryption = foreign
+        .get_bucket_encryption_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    let baseline_abac = foreign
+        .get_bucket_abac_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    let baseline_public_access_block = foreign
+        .get_bucket_public_access_block_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    let baseline_ownership_controls = foreign
+        .get_bucket_ownership_controls_on_admitted_route(&foreign_admission, &request)
+        .unwrap();
+    let baseline_bucket_acl = foreign
+        .get_bucket_acl_on_admitted_route(&foreign_admission, &request)
         .unwrap();
     let rejected_cors_request = PutBucketConfigRequest {
         bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
@@ -1673,6 +2065,44 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
         config: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"default-owner"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
         confirm_remove_self_bucket_access: false,
+    };
+    let rejected_object_lock_request = PutBucketObjectLockConfigurationRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: BucketObjectLockConfigurationUpdate {
+            object_lock_enabled: Some(true),
+            default_retention: Some(ObjectLockDefaultRetention {
+                mode: ObjectLockMode::Compliance,
+                period: s3_types::RetentionPeriod::days(2).unwrap(),
+            }),
+        },
+    };
+    let rejected_encryption_request = PutBucketEncryptionRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: BucketEncryptionConfig::default(),
+    };
+    let rejected_abac_request = PutBucketAbacRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        enabled: false,
+    };
+    let rejected_public_access_block_request = PutBucketPublicAccessBlockRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: PublicAccessBlockConfig {
+            block_public_acls: true,
+            ignore_public_acls: true,
+            block_public_policy: true,
+            restrict_public_buckets: true,
+        },
+    };
+    let rejected_ownership_controls_request = PutBucketOwnershipControlsRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        config: BucketOwnershipControls {
+            object_ownership: BucketObjectOwnership::ObjectWriter,
+        },
+    };
+    let rejected_bucket_acl_request = PutBucketAclRequest {
+        bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+        acl: PutBucketAclInput::Canned(BucketAcl::Private),
+        policy_context: PutObjectPolicyContext::default().with_default_canned_acl(Some("private")),
     };
     let control_request = BucketTagControlRequest {
         bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
@@ -1893,6 +2323,62 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
             local.delete_bucket_policy_on_admitted_route(&foreign_admission, &request),
         ),
         (
+            "PutBucketVersioning",
+            local.put_bucket_versioning_on_admitted_route(
+                &foreign_admission,
+                &baseline_versioning_request,
+            ),
+        ),
+        (
+            "PutBucketObjectLockConfiguration",
+            local.put_bucket_object_lock_configuration_on_admitted_route(
+                &foreign_admission,
+                &rejected_object_lock_request,
+            ),
+        ),
+        (
+            "PutBucketEncryption",
+            local.put_bucket_encryption_on_admitted_route(
+                &foreign_admission,
+                &rejected_encryption_request,
+            ),
+        ),
+        (
+            "DeleteBucketEncryption",
+            local.delete_bucket_encryption_on_admitted_route(&foreign_admission, &request),
+        ),
+        (
+            "PutBucketAbac",
+            local.put_bucket_abac_on_admitted_route(&foreign_admission, &rejected_abac_request),
+        ),
+        (
+            "PutBucketPublicAccessBlock",
+            local.put_bucket_public_access_block_on_admitted_route(
+                &foreign_admission,
+                &rejected_public_access_block_request,
+            ),
+        ),
+        (
+            "DeleteBucketPublicAccessBlock",
+            local.delete_bucket_public_access_block_on_admitted_route(&foreign_admission, &request),
+        ),
+        (
+            "PutBucketOwnershipControls",
+            local.put_bucket_ownership_controls_on_admitted_route(
+                &foreign_admission,
+                &rejected_ownership_controls_request,
+            ),
+        ),
+        (
+            "DeleteBucketOwnershipControls",
+            local.delete_bucket_ownership_controls_on_admitted_route(&foreign_admission, &request),
+        ),
+        (
+            "PutBucketAcl",
+            local
+                .put_bucket_acl_on_admitted_route(&foreign_admission, &rejected_bucket_acl_request),
+        ),
+        (
             "ListTagsForResource",
             local
                 .get_bucket_tags_for_control_action_on_admitted_route(
@@ -1954,6 +2440,48 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
             .get_bucket_policy_on_admitted_route(&foreign_admission, &request)
             .unwrap(),
         baseline_policy
+    );
+    assert_eq!(
+        foreign
+            .get_bucket_versioning_on_admitted_route(&foreign_admission, &request)
+            .unwrap(),
+        baseline_versioning
+    );
+    assert_eq!(
+        foreign
+            .get_bucket_object_lock_configuration_on_admitted_route(&foreign_admission, &request,)
+            .unwrap(),
+        baseline_object_lock
+    );
+    assert_eq!(
+        foreign
+            .get_bucket_encryption_on_admitted_route(&foreign_admission, &request)
+            .unwrap(),
+        baseline_encryption
+    );
+    assert_eq!(
+        foreign
+            .get_bucket_abac_on_admitted_route(&foreign_admission, &request)
+            .unwrap(),
+        baseline_abac
+    );
+    assert_eq!(
+        foreign
+            .get_bucket_public_access_block_on_admitted_route(&foreign_admission, &request)
+            .unwrap(),
+        baseline_public_access_block
+    );
+    assert_eq!(
+        foreign
+            .get_bucket_ownership_controls_on_admitted_route(&foreign_admission, &request)
+            .unwrap(),
+        baseline_ownership_controls
+    );
+    assert_eq!(
+        foreign
+            .get_bucket_acl_on_admitted_route(&foreign_admission, &request)
+            .unwrap(),
+        baseline_bucket_acl
     );
 }
 
