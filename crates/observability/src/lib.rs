@@ -218,6 +218,8 @@ static SHARD_REPAIR_EVENT_DIMENSIONS: OnceLock<Mutex<Vec<ShardRepairEventDimensi
     OnceLock::new();
 static SHARD_BACKFILL_EVENT_DIMENSIONS: OnceLock<Mutex<Vec<ShardBackfillEventDimensionCounter>>> =
     OnceLock::new();
+static SHARD_BACKFILL_OUTCOMES_BY_PG: OnceLock<Mutex<BTreeMap<u32, ShardBackfillOutcomeCounter>>> =
+    OnceLock::new();
 static SHARD_REPAIR_ERROR_DIMENSIONS: OnceLock<Mutex<Vec<ShardWorkerErrorDimensionCounter>>> =
     OnceLock::new();
 static SHARD_BACKFILL_ERROR_DIMENSIONS: OnceLock<Mutex<Vec<ShardWorkerErrorDimensionCounter>>> =
@@ -342,6 +344,7 @@ const FLIGHT_RECORDER_CAPACITY: usize = 512;
 const FLIGHT_RECORD_MAX_DETAIL_BYTES: usize = 1_024;
 const METADATA_COMMAND_DIMENSION_CAPACITY: usize = 512;
 const CONTROL_PLANE_HISTORY_REFERENCE_SAMPLE_CAPACITY: usize = 4_096;
+const SHARD_BACKFILL_OUTCOME_PG_CAPACITY: usize = 4_096;
 const STORAGE_RPC_LONG_RUNNING_THRESHOLD: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1211,6 +1214,13 @@ pub struct ShardBackfillEventDimensionSample {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardBackfillOutcomeSample {
+    pub pg_id: u32,
+    pub backfilled: u64,
+    pub complete_succeeded: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardWorkerErrorDimensionSample {
     pub pg_id: Option<u32>,
     pub event: &'static str,
@@ -1282,6 +1292,12 @@ struct ShardBackfillEventDimensionCounter {
     pg_id: Option<u32>,
     event: &'static str,
     count: u64,
+}
+
+#[derive(Default)]
+struct ShardBackfillOutcomeCounter {
+    backfilled: u64,
+    complete_succeeded: u64,
 }
 
 struct ShardWorkerErrorDimensionCounter {
@@ -1445,6 +1461,10 @@ fn shard_repair_event_dimensions() -> &'static Mutex<Vec<ShardRepairEventDimensi
 
 fn shard_backfill_event_dimensions() -> &'static Mutex<Vec<ShardBackfillEventDimensionCounter>> {
     SHARD_BACKFILL_EVENT_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn shard_backfill_outcomes_by_pg() -> &'static Mutex<BTreeMap<u32, ShardBackfillOutcomeCounter>> {
+    SHARD_BACKFILL_OUTCOMES_BY_PG.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 fn shard_repair_error_dimensions() -> &'static Mutex<Vec<ShardWorkerErrorDimensionCounter>> {
@@ -1656,6 +1676,30 @@ fn increment_shard_backfill_dimension(pg_id: Option<u32>, event: &'static str) {
             event,
             count: 1,
         });
+    }
+}
+
+fn increment_shard_backfill_outcome(pg_id: Option<u32>, event: &'static str) {
+    let Some(pg_id) = pg_id else {
+        return;
+    };
+    if !matches!(event, "backfilled" | "complete_succeeded") {
+        return;
+    }
+
+    let mut counters = shard_backfill_outcomes_by_pg()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if !counters.contains_key(&pg_id) && counters.len() >= SHARD_BACKFILL_OUTCOME_PG_CAPACITY {
+        return;
+    }
+    let counter = counters.entry(pg_id).or_default();
+    match event {
+        "backfilled" => counter.backfilled = counter.backfilled.saturating_add(1),
+        "complete_succeeded" => {
+            counter.complete_succeeded = counter.complete_succeeded.saturating_add(1);
+        }
+        _ => unreachable!("outcome was filtered above"),
     }
 }
 
@@ -1902,6 +1946,20 @@ pub fn shard_backfill_event_dimension_snapshot() -> Vec<ShardBackfillEventDimens
             pg_id: counter.pg_id,
             event: counter.event,
             count: counter.count,
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn shard_backfill_outcome_snapshot() -> Vec<ShardBackfillOutcomeSample> {
+    shard_backfill_outcomes_by_pg()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .map(|(&pg_id, counter)| ShardBackfillOutcomeSample {
+            pg_id,
+            backfilled: counter.backfilled,
+            complete_succeeded: counter.complete_succeeded,
         })
         .collect()
 }
@@ -4426,6 +4484,7 @@ pub fn emit_shard_backfill_event(target: &'static str, summary: ShardBackfillEve
     if let Some(shards_written) = summary.shards_written {
         SHARD_BACKFILL_SHARDS_WRITTEN_TOTAL.fetch_add(shards_written as u64, Ordering::Relaxed);
     }
+    increment_shard_backfill_outcome(summary.pg_id, summary.event);
     increment_shard_backfill_dimension(summary.pg_id, summary.event);
     let Some(context) = current_context() else {
         return false;
@@ -5208,9 +5267,16 @@ mod tests {
             }));
             original
         };
+        let original_outcomes = {
+            let mut outcomes = shard_backfill_outcomes_by_pg()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            std::mem::take(&mut *outcomes)
+        };
         let before = metrics_snapshot();
 
         for event in [
+            "backfilled",
             "complete_succeeded",
             "complete_failed",
             "failed",
@@ -5247,10 +5313,54 @@ mod tests {
         assert!(!shard_backfill_event_dimension_snapshot()
             .iter()
             .any(|sample| sample.pg_id == Some(u32::MAX)));
+        assert_eq!(
+            shard_backfill_outcome_snapshot(),
+            vec![ShardBackfillOutcomeSample {
+                pg_id: u32::MAX,
+                backfilled: 1,
+                complete_succeeded: 1,
+            }]
+        );
 
         *shard_backfill_event_dimensions()
             .lock()
             .unwrap_or_else(|err| err.into_inner()) = original_dimensions;
+        *shard_backfill_outcomes_by_pg()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = original_outcomes;
+    }
+
+    #[test]
+    fn shard_backfill_outcomes_are_bounded_without_losing_existing_pgs() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let original_outcomes = {
+            let mut outcomes = shard_backfill_outcomes_by_pg()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            std::mem::take(&mut *outcomes)
+        };
+
+        for pg_id in 0..u32::try_from(SHARD_BACKFILL_OUTCOME_PG_CAPACITY).unwrap() {
+            increment_shard_backfill_outcome(Some(pg_id), "backfilled");
+        }
+        increment_shard_backfill_outcome(Some(0), "complete_succeeded");
+        increment_shard_backfill_outcome(Some(u32::MAX), "backfilled");
+
+        let outcomes = shard_backfill_outcome_snapshot();
+        assert_eq!(outcomes.len(), SHARD_BACKFILL_OUTCOME_PG_CAPACITY);
+        assert_eq!(
+            outcomes.first(),
+            Some(&ShardBackfillOutcomeSample {
+                pg_id: 0,
+                backfilled: 1,
+                complete_succeeded: 1,
+            })
+        );
+        assert!(!outcomes.iter().any(|sample| sample.pg_id == u32::MAX));
+
+        *shard_backfill_outcomes_by_pg()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = original_outcomes;
     }
 
     #[test]

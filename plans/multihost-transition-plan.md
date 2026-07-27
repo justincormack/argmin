@@ -7918,8 +7918,13 @@ PG backfill and migration design notes:
   `shard_backfill_shards_written_total`, and UAT prints the same summary. The
   queue-depth signal uses an exact durable count rather than the bounded row
   listing API, and also counts as durable background backlog for opportunistic
-  scan admission. This is instrumentation only; scheduling priority is handled
-  by the later EC-risk priority slice.
+  scan admission. The migration release gate does not rely on the best-effort
+  per-event dimensions: a separate bounded per-PG outcome table retains
+  `backfilled` and `complete_succeeded` counts for every supported manifest PG,
+  and UAT requires both target-PG counters to advance from their pre-transition
+  baselines. Unrelated PG progress therefore cannot satisfy the migration
+  smoke. This is instrumentation only; scheduling priority is handled by the
+  later EC-risk priority slice.
 - Added the first EC-risk priority signal to durable shard-backfill scheduling.
   Backfill rows now carry `remaining_tolerance`, the number of additional shard
   losses the verified source segment can survive before it becomes

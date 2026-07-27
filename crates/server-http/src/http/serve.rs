@@ -1854,6 +1854,18 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
             pg_id, event, sample.count
         );
     }
+    for sample in observability::shard_backfill_outcome_snapshot() {
+        let _ = writeln!(
+            body,
+            "shard_backfill_backfilled_by_pg_total{{pg_id=\"{}\"}} {}",
+            sample.pg_id, sample.backfilled
+        );
+        let _ = writeln!(
+            body,
+            "shard_backfill_complete_succeeded_by_pg_total{{pg_id=\"{}\"}} {}",
+            sample.pg_id, sample.complete_succeeded
+        );
+    }
     for sample in observability::shard_repair_error_dimension_snapshot() {
         let pg_id = debug_metric_optional_pg_id_label(sample.pg_id);
         let event = debug_metric_label_value(sample.event);
@@ -6695,6 +6707,18 @@ Connection: close\r\n\r\n",
     async fn local_debug_metrics_endpoint_bypasses_request_admission() {
         let tmp = test_util::tempdir();
         let frontend = setup_frontend(tmp.path());
+        let backfill_pg_id = u32::MAX - 17;
+        for event in ["backfilled", "complete_succeeded"] {
+            observability::emit_shard_backfill_event(
+                "server_http_test",
+                observability::ShardBackfillEventSummary {
+                    pg_id: Some(backfill_pg_id),
+                    event,
+                    queue_depth: None,
+                    shards_written: None,
+                },
+            );
+        }
         let config = ServeConfig {
             local_debug_endpoint: true,
             ..ServeConfig::default()
@@ -6739,6 +6763,22 @@ Connection: close\r\n\r\n",
         }
         assert!(
             fixed_metrics.contains_key("frontend_storage_cluster_epoch"),
+            "{response}"
+        );
+        assert!(
+            fixed_metrics.contains_key(
+                format!("shard_backfill_backfilled_by_pg_total{{pg_id=\"{backfill_pg_id}\"}}")
+                    .as_str()
+            ),
+            "{response}"
+        );
+        assert!(
+            fixed_metrics.contains_key(
+                format!(
+                    "shard_backfill_complete_succeeded_by_pg_total{{pg_id=\"{backfill_pg_id}\"}}"
+                )
+                .as_str()
+            ),
             "{response}"
         );
     }

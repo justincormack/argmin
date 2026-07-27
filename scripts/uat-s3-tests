@@ -1563,6 +1563,10 @@ print_shard_backfill_debug() {
     if [[ -s "$metrics_path" ]]; then
         echo "shard_backfill_top event" >&2
         latest_metric_family_top "$metrics_path" shard_backfill_event_by_pg_total 20 >&2 || true
+        echo "shard_backfill_top backfilled outcomes" >&2
+        latest_metric_family_top "$metrics_path" shard_backfill_backfilled_by_pg_total 20 >&2 || true
+        echo "shard_backfill_top completed outcomes" >&2
+        latest_metric_family_top "$metrics_path" shard_backfill_complete_succeeded_by_pg_total 20 >&2 || true
         echo "metadata_pending_slot_top action" >&2
         latest_metric_family_top "$metrics_path" metadata_command_pending_slot_action_by_pg_command_total 20 >&2 || true
         echo "metadata_recovery_top admission" >&2
@@ -1720,6 +1724,11 @@ wait_for_shard_backfill_completion_metrics() {
     local max_failed="${12:-0}"
     local max_record_error_failed="${13:-0}"
     local target_pg_id="${14:-}"
+    local min_target_backfilled="${15:-0}"
+    local min_target_completed="${16:-0}"
+    if [[ -n "$target_pg_id" ]] && (($# < 16)); then
+        die "target-PG backfill completion requires exact backfilled and completed metric bounds"
+    fi
     local start
     start="$(date +%s)"
     while true; do
@@ -1738,6 +1747,8 @@ wait_for_shard_backfill_completion_metrics() {
         local failed
         local stale_retry
         local record_error_failed
+        local target_backfilled=0
+        local target_completed=0
         scan_total="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_total)"
         enqueued="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_enqueued_total)"
         written="$(latest_metric_sample_value "$metrics_path" shard_backfill_shards_written_total)"
@@ -1752,13 +1763,17 @@ wait_for_shard_backfill_completion_metrics() {
         failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_failed_total)"
         stale_retry="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event stale_retry)"
         record_error_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_record_error_failed_total)"
+        if [[ -n "$target_pg_id" ]]; then
+            target_backfilled="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_backfilled_by_pg_total pg_id "$target_pg_id")"
+            target_completed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_complete_succeeded_by_pg_total pg_id "$target_pg_id")"
+        fi
         if ((candidate_failed > max_candidate_failed || scan_error > max_scan_error || complete_failed > max_complete_failed || failed > max_failed || record_error_failed > max_record_error_failed)); then
             print_shard_backfill_debug "$metrics_path"
             cat "$metrics_path" >&2 || true
             die "shard backfill worker hard-failure metrics increased: candidate_failed=$candidate_failed scan_error=$scan_error complete_failed=$complete_failed failed=$failed record_error_failed=$record_error_failed"
         fi
-        if ((scan_total >= min_scan_total && enqueued >= min_enqueued && written >= min_written && completed >= min_completed && queue_depth == 0 && routine_admitted >= min_routine_admitted && routine_finished >= min_routine_finished)); then
-            echo "== argmin-s3 UAT shard backfill metrics: scan_total=$scan_total enqueued=$enqueued written=$written complete_succeeded=$completed candidate_deferred=$candidate_deferred candidate_failed=$candidate_failed scan_error=$scan_error stale_retry=$stale_retry failed=$failed queue_depth=$queue_depth routine_admitted=$routine_admitted routine_finished=$routine_finished pg_id=${target_pg_id:-any} =="
+        if ((scan_total >= min_scan_total && enqueued >= min_enqueued && written >= min_written && completed >= min_completed && queue_depth == 0 && routine_admitted >= min_routine_admitted && routine_finished >= min_routine_finished)) && { [[ -z "$target_pg_id" ]] || ((target_backfilled >= min_target_backfilled && target_completed >= min_target_completed)); }; then
+            echo "== argmin-s3 UAT shard backfill metrics: scan_total=$scan_total enqueued=$enqueued written=$written complete_succeeded=$completed candidate_deferred=$candidate_deferred candidate_failed=$candidate_failed scan_error=$scan_error stale_retry=$stale_retry failed=$failed queue_depth=$queue_depth routine_admitted=$routine_admitted routine_finished=$routine_finished pg_id=${target_pg_id:-any} target_backfilled=$target_backfilled target_complete_succeeded=$target_completed =="
             return 0
         fi
         if (($(date +%s) - start >= deadline_seconds)); then
@@ -2841,6 +2856,8 @@ run_pg_backfill_migration_smoke() {
     local min_completed
     local min_routine_admitted
     local min_routine_finished
+    local min_target_backfilled
+    local min_target_completed
     local max_candidate_failed
     local max_scan_error
     local max_complete_failed
@@ -2863,6 +2880,8 @@ run_pg_backfill_migration_smoke() {
     min_completed="$(($(latest_metric_sample_value "$metrics_path" shard_backfill_complete_succeeded_total) + 1))"
     min_routine_admitted="$(($(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event admitted class routine_backfill) + 1))"
     min_routine_finished="$(($(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event finished class routine_backfill) + 1))"
+    min_target_backfilled="$(($(latest_metric_family_label_sum "$metrics_path" shard_backfill_backfilled_by_pg_total pg_id "$data_pg") + 1))"
+    min_target_completed="$(($(latest_metric_family_label_sum "$metrics_path" shard_backfill_complete_succeeded_by_pg_total pg_id "$data_pg") + 1))"
 
     set_pg_acting_set "desired placement nodes 0,2" "$data_pg" 0 2
     wait_for_target_pg_runtime_installed "$data_pg" "0:2" 20 "$metrics_path"
@@ -2912,7 +2931,9 @@ run_pg_backfill_migration_smoke() {
         "$max_complete_failed" \
         "$max_failed" \
         "$max_record_error_failed" \
-        "$data_pg"
+        "$data_pg" \
+        "$min_target_backfilled" \
+        "$min_target_completed"
 
     echo "== argmin-s3 UAT PG backfill post-backfill reads =="
     print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
