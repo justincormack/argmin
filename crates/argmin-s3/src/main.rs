@@ -4646,62 +4646,40 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     let durable_wal_path = durable_artifact_wal_path(&durable_artifact_path);
     let authority = block_on_control_plane_raft(&runtime, async {
         let authority = if let Some(policy) = raft_peer_policy.clone() {
-            match (
-                config.control_plane_raft_peer_frame_transport.clone(),
-                config.static_cluster_identity.is_some() && !static_cluster_identity_established,
-            ) {
-                (Some(transport), true) => {
-                    ControlPlaneRaftAuthority::new_experimental_peer_durable_with_wal_pending_static_initialization_transport(
+            let network = if config.control_plane_raft_peer_client_endpoints.is_empty() {
+                ControlPlaneRaftPeerNetworkConfig::unix(
+                    config.control_plane_raft_peer_io_timeout,
+                )
+            } else {
+                ControlPlaneRaftPeerNetworkConfig::with_peer_endpoints(
+                    config.control_plane_raft_peer_io_timeout,
+                    config.control_plane_raft_peer_client_endpoints.clone(),
+                )
+                .map_err(|error| ControlPlaneError::RpcProtocol {
+                    message: error.to_string(),
+                })?
+            };
+            if config.static_cluster_identity.is_some() && !static_cluster_identity_established {
+                ControlPlaneRaftAuthority::new_experimental_peer_durable_with_wal_pending_static_initialization_network(
                         cluster_name.clone(),
                         node_id,
                         Path::new(state_path),
                         &durable_wal_path,
                         policy,
                         initial_control_plane_bootstrap_command(config),
-                        ControlPlaneRaftPeerNetworkConfig::with_transport(
-                            config.control_plane_raft_peer_io_timeout,
-                            transport,
-                        ),
+                        network,
                     )
                     .await?
-                }
-                (Some(transport), false) => {
-                    ControlPlaneRaftAuthority::new_experimental_peer_durable_with_wal_transport(
+            } else {
+                ControlPlaneRaftAuthority::new_experimental_peer_durable_with_wal_network(
                         cluster_name.clone(),
                         node_id,
                         Path::new(state_path),
                         &durable_wal_path,
                         policy,
-                        ControlPlaneRaftPeerNetworkConfig::with_transport(
-                            config.control_plane_raft_peer_io_timeout,
-                            transport,
-                        ),
+                        network,
                     )
                     .await?
-                }
-                (None, true) => {
-                    ControlPlaneRaftAuthority::new_experimental_unix_peer_durable_with_wal_pending_static_initialization(
-                        cluster_name.clone(),
-                        node_id,
-                        Path::new(state_path),
-                        &durable_wal_path,
-                        policy,
-                        initial_control_plane_bootstrap_command(config),
-                        config.control_plane_raft_peer_io_timeout,
-                    )
-                    .await?
-                }
-                (None, false) => {
-                    ControlPlaneRaftAuthority::new_experimental_unix_peer_durable_with_wal(
-                        cluster_name.clone(),
-                        node_id,
-                        Path::new(state_path),
-                        &durable_wal_path,
-                        policy,
-                        config.control_plane_raft_peer_io_timeout,
-                    )
-                    .await?
-                }
             }
         } else {
             ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
@@ -8159,7 +8137,7 @@ mod tests {
             control_plane_raft_peer_socket_path: None,
             control_plane_raft_peer_sockets: Vec::new(),
             control_plane_raft_peer_listeners: Vec::new(),
-            control_plane_raft_peer_frame_transport: None,
+            control_plane_raft_peer_client_endpoints: Vec::new(),
             control_plane_raft_peer_transport_limits: ControlPlaneRaftPeerTransportLimits::default(
             ),
             control_plane_raft_peer_max_connections: CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT,

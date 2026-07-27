@@ -9,8 +9,9 @@ use std::time::Duration;
 use storage::control_plane::{
     ControlPlaneRpcClientEndpoint, InitialClusterTopologyCertificate, MAX_HEARTBEAT_LEASE_MS,
 };
-use storage::control_plane_raft::ControlPlaneRaftPeerFrameTransport;
-use storage::control_plane_raft::ControlPlaneRaftPeerTransportLimits;
+use storage::control_plane_raft::{
+    ControlPlaneRaftPeerClientEndpoint, ControlPlaneRaftPeerTransportLimits,
+};
 use storage::storage_node_server::StorageNodeRpcListenerConfig;
 use storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS;
 use storage::storage_rpc_transport::StorageRpcClientEndpoint;
@@ -477,8 +478,8 @@ pub(crate) struct ServerConfig {
     pub(crate) control_plane_raft_peer_socket_path: Option<String>,
     pub(crate) control_plane_raft_peer_sockets: Vec<ConfiguredControlPlaneRaftPeerSocket>,
     pub(crate) control_plane_raft_peer_listeners: Vec<ConfiguredControlPlaneRaftPeerListener>,
-    pub(crate) control_plane_raft_peer_frame_transport:
-        Option<Arc<dyn ControlPlaneRaftPeerFrameTransport>>,
+    pub(crate) control_plane_raft_peer_client_endpoints:
+        Vec<(u64, ControlPlaneRaftPeerClientEndpoint)>,
     pub(crate) control_plane_raft_peer_transport_limits: ControlPlaneRaftPeerTransportLimits,
     pub(crate) control_plane_raft_peer_max_connections: usize,
     pub(crate) control_plane_raft_peer_connect_timeout: Duration,
@@ -1164,7 +1165,7 @@ impl ServerConfig {
             control_plane_raft_peer_socket_path,
             control_plane_raft_peer_sockets,
             control_plane_raft_peer_listeners: Vec::new(),
-            control_plane_raft_peer_frame_transport: None,
+            control_plane_raft_peer_client_endpoints: Vec::new(),
             control_plane_raft_peer_transport_limits: ControlPlaneRaftPeerTransportLimits::default(
             ),
             control_plane_raft_peer_max_connections: 64,

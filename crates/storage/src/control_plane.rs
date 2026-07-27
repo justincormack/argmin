@@ -11215,7 +11215,7 @@ pub(crate) type DeadlineUnixStream<'a> = DeadlineStream<&'a mut UnixStream>;
 type ControlPlaneDeadlineTcpSocket = DeadlineStream<TcpStream>;
 type ControlPlaneDeadlineUnixSocket = DeadlineStream<UnixStream>;
 
-async fn connect_control_plane_tcp_until_async(
+pub(crate) async fn connect_tcp_stream_until_async(
     host: String,
     port: u16,
     deadline: Instant,
@@ -11230,7 +11230,7 @@ async fn connect_control_plane_tcp_until_async(
         Err(_) => {
             return Err(std::io::Error::new(
                 ErrorKind::TimedOut,
-                "control-plane TLS/TCP connect deadline expired",
+                "TCP connect deadline expired",
             ));
         }
     };
@@ -11244,7 +11244,7 @@ fn connect_control_plane_tcp_until(
     port: u16,
     deadline: Instant,
 ) -> std::io::Result<TcpStream> {
-    let future = connect_control_plane_tcp_until_async(host.to_owned(), port, deadline);
+    let future = connect_tcp_stream_until_async(host.to_owned(), port, deadline);
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(|| handle.block_on(future))
@@ -16539,6 +16539,7 @@ fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
                     message: "control-plane response publication attempted more than once"
                         .to_owned(),
                 })?;
+            stream.begin_response(io_timeout);
             write_control_plane_rpc_response_and_flush(&mut stream, response)
         };
         let response_result = publish_control_plane_rpc_response(
@@ -23323,6 +23324,60 @@ mod tests {
 
         assert_eq!(status.pg_routes(), 0);
         assert_eq!(confirmation_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn control_plane_server_response_deadline_starts_after_publication() {
+        struct SlowPublication;
+
+        impl ControlPlaneRpcResponsePublication for SlowPublication {
+            fn publish(
+                &self,
+                publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+            ) -> Result<(), ControlPlaneError> {
+                std::thread::sleep(Duration::from_millis(100));
+                publish()
+            }
+        }
+
+        let directory = test_util::tempdir();
+        let socket_path = directory.path().join("control-plane.sock");
+        let listener = ControlPlaneRpcServerListener::unix(
+            UnixListener::bind(&socket_path).unwrap(),
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let policy = ControlPlaneRpcServerPolicy::new(
+            ControlPlaneRpcServerRole::Ordinary,
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        )
+        .unwrap()
+        .with_response_publication(Arc::new(SlowPublication));
+        let authority = Arc::new(Mutex::new(
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+                directory.path().join("control.state"),
+            ))
+            .unwrap(),
+        ));
+        let client = std::thread::spawn(move || {
+            UnixControlPlaneClient::new(socket_path)
+                .runtime_map_status_with_check_applied_timeout()
+                .unwrap()
+        });
+
+        listener
+            .accept_one(
+                &move || ControlPlaneRpcServerAuthority::Shared(Arc::clone(&authority)),
+                &policy,
+            )
+            .unwrap();
+        let status = client.join().unwrap();
+        wait_for_control_plane_server_workers_to_finish(&policy);
+
+        assert_eq!(status.pg_routes(), 0);
     }
 
     #[test]

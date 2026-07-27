@@ -21,18 +21,15 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::OpenOptions;
-use std::future::Future;
-use std::io;
 use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use storage::control_plane::{
-    ControlPlaneError, InitialClusterTopologyCertificate, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+    InitialClusterTopologyCertificate, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
     CONTROL_PLANE_RPC_MAX_SERVER_OPERATION_TIMEOUT, CONTROL_PLANE_TOPOLOGY_DIGEST_LEN,
 };
 use storage::control_plane_auth::{
@@ -41,8 +38,7 @@ use storage::control_plane_auth::{
 };
 use storage::control_plane_command::ControlPlaneCommand;
 use storage::control_plane_raft::{
-    validate_control_plane_command_replication_size, ControlPlaneRaftPeerFrameExchange,
-    ControlPlaneRaftPeerFrameExchangeError, ControlPlaneRaftPeerFrameTransport,
+    validate_control_plane_command_replication_size, ControlPlaneRaftPeerClientEndpoint,
     ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
     CONTROL_PLANE_RAFT_TLS_ALPN,
 };
@@ -52,9 +48,6 @@ use storage::{
     FrontendStorageRpcClientCapability, MaintenanceStorageRpcClientCapability, PgId,
     StorageNodeStorageRpcClientCapability, StorageRpcServerAuthConfig, StorageRpcTransportLimits,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio_rustls::TlsConnector;
 use x509_cert::der::Decode;
 use x509_cert::ext::pkix::{BasicConstraints, KeyUsage};
 use x509_cert::Certificate;
@@ -466,7 +459,7 @@ struct ResolvedStaticRaftPeerEndpoint {
     advertise: String,
     address: ResolvedStaticRaftPeerAddress,
     transport_profile_id: String,
-    tls_client_config: Option<Arc<RustlsClientConfig>>,
+    client_endpoint: ControlPlaneRaftPeerClientEndpoint,
 }
 
 impl fmt::Debug for ResolvedStaticRaftPeerEndpoint {
@@ -477,7 +470,7 @@ impl fmt::Debug for ResolvedStaticRaftPeerEndpoint {
             .field("advertise", &self.advertise)
             .field("address", &self.address)
             .field("transport_profile_id", &self.transport_profile_id)
-            .field("tls", &self.tls_client_config.is_some())
+            .field("client_endpoint", &self.client_endpoint)
             .finish()
     }
 }
@@ -508,236 +501,6 @@ struct ResolvedStaticRaftTransportPlan {
     local_node_id: u64,
     listeners: Vec<ResolvedStaticRaftListenerEndpoint>,
     peers: BTreeMap<u64, ResolvedStaticRaftPeerEndpoint>,
-}
-
-#[derive(Clone)]
-struct StaticRaftTcpPeer {
-    endpoint: String,
-    host: String,
-    port: u16,
-    server_name: String,
-    tls_client_config: Arc<RustlsClientConfig>,
-}
-
-impl fmt::Debug for StaticRaftTcpPeer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StaticRaftTcpPeer")
-            .field("endpoint", &self.endpoint)
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("server_name", &self.server_name)
-            .field("tls", &true)
-            .finish()
-    }
-}
-
-#[derive(Clone)]
-struct StaticRaftTcpPeerFrameTransport {
-    peers: Arc<BTreeMap<u64, StaticRaftTcpPeer>>,
-}
-
-impl fmt::Debug for StaticRaftTcpPeerFrameTransport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StaticRaftTcpPeerFrameTransport")
-            .field("peer_count", &self.peers.len())
-            .finish()
-    }
-}
-
-fn static_raft_tcp_exchange_context(
-    context_prefix: &'static str,
-    phase: &'static str,
-) -> &'static str {
-    match (context_prefix, phase) {
-        ("", "write") => "write transport",
-        ("", "read") => "read transport",
-        ("full_snapshot ", "write") => "full_snapshot write transport",
-        ("full_snapshot ", "read") => "full_snapshot read transport",
-        (_, "connect") => "connect",
-        (_, "tls") => "TLS handshake",
-        _ => "TCP peer transport",
-    }
-}
-
-fn static_raft_tcp_io_error(
-    context: &'static str,
-    source: io::Error,
-) -> ControlPlaneRaftPeerFrameExchangeError {
-    ControlPlaneRaftPeerFrameExchangeError::new(
-        context,
-        ControlPlaneError::Io {
-            context: "exchange control-plane OpenRaft TLS/TCP peer frame",
-            source,
-        },
-    )
-}
-
-async fn static_raft_tcp_io_until<T>(
-    deadline: Instant,
-    context: &'static str,
-    operation: impl Future<Output = io::Result<T>>,
-) -> Result<T, ControlPlaneRaftPeerFrameExchangeError> {
-    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), operation).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(source)) => Err(static_raft_tcp_io_error(context, source)),
-        Err(_) => Err(static_raft_tcp_io_error(
-            context,
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "control-plane OpenRaft TLS/TCP peer deadline expired",
-            ),
-        )),
-    }
-}
-
-async fn exchange_static_raft_tcp_peer_frame(
-    peer: StaticRaftTcpPeer,
-    exchange: ControlPlaneRaftPeerFrameExchange,
-) -> Result<Vec<u8>, ControlPlaneRaftPeerFrameExchangeError> {
-    if exchange.request_frame.len() > exchange.max_frame_bytes {
-        return Err(ControlPlaneRaftPeerFrameExchangeError::new(
-            static_raft_tcp_exchange_context(exchange.context_prefix, "write"),
-            ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "control-plane OpenRaft TLS/TCP request frame size {} bytes exceeds limit {}",
-                    exchange.request_frame.len(),
-                    exchange.max_frame_bytes
-                ),
-            },
-        ));
-    }
-    if peer.endpoint != exchange.endpoint {
-        return Err(ControlPlaneRaftPeerFrameExchangeError::new(
-            static_raft_tcp_exchange_context(exchange.context_prefix, "connect"),
-            ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "static Raft TCP endpoint mismatch for node {}",
-                    exchange.target
-                ),
-            },
-        ));
-    }
-    let connect_deadline = Instant::now()
-        .checked_add(exchange.connect_timeout)
-        .map_or(exchange.deadline, |configured| {
-            configured.min(exchange.deadline)
-        });
-    let stream = static_raft_tcp_io_until(
-        connect_deadline,
-        static_raft_tcp_exchange_context(exchange.context_prefix, "connect"),
-        TcpStream::connect((peer.host.as_str(), peer.port)),
-    )
-    .await?;
-    let server_name = ServerName::try_from(peer.server_name.clone()).map_err(|_| {
-        ControlPlaneRaftPeerFrameExchangeError::new(
-            static_raft_tcp_exchange_context(exchange.context_prefix, "tls"),
-            ControlPlaneError::RpcProtocol {
-                message: "static Raft TCP peer has an invalid TLS server name".to_string(),
-            },
-        )
-    })?;
-    let mut stream = static_raft_tcp_io_until(
-        exchange.deadline,
-        static_raft_tcp_exchange_context(exchange.context_prefix, "tls"),
-        TlsConnector::from(peer.tls_client_config).connect(server_name, stream),
-    )
-    .await?;
-    if stream.get_ref().1.alpn_protocol() != Some(CONTROL_PLANE_RAFT_TLS_ALPN) {
-        return Err(ControlPlaneRaftPeerFrameExchangeError::new(
-            static_raft_tcp_exchange_context(exchange.context_prefix, "tls"),
-            ControlPlaneError::RpcProtocol {
-                message:
-                    "control-plane OpenRaft TLS peer did not negotiate required argmin-raft/1 ALPN"
-                        .to_string(),
-            },
-        ));
-    }
-    let request_len = u32::try_from(exchange.request_frame.len()).map_err(|_| {
-        ControlPlaneRaftPeerFrameExchangeError::new(
-            static_raft_tcp_exchange_context(exchange.context_prefix, "write"),
-            ControlPlaneError::RpcProtocol {
-                message: "control-plane OpenRaft TLS/TCP request frame length exceeds u32"
-                    .to_string(),
-            },
-        )
-    })?;
-    static_raft_tcp_io_until(
-        exchange.deadline,
-        static_raft_tcp_exchange_context(exchange.context_prefix, "write"),
-        async {
-            stream.write_all(&request_len.to_be_bytes()).await?;
-            stream.write_all(&exchange.request_frame).await
-        },
-    )
-    .await?;
-    let mut header = [0_u8; std::mem::size_of::<u32>()];
-    static_raft_tcp_io_until(
-        exchange.deadline,
-        static_raft_tcp_exchange_context(exchange.context_prefix, "read"),
-        stream.read_exact(&mut header),
-    )
-    .await?;
-    let response_len = usize::try_from(u32::from_be_bytes(header)).map_err(|_| {
-        ControlPlaneRaftPeerFrameExchangeError::new(
-            static_raft_tcp_exchange_context(exchange.context_prefix, "read"),
-            ControlPlaneError::RpcProtocol {
-                message: "control-plane OpenRaft TLS/TCP response length does not fit usize"
-                    .to_string(),
-            },
-        )
-    })?;
-    if response_len > exchange.max_frame_bytes {
-        return Err(ControlPlaneRaftPeerFrameExchangeError::new(
-            static_raft_tcp_exchange_context(exchange.context_prefix, "read"),
-            ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "control-plane OpenRaft TLS/TCP response frame size {response_len} bytes exceeds limit {}",
-                    exchange.max_frame_bytes
-                ),
-            },
-        ));
-    }
-    let mut response = vec![0_u8; response_len];
-    static_raft_tcp_io_until(
-        exchange.deadline,
-        static_raft_tcp_exchange_context(exchange.context_prefix, "read"),
-        stream.read_exact(&mut response),
-    )
-    .await?;
-    Ok(response)
-}
-
-impl ControlPlaneRaftPeerFrameTransport for StaticRaftTcpPeerFrameTransport {
-    fn name(&self) -> &'static str {
-        "TLS/TCP"
-    }
-
-    fn exchange(
-        &self,
-        exchange: ControlPlaneRaftPeerFrameExchange,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Vec<u8>, ControlPlaneRaftPeerFrameExchangeError>>
-                + Send
-                + '_,
-        >,
-    > {
-        let peer = self.peers.get(&exchange.target).cloned();
-        Box::pin(async move {
-            let peer = peer.ok_or_else(|| {
-                ControlPlaneRaftPeerFrameExchangeError::new(
-                    static_raft_tcp_exchange_context(exchange.context_prefix, "connect"),
-                    ControlPlaneError::RpcProtocol {
-                        message: format!(
-                            "static Raft TCP transport has no peer for node {}",
-                            exchange.target
-                        ),
-                    },
-                )
-            })?;
-            exchange_static_raft_tcp_peer_frame(peer, exchange).await
-        })
-    }
 }
 
 struct ConfiguredStaticControlPlaneRpcClients {
@@ -1304,11 +1067,12 @@ impl ValidatedStaticClusterManifest {
                         canonical_endpoint.endpoint_id
                     )
                 })?;
-            let (address, tls_client_config) =
+            let (address, client_endpoint) =
                 match parse_endpoint_address(&endpoint.advertise, false)? {
-                    EndpointAddress::Unix(path) => {
-                        (ResolvedStaticRaftPeerAddress::Unix(path), None)
-                    }
+                    EndpointAddress::Unix(path) => (
+                        ResolvedStaticRaftPeerAddress::Unix(path.clone()),
+                        ControlPlaneRaftPeerClientEndpoint::unix(path),
+                    ),
                     EndpointAddress::Tcp { host, port } => {
                         let trust_bundle_id = endpoint
                             .tls_trust_bundle_id
@@ -1328,22 +1092,26 @@ impl ValidatedStaticClusterManifest {
                             .tls_server_name
                             .clone()
                             .expect("validated TCP endpoint has a TLS server name");
-                        let mut client_config =
-                            RustlsClientConfig::builder_with_provider(Arc::new(provider.clone()))
-                                .with_protocol_versions(&[&rustls::version::TLS13])
-                                .map_err(|_| {
-                                    "failed to select the static Raft TLS protocol".to_string()
-                                })?
-                                .with_root_certificates((*roots.roots).clone())
-                                .with_no_client_auth();
-                        client_config.alpn_protocols = vec![CONTROL_PLANE_RAFT_TLS_ALPN.to_vec()];
+                        let client_endpoint = ControlPlaneRaftPeerClientEndpoint::tls_tcp(
+                            endpoint.advertise.clone(),
+                            host.clone(),
+                            port,
+                            server_name.clone(),
+                            (*roots.roots).clone(),
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "failed to configure static Raft peer endpoint {}: {error}",
+                                endpoint.id
+                            )
+                        })?;
                         (
                             ResolvedStaticRaftPeerAddress::Tcp {
                                 host,
                                 port,
                                 server_name,
                             },
-                            Some(Arc::new(client_config)),
+                            client_endpoint,
                         )
                     }
                 };
@@ -1355,7 +1123,7 @@ impl ValidatedStaticClusterManifest {
                     advertise: endpoint.advertise.clone(),
                     address,
                     transport_profile_id: endpoint.transport_profile_id.clone(),
-                    tls_client_config,
+                    client_endpoint,
                 },
             );
             debug_assert!(replaced.is_none());
@@ -1800,55 +1568,22 @@ impl ValidatedStaticClusterManifest {
             .peers
             .values()
             .any(|peer| matches!(peer.address, ResolvedStaticRaftPeerAddress::Tcp { .. }));
-        let raft_peer_frame_transport: Option<Arc<dyn ControlPlaneRaftPeerFrameTransport>> =
-            if has_tcp_peer {
-                if raft_transport_plan
-                    .peers
-                    .values()
-                    .any(|peer| matches!(peer.address, ResolvedStaticRaftPeerAddress::Unix(_)))
-                {
-                    return Err(
-                        "canonical Raft peers must use one transport protocol per static topology"
-                            .to_string(),
-                    );
-                }
-                let peers = raft_transport_plan
-                    .peers
-                    .iter()
-                    .map(|(&node_id, peer)| {
-                        let ResolvedStaticRaftPeerAddress::Tcp {
-                            host,
-                            port,
-                            server_name,
-                        } = &peer.address
-                        else {
-                            unreachable!("mixed canonical Raft transports were rejected")
-                        };
-                        let tls_client_config =
-                            peer.tls_client_config.as_ref().ok_or_else(|| {
-                                format!(
-                                    "resolved TCP Raft peer {} has no TLS client configuration",
-                                    peer.endpoint_id
-                                )
-                            })?;
-                        Ok((
-                            node_id,
-                            StaticRaftTcpPeer {
-                                endpoint: peer.advertise.clone(),
-                                host: host.clone(),
-                                port: *port,
-                                server_name: server_name.clone(),
-                                tls_client_config: Arc::clone(tls_client_config),
-                            },
-                        ))
-                    })
-                    .collect::<Result<BTreeMap<_, _>, String>>()?;
-                Some(Arc::new(StaticRaftTcpPeerFrameTransport {
-                    peers: Arc::new(peers),
-                }))
-            } else {
-                None
-            };
+        if has_tcp_peer
+            && raft_transport_plan
+                .peers
+                .values()
+                .any(|peer| matches!(peer.address, ResolvedStaticRaftPeerAddress::Unix(_)))
+        {
+            return Err(
+                "canonical Raft peers must use one transport protocol per static topology"
+                    .to_string(),
+            );
+        }
+        let raft_peer_client_endpoints = raft_transport_plan
+            .peers
+            .iter()
+            .map(|(&node_id, peer)| (node_id, peer.client_endpoint.clone()))
+            .collect::<Vec<_>>();
 
         let mut raft_peer_sockets = Vec::new();
         for peer_authority in &self.manifest.authorities {
@@ -2043,7 +1778,7 @@ impl ValidatedStaticClusterManifest {
             EndpointAddress::Tcp { .. } => None,
         };
         config.control_plane_raft_peer_listeners = raft_peer_listeners;
-        config.control_plane_raft_peer_frame_transport = raft_peer_frame_transport;
+        config.control_plane_raft_peer_client_endpoints = raft_peer_client_endpoints;
         config.control_plane_raft_peer_sockets = raft_peer_sockets;
         config.control_plane_raft_peer_transport_limits = raft_transport_limits;
         config.control_plane_raft_peer_max_connections =
@@ -6156,51 +5891,8 @@ mod tests {
     use crate::config::ProcessRole;
     use std::fmt::Write as _;
     use std::fs::File;
-    use std::io::{Cursor, Write};
+    use std::io::Write;
     use std::os::unix::fs::symlink;
-
-    fn complete_test_tls_handshake(
-        client_config: Arc<RustlsClientConfig>,
-        server_config: Arc<rustls::ServerConfig>,
-        server_name: &str,
-    ) {
-        let mut client = rustls::ClientConnection::new(
-            client_config,
-            ServerName::try_from(server_name.to_string()).unwrap(),
-        )
-        .unwrap();
-        let mut server = rustls::ServerConnection::new(server_config).unwrap();
-        for _ in 0..16 {
-            let mut client_tls = Vec::new();
-            client.write_tls(&mut client_tls).unwrap();
-            if !client_tls.is_empty() {
-                server.read_tls(&mut Cursor::new(client_tls)).unwrap();
-                server.process_new_packets().unwrap();
-            }
-            let mut server_tls = Vec::new();
-            server.write_tls(&mut server_tls).unwrap();
-            if !server_tls.is_empty() {
-                client.read_tls(&mut Cursor::new(server_tls)).unwrap();
-                client.process_new_packets().unwrap();
-            }
-            if !client.is_handshaking() && !server.is_handshaking() {
-                break;
-            }
-        }
-        assert!(!client.is_handshaking());
-        assert!(!server.is_handshaking());
-        assert_eq!(client.alpn_protocol(), Some(CONTROL_PLANE_RAFT_TLS_ALPN));
-        assert_eq!(server.alpn_protocol(), Some(CONTROL_PLANE_RAFT_TLS_ALPN));
-
-        client.writer().write_all(b"raft-frame").unwrap();
-        let mut client_tls = Vec::new();
-        client.write_tls(&mut client_tls).unwrap();
-        server.read_tls(&mut Cursor::new(client_tls)).unwrap();
-        server.process_new_packets().unwrap();
-        let mut plaintext = [0_u8; 10];
-        server.reader().read_exact(&mut plaintext).unwrap();
-        assert_eq!(&plaintext, b"raft-frame");
-    }
 
     fn standalone_runtime_environment() -> BTreeMap<&'static str, String> {
         BTreeMap::from([
@@ -7082,7 +6774,19 @@ secret_ref = "file:/run/argmin-secrets/frontend-1-maintenance.key"
         assert_eq!(config.control_plane_raft_node_id, Some(101));
         assert_eq!(config.control_plane_raft_peer_max_connections, 17);
         assert_eq!(config.control_plane_raft_peer_listeners.len(), 1);
-        assert!(config.control_plane_raft_peer_frame_transport.is_none());
+        assert_eq!(config.control_plane_raft_peer_client_endpoints.len(), 3);
+        for (index, (node_id, endpoint)) in config
+            .control_plane_raft_peer_client_endpoints
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(*node_id, 101 + u64::try_from(index).unwrap());
+            assert_eq!(endpoint.transport_name(), "Unix");
+            assert_eq!(
+                endpoint.advertised_endpoint(),
+                format!("/run/argmin/raft-{}.sock", index + 1)
+            );
+        }
         assert_eq!(
             config.control_plane_state_path.as_deref(),
             Some("/srv/argmin/control-1/control.state")
@@ -7352,13 +7056,21 @@ tls_server_name = "localhost""#,
                 },
             ]
         );
-        let transport = config
-            .control_plane_raft_peer_frame_transport
-            .as_ref()
-            .expect("canonical TCP peers require a TCP frame transport");
-        assert_eq!(transport.name(), "TLS/TCP");
-        let debug = format!("{transport:?}");
-        assert!(debug.contains("peer_count"));
+        assert_eq!(config.control_plane_raft_peer_client_endpoints.len(), 3);
+        for (index, (node_id, endpoint)) in config
+            .control_plane_raft_peer_client_endpoints
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(*node_id, 101 + u64::try_from(index).unwrap());
+            assert_eq!(endpoint.transport_name(), "TLS/TCP");
+            assert_eq!(
+                endpoint.advertised_endpoint(),
+                format!("tcp://localhost:840{}", index + 1)
+            );
+        }
+        let debug = format!("{:?}", config.control_plane_raft_peer_client_endpoints);
+        assert!(debug.contains("advertised_endpoint"));
         assert!(!debug.contains("PRIVATE KEY"));
     }
 
@@ -7692,191 +7404,12 @@ tls_server_name = "control-1-alt.internal"
                 peer.address,
                 ResolvedStaticRaftPeerAddress::Tcp { .. }
             ));
-            let client_config = peer.tls_client_config.as_ref().unwrap();
-            assert_eq!(client_config.alpn_protocols, &[CONTROL_PLANE_RAFT_TLS_ALPN]);
+            assert_eq!(peer.client_endpoint.transport_name(), "TLS/TCP");
+            assert_eq!(peer.client_endpoint.advertised_endpoint(), peer.advertise);
         }
-        let local_peer = plan.peers.get(&plan.local_node_id).unwrap();
-        let ResolvedStaticRaftPeerAddress::Tcp { server_name, .. } = &local_peer.address else {
-            panic!("local resolved Raft peer must use TCP");
-        };
-        complete_test_tls_handshake(
-            Arc::clone(local_peer.tls_client_config.as_ref().unwrap()),
-            Arc::clone(server_config),
-            server_name,
-        );
         let debug = format!("{plan:?}");
-        assert!(debug.contains("tls: true"));
+        assert!(debug.contains("TLS/TCP"));
         assert!(!debug.contains("PRIVATE KEY"));
-    }
-
-    #[test]
-    fn static_raft_tcp_frame_transport_exchanges_complete_tls_frame() {
-        let (_dir, manifest) = materialized_replicated_manifest("control-1");
-        let material = manifest.resolve_selected_process_material_at(1).unwrap();
-        let plan = manifest
-            .resolved_static_raft_transport_plan(&material)
-            .unwrap();
-        let peer = plan.peers.get(&101).unwrap();
-        let listener_config = plan.listeners[0].tls_server_config.as_ref().unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server_config = Arc::clone(listener_config);
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            let connection = rustls::ServerConnection::new(server_config).unwrap();
-            let mut stream = rustls::StreamOwned::new(connection, stream);
-            let mut length = [0_u8; 4];
-            stream.read_exact(&mut length).unwrap();
-            let mut request = vec![0_u8; u32::from_be_bytes(length) as usize];
-            stream.read_exact(&mut request).unwrap();
-            assert_eq!(request, b"request-frame");
-            stream
-                .write_all(&(14_u32).to_be_bytes())
-                .and_then(|()| stream.write_all(b"response-frame"))
-                .unwrap();
-        });
-        let transport = StaticRaftTcpPeerFrameTransport {
-            peers: Arc::new(BTreeMap::from([(
-                101,
-                StaticRaftTcpPeer {
-                    endpoint: format!("tcp://localhost:{port}"),
-                    host: "127.0.0.1".to_string(),
-                    port,
-                    server_name: "localhost".to_string(),
-                    tls_client_config: Arc::clone(peer.tls_client_config.as_ref().unwrap()),
-                },
-            )])),
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let response = runtime
-            .block_on(transport.exchange(ControlPlaneRaftPeerFrameExchange {
-                target: 101,
-                endpoint: format!("tcp://localhost:{port}"),
-                request_frame: b"request-frame".to_vec(),
-                max_frame_bytes: 1024,
-                connect_timeout: Duration::from_secs(1),
-                deadline: Instant::now() + Duration::from_secs(1),
-                context_prefix: "",
-            }))
-            .unwrap();
-
-        assert_eq!(response, b"response-frame");
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn static_raft_tcp_frame_transport_rejects_missing_alpn() {
-        let (_dir, manifest) = materialized_replicated_manifest("control-1");
-        let material = manifest.resolve_selected_process_material_at(1).unwrap();
-        let plan = manifest
-            .resolved_static_raft_transport_plan(&material)
-            .unwrap();
-        let peer = plan.peers.get(&101).unwrap();
-        let mut server_config = (**plan.listeners[0].tls_server_config.as_ref().unwrap()).clone();
-        server_config.alpn_protocols.clear();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            let mut connection = rustls::ServerConnection::new(Arc::new(server_config)).unwrap();
-            while connection.is_handshaking() {
-                connection.complete_io(&mut stream).unwrap();
-            }
-            assert_eq!(connection.alpn_protocol(), None);
-        });
-        let transport = StaticRaftTcpPeerFrameTransport {
-            peers: Arc::new(BTreeMap::from([(
-                101,
-                StaticRaftTcpPeer {
-                    endpoint: format!("tcp://localhost:{port}"),
-                    host: "127.0.0.1".to_string(),
-                    port,
-                    server_name: "localhost".to_string(),
-                    tls_client_config: Arc::clone(peer.tls_client_config.as_ref().unwrap()),
-                },
-            )])),
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let error = runtime
-            .block_on(transport.exchange(ControlPlaneRaftPeerFrameExchange {
-                target: 101,
-                endpoint: format!("tcp://localhost:{port}"),
-                request_frame: b"request-frame".to_vec(),
-                max_frame_bytes: 1024,
-                connect_timeout: Duration::from_secs(1),
-                deadline: Instant::now() + Duration::from_secs(1),
-                context_prefix: "",
-            }))
-            .unwrap_err();
-
-        assert!(format!("{error:?}").contains("did not negotiate required"));
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn static_raft_tcp_frame_transport_bounds_tls_handshake_by_absolute_deadline() {
-        let (_dir, manifest) = materialized_replicated_manifest("control-1");
-        let material = manifest.resolve_selected_process_material_at(1).unwrap();
-        let plan = manifest
-            .resolved_static_raft_transport_plan(&material)
-            .unwrap();
-        let peer = plan.peers.get(&101).unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (_stream, _) = listener.accept().unwrap();
-            std::thread::sleep(Duration::from_millis(100));
-        });
-        let transport = StaticRaftTcpPeerFrameTransport {
-            peers: Arc::new(BTreeMap::from([(
-                101,
-                StaticRaftTcpPeer {
-                    endpoint: format!("tcp://localhost:{port}"),
-                    host: "127.0.0.1".to_string(),
-                    port,
-                    server_name: "localhost".to_string(),
-                    tls_client_config: Arc::clone(peer.tls_client_config.as_ref().unwrap()),
-                },
-            )])),
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let error = runtime
-            .block_on(transport.exchange(ControlPlaneRaftPeerFrameExchange {
-                target: 101,
-                endpoint: format!("tcp://localhost:{port}"),
-                request_frame: b"request-frame".to_vec(),
-                max_frame_bytes: 1024,
-                connect_timeout: Duration::from_secs(1),
-                deadline: Instant::now() + Duration::from_millis(20),
-                context_prefix: "",
-            }))
-            .unwrap_err();
-
-        assert!(format!("{error:?}").contains("TimedOut"));
-        server.join().unwrap();
     }
 
     #[test]
