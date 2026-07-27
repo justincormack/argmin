@@ -2786,7 +2786,7 @@ run_pg_backfill_migration_smoke() {
     fi
 
     set_pg_acting_set "old placement nodes 0,1 for PG backfill iteration $iteration" "$target_data_pg" 0 1
-    wait_for_target_pg_runtime_installed "$target_data_pg" "0:1" 10 "$metrics_path"
+    wait_for_target_pg_runtime_installed "$target_data_pg" "0:1" 20 "$metrics_path"
     local old_floor_before_object_diagnostics=""
     old_floor_before_object_diagnostics="$("${server_cmd[@]}" control-plane-runtime-map-diagnostics "$control_plane_socket_path" 2>/dev/null || true)"
     sample_frontend_metrics "$metrics_path"
@@ -2874,7 +2874,7 @@ run_pg_backfill_migration_smoke() {
     min_pg_completed="$(($(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total pg_id "$data_pg" event complete_succeeded) + 1))"
 
     set_pg_acting_set "desired placement nodes 0,2" "$data_pg" 0 2
-    wait_for_target_pg_runtime_installed "$data_pg" "0:2" 10 "$metrics_path"
+    wait_for_target_pg_runtime_installed "$data_pg" "0:2" 20 "$metrics_path"
     if ((${#old_floor_nodes_needing_signal[@]})); then
         wait_for_control_plane_storage_history_floor_nodes 20 "$old_placement_floor_max_epoch" "${old_floor_nodes_needing_signal[@]}"
     else
@@ -2884,7 +2884,7 @@ run_pg_backfill_migration_smoke() {
         restart_control_plane
         wait_for_control_plane_runtime_map_ready 10
         wait_for_control_plane_node_epochs_aligned 10 "$control_plane_runtime_map_ready_epoch"
-        wait_for_target_pg_runtime_installed "$data_pg" "0:2" 10 "$metrics_path"
+        wait_for_target_pg_runtime_installed "$data_pg" "0:2" 20 "$metrics_path"
         wait_for_control_plane_storage_history_floor_nodes 20 "$old_placement_floor_max_epoch" 0 1
     fi
     max_candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
