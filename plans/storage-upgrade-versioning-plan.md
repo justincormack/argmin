@@ -230,7 +230,7 @@ Initial ownership assessment:
 | PG schema and physical PG/shard layout | `storage` | SQL and the driver are now private to `PgStore`; remove SQLite magic, `metadata.db`, `pg-NNNN`, direct fsync, and raw shard-layout knowledge from `argmin-s3`. |
 | Metadata command log, checkpoints, and canonical metadata digests | `storage` | Codecs are largely crate-private; inventory every embedded nested format and keep recovery/corruption tests local. |
 | Storage-node RPC | `storage` | The main codec and wire error codes are private; `StorageNodeServer`, `StoreError`, and `StorageNodeFailureClass` form the logical facade. Remaining work is ALPN/TLS profile containment. |
-| Control-plane durable state, RPC, and auth envelope | `storage` | Replace raw frame transports and binary-owned request verification/response framing with a storage-controlled client/server facade. |
+| Control-plane durable state, RPC, and auth envelope | `storage` | The client transport is contained behind typed Unix/TLS endpoints. Replace binary-owned server verification, dispatch, and response framing with a storage-controlled server facade. |
 | Raft peer protocol, restart artifact, and WAL | `storage` | Hide raw frame decoders, framing helpers, WAL records/files, and layout helpers; move direct WAL construction tests into storage. |
 | Object user/system metadata blobs | `server-core` | Keep storage's carriers opaque; make serialization entry points crate-private unless another owner has a demonstrated need to interpret them. |
 | Tag and ACL canonical value formats | `s3-types` | Keep validation and canonical value codecs central; treat their embeddings in storage rows/RPCs as separately versioned containing formats. |
@@ -311,11 +311,13 @@ The public boundary and containment status for each surface are as follows.
   `AuthenticatedUnixControlPlaneClient` through the control-plane admin, heartbeat, runtime-map,
   and authority-clock traits. The authority implementations and typed snapshots/results also
   belong to `storage`.
-- The Unix client path is storage-owned, but the general client extension point is a raw
-  `ControlPlaneRpcFrameTransport`. It gives `argmin-s3` a fully encoded request `Vec<u8>`, frame
-  limit, deadline, and request-sent state and expects a fully encoded response `Vec<u8>`.
-  `static_cluster_config.rs` consequently implements Unix and TLS/TCP connect, deadline, ALPN,
-  complete-frame write/read, size enforcement, and construction of protocol errors.
+- The client transport containment slice is complete. Static configuration now supplies
+  `ControlPlaneRpcClientEndpoint` values containing Unix paths or TLS/TCP host, port, server-name,
+  connect-timeout, and trust-root inputs. `storage` owns DNS/connect deadlines, TLS profile and
+  ALPN construction, framing, frame limits, request-publication tracking, response decoding, and
+  endpoint failover. The former public `ControlPlaneRpcFrameTransport`, raw exchange value/error,
+  and `with_frame_transport` extension are removed. Raw transport tests are storage-owned, and a
+  repository check prevents those client-wire abstractions from returning outside `storage`.
 - The server boundary is substantially open. `argmin-s3/main.rs` binds Unix and TCP listeners,
   performs TLS and ALPN handling, manages worker and pre-auth byte budgets, reads raw frames,
   invokes storage authentication and endpoint-admission helpers, dispatches verified requests,
@@ -372,9 +374,10 @@ The public boundary and containment status for each surface are as follows.
 This completes the RPC inventory only; it does not satisfy Phase 1 containment. The bounded
 implementation order is:
 
-1. Replace the control-plane raw client frame-transport extension with storage-owned Unix and
-   TLS/TCP endpoint configuration. Keep static-manifest parsing in `argmin-s3`, but hide frames,
-   ALPN, request-sent tracking, and transport error construction.
+1. **Complete:** replace the control-plane raw client frame-transport extension with
+   storage-owned Unix and TLS/TCP endpoint configuration. Static-manifest parsing remains in
+   `argmin-s3`; frames, client ALPN construction, request-sent tracking, and transport error
+   construction are storage-owned.
 2. Add a storage-owned control-plane server facade that accepts listener, resource-limit,
    authentication, authority-clock, and durability-publication configuration while owning TLS,
    frame admission, verification, dispatch, response framing, and transport diagnostics.
@@ -535,25 +538,26 @@ implementation-error matching. These remain explicit work below.
 
 ## Immediate Next Steps
 
-1. Replace the raw control-plane client frame transport with storage-owned Unix and TLS/TCP
-   endpoint configuration.
-2. Move control-plane server framing, authentication, admission, dispatch, and transport
+Completed in the current containment pass: the raw control-plane client frame transport was
+replaced with storage-owned `ControlPlaneRpcClientEndpoint` configuration for Unix and TLS/TCP.
+
+1. Move control-plane server framing, authentication, admission, dispatch, and transport
    diagnostics behind a storage-owned server facade.
-3. Move Raft TLS/TCP client exchange and inbound peer serving behind storage-owned facades,
+2. Move Raft TLS/TCP client exchange and inbound peer serving behind storage-owned facades,
    preserving the pre-auth allocation bound and durability-before-ack invariant.
-4. Privatize the raw control-plane/Raft frame, auth-envelope, ALPN, OpenRaft-handle, and
+3. Privatize the remaining raw control-plane/Raft frame, auth-envelope, ALPN, OpenRaft-handle, and
    transport-error APIs and relocate malformed-wire tests into `storage`.
-5. Hide public WAL/restart-format constructors and move direct WAL/impossible-state tests into
+4. Hide public WAL/restart-format constructors and move direct WAL/impossible-state tests into
    the owner.
-6. Replace other higher-layer matching on database/RPC implementation errors with owner-defined
+5. Replace other higher-layer matching on database/RPC implementation errors with owner-defined
    semantic errors or classification methods.
-8. Inventory and restrict nested durable codecs for metadata, tags, ACLs, and encryption;
+6. Inventory and restrict nested durable codecs for metadata, tags, ACLs, and encryption;
    record how containing formats advance when a nested format changes.
-9. Audit existing version/fallback code and remove unsupported legacy compatibility where it
+7. Audit existing version/fallback code and remove unsupported legacy compatibility where it
    worsens current invariants.
-10. Add or tighten current-version rejection tests for existing versioned formats.
-11. Add boundary checks for the concrete leaks found in this audit, while relying on crate
-   privacy for the durable enforcement.
-12. Remove the trigger-verification item from Phase 11 stabilisation tracking and keep this
+8. Add or tighten current-version rejection tests for existing versioned formats.
+9. Add boundary checks for the concrete leaks found in this audit, while relying on crate
+    privacy for the durable enforcement.
+10. Remove the trigger-verification item from Phase 11 stabilisation tracking and keep this
     plan as the upgrade home for it; defer trigger body hashing/recreation until the upgrade
     framework is deliberately started.

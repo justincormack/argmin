@@ -2577,6 +2577,18 @@ fail_with_matches \
     "Storage-node wire errors and opaque diagnostics are private to storage; use StorageNodeFailureClass" \
     "$storage_rpc_wire_error_leaks"
 
+control_plane_client_wire_leaks=$(
+    rg -n --color=never \
+        '\bControlPlaneRpcFrame(Transport|Exchange|ExchangeError)\b|\bwith_frame_transport\b|\bconnect_unix_stream_until\b' \
+        . \
+        -g 'crates/**/*.rs' \
+        -g '!crates/storage/**' \
+        || true
+)
+fail_with_matches \
+    "Control-plane client framing and frame transport are private to storage; use ControlPlaneRpcClientEndpoint" \
+    "$control_plane_client_wire_leaks"
+
 if [[ "$failed" -ne 0 ]]; then
     echo
     echo "storage cluster boundary checks failed" >&2

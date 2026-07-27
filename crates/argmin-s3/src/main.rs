@@ -6792,10 +6792,9 @@ fn build_configured_unix_control_plane_client(
     config: &ServerConfig,
     primary_socket_path: &str,
 ) -> Result<UnixControlPlaneClient, String> {
-    if let Some(transport) = &config.control_plane_rpc_frame_transport {
-        return UnixControlPlaneClient::with_frame_transport(
+    if !config.control_plane_rpc_client_endpoints.is_empty() {
+        return UnixControlPlaneClient::with_endpoints(
             config.control_plane_rpc_client_endpoints.clone(),
-            Arc::clone(transport),
         )
         .map_err(|error| format!("invalid control-plane framed client endpoints: {error}"));
     }
@@ -6898,20 +6897,19 @@ fn build_admin_clock_recovery_client_from_config(
     config: &ServerConfig,
     fallback_control_plane_socket_path: &Path,
 ) -> Result<AdminControlPlaneClient, String> {
-    let client = if let Some(transport) = &config.control_plane_clock_recovery_rpc_frame_transport {
-        UnixControlPlaneClient::with_frame_transport(
+    let client = if !config
+        .control_plane_clock_recovery_rpc_client_endpoints
+        .is_empty()
+    {
+        UnixControlPlaneClient::with_endpoints(
             config
                 .control_plane_clock_recovery_rpc_client_endpoints
                 .clone(),
-            Arc::clone(transport),
         )
         .map_err(|error| {
             format!("invalid configured authority-clock recovery endpoints: {error}")
         })?
-    } else if config
-        .control_plane_clock_recovery_rpc_client_endpoints
-        .is_empty()
-    {
+    } else {
         let control_client =
             build_command_unix_control_plane_client(fallback_control_plane_socket_path)?;
         UnixControlPlaneClient::with_socket_paths(
@@ -6921,16 +6919,6 @@ fn build_admin_clock_recovery_client_from_config(
                 .map(|path| control_plane_clock_recovery_socket_path(path)),
         )
         .map_err(|error| format!("invalid control-plane clock recovery socket paths: {error}"))?
-    } else {
-        UnixControlPlaneClient::with_socket_paths(
-            config
-                .control_plane_clock_recovery_rpc_client_endpoints
-                .iter()
-                .map(PathBuf::from),
-        )
-        .map_err(|error| {
-            format!("invalid configured authority-clock recovery socket paths: {error}")
-        })?
     };
     build_admin_control_plane_client_from_config(config, client)
 }
@@ -8353,8 +8341,9 @@ mod tests {
     use openraft::raft::{TransferLeaderRequest, VoteRequest};
     use storage::control_plane::{
         build_control_plane_unix_response_with_auth_and_response_clock,
-        handle_control_plane_unix_stream, ControlPlaneHeartbeatSink, NodeAvailabilityState,
-        NodeHeartbeat, NodeMembershipState, NodePgHeartbeatObservation, PgMetadataProof,
+        handle_control_plane_unix_stream, ControlPlaneHeartbeatSink, ControlPlaneRpcClientEndpoint,
+        NodeAvailabilityState, NodeHeartbeat, NodeMembershipState, NodePgHeartbeatObservation,
+        PgMetadataProof,
     };
     use storage::control_plane_auth::{
         ControlPlaneAuthEnvelope, ControlPlaneAuthSignInput, ControlPlaneAuthTarget,
@@ -8390,17 +8379,7 @@ mod tests {
     fn test_control_plane_tls_client_config(
         negotiate_control_plane_alpn: bool,
     ) -> Arc<rustls::ClientConfig> {
-        let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(
-                CertificateDer::pem_slice_iter(include_bytes!(
-                    "../../s3-tests/testdata/ca-cert.pem"
-                ))
-                .next()
-                .unwrap()
-                .unwrap(),
-            )
-            .unwrap();
+        let roots = test_control_plane_tls_roots();
         let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -8412,6 +8391,21 @@ mod tests {
             config.alpn_protocols = vec![CONTROL_PLANE_RPC_TLS_ALPN.to_vec()];
         }
         Arc::new(config)
+    }
+
+    fn test_control_plane_tls_roots() -> rustls::RootCertStore {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(
+                CertificateDer::pem_slice_iter(include_bytes!(
+                    "../../s3-tests/testdata/ca-cert.pem"
+                ))
+                .next()
+                .unwrap()
+                .unwrap(),
+            )
+            .unwrap();
+        roots
     }
 
     #[test]
@@ -9085,53 +9079,6 @@ mod tests {
 
     #[test]
     fn tcp_control_plane_listener_requires_auth_when_role_is_unconfigured() {
-        #[derive(Debug, Default)]
-        struct RequestFrameCapture {
-            request_frame: Mutex<Option<Vec<u8>>>,
-        }
-
-        impl storage::control_plane::ControlPlaneRpcFrameTransport for RequestFrameCapture {
-            fn name(&self) -> &'static str {
-                "request frame capture"
-            }
-
-            fn exchange(
-                &self,
-                exchange: storage::control_plane::ControlPlaneRpcFrameExchange,
-            ) -> Result<Vec<u8>, storage::control_plane::ControlPlaneRpcFrameExchangeError>
-            {
-                *self.request_frame.lock().unwrap() = Some(exchange.request_frame);
-                Err(
-                    storage::control_plane::ControlPlaneRpcFrameExchangeError::after_request_started(
-                        ControlPlaneError::RpcProtocol {
-                            message: "request frame captured".to_owned(),
-                        },
-                    ),
-                )
-            }
-        }
-
-        let request_capture = Arc::new(RequestFrameCapture::default());
-        let capture_transport: Arc<dyn storage::control_plane::ControlPlaneRpcFrameTransport> =
-            request_capture.clone();
-        let capture_error = UnixControlPlaneClient::with_frame_transport(
-            ["capture://control-plane".to_owned()],
-            capture_transport,
-        )
-        .unwrap()
-        .runtime_map_status_with_check_applied_timeout()
-        .unwrap_err();
-        assert!(matches!(
-            capture_error,
-            ControlPlaneError::RpcProtocol { message } if message == "request frame captured"
-        ));
-        let request_frame = request_capture
-            .request_frame
-            .lock()
-            .unwrap()
-            .take()
-            .expect("unsigned runtime-map request frame should be captured");
-
         let admin_credential =
             ControlPlaneAdminAuthCredential::new(ControlPlaneAdminAuthCredentialInput {
                 instance_id: "admin-1".to_owned(),
@@ -9182,13 +9129,20 @@ mod tests {
             BoundControlPlaneRpcListener::Tcp { listener, .. } => listener.local_addr().unwrap(),
             BoundControlPlaneRpcListener::Unix { .. } => unreachable!(),
         };
-        let client_stream = StdTcpStream::connect(address).unwrap();
-        client_stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+        let client = thread::spawn(move || {
+            let endpoint = ControlPlaneRpcClientEndpoint::tls_tcp(
+                format!("tcp://{address}"),
+                address.ip().to_string(),
+                address.port(),
+                "localhost",
+                Duration::from_secs(2),
+                test_control_plane_tls_roots(),
+            )
             .unwrap();
-        client_stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+            UnixControlPlaneClient::with_endpoints([endpoint])
+                .unwrap()
+                .runtime_map_status_with_check_applied_timeout()
+        });
         let (server_stream, tls_server_config) = match &listener {
             BoundControlPlaneRpcListener::Tcp {
                 listener,
@@ -9216,31 +9170,7 @@ mod tests {
             None,
             policy,
         );
-
-        let connection = rustls::ClientConnection::new(
-            test_control_plane_tls_client_config(true),
-            rustls::pki_types::ServerName::try_from("localhost")
-                .unwrap()
-                .to_owned(),
-        )
-        .unwrap();
-        let mut client = rustls::StreamOwned::new(connection, client_stream);
-        client.write_all(&request_frame).unwrap();
-        client.flush().unwrap();
-        assert_eq!(
-            client.conn.alpn_protocol(),
-            Some(CONTROL_PLANE_RPC_TLS_ALPN)
-        );
-        let mut response_byte = [0_u8; 1];
-        match client.read(&mut response_byte) {
-            Ok(0) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-                ) => {}
-            result => panic!("unsigned TCP request unexpectedly produced a response: {result:?}"),
-        }
+        assert!(client.join().unwrap().is_err());
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while active_workers.load(Ordering::Acquire) != 0 {
@@ -9589,8 +9519,6 @@ mod tests {
             control_plane_clock_recovery_rpc_listeners: Vec::new(),
             control_plane_rpc_client_endpoints: Vec::new(),
             control_plane_clock_recovery_rpc_client_endpoints: Vec::new(),
-            control_plane_rpc_frame_transport: None,
-            control_plane_clock_recovery_rpc_frame_transport: None,
             control_plane_auth_cluster_id: None,
             control_plane_storage_auth_credentials: Vec::new(),
             control_plane_storage_auth_signing_credential: None,
@@ -10115,24 +10043,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_authority_clock_command_client_uses_recovery_frame_transport() {
-        #[derive(Debug)]
-        struct CommandRecoveryTransport;
-
-        impl storage::control_plane::ControlPlaneRpcFrameTransport for CommandRecoveryTransport {
-            fn name(&self) -> &'static str {
-                "command-recovery-test"
-            }
-
-            fn exchange(
-                &self,
-                _exchange: storage::control_plane::ControlPlaneRpcFrameExchange,
-            ) -> Result<Vec<u8>, storage::control_plane::ControlPlaneRpcFrameExchangeError>
-            {
-                unreachable!("client construction must not issue an RPC")
-            }
-        }
-
+    fn configured_authority_clock_command_client_uses_recovery_endpoints() {
         let mut config = test_server_config();
         config.control_plane_auth_cluster_id = Some("static-topology-cluster".to_string());
         config.control_plane_admin_auth_instance_id = Some("admin-1".to_string());
@@ -10143,12 +10054,21 @@ mod tests {
                 credential_version: 9,
                 secret: BinarySecretConfigValue::from_utf8("admin-secret".to_string()),
             }];
-        config.control_plane_clock_recovery_rpc_client_endpoints = vec![
-            "tcp://control-1.internal:7601".to_string(),
-            "tcp://control-2.internal:7602".to_string(),
-        ];
-        config.control_plane_clock_recovery_rpc_frame_transport =
-            Some(Arc::new(CommandRecoveryTransport));
+        config.control_plane_clock_recovery_rpc_client_endpoints =
+            [("control-1.internal", 7601), ("control-2.internal", 7602)]
+                .into_iter()
+                .map(|(host, port)| {
+                    ControlPlaneRpcClientEndpoint::tls_tcp(
+                        format!("tcp://{host}:{port}"),
+                        "127.0.0.1",
+                        port,
+                        host,
+                        Duration::from_secs(1),
+                        rustls::RootCertStore::empty(),
+                    )
+                    .unwrap()
+                })
+                .collect();
 
         let client = build_admin_clock_recovery_client_from_config(
             &config,
@@ -10163,7 +10083,7 @@ mod tests {
         let debug = format!("{:?}", client.inner());
         assert!(debug.contains("tcp://control-1.internal:7601"));
         assert!(debug.contains("tcp://control-2.internal:7602"));
-        assert!(debug.contains("command-recovery-test"));
+        assert!(debug.contains("ControlPlaneRpcClientEndpoint::TlsTcp"));
         assert!(!debug.contains("unused-control.sock"));
     }
 

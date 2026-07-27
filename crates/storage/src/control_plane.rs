@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, Read as _, Write as _};
+use std::net::TcpStream;
 use std::num::NonZeroU64;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 use checksum::{ChecksumAlgorithm, ChecksumHasher};
 use placement::NodeId;
 use ring::rand::SecureRandom as _;
+use rustls::pki_types::ServerName;
 use thiserror::Error;
 
 use crate::control_plane_auth::{
@@ -9822,10 +9824,137 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
 
 #[derive(Clone)]
 pub struct UnixControlPlaneClient {
+    endpoints: Arc<[ControlPlaneRpcClientEndpoint]>,
     socket_paths: Arc<[PathBuf]>,
-    frame_transport_endpoints: Arc<[String]>,
-    frame_transport: Option<Arc<dyn ControlPlaneRpcFrameTransport>>,
-    preferred_socket_index: Arc<AtomicUsize>,
+    preferred_endpoint_index: Arc<AtomicUsize>,
+}
+
+/// A configured endpoint for the logical control-plane RPC client.
+///
+/// Framing, protocol limits, TLS profile construction, ALPN, deadlines, and
+/// request-publication tracking remain owned by `storage`.
+#[derive(Clone)]
+pub struct ControlPlaneRpcClientEndpoint(ControlPlaneRpcClientEndpointKind);
+
+#[derive(Clone)]
+enum ControlPlaneRpcClientEndpointKind {
+    Unix {
+        socket_path: PathBuf,
+    },
+    TlsTcp {
+        advertised_endpoint: String,
+        host: String,
+        port: u16,
+        server_name: String,
+        connect_timeout: Duration,
+        tls_client_config: Arc<rustls::ClientConfig>,
+    },
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ControlPlaneRpcClientEndpointError {
+    #[error("control-plane TLS/TCP advertised endpoint must not be empty")]
+    EmptyAdvertisedEndpoint,
+    #[error("control-plane TLS/TCP host must not be empty")]
+    EmptyHost,
+    #[error("control-plane TLS/TCP endpoint has an invalid TLS server name")]
+    InvalidServerName,
+    #[error("failed to construct the control-plane TLS client profile")]
+    TlsProfileUnavailable,
+}
+
+impl ControlPlaneRpcClientEndpoint {
+    #[must_use]
+    pub fn unix(socket_path: impl Into<PathBuf>) -> Self {
+        Self(ControlPlaneRpcClientEndpointKind::Unix {
+            socket_path: socket_path.into(),
+        })
+    }
+
+    pub fn tls_tcp(
+        advertised_endpoint: impl Into<String>,
+        host: impl Into<String>,
+        port: u16,
+        server_name: impl Into<String>,
+        connect_timeout: Duration,
+        trust_roots: rustls::RootCertStore,
+    ) -> Result<Self, ControlPlaneRpcClientEndpointError> {
+        let advertised_endpoint = advertised_endpoint.into();
+        if advertised_endpoint.is_empty() {
+            return Err(ControlPlaneRpcClientEndpointError::EmptyAdvertisedEndpoint);
+        }
+        let host = host.into();
+        if host.is_empty() {
+            return Err(ControlPlaneRpcClientEndpointError::EmptyHost);
+        }
+        let server_name = server_name.into();
+        ServerName::try_from(server_name.clone())
+            .map_err(|_| ControlPlaneRpcClientEndpointError::InvalidServerName)?;
+        let mut tls_client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| ControlPlaneRpcClientEndpointError::TlsProfileUnavailable)?
+        .with_root_certificates(trust_roots)
+        .with_no_client_auth();
+        tls_client_config.alpn_protocols = vec![CONTROL_PLANE_RPC_TLS_ALPN.to_vec()];
+        Ok(Self(ControlPlaneRpcClientEndpointKind::TlsTcp {
+            advertised_endpoint,
+            host,
+            port,
+            server_name,
+            connect_timeout,
+            tls_client_config: Arc::new(tls_client_config),
+        }))
+    }
+
+    #[must_use]
+    pub fn advertised_endpoint(&self) -> String {
+        match &self.0 {
+            ControlPlaneRpcClientEndpointKind::Unix { socket_path } => {
+                format!("unix://{}", socket_path.display())
+            }
+            ControlPlaneRpcClientEndpointKind::TlsTcp {
+                advertised_endpoint,
+                ..
+            } => advertised_endpoint.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn unix_socket_path(&self) -> Option<&Path> {
+        match &self.0 {
+            ControlPlaneRpcClientEndpointKind::Unix { socket_path } => Some(socket_path),
+            ControlPlaneRpcClientEndpointKind::TlsTcp { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for ControlPlaneRpcClientEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            ControlPlaneRpcClientEndpointKind::Unix { socket_path } => formatter
+                .debug_struct("ControlPlaneRpcClientEndpoint::Unix")
+                .field("socket_path", socket_path)
+                .finish(),
+            ControlPlaneRpcClientEndpointKind::TlsTcp {
+                advertised_endpoint,
+                host,
+                port,
+                server_name,
+                connect_timeout,
+                ..
+            } => formatter
+                .debug_struct("ControlPlaneRpcClientEndpoint::TlsTcp")
+                .field("advertised_endpoint", advertised_endpoint)
+                .field("host", host)
+                .field("port", port)
+                .field("server_name", server_name)
+                .field("connect_timeout", connect_timeout)
+                .field("tls", &true)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -9871,64 +10000,25 @@ impl ControlPlaneEndpointPass {
 impl std::fmt::Debug for UnixControlPlaneClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnixControlPlaneClient")
+            .field("endpoints", &self.endpoints)
             .field("socket_paths", &self.socket_paths)
-            .field("frame_transport_endpoints", &self.frame_transport_endpoints)
-            .field(
-                "frame_transport",
-                &self
-                    .frame_transport
-                    .as_ref()
-                    .map(|transport| transport.name()),
-            )
             .field(
                 "preferred_endpoint_index",
-                &self.preferred_socket_index.load(Ordering::Acquire),
+                &self.preferred_endpoint_index.load(Ordering::Acquire),
             )
             .finish()
     }
-}
-
-pub struct ControlPlaneRpcFrameExchange {
-    pub endpoint: String,
-    pub request_frame: Vec<u8>,
-    pub deadline: Instant,
-    pub max_frame_bytes: usize,
-}
-
-impl std::fmt::Debug for ControlPlaneRpcFrameExchange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ControlPlaneRpcFrameExchange")
-            .field("endpoint", &self.endpoint)
-            .field("request_frame_bytes", &self.request_frame.len())
-            .field("deadline", &self.deadline)
-            .field("max_frame_bytes", &self.max_frame_bytes)
-            .finish()
-    }
-}
-
-pub trait ControlPlaneRpcFrameTransport: std::fmt::Debug + Send + Sync + 'static {
-    fn name(&self) -> &'static str;
-
-    /// Exchange one already-framed control-plane request and response.
-    ///
-    /// Implementations must apply `deadline` to the complete connect,
-    /// handshake, write, and read operation and reject responses larger than
-    /// `max_frame_bytes` before allocation.
-    fn exchange(
-        &self,
-        exchange: ControlPlaneRpcFrameExchange,
-    ) -> Result<Vec<u8>, ControlPlaneRpcFrameExchangeError>;
 }
 
 #[derive(Debug)]
-pub struct ControlPlaneRpcFrameExchangeError {
+struct ControlPlaneRpcFrameExchangeError {
     error: Box<ControlPlaneError>,
     request_may_have_been_sent: bool,
 }
 
 impl ControlPlaneRpcFrameExchangeError {
     #[must_use]
-    pub fn before_request(error: ControlPlaneError) -> Self {
+    fn before_request(error: ControlPlaneError) -> Self {
         Self {
             error: Box::new(error),
             request_may_have_been_sent: false,
@@ -9936,7 +10026,7 @@ impl ControlPlaneRpcFrameExchangeError {
     }
 
     #[must_use]
-    pub fn after_request_started(error: ControlPlaneError) -> Self {
+    fn after_request_started(error: ControlPlaneError) -> Self {
         Self {
             error: Box::new(error),
             request_may_have_been_sent: true,
@@ -9944,12 +10034,12 @@ impl ControlPlaneRpcFrameExchangeError {
     }
 
     #[must_use]
-    pub fn request_may_have_been_sent(&self) -> bool {
+    fn request_may_have_been_sent(&self) -> bool {
         self.request_may_have_been_sent
     }
 
     #[must_use]
-    pub fn into_error(self) -> ControlPlaneError {
+    fn into_error(self) -> ControlPlaneError {
         *self.error
     }
 }
@@ -10462,7 +10552,10 @@ fn unix_io_remaining(deadline: Instant) -> Result<Duration, std::io::Error> {
 }
 
 /// Connects to a control-plane Unix socket within one absolute operation deadline.
-pub fn connect_unix_stream_until(path: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
+pub(crate) fn connect_unix_stream_until(
+    path: &Path,
+    deadline: Instant,
+) -> std::io::Result<UnixStream> {
     unix_io_remaining(deadline)?;
     let path_bytes = path.as_os_str().as_bytes();
     if path_bytes.contains(&0) {
@@ -10693,14 +10786,225 @@ impl std::io::Write for DeadlineUnixStream<'_> {
     }
 }
 
+struct ControlPlaneDeadlineTcpSocket {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl ControlPlaneDeadlineTcpSocket {
+    fn apply_deadline(&self) -> std::io::Result<()> {
+        let remaining = control_plane_client_io_remaining(self.deadline)?;
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.set_write_timeout(Some(remaining))
+    }
+}
+
+impl std::io::Read for ControlPlaneDeadlineTcpSocket {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.apply_deadline()?;
+        self.stream.read(buffer)
+    }
+}
+
+impl std::io::Write for ControlPlaneDeadlineTcpSocket {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.apply_deadline()?;
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.apply_deadline()?;
+        self.stream.flush()
+    }
+}
+
+fn control_plane_client_io_remaining(deadline: Instant) -> std::io::Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(std::io::Error::new(
+            ErrorKind::TimedOut,
+            "control-plane RPC operation deadline expired",
+        ));
+    }
+    Ok(remaining)
+}
+
+async fn connect_control_plane_tcp_until_async(
+    host: String,
+    port: u16,
+    deadline: Instant,
+) -> std::io::Result<TcpStream> {
+    let stream = match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        tokio::net::TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "control-plane TLS/TCP connect deadline expired",
+            ));
+        }
+    };
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+fn connect_control_plane_tcp_until(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> std::io::Result<TcpStream> {
+    let future = connect_control_plane_tcp_until_async(host.to_owned(), port, deadline);
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(future))
+        }
+        Ok(_) => std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(future)
+        })
+        .join()
+        .map_err(|_| std::io::Error::other("control-plane TLS/TCP client runtime panicked"))?,
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(future),
+    }
+}
+
+fn connect_control_plane_tls_tcp(
+    host: &str,
+    port: u16,
+    server_name: &str,
+    connect_timeout: Duration,
+    tls_client_config: &Arc<rustls::ClientConfig>,
+    deadline: Instant,
+) -> Result<
+    rustls::StreamOwned<rustls::ClientConnection, ControlPlaneDeadlineTcpSocket>,
+    ControlPlaneError,
+> {
+    let connect_deadline = Instant::now()
+        .checked_add(connect_timeout)
+        .unwrap_or(deadline)
+        .min(deadline);
+    let tcp_stream =
+        connect_control_plane_tcp_until(host, port, connect_deadline).map_err(|source| {
+            ControlPlaneError::Io {
+                context: "connect control-plane TLS/TCP endpoint",
+                source,
+            }
+        })?;
+    tcp_stream
+        .set_nodelay(true)
+        .map_err(|source| ControlPlaneError::Io {
+            context: "configure control-plane TLS/TCP endpoint",
+            source,
+        })?;
+    let server_name = ServerName::try_from(server_name.to_owned()).map_err(|_| {
+        ControlPlaneError::RpcProtocol {
+            message: "control-plane TLS/TCP endpoint has an invalid TLS server name".to_owned(),
+        }
+    })?;
+    let connection = rustls::ClientConnection::new(Arc::clone(tls_client_config), server_name)
+        .map_err(|error| ControlPlaneError::RpcProtocol {
+            message: format!("failed to initialize control-plane TLS client: {error}"),
+        })?;
+    let socket = ControlPlaneDeadlineTcpSocket {
+        stream: tcp_stream,
+        deadline,
+    };
+    let mut stream = rustls::StreamOwned::new(connection, socket);
+    while stream.conn.is_handshaking() {
+        stream
+            .conn
+            .complete_io(&mut stream.sock)
+            .map_err(|source| ControlPlaneError::Io {
+                context: "complete control-plane TLS client handshake",
+                source,
+            })?;
+    }
+    if stream.conn.alpn_protocol() != Some(CONTROL_PLANE_RPC_TLS_ALPN) {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: "control-plane TLS peer did not negotiate the required protocol profile"
+                .to_owned(),
+        });
+    }
+    Ok(stream)
+}
+
+impl ControlPlaneRpcClientEndpoint {
+    fn exchange(
+        &self,
+        request_frame: &[u8],
+        deadline: Instant,
+    ) -> Result<(ControlPlaneRpcKind, Vec<u8>), ControlPlaneRpcFrameExchangeError> {
+        match &self.0 {
+            ControlPlaneRpcClientEndpointKind::Unix { socket_path } => {
+                let mut stream =
+                    connect_unix_stream_until(socket_path, deadline).map_err(|source| {
+                        ControlPlaneRpcFrameExchangeError::before_request(ControlPlaneError::Io {
+                            context: "connect control-plane socket",
+                            source,
+                        })
+                    })?;
+                let mut stream = DeadlineUnixStream::new(&mut stream, deadline);
+                stream.write_all(request_frame).map_err(|source| {
+                    ControlPlaneRpcFrameExchangeError::after_request_started(
+                        ControlPlaneError::Io {
+                            context: "write control-plane RPC frame",
+                            source,
+                        },
+                    )
+                })?;
+                read_control_plane_rpc_frame(&mut stream)
+                    .map_err(ControlPlaneRpcFrameExchangeError::after_request_started)
+            }
+            ControlPlaneRpcClientEndpointKind::TlsTcp {
+                host,
+                port,
+                server_name,
+                connect_timeout,
+                tls_client_config,
+                ..
+            } => {
+                let mut stream = connect_control_plane_tls_tcp(
+                    host,
+                    *port,
+                    server_name,
+                    *connect_timeout,
+                    tls_client_config,
+                    deadline,
+                )
+                .map_err(ControlPlaneRpcFrameExchangeError::before_request)?;
+                stream.write_all(request_frame).map_err(|source| {
+                    ControlPlaneRpcFrameExchangeError::after_request_started(
+                        ControlPlaneError::Io {
+                            context: "write control-plane TLS/TCP request frame",
+                            source,
+                        },
+                    )
+                })?;
+                read_control_plane_rpc_frame(&mut stream)
+                    .map_err(ControlPlaneRpcFrameExchangeError::after_request_started)
+            }
+        }
+    }
+}
+
 impl UnixControlPlaneClient {
     #[must_use]
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+        let socket_path = socket_path.into();
         Self {
-            socket_paths: Arc::from([socket_path.into()]),
-            frame_transport_endpoints: Arc::from([]),
-            frame_transport: None,
-            preferred_socket_index: Arc::new(AtomicUsize::new(0)),
+            endpoints: Arc::from([ControlPlaneRpcClientEndpoint::unix(socket_path.clone())]),
+            socket_paths: Arc::from([socket_path]),
+            preferred_endpoint_index: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -10725,72 +11029,82 @@ impl UnixControlPlaneClient {
             }
         }
         Ok(Self {
+            endpoints: socket_paths
+                .iter()
+                .cloned()
+                .map(ControlPlaneRpcClientEndpoint::unix)
+                .collect::<Vec<_>>()
+                .into(),
             socket_paths: socket_paths.into(),
-            frame_transport_endpoints: Arc::from([]),
-            frame_transport: None,
-            preferred_socket_index: Arc::new(AtomicUsize::new(0)),
+            preferred_endpoint_index: Arc::new(AtomicUsize::new(0)),
         })
     }
 
-    pub fn with_frame_transport(
-        endpoints: impl IntoIterator<Item = String>,
-        transport: Arc<dyn ControlPlaneRpcFrameTransport>,
+    pub fn with_endpoints(
+        endpoints: impl IntoIterator<Item = ControlPlaneRpcClientEndpoint>,
     ) -> Result<Self, ControlPlaneError> {
-        let endpoints: Vec<String> = endpoints.into_iter().collect();
+        let endpoints: Vec<ControlPlaneRpcClientEndpoint> = endpoints.into_iter().collect();
         if endpoints.is_empty() {
             return Err(ControlPlaneError::RpcProtocol {
-                message: "control-plane framed client requires at least one endpoint".to_owned(),
+                message: "control-plane client requires at least one endpoint".to_owned(),
             });
         }
         let mut unique = BTreeSet::new();
         for endpoint in &endpoints {
-            if endpoint.is_empty() {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: "control-plane framed client endpoint must not be empty".to_owned(),
-                });
-            }
-            if !unique.insert(endpoint.clone()) {
+            let advertised_endpoint = endpoint.advertised_endpoint();
+            if !unique.insert(advertised_endpoint.clone()) {
                 return Err(ControlPlaneError::RpcProtocol {
                     message: format!(
-                        "control-plane framed client contains duplicate endpoint {endpoint}"
+                        "control-plane client contains duplicate endpoint {advertised_endpoint}"
                     ),
                 });
             }
         }
+        let socket_paths = endpoints
+            .iter()
+            .map(|endpoint| endpoint.unix_socket_path().map(Path::to_path_buf))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
         Ok(Self {
-            socket_paths: Arc::from([]),
-            frame_transport_endpoints: endpoints.into(),
-            frame_transport: Some(transport),
-            preferred_socket_index: Arc::new(AtomicUsize::new(0)),
+            endpoints: endpoints.into(),
+            socket_paths: socket_paths.into(),
+            preferred_endpoint_index: Arc::new(AtomicUsize::new(0)),
         })
     }
 
+    /// Returns the primary path for a client configured exclusively with Unix endpoints.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the client contains a TLS/TCP endpoint.
     #[must_use]
     pub fn socket_path(&self) -> &Path {
         &self.socket_paths[0]
     }
 
+    /// Returns all paths when the client is configured exclusively with Unix endpoints.
+    /// Mixed or TLS/TCP-only clients return an empty slice.
     #[must_use]
     pub fn socket_paths(&self) -> &[PathBuf] {
         &self.socket_paths
     }
 
-    fn preferred_socket_index(&self) -> usize {
-        self.preferred_socket_index.load(Ordering::Acquire) % self.endpoint_count()
+    fn preferred_endpoint_index(&self) -> usize {
+        self.preferred_endpoint_index.load(Ordering::Acquire) % self.endpoint_count()
     }
 
-    fn prefer_socket_index(&self, socket_index: usize) {
-        self.preferred_socket_index
-            .store(socket_index % self.endpoint_count(), Ordering::Release);
+    fn prefer_endpoint_index(&self, endpoint_index: usize) {
+        self.preferred_endpoint_index
+            .store(endpoint_index % self.endpoint_count(), Ordering::Release);
     }
 
     fn endpoint_pass(&self) -> ControlPlaneEndpointPass {
-        ControlPlaneEndpointPass::new(self.preferred_socket_index(), self.endpoint_count())
+        ControlPlaneEndpointPass::new(self.preferred_endpoint_index(), self.endpoint_count())
     }
 
     fn prefer_next_endpoint_after_failure(&self, pass: &ControlPlaneEndpointPass) {
         let rejected = pass.last_endpoint_index();
-        let _ = self.preferred_socket_index.compare_exchange(
+        let _ = self.preferred_endpoint_index.compare_exchange(
             rejected,
             pass.next_endpoint_index,
             Ordering::AcqRel,
@@ -10799,15 +11113,11 @@ impl UnixControlPlaneClient {
     }
 
     fn prefer_successful_endpoint(&self, pass: &ControlPlaneEndpointPass) {
-        self.prefer_socket_index(pass.last_endpoint_index());
+        self.prefer_endpoint_index(pass.last_endpoint_index());
     }
 
     fn endpoint_count(&self) -> usize {
-        if self.frame_transport.is_some() {
-            self.frame_transport_endpoints.len()
-        } else {
-            self.socket_paths.len()
-        }
+        self.endpoints.len()
     }
 
     fn send_request(
@@ -10879,84 +11189,25 @@ impl UnixControlPlaneClient {
         deadline: Instant,
         endpoint_pass: &mut ControlPlaneEndpointPass,
     ) -> Result<Vec<u8>, ControlPlaneError> {
-        if let Some(transport) = &self.frame_transport {
-            let request_frame = encode_control_plane_rpc_frame(kind, payload)?;
-            let mut response_frame = None;
-            let mut last_pre_request_error = None;
-            while let Some(endpoint_index) = endpoint_pass.next() {
-                match transport.exchange(ControlPlaneRpcFrameExchange {
-                    endpoint: self.frame_transport_endpoints[endpoint_index].clone(),
-                    request_frame: request_frame.clone(),
-                    deadline,
-                    max_frame_bytes: control_plane_rpc_max_frame_bytes(),
-                }) {
-                    Ok(response) => {
-                        response_frame = Some(response);
-                        break;
-                    }
-                    Err(error) if !error.request_may_have_been_sent() => {
-                        last_pre_request_error = Some(error.into_error());
-                        self.prefer_next_endpoint_after_failure(endpoint_pass);
-                    }
-                    Err(error) => return Err(error.into_error()),
-                }
-            }
-            let response_frame = response_frame.ok_or_else(|| {
-                last_pre_request_error
-                    .expect("endpoint set is non-empty and every framed connect failed")
-            })?;
-            if response_frame.len() > control_plane_rpc_max_frame_bytes() {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: format!(
-                        "control-plane framed response size {} bytes exceeds limit {}",
-                        response_frame.len(),
-                        control_plane_rpc_max_frame_bytes()
-                    ),
-                });
-            }
-            let mut response = std::io::Cursor::new(response_frame.as_slice());
-            let (response_kind, response_payload) = read_control_plane_rpc_frame(&mut response)?;
-            if usize::try_from(response.position()).ok() != Some(response_frame.len()) {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: "control-plane framed response contains trailing bytes".to_owned(),
-                });
-            }
-            if response_kind != kind {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: format!(
-                        "response kind {:?} did not match request kind {:?}",
-                        response_kind, kind
-                    ),
-                });
-            }
-            return Ok(response_payload);
-        }
-        let mut stream = None;
-        let mut last_connect_error = None;
-        while let Some(socket_index) = endpoint_pass.next() {
-            match connect_unix_stream_until(&self.socket_paths[socket_index], deadline) {
-                Ok(connected) => {
-                    stream = Some(connected);
+        let request_frame = encode_control_plane_rpc_frame(kind, payload)?;
+        let mut response = None;
+        let mut last_pre_request_error = None;
+        while let Some(endpoint_index) = endpoint_pass.next() {
+            match self.endpoints[endpoint_index].exchange(&request_frame, deadline) {
+                Ok(result) => {
+                    response = Some(result);
                     break;
                 }
-                Err(source) => {
-                    last_connect_error = Some(ControlPlaneError::Io {
-                        context: "connect control-plane socket",
-                        source,
-                    });
+                Err(error) if !error.request_may_have_been_sent() => {
+                    last_pre_request_error = Some(error.into_error());
                     self.prefer_next_endpoint_after_failure(endpoint_pass);
                 }
+                Err(error) => return Err(error.into_error()),
             }
         }
-        let mut stream = stream.ok_or_else(|| {
-            last_connect_error.expect("endpoint set is non-empty and every connect failed")
+        let (response_kind, response_payload) = response.ok_or_else(|| {
+            last_pre_request_error.expect("endpoint set is non-empty and every connect failed")
         })?;
-        let mut stream = DeadlineUnixStream {
-            stream: &mut stream,
-            deadline,
-        };
-        write_control_plane_rpc_frame(&mut stream, kind, payload)?;
-        let (response_kind, response_payload) = read_control_plane_rpc_frame(&mut stream)?;
         if response_kind != kind {
             return Err(ControlPlaneError::RpcProtocol {
                 message: format!(
@@ -15332,10 +15583,6 @@ fn encode_control_plane_rpc_frame(
 
 const fn control_plane_rpc_frame_overhead() -> usize {
     CONTROL_PLANE_RPC_MAGIC.len() + 16
-}
-
-const fn control_plane_rpc_max_frame_bytes() -> usize {
-    CONTROL_PLANE_RPC_MAX_FRAME_BYTES
 }
 
 fn read_control_plane_rpc_frame(
@@ -21325,95 +21572,261 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
-    #[derive(Debug)]
-    struct TestControlPlaneFrameTransport {
-        fail_before_request_endpoint: Option<String>,
-        fail_after_request_started: bool,
-        calls: std::sync::atomic::AtomicUsize,
+    fn control_plane_test_tls_server_config() -> Arc<rustls::ServerConfig> {
+        use rustls::pki_types::pem::PemObject as _;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let certificates = CertificateDer::pem_slice_iter(include_bytes!(
+            "../../s3-tests/testdata/localhost-cert.pem"
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let private_key = PrivateKeyDer::from_pem_slice(include_bytes!(
+            "../../s3-tests/testdata/localhost-key.pem"
+        ))
+        .unwrap();
+        let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .unwrap();
+        server_config.alpn_protocols = vec![CONTROL_PLANE_RPC_TLS_ALPN.to_vec()];
+        Arc::new(server_config)
     }
 
-    impl ControlPlaneRpcFrameTransport for TestControlPlaneFrameTransport {
-        fn name(&self) -> &'static str {
-            "test"
-        }
+    fn control_plane_test_tls_roots() -> rustls::RootCertStore {
+        use rustls::pki_types::pem::PemObject as _;
+        use rustls::pki_types::CertificateDer;
 
-        fn exchange(
-            &self,
-            exchange: ControlPlaneRpcFrameExchange,
-        ) -> Result<Vec<u8>, ControlPlaneRpcFrameExchangeError> {
-            self.calls.fetch_add(1, Ordering::AcqRel);
-            if self.fail_after_request_started {
-                return Err(ControlPlaneRpcFrameExchangeError::after_request_started(
-                    ControlPlaneError::Io {
-                        context: "test exchange after request",
-                        source: std::io::Error::new(
-                            ErrorKind::ConnectionReset,
-                            "test response loss",
-                        ),
-                    },
-                ));
-            }
-            if self.fail_before_request_endpoint.as_deref() == Some(&exchange.endpoint) {
-                return Err(ControlPlaneRpcFrameExchangeError::before_request(
-                    ControlPlaneError::Io {
-                        context: "test exchange before request",
-                        source: std::io::Error::new(
-                            ErrorKind::ConnectionRefused,
-                            "test connect failure",
-                        ),
-                    },
-                ));
-            }
-            Ok(exchange.request_frame)
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct RoutingControlPlaneFrameTransport {
-        endpoints: Mutex<Vec<String>>,
-    }
-
-    impl ControlPlaneRpcFrameTransport for RoutingControlPlaneFrameTransport {
-        fn name(&self) -> &'static str {
-            "routing-test"
-        }
-
-        fn exchange(
-            &self,
-            exchange: ControlPlaneRpcFrameExchange,
-        ) -> Result<Vec<u8>, ControlPlaneRpcFrameExchangeError> {
-            self.endpoints
-                .lock()
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(
+                CertificateDer::pem_slice_iter(include_bytes!(
+                    "../../s3-tests/testdata/ca-cert.pem"
+                ))
+                .next()
                 .unwrap()
-                .push(exchange.endpoint.clone());
-            let response = match exchange.endpoint.as_str() {
-                "follower" => {
-                    encode_control_plane_rpc_response(Err(ControlPlaneError::RpcRemote {
-                        message: "local OpenRaft authority is not the serving leader".to_owned(),
-                    }))
-                    .unwrap()
-                }
-                "leader" => encode_control_plane_rpc_response(Ok(b"leader".to_vec())).unwrap(),
-                endpoint => panic!("request-local failover unexpectedly visited {endpoint}"),
-            };
-            Ok(
-                encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &response)
-                    .unwrap(),
+                .unwrap(),
             )
-        }
+            .unwrap();
+        roots
+    }
+
+    fn control_plane_test_tls_endpoint(
+        address: std::net::SocketAddr,
+    ) -> ControlPlaneRpcClientEndpoint {
+        ControlPlaneRpcClientEndpoint::tls_tcp(
+            format!("tcp://{address}"),
+            address.ip().to_string(),
+            address.port(),
+            "localhost",
+            Duration::from_secs(1),
+            control_plane_test_tls_roots(),
+        )
+        .unwrap()
     }
 
     #[test]
-    fn framed_control_plane_client_fails_over_only_before_request_starts() {
-        let failover_transport = Arc::new(TestControlPlaneFrameTransport {
-            fail_before_request_endpoint: Some("endpoint-a".to_string()),
-            fail_after_request_started: false,
-            calls: std::sync::atomic::AtomicUsize::new(0),
-        });
-        let client = UnixControlPlaneClient::with_frame_transport(
-            ["endpoint-a".to_string(), "endpoint-b".to_string()],
-            failover_transport.clone(),
+    fn control_plane_tls_tcp_endpoint_owns_protocol_profile() {
+        let endpoint = ControlPlaneRpcClientEndpoint::tls_tcp(
+            "tcp://localhost:7700",
+            "127.0.0.1",
+            7700,
+            "localhost",
+            Duration::from_secs(1),
+            rustls::RootCertStore::empty(),
         )
+        .unwrap();
+        let ControlPlaneRpcClientEndpointKind::TlsTcp {
+            tls_client_config, ..
+        } = endpoint.0
+        else {
+            panic!("TLS/TCP constructor returned a Unix endpoint")
+        };
+        assert_eq!(
+            tls_client_config.alpn_protocols,
+            [CONTROL_PLANE_RPC_TLS_ALPN]
+        );
+
+        assert_eq!(
+            ControlPlaneRpcClientEndpoint::tls_tcp(
+                "",
+                "127.0.0.1",
+                7700,
+                "localhost",
+                Duration::from_secs(1),
+                rustls::RootCertStore::empty(),
+            )
+            .unwrap_err(),
+            ControlPlaneRpcClientEndpointError::EmptyAdvertisedEndpoint
+        );
+        assert_eq!(
+            ControlPlaneRpcClientEndpoint::tls_tcp(
+                "tcp://localhost:7700",
+                "",
+                7700,
+                "localhost",
+                Duration::from_secs(1),
+                rustls::RootCertStore::empty(),
+            )
+            .unwrap_err(),
+            ControlPlaneRpcClientEndpointError::EmptyHost
+        );
+        assert_eq!(
+            ControlPlaneRpcClientEndpoint::tls_tcp(
+                "tcp://localhost:7700",
+                "127.0.0.1",
+                7700,
+                "not a valid server name",
+                Duration::from_secs(1),
+                rustls::RootCertStore::empty(),
+            )
+            .unwrap_err(),
+            ControlPlaneRpcClientEndpointError::InvalidServerName
+        );
+    }
+
+    #[test]
+    fn control_plane_tls_tcp_endpoint_exchanges_typed_frame() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_config = control_plane_test_tls_server_config();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let connection = rustls::ServerConnection::new(server_config).unwrap();
+            let mut stream = rustls::StreamOwned::new(connection, stream);
+            let (kind, payload) = read_control_plane_rpc_frame(&mut stream).unwrap();
+            assert_eq!(kind, ControlPlaneRpcKind::RuntimeMapStatus);
+            assert_eq!(payload, b"request");
+            write_control_plane_rpc_frame(&mut stream, kind, b"response").unwrap();
+        });
+        let endpoint = control_plane_test_tls_endpoint(address);
+        let client = UnixControlPlaneClient::with_endpoints([endpoint]).unwrap();
+
+        let response = client
+            .send_request_raw_response_until(
+                ControlPlaneRpcKind::RuntimeMapStatus,
+                b"request",
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+
+        assert_eq!(response, b"response");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn control_plane_tls_endpoint_fails_over_after_handshake_failure() {
+        let handshake_failure_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let handshake_failure_address = handshake_failure_listener.local_addr().unwrap();
+        let healthy_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let healthy_address = healthy_listener.local_addr().unwrap();
+        let handshake_failure_server = std::thread::spawn(move || {
+            let (stream, _) = handshake_failure_listener.accept().unwrap();
+            drop(stream);
+        });
+        let server_config = control_plane_test_tls_server_config();
+        let healthy_server = std::thread::spawn(move || {
+            let (stream, _) = healthy_listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let connection = rustls::ServerConnection::new(server_config).unwrap();
+            let mut stream = rustls::StreamOwned::new(connection, stream);
+            let (kind, payload) = read_control_plane_rpc_frame(&mut stream).unwrap();
+            write_control_plane_rpc_frame(&mut stream, kind, &payload).unwrap();
+        });
+        let client = UnixControlPlaneClient::with_endpoints([
+            control_plane_test_tls_endpoint(handshake_failure_address),
+            control_plane_test_tls_endpoint(healthy_address),
+        ])
+        .unwrap();
+
+        let response = client
+            .send_request_raw_response_until(
+                ControlPlaneRpcKind::RuntimeMapStatus,
+                b"request",
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+
+        assert_eq!(response, b"request");
+        handshake_failure_server.join().unwrap();
+        healthy_server.join().unwrap();
+    }
+
+    #[test]
+    fn control_plane_tls_endpoint_does_not_fail_over_after_request_publication() {
+        use std::io::Read as _;
+
+        let ambiguous_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ambiguous_address = ambiguous_listener.local_addr().unwrap();
+        let unvisited_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unvisited_address = unvisited_listener.local_addr().unwrap();
+        let server_config = control_plane_test_tls_server_config();
+        let ambiguous_server = std::thread::spawn(move || {
+            let (stream, _) = ambiguous_listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let connection = rustls::ServerConnection::new(server_config).unwrap();
+            let mut stream = rustls::StreamOwned::new(connection, stream);
+            let mut first_request_byte = [0];
+            stream.read_exact(&mut first_request_byte).unwrap();
+            first_request_byte[0]
+        });
+        let client = UnixControlPlaneClient::with_endpoints([
+            control_plane_test_tls_endpoint(ambiguous_address),
+            control_plane_test_tls_endpoint(unvisited_address),
+        ])
+        .unwrap();
+
+        let error = client
+            .send_request_raw_response_until(
+                ControlPlaneRpcKind::RuntimeMapStatus,
+                b"request",
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ControlPlaneError::Io { .. }));
+        assert_eq!(ambiguous_server.join().unwrap(), CONTROL_PLANE_RPC_MAGIC[0]);
+        unvisited_listener.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(unvisited_listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn configured_control_plane_client_fails_over_only_before_request_starts() {
+        let tmp = test_util::tempdir();
+        let dead_socket = tmp.path().join("dead.sock");
+        let healthy_socket = tmp.path().join("healthy.sock");
+        let healthy_listener = std::os::unix::net::UnixListener::bind(&healthy_socket).unwrap();
+        let healthy_server = std::thread::spawn(move || {
+            let (mut stream, _) = healthy_listener.accept().unwrap();
+            let (kind, payload) = read_control_plane_rpc_frame(&mut stream).unwrap();
+            write_control_plane_rpc_frame(&mut stream, kind, &payload).unwrap();
+        });
+        let client = UnixControlPlaneClient::with_endpoints([
+            ControlPlaneRpcClientEndpoint::unix(dead_socket),
+            ControlPlaneRpcClientEndpoint::unix(healthy_socket),
+        ])
         .unwrap();
 
         let response = client
@@ -21425,17 +21838,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(response, b"request");
-        assert_eq!(failover_transport.calls.load(Ordering::Acquire), 2);
+        healthy_server.join().unwrap();
 
-        let ambiguous_transport = Arc::new(TestControlPlaneFrameTransport {
-            fail_before_request_endpoint: None,
-            fail_after_request_started: true,
-            calls: std::sync::atomic::AtomicUsize::new(0),
+        let ambiguous_socket = tmp.path().join("ambiguous.sock");
+        let unvisited_socket = tmp.path().join("unvisited.sock");
+        let ambiguous_listener = std::os::unix::net::UnixListener::bind(&ambiguous_socket).unwrap();
+        let unvisited_listener = std::os::unix::net::UnixListener::bind(&unvisited_socket).unwrap();
+        let ambiguous_server = std::thread::spawn(move || {
+            let (mut stream, _) = ambiguous_listener.accept().unwrap();
+            let _request = read_control_plane_rpc_frame(&mut stream).unwrap();
         });
-        let client = UnixControlPlaneClient::with_frame_transport(
-            ["endpoint-a".to_string(), "endpoint-b".to_string()],
-            ambiguous_transport.clone(),
-        )
+        let client = UnixControlPlaneClient::with_endpoints([
+            ControlPlaneRpcClientEndpoint::unix(ambiguous_socket),
+            ControlPlaneRpcClientEndpoint::unix(unvisited_socket),
+        ])
         .unwrap();
 
         let error = client
@@ -21449,22 +21865,45 @@ mod tests {
         assert!(matches!(
             error,
             ControlPlaneError::Io { source, .. }
-                if source.kind() == ErrorKind::ConnectionReset
+                if source.kind() == ErrorKind::UnexpectedEof
         ));
-        assert_eq!(ambiguous_transport.calls.load(Ordering::Acquire), 1);
+        ambiguous_server.join().unwrap();
+        unvisited_listener.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(unvisited_listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock)
+        );
     }
 
     #[test]
     fn authenticated_endpoint_failover_ignores_concurrent_shared_hint_changes() {
-        let transport = Arc::new(RoutingControlPlaneFrameTransport::default());
-        let inner = UnixControlPlaneClient::with_frame_transport(
-            [
-                "follower".to_owned(),
-                "leader".to_owned(),
-                "concurrent-hint".to_owned(),
-            ],
-            transport.clone(),
-        )
+        let tmp = test_util::tempdir();
+        let follower_socket = tmp.path().join("follower.sock");
+        let leader_socket = tmp.path().join("leader.sock");
+        let concurrent_hint_socket = tmp.path().join("concurrent-hint.sock");
+        let follower_listener = std::os::unix::net::UnixListener::bind(&follower_socket).unwrap();
+        let leader_listener = std::os::unix::net::UnixListener::bind(&leader_socket).unwrap();
+        let concurrent_hint_listener =
+            std::os::unix::net::UnixListener::bind(&concurrent_hint_socket).unwrap();
+        let follower = std::thread::spawn(move || {
+            let (mut stream, _) = follower_listener.accept().unwrap();
+            let (kind, _) = read_control_plane_rpc_frame(&mut stream).unwrap();
+            let response = encode_control_plane_rpc_response(Err(ControlPlaneError::RpcRemote {
+                message: "local OpenRaft authority is not the serving leader".to_owned(),
+            }))
+            .unwrap();
+            write_control_plane_rpc_frame(&mut stream, kind, &response).unwrap();
+        });
+        let leader = std::thread::spawn(move || {
+            let (mut stream, _) = leader_listener.accept().unwrap();
+            let (kind, _) = read_control_plane_rpc_frame(&mut stream).unwrap();
+            let response = encode_control_plane_rpc_response(Ok(b"leader".to_vec())).unwrap();
+            write_control_plane_rpc_frame(&mut stream, kind, &response).unwrap();
+        });
+        let inner = UnixControlPlaneClient::with_endpoints([
+            ControlPlaneRpcClientEndpoint::unix(follower_socket),
+            ControlPlaneRpcClientEndpoint::unix(leader_socket),
+            ControlPlaneRpcClientEndpoint::unix(concurrent_hint_socket),
+        ])
         .unwrap();
         let concurrent_client = inner.clone();
         let client = AuthenticatedUnixControlPlaneClient::new(
@@ -21482,7 +21921,7 @@ mod tests {
                     if !changed_hint.swap(true, Ordering::AcqRel) {
                         // A concurrent request may update the cache after this request has
                         // already selected its endpoint pass.
-                        concurrent_client.prefer_socket_index(2);
+                        concurrent_client.prefer_endpoint_index(2);
                     }
                     Ok(response.to_vec())
                 },
@@ -21490,11 +21929,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response, b"leader");
-        assert_eq!(
-            *transport.endpoints.lock().unwrap(),
-            ["follower".to_owned(), "leader".to_owned()]
+        follower.join().unwrap();
+        leader.join().unwrap();
+        concurrent_hint_listener.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(concurrent_hint_listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock)
         );
-        assert_eq!(client.inner().preferred_socket_index(), 1);
+        assert_eq!(client.inner().preferred_endpoint_index(), 1);
     }
 
     fn assert_snapshot_invariant_error(
@@ -24964,7 +25405,7 @@ mod tests {
         leader.join().unwrap();
         assert_eq!(first.cluster_epoch(), ClusterEpoch::new(2).unwrap());
         assert_eq!(second.cluster_epoch(), ClusterEpoch::new(2).unwrap());
-        assert_eq!(client.preferred_socket_index(), 2);
+        assert_eq!(client.preferred_endpoint_index(), 2);
     }
 
     #[test]
@@ -25047,7 +25488,7 @@ mod tests {
         follower_2.join().unwrap();
         leader.join().unwrap();
         assert_eq!(runtime_map.cluster_epoch(), ClusterEpoch::new(2).unwrap());
-        assert_eq!(client.inner().preferred_socket_index(), 2);
+        assert_eq!(client.inner().preferred_endpoint_index(), 2);
     }
 
     #[test]
@@ -26752,7 +27193,7 @@ mod tests {
         failing_server.join().unwrap();
         healthy_server.join().unwrap();
         assert_eq!(observed, expected);
-        assert_eq!(client.inner().preferred_socket_index(), 1);
+        assert_eq!(client.inner().preferred_endpoint_index(), 1);
     }
 
     #[test]

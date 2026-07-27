@@ -23,7 +23,7 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -32,9 +32,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use storage::control_plane::{
-    connect_unix_stream_until, ControlPlaneError, ControlPlaneRpcFrameExchange,
-    ControlPlaneRpcFrameExchangeError, ControlPlaneRpcFrameTransport,
-    InitialClusterTopologyCertificate, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+    ControlPlaneError, InitialClusterTopologyCertificate, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
     CONTROL_PLANE_RPC_MAX_SERVER_OPERATION_TIMEOUT, CONTROL_PLANE_RPC_TLS_ALPN,
     CONTROL_PLANE_TOPOLOGY_DIGEST_LEN,
 };
@@ -743,377 +741,8 @@ impl ControlPlaneRaftPeerFrameTransport for StaticRaftTcpPeerFrameTransport {
     }
 }
 
-#[derive(Clone)]
-struct StaticControlPlaneTcpPeer {
-    endpoint: String,
-    host: String,
-    port: u16,
-    server_name: String,
-    connect_timeout: Duration,
-    max_frame_bytes: usize,
-    tls_client_config: Arc<RustlsClientConfig>,
-}
-
-#[derive(Clone)]
-struct StaticControlPlaneUnixPeer {
-    endpoint: String,
-    path: PathBuf,
-    max_frame_bytes: usize,
-}
-
-#[derive(Clone)]
-enum StaticControlPlanePeer {
-    Unix(StaticControlPlaneUnixPeer),
-    Tcp(StaticControlPlaneTcpPeer),
-}
-
-impl fmt::Debug for StaticControlPlaneTcpPeer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StaticControlPlaneTcpPeer")
-            .field("endpoint", &self.endpoint)
-            .field("host", &self.host)
-            .field("port", &self.port)
-            .field("server_name", &self.server_name)
-            .field("connect_timeout", &self.connect_timeout)
-            .field("max_frame_bytes", &self.max_frame_bytes)
-            .field("tls", &true)
-            .finish()
-    }
-}
-
-#[derive(Clone)]
-struct StaticControlPlaneFrameTransport {
-    peers: Arc<BTreeMap<String, StaticControlPlanePeer>>,
-}
-
 struct ConfiguredStaticControlPlaneRpcClients {
-    endpoints: Vec<String>,
-    frame_transport: Option<Arc<dyn ControlPlaneRpcFrameTransport>>,
-}
-
-impl fmt::Debug for StaticControlPlaneFrameTransport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StaticControlPlaneFrameTransport")
-            .field("peer_count", &self.peers.len())
-            .finish()
-    }
-}
-
-fn static_control_plane_unix_error(
-    context: &'static str,
-    source: io::Error,
-    request_started: bool,
-) -> ControlPlaneRpcFrameExchangeError {
-    let error = ControlPlaneError::Io { context, source };
-    if request_started {
-        ControlPlaneRpcFrameExchangeError::after_request_started(error)
-    } else {
-        ControlPlaneRpcFrameExchangeError::before_request(error)
-    }
-}
-
-fn static_control_plane_unix_remaining(deadline: Instant) -> io::Result<Duration> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "control-plane static Unix RPC deadline expired",
-        ));
-    }
-    Ok(remaining)
-}
-
-fn exchange_static_control_plane_unix_frame(
-    peer: StaticControlPlaneUnixPeer,
-    exchange: ControlPlaneRpcFrameExchange,
-) -> Result<Vec<u8>, ControlPlaneRpcFrameExchangeError> {
-    let frame_limit = exchange.max_frame_bytes.min(peer.max_frame_bytes);
-    if exchange.request_frame.len() > frame_limit {
-        return Err(ControlPlaneRpcFrameExchangeError::before_request(
-            ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "control-plane static Unix request frame size {} bytes exceeds limit {}",
-                    exchange.request_frame.len(),
-                    frame_limit
-                ),
-            },
-        ));
-    }
-    if peer.endpoint != exchange.endpoint {
-        return Err(ControlPlaneRpcFrameExchangeError::before_request(
-            ControlPlaneError::RpcProtocol {
-                message: "static control-plane Unix endpoint identity mismatch".to_string(),
-            },
-        ));
-    }
-    let mut stream =
-        connect_unix_stream_until(&peer.path, exchange.deadline).map_err(|source| {
-            static_control_plane_unix_error(
-                "connect control-plane static Unix endpoint",
-                source,
-                false,
-            )
-        })?;
-    let mut written = 0;
-    while written < exchange.request_frame.len() {
-        let timeout = static_control_plane_unix_remaining(exchange.deadline).map_err(|source| {
-            static_control_plane_unix_error(
-                "set control-plane static Unix write deadline",
-                source,
-                written != 0,
-            )
-        })?;
-        stream.set_write_timeout(Some(timeout)).map_err(|source| {
-            static_control_plane_unix_error(
-                "set control-plane static Unix write deadline",
-                source,
-                written != 0,
-            )
-        })?;
-        let count = stream
-            .write(&exchange.request_frame[written..])
-            .map_err(|source| {
-                static_control_plane_unix_error(
-                    "write control-plane static Unix request frame",
-                    source,
-                    true,
-                )
-            })?;
-        if count == 0 {
-            return Err(static_control_plane_unix_error(
-                "write control-plane static Unix request frame",
-                io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "control-plane static Unix request write stalled",
-                ),
-                true,
-            ));
-        }
-        written += count;
-    }
-    let mut response = Vec::new();
-    let mut buffer = [0_u8; 8 * 1024];
-    loop {
-        let timeout = static_control_plane_unix_remaining(exchange.deadline).map_err(|source| {
-            static_control_plane_unix_error(
-                "set control-plane static Unix read deadline",
-                source,
-                true,
-            )
-        })?;
-        stream.set_read_timeout(Some(timeout)).map_err(|source| {
-            static_control_plane_unix_error(
-                "set control-plane static Unix read deadline",
-                source,
-                true,
-            )
-        })?;
-        let count = stream.read(&mut buffer).map_err(|source| {
-            static_control_plane_unix_error(
-                "read control-plane static Unix response frame",
-                source,
-                true,
-            )
-        })?;
-        if count == 0 {
-            break;
-        }
-        if response.len().saturating_add(count) > frame_limit {
-            return Err(ControlPlaneRpcFrameExchangeError::after_request_started(
-                ControlPlaneError::RpcProtocol {
-                    message: format!(
-                        "control-plane static Unix response frame exceeds limit {frame_limit}"
-                    ),
-                },
-            ));
-        }
-        response.extend_from_slice(&buffer[..count]);
-    }
-    Ok(response)
-}
-
-fn static_control_plane_tcp_error(
-    context: &'static str,
-    source: io::Error,
-    request_started: bool,
-) -> ControlPlaneRpcFrameExchangeError {
-    let error = ControlPlaneError::Io { context, source };
-    if request_started {
-        ControlPlaneRpcFrameExchangeError::after_request_started(error)
-    } else {
-        ControlPlaneRpcFrameExchangeError::before_request(error)
-    }
-}
-
-async fn static_control_plane_tcp_io_until<T>(
-    deadline: Instant,
-    context: &'static str,
-    request_started: bool,
-    operation: impl Future<Output = io::Result<T>>,
-) -> Result<T, ControlPlaneRpcFrameExchangeError> {
-    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), operation).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(source)) => Err(static_control_plane_tcp_error(
-            context,
-            source,
-            request_started,
-        )),
-        Err(_) => Err(static_control_plane_tcp_error(
-            context,
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "control-plane TLS/TCP RPC deadline expired",
-            ),
-            request_started,
-        )),
-    }
-}
-
-async fn exchange_static_control_plane_tcp_frame(
-    peer: StaticControlPlaneTcpPeer,
-    exchange: ControlPlaneRpcFrameExchange,
-) -> Result<Vec<u8>, ControlPlaneRpcFrameExchangeError> {
-    let frame_limit = exchange.max_frame_bytes.min(peer.max_frame_bytes);
-    if exchange.request_frame.len() > frame_limit {
-        return Err(ControlPlaneRpcFrameExchangeError::before_request(
-            ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "control-plane TLS/TCP request frame size {} bytes exceeds limit {}",
-                    exchange.request_frame.len(),
-                    frame_limit
-                ),
-            },
-        ));
-    }
-    if peer.endpoint != exchange.endpoint {
-        return Err(ControlPlaneRpcFrameExchangeError::before_request(
-            ControlPlaneError::RpcProtocol {
-                message: "static control-plane TCP endpoint identity mismatch".to_string(),
-            },
-        ));
-    }
-    let connect_deadline = Instant::now()
-        .checked_add(peer.connect_timeout)
-        .unwrap_or(exchange.deadline)
-        .min(exchange.deadline);
-    let stream = static_control_plane_tcp_io_until(
-        connect_deadline,
-        "connect control-plane TLS/TCP endpoint",
-        false,
-        TcpStream::connect((peer.host.as_str(), peer.port)),
-    )
-    .await?;
-    let server_name = ServerName::try_from(peer.server_name.clone()).map_err(|_| {
-        ControlPlaneRpcFrameExchangeError::before_request(ControlPlaneError::RpcProtocol {
-            message: "static control-plane TCP endpoint has an invalid TLS server name".to_string(),
-        })
-    })?;
-    let mut stream = static_control_plane_tcp_io_until(
-        exchange.deadline,
-        "complete control-plane TLS client handshake",
-        false,
-        TlsConnector::from(peer.tls_client_config).connect(server_name, stream),
-    )
-    .await?;
-    if stream.get_ref().1.alpn_protocol() != Some(CONTROL_PLANE_RPC_TLS_ALPN) {
-        return Err(ControlPlaneRpcFrameExchangeError::before_request(
-            ControlPlaneError::RpcProtocol {
-                message:
-                    "control-plane TLS peer did not negotiate required argmin-control-plane/1 ALPN"
-                        .to_string(),
-            },
-        ));
-    }
-    static_control_plane_tcp_io_until(
-        exchange.deadline,
-        "write control-plane TLS/TCP request frame",
-        true,
-        stream.write_all(&exchange.request_frame),
-    )
-    .await?;
-    let read_limit = u64::try_from(frame_limit)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    let mut response = Vec::new();
-    static_control_plane_tcp_io_until(
-        exchange.deadline,
-        "read control-plane TLS/TCP response frame",
-        true,
-        stream.take(read_limit).read_to_end(&mut response),
-    )
-    .await?;
-    if response.len() > frame_limit {
-        return Err(ControlPlaneRpcFrameExchangeError::after_request_started(
-            ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "control-plane TLS/TCP response frame size {} bytes exceeds limit {}",
-                    response.len(),
-                    frame_limit
-                ),
-            },
-        ));
-    }
-    Ok(response)
-}
-
-impl ControlPlaneRpcFrameTransport for StaticControlPlaneFrameTransport {
-    fn name(&self) -> &'static str {
-        "static Unix/TLS/TCP"
-    }
-
-    fn exchange(
-        &self,
-        exchange: ControlPlaneRpcFrameExchange,
-    ) -> Result<Vec<u8>, ControlPlaneRpcFrameExchangeError> {
-        let peer = self.peers.get(&exchange.endpoint).cloned().ok_or_else(|| {
-            ControlPlaneRpcFrameExchangeError::before_request(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "static control-plane transport has no endpoint {}",
-                    exchange.endpoint
-                ),
-            })
-        })?;
-        let peer = match peer {
-            StaticControlPlanePeer::Unix(peer) => {
-                return exchange_static_control_plane_unix_frame(peer, exchange);
-            }
-            StaticControlPlanePeer::Tcp(peer) => peer,
-        };
-        let future = exchange_static_control_plane_tcp_frame(peer, exchange);
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| handle.block_on(future))
-            }
-            Ok(_) => std::thread::spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|source| {
-                        ControlPlaneRpcFrameExchangeError::before_request(ControlPlaneError::Io {
-                            context: "create control-plane TLS/TCP client runtime",
-                            source,
-                        })
-                    })?
-                    .block_on(future)
-            })
-            .join()
-            .map_err(|_| {
-                ControlPlaneRpcFrameExchangeError::before_request(ControlPlaneError::RpcProtocol {
-                    message: "control-plane TLS/TCP client runtime thread panicked".to_string(),
-                })
-            })?,
-            Err(_) => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|source| {
-                    ControlPlaneRpcFrameExchangeError::before_request(ControlPlaneError::Io {
-                        context: "create control-plane TLS/TCP client runtime",
-                        source,
-                    })
-                })?
-                .block_on(future),
-        }
-    }
+    endpoints: Vec<storage::control_plane::ControlPlaneRpcClientEndpoint>,
 }
 
 #[derive(Clone, Copy)]
@@ -1960,30 +1589,6 @@ impl ValidatedStaticClusterManifest {
                 selected.id
             ));
         }
-        let uses_tcp = selected_endpoints.iter().any(|endpoint| {
-            matches!(
-                parse_endpoint_address(&endpoint.advertise, false),
-                Ok(EndpointAddress::Tcp { .. })
-            )
-        });
-        if !uses_tcp {
-            let paths = selected_endpoints
-                .into_iter()
-                .map(
-                    |endpoint| match parse_endpoint_address(&endpoint.advertise, false)? {
-                        EndpointAddress::Unix(path) => Ok(path.to_string_lossy().into_owned()),
-                        EndpointAddress::Tcp { .. } => unreachable!("TCP use was precomputed"),
-                    },
-                )
-                .collect::<Result<Vec<_>, String>>()?;
-            return Ok(ConfiguredStaticControlPlaneRpcClients {
-                endpoints: paths,
-                frame_transport: None,
-            });
-        }
-
-        let provider = rustls::crypto::ring::default_provider();
-        let mut peers = BTreeMap::new();
         let mut endpoints = Vec::with_capacity(selected_endpoints.len());
         for endpoint in selected_endpoints {
             let transport = self
@@ -1992,17 +1597,9 @@ impl ValidatedStaticClusterManifest {
                 .iter()
                 .find(|profile| profile.id == endpoint.transport_profile_id)
                 .expect("validated control-plane endpoint transport profile exists");
-            let max_frame_bytes = usize::try_from(transport.max_frame_bytes)
-                .map_err(|_| "control-plane frame limit does not fit usize".to_string())?;
-            let advertise = endpoint.advertise.clone();
-            endpoints.push(advertise.clone());
-            let peer = match parse_endpoint_address(&endpoint.advertise, false)? {
+            let client_endpoint = match parse_endpoint_address(&endpoint.advertise, false)? {
                 EndpointAddress::Unix(path) => {
-                    StaticControlPlanePeer::Unix(StaticControlPlaneUnixPeer {
-                        endpoint: advertise.clone(),
-                        path,
-                        max_frame_bytes,
-                    })
+                    storage::control_plane::ControlPlaneRpcClientEndpoint::unix(path)
                 }
                 EndpointAddress::Tcp { host, port } => {
                     let trust_bundle_id = endpoint
@@ -2022,38 +1619,22 @@ impl ValidatedStaticClusterManifest {
                         .tls_server_name
                         .clone()
                         .expect("validated TCP endpoint has a TLS server name");
-                    let mut client_config =
-                        RustlsClientConfig::builder_with_provider(Arc::new(provider.clone()))
-                            .with_protocol_versions(&[&rustls::version::TLS13])
-                            .map_err(|_| {
-                                "failed to select the static control-plane TLS protocol".to_string()
-                            })?
-                            .with_root_certificates((*roots.roots).clone())
-                            .with_no_client_auth();
-                    client_config.alpn_protocols = vec![CONTROL_PLANE_RPC_TLS_ALPN.to_vec()];
-                    StaticControlPlanePeer::Tcp(StaticControlPlaneTcpPeer {
-                        endpoint: advertise.clone(),
+                    storage::control_plane::ControlPlaneRpcClientEndpoint::tls_tcp(
+                        endpoint.advertise.clone(),
                         host,
                         port,
                         server_name,
-                        connect_timeout: Duration::from_millis(transport.connect_timeout_ms),
-                        max_frame_bytes,
-                        tls_client_config: Arc::new(client_config),
-                    })
+                        Duration::from_millis(transport.connect_timeout_ms),
+                        (*roots.roots).clone(),
+                    )
+                    .map_err(|error| {
+                        format!("invalid control-plane endpoint {}: {error}", endpoint.id)
+                    })?
                 }
             };
-            if peers.insert(advertise.clone(), peer).is_some() {
-                return Err(format!(
-                    "multiple authority endpoint candidates use the same {protocol:?} address {advertise}"
-                ));
-            }
+            endpoints.push(client_endpoint);
         }
-        Ok(ConfiguredStaticControlPlaneRpcClients {
-            endpoints,
-            frame_transport: Some(Arc::new(StaticControlPlaneFrameTransport {
-                peers: Arc::new(peers),
-            })),
-        })
+        Ok(ConfiguredStaticControlPlaneRpcClients { endpoints })
     }
 
     fn replicated_unix_control_plane_server_config<F>(
@@ -2121,14 +1702,12 @@ impl ValidatedStaticClusterManifest {
             )?;
         let ConfiguredStaticControlPlaneRpcClients {
             endpoints: control_plane_client_endpoints,
-            frame_transport: control_plane_rpc_frame_transport,
         } = self.configured_static_control_plane_rpc_clients(
             material,
             EndpointProtocol::ControlPlane,
         )?;
         let ConfiguredStaticControlPlaneRpcClients {
             endpoints: control_plane_clock_recovery_client_endpoints,
-            frame_transport: control_plane_clock_recovery_rpc_frame_transport,
         } = self.configured_static_control_plane_rpc_clients(
             material,
             EndpointProtocol::AuthorityClockRecovery,
@@ -2457,20 +2036,17 @@ impl ValidatedStaticClusterManifest {
         config.control_plane_state_path = Some(authority.state_path.to_string_lossy().into_owned());
         config.control_plane_socket_path = Some(local_control_path);
         config.control_plane_clock_recovery_socket_path = Some(local_recovery_path);
-        if control_plane_rpc_frame_transport.is_none() {
-            config.control_plane_client_socket_paths = control_plane_client_endpoints.clone();
-        } else {
-            config.control_plane_client_socket_paths.clear();
-        }
+        config.control_plane_client_socket_paths = control_plane_client_endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.unix_socket_path())
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
         config.control_plane_rpc_listeners = control_plane_rpc_listeners;
         config.control_plane_clock_recovery_rpc_listeners =
             control_plane_clock_recovery_rpc_listeners;
         config.control_plane_rpc_client_endpoints = control_plane_client_endpoints;
         config.control_plane_clock_recovery_rpc_client_endpoints =
             control_plane_clock_recovery_client_endpoints;
-        config.control_plane_rpc_frame_transport = control_plane_rpc_frame_transport;
-        config.control_plane_clock_recovery_rpc_frame_transport =
-            control_plane_clock_recovery_rpc_frame_transport;
         config.control_plane_auth_cluster_id = Some(self.raft_cluster_identity());
         config.control_plane_storage_auth_credentials = storage_auth_credentials;
         config.control_plane_frontend_auth_credentials = frontend_auth_credentials;
@@ -2612,14 +2188,13 @@ impl ValidatedStaticClusterManifest {
 
         let ConfiguredStaticControlPlaneRpcClients {
             endpoints: control_plane_client_endpoints,
-            frame_transport: control_plane_rpc_frame_transport,
         } = self.configured_static_control_plane_rpc_clients(
             material,
             EndpointProtocol::ControlPlane,
         )?;
         let control_plane_endpoint = control_plane_client_endpoints
             .first()
-            .cloned()
+            .map(storage::control_plane::ControlPlaneRpcClientEndpoint::advertised_endpoint)
             .ok_or_else(|| "replicated data process has no control-plane route".to_string())?;
 
         let provider = rustls::crypto::ring::default_provider();
@@ -3103,13 +2678,12 @@ impl ValidatedStaticClusterManifest {
         config.storage_node_data_dir =
             selected_storage_node.map(|node| node.data_dir.to_string_lossy().into_owned());
         config.storage_node_socket_path = local_storage_endpoint.map(|(_, endpoint)| endpoint);
-        config.control_plane_client_socket_paths = if control_plane_rpc_frame_transport.is_none() {
-            control_plane_client_endpoints.clone()
-        } else {
-            Vec::new()
-        };
+        config.control_plane_client_socket_paths = control_plane_client_endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.unix_socket_path())
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
         config.control_plane_rpc_client_endpoints = control_plane_client_endpoints;
-        config.control_plane_rpc_frame_transport = control_plane_rpc_frame_transport;
         config.control_plane_auth_cluster_id = Some(self.raft_cluster_identity());
         config.control_plane_storage_auth_credentials = storage_control_plane_credentials;
         config.control_plane_storage_auth_signing_credential = storage_control_plane_signer;
@@ -7812,18 +7386,17 @@ tls_server_name = "localhost""#,
             EndpointProtocol::ControlPlane,
             EndpointProtocol::AuthorityClockRecovery,
         ] {
-            let ConfiguredStaticControlPlaneRpcClients {
-                endpoints,
-                frame_transport,
-            } = manifest
+            let ConfiguredStaticControlPlaneRpcClients { endpoints } = manifest
                 .configured_static_control_plane_rpc_clients(&material, protocol)
                 .unwrap();
 
             assert_eq!(endpoints.len(), 3);
             assert!(endpoints
                 .iter()
-                .all(|endpoint| endpoint.starts_with("tcp://")));
-            assert_eq!(frame_transport.unwrap().name(), "static Unix/TLS/TCP");
+                .all(|endpoint| endpoint.advertised_endpoint().starts_with("tcp://")));
+            assert!(endpoints
+                .iter()
+                .all(|endpoint| endpoint.unix_socket_path().is_none()));
         }
 
         let listeners = manifest
@@ -7927,13 +7500,13 @@ tls_server_name = "control-{host_number}.internal"
                 .unwrap();
             assert_eq!(clients.endpoints.len(), 6);
             for (index, host_number) in (1..=3).enumerate() {
-                assert!(
-                    clients.endpoints[index].ends_with(&format!(":{}", primary_port + host_number))
-                );
+                assert!(clients.endpoints[index]
+                    .advertised_endpoint()
+                    .ends_with(&format!(":{}", primary_port + host_number)));
                 assert!(clients.endpoints[index + 3]
+                    .advertised_endpoint()
                     .ends_with(&format!(":{}", fallback_port + host_number)));
             }
-            assert!(clients.frame_transport.is_some());
         }
     }
 
@@ -7961,11 +7534,19 @@ transport_profile_id = "control"
             .unwrap();
 
         assert_eq!(clients.endpoints.len(), 4);
-        assert_eq!(clients.endpoints[0], "unix:///run/argmin/control-1.sock");
-        assert!(clients.endpoints[1].ends_with(":7502"));
-        assert!(clients.endpoints[2].ends_with(":7503"));
-        assert!(clients.endpoints[3].ends_with(":7501"));
-        assert!(clients.frame_transport.is_some());
+        assert_eq!(
+            clients.endpoints[0].advertised_endpoint(),
+            "unix:///run/argmin/control-1.sock"
+        );
+        assert!(clients.endpoints[1]
+            .advertised_endpoint()
+            .ends_with(":7502"));
+        assert!(clients.endpoints[2]
+            .advertised_endpoint()
+            .ends_with(":7503"));
+        assert!(clients.endpoints[3]
+            .advertised_endpoint()
+            .ends_with(":7501"));
     }
 
     #[test]
@@ -8017,51 +7598,10 @@ tls_server_name = "localhost"
         assert_eq!(clients.endpoints.len(), 6);
         assert!(clients.endpoints[..3]
             .iter()
-            .all(|endpoint| endpoint.starts_with("unix://")));
+            .all(|endpoint| endpoint.unix_socket_path().is_some()));
         assert!(clients.endpoints[3..]
             .iter()
-            .all(|endpoint| endpoint.starts_with("tcp://")));
-        assert_eq!(
-            clients.frame_transport.unwrap().name(),
-            "static Unix/TLS/TCP"
-        );
-    }
-
-    #[test]
-    fn static_control_plane_frame_transport_exchanges_unix_fallback_frame() {
-        let dir = test_util::tempdir();
-        let path = dir.path().join("control.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 7];
-            stream.read_exact(&mut request).unwrap();
-            assert_eq!(&request, b"request");
-            stream.write_all(b"response").unwrap();
-        });
-        let endpoint = format!("unix://{}", path.display());
-        let transport = StaticControlPlaneFrameTransport {
-            peers: Arc::new(BTreeMap::from([(
-                endpoint.clone(),
-                StaticControlPlanePeer::Unix(StaticControlPlaneUnixPeer {
-                    endpoint: endpoint.clone(),
-                    path,
-                    max_frame_bytes: 1024,
-                }),
-            )])),
-        };
-
-        let response = transport
-            .exchange(ControlPlaneRpcFrameExchange {
-                endpoint,
-                request_frame: b"request".to_vec(),
-                deadline: Instant::now() + Duration::from_secs(1),
-                max_frame_bytes: 1024,
-            })
-            .unwrap();
-
-        assert_eq!(response, b"response");
-        server.join().unwrap();
+            .all(|endpoint| endpoint.unix_socket_path().is_none()));
     }
 
     #[test]
@@ -8126,45 +7666,6 @@ tls_server_name = "control-1-alt.internal"
     }
 
     #[test]
-    fn static_control_plane_tcp_transport_rejects_profile_oversize_before_connect() {
-        let client_config = RustlsClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(RootCertStore::empty())
-        .with_no_client_auth();
-        let endpoint = "tcp://127.0.0.1:1".to_string();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let error = runtime
-            .block_on(exchange_static_control_plane_tcp_frame(
-                StaticControlPlaneTcpPeer {
-                    endpoint: endpoint.clone(),
-                    host: "127.0.0.1".to_string(),
-                    port: 1,
-                    server_name: "localhost".to_string(),
-                    connect_timeout: Duration::from_secs(1),
-                    max_frame_bytes: 8,
-                    tls_client_config: Arc::new(client_config),
-                },
-                ControlPlaneRpcFrameExchange {
-                    endpoint,
-                    request_frame: vec![0; 9],
-                    deadline: Instant::now() + Duration::from_secs(1),
-                    max_frame_bytes: 16,
-                },
-            ))
-            .unwrap_err();
-
-        assert!(!error.request_may_have_been_sent());
-        assert!(format!("{error:?}").contains("exceeds limit 8"));
-    }
-
-    #[test]
     fn static_tls_control_plane_transport_authenticates_and_dispatches_recovery_rpc() {
         let certificates = CertificateDer::pem_slice_iter(include_bytes!(
             "../../s3-tests/testdata/localhost-cert.pem"
@@ -8197,31 +7698,19 @@ tls_server_name = "control-1-alt.internal"
                 .unwrap(),
             )
             .unwrap();
-        let mut client_config = RustlsClientConfig::builder_with_provider(Arc::new(provider))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        client_config.alpn_protocols = vec![CONTROL_PLANE_RPC_TLS_ALPN.to_vec()];
-
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let address = listener.local_addr().unwrap();
+        let port = address.port();
         let endpoint = format!("tcp://localhost:{port}");
-        let transport: Arc<dyn ControlPlaneRpcFrameTransport> =
-            Arc::new(StaticControlPlaneFrameTransport {
-                peers: Arc::new(BTreeMap::from([(
-                    endpoint.clone(),
-                    StaticControlPlanePeer::Tcp(StaticControlPlaneTcpPeer {
-                        endpoint: endpoint.clone(),
-                        host: "127.0.0.1".to_string(),
-                        port,
-                        server_name: "localhost".to_string(),
-                        connect_timeout: Duration::from_secs(1),
-                        max_frame_bytes: CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
-                        tls_client_config: Arc::new(client_config),
-                    }),
-                )])),
-            });
+        let client_endpoint = storage::control_plane::ControlPlaneRpcClientEndpoint::tls_tcp(
+            endpoint,
+            address.ip().to_string(),
+            address.port(),
+            "localhost",
+            Duration::from_secs(1),
+            roots,
+        )
+        .unwrap();
         let admin_credential = storage::control_plane::ControlPlaneAdminAuthCredential::new(
             storage::control_plane::ControlPlaneAdminAuthCredentialInput {
                 instance_id: "tcp-admin".to_string(),
@@ -8280,11 +7769,9 @@ tls_server_name = "control-1-alt.internal"
                 },
             );
         });
-        let client = storage::control_plane::UnixControlPlaneClient::with_frame_transport(
-            [endpoint],
-            transport,
-        )
-        .unwrap();
+        let client =
+            storage::control_plane::UnixControlPlaneClient::with_endpoints([client_endpoint])
+                .unwrap();
         let client = storage::control_plane::AuthenticatedUnixControlPlaneClient::new(
             client,
             admin_credential.scoped_for_cluster("tcp-cluster").unwrap(),
@@ -9913,7 +9400,10 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
             Duration::from_secs(15)
         );
         assert!(frontend_config.storage_rpc_server_auth.is_none());
-        assert!(frontend_config.control_plane_rpc_frame_transport.is_some());
+        assert!(frontend_config
+            .control_plane_rpc_client_endpoints
+            .iter()
+            .all(|endpoint| endpoint.unix_socket_path().is_none()));
     }
 
     #[test]

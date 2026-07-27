@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use storage::control_plane::{
-    ControlPlaneRpcFrameTransport, InitialClusterTopologyCertificate, MAX_HEARTBEAT_LEASE_MS,
+    ControlPlaneRpcClientEndpoint, InitialClusterTopologyCertificate, MAX_HEARTBEAT_LEASE_MS,
 };
 use storage::control_plane_raft::ControlPlaneRaftPeerFrameTransport;
 use storage::control_plane_raft::ControlPlaneRaftPeerTransportLimits;
@@ -458,11 +458,9 @@ pub(crate) struct ServerConfig {
     pub(crate) control_plane_client_socket_paths: Vec<String>,
     pub(crate) control_plane_rpc_listeners: Vec<ConfiguredControlPlaneRpcListener>,
     pub(crate) control_plane_clock_recovery_rpc_listeners: Vec<ConfiguredControlPlaneRpcListener>,
-    pub(crate) control_plane_rpc_client_endpoints: Vec<String>,
-    pub(crate) control_plane_clock_recovery_rpc_client_endpoints: Vec<String>,
-    pub(crate) control_plane_rpc_frame_transport: Option<Arc<dyn ControlPlaneRpcFrameTransport>>,
-    pub(crate) control_plane_clock_recovery_rpc_frame_transport:
-        Option<Arc<dyn ControlPlaneRpcFrameTransport>>,
+    pub(crate) control_plane_rpc_client_endpoints: Vec<ControlPlaneRpcClientEndpoint>,
+    pub(crate) control_plane_clock_recovery_rpc_client_endpoints:
+        Vec<ControlPlaneRpcClientEndpoint>,
     pub(crate) control_plane_auth_cluster_id: Option<String>,
     pub(crate) control_plane_storage_auth_credentials:
         Vec<ConfiguredControlPlaneStorageAuthCredential>,
@@ -1152,8 +1150,6 @@ impl ServerConfig {
             control_plane_clock_recovery_rpc_listeners: Vec::new(),
             control_plane_rpc_client_endpoints: Vec::new(),
             control_plane_clock_recovery_rpc_client_endpoints: Vec::new(),
-            control_plane_rpc_frame_transport: None,
-            control_plane_clock_recovery_rpc_frame_transport: None,
             control_plane_auth_cluster_id,
             control_plane_storage_auth_credentials,
             control_plane_storage_auth_signing_credential: None,
