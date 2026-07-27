@@ -2117,20 +2117,21 @@ fn run_one_placed_segment_shard_backfill(
             "background shard backfill admission denied",
             next_attempt_after,
         ) {
+            let event = shard_backfill_record_error_event(&record_error);
             observability::record_shard_backfill_error(
                 Some(claim.work_item.request.data_pg_id),
-                "record_error_failed",
+                event,
                 record_error.diagnostic_kind(),
             );
             emit_shard_backfill_event(
                 Some(claim.work_item.request.data_pg_id),
-                "record_error_failed",
+                event,
                 shard_backfill_queue_depth(storage_cluster),
                 None,
             );
             let _ = observability::event(
                 TRACE_TARGET,
-                "shard_backfill_record_error_failed",
+                "shard_backfill_record_error",
                 Some(format_args!("record_error={record_error}")),
             );
         }
@@ -2224,20 +2225,21 @@ fn run_one_placed_segment_shard_backfill(
                     next_attempt_after,
                 )
             {
+                let record_event = shard_backfill_record_error_event(&record_error);
                 observability::record_shard_backfill_error(
                     Some(claim.work_item.request.data_pg_id),
-                    "record_error_failed",
+                    record_event,
                     record_error.diagnostic_kind(),
                 );
                 emit_shard_backfill_event(
                     Some(claim.work_item.request.data_pg_id),
-                    "record_error_failed",
+                    record_event,
                     shard_backfill_queue_depth(storage_cluster),
                     None,
                 );
                 let _ = observability::event(
                     TRACE_TARGET,
-                    "shard_backfill_record_error_failed",
+                    "shard_backfill_record_error",
                     Some(format_args!(
                         "backfill_error={error} record_error={record_error}"
                     )),
@@ -2285,6 +2287,14 @@ fn shard_backfill_completion_error_event(error: &StoreError) -> &'static str {
         "complete_stale"
     } else {
         "complete_failed"
+    }
+}
+
+fn shard_backfill_record_error_event(error: &StoreError) -> &'static str {
+    if shard_backfill_error_is_stale_retry(error) {
+        "record_retry"
+    } else {
+        "record_error_failed"
     }
 }
 
@@ -3905,6 +3915,23 @@ mod tests {
                 message: "storage RPC stream I/O error: early eof".to_string(),
             }),
             "complete_stale"
+        );
+    }
+
+    #[test]
+    fn shard_backfill_record_error_classifies_stale_as_retry() {
+        assert_eq!(
+            shard_backfill_record_error_event(&StoreError::StorageRpc {
+                node_id: 2,
+                operation: "record placed segment shard backfill claim error",
+                code: storage::StorageRpcErrorCode::StaleShardLocation,
+                message: "request route epoch 10 does not match storage-node epoch 11".to_string(),
+            }),
+            "record_retry"
+        );
+        assert_eq!(
+            shard_backfill_record_error_event(&StoreError::NotFound),
+            "record_error_failed"
         );
     }
 

@@ -2760,6 +2760,9 @@ run_route_change_smoke() {
 
 run_pg_backfill_migration_smoke() {
     local iteration="${1:-1}"
+    # A stale claim-bookkeeping RPC falls back to the 30-second durable claim lease.
+    # Leave a full operation budget after expiry for rescan and backfill completion.
+    local backfill_convergence_seconds=60
     local smoke_dir="$data_dir/pg-backfill-migration-smoke/iteration-$iteration"
     local bucket_file="$smoke_dir/bucket"
     local old_key_file="$smoke_dir/old-key"
@@ -2897,7 +2900,7 @@ run_pg_backfill_migration_smoke() {
 
     wait_for_shard_backfill_completion_metrics \
         "$metrics_path" \
-        30 \
+        "$backfill_convergence_seconds" \
         "$min_scan_total" \
         "$min_enqueued" \
         "$min_written" \
