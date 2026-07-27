@@ -148,6 +148,10 @@ static SHARD_REPAIR_SHARDS_REWRITTEN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_SHARDS_WRITTEN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_COMPLETE_SUCCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_COMPLETE_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SHARD_BACKFILL_RECORD_ERROR_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_CANDIDATE_SCAN_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_CANDIDATE_SCANNED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_CANDIDATE_CURRENT_EPOCH_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -2714,6 +2718,10 @@ pub struct MetricsSnapshot {
     pub shard_backfill_queue_depth: u64,
     pub shard_backfill_event_total: u64,
     pub shard_backfill_shards_written_total: u64,
+    pub shard_backfill_complete_succeeded_total: u64,
+    pub shard_backfill_complete_failed_total: u64,
+    pub shard_backfill_failed_total: u64,
+    pub shard_backfill_record_error_failed_total: u64,
     pub shard_backfill_candidate_scan_total: u64,
     pub shard_backfill_candidate_scanned_total: u64,
     pub shard_backfill_candidate_current_epoch_total: u64,
@@ -2963,6 +2971,22 @@ impl MetricsSnapshot {
             (
                 "shard_backfill_shards_written_total",
                 self.shard_backfill_shards_written_total,
+            ),
+            (
+                "shard_backfill_complete_succeeded_total",
+                self.shard_backfill_complete_succeeded_total,
+            ),
+            (
+                "shard_backfill_complete_failed_total",
+                self.shard_backfill_complete_failed_total,
+            ),
+            (
+                "shard_backfill_failed_total",
+                self.shard_backfill_failed_total,
+            ),
+            (
+                "shard_backfill_record_error_failed_total",
+                self.shard_backfill_record_error_failed_total,
             ),
             (
                 "shard_backfill_candidate_scan_total",
@@ -3384,6 +3408,13 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         shard_backfill_queue_depth: SHARD_BACKFILL_QUEUE_DEPTH.load(Ordering::Relaxed),
         shard_backfill_event_total: SHARD_BACKFILL_EVENT_TOTAL.load(Ordering::Relaxed),
         shard_backfill_shards_written_total: SHARD_BACKFILL_SHARDS_WRITTEN_TOTAL
+            .load(Ordering::Relaxed),
+        shard_backfill_complete_succeeded_total: SHARD_BACKFILL_COMPLETE_SUCCEEDED_TOTAL
+            .load(Ordering::Relaxed),
+        shard_backfill_complete_failed_total: SHARD_BACKFILL_COMPLETE_FAILED_TOTAL
+            .load(Ordering::Relaxed),
+        shard_backfill_failed_total: SHARD_BACKFILL_FAILED_TOTAL.load(Ordering::Relaxed),
+        shard_backfill_record_error_failed_total: SHARD_BACKFILL_RECORD_ERROR_FAILED_TOTAL
             .load(Ordering::Relaxed),
         shard_backfill_candidate_scan_total: SHARD_BACKFILL_CANDIDATE_SCAN_TOTAL
             .load(Ordering::Relaxed),
@@ -4374,6 +4405,21 @@ pub fn emit_shard_repair_event(target: &'static str, summary: ShardRepairEventSu
 
 pub fn emit_shard_backfill_event(target: &'static str, summary: ShardBackfillEventSummary) -> bool {
     SHARD_BACKFILL_EVENT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    match summary.event {
+        "complete_succeeded" => {
+            SHARD_BACKFILL_COMPLETE_SUCCEEDED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "complete_failed" => {
+            SHARD_BACKFILL_COMPLETE_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "failed" => {
+            SHARD_BACKFILL_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        "record_error_failed" => {
+            SHARD_BACKFILL_RECORD_ERROR_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
     if let Some(queue_depth) = summary.queue_depth {
         SHARD_BACKFILL_QUEUE_DEPTH.store(queue_depth as u64, Ordering::Relaxed);
     }
@@ -5110,6 +5156,7 @@ mod tests {
         let snapshot = MetricsSnapshot {
             request_start_total: 11,
             storage_rpc_error_total: 22,
+            shard_backfill_complete_succeeded_total: 33,
             metadata_command_checkpoint_record_compaction_failed_total: 44,
             stream_upload_finalize_error_total: 55,
             stream_upload_finalize_started_total: 66,
@@ -5126,6 +5173,10 @@ mod tests {
         assert_eq!(map.get("request_start_total").copied(), Some(11));
         assert_eq!(map.get("storage_rpc_error_total").copied(), Some(22));
         assert_eq!(
+            map.get("shard_backfill_complete_succeeded_total").copied(),
+            Some(33)
+        );
+        assert_eq!(
             map.get("metadata_command_checkpoint_record_compaction_failed_total")
                 .copied(),
             Some(44)
@@ -5138,6 +5189,68 @@ mod tests {
             map.get("stream_upload_finalize_started_total").copied(),
             Some(66)
         );
+    }
+
+    #[test]
+    fn shard_backfill_outcomes_survive_dimension_capacity_exhaustion() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let original_dimensions = {
+            let mut dimensions = shard_backfill_event_dimensions()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let original = std::mem::take(&mut *dimensions);
+            dimensions.extend((0..METADATA_COMMAND_DIMENSION_CAPACITY).map(|pg_id| {
+                ShardBackfillEventDimensionCounter {
+                    pg_id: Some(u32::try_from(pg_id).unwrap()),
+                    event: "capacity_fixture",
+                    count: 1,
+                }
+            }));
+            original
+        };
+        let before = metrics_snapshot();
+
+        for event in [
+            "complete_succeeded",
+            "complete_failed",
+            "failed",
+            "record_error_failed",
+        ] {
+            emit_shard_backfill_event(
+                "storage",
+                ShardBackfillEventSummary {
+                    pg_id: Some(u32::MAX),
+                    event,
+                    queue_depth: None,
+                    shards_written: None,
+                },
+            );
+        }
+
+        let after = metrics_snapshot();
+        assert_eq!(
+            after.shard_backfill_complete_succeeded_total,
+            before.shard_backfill_complete_succeeded_total + 1
+        );
+        assert_eq!(
+            after.shard_backfill_complete_failed_total,
+            before.shard_backfill_complete_failed_total + 1
+        );
+        assert_eq!(
+            after.shard_backfill_failed_total,
+            before.shard_backfill_failed_total + 1
+        );
+        assert_eq!(
+            after.shard_backfill_record_error_failed_total,
+            before.shard_backfill_record_error_failed_total + 1
+        );
+        assert!(!shard_backfill_event_dimension_snapshot()
+            .iter()
+            .any(|sample| sample.pg_id == Some(u32::MAX)));
+
+        *shard_backfill_event_dimensions()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = original_dimensions;
     }
 
     #[test]

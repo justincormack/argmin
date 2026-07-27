@@ -1720,8 +1720,6 @@ wait_for_shard_backfill_completion_metrics() {
     local max_failed="${12:-0}"
     local max_record_error_failed="${13:-0}"
     local target_pg_id="${14:-}"
-    local min_pg_backfilled="${15:-0}"
-    local min_pg_completed="${16:-0}"
     local start
     start="$(date +%s)"
     while true; do
@@ -1740,33 +1738,27 @@ wait_for_shard_backfill_completion_metrics() {
         local failed
         local stale_retry
         local record_error_failed
-        local pg_backfilled=0
-        local pg_completed=0
         scan_total="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_total)"
         enqueued="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_enqueued_total)"
         written="$(latest_metric_sample_value "$metrics_path" shard_backfill_shards_written_total)"
-        completed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_succeeded)"
+        completed="$(latest_metric_sample_value "$metrics_path" shard_backfill_complete_succeeded_total)"
         queue_depth="$(latest_metric_sample_value "$metrics_path" shard_backfill_queue_depth)"
         routine_admitted="$(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event admitted class routine_backfill)"
         routine_finished="$(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event finished class routine_backfill)"
         candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
         candidate_deferred="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_deferred_total)"
         scan_error="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_error_total)"
-        complete_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_failed)"
-        failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event failed)"
+        complete_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_complete_failed_total)"
+        failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_failed_total)"
         stale_retry="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event stale_retry)"
-        record_error_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event record_error_failed)"
-        if [[ -n "$target_pg_id" ]]; then
-            pg_backfilled="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total pg_id "$target_pg_id" event backfilled)"
-            pg_completed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total pg_id "$target_pg_id" event complete_succeeded)"
-        fi
+        record_error_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_record_error_failed_total)"
         if ((candidate_failed > max_candidate_failed || scan_error > max_scan_error || complete_failed > max_complete_failed || failed > max_failed || record_error_failed > max_record_error_failed)); then
             print_shard_backfill_debug "$metrics_path"
             cat "$metrics_path" >&2 || true
             die "shard backfill worker hard-failure metrics increased: candidate_failed=$candidate_failed scan_error=$scan_error complete_failed=$complete_failed failed=$failed record_error_failed=$record_error_failed"
         fi
-        if ((scan_total >= min_scan_total && enqueued >= min_enqueued && written >= min_written && completed >= min_completed && queue_depth == 0 && routine_admitted >= min_routine_admitted && routine_finished >= min_routine_finished && pg_backfilled >= min_pg_backfilled && pg_completed >= min_pg_completed)); then
-            echo "== argmin-s3 UAT shard backfill metrics: scan_total=$scan_total enqueued=$enqueued written=$written complete_succeeded=$completed candidate_deferred=$candidate_deferred candidate_failed=$candidate_failed scan_error=$scan_error stale_retry=$stale_retry failed=$failed queue_depth=$queue_depth routine_admitted=$routine_admitted routine_finished=$routine_finished pg_id=${target_pg_id:-any} pg_backfilled=$pg_backfilled pg_complete_succeeded=$pg_completed =="
+        if ((scan_total >= min_scan_total && enqueued >= min_enqueued && written >= min_written && completed >= min_completed && queue_depth == 0 && routine_admitted >= min_routine_admitted && routine_finished >= min_routine_finished)); then
+            echo "== argmin-s3 UAT shard backfill metrics: scan_total=$scan_total enqueued=$enqueued written=$written complete_succeeded=$completed candidate_deferred=$candidate_deferred candidate_failed=$candidate_failed scan_error=$scan_error stale_retry=$stale_retry failed=$failed queue_depth=$queue_depth routine_admitted=$routine_admitted routine_finished=$routine_finished pg_id=${target_pg_id:-any} =="
             return 0
         fi
         if (($(date +%s) - start >= deadline_seconds)); then
@@ -2127,12 +2119,12 @@ print_slowdown_summary() {
         shard_backfill_started="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event started)"
         shard_backfill_resolved_clean="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event resolved_clean)"
         shard_backfill_backfilled="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event backfilled)"
-        shard_backfill_complete_succeeded="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event complete_succeeded)"
+        shard_backfill_complete_succeeded="$(latest_metric_sample_value "$metrics_log" shard_backfill_complete_succeeded_total)"
         shard_backfill_complete_stale="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event complete_stale)"
-        shard_backfill_complete_failed="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event complete_failed)"
+        shard_backfill_complete_failed="$(latest_metric_sample_value "$metrics_log" shard_backfill_complete_failed_total)"
         shard_backfill_stale_retry="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event stale_retry)"
-        shard_backfill_failed="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event failed)"
-        shard_backfill_record_error_failed="$(latest_metric_family_label_sum "$metrics_log" shard_backfill_event_by_pg_total event record_error_failed)"
+        shard_backfill_failed="$(latest_metric_sample_value "$metrics_log" shard_backfill_failed_total)"
+        shard_backfill_record_error_failed="$(latest_metric_sample_value "$metrics_log" shard_backfill_record_error_failed_total)"
         background_work_event="$(latest_metric_sample_value "$metrics_log" background_work_admission_event_total)"
         background_work_active="$(latest_metric_sample_value "$metrics_log" background_work_active_total)"
         background_work_finished="$(latest_metric_sample_value "$metrics_log" background_work_finished_total)"
@@ -2804,14 +2796,14 @@ run_pg_backfill_migration_smoke() {
     reset_min_scan_total="$(($(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_total) + 1))"
     reset_min_enqueued="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_enqueued_total)"
     reset_min_written="$(latest_metric_sample_value "$metrics_path" shard_backfill_shards_written_total)"
-    reset_min_completed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_succeeded)"
+    reset_min_completed="$(latest_metric_sample_value "$metrics_path" shard_backfill_complete_succeeded_total)"
     reset_min_routine_admitted="$(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event admitted class routine_backfill)"
     reset_min_routine_finished="$(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event finished class routine_backfill)"
     reset_max_candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
     reset_max_scan_error="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_error_total)"
-    reset_max_complete_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_failed)"
-    reset_max_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event failed)"
-    reset_max_record_error_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event record_error_failed)"
+    reset_max_complete_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_complete_failed_total)"
+    reset_max_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_failed_total)"
+    reset_max_record_error_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_record_error_failed_total)"
     wait_for_shard_backfill_completion_metrics \
         "$metrics_path" \
         20 \
@@ -2851,8 +2843,6 @@ run_pg_backfill_migration_smoke() {
     local max_complete_failed
     local max_failed
     local max_record_error_failed
-    local min_pg_backfilled
-    local min_pg_completed
     local old_placement_floor_max_epoch
     old_placement_floor_max_epoch="$(latest_metric_sample_value "$metrics_path" frontend_storage_cluster_epoch)"
     local old_floor_nodes_needing_signal=()
@@ -2867,11 +2857,9 @@ run_pg_backfill_migration_smoke() {
     min_scan_total="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_total)"
     min_enqueued="$(($(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_enqueued_total) + 1))"
     min_written="$(($(latest_metric_sample_value "$metrics_path" shard_backfill_shards_written_total) + 1))"
-    min_completed="$(($(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_succeeded) + 1))"
+    min_completed="$(($(latest_metric_sample_value "$metrics_path" shard_backfill_complete_succeeded_total) + 1))"
     min_routine_admitted="$(($(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event admitted class routine_backfill) + 1))"
     min_routine_finished="$(($(latest_metric_family_label_sum "$metrics_path" background_work_admission_by_class_total event finished class routine_backfill) + 1))"
-    min_pg_backfilled="$(($(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total pg_id "$data_pg" event backfilled) + 1))"
-    min_pg_completed="$(($(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total pg_id "$data_pg" event complete_succeeded) + 1))"
 
     set_pg_acting_set "desired placement nodes 0,2" "$data_pg" 0 2
     wait_for_target_pg_runtime_installed "$data_pg" "0:2" 20 "$metrics_path"
@@ -2889,9 +2877,9 @@ run_pg_backfill_migration_smoke() {
     fi
     max_candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
     max_scan_error="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_error_total)"
-    max_complete_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_failed)"
-    max_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event failed)"
-    max_record_error_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event record_error_failed)"
+    max_complete_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_complete_failed_total)"
+    max_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_failed_total)"
+    max_record_error_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_record_error_failed_total)"
 
     echo "== argmin-s3 UAT PG backfill historical read after acting-set change =="
     print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
@@ -2921,9 +2909,7 @@ run_pg_backfill_migration_smoke() {
         "$max_complete_failed" \
         "$max_failed" \
         "$max_record_error_failed" \
-        "$data_pg" \
-        "$min_pg_backfilled" \
-        "$min_pg_completed"
+        "$data_pg"
 
     echo "== argmin-s3 UAT PG backfill post-backfill reads =="
     print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
@@ -3268,9 +3254,9 @@ assert_pg_backfill_migration_final_clean() {
     queue_depth="$(latest_metric_sample_value "$metrics_path" shard_backfill_queue_depth)"
     candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
     scan_error="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_error_total)"
-    complete_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_failed)"
-    failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event failed)"
-    record_error_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event record_error_failed)"
+    complete_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_complete_failed_total)"
+    failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_failed_total)"
+    record_error_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_record_error_failed_total)"
     if ((queue_depth != 0 || candidate_failed > max_candidate_failed || scan_error > max_scan_error || complete_failed > max_complete_failed || failed > max_failed || record_error_failed > max_record_error_failed)); then
         cat "$metrics_path" >&2 || true
         die "PG backfill smoke left hard-failure state: queue_depth=$queue_depth candidate_failed=$candidate_failed scan_error=$scan_error complete_failed=$complete_failed failed=$failed record_error_failed=$record_error_failed"
@@ -3314,9 +3300,9 @@ elif [[ "$smoke" == "pg-backfill-migration" ]]; then
     sample_frontend_metrics "$pg_backfill_metrics_log"
     pg_backfill_initial_candidate_failed="$(latest_metric_sample_value "$pg_backfill_metrics_log" shard_backfill_candidate_failed_total)"
     pg_backfill_initial_scan_error="$(latest_metric_sample_value "$pg_backfill_metrics_log" shard_backfill_candidate_scan_error_total)"
-    pg_backfill_initial_complete_failed="$(latest_metric_family_label_sum "$pg_backfill_metrics_log" shard_backfill_event_by_pg_total event complete_failed)"
-    pg_backfill_initial_failed="$(latest_metric_family_label_sum "$pg_backfill_metrics_log" shard_backfill_event_by_pg_total event failed)"
-    pg_backfill_initial_record_error_failed="$(latest_metric_family_label_sum "$pg_backfill_metrics_log" shard_backfill_event_by_pg_total event record_error_failed)"
+    pg_backfill_initial_complete_failed="$(latest_metric_sample_value "$pg_backfill_metrics_log" shard_backfill_complete_failed_total)"
+    pg_backfill_initial_failed="$(latest_metric_sample_value "$pg_backfill_metrics_log" shard_backfill_failed_total)"
+    pg_backfill_initial_record_error_failed="$(latest_metric_sample_value "$pg_backfill_metrics_log" shard_backfill_record_error_failed_total)"
     for ((iteration = 1; iteration <= repeat_count; iteration++)); do
         run_pg_backfill_migration_smoke "$iteration"
     done
