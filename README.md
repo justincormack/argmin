@@ -2,10 +2,18 @@
 
 S3-compatible object storage written in Rust.
 
+Current status: not yet suited for production use, fine for local use cases like CI. There is
+still work to do to get this production ready, see [plans](plans/] for details.
+
+AI notice: this code was written with AI, with detailed care, attention and supervision.
+
+Development has focused on correctness, security and data safety over raw performance. 
+
 ## Prerequisites
 
-- **Rust** toolchain (2021 edition)
-- **Unix/Linux** runtime platform.
+- Rust toolchain (2021 edition)
+- Unix/Linux runtime platform
+- amd64 or aarch64 architecture
 
 ## Build
 
@@ -175,14 +183,22 @@ aws --endpoint-url http://127.0.0.1:9000 s3api delete-bucket --bucket my-bucket
 All requests must use `--endpoint-url`. The AWS CLI uses path-style addressing
 by default for custom endpoints.
 
-## Supported S3 operations
+## AWS S3 compatibility
 
-See [AWS compatibility guide](guides/aws-compatibility.md) for details of incompatibilities.
+In general there is a very high degree of compatibility to S3, with a very comprehensive test suite.
+
+See [AWS compatibility guide](guides/aws-compatibility.md) for details of known incompatibilities.
 
 Key compatibility notes
-- Implements standard S3 buckets, not directory buckets and other types
-- Does not yet support SSE-KMS, only SSE-S3 and SSE-C as does not have key management yet
-- Minimal user management and support for dynamic credentials, only early stage work on this 
+- Implements standard S3 buckets, not directory buckets and other types.
+- Does not yet support SSE-KMS, only SSE-S3 and SSE-C as does not have key management yet.
+- Minimal user management and support for dynamic credentials, only early stage work on this.
+- Bucket policies based on user details, tags etc are also limited due to this.
+
+## Operations
+
+Currently operational observability and tooling remains weak. Functions such as adding storage are not
+yet implemented, hence the "do not use in production" notice.
 
 ## Testing
 
