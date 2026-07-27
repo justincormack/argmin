@@ -1132,7 +1132,11 @@ impl Coordinator {
     }
 
     /// List parts of an in-progress multipart upload.
-    pub fn list_parts(&self, req: &ListPartsRequest) -> Result<ListPartsResult, ServerError> {
+    pub fn list_parts_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &ListPartsRequest,
+    ) -> Result<ListPartsResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::list_parts",
@@ -1142,18 +1146,25 @@ impl Coordinator {
             req.upload.upload_id(),
             req.max_parts
         );
+        self.require_storage_route_admission(admission)?;
+        let multipart_route = admission
+            .active_multipart_object_route(req.upload.bucket_name_typed(), req.upload.key_typed())
+            .map_err(super::map_store_error)?;
         let AuthorizedListParts {
             bucket_info,
             upload: authorized_upload,
-        } = self.authorize_list_parts(req)?;
-        let listed = self
-            .storage_node()
+        } = self.authorize_list_parts_on_admitted_route(admission, req)?;
+        #[cfg(test)]
+        super::maybe_run_list_parts_authorized_hook(req.upload.bucket_name(), req.upload.key());
+        let listed = multipart_route
             .list_multipart_parts_for_authorized_upload(
                 &authorized_upload,
                 req.part_number_marker,
                 req.max_parts,
             )
             .map_err(Self::map_object_pg_action_error)?;
+        #[cfg(test)]
+        super::maybe_run_list_parts_storage_list_hook(req.upload.bucket_name(), req.upload.key());
         let upload = listed.upload;
         let resp = listed.response;
         let upload_initiated_at = upload.initiated_at;
@@ -1188,12 +1199,19 @@ impl Coordinator {
             initiator: upload.initiator.clone(),
             checksum_algorithm,
             checksum_type,
-            lifecycle_abort: self.multipart_lifecycle_abort_headers(
+            lifecycle_abort: self.multipart_lifecycle_abort_headers_on_admitted_route(
+                admission,
                 &bucket_info,
                 upload.key.as_str(),
                 upload_initiated_at,
             )?,
         })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn list_parts(&self, req: &ListPartsRequest) -> Result<ListPartsResult, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.list_parts_on_admitted_route(&admission, req)
     }
 
     /// List in-progress multipart uploads for a bucket.

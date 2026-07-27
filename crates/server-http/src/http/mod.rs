@@ -3498,19 +3498,20 @@ impl HttpFrontend {
                 let upload_id =
                     parse_required_upload_id(req.query_param_lossy("uploadId").as_deref())?;
                 let requester = self.requester_from_auth(auth, req)?;
-                let result =
-                    self.coordinator
-                        .list_parts(&crate::coordinator::ListPartsRequest {
-                            upload: multipart_object_request(
-                                &bucket,
-                                &key,
-                                upload_id.clone(),
-                                requester,
-                                expected_bucket_owner,
-                            )?,
-                            part_number_marker,
-                            max_parts,
-                        })?;
+                let result = self.coordinator.list_parts_on_admitted_route(
+                    storage_route_admission,
+                    &crate::coordinator::ListPartsRequest {
+                        upload: multipart_object_request(
+                            &bucket,
+                            &key,
+                            upload_id.clone(),
+                            requester,
+                            expected_bucket_owner,
+                        )?,
+                        part_number_marker,
+                        max_parts,
+                    },
+                )?;
                 let owner = xml::RenderedCanonicalUser {
                     canonical_id: result.owner.canonical_id.clone(),
                     display_name: None,

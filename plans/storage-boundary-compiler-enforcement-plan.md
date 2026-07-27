@@ -3081,6 +3081,41 @@ Sixty-sixth Phase 3 slice:
   coordinator workflows and capability requirements on node-client traits
   also remain open in Phase 3.
 
+Sixty-seventh Phase 3 slice:
+
+- ListParts now consumes the buffered request's existing
+  `StorageClusterRouteAdmission` from HTTP dispatch through bucket/upload
+  authorization, object-PG part listing, and lifecycle response-header lookup.
+  Production coordinator code cannot resample the renewable runtime-map
+  handle; direct test/test-support wrappers acquire an admission before
+  entering the same path.
+- `ActiveMultipartObjectRoute` now owns the authorized ListParts read for its
+  fixed bucket, key, object-metadata PG, publication domain, runtime-map
+  generation, and immutable admitted deadline. The raw cluster wrapper is
+  test/test-hook only, and a crossed same-PG authorized upload is rejected
+  before node access.
+- ListParts authorization resolves the bucket summary and upload-management
+  record through admitted capabilities. Lifecycle response headers are loaded
+  through the same admission after the part listing, so neither the primary
+  read nor this later bucket-subresource read can silently adopt a same-epoch
+  renewal or a newly published runtime map.
+- deterministic same-epoch-renewal regressions expire the original admission
+  once after authorization and once after the object-PG list. They require
+  `OperationAborted` at the respective storage boundary, preserve the upload,
+  and then prove a fresh admission returns the empty listing and captured
+  lifecycle abort rule. A runtime-map publication race proves the admitted
+  request completes against its pinned map before publication proceeds.
+- same-cluster/different-publication-domain and crossed-object-subject
+  regressions prove rejection before node access while positive canaries use
+  the owning coordinator and correctly routed subject.
+- all 27 focused ListParts/storage/HTTP tests pass. Formatting, diff
+  validation, the storage boundary checker, workspace-wide strict Clippy, and
+  the full parallel workspace suite pass (7,617 tests).
+- CompleteMultipartUpload and the remaining multipart control/read operations
+  remain open for the same capability family. Other buffered coordinator
+  workflows and capability requirements on node-client traits also remain
+  open in Phase 3.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

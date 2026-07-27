@@ -1256,6 +1256,218 @@ fn multipart_abort_expires_at_pending_install_effect_boundary() {
 }
 
 #[test]
+fn list_parts_expires_after_authorization_and_uses_admitted_lifecycle_route() {
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    put_bucket_lifecycle_test(
+        &coord,
+        "bucket",
+        "<LifecycleConfiguration><Rule><ID>abort-mpu</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
+        test_requester(),
+        None,
+    )
+    .unwrap();
+    let metadata = MetadataBlob::new();
+    let upload_id = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                "bucket",
+                "logs/listed",
+                test_requester(),
+                None,
+            ),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            encryption: WriteEncryptionRequest::none(),
+        })
+        .unwrap()
+        .upload_id;
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let request = ListPartsRequest {
+        upload: multipart_object_request_with_expected_owner(
+            "bucket",
+            "logs/listed",
+            &upload_id,
+            test_requester(),
+            None,
+        ),
+        part_number_marker: None,
+        max_parts: 1_000,
+    };
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_clock = Arc::clone(&clock);
+    let hook = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some(("bucket".to_string(), "logs/listed".to_string())),
+        after_list_parts_authorized: Some(Arc::new(move || hook_clock.set(4_500))),
+        ..ReclamationTestHooks::default()
+    });
+    let error = coord
+        .list_parts_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(hook);
+    drop(admission);
+    assert_eq!(
+        cluster
+            .load_in_progress_multipart_upload(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("logs/listed"),
+                &upload_id,
+            )
+            .unwrap()
+            .upload_id,
+        upload_id
+    );
+
+    clock.set(1_000);
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let lifecycle_admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let hook_clock = Arc::clone(&clock);
+    let lifecycle_hook = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some(("bucket".to_string(), "logs/listed".to_string())),
+        after_list_parts_storage_list: Some(Arc::new(move || hook_clock.set(4_500))),
+        ..ReclamationTestHooks::default()
+    });
+    let error = coord
+        .list_parts_on_admitted_route(&lifecycle_admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(lifecycle_hook);
+    drop(lifecycle_admission);
+
+    clock.set(1_000);
+    let fresh_admission = coord.admit_storage_route_for_request().unwrap();
+    let listed = coord
+        .list_parts_on_admitted_route(&fresh_admission, &request)
+        .unwrap();
+    assert!(listed.parts.is_empty());
+    let lifecycle = listed
+        .lifecycle_abort
+        .expect("admitted lifecycle snapshot should produce abort headers");
+    assert_eq!(lifecycle.rule_id.as_deref(), Some("abort-mpu"));
+}
+
+#[test]
+fn list_parts_pins_runtime_map_after_authorization() {
+    let bucket = "list-parts-pinned-bucket";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        handle.clone(),
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+        BackgroundWorkerMode::none(),
+    )
+    .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    put_bucket_lifecycle_test(
+        &coord,
+        bucket,
+        "<LifecycleConfiguration><Rule><ID>abort-mpu</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
+        test_requester(),
+        None,
+    )
+    .unwrap();
+    let metadata = MetadataBlob::new();
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                bucket,
+                "logs/archive",
+                test_requester(),
+                None,
+            ),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            encryption: WriteEncryptionRequest::none(),
+        })
+        .unwrap();
+
+    let candidate_tmp = test_util::tempdir();
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
+    let hook_handle = handle.clone();
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), "logs/archive".to_string())),
+        after_list_parts_authorized: Some(Arc::new(move || {
+            let publishing_handle = hook_handle.clone();
+            let publishing_candidate = Arc::clone(&candidate);
+            let thread = thread::spawn(move || {
+                publishing_handle.install(publishing_candidate).unwrap();
+            });
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
+        })),
+        ..ReclamationTestHooks::default()
+    });
+
+    let result = coord
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request_with_expected_owner(
+                bucket,
+                "logs/archive",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number_marker: None,
+            max_parts: 1_000,
+        })
+        .unwrap();
+    assert!(result.parts.is_empty());
+    assert_eq!(
+        result
+            .lifecycle_abort
+            .as_ref()
+            .and_then(|headers| headers.rule_id.as_deref()),
+        Some("abort-mpu")
+    );
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("ListParts hook should start route publication")
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn multipart_creation_uses_admitted_lifecycle_snapshot_after_commit_deadline() {
     let tmp = test_util::tempdir();
     let cluster = open_test_storage_cluster(tmp.path(), &[0]);
@@ -2964,6 +3176,27 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
         .unwrap();
     assert_eq!(uploads.len(), 1);
     assert_eq!(uploads[0].upload_id, created.upload_id);
+
+    let list_request = ListPartsRequest {
+        upload: multipart_object_request_with_expected_owner(
+            "bucket",
+            "foreign-domain-multipart",
+            &created.upload_id,
+            test_requester(),
+            None,
+        ),
+        part_number_marker: None,
+        max_parts: 1_000,
+    };
+    let error = local
+        .list_parts_on_admitted_route(&foreign_admission, &list_request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(foreign
+        .list_parts_on_admitted_route(&foreign_admission, &list_request)
+        .unwrap()
+        .parts
+        .is_empty());
 
     let abort_request = multipart_object_request_with_expected_owner(
         "bucket",

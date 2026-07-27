@@ -14233,6 +14233,7 @@ impl super::StorageCluster {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn list_multipart_parts_for_authorized_upload(
         &self,
         authorized_upload: &AuthorizedMultipartUploadRecord,
@@ -14241,7 +14242,42 @@ impl super::StorageCluster {
     ) -> Result<ListedMultipartParts, ObjectPgActionError> {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
-        let pg_id = self.object_metadata_pg(bucket, key);
+        self.list_multipart_parts_for_authorized_upload_with_route_validation(
+            super::MultipartObjectMutationEffectRoute {
+                pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            authorized_upload,
+            part_number_marker,
+            max_parts,
+            || Ok(()),
+        )
+    }
+
+    pub(super) fn list_multipart_parts_for_authorized_upload_with_route_validation(
+        &self,
+        route: super::MultipartObjectMutationEffectRoute<'_>,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<ListedMultipartParts, ObjectPgActionError> {
+        let super::MultipartObjectMutationEffectRoute {
+            pg_id,
+            bucket,
+            key,
+            effect_fence: _,
+        } = route;
+        if authorized_upload.record().bucket != *bucket || authorized_upload.record().key != *key {
+            return Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "list multipart parts",
+                },
+            ));
+        }
+        require_valid_route().map_err(ObjectPgActionError::Store)?;
         self.object_mutation_metadata_primary_client(bucket, key)?
             .list_multipart_parts_for_authorized_upload(
                 pg_id,

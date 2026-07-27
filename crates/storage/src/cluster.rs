@@ -82,21 +82,21 @@ use crate::types::{
     CreateStreamUploadReq, DeleteCurrentObjectOutcome, DeleteSpecificObjectVersionOutcome,
     DirectPutCommitSnapshot, DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome,
     GenerationId, InsertCurrentDeleteMarkerOutcome, ListedBucketMultipartUploads,
-    ListedBucketObjectVersions, ListedBucketObjects, MultipartUploadManagementLookup,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot,
-    ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord,
-    OwnerIdentity, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
-    PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
-    PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
-    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,
-    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
-    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig,
-    RouteMapValidity, SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey,
-    ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
-    ShardScavengerObservationRecord, ShardScavengerPayloadReference,
-    ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus, StoredObject,
-    StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
-    StreamUploadTarget, UploadId, VersionId, WriteAck, WrittenShardAck,
+    ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartParts,
+    MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEncryption, ObjectKey,
+    ObjectLayout, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome,
+    ObjectRetention, ObjectSegmentRecord, OwnerIdentity, PgId, PgState,
+    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
+    PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
+    PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
+    PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,
+    PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
+    PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig, RouteMapValidity,
+    SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
+    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
+    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus,
+    StoredObject, StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, UploadId, VersionId, WriteAck, WrittenShardAck,
 };
 #[cfg(test)]
 use crate::types::{
@@ -2579,6 +2579,25 @@ impl ActiveMultipartObjectRoute<'_> {
             .lookup_multipart_upload_management_with_route_validation(
                 self.effect_route(),
                 upload_id,
+                || self.admission.require_valid_now(),
+            )
+    }
+
+    /// List parts for the exact upload authorized through this admitted
+    /// object route.
+    pub fn list_multipart_parts_for_authorized_upload(
+        &self,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+    ) -> Result<ListedMultipartParts, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .list_multipart_parts_for_authorized_upload_with_route_validation(
+                self.effect_route(),
+                authorized_upload,
+                part_number_marker,
+                max_parts,
                 || self.admission.require_valid_now(),
             )
     }

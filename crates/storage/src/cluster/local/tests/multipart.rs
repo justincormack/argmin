@@ -128,6 +128,82 @@ fn multipart_abort_route_rejects_a_crossed_object_subject_before_mutation() {
 }
 
 #[test]
+fn list_parts_route_rejects_a_crossed_same_pg_upload_before_node_access() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let (routed_key, crossed_key) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        (
+            key_for_object_pg(topology, &bucket, 1, "routed-key-"),
+            key_for_object_pg(topology, &bucket, 1, "crossed-key-"),
+        )
+    };
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_local_map(map).unwrap());
+    create_test_bucket(&cluster, &bucket);
+
+    let upload_id = upload_id_from_label("crossedlistparts");
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: crossed_key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    cluster
+        .create_multipart_upload(
+            &bucket,
+            &crossed_key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing_object| {
+                assert!(existing_object.is_none());
+                Ok::<_, ()>(((), create.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &crossed_key, &upload_id)
+        .unwrap();
+
+    let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission
+        .active_multipart_object_route(&bucket, &routed_key)
+        .unwrap();
+    let error = route
+        .list_multipart_parts_for_authorized_upload(
+            &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+            None,
+            1_000,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "list multipart parts",
+        })
+    ));
+}
+
+#[test]
 fn multipart_upload_lookup_fails_closed_while_metadata_pg_is_peering() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

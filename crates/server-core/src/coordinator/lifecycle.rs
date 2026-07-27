@@ -190,13 +190,15 @@ impl Coordinator {
         ))
     }
 
-    pub(super) fn multipart_lifecycle_abort_headers(
+    pub(super) fn multipart_lifecycle_abort_headers_on_admitted_route(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         bucket: &BucketSummary,
         key: &str,
         initiated_at: u64,
     ) -> Result<Option<LifecycleAbortHeaders>, ServerError> {
-        let Some(config) = self.cached_bucket_lifecycle(bucket)? else {
+        let Some(config) = self.cached_bucket_lifecycle_on_admitted_route(admission, bucket)?
+        else {
             return Ok(None);
         };
         Ok(Self::evaluate_multipart_lifecycle_abort_headers(

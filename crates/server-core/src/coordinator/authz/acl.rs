@@ -947,18 +947,34 @@ impl Coordinator {
         Ok(authorized)
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_list_parts(
         &self,
+        req: &ListPartsRequest<'_>,
+    ) -> Result<AuthorizedListParts, ServerError> {
+        let admission = self.admit_storage_route_for_request()?;
+        self.authorize_list_parts_on_admitted_route(&admission, req)
+    }
+
+    pub(in crate::coordinator) fn authorize_list_parts_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &ListPartsRequest<'_>,
     ) -> Result<AuthorizedListParts, ServerError> {
         let bucket = req.upload.bucket_name_typed();
         let key = req.upload.key_typed();
         let upload_id = req.upload.upload_id();
-        let bucket_info =
-            self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
-        match self
-            .storage_node()
-            .lookup_multipart_upload_management(bucket, key, upload_id)
+        self.require_storage_route_admission(admission)?;
+        let multipart_route = admission
+            .active_multipart_object_route(bucket, key)
+            .map_err(super::super::map_store_error)?;
+        let bucket_info = self.checked_active_bucket_summary_for_admitted_route(
+            admission,
+            bucket,
+            req.expected_bucket_owner(),
+        )?;
+        match multipart_route
+            .lookup_multipart_upload_management(upload_id)
             .map_err(Self::map_object_pg_action_error)?
         {
             storage::MultipartUploadManagementLookup::InProgress(upload) => {
