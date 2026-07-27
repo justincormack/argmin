@@ -1,17 +1,11 @@
 # argmin
 
-S3-compatible object storage written in Rust. Single-process local cluster,
-synchronous IO, erasure-coded with native Rust backends.
-
-This is the v1-minimal implementation: path-style addressing, AWS SigV4
-authentication, per-PG SQLite metadata, and CRC64-NVME integrity checking.
+S3-compatible object storage written in Rust.
 
 ## Prerequisites
 
 - **Rust** toolchain (2021 edition)
-- **Unix/Linux** runtime platform. The server uses Unix domain sockets, POSIX
-  file permissions, and Unix process ownership checks. Windows support would be
-  a separate port with dedicated CI coverage.
+- **Unix/Linux** runtime platform.
 
 ## Build
 
@@ -148,29 +142,6 @@ If you want to enable SSE-C, set a stable validator secret as well:
 ARGMIN_SSE_C_VALIDATOR_KEY='<base64-encoded-32-byte-secret>'
 ```
 
-## In-Progress Local Multihost Harness
-
-`ARGMIN_LOCAL_NODE_COUNT` is part of the multihost transition work. The default
-is derived from the configured EC shape, so the default `4+2` shape starts `6`
-local storage nodes. Each node gets its own data directory below
-`ARGMIN_DATA_DIR`, using stable numeric node IDs:
-
-```text
-ARGMIN_DATA_DIR/
-  node-0000/
-  node-0001/
-  node-0002/
-```
-
-Local multihost mode requires enough local nodes to place the configured EC
-shape on distinct nodes. `ARGMIN_LOCAL_NODE_COUNT` must be at least
-`ARGMIN_EC_K + ARGMIN_EC_M`.
-
-This mode is intended for local development and tests while the distributed
-storage path is being built. It does not yet add RPC, internal auth, failure
-detection, or distributed shard placement. Request routing still uses the
-current metadata-primary/local-node forwarding behavior for this phase.
-
 ## Usage with AWS CLI
 
 ```bash
@@ -183,7 +154,7 @@ export AWS_DEFAULT_REGION=us-east-1
 aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket --bucket my-bucket
 
 # Upload a file
-echo "Hello, argmin2!" > /tmp/hello.txt
+echo "Hello, argmin!" > /tmp/hello.txt
 aws --endpoint-url http://127.0.0.1:9000 s3 cp /tmp/hello.txt s3://my-bucket/hello.txt
 
 # List objects
@@ -206,45 +177,20 @@ by default for custom endpoints.
 
 ## Supported S3 operations
 
-| Operation | Method | Path |
-|---|---|---|
-| ListBuckets | `GET` | `/` |
-| CreateBucket | `PUT` | `/<bucket>` |
-| DeleteBucket | `DELETE` | `/<bucket>` |
-| HeadBucket | `HEAD` | `/<bucket>` |
-| ListObjectsV2 | `GET` | `/<bucket>` |
-| PutObject | `PUT` | `/<bucket>/<key>` |
-| GetObject | `GET` | `/<bucket>/<key>` |
-| DeleteObject | `DELETE` | `/<bucket>/<key>` |
-| HeadObject | `HEAD` | `/<bucket>/<key>` |
+See [AWS compatibility guide](guides/aws-compatibility.md) for details of incompatibilities.
 
-## Architecture
+Key compatibility notes
+- Implements standard S3 buckets, not directory buckets and other types
+- Does not yet support SSE-KMS, only SSE-S3 and SSE-C as does not have key management yet
+- Minimal user management and support for dynamic credentials, only early stage work on this 
 
-- **Erasure coding**: (4,2) Reed-Solomon via native Rust backends
-- **Storage**: per-placement-group SQLite metadata + shard files
-- **Integrity**: CRC64-NVME on every read; mismatches quarantine the shard
-- **Auth**: AWS Signature Version 4
-- **ETag**: CRC64-NVME (not MD5)
-
-## Limits
-
-| Limit | Value |
-|---|---|
-| Max object size | 256 MB |
-| Bucket name length | 3-63 characters |
-| Object key length | 1-1024 bytes |
-| Addressing | Path-style only |
-
-Bucket names must be lowercase letters, digits, hyphens, or periods. No leading
-or trailing hyphens, no consecutive periods, and not formatted as an IP address.
-
-## Tests
+## Testing
 
 ```bash
-cargo test --workspace
+cargo nextest run
 ```
 
-To run `s3-tests` against an external endpoint such as AWS S3:
+To run `s3-tests`, the S3 oracle test against AWS:
 
 ```bash
 ./scripts/aws-tests
@@ -262,15 +208,6 @@ To run the same suite against an already-built binary:
 ```bash
 ./scripts/uat-s3-tests --binary ./target/debug/argmin-s3
 ```
-
-The UAT wrapper starts `argmin-s3` with a temporary data directory, repository
-test TLS certificate, and the UAT-only credentials listed above, then runs
-`s3-tests` against that process as an external endpoint.
-
-External `s3-tests` runs now fail fast if the alternate credentials, account
-IDs, or bucket prefix are missing. For AWS S3, the alternate credentials must
-belong to a different AWS account with a different S3 canonical owner ID. A
-second IAM user in the same AWS account is not sufficient.
 
 Full AWS environment setup, including the committed IAM policy, required
 account-level S3 Block Public Access settings, the separate HTTP-only
