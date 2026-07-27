@@ -228,6 +228,7 @@ regression command still needs to be mapped or tightened.
 
 | Finding | Status | Local deterministic path | Notes |
 | --- | --- | --- | --- |
+| `security/TOCTOU-001.md` Data-directory privacy check uses path-based metadata and chmod | invalid | `cargo nextest run -p argmin-s3 --bin argmin-s3 -E 'test(static_cluster_filesystem_validation_rejects_local_symlink_traversal) \| test(static_cluster_filesystem_validation_rejects_insecure_local_path)'` | Invalid under the documented filesystem trust boundary. Static-manifest production paths reject symlinked, wrong-owner, cross-device, and group/other-writable components; exploiting the legacy helper requires an attacker-replaceable data-directory parent, which is already an unsupported deployment. A final-directory fd alone would not protect later path-based state operations. |
 | `security/codex-2cf85f1` AArch64 PMULL CRC path enabled without PMULL feature check | invalid | `./scripts/security-tests integrity` | Invalid finding; retained here so the low-level integrity surface is still tracked. |
 | `security/codex-32d164e` AArch64 CRC fast path lacks PMULL feature gating | invalid | `./scripts/security-tests integrity` | Invalid finding; retained here so the low-level integrity surface is still tracked. |
 | `security/codex-6e5f441` POST object ignores SSE-C headers, storing data unencrypted | invalid | `./scripts/security-tests transport integrity` | Invalid finding; SSE-C transport behavior remains covered under local transport tests and AWS oracle suites. |
