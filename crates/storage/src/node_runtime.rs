@@ -191,13 +191,14 @@ pub(super) mod client_facade {
 
 pub(super) mod server_facade {
     pub use super::server::{
-        initialize_storage_node_state, storage_node_control_plane_heartbeat_interval,
-        validate_storage_node_process_configs, PreparedStorageNodeServer, StorageNodeBootstrap,
-        StorageNodeControlPlaneRefresh, StorageNodeControlPlaneRefreshLoop,
-        StorageNodeControlPlaneRefreshLoopStatus, StorageNodePgRoute, StorageNodeProcessConfig,
-        StorageNodeProcessConfigParts, StorageNodeRpcListenerConfig, StorageNodeServer,
-        StorageNodeServerError, StorageNodeStateInitializationGuard,
-        STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MAX_INTERVAL_MS,
+        initialize_storage_node_state, inspect_initialized_storage_node_state,
+        storage_node_control_plane_heartbeat_interval, validate_storage_node_process_configs,
+        PreparedStorageNodeServer, StorageNodeBootstrap, StorageNodeControlPlaneRefresh,
+        StorageNodeControlPlaneRefreshLoop, StorageNodeControlPlaneRefreshLoopStatus,
+        StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeProcessConfigParts,
+        StorageNodeRpcListenerConfig, StorageNodeServer, StorageNodeServerError,
+        StorageNodeStateDiagnostic, StorageNodeStateInitializationGuard,
+        StorageNodeStateInspection, STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MAX_INTERVAL_MS,
         STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS,
         STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_USABLE_LEASE_MS,
         STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME,
@@ -208,14 +209,13 @@ pub(super) mod pg_store_facade {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) use super::pg_store::PgStore;
     pub use super::pg_store::{
-        initialize_pg_durable_identity, inspect_pg_shard_inventory, verify_pg_durable_identity,
         MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
         MetadataCheckpointValue, MetadataCommandCheckpoint,
         MetadataCommandCheckpointValidationError, MetadataCommandLogCompactionStatus,
         MetadataCommandLogStats, PgClusterMapHistoryReferenceSummary,
         PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind,
-        PgClusterMapHistoryRouteReferences, PgShardInventoryInspection,
-        MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES, MAX_PG_DURABLE_IDENTITY_BYTES,
+        PgClusterMapHistoryRouteReferences, MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
+        MAX_PG_DURABLE_IDENTITY_BYTES,
     };
     pub(crate) use super::pg_store::{
         ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow,

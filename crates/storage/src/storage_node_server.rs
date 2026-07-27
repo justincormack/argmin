@@ -53,7 +53,10 @@ use crate::node_client::{
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, ShardAckNodeClient,
     ShardScavengerNodeClient,
 };
-use crate::node_runtime::pg_store::{MetadataCommandCheckpoint, PgStore};
+use crate::node_runtime::pg_store::{
+    initialize_pg_durable_identity, inspect_pg_shard_inventory, sync_initialized_pg_store_layout,
+    verify_pg_durable_identity, MetadataCommandCheckpoint, PgStore,
+};
 use crate::node_runtime::traits::DurableBucketWriteReservationAcquire;
 use crate::node_runtime::traits::ShardStore;
 use crate::storage_rpc::{
@@ -1496,6 +1499,45 @@ fn maybe_emit_storage_rpc_error(node_id: NodeId, kind: StorageRpcMessageKind, pa
     );
 }
 
+/// Opaque retained implementation diagnostic for invalid initialized PG state.
+///
+/// The storage crate can preserve the underlying cause for internal diagnosis
+/// without exposing its database or filesystem error taxonomy to callers.
+pub struct StorageNodeStateDiagnostic {
+    _implementation_error: StorageNodeStateImplementationError,
+}
+
+impl StorageNodeStateDiagnostic {
+    fn from_store(implementation_error: StoreError) -> Self {
+        Self {
+            _implementation_error: StorageNodeStateImplementationError::Store {
+                _error: implementation_error,
+            },
+        }
+    }
+
+    fn from_io(implementation_error: io::Error) -> Self {
+        Self {
+            _implementation_error: StorageNodeStateImplementationError::Io {
+                _error: implementation_error,
+            },
+        }
+    }
+}
+
+enum StorageNodeStateImplementationError {
+    Store { _error: StoreError },
+    Io { _error: io::Error },
+}
+
+impl std::fmt::Debug for StorageNodeStateDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StorageNodeStateDiagnostic")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageNodeServerError {
     #[error("storage-node PG set must not be empty")]
@@ -1652,6 +1694,17 @@ pub enum StorageNodeServerError {
         locked_path: PathBuf,
         config_path: PathBuf,
     },
+    #[error("storage-node PG {pg_id} initialized durable state is invalid")]
+    InitializedPgStateInvalid {
+        pg_id: u32,
+        diagnostic: StorageNodeStateDiagnostic,
+    },
+    #[error("storage-node initialized durable state is invalid")]
+    InitializedStorageNodeStateInvalid {
+        diagnostic: StorageNodeStateDiagnostic,
+    },
+    #[error("storage-node PG {pg_id} has incomplete authoritative payload inventory")]
+    InitializedPgPayloadIncomplete { pg_id: u32 },
     #[error("storage-node I/O error during {context} for {path:?}: {source}")]
     Io {
         context: &'static str,
@@ -1945,6 +1998,45 @@ impl StorageNodeStateInitializationGuard {
     }
 }
 
+/// Semantic inspection of a configured storage node's durable PG state.
+///
+/// Physical PG paths, metadata-store representation, and shard-tree layout are
+/// deliberately owned by this module and are not exposed to process startup.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StorageNodeStateInspection {
+    incomplete_payload_pg_ids: Vec<u32>,
+}
+
+impl StorageNodeStateInspection {
+    #[must_use]
+    pub fn incomplete_payload_pg_ids(&self) -> &[u32] {
+        &self.incomplete_payload_pg_ids
+    }
+}
+
+/// Inspect every configured PG without creating or migrating durable state.
+pub fn inspect_initialized_storage_node_state(
+    data_dir: &Path,
+    pg_ids: &[u32],
+    expected_durable_identity: &[u8],
+) -> Result<StorageNodeStateInspection, StorageNodeServerError> {
+    validate_pg_ids(pg_ids)?;
+    let mut incomplete_payload_pg_ids = Vec::new();
+    for &pg_id in pg_ids {
+        let pg_dir = storage_node_pg_dir(data_dir, pg_id);
+        verify_pg_durable_identity(&pg_dir, pg_id, expected_durable_identity)
+            .map_err(|source| invalid_initialized_pg_state(pg_id, source))?;
+        let inventory = inspect_pg_shard_inventory(&pg_dir, pg_id)
+            .map_err(|source| invalid_initialized_pg_state(pg_id, source))?;
+        if !inventory.authoritative_inventory_is_complete() {
+            incomplete_payload_pg_ids.push(pg_id);
+        }
+    }
+    Ok(StorageNodeStateInspection {
+        incomplete_payload_pg_ids,
+    })
+}
+
 /// Initialize the durable PG state owned by one storage-node process.
 ///
 /// This is the explicit first-initialization boundary used before publishing
@@ -1958,15 +2050,63 @@ pub fn initialize_storage_node_state(
     pg_ids: &[u32],
     default_ec_shape: EcShape,
     initial_cluster_epoch: ClusterEpoch,
+    durable_identity: &[u8],
 ) -> Result<(), StorageNodeServerError> {
     let node = SharedStorageNode::open_with_default_ec_shape_and_epoch(
         initialization_guard.data_dir(),
         pg_ids,
         default_ec_shape,
         initial_cluster_epoch,
-    )?;
+    )
+    .map_err(invalid_initialized_storage_node_state)?;
     node.recover_pg_metadata_command_state(node_id)
-        .map_err(StorageNodeServerError::from)
+        .map_err(invalid_initialized_storage_node_state)?;
+    drop(node);
+
+    for &pg_id in pg_ids {
+        let pg_dir = storage_node_pg_dir(initialization_guard.data_dir(), pg_id);
+        initialize_pg_durable_identity(&pg_dir, pg_id, durable_identity)
+            .map_err(|source| invalid_initialized_pg_state(pg_id, source))?;
+    }
+    let inspection = inspect_initialized_storage_node_state(
+        initialization_guard.data_dir(),
+        pg_ids,
+        durable_identity,
+    )?;
+    if let Some(&pg_id) = inspection.incomplete_payload_pg_ids().first() {
+        return Err(StorageNodeServerError::InitializedPgPayloadIncomplete { pg_id });
+    }
+    for &pg_id in pg_ids {
+        let pg_dir = storage_node_pg_dir(initialization_guard.data_dir(), pg_id);
+        sync_initialized_pg_store_layout(&pg_dir, pg_id)
+            .map_err(|source| invalid_initialized_pg_state(pg_id, source))?;
+    }
+    File::open(initialization_guard.data_dir())
+        .and_then(|directory| directory.sync_all())
+        .map_err(invalid_initialized_storage_node_state_io)
+}
+
+fn storage_node_pg_dir(data_dir: &Path, pg_id: u32) -> PathBuf {
+    data_dir.join(format!("pg-{pg_id:04}"))
+}
+
+fn invalid_initialized_pg_state(pg_id: u32, source: StoreError) -> StorageNodeServerError {
+    StorageNodeServerError::InitializedPgStateInvalid {
+        pg_id,
+        diagnostic: StorageNodeStateDiagnostic::from_store(source),
+    }
+}
+
+fn invalid_initialized_storage_node_state(source: StoreError) -> StorageNodeServerError {
+    StorageNodeServerError::InitializedStorageNodeStateInvalid {
+        diagnostic: StorageNodeStateDiagnostic::from_store(source),
+    }
+}
+
+fn invalid_initialized_storage_node_state_io(source: io::Error) -> StorageNodeServerError {
+    StorageNodeServerError::InitializedStorageNodeStateInvalid {
+        diagnostic: StorageNodeStateDiagnostic::from_io(source),
+    }
 }
 
 impl StorageNodeBootstrap {
@@ -18625,6 +18765,7 @@ mod tests {
 
     #[test]
     fn storage_node_state_initialization_uses_configured_epoch_and_ec_shape() {
+        const TEST_IDENTITY: &[u8] = b"storage-node-test-identity";
         let tmp = test_util::tempdir();
         let data_dir = tmp.path().join("node");
         let initial_epoch = ClusterEpoch::new(7).unwrap();
@@ -18637,6 +18778,7 @@ mod tests {
             &[0, 3],
             ec_shape,
             initial_epoch,
+            TEST_IDENTITY,
         )
         .unwrap();
         drop(initialization_guard);
@@ -18647,8 +18789,14 @@ mod tests {
             &[0, 3],
             ec_shape,
             initial_epoch,
+            TEST_IDENTITY,
         )
         .unwrap();
+
+        assert_eq!(
+            inspect_initialized_storage_node_state(&data_dir, &[0, 3], TEST_IDENTITY).unwrap(),
+            StorageNodeStateInspection::default()
+        );
 
         for pg_id in [0, 3] {
             let store = PgStore::open(&data_dir.join(format!("pg-{pg_id:04}")), pg_id).unwrap();
@@ -18663,6 +18811,32 @@ mod tests {
         let reopened =
             SharedStorageNode::open_with_default_ec_shape(&data_dir, &[0, 3], ec_shape).unwrap();
         assert_eq!(reopened.default_ec_shape(), ec_shape);
+    }
+
+    #[test]
+    fn initialized_pg_state_error_keeps_implementation_diagnostic_opaque() {
+        let tmp = test_util::tempdir();
+
+        let error = inspect_initialized_storage_node_state(
+            &tmp.path().join("missing-node"),
+            &[3],
+            b"storage-node-test-identity",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            StorageNodeServerError::InitializedPgStateInvalid { pg_id: 3, .. }
+        ));
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(
+            error.to_string(),
+            "storage-node PG 3 initialized durable state is invalid"
+        );
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("StoreError"));
+        assert!(!debug.contains("PgDurableIdentityInvalid"));
+        assert!(!debug.contains("PG directory is unavailable"));
     }
 
     #[test]

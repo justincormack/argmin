@@ -12,9 +12,9 @@
 /// ```
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
-use std::fs;
-use std::io::Write;
-use std::os::unix::fs::MetadataExt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -146,6 +146,7 @@ pub struct PgClusterMapHistoryReferenceSummary {
 
 pub const MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES: usize = 4096;
 pub const MAX_PG_DURABLE_IDENTITY_BYTES: usize = 1024;
+const SQLITE_FILE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 
 /// Read-only comparison of the durable shard index with the local shard tree.
 ///
@@ -154,7 +155,7 @@ pub const MAX_PG_DURABLE_IDENTITY_BYTES: usize = 1024;
 /// replicated node may keep the PG active and repair an incomplete local
 /// payload inventory through EC reconstruction.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PgShardInventoryInspection {
+pub(crate) struct PgShardInventoryInspection {
     pub shard_row_count: usize,
     pub shard_file_count: usize,
     pub authoritative_missing_file_count: usize,
@@ -166,12 +167,12 @@ pub struct PgShardInventoryInspection {
 
 impl PgShardInventoryInspection {
     /// Whether every authoritative non-deleting shard row has a matching payload.
-    pub fn authoritative_inventory_is_complete(self) -> bool {
+    pub(crate) fn authoritative_inventory_is_complete(self) -> bool {
         self.authoritative_missing_file_count == 0 && self.authoritative_size_mismatch_count == 0
     }
 
     /// Whether crash residue remains for the PG recovery/scavenger path.
-    pub fn has_recoverable_residue(self) -> bool {
+    pub(crate) fn has_recoverable_residue(self) -> bool {
         self.recoverable_missing_file_count != 0
             || self.recoverable_size_mismatch_count != 0
             || self.recoverable_unindexed_file_count != 0
@@ -668,7 +669,7 @@ impl PgStoreRecoveryContext {
 /// database was already bound differently. It checkpoints the identity row
 /// into the main database before returning so publishing an outer/root
 /// identity cannot get ahead of the per-PG binding.
-pub fn initialize_pg_durable_identity(
+pub(crate) fn initialize_pg_durable_identity(
     pg_dir: &Path,
     pg_id: u32,
     identity_bytes: &[u8],
@@ -720,13 +721,13 @@ pub fn initialize_pg_durable_identity(
 }
 
 /// Verify a PG database's configured identity without creating or migrating it.
-pub fn verify_pg_durable_identity(
+pub(crate) fn verify_pg_durable_identity(
     pg_dir: &Path,
     pg_id: u32,
     expected_identity_bytes: &[u8],
 ) -> Result<(), StoreError> {
     validate_pg_durable_identity_bytes(pg_id, expected_identity_bytes)?;
-    let conn = open_existing_pg_database_read_only(pg_dir)?;
+    let conn = open_existing_pg_database_read_only(pg_dir, pg_id)?;
     require_current_pg_schema(&conn)?;
     let quick_check = conn
         .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
@@ -777,7 +778,7 @@ pub fn verify_pg_durable_identity(
 /// The caller decides whether an incomplete result is fatal or recoverable.
 /// Structural scan failures remain errors because no trustworthy inventory can
 /// be produced from them.
-pub fn inspect_pg_shard_inventory(
+pub(crate) fn inspect_pg_shard_inventory(
     pg_dir: &Path,
     pg_id: u32,
 ) -> Result<PgShardInventoryInspection, StoreError> {
@@ -808,7 +809,7 @@ pub fn inspect_pg_shard_inventory(
             errors: "shard root is on a different filesystem from its PG directory".to_string(),
         });
     }
-    let conn = open_existing_pg_database_read_only(pg_dir)?;
+    let conn = open_existing_pg_database_read_only(pg_dir, pg_id)?;
     require_current_pg_schema(&conn)?;
     let store = PgStore {
         pg_id,
@@ -892,15 +893,92 @@ fn validate_pg_durable_identity_bytes(pg_id: u32, identity_bytes: &[u8]) -> Resu
     Ok(())
 }
 
-fn open_existing_pg_database_read_only(pg_dir: &Path) -> Result<Connection, StoreError> {
+pub(crate) fn sync_initialized_pg_store_layout(
+    pg_dir: &Path,
+    pg_id: u32,
+) -> Result<(), StoreError> {
+    open_and_validate_existing_pg_database_file(pg_dir, pg_id)?
+        .sync_all()
+        .map_err(|source| StoreError::Io {
+            context: "sync initialized PG metadata store",
+            source,
+        })?;
+    File::open(pg_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| StoreError::Io {
+            context: "sync initialized PG directory",
+            source,
+        })
+}
+
+fn open_existing_pg_database_read_only(
+    pg_dir: &Path,
+    pg_id: u32,
+) -> Result<Connection, StoreError> {
+    drop(open_and_validate_existing_pg_database_file(pg_dir, pg_id)?);
     Connection::open_with_flags(
         pg_dir.join("metadata.db"),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|source| StoreError::Db {
         context: "open existing PG database read-only",
         source: source.into(),
     })
+}
+
+fn open_and_validate_existing_pg_database_file(
+    pg_dir: &Path,
+    pg_id: u32,
+) -> Result<File, StoreError> {
+    let pg_metadata =
+        fs::symlink_metadata(pg_dir).map_err(|source| StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: format!("PG directory is unavailable: {source}"),
+        })?;
+    if pg_metadata.file_type().is_symlink() || !pg_metadata.is_dir() {
+        return Err(StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: "PG path is not a real directory".to_string(),
+        });
+    }
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut file = options.open(pg_dir.join("metadata.db")).map_err(|source| {
+        StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: format!("metadata store is unavailable: {source}"),
+        }
+    })?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: format!("metadata store cannot be inspected: {source}"),
+        })?;
+    if !metadata.is_file() {
+        return Err(StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: "metadata store is not a regular file".to_string(),
+        });
+    }
+    let mut magic = [0_u8; SQLITE_FILE_MAGIC.len()];
+    file.read_exact(&mut magic)
+        .map_err(|source| StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: format!("metadata store has a truncated identity: {source}"),
+        })?;
+    if magic != *SQLITE_FILE_MAGIC {
+        return Err(StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: "metadata store has an invalid identity".to_string(),
+        });
+    }
+    Ok(file)
 }
 
 impl PgStore {
@@ -1306,6 +1384,37 @@ mod durable_identity_tests {
     const TEST_IDENTITY: &[u8] = b"test-static-cluster-identity";
 
     #[test]
+    fn pg_durable_identity_rejects_placeholder_metadata_store() {
+        let temp = test_util::tempdir();
+        fs::write(temp.path().join("metadata.db"), b"").unwrap();
+
+        let error = verify_pg_durable_identity(temp.path(), 3, TEST_IDENTITY).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::PgDurableIdentityInvalid { pg_id: 3, reason }
+                if reason.contains("truncated identity")
+        ));
+    }
+
+    #[test]
+    fn pg_durable_identity_rejects_symlinked_metadata_store() {
+        let temp = test_util::tempdir();
+        initialize_pg_durable_identity(temp.path(), 3, TEST_IDENTITY).unwrap();
+        let external = temp.path().join("external-metadata");
+        fs::rename(temp.path().join("metadata.db"), &external).unwrap();
+        std::os::unix::fs::symlink(&external, temp.path().join("metadata.db")).unwrap();
+
+        let error = verify_pg_durable_identity(temp.path(), 3, TEST_IDENTITY).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::PgDurableIdentityInvalid { pg_id: 3, reason }
+                if reason.contains("metadata store is unavailable")
+        ));
+    }
+
+    #[test]
     fn pg_durable_identity_rejects_unversioned_sqlite_database() {
         let temp = test_util::tempdir();
         fs::create_dir(temp.path().join("shards")).unwrap();
@@ -1350,6 +1459,31 @@ mod durable_identity_tests {
                 recoverable_unindexed_file_count: 0,
             }
         );
+    }
+
+    #[test]
+    fn storage_node_state_inspection_aggregates_incomplete_pg_payloads() {
+        let temp = test_util::tempdir();
+        let pg_dir = temp.path().join("pg-0003");
+        initialize_pg_durable_identity(&pg_dir, 3, TEST_IDENTITY).unwrap();
+        let store = PgStore::open(&pg_dir, 3).unwrap();
+        let key = ShardKey::new(&[7; 16], 11, 0);
+        store.write_shard(&key, b"durable shard payload").unwrap();
+        drop(store);
+        fs::remove_file(PgStore::shard_path_for_shards_dir(
+            &pg_dir.join("shards"),
+            &key,
+        ))
+        .unwrap();
+
+        let inspection = crate::storage_node_server::inspect_initialized_storage_node_state(
+            temp.path(),
+            &[3],
+            TEST_IDENTITY,
+        )
+        .unwrap();
+
+        assert_eq!(inspection.incomplete_payload_pg_ids(), &[3]);
     }
 
     #[test]

@@ -2549,6 +2549,17 @@ fail_with_matches \
     "SQLite and raw PgStore connections are private to the pg_store module" \
     "$database_implementation_leaks"
 
+storage_layout_leaks=$(
+    rg -n --color=never \
+        'SQLite format 3|metadata\.db|"pg-(\{|[0-9])|join\("shards"\)' \
+        crates/argmin-s3/src \
+        -g '*.rs' \
+        || true
+)
+fail_with_matches \
+    "Physical PG directories, metadata-store files, and shard trees are private to storage" \
+    "$storage_layout_leaks"
+
 if [[ "$failed" -ne 0 ]]; then
     echo
     echo "storage cluster boundary checks failed" >&2

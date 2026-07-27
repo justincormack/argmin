@@ -367,11 +367,32 @@ Requirements and open questions:
 
 Until these are answered, do not add rolling-upgrade compatibility code.
 
+## Completed Containment Slices
+
+The storage-owned PG layout slice is complete:
+
+- `storage` now owns configured PG path construction, metadata-store identity checks,
+  durable-identity binding, shard-inventory inspection, and initialization synchronisation
+  behind semantic storage-node initialization and inspection APIs.
+- The low-level PG identity and inventory operations are crate-private. `argmin-s3` no longer
+  knows the PG directory pattern, metadata-store filename or representation, SQLite file
+  identity, or shard-tree layout.
+- Impossible physical-layout tests for placeholder or symlinked metadata stores, missing
+  payloads, unindexed crash residue, and symlinked shard roots are owned by `pg_store`.
+- Storage-node errors retain low-level initialization diagnostics opaquely: callers receive a
+  semantic PG-state error and cannot inspect the underlying `StoreError` or its error chain.
+- `scripts/check-storage-cluster-boundaries` rejects new physical PG, metadata-store, or shard
+  layout knowledge in `argmin-s3`.
+
+Residual containment work includes removing `argmin-s3`'s knowledge of the native
+storage-node data-directory lock filename, completing the RPC/control-plane/Raft ownership
+inventory, hiding WAL and restart-format constructors, and replacing any remaining
+higher-layer implementation-error matching. These remain explicit work below.
+
 ## Immediate Next Steps
 
-1. Complete the persistence ownership boundary: move PG directory/file inspection,
-   SQLite-identity checks, metadata-file synchronisation, and impossible physical-layout tests
-   out of `argmin-s3` and into `storage`.
+1. Remove the native storage-node data-directory lock filename from `argmin-s3`; expose only a
+   semantic storage-owned initialization-directory inspection contract.
 2. Inventory the storage-node, control-plane, and Raft RPC surfaces by owner crate, including
    framing, authentication envelopes, error translation, retry classification, and transport
    setup.

@@ -8632,9 +8632,6 @@ transport_profile_id = "internal"
             .unwrap(),
         );
         assert_eq!(identity.process_id, "storage-1");
-        assert!(pg_ids.iter().all(|pg_id| data_dir
-            .join(format!("pg-{pg_id:04}/metadata.db"))
-            .is_file()));
     }
 
     #[test]

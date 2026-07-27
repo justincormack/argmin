@@ -13,7 +13,6 @@ const STORAGE_INITIALIZING_NEXT_FILE_NAME: &str = ".argmin-static-storage.initia
 const STORAGE_IDENTITY_NEXT_FILE_NAME: &str = ".argmin-static-storage.identity.next";
 const STORAGE_INITIALIZATION_LOCK_FILE_NAME: &str = ".argmin-static-storage.lock";
 const STORAGE_IDENTITY_MAGIC: &[u8; 8] = b"ARGSSID\0";
-const SQLITE_FILE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const STORAGE_IDENTITY_VERSION: u16 = 1;
 const STORAGE_IDENTITY_MAX_BYTES: u64 = 1_024;
 const CONTROL_PLANE_IDENTITY_MAGIC: &[u8; 8] = b"ARGSCPID";
@@ -589,17 +588,9 @@ pub(crate) fn initialize_static_storage(
         pg_ids,
         ec_shape,
         initial_cluster_epoch,
+        &expected_bytes,
     )
     .map_err(|error| format!("initialize static storage node: {error}"))?;
-    for pg_id in pg_ids {
-        storage::initialize_pg_durable_identity(
-            &data_dir.join(format!("pg-{pg_id:04}")),
-            *pg_id,
-            &expected_bytes,
-        )
-        .map_err(|error| format!("bind static storage PG {pg_id} identity: {error}"))?;
-    }
-    sync_initialized_pg_state(data_dir, pg_ids, &expected_bytes)?;
 
     publish_static_storage_identity(data_dir, &expected)?;
     drop(storage_node_initialization_guard);
@@ -614,7 +605,7 @@ pub(crate) fn lock_and_verify_standalone_storage_startup(
 ) -> Result<StaticStorageRuntimeLock, String> {
     let (runtime_lock, inventory) =
         lock_and_inspect_static_storage_startup(identity, storage_node_id, data_dir, pg_ids)?;
-    if let Some(pg_id) = inventory.incomplete_payload_pg_ids.first() {
+    if let Some(pg_id) = inventory.incomplete_payload_pg_ids().first() {
         return Err(format!(
             "static storage PG {pg_id} has incomplete authoritative shard inventory"
         ));
@@ -663,7 +654,12 @@ fn lock_and_inspect_static_storage_startup(
         ));
     }
     verify_static_storage_identity(&identity_path, &expected)?;
-    let inventory = inspect_static_storage_pg_state(data_dir, pg_ids, &expected.encode()?)?;
+    let inventory = storage::storage_node_server::inspect_initialized_storage_node_state(
+        data_dir,
+        pg_ids,
+        &expected.encode()?,
+    )
+    .map_err(|error| format!("inspect static storage node state: {error}"))?;
     remove_completed_initialization_marker(data_dir, &expected)?;
     Ok((
         StaticStorageRuntimeLock {
@@ -826,94 +822,20 @@ fn non_lock_directory_entries(path: &Path) -> Result<impl Iterator<Item = fs::Di
     }))
 }
 
-fn inspect_static_storage_pg_state(
-    data_dir: &Path,
-    pg_ids: &[u32],
-    expected_identity_bytes: &[u8],
-) -> Result<StaticStorageInventoryReport, String> {
-    let mut incomplete_payload_pg_ids = Vec::new();
-    for pg_id in pg_ids {
-        let pg_dir = data_dir.join(format!("pg-{pg_id:04}"));
-        require_real_directory(&pg_dir, "static storage PG directory")?;
-        let metadata_path = pg_dir.join("metadata.db");
-        require_sqlite_metadata_file(&metadata_path, *pg_id)?;
-        storage::verify_pg_durable_identity(&pg_dir, *pg_id, expected_identity_bytes)
-            .map_err(|error| format!("verify static storage PG {pg_id} identity: {error}"))?;
-        let inventory = storage::inspect_pg_shard_inventory(&pg_dir, *pg_id)
-            .map_err(|error| format!("inspect static storage PG {pg_id} inventory: {error}"))?;
-        if !inventory.authoritative_inventory_is_complete() {
-            incomplete_payload_pg_ids.push(*pg_id);
-        }
-    }
-    Ok(StaticStorageInventoryReport {
-        incomplete_payload_pg_ids,
-    })
-}
-
 fn verify_static_storage_pg_state(
     data_dir: &Path,
     pg_ids: &[u32],
     expected_identity_bytes: &[u8],
 ) -> Result<(), String> {
-    let inventory = inspect_static_storage_pg_state(data_dir, pg_ids, expected_identity_bytes)?;
-    if let Some(pg_id) = inventory.incomplete_payload_pg_ids.first() {
+    let inventory = storage::storage_node_server::inspect_initialized_storage_node_state(
+        data_dir,
+        pg_ids,
+        expected_identity_bytes,
+    )
+    .map_err(|error| format!("inspect static storage node state: {error}"))?;
+    if let Some(pg_id) = inventory.incomplete_payload_pg_ids().first() {
         return Err(format!(
             "static storage PG {pg_id} has incomplete authoritative shard inventory"
-        ));
-    }
-    Ok(())
-}
-
-fn sync_initialized_pg_state(
-    data_dir: &Path,
-    pg_ids: &[u32],
-    expected_identity_bytes: &[u8],
-) -> Result<(), String> {
-    verify_static_storage_pg_state(data_dir, pg_ids, expected_identity_bytes)?;
-    for pg_id in pg_ids {
-        let pg_dir = data_dir.join(format!("pg-{pg_id:04}"));
-        File::open(pg_dir.join("metadata.db"))
-            .and_then(|file| file.sync_all())
-            .map_err(|error| format!("sync initialized PG {pg_id} metadata: {error}"))?;
-        sync_directory(&pg_dir, "sync initialized static storage PG directory")?;
-    }
-    sync_directory(data_dir, "sync initialized static storage root")
-}
-
-fn require_real_directory(path: &Path, context: &str) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("{context} {} is unavailable: {error}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(format!(
-            "{context} {} is not a real directory",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
-fn require_sqlite_metadata_file(path: &Path, pg_id: u32) -> Result<(), String> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let mut file = options
-        .open(path)
-        .map_err(|error| format!("static storage PG {pg_id} metadata is unavailable: {error}"))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("inspect static storage PG {pg_id} metadata: {error}"))?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "static storage PG {pg_id} metadata is not a regular file"
-        ));
-    }
-    let mut magic = [0_u8; SQLITE_FILE_MAGIC.len()];
-    file.read_exact(&mut magic)
-        .map_err(|error| format!("read static storage PG {pg_id} metadata header: {error}"))?;
-    if magic != *SQLITE_FILE_MAGIC {
-        return Err(format!(
-            "static storage PG {pg_id} metadata has invalid SQLite identity"
         ));
     }
     Ok(())
@@ -929,16 +851,8 @@ pub(crate) struct StaticStorageRuntimeLock {
     _directory_lock: StaticStorageDirectoryLock,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct StaticStorageInventoryReport {
-    incomplete_payload_pg_ids: Vec<u32>,
-}
-
-impl StaticStorageInventoryReport {
-    pub(crate) fn incomplete_payload_pg_ids(&self) -> &[u32] {
-        &self.incomplete_payload_pg_ids
-    }
-}
+pub(crate) type StaticStorageInventoryReport =
+    storage::storage_node_server::StorageNodeStateInspection;
 
 fn acquire_storage_directory_lock(data_dir: &Path) -> Result<StaticStorageDirectoryLock, String> {
     let path = data_dir.join(STORAGE_INITIALIZATION_LOCK_FILE_NAME);
@@ -1164,11 +1078,7 @@ mod tests {
     use super::*;
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    use std::sync::Arc;
-    use storage::{
-        BucketName, GenerationId, LocalClusterMap, LocalNodeStoreConfig, ObjectKey, ShardKey,
-        StorageCluster,
-    };
+    use storage::{LocalClusterMap, LocalNodeStoreConfig};
 
     fn identity(process_id: &str, process_digest: &str) -> ConfiguredStaticClusterIdentity {
         ConfiguredStaticClusterIdentity {
@@ -1406,8 +1316,6 @@ mod tests {
         lock_and_verify_standalone_storage_startup(&expected, 1, &data_dir, &[0, 1]).unwrap();
         assert!(data_dir.join(STORAGE_IDENTITY_FILE_NAME).is_file());
         assert!(!data_dir.join(STORAGE_INITIALIZING_FILE_NAME).exists());
-        assert!(data_dir.join("pg-0000/metadata.db").is_file());
-        assert!(data_dir.join("pg-0001/metadata.db").is_file());
     }
 
     #[test]
@@ -1468,88 +1376,6 @@ mod tests {
     }
 
     #[test]
-    fn static_storage_restart_accepts_unindexed_crash_residue() {
-        let temp = test_util::tempdir();
-        let data_dir = temp.path().join("storage");
-        let expected = identity("all-1", "b");
-        initialize_storage(&expected, 1, &data_dir, &[0], EcShape { k: 1, m: 0 }).unwrap();
-        let key = ShardKey::new(&[7; 16], 11, 0);
-        let prefix_dir = data_dir.join("pg-0000/shards").join(key.hex_prefix());
-        fs::create_dir(&prefix_dir).unwrap();
-        fs::write(
-            prefix_dir.join(key.to_string()),
-            b"unregistered crash residue",
-        )
-        .unwrap();
-
-        lock_and_verify_standalone_storage_startup(&expected, 1, &data_dir, &[0]).unwrap();
-    }
-
-    #[test]
-    fn replicated_storage_reports_missing_payload_without_rejecting_startup() {
-        let temp = test_util::tempdir();
-        let data_dir = temp.path().join("storage");
-        let expected = identity("storage-1", "b");
-        let ec_shape = EcShape { k: 1, m: 0 };
-        initialize_storage(&expected, 1, &data_dir, &[0], ec_shape).unwrap();
-
-        let node_id = NodeId::new(1);
-        let local_map = LocalClusterMap::open_with_configs(
-            node_id,
-            [LocalNodeStoreConfig::new(node_id, &data_dir)],
-            &[0],
-            ec_shape,
-        )
-        .unwrap();
-        let cluster = StorageCluster::from_local_map(Arc::new(local_map)).unwrap();
-        let written = cluster
-            .write_direct_put_segment_payload_shards(
-                &BucketName::try_from("bucket".to_string()).unwrap(),
-                &ObjectKey::try_from("key".to_string()).unwrap(),
-                GenerationId::MIN,
-                0,
-                &[7; 16],
-                b"indexed payload",
-            )
-            .unwrap();
-        cluster
-            .test_register_payload_shard_acks(written.data_pg_id, &written.written_shards)
-            .unwrap();
-        let shard_key = &written.written_shards[0].key;
-        let shard_path = data_dir
-            .join("pg-0000/shards")
-            .join(shard_key.hex_prefix())
-            .join(shard_key.to_string());
-        drop(cluster);
-        fs::remove_file(shard_path).unwrap();
-
-        let (runtime_lock, inventory) =
-            lock_and_inspect_replicated_storage_startup(&expected, 1, &data_dir, &[0]).unwrap();
-        assert_eq!(inventory.incomplete_payload_pg_ids(), &[0]);
-        drop(runtime_lock);
-
-        let error =
-            lock_and_verify_standalone_storage_startup(&expected, 1, &data_dir, &[0]).unwrap_err();
-        assert!(error.contains("incomplete authoritative shard inventory"));
-    }
-
-    #[test]
-    fn static_storage_rejects_symlinked_shard_root() {
-        let temp = test_util::tempdir();
-        let data_dir = temp.path().join("storage");
-        let external_shards = temp.path().join("external-shards");
-        let expected = identity("all-1", "b");
-        initialize_storage(&expected, 1, &data_dir, &[0], EcShape { k: 1, m: 0 }).unwrap();
-        fs::rename(data_dir.join("pg-0000/shards"), &external_shards).unwrap();
-        std::os::unix::fs::symlink(&external_shards, data_dir.join("pg-0000/shards")).unwrap();
-
-        let error =
-            lock_and_verify_standalone_storage_startup(&expected, 1, &data_dir, &[0]).unwrap_err();
-
-        assert!(error.contains("shard root is not a real directory"));
-    }
-
-    #[test]
     fn static_storage_rejects_identity_only_relocation() {
         let temp = test_util::tempdir();
         let source = temp.path().join("source");
@@ -1566,28 +1392,7 @@ mod tests {
         let error = lock_and_verify_standalone_storage_startup(&expected, 1, &destination, &[0])
             .unwrap_err();
 
-        assert!(error.contains("PG directory"));
-    }
-
-    #[test]
-    fn static_storage_rejects_identity_with_placeholder_pg_database() {
-        let temp = test_util::tempdir();
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
-        let expected = identity("all-1", "b");
-        initialize_storage(&expected, 1, &source, &[0], EcShape { k: 1, m: 0 }).unwrap();
-        fs::create_dir_all(destination.join("pg-0000")).unwrap();
-        fs::copy(
-            source.join(STORAGE_IDENTITY_FILE_NAME),
-            destination.join(STORAGE_IDENTITY_FILE_NAME),
-        )
-        .unwrap();
-        fs::write(destination.join("pg-0000/metadata.db"), b"").unwrap();
-
-        let error = lock_and_verify_standalone_storage_startup(&expected, 1, &destination, &[0])
-            .unwrap_err();
-
-        assert!(error.contains("metadata header"));
+        assert!(error.contains("initialized durable state is invalid"));
     }
 
     #[test]
@@ -1616,7 +1421,7 @@ mod tests {
         let error = lock_and_verify_standalone_storage_startup(&expected, 1, &destination, &[0])
             .unwrap_err();
 
-        assert!(error.contains("durable identity"));
+        assert!(error.contains("initialized durable state is invalid"));
     }
 
     #[test]
@@ -1624,7 +1429,7 @@ mod tests {
         let temp = test_util::tempdir();
         let data_dir = temp.path().join("storage");
         fs::create_dir(&data_dir).unwrap();
-        fs::write(data_dir.join("metadata.db"), b"unbound").unwrap();
+        fs::write(data_dir.join("unexpected-state"), b"unbound").unwrap();
 
         let error = initialize_storage(
             &identity("all-1", "b"),
@@ -1649,8 +1454,6 @@ mod tests {
             &StaticStorageIdentity::new(&expected, 1),
         )
         .unwrap();
-        fs::create_dir(data_dir.join("pg-0000")).unwrap();
-
         initialize_storage(&expected, 1, &data_dir, &[0], EcShape { k: 1, m: 0 }).unwrap();
 
         lock_and_verify_standalone_storage_startup(&expected, 1, &data_dir, &[0]).unwrap();
@@ -1717,7 +1520,6 @@ mod tests {
         assert!(error.contains("already locked"));
         assert!(!data_dir.join(STORAGE_INITIALIZING_FILE_NAME).exists());
         assert!(!data_dir.join(STORAGE_IDENTITY_FILE_NAME).exists());
-        assert!(!data_dir.join("pg-0000").exists());
     }
 
     #[test]
@@ -1741,7 +1543,6 @@ mod tests {
         assert_eq!(fs::read(&external).unwrap(), b"external");
         assert!(!data_dir.join(STORAGE_INITIALIZING_FILE_NAME).exists());
         assert!(!data_dir.join(STORAGE_IDENTITY_FILE_NAME).exists());
-        assert!(!data_dir.join("pg-0000").exists());
     }
 
     #[test]
@@ -1762,6 +1563,5 @@ mod tests {
         assert!(error.contains("not a regular file"));
         assert!(!data_dir.join(STORAGE_INITIALIZING_FILE_NAME).exists());
         assert!(!data_dir.join(STORAGE_IDENTITY_FILE_NAME).exists());
-        assert!(!data_dir.join("pg-0000").exists());
     }
 }
