@@ -3579,7 +3579,11 @@ fn shard_backfill_candidate_scanner_retains_cursor_across_runtime_map_replacemen
     )
     .unwrap();
     let source_cluster = StorageCluster::from_local_map(Arc::new(source_map)).unwrap();
-    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&source_cluster));
+    // This regression drives the candidate scanner explicitly below. Keep the
+    // production sweepers from racing its exact one-candidate assertions.
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&source_cluster),
+    );
     coord
         .create_bucket_for_owner("default-owner", "backfill-cursor-bucket", false)
         .unwrap();
