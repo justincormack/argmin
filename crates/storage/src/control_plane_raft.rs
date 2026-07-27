@@ -4522,6 +4522,30 @@ fn restore_experimental_raft_durable_artifact(
     }
 }
 
+fn control_plane_raft_durable_purge_covers(
+    status: &ControlPlaneRaftLogStoreStatusSnapshot,
+    target: LogIdOf<ControlPlaneRaftTypeConfig>,
+) -> Result<bool, ControlPlaneError> {
+    if let Some(reason) = &status.durability.wal_poisoned {
+        return Err(ControlPlaneError::RpcRemote {
+            message: format!("OpenRaft snapshot purge WAL durability failed: {reason}"),
+        });
+    }
+    let Some(purged) = status.durable_last_purged_log_id else {
+        return Ok(false);
+    };
+    match purged.index().cmp(&target.index()) {
+        std::cmp::Ordering::Less => Ok(false),
+        std::cmp::Ordering::Greater => Ok(true),
+        std::cmp::Ordering::Equal if purged == target => Ok(true),
+        std::cmp::Ordering::Equal => Err(ControlPlaneError::RpcRemote {
+            message: format!(
+                "OpenRaft durable snapshot purge watermark {purged} conflicts with requested log id {target} at the same index"
+            ),
+        }),
+    }
+}
+
 impl ControlPlaneRaftAuthority {
     #[must_use]
     pub fn authority_clock_checkpoint_binding(
@@ -5069,12 +5093,19 @@ impl ControlPlaneRaftAuthority {
         if let Some(log_store) = &self.log_store {
             ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(10), async {
                 loop {
-                    match log_store.last_purged_log_id() {
-                        Ok(Some(purged)) if purged == snapshot_log_id => return Ok(()),
-                        Ok(_) => ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await,
+                    match log_store.status_snapshot() {
+                        Ok(status) => {
+                            if control_plane_raft_durable_purge_covers(
+                                &status,
+                                snapshot_log_id,
+                            )? {
+                                return Ok(());
+                            }
+                            ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
+                        }
                         Err(error) => {
                             return Err(openraft_remote_error(
-                                "snapshot purge log-store read",
+                                "snapshot purge durable log-store read",
                                 error,
                             ));
                         }
@@ -5084,7 +5115,7 @@ impl ControlPlaneRaftAuthority {
             .await
             .map_err(|_| ControlPlaneError::RpcRemote {
                 message: format!(
-                    "OpenRaft snapshot purge did not reach {snapshot_log_id:?} before timeout"
+                    "OpenRaft snapshot purge did not durably reach {snapshot_log_id:?} before timeout"
                 ),
             })??;
         }
@@ -6715,6 +6746,11 @@ static CONTROL_PLANE_RAFT_WAL_FILE_SYNC_GATES: Mutex<
     BTreeMap<PathBuf, ControlPlaneRaftWalFileSyncGate>,
 > = Mutex::new(BTreeMap::new());
 
+#[cfg(test)]
+static CONTROL_PLANE_RAFT_WAL_DURABLE_PUBLICATION_GATES: Mutex<
+    BTreeMap<PathBuf, ControlPlaneRaftWalFileSyncGate>,
+> = Mutex::new(BTreeMap::new());
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ControlPlaneRaftLogStoreRestartArtifact {
     vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
@@ -7503,6 +7539,10 @@ impl ControlPlaneRaftDurabilityLane {
                     *accepted
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.clone();
+                    inject_control_plane_raft_wal_durable_publication_delay(
+                        wal.path(),
+                        &request.record,
+                    );
                 }
                 *durable
                     .lock()
@@ -7641,20 +7681,18 @@ impl ControlPlaneRaftLogStore {
     }
 
     fn status_snapshot(&self) -> Result<ControlPlaneRaftLogStoreStatusSnapshot, io::Error> {
-        let (last_purged_log_id, wal_backed, wal_poisoned) = {
+        let last_purged_log_id = {
             let inner = self
                 .inner
                 .lock()
                 .map_err(|_| io::Error::other("control-plane OpenRaft log store lock poisoned"))?;
-            (
-                inner.last_purged_log_id,
-                self.wal.is_some(),
-                inner.poisoned.clone(),
-            )
+            inner.last_purged_log_id
         };
         let durable = self.durable.lock().map_err(|_| {
             io::Error::other("control-plane OpenRaft durable log store lock poisoned")
         })?;
+        let wal_backed = self.wal.is_some();
+        let wal_poisoned = durable.inner.poisoned.clone();
         let wal_offsets = match (&self.wal, &wal_poisoned) {
             (Some(_), None) => Some(durable.wal_offsets),
             (Some(_), Some(_)) | (None, _) => None,
@@ -10038,6 +10076,38 @@ fn inject_control_plane_raft_wal_file_sync_failure(path: &Path) -> Result<(), Co
 
     let _ = path;
     Ok(())
+}
+
+fn inject_control_plane_raft_wal_durable_publication_delay(
+    path: &Path,
+    record: &ControlPlaneRaftWalRecord,
+) {
+    #[cfg(test)]
+    {
+        if !matches!(record, ControlPlaneRaftWalRecord::Purge(_)) {
+            return;
+        }
+        let gate = CONTROL_PLANE_RAFT_WAL_DURABLE_PUBLICATION_GATES
+            .lock()
+            .expect("test WAL durable-publication gate lock should not be poisoned")
+            .get(path)
+            .cloned();
+        if let Some(gate) = gate {
+            let (state, condition) = &*gate;
+            let mut state = state
+                .lock()
+                .expect("test WAL durable-publication gate state should not be poisoned");
+            state.entered = true;
+            condition.notify_all();
+            while !state.released {
+                state = condition
+                    .wait(state)
+                    .expect("test WAL durable-publication gate state should not be poisoned");
+            }
+        }
+    }
+
+    let _ = (path, record);
 }
 
 fn sync_control_plane_raft_wal_parent(path: &Path) -> Result<(), ControlPlaneError> {
@@ -12636,23 +12706,39 @@ mod tests {
     struct TestWalFileSyncGate {
         path: PathBuf,
         state: ControlPlaneRaftWalFileSyncGate,
+        registry: &'static Mutex<BTreeMap<PathBuf, ControlPlaneRaftWalFileSyncGate>>,
     }
 
     impl TestWalFileSyncGate {
         fn install(path: PathBuf) -> Self {
+            Self::install_in(path, &CONTROL_PLANE_RAFT_WAL_FILE_SYNC_GATES)
+        }
+
+        fn install_durable_publication(path: PathBuf) -> Self {
+            Self::install_in(path, &CONTROL_PLANE_RAFT_WAL_DURABLE_PUBLICATION_GATES)
+        }
+
+        fn install_in(
+            path: PathBuf,
+            registry: &'static Mutex<BTreeMap<PathBuf, ControlPlaneRaftWalFileSyncGate>>,
+        ) -> Self {
             let state = Arc::new((
                 Mutex::new(ControlPlaneRaftWalFileSyncGateState::default()),
                 std::sync::Condvar::new(),
             ));
-            let mut gates = CONTROL_PLANE_RAFT_WAL_FILE_SYNC_GATES
+            let mut gates = registry
                 .lock()
-                .expect("test WAL file-sync gate lock should not be poisoned");
+                .expect("test WAL gate registry lock should not be poisoned");
             assert!(
                 gates.insert(path.clone(), Arc::clone(&state)).is_none(),
-                "only one WAL file-sync gate may be active per WAL path"
+                "only one test WAL gate may be active per WAL path and phase"
             );
             drop(gates);
-            Self { path, state }
+            Self {
+                path,
+                state,
+                registry,
+            }
         }
 
         fn wait_until_entered(&self, timeout: Duration) {
@@ -12676,6 +12762,36 @@ mod tests {
                 .expect("test WAL file-sync gate state should not be poisoned");
             state.released = true;
             condition.notify_all();
+        }
+
+        fn pending_operation_watchdog(
+            &self,
+            operation_completed: Arc<AtomicBool>,
+        ) -> thread::JoinHandle<bool> {
+            let state = Arc::clone(&self.state);
+            thread::spawn(move || {
+                let (gate, condition) = &*state;
+                let gate = gate
+                    .lock()
+                    .expect("test WAL gate state should not be poisoned");
+                let (gate, wait) = condition
+                    .wait_timeout_while(gate, Duration::from_secs(1), |gate| !gate.entered)
+                    .expect("test WAL gate state should not be poisoned");
+                assert!(
+                    gate.entered && !wait.timed_out(),
+                    "WAL durability worker did not reach the test gate"
+                );
+                drop(gate);
+                thread::sleep(Duration::from_millis(100));
+                let completed_before_release = operation_completed.load(Ordering::SeqCst);
+                let mut gate = state
+                    .0
+                    .lock()
+                    .expect("test WAL gate state should not be poisoned");
+                gate.released = true;
+                state.1.notify_all();
+                !completed_before_release
+            })
         }
     }
 
@@ -12725,9 +12841,10 @@ mod tests {
     impl Drop for TestWalFileSyncGate {
         fn drop(&mut self) {
             self.release();
-            let mut gates = CONTROL_PLANE_RAFT_WAL_FILE_SYNC_GATES
+            let mut gates = self
+                .registry
                 .lock()
-                .expect("test WAL file-sync gate lock should not be poisoned");
+                .expect("test WAL gate registry lock should not be poisoned");
             if gates
                 .get(&self.path)
                 .is_some_and(|state| Arc::ptr_eq(state, &self.state))
@@ -18922,6 +19039,66 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_raft_durable_purge_coverage_is_monotonic_and_poison_first() {
+        let target = raft_log_id(3, 1, 7);
+        let mut status = ControlPlaneRaftLogStore::default()
+            .status_snapshot()
+            .unwrap();
+        assert!(!control_plane_raft_durable_purge_covers(&status, target).unwrap());
+
+        status.durable_last_purged_log_id = Some(raft_log_id(3, 1, 6));
+        assert!(!control_plane_raft_durable_purge_covers(&status, target).unwrap());
+        status.durable_last_purged_log_id = Some(target);
+        assert!(control_plane_raft_durable_purge_covers(&status, target).unwrap());
+        status.durable_last_purged_log_id = Some(raft_log_id(4, 1, 8));
+        assert!(control_plane_raft_durable_purge_covers(&status, target).unwrap());
+
+        status.durable_last_purged_log_id = Some(raft_log_id(4, 1, 7));
+        assert!(matches!(
+            control_plane_raft_durable_purge_covers(&status, target),
+            Err(ControlPlaneError::RpcRemote { message })
+                if message.contains("conflicts with requested log id")
+        ));
+
+        status.durable_last_purged_log_id = Some(target);
+        status.durability.wal_poisoned = Some("injected post-sync failure".to_string());
+        assert!(matches!(
+            control_plane_raft_durable_purge_covers(&status, target),
+            Err(ControlPlaneError::RpcRemote { message })
+                if message.contains("injected post-sync failure")
+        ));
+    }
+
+    #[test]
+    fn control_plane_raft_status_binds_durable_purge_watermark_to_durable_poison() {
+        let target = raft_log_id(3, 1, 7);
+        let store = ControlPlaneRaftLogStore::default();
+        {
+            let accepted = store.inner.lock().unwrap();
+            assert_eq!(accepted.poisoned, None);
+            assert_eq!(accepted.last_purged_log_id, None);
+        }
+        {
+            let mut durable = store.durable.lock().unwrap();
+            durable.inner.last_purged_log_id = Some(target);
+            durable.inner.poisoned = Some("injected durable purge poison".to_string());
+        }
+
+        let status = store.status_snapshot().unwrap();
+        assert_eq!(status.last_purged_log_id, None);
+        assert_eq!(status.durable_last_purged_log_id, Some(target));
+        assert_eq!(
+            status.durability.wal_poisoned.as_deref(),
+            Some("injected durable purge poison")
+        );
+        assert!(matches!(
+            control_plane_raft_durable_purge_covers(&status, target),
+            Err(ControlPlaneError::RpcRemote { message })
+                if message.contains("injected durable purge poison")
+        ));
+    }
+
+    #[test]
     fn control_plane_raft_log_id_round_trips_term_and_index() {
         let control_plane_log_id = ControlPlaneLogId::new(7, 42).unwrap();
         let raft_log_id = raft_log_id_from_control_plane(3, control_plane_log_id);
@@ -22000,6 +22177,140 @@ mod tests {
                 authority.status().await.unwrap().last_purged_log_id(),
                 Some(snapshot_log_id)
             );
+            authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_snapshot_purge_waits_for_durable_publication() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let artifact_path = tmp.path().join("raft.state");
+            let wal_path = tmp.path().join("raft.wal");
+            let node_id = 122;
+            let authority =
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+                    "control-plane-raft-purge-durable-publication-test",
+                    node_id,
+                    &artifact_path,
+                    &wal_path,
+                )
+                .await
+                .unwrap();
+            authority
+                .initialize_single_node_membership(node_id)
+                .await
+                .unwrap();
+            authority
+                .wait_for_current_leader(
+                    node_id,
+                    Duration::from_secs(1),
+                    "durable-publication purge leadership",
+                )
+                .await
+                .unwrap();
+            wait_for_authority_status_matching(
+                &authority,
+                Duration::from_secs(1),
+                "durable-publication purge serving state",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
+
+            let snapshot_log_id = authority
+                .trigger_snapshot_applied()
+                .await
+                .unwrap()
+                .expect("membership should establish a snapshot log id");
+            let gate = TestWalFileSyncGate::install_durable_publication(wal_path);
+            let operation_completed = Arc::new(AtomicBool::new(false));
+            let watchdog = gate.pending_operation_watchdog(Arc::clone(&operation_completed));
+
+            authority
+                .purge_log_through_snapshot(snapshot_log_id)
+                .await
+                .unwrap();
+            operation_completed.store(true, Ordering::SeqCst);
+            assert!(
+                watchdog.join().expect("purge watchdog should not panic"),
+                "snapshot purge returned after accepted publication but before durable publication"
+            );
+            let status = authority.status().await.unwrap();
+            assert_eq!(status.last_purged_log_id(), Some(snapshot_log_id));
+            assert_eq!(status.durable_last_purged_log_id(), Some(snapshot_log_id));
+
+            drop(gate);
+            authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_snapshot_purge_reports_post_sync_poison() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let artifact_path = tmp.path().join("raft.state");
+            let wal_path = tmp.path().join("raft.wal");
+            let node_id = 123;
+            let authority =
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+                    "control-plane-raft-purge-post-sync-poison-test",
+                    node_id,
+                    &artifact_path,
+                    &wal_path,
+                )
+                .await
+                .unwrap();
+            authority
+                .initialize_single_node_membership(node_id)
+                .await
+                .unwrap();
+            authority
+                .wait_for_current_leader(
+                    node_id,
+                    Duration::from_secs(1),
+                    "post-sync poison purge leadership",
+                )
+                .await
+                .unwrap();
+            wait_for_authority_status_matching(
+                &authority,
+                Duration::from_secs(1),
+                "post-sync poison purge serving state",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
+
+            let snapshot_log_id = authority
+                .trigger_snapshot_applied()
+                .await
+                .unwrap()
+                .expect("membership should establish a snapshot log id");
+            *CONTROL_PLANE_RAFT_WAL_FAIL_NEXT_PARENT_SYNC
+                .lock()
+                .expect("test WAL parent-sync fault lock should not be poisoned") = Some(wal_path);
+            let error = authority
+                .purge_log_through_snapshot(snapshot_log_id)
+                .await
+                .expect_err("post-sync purge poison must override the durable watermark");
+            assert!(
+                matches!(error, ControlPlaneError::RpcRemote { ref message }
+                    if message.contains("snapshot purge WAL durability failed")
+                        && message.contains("WAL append failed after file sync")),
+                "unexpected post-sync purge error: {error:?}"
+            );
+            let status = authority
+                .log_store
+                .as_ref()
+                .unwrap()
+                .status_snapshot()
+                .unwrap();
+            assert_eq!(
+                status.durable_last_purged_log_id,
+                Some(snapshot_log_id),
+                "the regression requires poison and the target durable watermark together"
+            );
+            assert!(status.durability.wal_poisoned.is_some());
+
             authority.shutdown().await.unwrap();
         });
     }
