@@ -318,27 +318,28 @@ The public boundary and containment status for each surface are as follows.
   endpoint failover. The former public `ControlPlaneRpcFrameTransport`, raw exchange value/error,
   and `with_frame_transport` extension are removed. Raw transport tests are storage-owned, and a
   repository check prevents those client-wire abstractions from returning outside `storage`.
-- The server boundary is substantially open. `argmin-s3/main.rs` binds Unix and TCP listeners,
-  performs TLS and ALPN handling, manages worker and pre-auth byte budgets, reads raw frames,
-  invokes storage authentication and endpoint-admission helpers, dispatches verified requests,
-  writes framed responses, and classifies response-write I/O errors. Public
-  `ControlPlaneRpcRequest`, `VerifiedControlPlaneRpcRequest`, `ControlPlaneRpcResponse`, raw
-  read/verify/write functions, and `ControlPlaneAuthEnvelope::decode_frame` exist chiefly to
-  support that binary-owned protocol loop.
-- `CONTROL_PLANE_RPC_TLS_ALPN` is public and `argmin-s3` constructs and validates
-  `argmin-control-plane/1` Rustls profiles directly. As with storage-node RPC, the static manifest
-  may specify endpoint and TLS material, but storage must own ALPN and protocol-profile assembly.
+- **Completed containment slice:** `ControlPlaneRpcServerListener` and
+  `ControlPlaneRpcServerPolicy` now form the storage-owned server facade. `argmin-s3` binds the
+  configured socket and supplies endpoint limits, credentials, certificate material,
+  authority-clock state, and semantic durability/authority callbacks. Storage owns TLS 1.3 and
+  ALPN profile construction, absolute Unix and TLS handshake/I/O deadlines, worker and pre-auth byte
+  admission, endpoint-role admission, authentication ordering, verified dispatch, response
+  framing/finalization, and bounded write-error metrics.
+- The raw control-plane request/response types, verified-request type, ALPN constant, one-shot
+  stream handlers, and raw read/verify/build/write helpers are private again. Their protocol,
+  malformed-input, resource, TLS/ALPN, and authentication tests are colocated in `storage`;
+  binary tests retain only process lifecycle/configuration behavior through logical clients or the
+  opaque facade. A repository check rejects reintroduction of these concrete server-wire symbols
+  outside `storage`.
 - `ControlPlaneError` currently mixes logical authority failures with public `Io`, `RpcProtocol`,
   and string-valued `RpcRemote` wire/transport failures. The storage clients own much of the
   retry logic, including read-only endpoint failover and operation-specific response-loss
   confirmation, but `argmin-s3` still destructures I/O errors for metrics and parses rendered
   control-plane and runtime-map messages to make retry decisions. These need owner-defined
   semantic classifications and a stable server diagnostic surface.
-- Storage contains comprehensive codec, version, authentication, retry, and Unix client/server
-  tests. `argmin-s3` also has raw-frame tests for pre-auth admission, TLS/ALPN, authentication,
-  response publication, and transport failure injection. Process-level lifecycle and durability
-  tests may remain there, but malformed-frame and protocol-profile tests must move to `storage`;
-  process tests should call a logical client or an opaque storage-owned test facility.
+- Storage contains the codec, version, authentication, retry, resource-admission, TLS/ALPN, and
+  client/server protocol tests. Process-level lifecycle and durability tests remain in
+  `argmin-s3`, but use logical clients and the opaque storage-owned server facade.
 
 #### Raft peer RPC
 
@@ -378,15 +379,16 @@ implementation order is:
    storage-owned Unix and TLS/TCP endpoint configuration. Static-manifest parsing remains in
    `argmin-s3`; frames, client ALPN construction, request-sent tracking, and transport error
    construction are storage-owned.
-2. Add a storage-owned control-plane server facade that accepts listener, resource-limit,
-   authentication, authority-clock, and durability-publication configuration while owning TLS,
-   frame admission, verification, dispatch, response framing, and transport diagnostics.
+2. **Complete:** add a storage-owned control-plane server facade that accepts listener,
+   resource-limit, authentication, authority-clock, and durability-publication configuration
+   while owning TLS, frame admission, verification, dispatch, response framing, and transport
+   diagnostics. Raw control-plane server symbols and ALPN are private and boundary-checked.
 3. Replace the Raft raw client frame transport with storage-owned peer endpoint configuration,
    then add a storage-owned peer server facade that preserves the existing pre-auth allocation
    bound and durability-before-ack invariant.
-4. Make raw control-plane/Raft frame, auth-envelope, ALPN, OpenRaft-handle, and transport-error
-   APIs private after callers and protocol tests have moved. Add repository checks for the
-   concrete leaks only after the replacement facades exist.
+4. After the peer facade exists, make the remaining raw Raft frame, auth-envelope, ALPN,
+   OpenRaft-handle, and transport-error APIs private and add repository checks. The equivalent
+   control-plane client and server cleanup is complete.
 
 Phase 1 exit criteria:
 

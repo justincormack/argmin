@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, Read as _, Write as _};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::num::NonZeroU64;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,6 +14,7 @@ use checksum::{ChecksumAlgorithm, ChecksumHasher};
 use placement::NodeId;
 use ring::rand::SecureRandom as _;
 use rustls::pki_types::ServerName;
+use rustls::sign::CertifiedKey;
 use thiserror::Error;
 
 use crate::control_plane_auth::{
@@ -57,7 +58,7 @@ const CONTROL_PLANE_RPC_VERSION: u16 = 9;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
-pub const CONTROL_PLANE_RPC_TLS_ALPN: &[u8] = b"argmin-control-plane/1";
+const CONTROL_PLANE_RPC_TLS_ALPN: &[u8] = b"argmin-control-plane/1";
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 pub const CONTROL_PLANE_RPC_MAX_SERVER_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
@@ -9957,6 +9958,461 @@ impl std::fmt::Debug for ControlPlaneRpcClientEndpoint {
     }
 }
 
+/// The operation class accepted by a control-plane RPC server endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlPlaneRpcServerRole {
+    Ordinary,
+    AuthorityClockRecovery,
+}
+
+impl ControlPlaneRpcServerRole {
+    fn accepts(self, request: &VerifiedControlPlaneRpcRequest) -> bool {
+        match self {
+            Self::Ordinary => !request.is_authority_clock_admin(),
+            Self::AuthorityClockRecovery => request.is_authority_clock_admin(),
+        }
+    }
+}
+
+/// Storage-owned gate around publication of a fully encoded RPC response.
+///
+/// Implementations may delay or reject publication to preserve an external
+/// durability invariant, but never receive access to the transport or frame.
+/// A successful implementation must invoke `publish` exactly once; the server
+/// rejects implementations that return success without publishing or invoke
+/// the callback repeatedly.
+pub trait ControlPlaneRpcResponsePublication: Send + Sync {
+    fn publish(
+        &self,
+        publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+    ) -> Result<(), ControlPlaneError>;
+}
+
+fn publish_control_plane_rpc_response(
+    publication: Option<&dyn ControlPlaneRpcResponsePublication>,
+    publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+) -> Result<(), ControlPlaneError> {
+    let mut published = false;
+    let result = {
+        let mut publish_once = || {
+            if std::mem::replace(&mut published, true) {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: "control-plane response publication attempted more than once"
+                        .to_owned(),
+                });
+            }
+            publish()
+        };
+        match publication {
+            Some(publication) => publication.publish(&mut publish_once),
+            None => publish_once(),
+        }
+    };
+    if result.is_ok() && !published {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: "control-plane response publication completed without publishing".to_owned(),
+        });
+    }
+    result
+}
+
+/// Durable authority-clock checkpoint destination used by the RPC server and
+/// the process-level lease-expiry loop.
+pub struct ControlPlaneAuthorityClockCheckpointTarget {
+    path: PathBuf,
+    binding: ControlPlaneAuthorityClockCheckpointBinding,
+}
+
+impl std::fmt::Debug for ControlPlaneAuthorityClockCheckpointTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlPlaneAuthorityClockCheckpointTarget")
+            .field("checkpoint", &"configured")
+            .finish()
+    }
+}
+
+impl ControlPlaneAuthorityClockCheckpointTarget {
+    #[must_use]
+    pub fn new(
+        path: impl Into<PathBuf>,
+        binding: ControlPlaneAuthorityClockCheckpointBinding,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            binding,
+        }
+    }
+
+    pub fn persist_established(
+        &self,
+        context: ControlPlaneAuthorityClockContext,
+        authority_clock: &mut ControlPlaneAuthorityClock,
+    ) -> Result<(), ControlPlaneError> {
+        if !authority_clock.status(context).established() {
+            return Ok(());
+        }
+        let persistence_started = Instant::now();
+        let mut invalidate_elapsed = Duration::ZERO;
+        let mut store_elapsed = Duration::ZERO;
+        let persistence_result = (|| {
+            let invalidate_started = Instant::now();
+            invalidate_authority_clock_restart_checkpoint(&self.path)?;
+            invalidate_elapsed = invalidate_started.elapsed();
+            let store_started = Instant::now();
+            store_validated_authority_clock_restart_checkpoint(
+                &self.path,
+                self.binding,
+                context.committed_timestamp_high_water_ms(),
+                authority_clock,
+            )?;
+            store_elapsed = store_started.elapsed();
+            Ok::<(), ControlPlaneError>(())
+        })();
+        let persistence_elapsed = persistence_started.elapsed();
+        if persistence_elapsed >= Duration::from_secs(1) {
+            eprintln!(
+                "control-plane authority-clock checkpoint persistence took {persistence_elapsed:?} \
+                 (invalidation {invalidate_elapsed:?}, replacement {store_elapsed:?})"
+            );
+        }
+        if let Err(error) = persistence_result {
+            if authority_clock.status(context).established() {
+                authority_clock.fail_closed_after_checkpoint_persistence_failure()?;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn invalidate_if_blocked(
+        &self,
+        authority_clock: &ControlPlaneAuthorityClock,
+    ) -> Result<(), ControlPlaneError> {
+        if authority_clock.is_established() {
+            return Ok(());
+        }
+        invalidate_authority_clock_restart_checkpoint(&self.path)
+    }
+}
+
+#[derive(Clone)]
+struct ControlPlaneRpcServerResources {
+    active_workers: Arc<AtomicUsize>,
+    worker_limit: usize,
+    pre_auth_byte_budget: Arc<ControlPlaneRpcPreAuthByteBudget>,
+}
+
+/// Logical policy for one class of control-plane RPC endpoints.
+///
+/// Clones share the worker and pre-authentication memory budgets, allowing a
+/// group of listeners to enforce one aggregate resource limit.
+#[derive(Clone)]
+pub struct ControlPlaneRpcServerPolicy {
+    role: ControlPlaneRpcServerRole,
+    resources: ControlPlaneRpcServerResources,
+    gate_request_time_with_authority_clock: bool,
+    auth_verifier: Option<Arc<ControlPlaneUnixAuthVerifier>>,
+    authority_clock: Option<Arc<Mutex<ControlPlaneAuthorityClock>>>,
+    authority_clock_checkpoint_target: Option<Arc<ControlPlaneAuthorityClockCheckpointTarget>>,
+    authority_confirmation: Option<Arc<dyn Fn() -> Result<(), ControlPlaneError> + Send + Sync>>,
+    response_publication: Option<Arc<dyn ControlPlaneRpcResponsePublication>>,
+    fatal_error_handler: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    test_authority_now_ms: Option<u64>,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ControlPlaneRpcServerConfigError {
+    #[error("control-plane RPC worker limit must be positive")]
+    ZeroWorkerLimit,
+    #[error("control-plane RPC pre-authentication byte budget must be positive")]
+    ZeroPreAuthByteBudget,
+    #[error("control-plane RPC listener connection limit must be positive")]
+    ZeroConnectionLimit,
+    #[error("control-plane RPC listener frame limit must include the protocol envelope")]
+    InvalidFrameLimit,
+    #[error("control-plane RPC listener I/O timeout must be positive")]
+    ZeroIoTimeout,
+    #[error("control-plane RPC listener I/O timeout exceeds the supported operation bound")]
+    IoTimeoutTooLarge,
+    #[error("failed to construct the control-plane TLS server profile")]
+    TlsProfileUnavailable,
+}
+
+impl ControlPlaneRpcServerPolicy {
+    pub fn new(
+        role: ControlPlaneRpcServerRole,
+        worker_limit: usize,
+        pre_auth_byte_budget: usize,
+    ) -> Result<Self, ControlPlaneRpcServerConfigError> {
+        if worker_limit == 0 {
+            return Err(ControlPlaneRpcServerConfigError::ZeroWorkerLimit);
+        }
+        if pre_auth_byte_budget == 0 {
+            return Err(ControlPlaneRpcServerConfigError::ZeroPreAuthByteBudget);
+        }
+        Ok(Self {
+            role,
+            resources: ControlPlaneRpcServerResources {
+                active_workers: Arc::new(AtomicUsize::new(0)),
+                worker_limit,
+                pre_auth_byte_budget: Arc::new(ControlPlaneRpcPreAuthByteBudget::new(
+                    pre_auth_byte_budget,
+                )),
+            },
+            gate_request_time_with_authority_clock: false,
+            auth_verifier: None,
+            authority_clock: None,
+            authority_clock_checkpoint_target: None,
+            authority_confirmation: None,
+            response_publication: None,
+            fatal_error_handler: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            test_authority_now_ms: None,
+        })
+    }
+
+    #[must_use]
+    pub fn with_auth_verifier(mut self, auth_verifier: Arc<ControlPlaneUnixAuthVerifier>) -> Self {
+        self.auth_verifier = Some(auth_verifier);
+        self
+    }
+
+    #[must_use]
+    pub fn with_authority_clock(
+        mut self,
+        authority_clock: Arc<Mutex<ControlPlaneAuthorityClock>>,
+        checkpoint_target: Arc<ControlPlaneAuthorityClockCheckpointTarget>,
+        gate_request_time: bool,
+    ) -> Self {
+        self.authority_clock = Some(authority_clock);
+        self.authority_clock_checkpoint_target = Some(checkpoint_target);
+        self.gate_request_time_with_authority_clock = gate_request_time;
+        self
+    }
+
+    #[must_use]
+    pub fn with_authority_confirmation(
+        mut self,
+        authority_confirmation: Arc<dyn Fn() -> Result<(), ControlPlaneError> + Send + Sync>,
+    ) -> Self {
+        self.authority_confirmation = Some(authority_confirmation);
+        self
+    }
+
+    #[must_use]
+    pub fn with_response_publication(
+        mut self,
+        response_publication: Arc<dyn ControlPlaneRpcResponsePublication>,
+    ) -> Self {
+        self.response_publication = Some(response_publication);
+        self
+    }
+
+    /// Installs the process-lifecycle action used after a fatal durable
+    /// checkpoint failure has been diagnosed and logged by storage.
+    #[must_use]
+    pub fn with_fatal_error_handler(
+        mut self,
+        fatal_error_handler: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.fatal_error_handler = Some(fatal_error_handler);
+        self
+    }
+
+    #[must_use]
+    pub fn active_workers(&self) -> usize {
+        self.resources.active_workers.load(Ordering::Acquire)
+    }
+
+    fn authority_now_ms(&self) -> u64 {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(authority_now_ms) = self.test_authority_now_ms {
+            return authority_now_ms;
+        }
+        crate::clock::current_time_millis()
+    }
+}
+
+#[derive(Debug)]
+struct ControlPlaneRpcPreAuthByteBudget {
+    reserved_bytes: AtomicUsize,
+    limit_bytes: usize,
+}
+
+impl ControlPlaneRpcPreAuthByteBudget {
+    fn new(limit_bytes: usize) -> Self {
+        Self {
+            reserved_bytes: AtomicUsize::new(0),
+            limit_bytes,
+        }
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        frame_bytes: usize,
+    ) -> Result<ControlPlaneRpcPreAuthByteReservation, ControlPlaneError> {
+        let result =
+            self.reserved_bytes
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                    reserved
+                        .checked_add(frame_bytes)
+                        .filter(|total| *total <= self.limit_bytes)
+                });
+        match result {
+            Ok(_) => Ok(ControlPlaneRpcPreAuthByteReservation {
+                budget: Arc::clone(self),
+                frame_bytes,
+            }),
+            Err(reserved) => Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "control-plane RPC pre-authentication frame budget exhausted: requested {frame_bytes} bytes with {reserved} of {} bytes reserved",
+                    self.limit_bytes
+                ),
+            }),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ControlPlaneRpcPreAuthByteReservation {
+    budget: Arc<ControlPlaneRpcPreAuthByteBudget>,
+    frame_bytes: usize,
+}
+
+impl Drop for ControlPlaneRpcPreAuthByteReservation {
+    fn drop(&mut self) {
+        self.budget
+            .reserved_bytes
+            .fetch_sub(self.frame_bytes, Ordering::AcqRel);
+    }
+}
+
+struct ControlPlaneRpcTlsCertificateResolver {
+    certified_key: Arc<CertifiedKey>,
+}
+
+impl std::fmt::Debug for ControlPlaneRpcTlsCertificateResolver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlPlaneRpcTlsCertificateResolver")
+            .field("certificate", &"configured")
+            .finish()
+    }
+}
+
+impl rustls::server::ResolvesServerCert for ControlPlaneRpcTlsCertificateResolver {
+    fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(&self.certified_key))
+    }
+}
+
+enum ControlPlaneRpcServerListenerKind {
+    Unix(UnixListener),
+    TlsTcp {
+        listener: TcpListener,
+        tls_server_config: Arc<rustls::ServerConfig>,
+    },
+}
+
+/// Opaque bound listener for the storage-owned control-plane RPC server.
+pub struct ControlPlaneRpcServerListener {
+    kind: ControlPlaneRpcServerListenerKind,
+    max_connections: usize,
+    max_frame_bytes: usize,
+    io_timeout: Duration,
+}
+
+impl std::fmt::Debug for ControlPlaneRpcServerListener {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let transport = match self.kind {
+            ControlPlaneRpcServerListenerKind::Unix(_) => "unix",
+            ControlPlaneRpcServerListenerKind::TlsTcp { .. } => "tls-tcp",
+        };
+        formatter
+            .debug_struct("ControlPlaneRpcServerListener")
+            .field("transport", &transport)
+            .field("max_connections", &self.max_connections)
+            .field("max_frame_bytes", &self.max_frame_bytes)
+            .field("io_timeout", &self.io_timeout)
+            .finish()
+    }
+}
+
+fn validate_control_plane_rpc_server_listener_limits(
+    max_connections: usize,
+    max_frame_bytes: usize,
+    io_timeout: Duration,
+) -> Result<(), ControlPlaneRpcServerConfigError> {
+    if max_connections == 0 {
+        return Err(ControlPlaneRpcServerConfigError::ZeroConnectionLimit);
+    }
+    if max_frame_bytes < control_plane_rpc_frame_overhead() {
+        return Err(ControlPlaneRpcServerConfigError::InvalidFrameLimit);
+    }
+    if io_timeout.is_zero() {
+        return Err(ControlPlaneRpcServerConfigError::ZeroIoTimeout);
+    }
+    if io_timeout > CONTROL_PLANE_RPC_MAX_SERVER_OPERATION_TIMEOUT {
+        return Err(ControlPlaneRpcServerConfigError::IoTimeoutTooLarge);
+    }
+    Ok(())
+}
+
+impl ControlPlaneRpcServerListener {
+    pub fn unix(
+        listener: UnixListener,
+        max_connections: usize,
+        max_frame_bytes: usize,
+        io_timeout: Duration,
+    ) -> Result<Self, ControlPlaneRpcServerConfigError> {
+        validate_control_plane_rpc_server_listener_limits(
+            max_connections,
+            max_frame_bytes,
+            io_timeout,
+        )?;
+        Ok(Self {
+            kind: ControlPlaneRpcServerListenerKind::Unix(listener),
+            max_connections,
+            max_frame_bytes,
+            io_timeout,
+        })
+    }
+
+    pub fn tls_tcp(
+        listener: TcpListener,
+        certified_key: Arc<CertifiedKey>,
+        max_connections: usize,
+        max_frame_bytes: usize,
+        io_timeout: Duration,
+    ) -> Result<Self, ControlPlaneRpcServerConfigError> {
+        validate_control_plane_rpc_server_listener_limits(
+            max_connections,
+            max_frame_bytes,
+            io_timeout,
+        )?;
+        let resolver = ControlPlaneRpcTlsCertificateResolver { certified_key };
+        let mut tls_server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| ControlPlaneRpcServerConfigError::TlsProfileUnavailable)?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(resolver));
+        tls_server_config.alpn_protocols = vec![CONTROL_PLANE_RPC_TLS_ALPN.to_vec()];
+        Ok(Self {
+            kind: ControlPlaneRpcServerListenerKind::TlsTcp {
+                listener,
+                tls_server_config: Arc::new(tls_server_config),
+            },
+            max_connections,
+            max_frame_bytes,
+            io_timeout,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct ControlPlaneEndpointPass {
     endpoint_count: usize,
@@ -10789,6 +11245,38 @@ impl std::io::Write for DeadlineUnixStream<'_> {
 struct ControlPlaneDeadlineTcpSocket {
     stream: TcpStream,
     deadline: Instant,
+}
+
+struct ControlPlaneDeadlineUnixSocket {
+    stream: UnixStream,
+    deadline: Instant,
+}
+
+impl ControlPlaneDeadlineUnixSocket {
+    fn apply_deadline(&self) -> std::io::Result<()> {
+        let remaining = control_plane_client_io_remaining(self.deadline)?;
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.set_write_timeout(Some(remaining))
+    }
+}
+
+impl std::io::Read for ControlPlaneDeadlineUnixSocket {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.apply_deadline()?;
+        self.stream.read(buffer)
+    }
+}
+
+impl std::io::Write for ControlPlaneDeadlineUnixSocket {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.apply_deadline()?;
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.apply_deadline()?;
+        self.stream.flush()
+    }
 }
 
 impl ControlPlaneDeadlineTcpSocket {
@@ -14500,7 +14988,8 @@ impl AuthenticatedUnixControlPlaneClient {
     }
 }
 
-pub fn handle_control_plane_unix_stream<T>(
+#[cfg(test)]
+fn handle_control_plane_unix_stream<T>(
     control_plane: &mut T,
     stream: &mut UnixStream,
     authority_now_ms: u64,
@@ -14513,7 +15002,8 @@ where
     write_control_plane_unix_response(stream, response)
 }
 
-pub fn handle_control_plane_unix_stream_with_auth<T>(
+#[cfg(test)]
+fn handle_control_plane_unix_stream_with_auth<T>(
     control_plane: &mut T,
     stream: &mut UnixStream,
     authority_now_ms: u64,
@@ -14533,14 +15023,14 @@ where
 }
 
 #[derive(Debug)]
-pub struct ControlPlaneRpcRequest {
+struct ControlPlaneRpcRequest {
     kind: ControlPlaneRpcKind,
     payload: Vec<u8>,
 }
 
 impl ControlPlaneRpcRequest {
     #[must_use]
-    pub fn metrics_kind(&self) -> observability::ControlPlaneRpcMetricKind {
+    fn metrics_kind(&self) -> observability::ControlPlaneRpcMetricKind {
         self.kind.metrics_kind()
     }
 }
@@ -14552,7 +15042,7 @@ struct ControlPlaneUnixResponseAuth {
     operation: ControlPlaneAuthOperation,
 }
 
-pub struct VerifiedControlPlaneRpcRequest {
+struct VerifiedControlPlaneRpcRequest {
     kind: ControlPlaneRpcKind,
     payload: Vec<u8>,
     response_auth: Option<ControlPlaneUnixResponseAuth>,
@@ -14560,17 +15050,12 @@ pub struct VerifiedControlPlaneRpcRequest {
 
 impl VerifiedControlPlaneRpcRequest {
     #[must_use]
-    pub fn metrics_kind(&self) -> observability::ControlPlaneRpcMetricKind {
-        self.kind.metrics_kind()
-    }
-
-    #[must_use]
-    pub fn is_refresh_node_heartbeat(&self) -> bool {
+    fn is_refresh_node_heartbeat(&self) -> bool {
         self.kind == ControlPlaneRpcKind::RefreshNodeHeartbeat
     }
 
     #[must_use]
-    pub fn is_authority_clock_admin(&self) -> bool {
+    fn is_authority_clock_admin(&self) -> bool {
         matches!(
             self.kind,
             ControlPlaneRpcKind::AuthorityClockStatus
@@ -14579,7 +15064,7 @@ impl VerifiedControlPlaneRpcRequest {
     }
 
     #[must_use]
-    pub fn requires_raft_authority_confirmation(&self) -> bool {
+    fn requires_raft_authority_confirmation(&self) -> bool {
         !matches!(
             self.kind,
             ControlPlaneRpcKind::AuthorityClockStatus | ControlPlaneRpcKind::TriggerRaftElection
@@ -14588,25 +15073,26 @@ impl VerifiedControlPlaneRpcRequest {
 }
 
 #[derive(Debug)]
-pub struct ControlPlaneRpcResponse {
+struct ControlPlaneRpcResponse {
     kind: ControlPlaneRpcKind,
     payload: Vec<u8>,
 }
 
 #[derive(Debug)]
-pub struct PreparedControlPlaneHeartbeatResponse {
+struct PreparedControlPlaneHeartbeatResponse {
     refresh: Result<ControlPlaneHeartbeatRefresh, ControlPlaneError>,
     response_auth: Option<ControlPlaneUnixResponseAuth>,
 }
 
-pub fn read_control_plane_unix_request(
+#[cfg(test)]
+fn read_control_plane_unix_request(
     stream: &mut impl std::io::Read,
 ) -> Result<ControlPlaneRpcRequest, ControlPlaneError> {
     let (kind, payload) = read_control_plane_rpc_frame(stream)?;
     Ok(ControlPlaneRpcRequest { kind, payload })
 }
 
-pub fn read_control_plane_request_with_reservation<R>(
+fn read_control_plane_request_with_reservation<R>(
     stream: &mut impl std::io::Read,
     reserve: impl FnOnce(usize) -> Result<R, ControlPlaneError>,
 ) -> Result<(ControlPlaneRpcRequest, R), ControlPlaneError> {
@@ -14615,7 +15101,7 @@ pub fn read_control_plane_request_with_reservation<R>(
     Ok((ControlPlaneRpcRequest { kind, payload }, reservation))
 }
 
-pub fn verify_control_plane_unix_request(
+fn verify_control_plane_unix_request(
     request: ControlPlaneRpcRequest,
     auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
     authority_now_ms: u64,
@@ -14623,7 +15109,7 @@ pub fn verify_control_plane_unix_request(
     verify_control_plane_request(request, auth_verifier, authority_now_ms, false)
 }
 
-pub fn verify_control_plane_authenticated_request(
+fn verify_control_plane_authenticated_request(
     request: ControlPlaneRpcRequest,
     auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
     authority_now_ms: u64,
@@ -14769,7 +15255,8 @@ fn verify_control_plane_request(
     })
 }
 
-pub fn build_control_plane_unix_response<T>(
+#[cfg(test)]
+fn build_control_plane_unix_response<T>(
     control_plane: &mut T,
     request: ControlPlaneRpcRequest,
     authority_now_ms: u64,
@@ -14780,7 +15267,8 @@ where
     build_control_plane_unix_response_with_auth(control_plane, request, authority_now_ms, None)
 }
 
-pub fn build_control_plane_unix_response_with_auth<T>(
+#[cfg(test)]
+fn build_control_plane_unix_response_with_auth<T>(
     control_plane: &mut T,
     request: ControlPlaneRpcRequest,
     authority_now_ms: u64,
@@ -14798,7 +15286,8 @@ where
     )
 }
 
-pub fn build_control_plane_unix_response_with_auth_and_response_clock<T, F>(
+#[cfg(test)]
+fn build_control_plane_unix_response_with_auth_and_response_clock<T, F>(
     control_plane: &mut T,
     request: ControlPlaneRpcRequest,
     authority_now_ms: u64,
@@ -14818,7 +15307,7 @@ where
     )
 }
 
-pub fn build_control_plane_unix_response_from_verified<T, F>(
+fn build_control_plane_unix_response_from_verified<T, F>(
     control_plane: &mut T,
     request: VerifiedControlPlaneRpcRequest,
     authority_now_ms: u64,
@@ -15073,7 +15562,7 @@ where
     )
 }
 
-pub fn build_control_plane_unix_admission_error_response(
+fn build_control_plane_unix_admission_error_response(
     request: VerifiedControlPlaneRpcRequest,
     error: ControlPlaneError,
     authority_now_ms: u64,
@@ -15106,7 +15595,8 @@ fn build_control_plane_verified_response(
     Ok(ControlPlaneRpcResponse { kind, payload })
 }
 
-pub fn build_control_plane_authority_clock_admin_response<T, P, F>(
+#[cfg(test)]
+fn build_control_plane_authority_clock_admin_response<T, P, F>(
     control_plane: &T,
     authority_clock: &mut ControlPlaneAuthorityClock,
     request: ControlPlaneRpcRequest,
@@ -15132,7 +15622,8 @@ where
     )
 }
 
-pub fn build_control_plane_authority_clock_admin_response_from_verified<T, P, F>(
+#[cfg(test)]
+fn build_control_plane_authority_clock_admin_response_from_verified<T, P, F>(
     control_plane: &T,
     authority_clock: &mut ControlPlaneAuthorityClock,
     request: VerifiedControlPlaneRpcRequest,
@@ -15156,7 +15647,7 @@ where
     )
 }
 
-pub fn build_control_plane_authority_clock_admin_response_from_verified_with_context<P, F>(
+fn build_control_plane_authority_clock_admin_response_from_verified_with_context<P, F>(
     authority_clock: &mut ControlPlaneAuthorityClock,
     request: VerifiedControlPlaneRpcRequest,
     sample: ControlPlaneAuthorityClockAdminSample,
@@ -15241,14 +15732,15 @@ where
     Ok(ControlPlaneRpcResponse { kind, payload })
 }
 
-pub fn write_control_plane_unix_response(
+fn write_control_plane_unix_response(
     stream: &mut impl std::io::Write,
     response: ControlPlaneRpcResponse,
 ) -> Result<(), ControlPlaneError> {
     write_control_plane_rpc_frame(stream, response.kind, &response.payload)
 }
 
-pub fn respond_control_plane_unix_request<T>(
+#[cfg(test)]
+fn respond_control_plane_unix_request<T>(
     control_plane: &mut T,
     stream: &mut impl std::io::Write,
     request: ControlPlaneRpcRequest,
@@ -15258,25 +15750,6 @@ where
     T: ControlPlaneAdmin + ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
 {
     let response = build_control_plane_unix_response(control_plane, request, authority_now_ms)?;
-    write_control_plane_unix_response(stream, response)
-}
-
-pub fn respond_control_plane_unix_request_with_auth<T>(
-    control_plane: &mut T,
-    stream: &mut impl std::io::Write,
-    request: ControlPlaneRpcRequest,
-    authority_now_ms: u64,
-    auth_verifier: &ControlPlaneUnixAuthVerifier,
-) -> Result<(), ControlPlaneError>
-where
-    T: ControlPlaneAdmin + ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
-{
-    let response = build_control_plane_unix_response_with_auth(
-        control_plane,
-        request,
-        authority_now_ms,
-        Some(auth_verifier),
-    )?;
     write_control_plane_unix_response(stream, response)
 }
 
@@ -15380,7 +15853,8 @@ impl ControlPlaneRpcKind {
     }
 }
 
-pub fn prepare_control_plane_heartbeat_response<T>(
+#[cfg(test)]
+fn prepare_control_plane_heartbeat_response<T>(
     control_plane: &mut T,
     request: ControlPlaneRpcRequest,
     authority_now_ms: u64,
@@ -15393,7 +15867,7 @@ where
     prepare_control_plane_heartbeat_response_from_verified(control_plane, request, authority_now_ms)
 }
 
-pub fn prepare_control_plane_heartbeat_response_from_verified<T>(
+fn prepare_control_plane_heartbeat_response_from_verified<T>(
     control_plane: &mut T,
     request: VerifiedControlPlaneRpcRequest,
     authority_now_ms: u64,
@@ -15409,26 +15883,7 @@ where
     )
 }
 
-pub fn prepare_control_plane_heartbeat_response_with_lease_horizon_authority<T>(
-    control_plane: &mut T,
-    request: ControlPlaneRpcRequest,
-    authority_now_ms: u64,
-    lease_horizon_authority: LeaseHorizonAuthorityBinding,
-    auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
-) -> Result<PreparedControlPlaneHeartbeatResponse, ControlPlaneError>
-where
-    T: ControlPlaneHeartbeatRuntimeMapSource,
-{
-    let request = verify_control_plane_unix_request(request, auth_verifier, authority_now_ms)?;
-    prepare_control_plane_heartbeat_response_with_lease_horizon_authority_from_verified(
-        control_plane,
-        request,
-        authority_now_ms,
-        lease_horizon_authority,
-    )
-}
-
-pub fn prepare_control_plane_heartbeat_response_with_lease_horizon_authority_from_verified<T>(
+fn prepare_control_plane_heartbeat_response_with_lease_horizon_authority_from_verified<T>(
     control_plane: &mut T,
     request: VerifiedControlPlaneRpcRequest,
     authority_now_ms: u64,
@@ -15510,7 +15965,7 @@ where
     })
 }
 
-pub fn finish_control_plane_heartbeat_response<F>(
+fn finish_control_plane_heartbeat_response<F>(
     prepared: PreparedControlPlaneHeartbeatResponse,
     mut response_authority_now_ms: F,
 ) -> Result<ControlPlaneRpcResponse, ControlPlaneError>
@@ -15533,6 +15988,701 @@ where
         prepared.response_auth,
         response_authority_now_ms,
     )
+}
+
+/// Opaque failure returned when a control-plane server can no longer accept
+/// connections. The concrete transport diagnostic is logged inside storage.
+pub struct ControlPlaneRpcServerError;
+
+impl std::fmt::Debug for ControlPlaneRpcServerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ControlPlaneRpcServerError")
+    }
+}
+
+impl std::fmt::Display for ControlPlaneRpcServerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("control-plane RPC server stopped accepting connections")
+    }
+}
+
+impl std::error::Error for ControlPlaneRpcServerError {}
+
+enum ControlPlaneRpcServerAuthority<T> {
+    Shared(Arc<Mutex<T>>),
+    PerWorker(T),
+}
+
+impl<T> ControlPlaneRpcServerAuthority<T> {
+    fn with_mut<R>(
+        &mut self,
+        metrics_kind: observability::ControlPlaneRpcMetricKind,
+        operation: impl FnOnce(&mut T) -> R,
+    ) -> R {
+        match self {
+            Self::Shared(authority) => {
+                let lock_started = Instant::now();
+                let mut authority = authority
+                    .lock()
+                    .expect("control-plane authority mutex poisoned");
+                observability::record_control_plane_rpc_lock_wait(
+                    metrics_kind,
+                    lock_started.elapsed(),
+                );
+                operation(&mut authority)
+            }
+            Self::PerWorker(authority) => {
+                observability::record_control_plane_rpc_lock_wait(metrics_kind, Duration::ZERO);
+                operation(authority)
+            }
+        }
+    }
+}
+
+enum ControlPlaneRpcAdmissionFailure {
+    Unauthenticated(Box<ControlPlaneError>),
+    Authenticated {
+        request: Box<VerifiedControlPlaneRpcRequest>,
+        error: Box<ControlPlaneError>,
+    },
+}
+
+fn authenticate_and_admit_control_plane_rpc(
+    request: ControlPlaneRpcRequest,
+    policy: &ControlPlaneRpcServerPolicy,
+    require_authentication: bool,
+    authority_now_ms: u64,
+) -> Result<VerifiedControlPlaneRpcRequest, ControlPlaneRpcAdmissionFailure> {
+    let verify = if require_authentication {
+        verify_control_plane_authenticated_request
+    } else {
+        verify_control_plane_unix_request
+    };
+    let request = verify(request, policy.auth_verifier.as_deref(), authority_now_ms)
+        .map_err(|error| ControlPlaneRpcAdmissionFailure::Unauthenticated(Box::new(error)))?;
+    if !policy.role.accepts(&request) {
+        let error = ControlPlaneError::RpcProtocol {
+            message: match policy.role {
+                ControlPlaneRpcServerRole::Ordinary => {
+                    "authority-clock administration requires the dedicated recovery endpoint"
+                        .to_owned()
+                }
+                ControlPlaneRpcServerRole::AuthorityClockRecovery => {
+                    "dedicated authority-clock recovery endpoint rejects ordinary control-plane RPCs"
+                        .to_owned()
+                }
+            },
+        };
+        return Err(ControlPlaneRpcAdmissionFailure::Authenticated {
+            request: Box::new(request),
+            error: Box::new(error),
+        });
+    }
+    if request.requires_raft_authority_confirmation() {
+        if let Some(confirm) = &policy.authority_confirmation {
+            if let Err(error) = confirm() {
+                return Err(ControlPlaneRpcAdmissionFailure::Authenticated {
+                    request: Box::new(request),
+                    error: Box::new(error),
+                });
+            }
+        }
+    }
+    Ok(request)
+}
+
+trait ControlPlaneRpcServerStream: std::io::Read + std::io::Write + Send {
+    fn finish_response(&mut self) -> std::io::Result<()>;
+}
+
+impl ControlPlaneRpcServerStream for ControlPlaneDeadlineUnixSocket {
+    fn finish_response(&mut self) -> std::io::Result<()> {
+        self.flush()
+    }
+}
+
+impl ControlPlaneRpcServerStream
+    for rustls::StreamOwned<rustls::ServerConnection, ControlPlaneDeadlineTcpSocket>
+{
+    fn finish_response(&mut self) -> std::io::Result<()> {
+        self.conn.send_close_notify();
+        self.flush()
+    }
+}
+
+struct ControlPlaneRpcWorkerGuard {
+    active_workers: Arc<AtomicUsize>,
+}
+
+impl Drop for ControlPlaneRpcWorkerGuard {
+    fn drop(&mut self) {
+        self.active_workers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl ControlPlaneRpcServerListener {
+    /// Serves this listener using one shared, mutex-protected authority.
+    ///
+    /// This method blocks until the listener encounters an unrecoverable
+    /// accept error. Individual connection failures remain isolated to their
+    /// worker.
+    pub fn serve_shared<T>(
+        self,
+        authority: Arc<Mutex<T>>,
+        policy: ControlPlaneRpcServerPolicy,
+    ) -> Result<(), ControlPlaneRpcServerError>
+    where
+        T: ControlPlaneAdmin
+            + ControlPlaneHeartbeatRuntimeMapSource
+            + ControlPlaneRuntimeMapSource
+            + Send
+            + 'static,
+    {
+        self.serve_with(
+            move || ControlPlaneRpcServerAuthority::Shared(Arc::clone(&authority)),
+            policy,
+        )
+    }
+
+    /// Serves this listener with an independently cloned authority per worker.
+    pub fn serve_cloned<T>(
+        self,
+        authority: T,
+        policy: ControlPlaneRpcServerPolicy,
+    ) -> Result<(), ControlPlaneRpcServerError>
+    where
+        T: Clone
+            + ControlPlaneAdmin
+            + ControlPlaneHeartbeatRuntimeMapSource
+            + ControlPlaneRuntimeMapSource
+            + Send
+            + 'static,
+    {
+        self.serve_with(
+            move || ControlPlaneRpcServerAuthority::PerWorker(authority.clone()),
+            policy,
+        )
+    }
+
+    /// Serves a bounded sequence of requests for a cross-crate process test.
+    ///
+    /// This test-only facility retains the complete production facade while
+    /// allowing deterministic authority timestamps and a joinable server.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn serve_shared_requests_for_test<T>(
+        self,
+        authority: Arc<Mutex<T>>,
+        mut policy: ControlPlaneRpcServerPolicy,
+        authority_times_ms: impl IntoIterator<Item = u64>,
+        mut after_request: impl FnMut(&T),
+    ) -> Result<(), ControlPlaneRpcServerError>
+    where
+        T: ControlPlaneAdmin
+            + ControlPlaneHeartbeatRuntimeMapSource
+            + ControlPlaneRuntimeMapSource
+            + Send
+            + 'static,
+    {
+        let configure_result = match &self.kind {
+            ControlPlaneRpcServerListenerKind::Unix(listener) => listener.set_nonblocking(false),
+            ControlPlaneRpcServerListenerKind::TlsTcp { listener, .. } => {
+                listener.set_nonblocking(false)
+            }
+        };
+        if let Err(error) = configure_result {
+            eprintln!("control-plane RPC test listener setup failed: {error}");
+            return Err(ControlPlaneRpcServerError);
+        }
+        for authority_now_ms in authority_times_ms {
+            policy.test_authority_now_ms = Some(authority_now_ms);
+            self.accept_one(
+                &|| ControlPlaneRpcServerAuthority::Shared(Arc::clone(&authority)),
+                &policy,
+            )?;
+            while policy.active_workers() != 0 {
+                std::thread::yield_now();
+            }
+            let authority = authority
+                .lock()
+                .expect("control-plane test authority mutex poisoned");
+            after_request(&authority);
+        }
+        Ok(())
+    }
+
+    /// Injects one pre-dispatch connection loss, then serves bounded requests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn serve_shared_requests_after_dropped_connection_for_test<T>(
+        self,
+        authority: Arc<Mutex<T>>,
+        policy: ControlPlaneRpcServerPolicy,
+        authority_times_ms: impl IntoIterator<Item = u64>,
+        after_request: impl FnMut(&T),
+    ) -> Result<(), ControlPlaneRpcServerError>
+    where
+        T: ControlPlaneAdmin
+            + ControlPlaneHeartbeatRuntimeMapSource
+            + ControlPlaneRuntimeMapSource
+            + Send
+            + 'static,
+    {
+        match &self.kind {
+            ControlPlaneRpcServerListenerKind::Unix(listener) => listener.accept().map(drop),
+            ControlPlaneRpcServerListenerKind::TlsTcp { listener, .. } => {
+                listener.accept().map(drop)
+            }
+        }
+        .map_err(|error| {
+            eprintln!("control-plane RPC test connection-loss injection failed: {error}");
+            ControlPlaneRpcServerError
+        })?;
+        self.serve_shared_requests_for_test(authority, policy, authority_times_ms, after_request)
+    }
+
+    fn serve_with<T>(
+        self,
+        authority: impl Fn() -> ControlPlaneRpcServerAuthority<T>,
+        policy: ControlPlaneRpcServerPolicy,
+    ) -> Result<(), ControlPlaneRpcServerError>
+    where
+        T: ControlPlaneAdmin
+            + ControlPlaneHeartbeatRuntimeMapSource
+            + ControlPlaneRuntimeMapSource
+            + Send
+            + 'static,
+    {
+        let configure_result = match &self.kind {
+            ControlPlaneRpcServerListenerKind::Unix(listener) => listener.set_nonblocking(false),
+            ControlPlaneRpcServerListenerKind::TlsTcp { listener, .. } => {
+                listener.set_nonblocking(false)
+            }
+        };
+        if let Err(error) = configure_result {
+            eprintln!("control-plane RPC listener setup failed: {error}");
+            return Err(ControlPlaneRpcServerError);
+        }
+        loop {
+            self.accept_one(&authority, &policy)?;
+        }
+    }
+
+    fn accept_one<T>(
+        &self,
+        authority: &impl Fn() -> ControlPlaneRpcServerAuthority<T>,
+        policy: &ControlPlaneRpcServerPolicy,
+    ) -> Result<(), ControlPlaneRpcServerError>
+    where
+        T: ControlPlaneAdmin
+            + ControlPlaneHeartbeatRuntimeMapSource
+            + ControlPlaneRuntimeMapSource
+            + Send
+            + 'static,
+    {
+        let worker_limit = policy.resources.worker_limit.min(self.max_connections);
+        match &self.kind {
+            ControlPlaneRpcServerListenerKind::Unix(listener) => match listener.accept() {
+                Ok((stream, _)) => spawn_control_plane_rpc_server_worker(
+                    stream,
+                    authority(),
+                    policy.clone(),
+                    false,
+                    self.max_frame_bytes,
+                    worker_limit,
+                    self.io_timeout,
+                    move |stream, deadline| {
+                        stream
+                            .set_nonblocking(false)
+                            .map_err(|source| ControlPlaneError::Io {
+                                context: "set control-plane Unix RPC blocking mode",
+                                source,
+                            })?;
+                        Ok(
+                            Box::new(ControlPlaneDeadlineUnixSocket { stream, deadline })
+                                as Box<dyn ControlPlaneRpcServerStream>,
+                        )
+                    },
+                ),
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => {
+                    eprintln!("control-plane Unix socket accept failed: {error}");
+                    return Err(ControlPlaneRpcServerError);
+                }
+            },
+            ControlPlaneRpcServerListenerKind::TlsTcp {
+                listener,
+                tls_server_config,
+            } => match listener.accept() {
+                Ok((stream, _)) => {
+                    let tls_server_config = Arc::clone(tls_server_config);
+                    spawn_control_plane_rpc_server_worker(
+                        stream,
+                        authority(),
+                        policy.clone(),
+                        true,
+                        self.max_frame_bytes,
+                        worker_limit,
+                        self.io_timeout,
+                        move |stream, deadline| {
+                            let socket = ControlPlaneDeadlineTcpSocket { stream, deadline };
+                            let connection = rustls::ServerConnection::new(tls_server_config)
+                                .map_err(|_| ControlPlaneError::RpcProtocol {
+                                    message:
+                                        "failed to initialize control-plane TLS server connection"
+                                            .to_owned(),
+                                })?;
+                            let mut stream = rustls::StreamOwned::new(connection, socket);
+                            while stream.conn.is_handshaking() {
+                                stream
+                                    .conn
+                                    .complete_io(&mut stream.sock)
+                                    .map_err(|source| ControlPlaneError::Io {
+                                        context: "complete control-plane TLS server handshake",
+                                        source,
+                                    })?;
+                            }
+                            if stream.conn.alpn_protocol() != Some(CONTROL_PLANE_RPC_TLS_ALPN) {
+                                return Err(ControlPlaneError::RpcProtocol {
+                                    message: "control-plane TLS peer did not negotiate the required protocol profile".to_owned(),
+                                });
+                            }
+                            Ok(Box::new(stream) as Box<dyn ControlPlaneRpcServerStream>)
+                        },
+                    );
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => {
+                    eprintln!("control-plane TCP socket accept failed: {error}");
+                    return Err(ControlPlaneRpcServerError);
+                }
+            },
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
+    stream: RawStream,
+    mut authority: ControlPlaneRpcServerAuthority<T>,
+    policy: ControlPlaneRpcServerPolicy,
+    require_authentication: bool,
+    max_frame_bytes: usize,
+    worker_limit: usize,
+    io_timeout: Duration,
+    prepare: Prepare,
+) where
+    T: ControlPlaneAdmin
+        + ControlPlaneHeartbeatRuntimeMapSource
+        + ControlPlaneRuntimeMapSource
+        + Send
+        + 'static,
+    RawStream: Send + 'static,
+    Prepare: FnOnce(
+            RawStream,
+            Instant,
+        ) -> Result<Box<dyn ControlPlaneRpcServerStream>, ControlPlaneError>
+        + Send
+        + 'static,
+{
+    if !reserve_control_plane_rpc_worker(&policy.resources.active_workers, worker_limit) {
+        eprintln!("control-plane RPC rejected: worker limit reached");
+        return;
+    }
+    let connection_deadline = Instant::now()
+        .checked_add(io_timeout)
+        .unwrap_or(Instant::now());
+    std::thread::spawn(move || {
+        let _guard = ControlPlaneRpcWorkerGuard {
+            active_workers: Arc::clone(&policy.resources.active_workers),
+        };
+        let mut stream = match prepare(stream, connection_deadline) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("control-plane RPC transport setup failed: {error}");
+                return;
+            }
+        };
+        let request = match read_control_plane_request_with_reservation(
+            &mut stream,
+            |frame_bytes| {
+                if frame_bytes > max_frame_bytes {
+                    return Err(ControlPlaneError::RpcProtocol {
+                        message: format!(
+                            "control-plane RPC frame size {frame_bytes} bytes exceeds listener limit {max_frame_bytes}"
+                        ),
+                    });
+                }
+                policy.resources.pre_auth_byte_budget.reserve(frame_bytes)
+            },
+        ) {
+            Ok((request, reservation)) => (request, reservation),
+            Err(error) => {
+                eprintln!("control-plane RPC request read failed: {error}");
+                return;
+            }
+        };
+        let (request, _pre_auth_byte_reservation) = request;
+        let metrics_kind = request.metrics_kind();
+        let request = match authenticate_and_admit_control_plane_rpc(
+            request,
+            &policy,
+            require_authentication,
+            policy.authority_now_ms(),
+        ) {
+            Ok(request) => request,
+            Err(ControlPlaneRpcAdmissionFailure::Unauthenticated(error)) => {
+                eprintln!("control-plane RPC authentication failed: {error}");
+                return;
+            }
+            Err(ControlPlaneRpcAdmissionFailure::Authenticated { request, error }) => {
+                let response = build_control_plane_unix_admission_error_response(
+                    *request,
+                    *error,
+                    policy.authority_now_ms(),
+                );
+                write_control_plane_rpc_admission_response(&mut stream, metrics_kind, response);
+                if let Err(error) = stream.finish_response() {
+                    eprintln!("control-plane RPC response finalization failed: {error}");
+                }
+                return;
+            }
+        };
+        let response = (|| {
+            if request.is_authority_clock_admin() {
+                let _operation_timer =
+                    observability::control_plane_rpc_operation_timer(metrics_kind);
+                let authority_clock = policy.authority_clock.as_ref().ok_or_else(|| {
+                    ControlPlaneError::RpcProtocol {
+                        message:
+                            "authority-clock administration requires a process-local clock gate"
+                                .to_owned(),
+                    }
+                })?;
+                let context = authority.with_mut(metrics_kind, |authority| {
+                    authority.authority_clock_context()
+                });
+                let mut authority_clock = authority_clock
+                    .lock()
+                    .expect("control-plane authority clock mutex poisoned");
+                let response =
+                    build_control_plane_authority_clock_admin_response_from_verified_with_context(
+                        &mut authority_clock,
+                        request,
+                        ControlPlaneAuthorityClockAdminSample::from_process_clock()?,
+                        context,
+                        |context, authority_clock| {
+                            policy
+                                .authority_clock_checkpoint_target
+                                .as_ref()
+                                .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                                    message: "authority-clock administration requires a durable checkpoint target".to_owned(),
+                                })?
+                                .persist_established(context, authority_clock)
+                        },
+                        || Ok(policy.authority_now_ms()),
+                    );
+                policy
+                    .authority_clock_checkpoint_target
+                    .as_ref()
+                    .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                        message:
+                            "authority-clock administration requires a durable checkpoint target"
+                                .to_owned(),
+                    })?
+                    .invalidate_if_blocked(&authority_clock)?;
+                response
+            } else if request.is_refresh_node_heartbeat() {
+                let prepared = {
+                    let _operation_timer =
+                        observability::control_plane_rpc_operation_timer(metrics_kind);
+                    authority.with_mut(metrics_kind, |authority| {
+                        let (now_ms, lease_horizon_authority) = match &policy.authority_clock {
+                            Some(authority_clock)
+                                if policy.gate_request_time_with_authority_clock =>
+                            {
+                                let mut authority_clock = authority_clock
+                                    .lock()
+                                    .expect("control-plane authority clock mutex poisoned");
+                                let now_ms = authority_clock.effective_process_now_ms();
+                                policy
+                                    .authority_clock_checkpoint_target
+                                    .as_ref()
+                                    .expect("configured authority clock has checkpoint target")
+                                    .invalidate_if_blocked(&authority_clock)?;
+                                let now_ms = now_ms?;
+                                let lease_horizon_authority =
+                                    authority_clock.lease_horizon_authority_binding(None)?;
+                                (now_ms, Some(lease_horizon_authority))
+                            }
+                            _ => (policy.authority_now_ms(), None),
+                        };
+                        match lease_horizon_authority {
+                            Some(lease_horizon_authority) => {
+                                prepare_control_plane_heartbeat_response_with_lease_horizon_authority_from_verified(
+                                    authority,
+                                    request,
+                                    now_ms,
+                                    lease_horizon_authority,
+                                )
+                            }
+                            None => prepare_control_plane_heartbeat_response_from_verified(
+                                authority, request, now_ms,
+                            ),
+                        }
+                    })
+                };
+                prepared.and_then(|prepared| {
+                    finish_control_plane_heartbeat_response(prepared, || {
+                        Ok(policy.authority_now_ms())
+                    })
+                })
+            } else {
+                let _operation_timer =
+                    observability::control_plane_rpc_operation_timer(metrics_kind);
+                authority.with_mut(metrics_kind, |authority| {
+                    let now_ms = match &policy.authority_clock {
+                        Some(authority_clock) if policy.gate_request_time_with_authority_clock => {
+                            let mut authority_clock = authority_clock
+                                .lock()
+                                .expect("control-plane authority clock mutex poisoned");
+                            let now_ms = authority_clock.effective_process_now_ms();
+                            policy
+                                .authority_clock_checkpoint_target
+                                .as_ref()
+                                .expect("configured authority clock has checkpoint target")
+                                .invalidate_if_blocked(&authority_clock)?;
+                            now_ms?
+                        }
+                        _ => policy.authority_now_ms(),
+                    };
+                    build_control_plane_unix_response_from_verified(
+                        authority,
+                        request,
+                        now_ms,
+                        || Ok(policy.authority_now_ms()),
+                    )
+                })
+            }
+        })();
+        if let Some(authority_clock) = &policy.authority_clock {
+            let authority_clock = authority_clock
+                .lock()
+                .expect("control-plane authority clock mutex poisoned");
+            let checkpoint_result = policy
+                .authority_clock_checkpoint_target
+                .as_ref()
+                .expect("configured authority clock has checkpoint target")
+                .invalidate_if_blocked(&authority_clock);
+            if let Err(error) = checkpoint_result {
+                eprintln!(
+                    "failed to invalidate blocked control-plane authority-clock checkpoint: {error}"
+                );
+                if let Some(fatal_error_handler) = &policy.fatal_error_handler {
+                    fatal_error_handler();
+                }
+                return;
+            }
+        }
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                eprintln!("control-plane RPC response build failed: {error}");
+                return;
+            }
+        };
+        let response_write_started = Instant::now();
+        let mut response = Some(response);
+        let mut write_response = || {
+            let response = response
+                .take()
+                .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                    message: "control-plane response publication attempted more than once"
+                        .to_owned(),
+                })?;
+            write_control_plane_rpc_response_and_flush(&mut stream, response)
+        };
+        let response_result = publish_control_plane_rpc_response(
+            policy.response_publication.as_deref(),
+            &mut write_response,
+        );
+        observability::record_control_plane_rpc_response_write(
+            metrics_kind,
+            response_write_started.elapsed(),
+        );
+        if let Err(error) = response_result {
+            observability::record_control_plane_rpc_response_write_error(
+                metrics_kind,
+                control_plane_rpc_response_write_error_kind(&error),
+            );
+            eprintln!("control-plane RPC response failed: {error}");
+        } else if let Err(error) = stream.finish_response() {
+            eprintln!("control-plane RPC response finalization failed: {error}");
+        }
+    });
+}
+
+fn reserve_control_plane_rpc_worker(active_workers: &AtomicUsize, worker_limit: usize) -> bool {
+    active_workers
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < worker_limit).then_some(active + 1)
+        })
+        .is_ok()
+}
+
+fn write_control_plane_rpc_admission_response(
+    stream: &mut impl std::io::Write,
+    metrics_kind: observability::ControlPlaneRpcMetricKind,
+    response: Result<ControlPlaneRpcResponse, ControlPlaneError>,
+) {
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("control-plane RPC admission response build failed: {error}");
+            return;
+        }
+    };
+    let response_write_started = Instant::now();
+    let response_result = write_control_plane_rpc_response_and_flush(stream, response);
+    observability::record_control_plane_rpc_response_write(
+        metrics_kind,
+        response_write_started.elapsed(),
+    );
+    if let Err(error) = response_result {
+        observability::record_control_plane_rpc_response_write_error(
+            metrics_kind,
+            control_plane_rpc_response_write_error_kind(&error),
+        );
+        eprintln!("control-plane RPC admission response failed: {error}");
+    }
+}
+
+fn write_control_plane_rpc_response_and_flush(
+    stream: &mut impl std::io::Write,
+    response: ControlPlaneRpcResponse,
+) -> Result<(), ControlPlaneError> {
+    write_control_plane_unix_response(stream, response)?;
+    stream.flush().map_err(|source| ControlPlaneError::Io {
+        context: "flush control-plane RPC response",
+        source,
+    })
+}
+
+fn control_plane_rpc_response_write_error_kind(
+    error: &ControlPlaneError,
+) -> observability::ControlPlaneRpcResponseWriteErrorKind {
+    let ControlPlaneError::Io { source, .. } = error else {
+        return observability::ControlPlaneRpcResponseWriteErrorKind::Other;
+    };
+    match source.kind() {
+        ErrorKind::BrokenPipe => observability::ControlPlaneRpcResponseWriteErrorKind::BrokenPipe,
+        ErrorKind::ConnectionReset => {
+            observability::ControlPlaneRpcResponseWriteErrorKind::ConnectionReset
+        }
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => {
+            observability::ControlPlaneRpcResponseWriteErrorKind::Timeout
+        }
+        _ => observability::ControlPlaneRpcResponseWriteErrorKind::Other,
+    }
 }
 
 fn write_control_plane_rpc_frame(
@@ -21572,7 +22722,7 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
-    fn control_plane_test_tls_server_config() -> Arc<rustls::ServerConfig> {
+    fn control_plane_test_tls_certified_key() -> Arc<CertifiedKey> {
         use rustls::pki_types::pem::PemObject as _;
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -21585,16 +22735,38 @@ mod tests {
             "../../s3-tests/testdata/localhost-key.pem"
         ))
         .unwrap();
+        let provider = rustls::crypto::ring::default_provider();
+        Arc::new(CertifiedKey::from_der(certificates, private_key, &provider).unwrap())
+    }
+
+    fn control_plane_test_tls_server_config() -> Arc<rustls::ServerConfig> {
+        let certified_key = control_plane_test_tls_certified_key();
+        let resolver = ControlPlaneRpcTlsCertificateResolver { certified_key };
         let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()
         .with_no_client_auth()
-        .with_single_cert(certificates, private_key)
-        .unwrap();
+        .with_cert_resolver(Arc::new(resolver));
         server_config.alpn_protocols = vec![CONTROL_PLANE_RPC_TLS_ALPN.to_vec()];
         Arc::new(server_config)
+    }
+
+    fn control_plane_test_tls_client_config(
+        negotiate_control_plane_alpn: bool,
+    ) -> Arc<rustls::ClientConfig> {
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(control_plane_test_tls_roots())
+        .with_no_client_auth();
+        if negotiate_control_plane_alpn {
+            config.alpn_protocols = vec![CONTROL_PLANE_RPC_TLS_ALPN.to_vec()];
+        }
+        Arc::new(config)
     }
 
     fn control_plane_test_tls_roots() -> rustls::RootCertStore {
@@ -21627,6 +22799,545 @@ mod tests {
             control_plane_test_tls_roots(),
         )
         .unwrap()
+    }
+
+    fn test_control_plane_server_authority(
+        name: &str,
+    ) -> (
+        test_util::TempDir,
+        Arc<Mutex<SingleAuthorityControlPlane<FileControlPlaneStore>>>,
+    ) {
+        let directory = test_util::tempdir();
+        let state_path = directory.path().join(format!("{name}.state"));
+        let authority =
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(state_path)).unwrap();
+        (directory, Arc::new(Mutex::new(authority)))
+    }
+
+    fn wait_for_control_plane_server_workers_to_finish(policy: &ControlPlaneRpcServerPolicy) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while policy.active_workers() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "control-plane server worker did not terminate"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn control_plane_rpc_server_policy_rejects_zero_resource_limits() {
+        assert!(matches!(
+            ControlPlaneRpcServerPolicy::new(ControlPlaneRpcServerRole::Ordinary, 0, 1),
+            Err(ControlPlaneRpcServerConfigError::ZeroWorkerLimit)
+        ));
+        assert!(matches!(
+            ControlPlaneRpcServerPolicy::new(ControlPlaneRpcServerRole::Ordinary, 1, 0),
+            Err(ControlPlaneRpcServerConfigError::ZeroPreAuthByteBudget)
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_server_policies_have_independent_worker_reservations() {
+        let ordinary = ControlPlaneRpcServerPolicy::new(
+            ControlPlaneRpcServerRole::Ordinary,
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        let recovery = ControlPlaneRpcServerPolicy::new(
+            ControlPlaneRpcServerRole::AuthorityClockRecovery,
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+
+        assert!(reserve_control_plane_rpc_worker(
+            &ordinary.resources.active_workers,
+            ordinary.resources.worker_limit
+        ));
+        assert!(!reserve_control_plane_rpc_worker(
+            &ordinary.resources.active_workers,
+            ordinary.resources.worker_limit
+        ));
+        assert!(reserve_control_plane_rpc_worker(
+            &recovery.resources.active_workers,
+            recovery.resources.worker_limit
+        ));
+        assert_eq!(ordinary.active_workers(), 1);
+        assert_eq!(recovery.active_workers(), 1);
+    }
+
+    #[test]
+    fn control_plane_rpc_server_pre_auth_budget_rejects_before_payload_read() {
+        let frame =
+            encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &[1]).unwrap();
+        let frame_bytes = frame.len();
+        let budget = Arc::new(ControlPlaneRpcPreAuthByteBudget::new(frame_bytes));
+        let held = budget.reserve(frame_bytes).unwrap();
+        let mut framed_header = std::io::Cursor::new(&frame[..control_plane_rpc_frame_overhead()]);
+
+        let error =
+            read_control_plane_request_with_reservation(&mut framed_header, |frame_bytes| {
+                budget.reserve(frame_bytes)
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("pre-authentication frame budget exhausted")
+        ));
+        assert_eq!(
+            framed_header.position(),
+            u64::try_from(control_plane_rpc_frame_overhead()).unwrap()
+        );
+        assert_eq!(budget.reserved_bytes.load(Ordering::Acquire), frame_bytes);
+        drop(held);
+        assert_eq!(budget.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn control_plane_rpc_server_response_errors_use_bounded_categories() {
+        let classify = |kind| {
+            control_plane_rpc_response_write_error_kind(&ControlPlaneError::Io {
+                context: "write test response",
+                source: std::io::Error::from(kind),
+            })
+        };
+
+        assert_eq!(
+            classify(ErrorKind::BrokenPipe),
+            observability::ControlPlaneRpcResponseWriteErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            classify(ErrorKind::ConnectionReset),
+            observability::ControlPlaneRpcResponseWriteErrorKind::ConnectionReset
+        );
+        assert_eq!(
+            classify(ErrorKind::WouldBlock),
+            observability::ControlPlaneRpcResponseWriteErrorKind::Timeout
+        );
+        assert_eq!(
+            classify(ErrorKind::PermissionDenied),
+            observability::ControlPlaneRpcResponseWriteErrorKind::Other
+        );
+    }
+
+    #[test]
+    fn control_plane_rpc_server_requires_exactly_one_response_publication() {
+        struct SkipPublication;
+        impl ControlPlaneRpcResponsePublication for SkipPublication {
+            fn publish(
+                &self,
+                _publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+            ) -> Result<(), ControlPlaneError> {
+                Ok(())
+            }
+        }
+
+        struct DuplicatePublication;
+        impl ControlPlaneRpcResponsePublication for DuplicatePublication {
+            fn publish(
+                &self,
+                publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+            ) -> Result<(), ControlPlaneError> {
+                publish()?;
+                publish()
+            }
+        }
+
+        let calls = Cell::new(0);
+        let mut publish = || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        let error =
+            publish_control_plane_rpc_response(Some(&SkipPublication), &mut publish).unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("without publishing")
+        ));
+        assert_eq!(calls.get(), 0);
+
+        let error = publish_control_plane_rpc_response(Some(&DuplicatePublication), &mut publish)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("more than once")
+        ));
+        assert_eq!(calls.get(), 1);
+
+        publish_control_plane_rpc_response(None, &mut publish).unwrap();
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn control_plane_tls_server_listener_owns_protocol_profile() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = ControlPlaneRpcServerListener::tls_tcp(
+            listener,
+            control_plane_test_tls_certified_key(),
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let ControlPlaneRpcServerListenerKind::TlsTcp {
+            tls_server_config, ..
+        } = &listener.kind
+        else {
+            panic!("TLS/TCP constructor returned a Unix listener")
+        };
+
+        assert_eq!(
+            tls_server_config.alpn_protocols,
+            [CONTROL_PLANE_RPC_TLS_ALPN]
+        );
+    }
+
+    #[test]
+    fn control_plane_tls_server_bounds_stalled_handshake() {
+        let raw_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = raw_listener.local_addr().unwrap();
+        let listener = ControlPlaneRpcServerListener::tls_tcp(
+            raw_listener,
+            control_plane_test_tls_certified_key(),
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let policy = ControlPlaneRpcServerPolicy::new(
+            ControlPlaneRpcServerRole::Ordinary,
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        let (_authority_directory, authority) =
+            test_control_plane_server_authority("stalled-tls-handshake");
+        let stalled_client = TcpStream::connect(address).unwrap();
+        let started_at = Instant::now();
+        listener
+            .accept_one(
+                &move || ControlPlaneRpcServerAuthority::Shared(Arc::clone(&authority)),
+                &policy,
+            )
+            .unwrap();
+        wait_for_control_plane_server_workers_to_finish(&policy);
+
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+        drop(stalled_client);
+    }
+
+    #[test]
+    fn control_plane_unix_server_bounds_trickled_request_absolutely() {
+        let directory = test_util::tempdir();
+        let socket_path = directory.path().join("control-plane.sock");
+        let listener = ControlPlaneRpcServerListener::unix(
+            UnixListener::bind(&socket_path).unwrap(),
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let policy = ControlPlaneRpcServerPolicy::new(
+            ControlPlaneRpcServerRole::Ordinary,
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        let (_authority_directory, authority) =
+            test_control_plane_server_authority("trickled-unix-request");
+        let writer = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket_path).unwrap();
+            let mut written = 0;
+            for byte in CONTROL_PLANE_RPC_MAGIC {
+                if stream.write_all(std::slice::from_ref(byte)).is_err() {
+                    break;
+                }
+                written += 1;
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            written
+        });
+        listener
+            .accept_one(
+                &move || ControlPlaneRpcServerAuthority::Shared(Arc::clone(&authority)),
+                &policy,
+            )
+            .unwrap();
+        wait_for_control_plane_server_workers_to_finish(&policy);
+        let written = writer.join().unwrap();
+
+        assert!(written < CONTROL_PLANE_RPC_MAGIC.len());
+    }
+
+    #[test]
+    fn control_plane_tls_server_rejects_missing_protocol_profile() {
+        use rustls::pki_types::ServerName;
+
+        let raw_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = raw_listener.local_addr().unwrap();
+        let listener = ControlPlaneRpcServerListener::tls_tcp(
+            raw_listener,
+            control_plane_test_tls_certified_key(),
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let policy = ControlPlaneRpcServerPolicy::new(
+            ControlPlaneRpcServerRole::Ordinary,
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        let (_authority_directory, authority) =
+            test_control_plane_server_authority("tls-alpn-required");
+        let (handshake_tx, handshake_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            let stream = TcpStream::connect(address).unwrap();
+            let connection = rustls::ClientConnection::new(
+                control_plane_test_tls_client_config(false),
+                ServerName::try_from("localhost").unwrap(),
+            )
+            .unwrap();
+            let mut stream = rustls::StreamOwned::new(connection, stream);
+            while stream.conn.is_handshaking() {
+                stream.conn.complete_io(&mut stream.sock).unwrap();
+            }
+            handshake_tx
+                .send(stream.conn.alpn_protocol().map(<[u8]>::to_vec))
+                .unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        listener
+            .accept_one(
+                &move || ControlPlaneRpcServerAuthority::Shared(Arc::clone(&authority)),
+                &policy,
+            )
+            .unwrap();
+        assert_eq!(
+            handshake_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            None
+        );
+        wait_for_control_plane_server_workers_to_finish(&policy);
+        release_tx.send(()).unwrap();
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn control_plane_tls_server_requires_auth_before_authority_confirmation() {
+        use rustls::pki_types::ServerName;
+
+        let raw_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = raw_listener.local_addr().unwrap();
+        let listener = ControlPlaneRpcServerListener::tls_tcp(
+            raw_listener,
+            control_plane_test_tls_certified_key(),
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let verifier = Arc::new(frontend_auth_verifier("auth-cluster", "frontend-1"));
+        let verifier_for_assert = Arc::clone(&verifier);
+        let confirmation_calls = Arc::new(AtomicUsize::new(0));
+        let confirmation_calls_for_policy = Arc::clone(&confirmation_calls);
+        let policy = ControlPlaneRpcServerPolicy::new(
+            ControlPlaneRpcServerRole::Ordinary,
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        )
+        .unwrap()
+        .with_auth_verifier(verifier)
+        .with_authority_confirmation(Arc::new(move || {
+            confirmation_calls_for_policy.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }));
+        let (_authority_directory, authority) =
+            test_control_plane_server_authority("tls-auth-required");
+        let client = std::thread::spawn(move || {
+            let stream = TcpStream::connect(address).unwrap();
+            let connection = rustls::ClientConnection::new(
+                control_plane_test_tls_client_config(true),
+                ServerName::try_from("localhost").unwrap(),
+            )
+            .unwrap();
+            let mut stream = rustls::StreamOwned::new(connection, stream);
+            write_control_plane_rpc_frame(&mut stream, ControlPlaneRpcKind::RuntimeMapStatus, &[])
+                .unwrap();
+            stream.flush().unwrap();
+            read_control_plane_rpc_frame(&mut stream).unwrap_err()
+        });
+
+        listener
+            .accept_one(
+                &move || ControlPlaneRpcServerAuthority::Shared(Arc::clone(&authority)),
+                &policy,
+            )
+            .unwrap();
+        let _error = client.join().unwrap();
+        wait_for_control_plane_server_workers_to_finish(&policy);
+
+        assert_eq!(confirmation_calls.load(Ordering::Acquire), 0);
+        let metrics = verifier_for_assert.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::Missing),
+            1
+        );
+    }
+
+    #[test]
+    fn control_plane_unix_server_facade_dispatches_logical_client_request() {
+        let directory = test_util::tempdir();
+        let socket_path = directory.path().join("control-plane.sock");
+        let listener = ControlPlaneRpcServerListener::unix(
+            UnixListener::bind(&socket_path).unwrap(),
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let policy = ControlPlaneRpcServerPolicy::new(
+            ControlPlaneRpcServerRole::Ordinary,
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        let authority = Arc::new(Mutex::new(
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+                directory.path().join("control.state"),
+            ))
+            .unwrap(),
+        ));
+        let client = std::thread::spawn(move || {
+            UnixControlPlaneClient::new(socket_path)
+                .runtime_map_status_with_check_applied_timeout()
+                .unwrap()
+        });
+
+        listener
+            .accept_one(
+                &move || ControlPlaneRpcServerAuthority::Shared(Arc::clone(&authority)),
+                &policy,
+            )
+            .unwrap();
+        let status = client.join().unwrap();
+        wait_for_control_plane_server_workers_to_finish(&policy);
+
+        assert_eq!(status.pg_routes(), 0);
+    }
+
+    #[test]
+    fn control_plane_tls_recovery_server_dispatches_authenticated_status() {
+        let directory = test_util::tempdir();
+        let state_path = directory.path().join("control.state");
+        let raw_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = raw_listener.local_addr().unwrap();
+        let listener = ControlPlaneRpcServerListener::tls_tcp(
+            raw_listener,
+            control_plane_test_tls_certified_key(),
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let admin_credential =
+            admin_auth_config_credential_with("tcp-admin", "tcp-admin", 1, "tcp-admin-secret");
+        let verifier = Arc::new(
+            ControlPlaneUnixAuthVerifier::new_empty("tcp-cluster")
+                .unwrap()
+                .with_admin_credentials(vec![admin_credential.clone()])
+                .unwrap(),
+        );
+        let now_ms = crate::clock::current_time_millis();
+        let authority_clock = Arc::new(Mutex::new(
+            ControlPlaneAuthorityClock::new(None, now_ms, crate::clock::clock_health_time_millis())
+                .unwrap(),
+        ));
+        let checkpoint_target = Arc::new(ControlPlaneAuthorityClockCheckpointTarget::new(
+            &state_path,
+            ControlPlaneAuthorityClockCheckpointBinding::for_raft("tcp-cluster", 1),
+        ));
+        let policy = ControlPlaneRpcServerPolicy::new(
+            ControlPlaneRpcServerRole::AuthorityClockRecovery,
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        )
+        .unwrap()
+        .with_auth_verifier(verifier)
+        .with_authority_clock(authority_clock, checkpoint_target, false);
+        let authority = Arc::new(Mutex::new(
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&state_path)).unwrap(),
+        ));
+        let client = std::thread::spawn(move || {
+            let endpoint = control_plane_test_tls_endpoint(address);
+            let client = UnixControlPlaneClient::with_endpoints([endpoint]).unwrap();
+            let client = AuthenticatedUnixControlPlaneClient::new(
+                client,
+                admin_credential.scoped_for_cluster("tcp-cluster").unwrap(),
+            );
+            client.authority_clock_status(now_ms).unwrap()
+        });
+
+        listener
+            .accept_one(
+                &move || ControlPlaneRpcServerAuthority::Shared(Arc::clone(&authority)),
+                &policy,
+            )
+            .unwrap();
+        let status = client.join().unwrap();
+        wait_for_control_plane_server_workers_to_finish(&policy);
+
+        assert!(status.established());
+    }
+
+    #[test]
+    fn invalid_control_plane_auth_precedes_authority_confirmation() {
+        let verifier = Arc::new(storage_node_auth_verifier(
+            "auth-cluster",
+            vec![storage_node_auth_node_credential(1)],
+        ));
+        let confirmation_calls = Arc::new(AtomicUsize::new(0));
+        let confirmation_calls_for_policy = Arc::clone(&confirmation_calls);
+        let policy = ControlPlaneRpcServerPolicy::new(
+            ControlPlaneRpcServerRole::Ordinary,
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        )
+        .unwrap()
+        .with_auth_verifier(verifier)
+        .with_authority_confirmation(Arc::new(move || {
+            confirmation_calls_for_policy.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }));
+        let request = signed_storage_node_heartbeat_request(
+            &storage_node_auth_credential("wrong-cluster", 1, 1),
+            &NodeHeartbeat {
+                node_id: NodeId::new(1),
+                node_incarnation: 1,
+                endpoint: "/tmp/node-1.sock".to_owned(),
+                observed_epoch: ClusterEpoch::INITIAL,
+                requested_lease_duration_ms: 100,
+                cluster_map_history_route_references: Default::default(),
+                pg_observations: Vec::new(),
+            },
+            Some(2_000),
+            Some(3_000),
+        );
+
+        assert!(matches!(
+            authenticate_and_admit_control_plane_rpc(request, &policy, false, 2_500),
+            Err(ControlPlaneRpcAdmissionFailure::Unauthenticated(_))
+        ));
+        assert_eq!(confirmation_calls.load(Ordering::Acquire), 0);
     }
 
     #[test]

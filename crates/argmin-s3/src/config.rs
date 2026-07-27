@@ -124,7 +124,7 @@ pub(crate) enum ConfiguredControlPlaneRpcListener {
     Tcp {
         endpoint_id: String,
         bind_addr: String,
-        tls_server_config: Arc<rustls::ServerConfig>,
+        certified_key: Arc<rustls::sign::CertifiedKey>,
         max_connections: usize,
         max_frame_bytes: usize,
         io_timeout: Duration,

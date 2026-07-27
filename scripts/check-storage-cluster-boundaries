@@ -2589,6 +2589,18 @@ fail_with_matches \
     "Control-plane client framing and frame transport are private to storage; use ControlPlaneRpcClientEndpoint" \
     "$control_plane_client_wire_leaks"
 
+control_plane_server_wire_leaks=$(
+    rg -n --color=never \
+        '\bControlPlaneRpc(Request|Response|WorkerPolicy|WorkerGuard|PreAuthByteBudget|Endpoint)\b|\bVerifiedControlPlaneRpcRequest\b|\bBoundControlPlaneRpcListener\b|\bspawn_control_plane_(tcp_)?rpc_worker\b|\b(handle_control_plane_unix_stream(_with_auth)?|read_control_plane_(unix_request|request_with_reservation)|verify_control_plane_(unix_request|authenticated_request)|write_control_plane_unix_response)\b|\bCONTROL_PLANE_RPC_TLS_ALPN\b' \
+        . \
+        -g 'crates/**/*.rs' \
+        -g '!crates/storage/**' \
+        || true
+)
+fail_with_matches \
+    "Control-plane server framing, admission, TLS profile, and workers are private to storage; use ControlPlaneRpcServerListener and ControlPlaneRpcServerPolicy" \
+    "$control_plane_server_wire_leaks"
+
 if [[ "$failed" -ne 0 ]]; then
     echo
     echo "storage cluster boundary checks failed" >&2

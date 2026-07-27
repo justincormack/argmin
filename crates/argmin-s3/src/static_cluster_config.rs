@@ -33,8 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use storage::control_plane::{
     ControlPlaneError, InitialClusterTopologyCertificate, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
-    CONTROL_PLANE_RPC_MAX_SERVER_OPERATION_TIMEOUT, CONTROL_PLANE_RPC_TLS_ALPN,
-    CONTROL_PLANE_TOPOLOGY_DIGEST_LEN,
+    CONTROL_PLANE_RPC_MAX_SERVER_OPERATION_TIMEOUT, CONTROL_PLANE_TOPOLOGY_DIGEST_LEN,
 };
 use storage::control_plane_auth::{
     ControlPlaneAuthPrincipal, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
@@ -1444,7 +1443,6 @@ impl ValidatedStaticClusterManifest {
             EndpointProtocol::ControlPlane | EndpointProtocol::AuthorityClockRecovery
         ));
         let selected = &self.manifest.processes[self.selected_process_index];
-        let provider = rustls::crypto::ring::default_provider();
         let mut endpoints = self
             .manifest
             .endpoints
@@ -1487,23 +1485,10 @@ impl ValidatedStaticClusterManifest {
                                 endpoint.id
                             )
                         })?;
-                        let resolver = StaticSingleCertificateResolver {
-                            certified_key: Arc::clone(&identity.certified_key),
-                        };
-                        let mut server_config = rustls::ServerConfig::builder_with_provider(
-                            Arc::new(provider.clone()),
-                        )
-                        .with_protocol_versions(&[&rustls::version::TLS13])
-                        .map_err(|_| {
-                            "failed to select the static control-plane TLS protocol".to_string()
-                        })?
-                        .with_no_client_auth()
-                        .with_cert_resolver(Arc::new(resolver));
-                        server_config.alpn_protocols = vec![CONTROL_PLANE_RPC_TLS_ALPN.to_vec()];
                         Ok(ConfiguredControlPlaneRpcListener::Tcp {
                             endpoint_id: endpoint.id.clone(),
                             bind_addr: tcp_socket_address(&host, port),
-                            tls_server_config: Arc::new(server_config),
+                            certified_key: Arc::clone(&identity.certified_key),
                             max_connections,
                             max_frame_bytes,
                             io_timeout,
@@ -7663,124 +7648,6 @@ tls_server_name = "control-1-alt.internal"
             assert!(error.contains("control-plane endpoint"));
             assert!(error.contains("frame limit must equal"));
         }
-    }
-
-    #[test]
-    fn static_tls_control_plane_transport_authenticates_and_dispatches_recovery_rpc() {
-        let certificates = CertificateDer::pem_slice_iter(include_bytes!(
-            "../../s3-tests/testdata/localhost-cert.pem"
-        ))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-        let private_key = PrivateKeyDer::from_pem_slice(include_bytes!(
-            "../../s3-tests/testdata/localhost-key.pem"
-        ))
-        .unwrap();
-        let provider = rustls::crypto::ring::default_provider();
-        let mut server_config =
-            rustls::ServerConfig::builder_with_provider(Arc::new(provider.clone()))
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .unwrap()
-                .with_no_client_auth()
-                .with_single_cert(certificates, private_key)
-                .unwrap();
-        server_config.alpn_protocols = vec![CONTROL_PLANE_RPC_TLS_ALPN.to_vec()];
-        let server_config = Arc::new(server_config);
-
-        let mut roots = RootCertStore::empty();
-        roots
-            .add(
-                CertificateDer::pem_slice_iter(include_bytes!(
-                    "../../s3-tests/testdata/ca-cert.pem"
-                ))
-                .next()
-                .unwrap()
-                .unwrap(),
-            )
-            .unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let port = address.port();
-        let endpoint = format!("tcp://localhost:{port}");
-        let client_endpoint = storage::control_plane::ControlPlaneRpcClientEndpoint::tls_tcp(
-            endpoint,
-            address.ip().to_string(),
-            address.port(),
-            "localhost",
-            Duration::from_secs(1),
-            roots,
-        )
-        .unwrap();
-        let admin_credential = storage::control_plane::ControlPlaneAdminAuthCredential::new(
-            storage::control_plane::ControlPlaneAdminAuthCredentialInput {
-                instance_id: "tcp-admin".to_string(),
-                credential_id: "tcp-admin".to_string(),
-                credential_version: 1,
-                secret: b"tcp-admin-secret".to_vec(),
-            },
-        )
-        .unwrap();
-        let verifier = Arc::new(
-            storage::control_plane::ControlPlaneUnixAuthVerifier::new_empty("tcp-cluster")
-                .unwrap()
-                .with_admin_credentials(vec![admin_credential.clone()])
-                .unwrap(),
-        );
-        let now_ms = storage::clock::current_time_millis();
-        let authority_clock = Arc::new(std::sync::Mutex::new(
-            storage::control_plane::ControlPlaneAuthorityClock::new(
-                None,
-                now_ms,
-                storage::clock::clock_health_time_millis(),
-            )
-            .unwrap(),
-        ));
-        let state_dir = test_util::tempdir();
-        let authority = Arc::new(std::sync::Mutex::new(
-            storage::control_plane::SingleAuthorityControlPlane::open(
-                storage::control_plane::FileControlPlaneStore::new(
-                    state_dir.path().join("control.state"),
-                ),
-            )
-            .unwrap(),
-        ));
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            crate::spawn_control_plane_tcp_rpc_worker(
-                stream,
-                server_config,
-                crate::ControlPlaneRpcWorkerAuthority::Shared(authority),
-                Some(authority_clock),
-                None,
-                crate::ControlPlaneRpcWorkerPolicy {
-                    gate_request_time_with_authority_clock: false,
-                    require_authentication: true,
-                    active_rpc_workers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                    worker_limit: 1,
-                    max_frame_bytes: CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
-                    io_timeout: Duration::from_secs(2),
-                    pre_auth_byte_budget: Arc::new(crate::ControlPlaneRpcPreAuthByteBudget::new(
-                        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
-                    )),
-                    endpoint: crate::ControlPlaneRpcEndpoint::ClockRecovery,
-                    auth_verifier: Some(verifier),
-                    raft_authority_admission: None,
-                    durable_response_publication: None,
-                },
-            );
-        });
-        let client =
-            storage::control_plane::UnixControlPlaneClient::with_endpoints([client_endpoint])
-                .unwrap();
-        let client = storage::control_plane::AuthenticatedUnixControlPlaneClient::new(
-            client,
-            admin_credential.scoped_for_cluster("tcp-cluster").unwrap(),
-        );
-
-        let status = client.authority_clock_status(now_ms).unwrap();
-
-        assert!(status.established());
-        server.join().unwrap();
     }
 
     #[test]
