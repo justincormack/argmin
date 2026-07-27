@@ -249,7 +249,7 @@ define_metadata_command_publishers! {
         AllocatorCleanup
     ),
     CompleteMultipartUploadCommitSerialized => (
-        "complete_multipart_upload_commit_serialized",
+        "complete_multipart_upload_commit_serialized_with_route_validation",
         "CommitMultipartObject",
         MatchingOutcomeRetry
     ),

@@ -1256,6 +1256,186 @@ fn multipart_abort_expires_at_pending_install_effect_boundary() {
 }
 
 #[test]
+fn multipart_completion_expires_at_final_pending_install_effect_boundary() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let (upload_id, parts) =
+        create_upload_with_parts(&initial_coord, "bucket", "late-completion", &[(1, b"part")]);
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
+    drop(initial_coord);
+    drop(initial);
+    let cluster = open_same_store_cluster_with_route_map_validity(
+        same_store_inputs,
+        RouteMapValidity::until_ms(5_000).unwrap(),
+    );
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+
+    let pending_install_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_count = Arc::clone(&pending_install_count);
+    let hook_clock = Arc::clone(&clock);
+    let hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            if hook_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                hook_clock.set(4_500);
+            }
+        }));
+    let request = CompleteMultipartUploadRequest {
+        upload: multipart_object_request_with_expected_owner(
+            "bucket",
+            "late-completion",
+            &upload_id,
+            test_requester(),
+            None,
+        ),
+        parts: &parts,
+        claimed_checksum: None,
+        expected_object_size: None,
+        cond: &WriteCondition::default(),
+        sse_customer: None,
+    };
+    let error = coord
+        .complete_multipart_upload_on_admitted_route(&admission, &request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(pending_install_count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    drop(hook);
+    drop(admission);
+    assert_eq!(
+        cluster
+            .load_in_progress_multipart_upload(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("late-completion"),
+                &upload_id,
+            )
+            .unwrap()
+            .upload_id,
+        upload_id
+    );
+
+    clock.set(1_000);
+    let fresh_admission = coord.admit_storage_route_for_request().unwrap();
+    coord
+        .complete_multipart_upload_on_admitted_route(&fresh_admission, &request)
+        .unwrap();
+    assert_eq!(
+        coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "late-completion",
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap()
+            .body
+            .read_all()
+            .unwrap(),
+        b"part"
+    );
+}
+
+#[test]
+fn multipart_completion_uses_captured_lifecycle_after_commit_deadline() {
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    put_bucket_lifecycle_test(
+        &coord,
+        "bucket",
+        "<LifecycleConfiguration><Rule><ID>expire-completed</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+        test_requester(),
+        None,
+    )
+    .unwrap();
+    let (upload_id, parts) =
+        create_upload_with_parts(&coord, "bucket", "logs/completed", &[(1, b"part")]);
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_clock = Arc::clone(&clock);
+    let hook = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some(("bucket".to_string(), "logs/completed".to_string())),
+        after_multipart_complete_commit: Some(Arc::new(move || hook_clock.set(4_500))),
+        ..ReclamationTestHooks::default()
+    });
+    let result = coord
+        .complete_multipart_upload_on_admitted_route(
+            &admission,
+            &CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "logs/completed",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &parts,
+                claimed_checksum: None,
+                expected_object_size: None,
+                cond: &WriteCondition::default(),
+                sse_customer: None,
+            },
+        )
+        .unwrap();
+    let lifecycle = result
+        .lifecycle_expiration
+        .expect("captured lifecycle configuration should produce an expiration header");
+    assert_eq!(lifecycle.rule_id.as_deref(), Some("expire-completed"));
+    drop(hook);
+    drop(admission);
+
+    clock.set(1_000);
+    assert_eq!(
+        coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "logs/completed",
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap()
+            .body
+            .read_all()
+            .unwrap(),
+        b"part"
+    );
+}
+
+#[test]
 fn list_parts_expires_after_authorization_and_uses_admitted_lifecycle_route() {
     let tmp = test_util::tempdir();
     let cluster = open_test_storage_cluster(tmp.path(), &[0]);
@@ -3264,6 +3444,26 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
             &complete_preflight_request,
         )
         .unwrap();
+
+    let complete_request = CompleteMultipartUploadRequest {
+        upload: complete_preflight_request,
+        parts: &[],
+        claimed_checksum: None,
+        expected_object_size: None,
+        cond: &WriteCondition::default(),
+        sse_customer: None,
+    };
+    let error = local
+        .complete_multipart_upload_on_admitted_route(&foreign_admission, &complete_request)
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    let error = foreign
+        .complete_multipart_upload_on_admitted_route(&foreign_admission, &complete_request)
+        .unwrap_err();
+    assert!(
+        matches!(error, ServerError::InvalidRequest { .. }),
+        "{error:?}"
+    );
 
     let list_request = ListPartsRequest {
         upload: multipart_object_request_with_expected_owner(
@@ -7189,10 +7389,15 @@ fn complete_multipart_epoch_change_before_metadata_apply_commits_once_on_pinned_
         "multipart completion should not apply an object-PG command before the pre-commit gate"
     );
 
-    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
+        &handle,
+        &initial,
+        tmp.path(),
+    );
 
     gate.release();
     let complete_result = complete_thread.join().unwrap().unwrap();
+    publication_thread.join().unwrap();
     assert_eq!(complete_result.version_id, VersionId::Null);
     let after_object_pg_proof = initial
         .test_object_pg_metadata_proof(&bucket_name, &object_key)
@@ -9358,6 +9563,8 @@ fn complete_multipart_upload_pins_runtime_map_between_snapshot_and_commit() {
         &[0, 1],
     ));
     let hook_handle = handle.clone();
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -9365,7 +9572,13 @@ fn complete_multipart_upload_pins_runtime_map_between_snapshot_and_commit() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some((bucket.to_string(), "key".to_string())),
         after_multipart_complete_pre_commit: Some(Arc::new(move || {
-            hook_handle.install(Arc::clone(&candidate)).unwrap();
+            let install_handle = hook_handle.clone();
+            let install_candidate = Arc::clone(&candidate);
+            let thread = thread::spawn(move || {
+                install_handle.install(install_candidate).unwrap();
+            });
+            hook_handle.test_wait_until_route_publication_is_pending();
+            *hook_publication_thread.lock().unwrap() = Some(thread);
         })),
         ..ReclamationTestHooks::default()
     });
@@ -9385,6 +9598,13 @@ fn complete_multipart_upload_pins_runtime_map_between_snapshot_and_commit() {
             cond: &WriteCondition::default(),
             sse_customer: None,
         })
+        .unwrap();
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("completion hook should start runtime-map publication")
+        .join()
         .unwrap();
 
     handle

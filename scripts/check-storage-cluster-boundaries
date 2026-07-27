@@ -1042,7 +1042,7 @@ migrated_simple_object_read_bypasses=$(
                 || $0 ~ /CommitDirectPutObjectCommand[[:space:]]*\{/)) {
             print FILENAME ":" FNR ":" $0
         }
-        if (current_fn == "complete_multipart_upload_commit_serialized" \
+        if (current_fn == "complete_multipart_upload_commit_serialized_with_route_validation" \
             && ($0 ~ /PgMetadataStore::get_multipart_upload\(/ \
                 || $0 ~ /PgMetadataStore::list_multipart_parts\(/ \
                 || $0 ~ /PgMetadataStore::get_all_multipart_part_segments_for_upload\(/ \
@@ -1866,7 +1866,7 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_locked:AbortMultipartUploadLocked:try_set_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete_if_current_with_route_validation:BeginBucketDelete:try_set_bucket_pg_pending_command_or_retry
 1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session_with_cleanup_deadline:BeginUploadPartStreamSession:install_snapshot_sensitive_metadata_command_or_drain
-1 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized:CompleteMultipartUploadCommitSerialized:try_install_pending_metadata_command_for_bucket
+1 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized_with_route_validation:CompleteMultipartUploadCommitSerialized:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:create_bucket_with_config_and_load_info_with_route_validation:CreateBucket:try_set_bucket_pg_pending_command_or_retry
 1 crates/storage/src/cluster/request_ops.rs:create_multipart_upload_inner_with_route_validation:CreateMultipartUpload:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session_with_cleanup_deadline:CreatePutObjectStreamSession:try_install_object_pg_pending_command_or_drain
@@ -1983,7 +1983,7 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:apply_new_object_metadata_command_for_bucket:exact-command-match
 1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete_if_current_with_route_validation:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session_with_cleanup_deadline:metadata-command-log-conflict
-2 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized:metadata-command-log-conflict
+2 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized_with_route_validation:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:create_multipart_upload_inner_with_route_validation:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session_with_cleanup_deadline:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:create_upload_part_stream_session:metadata-command-log-conflict

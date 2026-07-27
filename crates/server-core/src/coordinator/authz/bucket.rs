@@ -910,20 +910,6 @@ impl Coordinator {
         })
     }
 
-    /// Creates an internal authorization token for lifecycle state loads.
-    ///
-    /// This intentionally bypasses request auth because the coordinator is
-    /// loading already-authoritative stored lifecycle state for internal
-    /// lifecycle evaluation such as response-header computation.
-    pub(in crate::coordinator) fn authorize_load_bucket_lifecycle_for(
-        &self,
-        name: &BucketName,
-    ) -> AuthorizedLoadBucketLifecycleConfig {
-        AuthorizedLoadBucketLifecycleConfig {
-            bucket: name.clone(),
-        }
-    }
-
     pub(in crate::coordinator) fn authorize_delete_bucket_lifecycle_on_admitted_route(
         &self,
         admission: &storage::StorageClusterRouteAdmission,

@@ -102,7 +102,6 @@ fn multipart_abort_route_rejects_a_crossed_object_subject_before_mutation() {
     let upload = cluster
         .load_in_progress_multipart_upload(&bucket, &crossed_key, &upload_id)
         .unwrap();
-
     let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
     let admission = handle.admit_current_route().unwrap();
     let route = admission
@@ -182,6 +181,8 @@ fn multipart_routes_bind_crossed_same_pg_upload_subjects() {
     let upload = cluster
         .load_in_progress_multipart_upload(&bucket, &crossed_key, &upload_id)
         .unwrap();
+    let authorized_upload =
+        crate::AuthorizedMultipartUploadRecord::assume_authorized(upload.clone());
 
     let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
     let admission = handle.admit_current_route().unwrap();
@@ -205,16 +206,21 @@ fn multipart_routes_bind_crossed_same_pg_upload_subjects() {
         ))
     ));
     let error = route
-        .list_multipart_parts_for_authorized_upload(
-            &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
-            None,
-            1_000,
-        )
+        .list_multipart_parts_for_authorized_upload(&authorized_upload, None, 1_000)
         .unwrap_err();
     assert!(matches!(
         error,
         crate::ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
             operation: "list multipart parts",
+        })
+    ));
+    let error = route
+        .load_multipart_completion_snapshot(&authorized_upload, &[])
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "load multipart completion snapshot",
         })
     ));
 }

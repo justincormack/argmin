@@ -311,6 +311,17 @@ pub type BucketDeleteExactDrainStartTestHook =
 type MultipartCompletionBarrierCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MultipartCompletionStaleRetryTestEvent {
+    BeforeStalePayloadSourceLoad,
+    AfterStaleCommandBuild,
+}
+
+#[cfg(test)]
+type MultipartCompletionStaleRetryTestHook =
+    Arc<dyn Fn(MultipartCompletionStaleRetryTestEvent, &UploadId) + Send + Sync>;
+
+#[cfg(test)]
 static BEFORE_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
     Mutex<HashMap<usize, MetadataCommandApplyTestHook>>,
 > = OnceLock::new();
@@ -373,6 +384,11 @@ static BEFORE_BUCKET_DELETE_EXACT_DRAIN_HOOKS: OnceLock<
 #[cfg(test)]
 static BEFORE_MULTIPART_COMPLETION_BARRIER_COMMAND_ID_HOOKS: OnceLock<
     Mutex<HashMap<usize, MultipartCompletionBarrierCommandIdTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static MULTIPART_COMPLETION_STALE_RETRY_HOOKS: OnceLock<
+    Mutex<HashMap<usize, MultipartCompletionStaleRetryTestHook>>,
 > = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -442,6 +458,11 @@ pub struct BucketDeleteExactDrainStartTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct MultipartCompletionBarrierCommandIdTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct MultipartCompletionStaleRetryTestHookGuard {
     scope_id: usize,
 }
 
@@ -593,6 +614,18 @@ impl Drop for MultipartCompletionBarrierCommandIdTestHookGuard {
     fn drop(&mut self) {
         let hooks = BEFORE_MULTIPART_COMPLETION_BARRIER_COMMAND_ID_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for MultipartCompletionStaleRetryTestHookGuard {
+    fn drop(&mut self) {
+        let hooks =
+            MULTIPART_COMPLETION_STALE_RETRY_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -820,6 +853,23 @@ fn maybe_run_before_multipart_completion_barrier_command_id_hook(_scope_id: usiz
         .cloned();
     if let Some(hook) = hook {
         hook();
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_multipart_completion_stale_retry_hook(
+    _scope_id: usize,
+    _event: MultipartCompletionStaleRetryTestEvent,
+    _upload_id: &UploadId,
+) {
+    let hook = MULTIPART_COMPLETION_STALE_RETRY_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&_scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook(_event, _upload_id);
     }
 }
 
@@ -1315,6 +1365,20 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         MultipartCompletionBarrierCommandIdTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_multipart_completion_stale_retry_hook(
+        &self,
+        hook: MultipartCompletionStaleRetryTestHook,
+    ) -> MultipartCompletionStaleRetryTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot =
+            MULTIPART_COMPLETION_STALE_RETRY_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        MultipartCompletionStaleRetryTestHookGuard { scope_id }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -3411,6 +3475,7 @@ impl super::StorageCluster {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn acquire_completion_durable_bucket_write_reservation(
         &self,
         bucket: &BucketName,
@@ -3437,6 +3502,42 @@ impl super::StorageCluster {
                     lease_deadline: self.bucket_write_reservation_lease_deadline(),
                     target_context,
                 },
+            )?;
+        Ok(super::DurableBucketWriteReservation {
+            node: Arc::clone(node.bucket_metadata_client()),
+            pg_id,
+            record,
+        })
+    }
+
+    pub(super) fn acquire_completion_durable_bucket_write_reservation_with_effect_fence(
+        &self,
+        bucket: &BucketName,
+        operation_kind: &'static str,
+        target_context: Option<&str>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<super::DurableBucketWriteReservation, BucketSnapshotLoadError> {
+        let pg_id = self.bucket_metadata_pg_id(bucket);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+        let reservation_id = self.next_bucket_write_reservation_id()?;
+        let owner_token = self.bucket_write_owner_token();
+        let record = node
+            .bucket_write_reservation_client()
+            .acquire_completion_durable_bucket_write_reservation_with_effect_fence(
+                self.validated_bucket_metadata_pg(PgId::new(pg_id)),
+                DurableBucketWriteReservationAcquire {
+                    name: bucket,
+                    reservation_id: &reservation_id,
+                    owner_token: &owner_token,
+                    cluster_epoch: self.operation_epoch(),
+                    operation_kind,
+                    created_at: crate::clock::current_time_millis(),
+                    lease_deadline: self.bucket_write_reservation_lease_deadline(),
+                    target_context,
+                },
+                effect_fence,
             )?;
         Ok(super::DurableBucketWriteReservation {
             node: Arc::clone(node.bucket_metadata_client()),
@@ -13178,6 +13279,7 @@ impl super::StorageCluster {
             .load_in_progress_multipart_upload_for_listing(pg_id, bucket, key, upload_id)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn load_multipart_completion_snapshot(
         &self,
         authorized_upload: &AuthorizedMultipartUploadRecord,
@@ -13185,7 +13287,40 @@ impl super::StorageCluster {
     ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
-        let pg_id = self.object_metadata_pg(bucket, key);
+        self.load_multipart_completion_snapshot_with_route_validation(
+            super::MultipartObjectMutationEffectRoute {
+                pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            authorized_upload,
+            requested_part_numbers,
+            || Ok(()),
+        )
+    }
+
+    pub(super) fn load_multipart_completion_snapshot_with_route_validation(
+        &self,
+        route: super::MultipartObjectMutationEffectRoute<'_>,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+        requested_part_numbers: &[u32],
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
+        let super::MultipartObjectMutationEffectRoute {
+            pg_id,
+            bucket,
+            key,
+            effect_fence: _,
+        } = route;
+        if authorized_upload.record().bucket != *bucket || authorized_upload.record().key != *key {
+            return Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "load multipart completion snapshot",
+                },
+            ));
+        }
+        require_valid_route().map_err(ObjectPgActionError::Store)?;
         self.object_mutation_metadata_primary_client(bucket, key)?
             .load_multipart_completion_snapshot(pg_id, authorized_upload, requested_part_numbers)
     }
@@ -13258,6 +13393,8 @@ impl super::StorageCluster {
         bucket: &BucketName,
         completion_target_context: &str,
         bucket_write_reservation: &BucketWriteReservationProof,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<u64, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(EstablishMultipartCompletionBarrier);
@@ -13268,6 +13405,7 @@ impl super::StorageCluster {
             .bucket_metadata_client()
             .clone();
         loop {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             work_budget.check("multipart completion barrier reservation budget exhausted")?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if self
@@ -13321,6 +13459,7 @@ impl super::StorageCluster {
             maybe_run_before_multipart_completion_barrier_command_id_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
             );
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             let Some(command_id) = self
                 .next_completion_bucket_metadata_command_id_or_drain_with_work_budget(
                     pg_id,
@@ -13341,10 +13480,11 @@ impl super::StorageCluster {
                 )
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
             if !self
-                .try_set_bucket_pg_pending_command_or_retry_with_work_budget(
+                .try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence(
                     pg_id,
                     bucket,
                     &command,
+                    effect_fence,
                     work_budget,
                 )
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
@@ -13394,6 +13534,8 @@ impl super::StorageCluster {
             bucket,
             "test-completed-multipart-order",
             &proof,
+            None,
+            || Ok(()),
             &mut work_budget,
         );
         let release = self
@@ -13483,18 +13625,51 @@ impl super::StorageCluster {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn complete_multipart_upload_commit_serialized(
         &self,
+        req: CompleteMultipartCommitRequest,
+    ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
+        let bucket = req.bucket.clone();
+        let key = req.key.clone();
+        self.complete_multipart_upload_commit_serialized_with_route_validation(
+            super::MultipartObjectMutationEffectRoute {
+                pg_id: self.object_metadata_pg(&bucket, &key),
+                bucket: &bucket,
+                key: &key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            req,
+            || Ok(()),
+        )
+    }
+
+    pub(super) fn complete_multipart_upload_commit_serialized_with_route_validation(
+        &self,
+        route: super::MultipartObjectMutationEffectRoute<'_>,
         mut req: CompleteMultipartCommitRequest,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(
             CompleteMultipartUploadCommitSerialized
         );
+        let super::MultipartObjectMutationEffectRoute {
+            pg_id: object_pg_id,
+            bucket: route_bucket,
+            key: route_key,
+            effect_fence,
+        } = route;
+        if req.bucket != *route_bucket || req.key != *route_key {
+            return Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "complete multipart upload",
+                },
+            ));
+        }
         let bucket = req.bucket.clone();
         let key = req.key.clone();
         let upload_id = req.upload_id.clone();
         let generation_id = req.generation_id;
-        let object_pg_id = self.object_metadata_pg(&bucket, &key);
         let pg_id = object_pg_id.pg_id();
         let mutation_client = self.object_mutation_metadata_primary_client(&bucket, &key)?;
         let mut work_budget = super::RequestWorkBudget::new(
@@ -13505,12 +13680,15 @@ impl super::StorageCluster {
         .for_pg(pg_id);
 
         'retry_after_pending_conflict: loop {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             work_budget.check("complete multipart commit budget exhausted")?;
-            let reservation = match self.acquire_completion_durable_bucket_write_reservation(
-                &bucket,
-                COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
-                Some(key.as_str()),
-            ) {
+            let reservation = match self
+                .acquire_completion_durable_bucket_write_reservation_with_effect_fence(
+                    &bucket,
+                    COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                    Some(key.as_str()),
+                    effect_fence,
+                ) {
                 Ok(reservation) => reservation,
                 Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
                     self.wait_for_durable_bucket_write_drain(&bucket)
@@ -13531,7 +13709,19 @@ impl super::StorageCluster {
                 }};
             }
 
-            while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, &bucket)? {
+            loop {
+                if let Err(error) = require_valid_route() {
+                    release_bucket_write_proof!()?;
+                    return Err(ObjectPgActionError::Store(error));
+                }
+                let command = match self.pending_metadata_command_for_bucket(pg_id, &bucket) {
+                    Ok(Some(command)) => command,
+                    Ok(None) => break,
+                    Err(error) => {
+                        release_bucket_write_proof!()?;
+                        return Err(error.into());
+                    }
+                };
                 if let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() {
                     if commit.matches_request(
                         &bucket,
@@ -13563,6 +13753,10 @@ impl super::StorageCluster {
             }
 
             if req.conditional_completion {
+                if let Err(error) = require_valid_route() {
+                    release_bucket_write_proof!()?;
+                    return Err(ObjectPgActionError::Store(error));
+                }
                 let upload = match mutation_client.load_in_progress_multipart_upload(
                     object_pg_id,
                     &bucket,
@@ -13582,6 +13776,16 @@ impl super::StorageCluster {
             }
 
             if req.versioning != BucketVersioningState::Enabled {
+                if let Err(error) = require_valid_route() {
+                    release_bucket_write_proof!()?;
+                    return Err(ObjectPgActionError::Store(error));
+                }
+                #[cfg(test)]
+                maybe_run_multipart_completion_stale_retry_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                    MultipartCompletionStaleRetryTestEvent::BeforeStalePayloadSourceLoad,
+                    &upload_id,
+                );
                 match mutation_client.load_multipart_completion_stale_payload_source(
                     object_pg_id,
                     &bucket,
@@ -13598,7 +13802,13 @@ impl super::StorageCluster {
             }
 
             let version_id = if req.versioning == BucketVersioningState::Enabled {
-                match self.reserve_next_object_version_for_completion(pg_id, &bucket, &key) {
+                match self.reserve_next_object_version_for_completion_with_effect_fence(
+                    pg_id,
+                    &bucket,
+                    &key,
+                    effect_fence,
+                    &mut require_valid_route,
+                ) {
                     Ok(version_id) => version_id,
                     Err(error) => {
                         release_bucket_write_proof!()?;
@@ -13614,6 +13824,8 @@ impl super::StorageCluster {
                 &bucket,
                 key.as_str(),
                 &bucket_write_reservation,
+                Some(effect_fence),
+                &mut require_valid_route,
                 &mut work_budget,
             ) {
                 release_bucket_write_proof!()?;
@@ -13624,6 +13836,10 @@ impl super::StorageCluster {
                 version_id,
                 self.local_map.pg_topology(),
             );
+            if let Err(error) = require_valid_route() {
+                release_bucket_write_proof!()?;
+                return Err(ObjectPgActionError::Store(error));
+            }
             let command = match mutation_client.build_complete_multipart_object_command(
                 BuildCompleteMultipartObjectCommandReq {
                     pg_id: object_pg_id,
@@ -13650,6 +13866,22 @@ impl super::StorageCluster {
                 Err(ObjectPgActionError::StaleMultipartCompletionSnapshot)
                     if version_id.is_null() =>
                 {
+                    #[cfg(test)]
+                    maybe_run_multipart_completion_stale_retry_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        MultipartCompletionStaleRetryTestEvent::AfterStaleCommandBuild,
+                        &upload_id,
+                    );
+                    if let Err(error) = require_valid_route() {
+                        release_bucket_write_proof!()?;
+                        return Err(ObjectPgActionError::Store(error));
+                    }
+                    #[cfg(test)]
+                    maybe_run_multipart_completion_stale_retry_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        MultipartCompletionStaleRetryTestEvent::BeforeStalePayloadSourceLoad,
+                        &upload_id,
+                    );
                     let current_stale_payload_source = match mutation_client
                         .load_multipart_completion_stale_payload_source(object_pg_id, &bucket, &key)
                     {
@@ -13675,8 +13907,12 @@ impl super::StorageCluster {
             // Let the retry loop observe it instead of draining it generically and losing that
             // request-shaped result.
             let installed = match self
-                .try_install_pending_metadata_command_for_bucket(pg_id, &bucket, &command)
-            {
+                .try_install_pending_metadata_command_for_bucket_with_effect_fence(
+                    pg_id,
+                    &bucket,
+                    &command,
+                    Some(effect_fence),
+                ) {
                 Ok(installed) => installed,
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                     ..

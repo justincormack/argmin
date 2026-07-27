@@ -74,11 +74,6 @@ pub(super) struct AuthorizedGetBucketLifecycle {
 }
 
 #[derive(Debug)]
-pub(super) struct AuthorizedLoadBucketLifecycleConfig {
-    pub(super) bucket: BucketName,
-}
-
-#[derive(Debug)]
 pub(super) struct AuthorizedDeleteBucketLifecycle {
     pub(super) bucket: BucketName,
 }
@@ -317,14 +312,15 @@ pub(super) struct AuthorizedUploadPartCopy {
 pub(super) enum AuthorizedCompleteMultipartUpload {
     InProgress {
         bucket_info: BucketSummary,
+        lifecycle: Option<Box<BucketLifecycleConfiguration>>,
         bucket: BucketName,
         key: ObjectKey,
         upload_id: UploadId,
         upload: Box<AuthorizedMultipartUploadRecord>,
-        multipart_write_encryption: ActiveWriteEncryption,
+        multipart_write_encryption: Box<ActiveWriteEncryption>,
     },
     Replay {
-        bucket_info: BucketSummary,
+        lifecycle: Option<Box<BucketLifecycleConfiguration>>,
         key: ObjectKey,
         replay: storage::MultipartCompletionReplay,
     },

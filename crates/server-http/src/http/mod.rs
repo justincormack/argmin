@@ -3369,16 +3369,19 @@ impl HttpFrontend {
                     Err(err) => return Err(err),
                 };
                 let sse_customer = parse_sse_customer_request(req)?;
-                let result = match self.coordinator.complete_multipart_upload(
-                    &crate::coordinator::CompleteMultipartUploadRequest {
-                        upload: upload_request,
-                        parts: &parts,
-                        claimed_checksum: claimed_checksum.as_ref(),
-                        expected_object_size,
-                        cond: &cond,
-                        sse_customer: sse_customer.as_ref(),
-                    },
-                ) {
+                let result = match self
+                    .coordinator
+                    .complete_multipart_upload_on_admitted_route(
+                        storage_route_admission,
+                        &crate::coordinator::CompleteMultipartUploadRequest {
+                            upload: upload_request,
+                            parts: &parts,
+                            claimed_checksum: claimed_checksum.as_ref(),
+                            expected_object_size,
+                            cond: &cond,
+                            sse_customer: sse_customer.as_ref(),
+                        },
+                    ) {
                     Ok(result) => result,
                     Err(ServerError::NoSuchUpload { .. }) => {
                         return Ok(S3Response::complete_multipart_no_such_upload(

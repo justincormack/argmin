@@ -22,6 +22,7 @@ pub(super) struct ReclamationTestHooks {
     pub(super) after_list_parts_storage_list: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) before_multipart_complete_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_multipart_complete_pre_commit: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(super) after_multipart_complete_commit: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_object_read_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_upload_part_copy_stream_session: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_object_segments_first_segment: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -566,6 +567,23 @@ pub(super) fn maybe_run_multipart_complete_snapshot_hook(bucket: &str, key: &str
         .is_some_and(|(b, k)| b == bucket && k == key)
     {
         if let Some(hook) = hooks.before_multipart_complete_snapshot {
+            hook();
+        }
+    }
+}
+
+pub(super) fn maybe_run_multipart_complete_commit_hook(bucket: &str, key: &str) {
+    let hooks = RECLAMATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target
+        .as_ref()
+        .is_some_and(|(b, k)| b == bucket && k == key)
+    {
+        if let Some(hook) = hooks.after_multipart_complete_commit {
             hook();
         }
     }

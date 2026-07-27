@@ -79,10 +79,11 @@ use crate::types::{
     BucketOwnershipControls, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
     BucketSubresourceKind, BucketVersioningState, BucketWriteDrainRecord,
     BucketWriteReservationRecord, CanonicalUserId, ClusterEpoch, CommitDirectPutObjectReq,
-    CreateStreamUploadReq, DeleteCurrentObjectOutcome, DeleteSpecificObjectVersionOutcome,
-    DirectPutCommitSnapshot, DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome,
-    GenerationId, InsertCurrentDeleteMarkerOutcome, ListedBucketMultipartUploads,
-    ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartParts,
+    CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest, CreateStreamUploadReq,
+    DeleteCurrentObjectOutcome, DeleteSpecificObjectVersionOutcome, DirectPutCommitSnapshot,
+    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
+    InsertCurrentDeleteMarkerOutcome, ListedBucketMultipartUploads, ListedBucketObjectVersions,
+    ListedBucketObjects, ListedMultipartParts, MultipartCompletionSnapshot,
     MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEncryption, ObjectKey,
     ObjectLayout, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome,
     ObjectRetention, ObjectSegmentRecord, OwnerIdentity, PgId, PgState,
@@ -2597,6 +2598,17 @@ impl ActiveMultipartObjectRoute<'_> {
             )
     }
 
+    #[cfg(feature = "test-hooks")]
+    pub fn try_load_in_progress_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<Option<MultipartUploadRecord>, ObjectPgActionError> {
+        self.admission.require_valid_now()?;
+        self.admission
+            .cluster
+            .try_load_in_progress_multipart_upload(&self.bucket, &self.key, upload_id)
+    }
+
     /// List parts for the exact upload authorized through this admitted
     /// object route.
     pub fn list_multipart_parts_for_authorized_upload(
@@ -2614,6 +2626,47 @@ impl ActiveMultipartObjectRoute<'_> {
                 max_parts,
                 || self.admission.require_valid_now(),
             )
+    }
+
+    /// Load the completion snapshot for the exact upload authorized through
+    /// this admitted object route.
+    pub fn load_multipart_completion_snapshot(
+        &self,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+        requested_part_numbers: &[u32],
+    ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .load_multipart_completion_snapshot_with_route_validation(
+                self.effect_route(),
+                authorized_upload,
+                requested_part_numbers,
+                || self.admission.require_valid_now(),
+            )
+    }
+
+    /// Publish completion for this exact admitted multipart object route.
+    pub fn complete_multipart_upload_commit_serialized(
+        &self,
+        request: CompleteMultipartCommitRequest,
+    ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .complete_multipart_upload_commit_serialized_with_route_validation(
+                self.effect_route(),
+                request,
+                || self.admission.require_valid_now(),
+            )
+    }
+
+    /// Schedule reclaim for a generation displaced by a completion on this
+    /// exact admitted object route.
+    pub fn enqueue_object_payload_reclaim(&self, generation_id: GenerationId) {
+        self.admission.cluster.enqueue_object_payload_reclaim(
+            &self.bucket,
+            &self.key,
+            generation_id,
+        );
     }
 
     /// Abort the exact upload authorized through this admitted object route.
@@ -9778,6 +9831,24 @@ impl StorageCluster {
             true,
             None,
             || Ok(()),
+        )
+    }
+
+    fn reserve_next_object_version_for_completion_with_effect_fence(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        effect_fence: AdmittedRouteEffectFence,
+        require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<VersionId, ObjectPgActionError> {
+        self.reserve_next_object_version_with_completion_admission(
+            pg_id,
+            bucket,
+            key,
+            true,
+            Some(effect_fence),
+            require_valid_route,
         )
     }
 

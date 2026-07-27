@@ -478,6 +478,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         )
     }
 
+    #[cfg(test)]
     fn acquire_completion_durable_bucket_write_reservation(
         &self,
         pg_id: BucketPgId,
@@ -489,6 +490,27 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             acquire,
             UnixStorageNodeRpcAdmissionClass::Completion,
             None,
+        )
+    }
+
+    fn acquire_completion_durable_bucket_write_reservation_with_effect_fence(
+        &self,
+        pg_id: BucketPgId,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        effect_fence.require_valid_for(acquire.cluster_epoch)?;
+        unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_class(
+            self,
+            pg_id,
+            acquire,
+            UnixStorageNodeRpcAdmissionClass::Completion,
+            effect_fence
+                .deadline()
+                .map(|deadline| StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }),
         )
     }
     fn validate_bucket_write_reservation_proof(

@@ -200,12 +200,26 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
 
+    #[cfg(test)]
     fn acquire_completion_durable_bucket_write_reservation(
         &self,
         pg_id: BucketPgId,
         acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         self.acquire_durable_bucket_write_reservation(pg_id, acquire)
+    }
+
+    fn acquire_completion_durable_bucket_write_reservation_with_effect_fence(
+        &self,
+        pg_id: BucketPgId,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        self.acquire_durable_bucket_write_reservation_with_effect_fence(
+            pg_id,
+            acquire,
+            effect_fence,
+        )
     }
 
     fn validate_bucket_write_reservation_proof(

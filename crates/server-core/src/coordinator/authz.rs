@@ -35,12 +35,11 @@ use super::authz_results::{
     AuthorizedGetBucketPublicAccessBlock, AuthorizedGetBucketTagging,
     AuthorizedGetBucketVersioning, AuthorizedHeadBucket, AuthorizedListBuckets,
     AuthorizedListMultipartUploads, AuthorizedListObjectVersions, AuthorizedListObjectsV2,
-    AuthorizedListParts, AuthorizedLoadBucketCorsConfig, AuthorizedLoadBucketLifecycleConfig,
-    AuthorizedMultipartPartWrite, AuthorizedObjectRead, AuthorizedPutBucketAbac,
-    AuthorizedPutBucketAcl, AuthorizedPutBucketCors, AuthorizedPutBucketEncryption,
-    AuthorizedPutBucketLifecycle, AuthorizedPutBucketObjectLockConfiguration,
-    AuthorizedPutBucketOwnershipControls, AuthorizedPutBucketPolicy,
-    AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketTagging,
+    AuthorizedListParts, AuthorizedLoadBucketCorsConfig, AuthorizedMultipartPartWrite,
+    AuthorizedObjectRead, AuthorizedPutBucketAbac, AuthorizedPutBucketAcl, AuthorizedPutBucketCors,
+    AuthorizedPutBucketEncryption, AuthorizedPutBucketLifecycle,
+    AuthorizedPutBucketObjectLockConfiguration, AuthorizedPutBucketOwnershipControls,
+    AuthorizedPutBucketPolicy, AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketTagging,
     AuthorizedPutBucketVersioning, AuthorizedUploadPartCopy, ObjectAttributePermissions,
 };
 use super::authz_types::{AuthorizedPutObjectWrite, AuthorizedPutObjectWriteAcl, ValidatedBucket};
@@ -415,31 +414,36 @@ impl Coordinator {
         &self,
         req: &CompleteMultipartUploadRequest<'_>,
     ) -> Result<AuthorizedCompleteMultipartUpload, ServerError> {
-        self.authorize_complete_multipart_upload_with_storage_node(&self.storage_node(), req)
+        let admission = self.admit_storage_route_for_request()?;
+        self.authorize_complete_multipart_upload_on_admitted_route(&admission, req)
     }
 
-    pub(in crate::coordinator) fn authorize_complete_multipart_upload_with_storage_node(
+    pub(in crate::coordinator) fn authorize_complete_multipart_upload_on_admitted_route(
         &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        admission: &storage::StorageClusterRouteAdmission,
         req: &CompleteMultipartUploadRequest<'_>,
     ) -> Result<AuthorizedCompleteMultipartUpload, ServerError> {
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
-            .requiring_bucket_tags_if_abac_enabled();
-        self.with_bucket_write_handle_for_storage_node(
-            storage_node,
+            .requiring_bucket_tags_if_abac_enabled()
+            .requiring_lifecycle_view();
+        let multipart_route = admission
+            .active_multipart_object_route(req.upload.bucket_name_typed(), req.upload.key_typed())
+            .map_err(super::map_store_error)?;
+        self.with_bucket_write_handle_on_admitted_route(
+            admission,
             &req.upload,
             request,
             |bucket_handle| match ObjectAuthLoadedBucketHandle::classify(&bucket_handle) {
                 ObjectAuthLoadedBucketHandle::Boe(bucket_handle) => self
-                    .authorize_complete_multipart_upload_boe_with_storage_node(
-                        storage_node,
+                    .authorize_complete_multipart_upload_boe_on_admitted_route(
+                        &multipart_route,
                         req,
                         bucket_handle,
                     ),
                 ObjectAuthLoadedBucketHandle::NonBoe(bucket_handle) => self
-                    .authorize_complete_multipart_upload_non_boe_with_storage_node(
-                        storage_node,
+                    .authorize_complete_multipart_upload_non_boe_on_admitted_route(
+                        &multipart_route,
                         req,
                         bucket_handle,
                     ),

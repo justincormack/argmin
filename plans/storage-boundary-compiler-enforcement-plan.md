@@ -3148,6 +3148,63 @@ Sixty-eighth Phase 3 slice:
   capability slice. Other buffered coordinator workflows and capability
   requirements on node-client traits also remain open in Phase 3.
 
+Sixty-ninth Phase 3 slice:
+
+- the full CompleteMultipartUpload workflow now consumes the buffered
+  request's existing `StorageClusterRouteAdmission` from bucket/policy/upload
+  authorization through completion snapshot loading, durable publication,
+  replay response construction, lifecycle response evaluation, and displaced
+  payload reclaim scheduling. Production coordinator code cannot resample the
+  renewable runtime-map handle; direct test/test-support wrappers acquire an
+  admission before entering the same production path.
+- completion authorization loads policy, conditional ABAC bucket tags, and
+  lifecycle configuration in one admitted bucket-write snapshot. BOE and ACL
+  authorization resolve the upload-management state through the same admitted
+  multipart object route. Both in-progress and replay results carry the parsed
+  lifecycle configuration, so neither replay nor post-commit response-header
+  construction performs a later storage read.
+- `ActiveMultipartObjectRoute` now owns the authorized completion snapshot,
+  serialized completion publisher, and displaced-generation reclaim enqueue
+  for its fixed bucket, key, object-metadata PG, publication domain,
+  runtime-map generation, and immutable deadline. Snapshot loading rejects a
+  crossed same-PG authorized upload before node access; the final publisher
+  independently rejects a request whose bucket/key does not match its route.
+- the route-validating completion publisher carries the immutable admitted
+  effect fence through completion-reservation acquisition, version
+  reservation, the bucket-PG completion barrier, and final object-PG pending
+  insertion. Same-epoch raw-route renewal cannot extend any fresh durable
+  effect. Exact pending-command application remains convergence and preserves
+  the existing proof-release and matching-outcome semantics.
+- the completion-specific Unix reservation path retains its reserved
+  completion admission class while transporting only the portable admitted
+  deadline; the storage process conservatively binds that deadline to its own
+  monotonic clock through the existing fenced reservation RPC boundary.
+- deterministic coverage expires an admitted completion at its final pending
+  insertion after the barrier is durable, requires `OperationAborted`, proves
+  the upload remains active, and then completes with a fresh admission. A
+  second regression expires the admission after durable object publication
+  and proves the response still succeeds with the captured lifecycle rule.
+  Same-cluster/different-publication-domain and crossed-object-subject tests
+  prove rejection before mutation or node access while retaining owning-route
+  positive canaries.
+- the null-version stale-snapshot retry revalidates the immutable admission
+  before reloading the current stale-payload source. Expiry at the end of
+  command construction now releases the transient completion reservation and
+  returns `OperationAborted` without performing that second storage read; a
+  deterministic competing-completion regression pins the retry boundary and
+  fresh-admission recovery.
+- the publisher registry, contention guide, storage-cluster invariants,
+  bucket-write drain guide, scanner, and temporary semantic inventories now
+  identify the route-validating completion publisher as the canonical
+  production entry point. The obsolete raw lifecycle-response loader and its
+  internal authorization token were removed.
+- focused completion deadline, lifecycle, publication-domain, and
+  crossed-subject regressions pass, along with formatting, the storage
+  boundary checker, workspace-wide strict Clippy, and the full parallel
+  workspace suite (7,623 tests).
+- remaining buffered coordinator workflows and capability requirements on
+  node-client traits remain open in Phase 3.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

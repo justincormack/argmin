@@ -59,7 +59,8 @@ use super::{
 };
 #[cfg(test)]
 use super::{
-    maybe_run_multipart_complete_pre_commit_hook, maybe_run_multipart_complete_snapshot_hook,
+    maybe_run_multipart_complete_commit_hook, maybe_run_multipart_complete_pre_commit_hook,
+    maybe_run_multipart_complete_snapshot_hook,
 };
 use crate::checksum_claim::ChecksumClaim;
 use crate::conditional::{check_write_conditions, WriteCondition};
@@ -572,11 +573,21 @@ impl Coordinator {
     /// Validates the part list, checks ETags and sizes, writes the final
     /// object metadata row with `MultipartManifest` layout, commits
     /// manifest rows into `object_parts`, and deletes in-progress state.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn complete_multipart_upload(
         &self,
         req: &CompleteMultipartUploadRequest,
     ) -> Result<CompleteMultipartUploadResult, ServerError> {
-        let storage_node = self.storage_node();
+        let admission = self.admit_storage_route_for_request()?;
+        self.complete_multipart_upload_on_admitted_route(&admission, req)
+    }
+
+    pub fn complete_multipart_upload_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        req: &CompleteMultipartUploadRequest,
+    ) -> Result<CompleteMultipartUploadResult, ServerError> {
+        self.require_storage_route_admission(admission)?;
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::complete_multipart_upload",
@@ -590,52 +601,62 @@ impl Coordinator {
         let mut stale_snapshot_retry_deadline = None;
         'retry_stale_commit_snapshot: loop {
             let authorized =
-                self.authorize_complete_multipart_upload_with_storage_node(&storage_node, req)?;
-            let (bucket_info, bucket, key, upload_id, upload, multipart_write_encryption) =
-                match authorized {
-                    AuthorizedCompleteMultipartUpload::InProgress {
-                        bucket_info,
-                        bucket,
-                        key,
-                        upload_id,
-                        upload,
-                        multipart_write_encryption,
-                    } => (
-                        bucket_info,
-                        bucket,
-                        key,
-                        upload_id,
-                        upload,
-                        multipart_write_encryption,
-                    ),
-                    AuthorizedCompleteMultipartUpload::Replay {
-                        bucket_info,
-                        key,
-                        replay,
-                    } => {
-                        if replay.fingerprint != multipart_completion_fingerprint(req.parts) {
-                            return Err(ServerError::NoSuchUpload {
-                                upload_id: replay.upload_id.to_string(),
-                            });
-                        }
-                        let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
-                            &bucket_info,
+                self.authorize_complete_multipart_upload_on_admitted_route(admission, req)?;
+            let (
+                bucket_info,
+                lifecycle,
+                bucket,
+                key,
+                upload_id,
+                upload,
+                multipart_write_encryption,
+            ) = match authorized {
+                AuthorizedCompleteMultipartUpload::InProgress {
+                    bucket_info,
+                    lifecycle,
+                    bucket,
+                    key,
+                    upload_id,
+                    upload,
+                    multipart_write_encryption,
+                } => (
+                    bucket_info,
+                    lifecycle,
+                    bucket,
+                    key,
+                    upload_id,
+                    upload,
+                    multipart_write_encryption,
+                ),
+                AuthorizedCompleteMultipartUpload::Replay {
+                    lifecycle,
+                    key,
+                    replay,
+                } => {
+                    if replay.fingerprint != multipart_completion_fingerprint(req.parts) {
+                        return Err(ServerError::NoSuchUpload {
+                            upload_id: replay.upload_id.to_string(),
+                        });
+                    }
+                    let lifecycle_expiration =
+                        Self::current_object_write_lifecycle_expiration_for_config(
+                            lifecycle.as_deref(),
                             key.as_str(),
                             replay.tags.as_deref(),
                             replay.size,
                             replay.last_modified,
                         )?;
-                        return Ok(CompleteMultipartUploadResult {
-                            etag: replay.etag.format(),
-                            version_id: replay.version_id,
-                            managed_encryption: replay.encryption.managed_encryption_algorithm(),
-                            checksum_algorithm: None,
-                            checksum_type: None,
-                            checksum_value: None,
-                            lifecycle_expiration,
-                        });
-                    }
-                };
+                    return Ok(CompleteMultipartUploadResult {
+                        etag: replay.etag.format(),
+                        version_id: replay.version_id,
+                        managed_encryption: replay.encryption.managed_encryption_algorithm(),
+                        checksum_algorithm: None,
+                        checksum_type: None,
+                        checksum_value: None,
+                        lifecycle_expiration,
+                    });
+                }
+            };
             let parts = req.parts;
             let claimed_checksum = req.claimed_checksum;
             let expected_object_size = req.expected_object_size;
@@ -658,7 +679,10 @@ impl Coordinator {
             let checksum_config = upload.checksum;
             #[cfg(test)]
             maybe_run_multipart_complete_snapshot_hook(bucket.as_str(), key.as_str());
-            let completion_snapshot = match storage_node
+            let multipart_route = admission
+                .active_multipart_object_route(&bucket, &key)
+                .map_err(super::map_store_error)?;
+            let completion_snapshot = match multipart_route
                 .load_multipart_completion_snapshot(&upload, &requested_part_numbers)
             {
                 Ok(snapshot) => snapshot,
@@ -929,35 +953,38 @@ impl Coordinator {
             #[cfg(test)]
             maybe_run_multipart_complete_pre_commit_hook(bucket.as_str(), key.as_str());
 
-            let completion_outcome = match storage_node.complete_multipart_upload_commit_serialized(
-                storage::CompleteMultipartCommitRequest {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    upload_id: upload_id.clone(),
-                    completion_fingerprint: multipart_completion_fingerprint(req.parts),
-                    versioning: bucket_info.versioning,
-                    owner: upload.owner.clone(),
-                    acl_grants: upload.acl_grants.clone(),
-                    public_read: upload.public_read,
-                    generation_id: upload.object_generation_id,
-                    size: total_size,
-                    etag_crc64,
-                    tags: upload.tags.clone(),
-                    metadata_blob: Some(upload.metadata_blob.clone()),
-                    system_metadata_blob: Some(system_metadata_bytes),
-                    object_lock: Self::resolve_new_object_lock_state(
-                        &bucket_info,
-                        upload.object_lock,
-                    )?,
-                    encryption: final_encryption,
-                    expected_stale_payload_source: completion_snapshot.stale_payload_source,
-                    expected_current_object_identity: completion_snapshot.current_object_identity,
-                    conditional_completion: !req.cond.is_empty(),
-                    part_records: part_records.clone(),
-                    selected_streaming_segments: completion_snapshot.selected_streaming_segments,
-                    expected_cleanup: completion_snapshot.cleanup,
-                },
-            ) {
+            let completion_outcome = match multipart_route
+                .complete_multipart_upload_commit_serialized(
+                    storage::CompleteMultipartCommitRequest {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        upload_id: upload_id.clone(),
+                        completion_fingerprint: multipart_completion_fingerprint(req.parts),
+                        versioning: bucket_info.versioning,
+                        owner: upload.owner.clone(),
+                        acl_grants: upload.acl_grants.clone(),
+                        public_read: upload.public_read,
+                        generation_id: upload.object_generation_id,
+                        size: total_size,
+                        etag_crc64,
+                        tags: upload.tags.clone(),
+                        metadata_blob: Some(upload.metadata_blob.clone()),
+                        system_metadata_blob: Some(system_metadata_bytes),
+                        object_lock: Self::resolve_new_object_lock_state(
+                            &bucket_info,
+                            upload.object_lock,
+                        )?,
+                        encryption: final_encryption,
+                        expected_stale_payload_source: completion_snapshot.stale_payload_source,
+                        expected_current_object_identity: completion_snapshot
+                            .current_object_identity,
+                        conditional_completion: !req.cond.is_empty(),
+                        part_records: part_records.clone(),
+                        selected_streaming_segments: completion_snapshot
+                            .selected_streaming_segments,
+                        expected_cleanup: completion_snapshot.cleanup,
+                    },
+                ) {
                 Ok(outcome) => outcome,
                 Err(storage::ObjectPgActionError::StaleMultipartCompletionSnapshot) => {
                     let deadline = stale_snapshot_retry_deadline.get_or_insert_with(|| {
@@ -1004,16 +1031,18 @@ impl Coordinator {
             let lifecycle_size = completion_outcome.live_size;
             let lifecycle_last_modified = completion_outcome.live_last_modified;
 
-            let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
-                &bucket_info,
+            #[cfg(test)]
+            maybe_run_multipart_complete_commit_hook(bucket.as_str(), key.as_str());
+
+            let lifecycle_expiration = Self::current_object_write_lifecycle_expiration_for_config(
+                lifecycle.as_deref(),
                 key.as_str(),
                 lifecycle_tags.as_deref(),
                 lifecycle_size,
                 lifecycle_last_modified,
             )?;
             if let Some(ref payload) = stale_payload {
-                self.read_runtime_for_storage_node(std::sync::Arc::clone(&storage_node))
-                    .enqueue_object_payload_reclaim_for(&bucket, &key, payload.generation_id);
+                multipart_route.enqueue_object_payload_reclaim(payload.generation_id);
             }
 
             return Ok(CompleteMultipartUploadResult {

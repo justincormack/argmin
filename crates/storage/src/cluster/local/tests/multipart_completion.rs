@@ -1,6 +1,171 @@
 use super::*;
 
 #[test]
+fn multipart_completion_route_rejects_crossed_same_pg_request_before_mutation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let crossed_key = key_for_object_pg(
+        map.nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        &bucket,
+        object_pg,
+        "crossed-completion-route-",
+    );
+    assert_ne!(crossed_key, key);
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_local_map(map).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let (request, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "crossedcomplete");
+    let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let crossed_route = admission
+        .active_multipart_object_route(&bucket, &crossed_key)
+        .unwrap();
+    let error = crossed_route
+        .complete_multipart_upload_commit_serialized(request.clone())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "complete multipart upload",
+        })
+    ));
+    assert_eq!(
+        cluster
+            .load_in_progress_multipart_upload(&bucket, &key, &request.upload_id)
+            .unwrap()
+            .upload_id,
+        request.upload_id
+    );
+}
+
+#[test]
+fn multipart_completion_stale_retry_rechecks_expired_route_before_reload() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, _object_pg, _data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap());
+    let contender = Arc::new(crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let (request, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "expirestaleretry");
+    let (contender_request, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "stalecontender");
+
+    let clock = Arc::new(crate::clock::test_time_override_guard(1_000));
+    cluster.test_store_route_map_lease(
+        crate::RouteMapValidity::until_ms(5_000).unwrap(),
+        Some(4_000),
+    );
+    let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    cluster.test_store_route_map_validity(crate::RouteMapValidity::until_ms(10_000).unwrap());
+
+    let contender_for_hook = Arc::clone(&contender);
+    let contender_request_for_hook = contender_request.clone();
+    let replace_once = Arc::new(AtomicBool::new(true));
+    let replace_once_for_hook = Arc::clone(&replace_once);
+    let replace_hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            if replace_once_for_hook.swap(false, Ordering::SeqCst) {
+                contender_for_hook
+                    .complete_multipart_upload_commit_serialized(contender_request_for_hook.clone())
+                    .expect("contender completion should replace the stale payload source");
+            }
+        }));
+    let stale_builds = Arc::new(AtomicUsize::new(0));
+    let stale_builds_for_hook = Arc::clone(&stale_builds);
+    let stale_source_loads = Arc::new(AtomicUsize::new(0));
+    let stale_source_loads_for_hook = Arc::clone(&stale_source_loads);
+    let target_upload_id = request.upload_id.clone();
+    let clock_for_hook = Arc::clone(&clock);
+    let stale_retry_hook = cluster.test_install_multipart_completion_stale_retry_hook(Arc::new(
+        move |event, upload_id| {
+            if *upload_id != target_upload_id {
+                return;
+            }
+            match event {
+                crate::cluster::request_ops::MultipartCompletionStaleRetryTestEvent::BeforeStalePayloadSourceLoad => {
+                    stale_source_loads_for_hook.fetch_add(1, Ordering::SeqCst);
+                }
+                crate::cluster::request_ops::MultipartCompletionStaleRetryTestEvent::AfterStaleCommandBuild => {
+                    stale_builds_for_hook.fetch_add(1, Ordering::SeqCst);
+                    clock_for_hook.set(4_500);
+                }
+            }
+        },
+    ));
+
+    let route = admission
+        .active_multipart_object_route(&bucket, &key)
+        .unwrap();
+    let error = route
+        .complete_multipart_upload_commit_serialized(request.clone())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
+    ));
+    assert!(!replace_once.load(Ordering::SeqCst));
+    assert_eq!(stale_builds.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        stale_source_loads.load(Ordering::SeqCst),
+        1,
+        "expired stale retry must not issue its second payload-source RPC"
+    );
+    drop(stale_retry_hook);
+    drop(replace_hook);
+    assert_eq!(
+        cluster
+            .load_in_progress_multipart_upload(&bucket, &key, &request.upload_id)
+            .unwrap()
+            .upload_id,
+        request.upload_id
+    );
+    assert_bucket_write_reservations_released(&map, &bucket);
+
+    drop(route);
+    drop(admission);
+    clock.set(1_000);
+    let fresh_admission = handle.admit_current_route().unwrap();
+    let fresh_route = fresh_admission
+        .active_multipart_object_route(&bucket, &key)
+        .unwrap();
+    fresh_route
+        .complete_multipart_upload_commit_serialized(request)
+        .unwrap();
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn direct_put_metadata_command_retry_reuses_pending_partial_replica_command() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -2762,14 +2927,17 @@ fn multipart_completion_pending_install_conflict_with_matching_completion_return
         last_modified_millis,
     );
 
-    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_runs = Arc::new(AtomicUsize::new(0));
     let hook_map = Arc::clone(&map);
     let hook_bucket = bucket.clone();
     let hook_command_template = pending_completion.clone();
-    let hook_ran_for_closure = Arc::clone(&hook_ran);
+    let hook_runs_for_closure = Arc::clone(&hook_runs);
     let _hook_guard =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
-            if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
+            // The admitted completion now fences both the bucket-PG barrier
+            // and final object-PG install. Inject the matching contender only
+            // at the latter boundary.
+            if hook_runs_for_closure.fetch_add(1, Ordering::SeqCst) != 1 {
                 return;
             }
             let payload = hook_command_template.payload().clone();
@@ -2781,7 +2949,7 @@ fn multipart_completion_pending_install_conflict_with_matching_completion_return
         .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap();
 
-    assert!(hook_ran.load(Ordering::SeqCst));
+    assert!(hook_runs.load(Ordering::SeqCst) >= 2);
     assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
     assert_eq!(outcome.version_id, crate::VersionId::Null);
     assert_eq!(outcome.live_tags, req.tags);

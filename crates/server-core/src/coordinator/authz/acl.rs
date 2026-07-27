@@ -719,9 +719,9 @@ impl Coordinator {
         })
     }
 
-    pub(in crate::coordinator) fn authorize_complete_multipart_upload_non_boe_with_storage_node(
+    pub(in crate::coordinator) fn authorize_complete_multipart_upload_non_boe_on_admitted_route(
         &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        multipart_route: &storage::ActiveMultipartObjectRoute<'_>,
         req: &CompleteMultipartUploadRequest<'_>,
         bucket_handle: NonBoeLoadedBucketHandle<'_>,
     ) -> Result<AuthorizedCompleteMultipartUpload, ServerError> {
@@ -731,23 +731,26 @@ impl Coordinator {
         let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
         let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
+        let lifecycle = self
+            .cached_bucket_lifecycle_for_loaded_handle(&bucket_handle)?
+            .map(Box::new);
         #[cfg(test)]
         let lookup = if should_probe_multipart_complete_auth_lookup(bucket.as_str(), key.as_str()) {
-            let upload = storage_node
-                .try_load_in_progress_multipart_upload(bucket, key, upload_id)
+            let upload = multipart_route
+                .try_load_in_progress_multipart_upload(upload_id)
                 .map_err(Self::map_object_pg_action_error)?
                 .ok_or_else(|| ServerError::InternalError {
                     reason: "multipart complete auth lookup would block".to_string(),
                 })?;
             storage::MultipartUploadManagementLookup::InProgress(Box::new(upload))
         } else {
-            storage_node
-                .lookup_multipart_upload_management(bucket, key, upload_id)
+            multipart_route
+                .lookup_multipart_upload_management(upload_id)
                 .map_err(Self::map_object_pg_action_error)?
         };
         #[cfg(not(test))]
-        let lookup = storage_node
-            .lookup_multipart_upload_management(bucket, key, upload_id)
+        let lookup = multipart_route
+            .lookup_multipart_upload_management(upload_id)
             .map_err(Self::map_object_pg_action_error)?;
         let upload = match lookup {
             storage::MultipartUploadManagementLookup::InProgress(upload) => *upload,
@@ -793,7 +796,7 @@ impl Coordinator {
                     false,
                 )?;
                 return Ok(AuthorizedCompleteMultipartUpload::Replay {
-                    bucket_info: bucket_info.into_inner(),
+                    lifecycle,
                     key: key.clone(),
                     replay,
                 });
@@ -844,13 +847,14 @@ impl Coordinator {
 
         Ok(AuthorizedCompleteMultipartUpload::InProgress {
             bucket_info: bucket_info.into_inner(),
+            lifecycle,
             bucket: req.upload.bucket_name_typed().clone(),
             key: req.upload.key_typed().clone(),
             upload_id: upload.upload_id.clone(),
             upload: Box::new(storage::AuthorizedMultipartUploadRecord::assume_authorized(
                 upload,
             )),
-            multipart_write_encryption,
+            multipart_write_encryption: Box::new(multipart_write_encryption),
         })
     }
 

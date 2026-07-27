@@ -215,7 +215,7 @@ function publisher_helper(line) {
     if (line ~ /try_set_pending_metadata_command_for_bucket\(/) {
         return "try_set_pending_metadata_command_for_bucket"
     }
-    if (line ~ /try_install_pending_metadata_command_for_bucket\(/) {
+    if (line ~ /try_install_pending_metadata_command_for_bucket(_with_effect_fence)?\(/) {
         return "try_install_pending_metadata_command_for_bucket"
     }
     if (line ~ /try_install_object_pg_pending_command_with_fresh_id\(/) {

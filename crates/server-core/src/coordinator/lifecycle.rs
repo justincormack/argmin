@@ -1,11 +1,9 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use s3_types::{
     BucketLifecycleConfiguration, LifecycleDate, LifecycleExpiration, LifecycleRule,
     LifecycleRuleStatus, VersionId,
 };
-use storage::{StorageCluster, StoredObject};
+use std::collections::HashMap;
+use storage::StoredObject;
 
 use super::{
     bucket_handles::{LoadedBucketHandle, LoadedBucketValue},
@@ -24,44 +22,6 @@ impl Coordinator {
     ) -> Result<bool, ServerError> {
         let _ = (bucket, key, resolved_version_id);
         Ok(requested_version_id.is_none())
-    }
-
-    pub(super) fn cached_bucket_lifecycle(
-        &self,
-        bucket: &BucketSummary,
-    ) -> Result<Option<BucketLifecycleConfiguration>, ServerError> {
-        self.cached_bucket_lifecycle_with_storage_node(&self.storage_node(), bucket)
-    }
-
-    pub(super) fn cached_bucket_lifecycle_with_storage_node(
-        &self,
-        storage_node: &Arc<StorageCluster>,
-        bucket: &BucketSummary,
-    ) -> Result<Option<BucketLifecycleConfiguration>, ServerError> {
-        if !bucket.bucket_lifecycle_present {
-            return Ok(None);
-        }
-
-        let authorized = self.authorize_load_bucket_lifecycle_for(&bucket.name);
-        let raw_config = storage_node
-            .get_bucket_subresource(
-                &authorized.bucket,
-                storage::BucketSubresourceKind::Lifecycle,
-            )
-            .map_err(Self::map_bucket_snapshot_load_error)?;
-        match raw_config {
-            Some(config_xml) => s3_types::parse_lifecycle_configuration_xml(config_xml.as_bytes())
-                .map(Some)
-                .map_err(
-                    |error| ServerError::InternalError {
-                        reason: format!(
-                            "stored lifecycle configuration for {} failed to parse at request time: {error}",
-                            bucket.name
-                        ),
-                    },
-                ),
-            None => Ok(None),
-        }
     }
 
     pub(super) fn cached_bucket_lifecycle_on_admitted_route(
@@ -142,30 +102,6 @@ impl Coordinator {
         ))
     }
 
-    pub(super) fn current_object_write_lifecycle_expiration(
-        &self,
-        bucket: &BucketSummary,
-        key: &str,
-        tags_xml: Option<&str>,
-        size: u64,
-        last_modified: u64,
-    ) -> Result<Option<LifecycleExpirationHeader>, ServerError> {
-        let Some(config) = self.cached_bucket_lifecycle(bucket)? else {
-            return Ok(None);
-        };
-        let tags = match tags_xml {
-            Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
-            None => Vec::new(),
-        };
-        Ok(Self::evaluate_current_object_lifecycle_expiration(
-            &config,
-            key,
-            &tags,
-            size,
-            last_modified,
-        ))
-    }
-
     pub(super) fn current_object_write_lifecycle_expiration_for_loaded_bucket(
         &self,
         bucket: &LoadedBucketHandle,
@@ -183,6 +119,29 @@ impl Coordinator {
         };
         Ok(Self::evaluate_current_object_lifecycle_expiration(
             &config,
+            key,
+            &tags,
+            size,
+            last_modified,
+        ))
+    }
+
+    pub(super) fn current_object_write_lifecycle_expiration_for_config(
+        lifecycle: Option<&BucketLifecycleConfiguration>,
+        key: &str,
+        tags_xml: Option<&str>,
+        size: u64,
+        last_modified: u64,
+    ) -> Result<Option<LifecycleExpirationHeader>, ServerError> {
+        let Some(config) = lifecycle else {
+            return Ok(None);
+        };
+        let tags = match tags_xml {
+            Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
+            None => Vec::new(),
+        };
+        Ok(Self::evaluate_current_object_lifecycle_expiration(
+            config,
             key,
             &tags,
             size,

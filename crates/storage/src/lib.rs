@@ -69,7 +69,7 @@ mod traits {
 }
 
 pub use cluster::{
-    ActiveBucketMetadataScan, ActiveBucketRoute, ActiveBucketRoutePair,
+    ActiveBucketMetadataScan, ActiveBucketRoute, ActiveBucketRoutePair, ActiveMultipartObjectRoute,
     ActiveObjectMetadataMutationRoute, ActiveObjectMetadataScan, ActiveObjectReadRoute,
     BucketWriteSnapshotAction, DurableReclaimScanBatch, DurableReclaimScanOutcome,
     LeasedObjectReadSnapshot, LeasedObjectReadSnapshotOutcome, LocalClusterMap,
