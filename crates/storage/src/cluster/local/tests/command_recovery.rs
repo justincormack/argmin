@@ -1363,12 +1363,7 @@ fn recovery_waiter_drain_treats_missing_unapplied_command_as_abandoned() {
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
         .unwrap();
     let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
-    pg.connection()
-        .execute(
-            "DELETE FROM metadata_command_pending_slot WHERE singleton = 0",
-            [],
-        )
-        .unwrap();
+    assert!(pg.test_clear_pending_metadata_command_slot().unwrap());
     drop(pg);
     drop(leader_guard);
 
@@ -3073,11 +3068,7 @@ fn metadata_transfer_export_packages_retained_suffix_with_base_proof() {
         .apply_metadata_command_and_record(0, &second)
         .unwrap();
     source_pg
-        .connection()
-        .execute(
-            "DELETE FROM metadata_command_log WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-            rusqlite::params![ClusterEpoch::INITIAL.get() as i64, pg_id.get() as i64, 1_i64],
-        )
+        .test_delete_metadata_command_log_entry(ClusterEpoch::INITIAL, 1)
         .unwrap();
     drop(source_pg);
 
@@ -3134,11 +3125,7 @@ fn metadata_transfer_import_rejects_suffix_into_empty_destination_without_mutati
         .apply_metadata_command_and_record(0, &second)
         .unwrap();
     source_pg
-        .connection()
-        .execute(
-            "DELETE FROM metadata_command_log WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-            rusqlite::params![ClusterEpoch::INITIAL.get() as i64, pg_id.get() as i64, 1_i64],
-        )
+        .test_delete_metadata_command_log_entry(ClusterEpoch::INITIAL, 1)
         .unwrap();
     drop(source_pg);
 
@@ -3218,11 +3205,7 @@ fn metadata_transfer_export_fails_closed_when_retained_state_digest_chain_is_bro
         .apply_metadata_command_and_record(0, &second)
         .unwrap();
     source_pg
-        .connection()
-        .execute(
-            "UPDATE metadata_command_log SET pre_state_digest = pre_state_digest + 1 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-            rusqlite::params![ClusterEpoch::INITIAL.get() as i64, pg_id.get() as i64, 2_i64],
-        )
+        .test_increment_metadata_command_log_pre_state_digest(ClusterEpoch::INITIAL, 2)
         .unwrap();
     drop(source_pg);
 
@@ -3927,11 +3910,7 @@ fn metadata_transfer_import_rejects_older_prefix_with_unproven_log_hash() {
     }
     for node_id in [NodeId::new(1), NodeId::new(2)] {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
-        pg.connection()
-            .execute(
-                "UPDATE metadata_command_replica_state SET applied_log_hash = applied_log_hash + 1 WHERE singleton = 0",
-                [],
-            )
+        pg.test_increment_metadata_command_replica_applied_log_hash()
             .unwrap();
     }
     map.node(NodeId::new(0))
@@ -4508,12 +4487,7 @@ fn metadata_transfer_checkpoint_import_replaces_stale_older_epoch_destination() 
     assert_eq!(replaced_state.applied_log_index, 0);
     assert_eq!(replaced_state.applied_log_hash, 0);
     assert_eq!(replaced_state.state_digest, artifact.proof.state_digest);
-    let retained_rows: i64 = replaced_pg
-        .connection()
-        .query_row("SELECT count(*) FROM metadata_command_log", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
+    let retained_rows = replaced_pg.test_metadata_command_log_row_count().unwrap();
     assert_eq!(retained_rows, 0);
 }
 
@@ -4545,11 +4519,7 @@ fn metadata_transfer_live_export_falls_back_to_checkpoint_without_retained_state
         .apply_metadata_command_and_record(0, &command)
         .unwrap();
     source_pg
-        .connection()
-        .execute(
-            "UPDATE metadata_command_log SET post_state_digest = NULL WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-            rusqlite::params![ClusterEpoch::INITIAL.get() as i64, pg_id.get() as i64, 1_i64],
-        )
+        .test_clear_metadata_command_log_post_state_digest(ClusterEpoch::INITIAL, 1)
         .unwrap();
     drop(source_pg);
 
@@ -4601,11 +4571,7 @@ fn metadata_transfer_live_checkpoint_fallback_preserves_source_epoch_under_fence
         .unwrap();
     let source_state = source_pg.metadata_command_replica_state().unwrap();
     source_pg
-        .connection()
-        .execute(
-            "UPDATE metadata_command_log SET post_state_digest = NULL WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-            rusqlite::params![ClusterEpoch::INITIAL.get() as i64, pg_id.get() as i64, 1_i64],
-        )
+        .test_clear_metadata_command_log_post_state_digest(ClusterEpoch::INITIAL, 1)
         .unwrap();
     drop(source_pg);
 
@@ -4689,11 +4655,7 @@ fn metadata_transfer_live_export_prefers_checkpoint_suffix_candidate() {
     corrupt_newest_checkpoint.checkpoint_crc64 ^= 1;
     let source_state = source_pg.metadata_command_replica_state().unwrap();
     source_pg
-        .connection()
-        .execute(
-            "UPDATE metadata_command_log SET post_state_digest = NULL WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-            rusqlite::params![ClusterEpoch::INITIAL.get() as i64, pg_id.get() as i64, 1_i64],
-        )
+        .test_clear_metadata_command_log_post_state_digest(ClusterEpoch::INITIAL, 1)
         .unwrap();
     drop(source_pg);
 
@@ -4796,11 +4758,7 @@ proptest! {
         }
         let source_state = source_pg.metadata_command_replica_state().unwrap();
         source_pg
-            .connection()
-            .execute(
-                "UPDATE metadata_command_log SET post_state_digest = NULL WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-                rusqlite::params![ClusterEpoch::INITIAL.get() as i64, pg_id.get() as i64, 1_i64],
-            )
+            .test_clear_metadata_command_log_post_state_digest(ClusterEpoch::INITIAL, 1)
             .unwrap();
         drop(source_pg);
 
@@ -4899,11 +4857,7 @@ fn metadata_transfer_live_export_uses_durable_checkpoint_candidate() {
         .unwrap();
     let source_state = source_pg.metadata_command_replica_state().unwrap();
     source_pg
-        .connection()
-        .execute(
-            "UPDATE metadata_command_log SET post_state_digest = NULL WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-            rusqlite::params![ClusterEpoch::INITIAL.get() as i64, pg_id.get() as i64, 1_i64],
-        )
+        .test_clear_metadata_command_log_post_state_digest(ClusterEpoch::INITIAL, 1)
         .unwrap();
     drop(source_pg);
 

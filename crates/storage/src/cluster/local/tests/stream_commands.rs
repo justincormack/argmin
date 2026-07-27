@@ -182,14 +182,7 @@ fn stream_put_create_retry_rejects_same_request_with_mismatched_created_at() {
         let primary = map.node(NodeId::new(0)).unwrap().storage_node();
         let pg = primary.get_pg(object_pg).unwrap();
         let session = crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap();
-        pg.connection()
-            .execute(
-                "UPDATE stream_uploads SET created_at = ?1 WHERE session_id = ?2",
-                rusqlite::params![
-                    session.created_at.saturating_add(1) as i64,
-                    session_id.as_str()
-                ],
-            )
+        pg.test_force_stream_upload_created_at(&session_id, session.created_at.saturating_add(1))
             .unwrap();
     }
 
@@ -207,7 +200,7 @@ fn stream_put_create_retry_rejects_same_request_with_mismatched_created_at() {
     assert!(
         matches!(
             err,
-            crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::Db {
+            crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::InvariantViolation {
                 context: "create stream upload existing session mismatch",
                 ..
             })
@@ -259,12 +252,11 @@ fn stream_put_create_retry_rejects_same_request_with_mismatched_allocator_floor(
     {
         let primary = map.node(NodeId::new(0)).unwrap().storage_node();
         let pg = primary.get_pg(object_pg).unwrap();
-        pg.connection()
-            .execute(
-                "UPDATE stream_uploads SET next_segment_vid = ?1 WHERE session_id = ?2",
-                rusqlite::params![2_i64, session_id.as_str()],
-            )
-            .unwrap();
+        pg.test_force_stream_upload_next_segment_vid(
+            &session_id,
+            crate::GenerationId::new(2).unwrap(),
+        )
+        .unwrap();
     }
 
     let err = cluster
@@ -281,7 +273,7 @@ fn stream_put_create_retry_rejects_same_request_with_mismatched_allocator_floor(
     assert!(
         matches!(
             err,
-            crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::Db {
+            crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::InvariantViolation {
                 context: "create stream upload existing session mismatch",
                 ..
             })
@@ -3016,7 +3008,7 @@ fn generic_pending_drain_rejects_stream_put_with_substituted_proof() {
         .unwrap_err();
     assert!(matches!(
         central_error,
-        crate::MetadataError::Db {
+        crate::MetadataError::InvariantViolation {
             context: "commit direct put command stream reservation mismatch",
             ..
         }
@@ -3037,7 +3029,7 @@ fn generic_pending_drain_rejects_stream_put_with_substituted_proof() {
     assert!(
         matches!(
             error,
-            crate::ObjectPgActionError::Metadata(crate::MetadataError::Db {
+            crate::ObjectPgActionError::Metadata(crate::MetadataError::InvariantViolation {
                 context: "commit direct put command stream reservation mismatch",
                 ..
             })

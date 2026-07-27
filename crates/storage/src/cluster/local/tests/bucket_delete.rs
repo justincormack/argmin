@@ -23,9 +23,7 @@ fn apply_delete_finalized_bucket_command_to_pg(
 }
 
 fn delete_bucket_row_for_divergence_test(pg: &crate::PgStore, bucket: &BucketName) {
-    pg.connection()
-        .execute("DELETE FROM buckets WHERE name = ?1", [bucket.as_str()])
-        .unwrap();
+    pg.test_delete_bucket_row(bucket).unwrap();
     pg.refresh_metadata_command_state_digest().unwrap();
 }
 

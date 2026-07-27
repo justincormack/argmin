@@ -5260,15 +5260,14 @@ fn unix_complete_multipart_uses_durable_initiation_identity() {
             },
         )
         .unwrap();
-        pg.connection()
-            .execute(
-                "UPDATE multipart_uploads SET initiated_object_kind = 1, \
-                 initiated_object_version_id = 0, \
-                 initiated_object_generation_or_write_sequence = 1 \
-                 WHERE upload_id = ?1",
-                rusqlite::params![upload_id.as_str()],
-            )
-            .unwrap();
+        pg.test_force_multipart_upload_initiated_object_identity(
+            &upload_id,
+            crate::MultipartObjectIdentity::Live {
+                version_id: VersionId::Null,
+                generation_id: GenerationId::MIN,
+            },
+        )
+        .unwrap();
         PgMetadataStore::put_object_meta(&*pg, &crate::PutObjectReq::Live(put_live(3))).unwrap();
         pg.refresh_metadata_command_state_digest().unwrap();
         PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap()

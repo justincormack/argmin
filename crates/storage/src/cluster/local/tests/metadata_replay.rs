@@ -1356,8 +1356,7 @@ fn local_cluster_reopen_rejects_missing_applied_command_log_entry() {
             .get_pg(1)
             .unwrap();
         node_zero_pg
-            .connection()
-            .execute("DELETE FROM metadata_command_log WHERE log_index = 1", [])
+            .test_delete_metadata_command_log_entry(ClusterEpoch::INITIAL, 1)
             .unwrap();
     }
 
@@ -1763,11 +1762,7 @@ fn local_cluster_reopen_rejects_inflight_matching_log_with_divergent_advanced_di
             .get_pg(1)
             .unwrap();
         divergent_pg
-            .connection()
-            .execute(
-                "UPDATE buckets SET public_read = 1 WHERE name = ?1",
-                rusqlite::params![bucket.as_str()],
-            )
+            .test_set_bucket_public_read(&bucket, true)
             .unwrap();
         divergent_pg
             .refresh_metadata_command_state_digest()
@@ -1817,20 +1812,8 @@ fn local_cluster_reopen_recovers_abandoned_log_tail_without_nonprimary_pending_s
                 )
                 .unwrap();
             }
-            pg.connection()
-                    .execute(
-                        "INSERT INTO metadata_command_log \
-                         (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL)",
-                        rusqlite::params![
-                            ClusterEpoch::INITIAL.get() as i64,
-                            1_i64,
-                            1_i64,
-                            command.abandoned_log_checksum_crc64() as i64,
-                            command.abandoned_log_bytes(),
-                        ],
-                    )
-                    .unwrap();
+            pg.test_insert_abandoned_metadata_command_log_entry(&command)
+                .unwrap();
         }
         bucket
     };
@@ -1889,16 +1872,7 @@ fn local_cluster_reopen_rejects_reordered_applied_command_log_entry() {
             .get_pg(1)
             .unwrap();
         node_zero_pg
-            .connection()
-            .execute(
-                "UPDATE metadata_command_log \
-                     SET command_checksum = ?1, command_bytes = ?2 \
-                     WHERE log_index = 1",
-                rusqlite::params![
-                    second_command.checksum_crc64() as i64,
-                    second_command.command_bytes(),
-                ],
-            )
+            .test_replace_metadata_command_log_command(1, &second_command)
             .unwrap();
     }
 
@@ -1943,11 +1917,7 @@ fn local_cluster_reopen_rejects_corrupt_applied_command_log_hash() {
             .get_pg(1)
             .unwrap();
         node_zero_pg
-            .connection()
-            .execute(
-                "UPDATE metadata_command_log SET previous_log_hash = ?1 WHERE log_index = 1",
-                rusqlite::params![123_i64],
-            )
+            .test_set_metadata_command_log_previous_hash(1, 123)
             .unwrap();
     }
 
@@ -1992,11 +1962,7 @@ fn local_cluster_reopen_rejects_materialized_state_digest_mismatch() {
             .get_pg(1)
             .unwrap();
         node_zero_pg
-            .connection()
-            .execute(
-                "UPDATE buckets SET public_read = 1 WHERE name = ?1",
-                rusqlite::params![bucket.as_str()],
-            )
+            .test_set_bucket_public_read(&bucket, true)
             .unwrap();
     }
 
@@ -2037,11 +2003,7 @@ fn local_cluster_reopen_rejects_replica_materialized_state_digest_mismatch() {
             .get_pg(1)
             .unwrap();
         replica_pg
-            .connection()
-            .execute(
-                "UPDATE buckets SET public_read = 1 WHERE name = ?1",
-                rusqlite::params![bucket.as_str()],
-            )
+            .test_set_bucket_public_read(&bucket, true)
             .unwrap();
     }
 
@@ -2085,11 +2047,7 @@ fn local_cluster_reopen_rejects_missing_replica_state_for_nonempty_pg() {
             .get_pg(1)
             .unwrap();
         node_zero_pg
-            .connection()
-            .execute(
-                "DELETE FROM metadata_command_replica_state WHERE singleton = 0",
-                [],
-            )
+            .test_delete_metadata_command_replica_state()
             .unwrap();
     }
 
@@ -2134,15 +2092,7 @@ fn local_cluster_reopen_rejects_replica_state_disagreement() {
                 .unwrap();
             (
                 node_zero_pg.metadata_command_replica_state().unwrap(),
-                node_zero_pg
-                    .connection()
-                    .query_row(
-                        "SELECT next_bucket_execution_generation \
-                             FROM pg_counters WHERE singleton = 0",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap(),
+                node_zero_pg.test_bucket_execution_generation().unwrap(),
             )
         };
         cluster
@@ -2155,39 +2105,14 @@ fn local_cluster_reopen_rejects_replica_state_disagreement() {
             .get_pg(1)
             .unwrap();
         node_zero_pg
-            .connection()
-            .execute("DELETE FROM metadata_command_log WHERE log_index = 2", [])
+            .test_delete_metadata_command_log_entry(ClusterEpoch::INITIAL, 2)
+            .unwrap();
+        node_zero_pg.test_delete_bucket_row(&second_bucket).unwrap();
+        node_zero_pg
+            .test_set_bucket_execution_generation(stale_state.1)
             .unwrap();
         node_zero_pg
-            .connection()
-            .execute(
-                "DELETE FROM buckets WHERE name = ?1",
-                rusqlite::params![second_bucket.as_str()],
-            )
-            .unwrap();
-        node_zero_pg
-            .connection()
-            .execute(
-                "UPDATE pg_counters \
-                     SET next_bucket_execution_generation = ?1 \
-                     WHERE singleton = 0",
-                rusqlite::params![stale_state.1],
-            )
-            .unwrap();
-        node_zero_pg
-            .connection()
-            .execute(
-                "UPDATE metadata_command_replica_state \
-                     SET cluster_epoch = ?1, applied_log_index = ?2, \
-                         applied_log_hash = ?3, state_digest = ?4 \
-                     WHERE singleton = 0",
-                rusqlite::params![
-                    stale_state.0.cluster_epoch.get() as i64,
-                    stale_state.0.applied_log_index as i64,
-                    stale_state.0.applied_log_hash as i64,
-                    stale_state.0.state_digest as i64,
-                ],
-            )
+            .test_replace_metadata_command_replica_state(stale_state.0)
             .unwrap();
     }
 
@@ -2247,28 +2172,15 @@ fn local_cluster_reopen_rejects_same_state_with_different_history() {
             .get_pg(1)
             .unwrap();
         replica_pg
-            .connection()
-            .execute(
-                "UPDATE metadata_command_log \
-                     SET command_checksum = ?1, command_bytes = ?2, \
-                         previous_log_hash = ?3, log_hash = ?4 \
-                     WHERE log_index = 1",
-                rusqlite::params![
-                    alternate_command.checksum_crc64() as i64,
-                    alternate_command.command_bytes(),
-                    0_i64,
-                    alternate_hash as i64,
-                ],
+            .test_replace_metadata_command_log_command_and_hashes(
+                1,
+                &alternate_command,
+                0,
+                alternate_hash,
             )
             .unwrap();
         replica_pg
-            .connection()
-            .execute(
-                "UPDATE metadata_command_replica_state \
-                     SET applied_log_hash = ?1 \
-                     WHERE singleton = 0",
-                rusqlite::params![alternate_hash as i64],
-            )
+            .test_set_metadata_command_replica_applied_log_hash(alternate_hash)
             .unwrap();
     }
 

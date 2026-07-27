@@ -274,12 +274,11 @@ fn cluster_shard_scavenger_treats_pending_multipart_completion_as_referenced() {
         Some(&bucket),
     )
     .unwrap();
-    pg.connection()
-        .execute(
-            "DELETE FROM multipart_part_segments WHERE upload_id = ?1",
-            rusqlite::params![req.upload_id.as_str()],
-        )
-        .unwrap();
+    assert!(
+        pg.test_delete_multipart_part_segments_for_upload(&req.upload_id)
+            .unwrap()
+            > 0
+    );
     drop(pg);
 
     let ec = EcShape {
@@ -312,12 +311,7 @@ fn cluster_shard_scavenger_treats_pending_multipart_completion_as_referenced() {
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
         .unwrap();
     let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
-    pg.connection()
-        .execute(
-            "DELETE FROM metadata_command_pending_slot WHERE singleton = 0",
-            [],
-        )
-        .unwrap();
+    assert!(pg.test_clear_pending_metadata_command_slot().unwrap());
     drop(pg);
 
     let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
@@ -577,20 +571,17 @@ fn cluster_shard_scavenger_reference_scan_failure_suppresses_negative_reference_
     let malformed_bytes = b"not a metadata command".to_vec();
     let malformed_checksum = checksum::crc64::checksum(&malformed_bytes);
     reference_pg
-            .connection()
-            .execute(
-                "INSERT INTO metadata_command_pending_slot \
-                 (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) \
-                 VALUES (0, ?1, ?2, ?3, ?4, ?5, NULL)",
-                rusqlite::params![
-                    ClusterEpoch::INITIAL.get() as i64,
-                    reference_pg_id as i64,
-                    1_i64,
-                    malformed_checksum as i64,
-                    malformed_bytes,
-                ],
-            )
-            .unwrap();
+        .test_insert_raw_pending_metadata_command_slot(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(reference_pg_id),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            malformed_checksum,
+            &malformed_bytes,
+            None,
+        )
+        .unwrap();
     drop(reference_pg);
 
     let map = Arc::new(local_map);
@@ -628,13 +619,9 @@ fn cluster_shard_scavenger_reference_scan_failure_suppresses_negative_reference_
         .storage_node()
         .get_pg(reference_pg_id)
         .unwrap();
-    reference_pg
-        .connection()
-        .execute(
-            "DELETE FROM metadata_command_pending_slot WHERE singleton = 0",
-            [],
-        )
-        .unwrap();
+    assert!(reference_pg
+        .test_clear_pending_metadata_command_slot()
+        .unwrap());
     drop(reference_pg);
 
     let observations = cluster.audit_shard_storage_for_scavenger().unwrap();

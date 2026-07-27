@@ -347,7 +347,7 @@ impl Coordinator {
             let part = obj_parts
                 .iter()
                 .find(|p| p.record.part_number == part_number)
-                .ok_or_else(|| ServerError::InvalidPartNumber {
+                .ok_or(ServerError::InvalidPartNumber {
                     part_number,
                     parts_count: obj_parts.len() as u32,
                 })?;
@@ -599,7 +599,7 @@ impl Coordinator {
             let part_index = obj_parts
                 .iter()
                 .position(|p| p.part_number == part_number)
-                .ok_or_else(|| ServerError::InvalidPartNumber {
+                .ok_or(ServerError::InvalidPartNumber {
                     part_number,
                     parts_count: obj_parts.len() as u32,
                 })?;

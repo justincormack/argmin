@@ -2062,20 +2062,30 @@ fn stream_put_record_pending_install_race_releases_reservation_and_retries() {
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
         .unwrap();
     let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
-    let command_bytes = primary_pg
-        .connection()
-        .prepare("SELECT command_bytes FROM metadata_command_log ORDER BY log_index")
+    let applied_log_index = primary_pg
+        .metadata_command_replica_state()
         .unwrap()
-        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .applied_log_index;
+    let entries = primary_pg
+        .retained_metadata_command_log_entries(
+            primary.node_id().as_u32(),
+            ClusterEpoch::INITIAL,
+            MetadataCommandLogIndex::new(1).unwrap(),
+            MetadataCommandLogIndex::new(applied_log_index).unwrap(),
+        )
         .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+        .into_iter()
+        .filter_map(|entry| match entry.kind {
+            crate::metadata_command::MetadataCommandLogRangeEntryKind::Applied(command) => {
+                Some(command)
+            }
+            crate::metadata_command::MetadataCommandLogRangeEntryKind::Abandoned { .. } => None,
+        })
+        .collect::<Vec<_>>();
     assert!(
-        command_bytes.iter().any(|bytes| {
+        entries.iter().any(|command| {
             matches!(
-                crate::metadata_command::decode_metadata_command_envelope(bytes)
-                    .unwrap()
-                    .payload(),
+                command.payload(),
                 MetadataCommandPayload::ReleaseObjectGeneration(release)
                     if release.matches_request(&bucket, &key, &session_id)
             )
@@ -2083,11 +2093,9 @@ fn stream_put_record_pending_install_race_releases_reservation_and_retries() {
         "pending-install contention must release the stream create reservation before retrying"
     );
     assert!(
-        command_bytes.iter().any(|bytes| {
+        entries.iter().any(|command| {
             matches!(
-                crate::metadata_command::decode_metadata_command_envelope(bytes)
-                    .unwrap()
-                    .payload(),
+                command.payload(),
                 MetadataCommandPayload::CreateStreamUpload(create)
                     if create.session.session_id == session_id
             )

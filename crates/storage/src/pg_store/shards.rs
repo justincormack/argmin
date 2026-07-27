@@ -8,6 +8,27 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 impl PgStore {
+    #[cfg(test)]
+    pub(crate) fn test_delete_shard_row(&self, key: &ShardKey) -> Result<(), StoreError> {
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM shards WHERE shard_key = ?1",
+                params![key.as_bytes().as_slice()],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "delete shard row for test",
+                source: source.into(),
+            })?;
+        if changed != 1 {
+            return Err(StoreError::IntegrityError {
+                expected: 1,
+                actual: changed as u64,
+            });
+        }
+        Ok(())
+    }
+
     /// Resolve the file path for a shard key.
     fn shard_path(&self, key: &ShardKey) -> PathBuf {
         Self::shard_path_for_shards_dir(&self.shards_dir, key)
@@ -220,7 +241,7 @@ impl PgStore {
             )
             .map_err(|e| StoreError::Db {
                 context: "insert shard record",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -240,7 +261,7 @@ impl PgStore {
             .optional()
             .map_err(|e| StoreError::Db {
                 context: "validate written shard ack",
-                source: e,
+                source: e.into(),
             })?;
         let Some((actual_size, actual_crc, status)) = row else {
             return Err(StoreError::NotFound);
@@ -270,7 +291,7 @@ impl PgStore {
             )
             .map_err(|e| StoreError::Db {
                 context: "delete shard record",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -290,7 +311,7 @@ impl PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| StoreError::Db {
                 context: "register written shards batch (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
         let now = Self::now_secs() as i64;
@@ -303,7 +324,7 @@ impl PgStore {
                 )
                 .map_err(|e| StoreError::Db {
                     context: "register written shards batch (prepare)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             for (key, ack) in shards {
@@ -315,7 +336,7 @@ impl PgStore {
                 ])
                 .map_err(|e| StoreError::Db {
                     context: "register written shards batch (insert shard record)",
-                    source: e,
+                    source: e.into(),
                 })?;
             }
 
@@ -328,7 +349,7 @@ impl PgStore {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     return Err(StoreError::Db {
                         context: "register written shards batch (commit txn)",
-                        source: e,
+                        source: e.into(),
                     });
                 }
                 Ok(())
@@ -355,7 +376,7 @@ impl PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| StoreError::Db {
                 context: "register written shards batch exact (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
         let now = Self::now_secs() as i64;
@@ -367,7 +388,7 @@ impl PgStore {
                 )
                 .map_err(|e| StoreError::Db {
                     context: "register written shards batch exact (prepare lookup)",
-                    source: e,
+                    source: e.into(),
                 })?;
             let mut insert = self
                 .conn
@@ -377,7 +398,7 @@ impl PgStore {
                 )
                 .map_err(|e| StoreError::Db {
                     context: "register written shards batch exact (prepare insert)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             for (key, ack) in shards {
@@ -388,7 +409,7 @@ impl PgStore {
                     .optional()
                     .map_err(|e| StoreError::Db {
                         context: "register written shards batch exact (lookup shard record)",
-                        source: e,
+                        source: e.into(),
                     })?;
 
                 if let Some((actual_size, actual_crc, status)) = row {
@@ -418,7 +439,7 @@ impl PgStore {
                     ])
                     .map_err(|e| StoreError::Db {
                         context: "register written shards batch exact (insert shard record)",
-                        source: e,
+                        source: e.into(),
                     })?;
             }
 
@@ -431,7 +452,7 @@ impl PgStore {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     return Err(StoreError::Db {
                         context: "register written shards batch exact (commit txn)",
-                        source: e,
+                        source: e.into(),
                     });
                 }
                 Ok(())
@@ -461,7 +482,7 @@ impl PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
                 context: "append stream segment with shard publish (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
         let now = Self::now_secs() as i64;
@@ -474,7 +495,7 @@ impl PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "append stream segment with shard publish (prepare shard insert)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             for (key, ack) in shards {
@@ -487,7 +508,7 @@ impl PgStore {
                     ])
                     .map_err(|e| MetadataError::Db {
                         context: "append stream segment with shard publish (insert shard record)",
-                        source: e,
+                        source: e.into(),
                     })?;
             }
 
@@ -512,7 +533,7 @@ impl PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "append stream segment with shard publish (insert segment)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             Ok(())
@@ -524,7 +545,7 @@ impl PgStore {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     return Err(MetadataError::Db {
                         context: "append stream segment with shard publish (commit txn)",
-                        source: e,
+                        source: e.into(),
                     });
                 }
                 Ok(())
@@ -571,7 +592,7 @@ impl ShardStore for PgStore {
             .optional()
             .map_err(|e| StoreError::Db {
                 context: "lookup shard",
-                source: e,
+                source: e.into(),
             })?;
 
         let (expected_crc, _size, status) = row.ok_or(StoreError::NotFound)?;
@@ -624,7 +645,7 @@ impl ShardStore for PgStore {
             )
             .map_err(|e| StoreError::Db {
                 context: "mark shard deleting",
-                source: e,
+                source: e.into(),
             })?;
 
         // Unlink the file (ignore ENOENT for idempotency).
@@ -649,7 +670,7 @@ impl ShardStore for PgStore {
                 )
                 .map_err(|e| StoreError::Db {
                     context: "delete shard record",
-                    source: e,
+                    source: e.into(),
                 })?;
         }
 
@@ -676,7 +697,7 @@ impl ShardStore for PgStore {
             .optional()
             .map_err(|e| StoreError::Db {
                 context: "stat shard",
-                source: e,
+                source: e.into(),
             })?;
 
         let (size, crc, created_at, last_verified, status) = row.ok_or(StoreError::NotFound)?;

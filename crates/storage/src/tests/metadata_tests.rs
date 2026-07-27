@@ -433,12 +433,9 @@ fn apply_delete_finalized_bucket_command(
 #[test]
 fn file_pg_store_uses_in_memory_temp_store() {
     let (_dir, store) = make_pg_store();
-    let temp_store: i64 = store
-        .connection()
-        .query_row("PRAGMA temp_store", [], |row| row.get(0))
-        .unwrap();
+    let configuration = store.test_sqlite_configuration().unwrap();
     assert_eq!(
-        temp_store, 2,
+        configuration.temp_store, 2,
         "PgStore connections must keep SQLite temp storage in memory"
     );
 }
@@ -446,17 +443,10 @@ fn file_pg_store_uses_in_memory_temp_store() {
 #[test]
 fn file_pg_store_uses_power_loss_safe_wal_pragmas() {
     let (_dir, store) = make_pg_store();
-    let journal_mode: String = store
-        .connection()
-        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-        .unwrap();
-    let synchronous: i64 = store
-        .connection()
-        .query_row("PRAGMA synchronous", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    let configuration = store.test_sqlite_configuration().unwrap();
+    assert_eq!(configuration.journal_mode.to_ascii_lowercase(), "wal");
     assert_eq!(
-        synchronous, 2,
+        configuration.synchronous, 2,
         "PgStore connections must use SQLite synchronous=FULL with WAL so committed metadata commands are fsynced before acknowledgement"
     );
 }
@@ -680,26 +670,16 @@ fn delete_bucket_clears_object_version_counter_records() {
             encryption: ObjectEncryption::None,
         }))
         .unwrap();
-    let counter_rows: i64 = store
-        .connection()
-        .query_row(
-            "SELECT COUNT(*) FROM object_version_counters WHERE bucket = ?1",
-            [bucket.as_str()],
-            |row| row.get(0),
-        )
+    let counter_rows = store
+        .test_object_version_counter_rows_for_bucket(&bucket)
         .unwrap();
     assert_eq!(counter_rows, 1);
 
     store.delete_object_version(&bucket, &key, v1).unwrap();
     store.mark_bucket_deleting(&bucket).unwrap();
     apply_delete_finalized_bucket_command(&store, &bucket, 1);
-    let counter_rows: i64 = store
-        .connection()
-        .query_row(
-            "SELECT COUNT(*) FROM object_version_counters WHERE bucket = ?1",
-            [bucket.as_str()],
-            |row| row.get(0),
-        )
+    let counter_rows = store
+        .test_object_version_counter_rows_for_bucket(&bucket)
         .unwrap();
     assert_eq!(counter_rows, 0);
 
@@ -1498,7 +1478,13 @@ fn file_bucket_subresource_rejects_aux_kind_mismatch() {
             },
         )
         .unwrap_err();
-    assert!(matches!(err, crate::error::MetadataError::Db { .. }));
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::InvariantViolation {
+            context: "put bucket subresource",
+            ..
+        }
+    ));
 
     let err = store
         .put_bucket_subresource(
@@ -1510,7 +1496,13 @@ fn file_bucket_subresource_rejects_aux_kind_mismatch() {
             },
         )
         .unwrap_err();
-    assert!(matches!(err, crate::error::MetadataError::Db { .. }));
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::InvariantViolation {
+            context: "put bucket subresource",
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -1846,52 +1838,6 @@ fn file_metadata_object_has_standard_layout() {
     let live = obj.as_live().unwrap();
     assert_eq!(live.layout, ObjectLayout::Standard);
     assert_eq!(live.metadata_blob, None);
-}
-
-#[test]
-fn file_metadata_invalid_data_layout_returns_error() {
-    let (_dir, store) = make_pg_store();
-
-    // Insert a valid object first
-    store
-        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: bucket_name("bucket"),
-            key: object_key("k"),
-            version_id: VersionId::Null,
-            owner: test_owner(),
-            acl_grants: AclGrants::default(),
-            public_read: false,
-            generation_id: GenerationId::MIN,
-            ec: EcShape { k: 4, m: 2 },
-            size: 100,
-            etag: ObjectEtag::SinglePart([1, 2, 3, 0, 0, 0, 0, 0]),
-            layout: ObjectLayout::Standard,
-            tags: None,
-            metadata_blob: None,
-            system_metadata_blob: None,
-            object_lock: ObjectLockState::default(),
-            encryption: ObjectEncryption::None,
-        }))
-        .unwrap();
-
-    // Corrupting data_layout is blocked by DB CHECK constraints.
-    let err = store
-        .connection()
-        .execute(
-            "UPDATE objects SET data_layout = 99 WHERE bucket = 'bucket' AND key = 'k'",
-            [],
-        )
-        .unwrap_err();
-    assert!(
-        matches!(err, rusqlite::Error::SqliteFailure(_, _)),
-        "expected sqlite constraint failure, got: {err:?}"
-    );
-
-    // Record remains readable and unchanged.
-    let obj = store
-        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
-        .unwrap();
-    assert_eq!(obj.as_live().unwrap().layout, ObjectLayout::Standard);
 }
 
 // --- Multipart metadata tests (PgStore only — needs SQL) ---
@@ -2242,16 +2188,6 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         .into_live()
         .unwrap();
     assert_eq!(live.tags.as_deref(), Some(tags));
-
-    let reservation_count: i64 = store
-        .connection()
-        .query_row(
-            "SELECT COUNT(*) FROM object_generation_reservations WHERE reservation_id = ?1",
-            rusqlite::params![multipart_upload_id("uid-cmc").as_str()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(reservation_count, 0);
 }
 
 #[test]
@@ -3623,19 +3559,14 @@ fn mpu_delete_upload_during_upsert_returns_no_such_upload() {
 // --- COMMIT failure path tests ---
 
 #[test]
-fn mpu_upsert_commit_failure_via_deferred_fk() {
-    // Use PRAGMA defer_foreign_keys to defer FK checks to COMMIT time.
-    // INSERT succeeds (FK deferred), COMMIT fails with constraint violation.
-    // This exercises the COMMIT failure branch in upsert_multipart_part.
+fn mpu_upsert_commit_failure_is_reported_and_rolled_back() {
     let (_dir, store) = make_pg_store();
 
-    store
-        .connection()
-        .execute_batch("PRAGMA defer_foreign_keys=ON")
-        .unwrap();
+    create_upload(&store, "uid-fail");
+    store.fail_next_metadata_txn_commit();
 
     let err = store
-        .upsert_multipart_part(&make_part("nonexistent", 1, 0))
+        .upsert_multipart_part(&make_part("uid-fail", 1, 0))
         .unwrap_err();
 
     // Must come from the COMMIT failure path, not the statement failure path.
@@ -3662,7 +3593,7 @@ fn mpu_upsert_commit_failure_via_deferred_fk() {
 
 #[test]
 fn mpu_upsert_commit_failure_preserves_prior_state() {
-    // Verify that a COMMIT failure via deferred FK doesn't corrupt existing data.
+    // Verify that an injected COMMIT failure doesn't corrupt existing data.
     let (_dir, store) = make_pg_store();
 
     create_upload(&store, "uid-prior");
@@ -3670,14 +3601,18 @@ fn mpu_upsert_commit_failure_preserves_prior_state() {
         .upsert_multipart_part(&make_part("uid-prior", 1, 0))
         .unwrap();
 
-    // Force a COMMIT failure on a different upload (nonexistent).
-    store
-        .connection()
-        .execute_batch("PRAGMA defer_foreign_keys=ON")
-        .unwrap();
-    let _ = store
-        .upsert_multipart_part(&make_part("nonexistent", 1, 0))
+    create_upload(&store, "uid-fail");
+    store.fail_next_metadata_txn_commit();
+    let err = store
+        .upsert_multipart_part(&make_part("uid-fail", 1, 0))
         .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::Db {
+            context: "upsert part (commit txn)",
+            ..
+        }
+    ));
 
     // Prior data should be intact.
     let part = store
@@ -3687,31 +3622,11 @@ fn mpu_upsert_commit_failure_preserves_prior_state() {
 }
 
 #[test]
-fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
-    // Switch to DELETE journal mode so a reader holding SHARED lock prevents
-    // COMMIT from acquiring EXCLUSIVE lock, forcing the COMMIT failure path.
-    let dir = test_util::tempdir();
-    let pg_dir = dir.path().join("pg-0000");
-    let store = crate::PgStore::open(&pg_dir, 0).unwrap();
+fn mpu_commit_object_parts_commit_failure_is_reported_and_rolled_back() {
+    let (_dir, store) = make_pg_store();
+    store.fail_next_metadata_txn_commit();
 
-    // Switch from WAL to DELETE journal mode.
-    store
-        .connection()
-        .execute_batch("PRAGMA journal_mode=DELETE")
-        .unwrap();
-
-    // Open a raw blocker connection that holds a SHARED lock via read transaction.
-    let db_path = pg_dir.join("metadata.db");
-    let blocker = rusqlite::Connection::open(&db_path).unwrap();
-    blocker
-        .busy_timeout(std::time::Duration::from_millis(0))
-        .unwrap();
-    blocker
-        .execute_batch("BEGIN; SELECT * FROM object_parts;")
-        .unwrap();
-
-    // commit_object_parts: BEGIN IMMEDIATE gets RESERVED (OK), INSERT succeeds,
-    // COMMIT fails with SQLITE_BUSY (can't upgrade to EXCLUSIVE).
+    // The injected failure occurs after the writes and exercises COMMIT rollback.
     let part = ObjectPartRecord {
         bucket: bucket_name("bucket"),
         key: object_key("k"),
@@ -3740,10 +3655,6 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
         }
         other => panic!("expected Db error from COMMIT path, got: {other:?}"),
     }
-
-    // Release the blocker's lock.
-    blocker.execute_batch("ROLLBACK").unwrap();
-    drop(blocker);
 
     // Rolled-back parts should not be visible.
     let parts = store
@@ -3784,13 +3695,11 @@ fn mpu_threaded_upserts_different_parts() {
 
     let store1 = crate::PgStore::open(&pg_dir, 0).unwrap();
     store1
-        .connection()
-        .execute_batch("PRAGMA busy_timeout=10000")
+        .test_set_busy_timeout(std::time::Duration::from_secs(10))
         .unwrap();
     let store2 = crate::PgStore::open(&pg_dir, 0).unwrap();
     store2
-        .connection()
-        .execute_batch("PRAGMA busy_timeout=10000")
+        .test_set_busy_timeout(std::time::Duration::from_secs(10))
         .unwrap();
 
     let barrier = Arc::new(Barrier::new(2));
@@ -3839,13 +3748,11 @@ fn mpu_threaded_state_transition_race() {
 
     let store1 = crate::PgStore::open(&pg_dir, 0).unwrap();
     store1
-        .connection()
-        .execute_batch("PRAGMA busy_timeout=10000")
+        .test_set_busy_timeout(std::time::Duration::from_secs(10))
         .unwrap();
     let store2 = crate::PgStore::open(&pg_dir, 0).unwrap();
     store2
-        .connection()
-        .execute_batch("PRAGMA busy_timeout=10000")
+        .test_set_busy_timeout(std::time::Duration::from_secs(10))
         .unwrap();
 
     let barrier = Arc::new(Barrier::new(2));
@@ -3902,8 +3809,7 @@ fn mpu_threaded_upsert_same_part_stress() {
             std::thread::spawn(move || {
                 let store = crate::PgStore::open(&pg, 0).unwrap();
                 store
-                    .connection()
-                    .execute_batch("PRAGMA busy_timeout=10000")
+                    .test_set_busy_timeout(std::time::Duration::from_secs(10))
                     .unwrap();
                 b.wait();
                 store
@@ -4578,14 +4484,10 @@ mod prop_tests {
             let versions = model.versions_for_key(key);
             if versions.len() > 1 {
                 store
-                    .connection()
-                    .execute(
-                        "UPDATE objects SET last_modified = ?1 WHERE bucket = ?2 AND key = ?3",
-                        rusqlite::params![
-                            FORCED_TIED_LAST_MODIFIED_MILLIS,
-                            PROP_TEST_BUCKET,
-                            key.as_str()
-                        ],
+                    .test_force_object_last_modified(
+                        &bucket_name(PROP_TEST_BUCKET),
+                        key,
+                        FORCED_TIED_LAST_MODIFIED_MILLIS as u64,
                     )
                     .map_err(|err| {
                         TestCaseError::fail(format!(
@@ -4927,13 +4829,7 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
 
     let shard = ShardKey::new(&[0xA1; 16], 1, 0);
     let ack = store.write_shard(&shard, b"bbbb").unwrap();
-    store
-        .connection()
-        .execute(
-            "DELETE FROM shards WHERE shard_key = ?1",
-            rusqlite::params![shard.as_bytes().as_slice()],
-        )
-        .unwrap();
+    store.test_delete_shard_row(&shard).unwrap();
     assert!(matches!(
         store.read_shard(&shard),
         Err(crate::StoreError::NotFound)
@@ -5234,24 +5130,42 @@ fn delete_object_segments_cleanup() {
 fn multipart_part_segments_crud() {
     let (_dir, store) = make_pg_store();
 
-    // Insert part segments directly (simulating committed state)
-    let conn = store.connection();
-    conn.execute(
-        "INSERT INTO multipart_part_segments \
-         (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, \
-          segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
-         VALUES ('bucket', 'k', ?1, 1, 1, 0, 4000000, 41, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 10, 0, 13, 4, 2)",
-        [multipart_upload_id("uid-1").into_string()],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO multipart_part_segments \
-         (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, \
-          segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
-         VALUES ('bucket', 'k', ?1, 1, 1, 1, 2000000, 42, X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 10, 1, 14, 4, 2)",
-        [multipart_upload_id("uid-1").into_string()],
-    )
-    .unwrap();
+    store
+        .test_insert_multipart_part_segments(&[
+            MultipartPartSegmentRecord {
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
+                upload_id: multipart_upload_id("uid-1"),
+                version_id: 1,
+                part_number: 1,
+                segment_index: 0,
+                size: 4_000_000,
+                segment_crc64: 41,
+                segment_okh: [0xAA; 16],
+                segment_vid: GenerationId::new(10).unwrap(),
+                data_pg_id: 0,
+                placement_cluster_epoch: ClusterEpoch::new(13).unwrap(),
+                ec_k: 4,
+                ec_m: 2,
+            },
+            MultipartPartSegmentRecord {
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
+                upload_id: multipart_upload_id("uid-1"),
+                version_id: 1,
+                part_number: 1,
+                segment_index: 1,
+                size: 2_000_000,
+                segment_crc64: 42,
+                segment_okh: [0xBB; 16],
+                segment_vid: GenerationId::new(10).unwrap(),
+                data_pg_id: 1,
+                placement_cluster_epoch: ClusterEpoch::new(14).unwrap(),
+                ec_k: 4,
+                ec_m: 2,
+            },
+        ])
+        .unwrap();
 
     // Read back
     let segments = store
@@ -6315,54 +6229,6 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
     );
 }
 
-#[test]
-fn malformed_segment_okh_returns_db_error() {
-    let (_dir, store) = make_pg_store();
-
-    // Insert a segment with wrong-length okh directly via SQL
-    let conn = store.connection();
-    conn.execute(
-        "INSERT INTO object_segments \
-         (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, \
-          segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
-         VALUES ('bucket', 'k', 0, 0, 100, 99, X'AABB', 1, 0, 1, 4, 2)",
-        [],
-    )
-    .unwrap();
-
-    let err = store
-        .get_object_segments(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
-        .unwrap_err();
-    assert!(
-        matches!(err, crate::error::MetadataError::Db { .. }),
-        "expected Db error for malformed okh, got: {err:?}"
-    );
-}
-
-#[test]
-fn malformed_multipart_segment_okh_returns_db_error() {
-    let (_dir, store) = make_pg_store();
-
-    // Insert a multipart part segment with wrong-length okh directly via SQL
-    let conn = store.connection();
-    conn.execute(
-        "INSERT INTO multipart_part_segments \
-         (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, \
-          segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
-         VALUES ('bucket', 'k', ?1, 0, 1, 0, 100, 99, X'AABB', 1, 0, 1, 4, 2)",
-        [multipart_upload_id("mpu-bad").into_string()],
-    )
-    .unwrap();
-
-    let err = store
-        .get_all_multipart_part_segments_for_upload(&multipart_upload_id("mpu-bad"))
-        .unwrap_err();
-    assert!(
-        matches!(err, crate::error::MetadataError::Db { .. }),
-        "expected Db error for malformed multipart segment okh, got: {err:?}"
-    );
-}
-
 // ── get_object_version / delete_object_version ─────────────────────────
 
 #[test]
@@ -6822,11 +6688,7 @@ fn suspended_null_live_version_stays_current_when_last_modified_ties() {
         }))
         .unwrap();
     store
-        .connection()
-        .execute(
-            "UPDATE objects SET last_modified = ?1 WHERE bucket = ?2 AND key = ?3",
-            rusqlite::params![1_i64, "bucket", "k"],
-        )
+        .test_force_object_last_modified(&bucket_name("bucket"), &object_key("k"), 1)
         .unwrap();
 
     let current = store
@@ -6911,11 +6773,7 @@ fn suspended_null_delete_marker_stays_current_when_last_modified_ties() {
         }))
         .unwrap();
     store
-        .connection()
-        .execute(
-            "UPDATE objects SET last_modified = ?1 WHERE bucket = ?2 AND key = ?3",
-            rusqlite::params![1_i64, "bucket", "k"],
-        )
+        .test_force_object_last_modified(&bucket_name("bucket"), &object_key("k"), 1)
         .unwrap();
 
     let current = store
@@ -7263,15 +7121,10 @@ fn next_version_id_does_not_mutate_counter() {
         store.next_version_id(&bucket, &key).unwrap(),
         VersionId::from_u64(1)
     );
-    let counter_rows: i64 = store
-        .connection()
-        .query_row(
-            "SELECT COUNT(*) FROM object_version_counters WHERE bucket = ?1 AND key = ?2",
-            [bucket.as_str(), key.as_str()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(counter_rows, 0);
+    assert_eq!(
+        store.test_object_version_counter(&bucket, &key).unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -7577,17 +7430,27 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
         })
         .unwrap();
 
-    // Insert segments via SQL since upsert_multipart_part_segments may have
-    // requirements we can work around here.
-    let conn = store.connection();
-    conn.execute(
-        "INSERT INTO multipart_part_segments \
-         (bucket, key, upload_id, version_id, part_number, segment_index, size, \
-          segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
-         VALUES ('bucket', 'k', ?1, 0, 1, 0, 100, 99, X'00112233445566778899AABBCCDDEEFF', 1, 0, 1, 4, 2)",
-        [multipart_upload_id("mpu-seg").into_string()],
-    )
-    .unwrap();
+    store
+        .test_insert_multipart_part_segments(&[MultipartPartSegmentRecord {
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
+            upload_id: multipart_upload_id("mpu-seg"),
+            version_id: VersionId::Null.to_u64(),
+            part_number: 1,
+            segment_index: 0,
+            size: 100,
+            segment_crc64: 99,
+            segment_okh: [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+                0xEE, 0xFF,
+            ],
+            segment_vid: GenerationId::MIN,
+            data_pg_id: 0,
+            placement_cluster_epoch: ClusterEpoch::INITIAL,
+            ec_k: 4,
+            ec_m: 2,
+        }])
+        .unwrap();
 
     // Verify segments exist
     let segs = store
@@ -8159,7 +8022,13 @@ fn bucket_object_lock_requires_enabled_versioning() {
     let err = store
         .put_bucket_object_lock(&bucket_name("mybucket"), config)
         .unwrap_err();
-    assert!(matches!(err, crate::error::MetadataError::Db { .. }));
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::InvariantViolation {
+            context: "put bucket object lock",
+            ref reason,
+        } if reason == "bucket object lock requires enabled versioning"
+    ));
 
     store
         .put_bucket_versioning(&bucket_name("mybucket"), BucketVersioningState::Suspended)
@@ -8167,7 +8036,13 @@ fn bucket_object_lock_requires_enabled_versioning() {
     let err = store
         .put_bucket_object_lock(&bucket_name("mybucket"), config)
         .unwrap_err();
-    assert!(matches!(err, crate::error::MetadataError::Db { .. }));
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::InvariantViolation {
+            context: "put bucket object lock",
+            ref reason,
+        } if reason == "bucket object lock requires enabled versioning"
+    ));
 }
 
 #[test]
@@ -8193,7 +8068,13 @@ fn bucket_object_lock_rejects_default_retention_without_enablement() {
             },
         )
         .unwrap_err();
-    assert!(matches!(err, crate::error::MetadataError::Db { .. }));
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::InvariantViolation {
+            context: "put bucket object lock",
+            ref reason,
+        } if reason == "bucket object lock defaults require object lock enabled"
+    ));
 }
 
 #[test]
@@ -8219,12 +8100,24 @@ fn bucket_object_lock_cannot_be_disabled_or_suspended() {
     let err = store
         .put_bucket_versioning(&bucket_name("mybucket"), BucketVersioningState::Suspended)
         .unwrap_err();
-    assert!(matches!(err, crate::error::MetadataError::Db { .. }));
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::InvariantViolation {
+            context: "put bucket versioning",
+            ref reason,
+        } if reason == "bucket object lock requires enabled versioning"
+    ));
 
     let err = store
         .put_bucket_object_lock(&bucket_name("mybucket"), BucketObjectLockConfig::default())
         .unwrap_err();
-    assert!(matches!(err, crate::error::MetadataError::Db { .. }));
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::InvariantViolation {
+            context: "put bucket object lock",
+            ref reason,
+        } if reason == "bucket object lock cannot be disabled once enabled"
+    ));
 }
 
 #[test]
@@ -8439,35 +8332,4 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
         .get_object_version(&bucket_name("bucket"), &object_key("key"), obj.version_id)
         .unwrap();
     assert_eq!(committed.as_live().unwrap().object_lock, object_lock);
-}
-
-#[test]
-fn schema_rejects_delete_marker_with_object_lock_state() {
-    let (_dir, store) = make_pg_store();
-    let err = store
-        .connection()
-        .execute(
-            "INSERT INTO objects \
-             (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-             VALUES (?1, ?2, ?3, NULL, 0, zeroblob(0), 0, ?4, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL, ?5, ?6, '', 0, 0, 1900000000, 2)",
-            rusqlite::params![
-                "bucket",
-                "key",
-                1i64,
-                0i64,
-                "owner",
-                CanonicalUserId::from_principal("owner").as_str(),
-            ],
-        )
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ffi::ErrorCode::ConstraintViolation,
-                ..
-            },
-            _
-        )
-    ));
 }

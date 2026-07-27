@@ -25940,14 +25940,7 @@ mod tests {
             )
             .unwrap();
             pg.refresh_metadata_command_state_digest().unwrap();
-            pg.connection()
-                .execute(
-                    "UPDATE metadata_table_digests \
-                     SET table_digest = table_digest + 1 \
-                     WHERE table_name = ?1",
-                    rusqlite::params!["buckets"],
-                )
-                .unwrap();
+            pg.test_increment_metadata_table_digest("buckets").unwrap();
             assert!(
                 !pg.test_metadata_digest_table_mismatches()
                     .unwrap()
@@ -25980,13 +25973,7 @@ mod tests {
             )
             .unwrap();
             let pg = node.get_pg(0).unwrap();
-            pg.connection()
-                .execute(
-                    "UPDATE metadata_command_replica_state \
-                     SET state_digest = state_digest + 1 \
-                     WHERE singleton = 0",
-                    [],
-                )
+            pg.test_increment_metadata_command_replica_state_digest()
                 .unwrap();
         }
 

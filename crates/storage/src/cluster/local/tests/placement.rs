@@ -2639,21 +2639,21 @@ fn local_cluster_map_history_reference_summary_merges_node_pg_references() {
             .storage_node()
             .get_pg(0)
             .unwrap();
-        pg.connection()
-            .execute(
-                "INSERT INTO object_segments \
-                 (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, \
-                  segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
-                 VALUES (?1, ?2, 1, 0, 1024, ?3, ?4, 10, 0, ?5, 1, 1)",
-                rusqlite::params![
-                    "history-floor-bucket",
-                    "node-zero-object",
-                    0x1234_i64,
-                    [0x11_u8; 16].as_slice(),
-                    6_i64,
-                ],
-            )
-            .unwrap();
+        pg.test_insert_object_segment(&crate::ObjectSegmentRecord {
+            bucket: crate::BucketName::try_from("history-floor-bucket").unwrap(),
+            key: crate::ObjectKey::try_from("node-zero-object").unwrap(),
+            version_id: crate::VersionId::from_u64(1),
+            segment_index: 0,
+            size: 1024,
+            segment_crc64: 0x1234,
+            segment_okh: [0x11; 16],
+            segment_vid: crate::GenerationId::new(10).unwrap(),
+            data_pg_id: 0,
+            placement_cluster_epoch: ClusterEpoch::new(6).unwrap(),
+            ec_k: 1,
+            ec_m: 1,
+        })
+        .unwrap();
     }
 
     {

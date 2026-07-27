@@ -2170,17 +2170,14 @@ impl StorageNodeClient for LocalStorageNodeClient {
         let barrier_sequence =
             current_sequence
                 .checked_add(1)
-                .ok_or_else(|| MetadataError::Db {
+                .ok_or_else(|| MetadataError::InvariantViolation {
                     context: "reserve multipart completion barrier overflow",
-                    source: rusqlite::Error::ToSqlConversionFailure(Box::from(
-                        "multipart completion barrier sequence overflow",
-                    )),
+                    reason: "multipart completion barrier sequence overflow".into(),
                 })?;
-        i64::try_from(barrier_sequence).map_err(|_| MetadataError::Db {
+        i64::try_from(barrier_sequence).map_err(|_| MetadataError::InvariantViolation {
             context: "reserve multipart completion barrier overflow",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::from(
-                "multipart completion barrier sequence exceeds SQLite integer range",
-            )),
+            reason: "multipart completion barrier sequence exceeds the durable integer range"
+                .into(),
         })?;
         Ok((
             barrier_sequence,
@@ -2975,9 +2972,9 @@ impl StorageNodeClient for LocalStorageNodeClient {
             {
                 Ok(true)
             }
-            Ok(_) => Err(MetadataError::Db {
+            Ok(_) => Err(MetadataError::InvariantViolation {
                 context: "create stream upload existing session mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "existing stream session does not match the command".into(),
             }
             .into()),
             Err(MetadataError::StreamSessionNotFound { .. }) => Ok(false),
@@ -3002,9 +2999,9 @@ impl StorageNodeClient for LocalStorageNodeClient {
             {
                 Ok(Some(existing.initiated_at))
             }
-            Ok(_) => Err(MetadataError::Db {
+            Ok(_) => Err(MetadataError::InvariantViolation {
                 context: "create multipart upload existing upload mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "existing multipart upload does not match the command".into(),
             }
             .into()),
             Err(MetadataError::NoSuchUpload { .. }) => Ok(None),
@@ -3082,9 +3079,9 @@ impl StorageNodeClient for LocalStorageNodeClient {
         }
         match pg.get_stream_upload(&request.request.session_id) {
             Ok(_) => {
-                return Err(MetadataError::Db {
+                return Err(MetadataError::InvariantViolation {
                     context: "create stream upload existing session mismatch",
-                    source: rusqlite::Error::InvalidQuery,
+                    reason: "stream session already exists".into(),
                 }
                 .into());
             }
@@ -3124,9 +3121,9 @@ impl StorageNodeClient for LocalStorageNodeClient {
         }
         match pg.get_multipart_upload(&request.request.upload_id) {
             Ok(_) => {
-                return Err(MetadataError::Db {
+                return Err(MetadataError::InvariantViolation {
                     context: "create multipart upload existing upload mismatch",
-                    source: rusqlite::Error::InvalidQuery,
+                    reason: "multipart upload already exists".into(),
                 }
                 .into());
             }
@@ -3670,16 +3667,16 @@ impl StorageNodeClient for LocalStorageNodeClient {
             .into());
         }
         if upload.object_generation_id != complete.generation_id {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "complete multipart command generation mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "multipart upload generation does not match the command".into(),
             }
             .into());
         }
         if complete.part_records.is_empty() {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "complete multipart command empty parts",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "multipart completion requires at least one part".into(),
             }
             .into());
         }
@@ -3716,15 +3713,17 @@ impl StorageNodeClient for LocalStorageNodeClient {
             }
         }
 
-        let parts_len =
-            u32::try_from(complete.part_records.len()).map_err(|_| MetadataError::Db {
+        let parts_len = u32::try_from(complete.part_records.len()).map_err(|_| {
+            MetadataError::InvariantViolation {
                 context: "complete multipart command too many parts",
-                source: rusqlite::Error::InvalidQuery,
-            })?;
-        let parts_count = std::num::NonZeroU32::new(parts_len).ok_or(MetadataError::Db {
-            context: "complete multipart command empty parts",
-            source: rusqlite::Error::InvalidQuery,
+                reason: "multipart part count exceeds the durable range".into(),
+            }
         })?;
+        let parts_count =
+            std::num::NonZeroU32::new(parts_len).ok_or(MetadataError::InvariantViolation {
+                context: "complete multipart command empty parts",
+                reason: "multipart completion requires at least one part".into(),
+            })?;
         let selected_part_numbers: std::collections::BTreeSet<u32> = complete
             .part_records
             .iter()

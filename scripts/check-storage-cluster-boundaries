@@ -12,7 +12,7 @@ if ! command -v rg >/dev/null 2>&1; then
     exit 1
 fi
 
-repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
 failed=0
@@ -2532,6 +2532,19 @@ unbudgeted_request_work_helpers=$(
 fail_with_matches \
     "Production request paths must use request-work-budget variants for bucket metadata drain/retry helpers" \
     "$unbudgeted_request_work_helpers"
+
+database_implementation_leaks=$(
+    rg -n --color=never \
+        'rusqlite::|use[[:space:]]+rusqlite|\.connection\(\)' \
+        crates/storage/src \
+        -g '*.rs' \
+        -g '!crates/storage/src/pg_store.rs' \
+        -g '!crates/storage/src/pg_store/**' \
+        || true
+)
+fail_with_matches \
+    "SQLite and raw PgStore connections are private to the pg_store module" \
+    "$database_implementation_leaks"
 
 if [[ "$failed" -ne 0 ]]; then
     echo

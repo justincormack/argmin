@@ -782,22 +782,6 @@ macro_rules! validated_string_newtype {
             }
         }
 
-        impl rusqlite::types::ToSql for $name {
-            fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-                self.0.to_sql()
-            }
-        }
-
-        impl rusqlite::types::FromSql for $name {
-            fn column_result(
-                value: rusqlite::types::ValueRef<'_>,
-            ) -> rusqlite::types::FromSqlResult<Self> {
-                let value = String::column_result(value)?;
-                Self::try_from(value).map_err(|error| {
-                    rusqlite::types::FromSqlError::Other(Box::new(error))
-                })
-            }
-        }
     };
 }
 
@@ -964,19 +948,6 @@ impl PartialEq<String> for SessionId {
 impl PartialEq<SessionId> for String {
     fn eq(&self, other: &SessionId) -> bool {
         *self == other.0
-    }
-}
-
-impl rusqlite::types::ToSql for SessionId {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        self.0.to_sql()
-    }
-}
-
-impl rusqlite::types::FromSql for SessionId {
-    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        let value = String::column_result(value)?;
-        Self::try_from(value).map_err(|error| rusqlite::types::FromSqlError::Other(Box::new(error)))
     }
 }
 
@@ -5040,59 +5011,6 @@ mod tests {
     fn object_key_common_prefix_returns_none_for_empty_delimiter() {
         let key = ObjectKey::try_from("photos/2025/image.jpg").unwrap();
         assert_eq!(object_key_common_prefix(&key, "", ""), None);
-    }
-
-    #[test]
-    fn bucket_name_from_sql_rejects_invalid_rows() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE t (name TEXT NOT NULL)", [])
-            .unwrap();
-        conn.execute("INSERT INTO t (name) VALUES (?1)", ["BadBucket"])
-            .unwrap();
-
-        let err = conn
-            .query_row("SELECT name FROM t", [], |row| row.get::<_, BucketName>(0))
-            .unwrap_err();
-        match err {
-            rusqlite::Error::FromSqlConversionFailure(_, rusqlite::types::Type::Text, _) => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn object_key_from_sql_rejects_invalid_rows() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE t (key TEXT NOT NULL)", [])
-            .unwrap();
-        conn.execute("INSERT INTO t (key) VALUES (?1)", [String::new()])
-            .unwrap();
-
-        let err = conn
-            .query_row("SELECT key FROM t", [], |row| row.get::<_, ObjectKey>(0))
-            .unwrap_err();
-        match err {
-            rusqlite::Error::FromSqlConversionFailure(_, rusqlite::types::Type::Text, _) => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn upload_id_from_sql_rejects_invalid_rows() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE t (upload_id TEXT NOT NULL)", [])
-            .unwrap();
-        conn.execute("INSERT INTO t (upload_id) VALUES (?1)", ["short"])
-            .unwrap();
-
-        let err = conn
-            .query_row("SELECT upload_id FROM t", [], |row| {
-                row.get::<_, UploadId>(0)
-            })
-            .unwrap_err();
-        match err {
-            rusqlite::Error::FromSqlConversionFailure(_, rusqlite::types::Type::Text, _) => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
     }
 
     // ── Property-based tests ────────────────────────────────────────

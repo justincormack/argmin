@@ -29,11 +29,7 @@ fn metadata_command_log_checksum_mismatch_prevents_ack() {
             .get_pg(1)
             .unwrap();
         node_zero_pg
-            .connection()
-            .execute(
-                "UPDATE metadata_command_log SET command_checksum = ?1 WHERE log_index = 1",
-                rusqlite::params![command.checksum_crc64().wrapping_add(1) as i64],
-            )
+            .test_set_metadata_command_log_checksum(1, command.checksum_crc64().wrapping_add(1))
             .unwrap();
     }
 
@@ -81,11 +77,7 @@ fn metadata_command_log_bytes_mismatch_prevents_ack() {
             .get_pg(1)
             .unwrap();
         node_zero_pg
-            .connection()
-            .execute(
-                "UPDATE metadata_command_log SET command_bytes = ?1 WHERE log_index = 1",
-                rusqlite::params![b"corrupt-command-bytes".as_slice()],
-            )
+            .test_set_metadata_command_log_bytes(1, b"corrupt-command-bytes")
             .unwrap();
     }
 
@@ -138,11 +130,7 @@ fn metadata_state_digest_mismatch_prevents_ack() {
             .unwrap()
             .state_digest;
         node_zero_pg
-            .connection()
-            .execute(
-                "UPDATE buckets SET public_read = 1 WHERE name = ?1",
-                rusqlite::params![&first_bucket],
-            )
+            .test_set_bucket_public_read(&first_bucket, true)
             .unwrap();
         expected_digest
     };
@@ -465,13 +453,9 @@ fn partially_applied_stream_create_converges_after_bucket_reservation_expires() 
         crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket).unwrap();
     assert_eq!(reservations.len(), 1);
     primary_pg
-        .connection()
-        .execute(
-            "UPDATE bucket_write_reservations SET lease_deadline = ?1 WHERE reservation_id = ?2",
-            rusqlite::params![
-                crate::clock::current_time_millis().saturating_sub(1),
-                &reservations[0].reservation_id,
-            ],
+        .test_set_bucket_write_reservation_lease_deadline(
+            &reservations[0].reservation_id,
+            crate::clock::current_time_millis().saturating_sub(1),
         )
         .unwrap();
     let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
@@ -576,13 +560,9 @@ fn unapplied_object_command_is_abandoned_after_bucket_reservation_expires() {
         .get_pg(1)
         .unwrap();
     primary_pg
-        .connection()
-        .execute(
-            "UPDATE bucket_write_reservations SET lease_deadline = ?1 WHERE reservation_id = ?2",
-            rusqlite::params![
-                crate::clock::current_time_millis().saturating_sub(1),
-                &proof.reservation_id,
-            ],
+        .test_set_bucket_write_reservation_lease_deadline(
+            &proof.reservation_id,
+            crate::clock::current_time_millis().saturating_sub(1),
         )
         .unwrap();
     drop(primary_pg);
@@ -768,11 +748,7 @@ fn stream_put_create_preserves_reservation_when_pending_owner_check_fails() {
                 .get_pg(1)
                 .unwrap();
             primary_pg
-                .connection()
-                .execute(
-                    "UPDATE metadata_command_pending_slot SET command_bytes = ?1",
-                    rusqlite::params![vec![0_u8]],
-                )
+                .test_set_pending_metadata_command_bytes(&[0])
                 .unwrap();
             Err(StoreError::Io {
                 context: "injected request stream-create apply failure after corrupt pending",
@@ -1135,15 +1111,9 @@ fn stream_create_command_rejects_stale_bucket_incarnation_proof() {
             .get_pg(1)
             .unwrap();
         bucket_pg
-            .connection()
-            .execute(
-                "UPDATE buckets \
-                     SET bucket_incarnation_generation = ?1 \
-                     WHERE name = ?2",
-                rusqlite::params![
-                    (proof.bucket_incarnation_generation + 1) as i64,
-                    bucket.as_str(),
-                ],
+            .test_set_bucket_incarnation_generation(
+                &bucket,
+                proof.bucket_incarnation_generation + 1,
             )
             .unwrap();
     }
@@ -1481,11 +1451,7 @@ fn local_cluster_reopen_rejects_large_command_stream_materialized_tamper() {
     assert_eq!(state.applied_log_index, 129);
     assert_ne!(state.state_digest, 0);
     node_zero_pg
-        .connection()
-        .execute(
-            "UPDATE buckets SET public_read = 1 WHERE name = ?1",
-            rusqlite::params![first_bucket.unwrap().as_str()],
-        )
+        .test_set_bucket_public_read(&first_bucket.unwrap(), true)
         .unwrap();
 
     drop(node_zero_pg);

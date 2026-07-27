@@ -322,7 +322,7 @@ impl MetadataCommandCheckpoint {
 fn decode_nonnegative_u64(context: &'static str, raw: i64) -> Result<u64, StoreError> {
     raw.try_into().map_err(|_| StoreError::Db {
         context,
-        source: rusqlite::Error::FromSqlConversionFailure(
+        source: crate::error::DatabaseError::from_sql_conversion_failure(
             0,
             rusqlite::types::Type::Integer,
             Box::from("negative integer where non-negative value was expected"),
@@ -853,6 +853,317 @@ struct MetadataTableDigestStats {
 }
 
 impl PgStore {
+    #[cfg(test)]
+    fn test_require_one_changed(changed: usize) -> Result<(), StoreError> {
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::IntegrityError {
+                expected: 1,
+                actual: changed as u64,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_delete_metadata_command_log_entry(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "DELETE FROM metadata_command_log WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+            params![cluster_epoch.get() as i64, self.pg_id as i64, log_index as i64],
+            "delete metadata command log entry for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_metadata_command_log_checksum(
+        &self,
+        log_index: u64,
+        checksum: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE metadata_command_log SET command_checksum = ?1 WHERE log_index = ?2",
+            params![checksum as i64, log_index as i64],
+            "replace metadata command checksum for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_metadata_command_log_bytes(
+        &self,
+        log_index: u64,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE metadata_command_log SET command_bytes = ?1 WHERE log_index = ?2",
+            params![bytes, log_index as i64],
+            "replace metadata command bytes for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_replace_metadata_command_log_command(
+        &self,
+        log_index: u64,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE metadata_command_log SET command_checksum = ?1, command_bytes = ?2 WHERE log_index = ?3",
+            params![
+                command.checksum_crc64() as i64,
+                command.command_bytes(),
+                log_index as i64
+            ],
+            "replace metadata command for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_replace_metadata_command_log_command_and_hashes(
+        &self,
+        log_index: u64,
+        command: &MetadataCommandEnvelope,
+        previous_log_hash: u64,
+        log_hash: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE metadata_command_log SET command_checksum = ?1, command_bytes = ?2, previous_log_hash = ?3, log_hash = ?4 WHERE log_index = ?5",
+            params![
+                command.checksum_crc64() as i64,
+                command.command_bytes(),
+                previous_log_hash as i64,
+                log_hash as i64,
+                log_index as i64
+            ],
+            "replace metadata command and hashes for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_metadata_command_log_previous_hash(
+        &self,
+        log_index: u64,
+        previous_log_hash: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE metadata_command_log SET previous_log_hash = ?1 WHERE log_index = ?2",
+            params![previous_log_hash as i64, log_index as i64],
+            "replace metadata command previous hash for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_increment_metadata_command_log_pre_state_digest(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE metadata_command_log SET pre_state_digest = pre_state_digest + 1 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+            params![cluster_epoch.get() as i64, self.pg_id as i64, log_index as i64],
+            "increment metadata command pre-state digest for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_clear_metadata_command_log_post_state_digest(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE metadata_command_log SET post_state_digest = NULL WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+            params![cluster_epoch.get() as i64, self.pg_id as i64, log_index as i64],
+            "clear metadata command post-state digest for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_insert_abandoned_metadata_command_log_entry(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "INSERT INTO metadata_command_log (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL)",
+            params![
+                command.id().cluster_epoch().get() as i64,
+                self.pg_id as i64,
+                command.id().log_index().get() as i64,
+                command.abandoned_log_checksum_crc64() as i64,
+                command.abandoned_log_bytes(),
+            ],
+            "insert abandoned metadata command log entry for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_increment_metadata_command_replica_state_digest(
+        &self,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE metadata_command_replica_state SET state_digest = state_digest + 1 WHERE singleton = 0",
+            [],
+            "increment metadata command replica state digest for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_increment_metadata_table_digest(
+        &self,
+        table_name: &str,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE metadata_table_digests SET table_digest = table_digest + 1 WHERE table_name = ?1",
+            params![table_name],
+            "increment cached metadata table digest for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_increment_metadata_command_replica_applied_log_hash(
+        &self,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE metadata_command_replica_state SET applied_log_hash = applied_log_hash + 1 WHERE singleton = 0",
+            [],
+            "increment metadata command replica applied log hash for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_metadata_command_replica_applied_log_hash(
+        &self,
+        applied_log_hash: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE metadata_command_replica_state SET applied_log_hash = ?1 WHERE singleton = 0",
+            params![applied_log_hash as i64],
+            "replace metadata command replica applied log hash for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_replace_metadata_command_replica_state(
+        &self,
+        state: MetadataCommandReplicaState,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE metadata_command_replica_state SET cluster_epoch = ?1, applied_log_index = ?2, applied_log_hash = ?3, state_digest = ?4 WHERE singleton = 0",
+            params![
+                state.cluster_epoch.get() as i64,
+                state.applied_log_index as i64,
+                state.applied_log_hash as i64,
+                state.state_digest as i64,
+            ],
+            "replace metadata command replica state for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_delete_metadata_command_replica_state(&self) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "DELETE FROM metadata_command_replica_state WHERE singleton = 0",
+            [],
+            "delete metadata command replica state for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_replace_pending_metadata_command_slot(
+        &self,
+        command: &MetadataCommandEnvelope,
+        scope_bucket: Option<&BucketName>,
+    ) -> Result<(), StoreError> {
+        self.execute_cached(
+            "INSERT INTO metadata_command_pending_slot (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(singleton) DO UPDATE SET cluster_epoch = excluded.cluster_epoch, pg_id = excluded.pg_id, log_index = excluded.log_index, command_checksum = excluded.command_checksum, command_bytes = excluded.command_bytes, scope_bucket = excluded.scope_bucket",
+            params![
+                command.id().cluster_epoch().get() as i64,
+                command.id().pg_id().get() as i64,
+                command.id().log_index().get() as i64,
+                command.checksum_crc64() as i64,
+                command.command_bytes(),
+                scope_bucket,
+            ],
+            "replace pending metadata command slot for test",
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_insert_raw_pending_metadata_command_slot(
+        &self,
+        id: MetadataCommandId,
+        checksum: u64,
+        bytes: &[u8],
+        scope_bucket: Option<&BucketName>,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "INSERT INTO metadata_command_pending_slot (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id.cluster_epoch().get() as i64,
+                id.pg_id().get() as i64,
+                id.log_index().get() as i64,
+                checksum as i64,
+                bytes,
+                scope_bucket,
+            ],
+            "insert raw pending metadata command slot for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_clear_pending_metadata_command_slot(&self) -> Result<bool, StoreError> {
+        self.execute_cached(
+            "DELETE FROM metadata_command_pending_slot WHERE singleton = 0",
+            [],
+            "clear pending metadata command slot for test",
+        )
+        .map(|changed| changed == 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_pending_metadata_command_bytes(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE metadata_command_pending_slot SET command_bytes = ?1 WHERE singleton = 0",
+            params![bytes],
+            "replace pending metadata command bytes for test",
+        )?;
+        Self::test_require_one_changed(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_metadata_command_log_row_count(&self) -> Result<u64, StoreError> {
+        let count = self.query_row_cached(
+            "SELECT count(*) FROM metadata_command_log",
+            [],
+            "inspect metadata command log row count for test",
+            |row| row.get::<_, i64>(0),
+        )?;
+        decode_nonnegative_u64("decode metadata command log row count for test", count)
+    }
+
     pub(super) fn ensure_metadata_digest_bootstrap(&self) -> Result<(), StoreError> {
         if self.metadata_digest_bootstrap_complete()? {
             self.validate_metadata_digest_bootstrap()?;
@@ -863,7 +1174,7 @@ impl PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| StoreError::Db {
                 context: "begin metadata digest bootstrap",
-                source: e,
+                source: e.into(),
             })?;
         let result = (|| {
             if self.metadata_digest_bootstrap_complete()? {
@@ -878,7 +1189,7 @@ impl PgStore {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 StoreError::Db {
                     context: "commit metadata digest bootstrap",
-                    source: e,
+                    source: e.into(),
                 }
             }),
             Err(err) => {
@@ -961,7 +1272,7 @@ impl PgStore {
                 .execute_batch(&self.metadata_digest_trigger_sql(table))
                 .map_err(|e| StoreError::Db {
                     context: "install metadata digest triggers",
-                    source: e,
+                    source: e.into(),
                 })?;
         }
         Ok(())
@@ -1151,7 +1462,7 @@ impl PgStore {
                 .optional()
                 .map_err(|e| StoreError::Db {
                     context: "check canonical metadata state emptiness",
-                    source: e,
+                    source: e.into(),
                 })?
                 .is_some()
             {
@@ -1171,7 +1482,7 @@ impl PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| StoreError::Db {
                 context: "begin metadata transfer empty state initialization",
-                source: e,
+                source: e.into(),
             })?;
 
         let result = (|| {
@@ -1219,7 +1530,7 @@ impl PgStore {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     StoreError::Db {
                         context: "commit metadata transfer empty state initialization",
-                        source: e,
+                        source: e.into(),
                     }
                 })?;
                 self.mark_metadata_state_digest_clean()?;
@@ -1254,7 +1565,7 @@ impl PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| StoreError::Db {
                 context: "begin metadata transfer matching state initialization",
-                source: e,
+                source: e.into(),
             })?;
 
         let result = (|| {
@@ -1298,7 +1609,7 @@ impl PgStore {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     StoreError::Db {
                         context: "commit metadata transfer matching state initialization",
-                        source: e,
+                        source: e.into(),
                     }
                 })?;
                 self.mark_metadata_state_digest_clean()?;
@@ -1343,7 +1654,7 @@ impl PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| StoreError::Db {
                 context: "begin metadata transfer checkpoint install",
-                source: e,
+                source: e.into(),
             })?;
         self.conn
             .execute_batch("PRAGMA defer_foreign_keys = ON")
@@ -1351,7 +1662,7 @@ impl PgStore {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 StoreError::Db {
                     context: "defer metadata transfer checkpoint foreign keys",
-                    source: e,
+                    source: e.into(),
                 }
             })?;
 
@@ -1409,7 +1720,7 @@ impl PgStore {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     StoreError::Db {
                         context: "commit metadata transfer checkpoint install",
-                        source: e,
+                        source: e.into(),
                     }
                 })?;
                 self.mark_metadata_state_digest_clean()?;
@@ -1440,7 +1751,7 @@ impl PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| StoreError::Db {
                 context: "begin metadata transfer state adoption",
-                source: e,
+                source: e.into(),
             })?;
 
         let result = (|| {
@@ -1557,7 +1868,7 @@ impl PgStore {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     StoreError::Db {
                         context: "commit metadata transfer state adoption",
-                        source: e,
+                        source: e.into(),
                     }
                 })?;
                 self.mark_metadata_state_digest_clean()?;
@@ -1647,7 +1958,7 @@ impl PgStore {
             .try_into()
             .map_err(|_| StoreError::Db {
                 context: "decode max metadata command log index",
-                source: rusqlite::Error::FromSqlConversionFailure(
+                source: crate::error::DatabaseError::from_sql_conversion_failure(
                     0,
                     rusqlite::types::Type::Integer,
                     Box::from("negative metadata command log index"),
@@ -1971,7 +2282,7 @@ impl PgStore {
         .expect("pending slot stores non-zero cluster epoch");
         let stored_pg_id: u32 = raw_pg_id.try_into().map_err(|_| StoreError::Db {
             context: "decode pending slot PG id",
-            source: rusqlite::Error::FromSqlConversionFailure(
+            source: crate::error::DatabaseError::from_sql_conversion_failure(
                 0,
                 rusqlite::types::Type::Integer,
                 Box::from("negative metadata command pending slot PG id"),
@@ -2024,7 +2335,7 @@ impl PgStore {
             .transpose()
             .map_err(|reason| StoreError::Db {
                 context: "decode pending slot scope bucket",
-                source: rusqlite::Error::FromSqlConversionFailure(
+                source: crate::error::DatabaseError::from_sql_conversion_failure(
                     5,
                     rusqlite::types::Type::Text,
                     Box::from(reason.to_string()),
@@ -2259,7 +2570,7 @@ impl PgStore {
                 .execute_batch("BEGIN IMMEDIATE")
                 .map_err(|source| StoreError::Db {
                     context: "remove pending metadata command slot (begin txn)",
-                    source,
+                    source: source.into(),
                 })?;
             let result = self.remove_pending_metadata_command_slot_inner(node_id, command);
             match result {
@@ -2268,7 +2579,7 @@ impl PgStore {
                         let _ = self.conn.execute_batch("ROLLBACK");
                         return Err(StoreError::Db {
                             context: "remove pending metadata command slot (commit txn)",
-                            source,
+                            source: source.into(),
                         });
                     }
                     Ok(removed)
@@ -2703,7 +3014,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "record metadata command checkpoint",
-                source,
+                source: source.into(),
             })?;
         self.prune_metadata_command_checkpoints(
             checkpoint.cluster_epoch,
@@ -2737,7 +3048,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "prune metadata command checkpoints",
-                source,
+                source: source.into(),
             })?;
         Ok(())
     }
@@ -2764,7 +3075,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "prune metadata command checkpoint epochs",
-                source,
+                source: source.into(),
             })?;
         Ok(())
     }
@@ -2790,7 +3101,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "prepare metadata command checkpoint candidate scan",
-                source,
+                source: source.into(),
             })?;
         let rows = stmt
             .query_map(
@@ -2811,7 +3122,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "scan metadata command checkpoint candidates",
-                source,
+                source: source.into(),
             })?;
         for row in rows {
             let (
@@ -2822,7 +3133,7 @@ impl PgStore {
                 checkpoint_bytes,
             ) = row.map_err(|source| StoreError::Db {
                 context: "decode metadata command checkpoint candidate row",
-                source,
+                source: source.into(),
             })?;
             let Ok(applied_log_index) = decode_nonnegative_u64(
                 "decode metadata command checkpoint candidate log index",
@@ -3715,7 +4026,7 @@ impl PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|source| StoreError::Db {
                 context: "record abandoned metadata command (begin txn)",
-                source,
+                source: source.into(),
             })?;
 
         let result = self.record_metadata_command_abandoned_inner(node_id, command);
@@ -3726,7 +4037,7 @@ impl PgStore {
                     self.invalidate_clean_metadata_digest_revision();
                     return Err(StoreError::Db {
                         context: "record abandoned metadata command (commit txn)",
-                        source,
+                        source: source.into(),
                     });
                 }
                 self.invalidate_clean_metadata_digest_revision();
@@ -4321,7 +4632,7 @@ impl PgStore {
                     .copied()
                     .ok_or_else(|| StoreError::Db {
                         context: "load initialized cached metadata table digest",
-                        source: rusqlite::Error::QueryReturnedNoRows,
+                        source: rusqlite::Error::QueryReturnedNoRows.into(),
                     })?;
             Self::digest_metadata_table_digest_entry(&mut hasher, table, table_digest);
         }
@@ -4340,7 +4651,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "prepare cached metadata table digests with revision",
-                source,
+                source: source.into(),
             })?;
         let rows = stmt
             .query_map([], |row| {
@@ -4352,7 +4663,7 @@ impl PgStore {
             })
             .map_err(|source| StoreError::Db {
                 context: "load cached metadata table digests with revision",
-                source,
+                source: source.into(),
             })?;
         let mut digests = HashMap::new();
         let mut revision = None;
@@ -4360,7 +4671,7 @@ impl PgStore {
             let (table_name, table_digest, raw_revision) =
                 row.map_err(|source| StoreError::Db {
                     context: "decode cached metadata table digest with revision",
-                    source,
+                    source: source.into(),
                 })?;
             digests.insert(table_name, table_digest as u64);
             revision = Some(decode_nonnegative_u64(
@@ -4370,7 +4681,7 @@ impl PgStore {
         }
         let revision = revision.ok_or_else(|| StoreError::Db {
             context: "load metadata digest revision with cached table digests",
-            source: rusqlite::Error::QueryReturnedNoRows,
+            source: rusqlite::Error::QueryReturnedNoRows.into(),
         })?;
         Ok((digests, revision))
     }
@@ -4506,7 +4817,7 @@ impl PgStore {
         let sql = format!("INSERT INTO {table_sql} ({columns}) VALUES ({placeholders})");
         let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| StoreError::Db {
             context: "prepare metadata checkpoint row insert",
-            source: e,
+            source: e.into(),
         })?;
         for row in &block.rows {
             let values = row
@@ -4517,7 +4828,7 @@ impl PgStore {
             stmt.execute(params_from_iter(values))
                 .map_err(|e| StoreError::Db {
                     context: "insert metadata checkpoint row",
-                    source: e,
+                    source: e.into(),
                 })?;
         }
         Ok(())
@@ -4535,7 +4846,7 @@ impl PgStore {
             MetadataCheckpointValue::Text(value) => {
                 let text = String::from_utf8(value.clone()).map_err(|error| StoreError::Db {
                     context: "encode metadata checkpoint text value",
-                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(error)),
+                    source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(error)),
                 })?;
                 rusqlite::types::Value::Text(text)
             }
@@ -4575,11 +4886,11 @@ impl PgStore {
             format!("SELECT {select_values} FROM {table_sql}{where_clause} ORDER BY {order_by}");
         let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| StoreError::Db {
             context: "prepare canonical metadata checkpoint table block scan",
-            source: e,
+            source: e.into(),
         })?;
         let mut rows = stmt.query([]).map_err(|e| StoreError::Db {
             context: "scan canonical metadata checkpoint table block rows",
-            source: e,
+            source: e.into(),
         })?;
         let mut checkpoint_rows = Vec::new();
         let mut stats = MetadataTableDigestStats {
@@ -4589,13 +4900,13 @@ impl PgStore {
         };
         while let Some(row) = rows.next().map_err(|e| StoreError::Db {
             context: "scan canonical metadata checkpoint table block row",
-            source: e,
+            source: e.into(),
         })? {
             let mut values = Vec::with_capacity(table.columns.len());
             for index in 0..table.columns.len() {
                 let value = row.get_ref(index).map_err(|e| StoreError::Db {
                     context: "read canonical metadata checkpoint row value",
-                    source: e,
+                    source: e.into(),
                 })?;
                 values.push(Self::metadata_checkpoint_value_from_sql(value));
             }
@@ -4770,11 +5081,11 @@ impl PgStore {
             format!("SELECT {select_values} FROM {table_sql}{where_clause} ORDER BY {order_by}");
         let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| StoreError::Db {
             context: "prepare canonical metadata table range scan",
-            source: e,
+            source: e.into(),
         })?;
         let mut rows = stmt.query([]).map_err(|e| StoreError::Db {
             context: "scan canonical metadata table range rows",
-            source: e,
+            source: e.into(),
         })?;
         let mut stats = MetadataTableDigestStats {
             row_count: 0,
@@ -4783,7 +5094,7 @@ impl PgStore {
         };
         while let Some(row) = rows.next().map_err(|e| StoreError::Db {
             context: "scan canonical metadata table range row",
-            source: e,
+            source: e.into(),
         })? {
             let mut hasher = checksum::crc64::Hasher::new();
             digest_u8(&mut hasher, 0x20);
@@ -4792,7 +5103,7 @@ impl PgStore {
             for index in 0..table.columns.len() {
                 let value = row.get_ref(index).map_err(|e| StoreError::Db {
                     context: "read canonical metadata table range value",
-                    source: e,
+                    source: e.into(),
                 })?;
                 Self::digest_canonical_sql_value(&mut hasher, value);
             }
@@ -4877,24 +5188,24 @@ impl PgStore {
             .prepare_cached("SELECT table_name, table_digest FROM metadata_table_digests")
             .map_err(|e| StoreError::Db {
                 context: "prepare cached metadata table digests",
-                source: e,
+                source: e.into(),
             })?;
         let mut rows = stmt.query([]).map_err(|e| StoreError::Db {
             context: "load cached metadata table digests",
-            source: e,
+            source: e.into(),
         })?;
         let mut digests = HashMap::with_capacity(METADATA_DIGEST_TABLES.len());
         while let Some(row) = rows.next().map_err(|e| StoreError::Db {
             context: "load cached metadata table digest row",
-            source: e,
+            source: e.into(),
         })? {
             let table_name = row.get::<_, String>(0).map_err(|e| StoreError::Db {
                 context: "decode cached metadata table digest name",
-                source: e,
+                source: e.into(),
             })?;
             let table_digest = row.get::<_, i64>(1).map_err(|e| StoreError::Db {
                 context: "decode cached metadata table digest",
-                source: e,
+                source: e.into(),
             })? as u64;
             digests.insert(table_name, table_digest);
         }
@@ -4920,7 +5231,7 @@ impl PgStore {
                     .copied()
                     .ok_or_else(|| StoreError::Db {
                         context: "load initialized cached metadata table digest",
-                        source: rusqlite::Error::QueryReturnedNoRows,
+                        source: rusqlite::Error::QueryReturnedNoRows.into(),
                     })?;
             Self::digest_metadata_table_digest_entry(&mut hasher, table, table_digest);
         }

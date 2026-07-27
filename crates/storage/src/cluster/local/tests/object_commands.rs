@@ -1856,7 +1856,7 @@ fn object_metadata_command_rejects_non_metadata_post_image_mismatch() {
     assert!(
         matches!(
             err,
-            crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::Db {
+            crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::InvariantViolation {
                 context: "put object metadata command preimage mismatch",
                 ..
             })

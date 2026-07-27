@@ -4,6 +4,40 @@ use std::path::PathBuf;
 use crate::storage_rpc::StorageRpcErrorCode;
 use crate::types::{ClusterEpoch, PgState};
 
+/// Opaque diagnostic for a failure inside the metadata database implementation.
+///
+/// The concrete database driver and its error types are private to `PgStore`.
+/// Callers may preserve and report this diagnostic, but cannot construct or
+/// classify it by backend-specific details.
+pub struct DatabaseError {
+    detail: Box<str>,
+}
+
+impl DatabaseError {
+    pub(crate) fn new(detail: impl Into<Box<str>>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Debug for DatabaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("DatabaseError")
+            .field(&self.detail)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for DatabaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for DatabaseError {}
+
 /// Shard-level storage errors.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -423,7 +457,7 @@ pub enum StoreError {
     Db {
         context: &'static str,
         #[source]
-        source: rusqlite::Error,
+        source: DatabaseError,
     },
 
     #[error("erasure coding error: {context}: {reason}")]
@@ -1023,11 +1057,17 @@ pub enum MetadataError {
     #[error("not implemented: {context}")]
     NotImplemented { context: &'static str },
 
+    #[error("metadata invariant violation during {context}: {reason}")]
+    InvariantViolation {
+        context: &'static str,
+        reason: String,
+    },
+
     #[error("database error: {context}: {source}")]
     Db {
         context: &'static str,
         #[source]
-        source: rusqlite::Error,
+        source: DatabaseError,
     },
 }
 

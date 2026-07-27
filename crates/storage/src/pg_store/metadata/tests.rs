@@ -1686,7 +1686,7 @@ fn bucket_delete_finalize_claim_clears_expired_non_deleting_different_bucket() {
         .unwrap()
         .expect("later bucket finalizer should be claimable");
     store
-        .connection()
+        .conn
         .execute(
             "UPDATE buckets SET state = ?1 WHERE name = ?2",
             params![BucketState::Active as u8, &bucket_b],
@@ -4234,7 +4234,7 @@ fn metadata_command_checkpoint_catalogue_persists_and_lists_newest_valid_candida
     assert_eq!(bounded_candidates, vec![first_checkpoint.clone()]);
 
     store
-        .connection()
+        .conn
         .execute(
             "UPDATE metadata_command_checkpoints SET checkpoint_bytes = X'00' \
              WHERE cluster_epoch = ?1 AND pg_id = ?2 AND applied_log_index = ?3",
@@ -4299,7 +4299,7 @@ fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_co
     );
 
     store
-        .connection()
+        .conn
         .execute(
             "INSERT INTO object_segments \
              (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, \
@@ -4315,7 +4315,7 @@ fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_co
         )
         .unwrap();
     store
-        .connection()
+        .conn
         .execute(
             "INSERT INTO object_parts \
              (bucket, key, version_id, part_number, object_offset_start, size, payload_crc64, \
@@ -4331,7 +4331,7 @@ fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_co
         )
         .unwrap();
     store
-        .connection()
+        .conn
         .execute(
             "INSERT INTO multipart_part_segments \
              (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, \
@@ -6282,7 +6282,7 @@ fn abort_stream_upload_command_binds_stable_reservation_identity() {
     );
     assert!(matches!(
         store.apply_metadata_command(&substituted),
-        Err(MetadataError::Db {
+        Err(MetadataError::InvariantViolation {
             context: "abort stream upload command reservation mismatch",
             ..
         })
@@ -7025,7 +7025,7 @@ fn reserve_object_version_command_advances_counter_exactly() {
     assert!(
         matches!(
             err,
-            MetadataError::Db {
+            MetadataError::InvariantViolation {
                 context: "reserve object version command null version",
                 ..
             }
@@ -7640,7 +7640,7 @@ fn put_bucket_versioning_command_does_not_lower_execution_generation() {
     assert!(
         matches!(
             err,
-            MetadataError::Db {
+            MetadataError::InvariantViolation {
                 context: "apply conflicting bucket versioning command",
                 ..
             }
@@ -7748,7 +7748,7 @@ fn put_bucket_acl_command_does_not_lower_execution_generation() {
     assert!(
         matches!(
             err,
-            MetadataError::Db {
+            MetadataError::InvariantViolation {
                 context: "apply conflicting bucket acl command",
                 ..
             }
@@ -7864,7 +7864,7 @@ fn put_bucket_property_command_does_not_lower_execution_generation() {
     assert!(
         matches!(
             err,
-            MetadataError::Db {
+            MetadataError::InvariantViolation {
                 context: "apply conflicting bucket encryption command",
                 ..
             }
@@ -7968,7 +7968,7 @@ fn put_bucket_subresource_command_does_not_lower_execution_generation() {
     assert!(
         matches!(
             err,
-            MetadataError::Db {
+            MetadataError::InvariantViolation {
                 context: "apply conflicting put bucket subresource command",
                 ..
             }
@@ -8041,19 +8041,11 @@ fn list_objects_prefix_and_start_after() {
 // ── stat_shard on quarantined shard ───────────────────────────────
 
 #[test]
-fn connection_accessor() {
-    let tmp = test_util::tempdir();
-    let store = PgStore::open(tmp.path(), 0).unwrap();
-    // Just verify we can call it without panicking
-    let _conn = store.connection();
-}
-
-#[test]
 fn row_to_object_record_rejects_negative_parts_count() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 0).unwrap();
     let err = store
-        .connection()
+        .conn
         .query_row(
             "SELECT \
                 'bucket' AS bucket, \
@@ -8098,7 +8090,7 @@ fn row_to_object_record_rejects_pending_delete_status() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 0).unwrap();
     let err = store
-        .connection()
+        .conn
         .query_row(
             "SELECT \
                 'b' AS bucket, \
@@ -8239,4 +8231,132 @@ fn list_objects_start_at_is_inclusive() {
     assert_eq!(resp.objects.len(), 2);
     assert_eq!(resp.objects[0].key(), "beta");
     assert_eq!(resp.objects[1].key(), "gamma");
+}
+
+#[test]
+fn object_layout_schema_rejects_invalid_discriminant() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 100,
+            etag: ObjectEtag::SinglePart([1, 2, 3, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        }))
+        .unwrap();
+
+    let err = store
+        .conn
+        .execute(
+            "UPDATE objects SET data_layout = 99 WHERE bucket = ?1 AND key = ?2",
+            params![bucket, key],
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, rusqlite::Error::SqliteFailure(_, _)),
+        "expected SQLite constraint failure, got: {err:?}"
+    );
+
+    let object = store.get_object_meta(&bucket, &key).unwrap();
+    assert_eq!(object.as_live().unwrap().layout, ObjectLayout::Standard);
+}
+
+#[test]
+fn malformed_object_segment_okh_is_rejected_when_decoded() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO object_segments \
+             (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, \
+              segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+             VALUES ('bucket', 'key', 0, 0, 100, 99, X'AABB', 1, 0, 1, 4, 2)",
+            [],
+        )
+        .unwrap();
+
+    let err = store
+        .get_object_segments(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            VersionId::Null,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, MetadataError::Db { .. }),
+        "expected database error for malformed OKH, got: {err:?}"
+    );
+}
+
+#[test]
+fn malformed_multipart_segment_okh_is_rejected_when_decoded() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let upload_id = crate::tests::multipart_upload_id("mpu-bad");
+    store
+        .conn
+        .execute(
+            "INSERT INTO multipart_part_segments \
+             (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, \
+              segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+             VALUES ('bucket', 'key', ?1, 0, 1, 0, 100, 99, X'AABB', 1, 0, 1, 4, 2)",
+            params![upload_id],
+        )
+        .unwrap();
+
+    let err = store
+        .get_all_multipart_part_segments_for_upload(&upload_id)
+        .unwrap_err();
+    assert!(
+        matches!(err, MetadataError::Db { .. }),
+        "expected database error for malformed multipart segment OKH, got: {err:?}"
+    );
+}
+
+#[test]
+fn object_schema_rejects_delete_marker_with_object_lock_state() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let err = store
+        .conn
+        .execute(
+            "INSERT INTO objects \
+             (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+             VALUES (?1, ?2, ?3, NULL, 0, zeroblob(0), 0, ?4, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL, ?5, ?6, '', 0, 0, 1900000000, 2)",
+            params![
+                "bucket",
+                "key",
+                1_i64,
+                0_i64,
+                "owner",
+                CanonicalUserId::from_principal("owner").as_str(),
+            ],
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::ConstraintViolation,
+                ..
+            },
+            _
+        )
+    ));
 }

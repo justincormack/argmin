@@ -697,7 +697,10 @@ impl PgStore {
                 |_| Ok(()),
             )
             .optional()
-            .map_err(|source| MetadataError::Db { context, source })?
+            .map_err(|source| MetadataError::Db {
+                context,
+                source: source.into(),
+            })?
             .ok_or_else(|| bucket_not_found(name))
     }
 
@@ -705,11 +708,9 @@ impl PgStore {
         kind: BucketSubresourceKind,
         aux: BucketSubresourceAux,
     ) -> MetadataError {
-        MetadataError::Db {
+        MetadataError::InvariantViolation {
             context: "put bucket subresource",
-            source: rusqlite::Error::InvalidParameterName(format!(
-                "{kind:?} does not support aux {aux:?}"
-            )),
+            reason: format!("{kind:?} does not support aux {aux:?}"),
         }
     }
 
@@ -830,9 +831,9 @@ impl PgStore {
                     if self.bucket_subresource_matches(&info, mutation)? {
                         return Ok(());
                     }
-                    return Err(MetadataError::Db {
+                    return Err(MetadataError::InvariantViolation {
                         context: bucket_subresource_conflict_context(mutation),
-                        source: rusqlite::Error::InvalidQuery,
+                        reason: "metadata state does not satisfy the operation invariant".into(),
                     });
                 }
                 if info.bucket_execution_generation > explicit {
@@ -889,7 +890,7 @@ impl PgStore {
                                     |source| MetadataError::Db {
                                         context:
                                             "put bucket subresource command (parse generation)",
-                                        source,
+                                        source: source.into(),
                                     },
                                 )
                             })?;
@@ -920,7 +921,7 @@ impl PgStore {
                                     |source| MetadataError::Db {
                                         context:
                                             "put bucket subresource command (parse generation)",
-                                        source,
+                                        source: source.into(),
                                     },
                                 )
                             })?;
@@ -1057,7 +1058,7 @@ impl PgStore {
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "get bucket subresource",
-                source: e,
+                source: e.into(),
             })?
             .ok_or_else(|| bucket_not_found(name))
     }

@@ -93,7 +93,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "record placed segment shard repair",
-                source,
+                source: source.into(),
             })?;
         Ok(())
     }
@@ -113,7 +113,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "list placed segment shard repairs (prepare)",
-                source,
+                source: source.into(),
             })?;
         let rows = stmt
             .query_map(
@@ -130,7 +130,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "list placed segment shard repairs",
-                source,
+                source: source.into(),
             })?;
 
         let mut repairs = Vec::new();
@@ -138,7 +138,7 @@ impl PgStore {
             let (work_item, first_seen_at, last_seen_at, observation_count, last_error) = row
                 .map_err(|source| StoreError::Db {
                     context: "read placed segment shard repair",
-                    source,
+                    source: source.into(),
                 })?;
             repairs.push(PlacedSegmentShardRepairRecord {
                 work_item,
@@ -170,7 +170,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "resolve placed segment shard repair",
-                source,
+                source: source.into(),
             })?;
         Ok(updated > 0)
     }
@@ -218,7 +218,7 @@ impl PgStore {
                     .optional()
                     .map_err(|source| StoreError::Db {
                         context: "load existing placed segment shard backfill",
-                        source,
+                        source: source.into(),
                     })?;
                 if let Some(existing) = existing {
                     validate_placed_segment_shard_backfill_coalesces_exactly(&existing, work_item)?;
@@ -245,7 +245,7 @@ impl PgStore {
                         )
                         .map_err(|source| StoreError::Db {
                             context: "coalesce placed segment shard backfill",
-                            source,
+                            source: source.into(),
                         })?;
                     return Ok(());
                 }
@@ -275,7 +275,7 @@ impl PgStore {
                     )
                     .map_err(|source| StoreError::Db {
                         context: "record placed segment shard backfill",
-                        source,
+                        source: source.into(),
                     })?;
                 Ok(())
             },
@@ -299,7 +299,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "list placed segment shard backfills (prepare)",
-                source,
+                source: source.into(),
             })?;
         let rows = stmt
             .query_map(
@@ -317,7 +317,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "list placed segment shard backfills",
-                source,
+                source: source.into(),
             })?;
 
         let mut backfills = Vec::new();
@@ -331,12 +331,14 @@ impl PgStore {
                 last_error,
             ) = row.map_err(|source| StoreError::Db {
                 context: "read placed segment shard backfill",
-                source,
+                source: source.into(),
             })?;
             let remaining_tolerance =
                 u8::try_from(remaining_tolerance).map_err(|source| StoreError::Db {
                     context: "read placed segment shard backfill remaining tolerance",
-                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                    source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(
+                        source,
+                    )),
                 })?;
             validate_placed_segment_shard_backfill_remaining_tolerance(
                 &work_item,
@@ -364,11 +366,15 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "count placed segment shard backfills",
-                source,
+                source: source.into(),
             })?;
-        usize::try_from(count).map_err(|_| StoreError::Db {
+        usize::try_from(count).map_err(|source| StoreError::Db {
             context: "count placed segment shard backfills range",
-            source: rusqlite::Error::InvalidQuery,
+            source: crate::error::DatabaseError::from_sql_conversion_failure(
+                0,
+                rusqlite::types::Type::Integer,
+                Box::new(source),
+            ),
         })
     }
 
@@ -401,7 +407,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "check placed segment shard backfill exists",
-                source,
+                source: source.into(),
             })
     }
 
@@ -432,7 +438,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "resolve placed segment shard backfill",
-                source,
+                source: source.into(),
             })?;
         Ok(updated > 0)
     }
@@ -485,7 +491,7 @@ impl PgStore {
                     .optional()
                     .map_err(|source| StoreError::Db {
                         context: "load existing placed segment shard backfill claim",
-                        source,
+                        source: source.into(),
                     })?
                 {
                     return Ok(Some(existing));
@@ -508,7 +514,7 @@ impl PgStore {
                     .optional()
                     .map_err(|source| StoreError::Db {
                         context: "load claimable placed segment shard backfill",
-                        source,
+                        source: source.into(),
                     })?;
 
                 let Some(candidate) = candidate else {
@@ -543,7 +549,7 @@ impl PgStore {
                     )
                     .map_err(|source| StoreError::Db {
                         context: "install placed segment shard backfill claim",
-                        source,
+                        source: source.into(),
                     })?;
 
                 let reload_sql = durable_backfill_claim_select_sql(
@@ -563,7 +569,7 @@ impl PgStore {
                     .optional()
                     .map_err(|source| StoreError::Db {
                         context: "reload placed segment shard backfill claim",
-                        source,
+                        source: source.into(),
                     })
             },
         )
@@ -599,7 +605,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "complete placed segment shard backfill claim",
-                source,
+                source: source.into(),
             })?;
         Ok(updated > 0)
     }
@@ -651,7 +657,7 @@ impl PgStore {
                     .optional()
                     .map_err(|source| StoreError::Db {
                         context: "load existing placed segment shard repair claim",
-                        source,
+                        source: source.into(),
                     })?
                 {
                     return Ok(Some(existing));
@@ -673,7 +679,7 @@ impl PgStore {
                     .optional()
                     .map_err(|source| StoreError::Db {
                         context: "load claimable placed segment shard repair",
-                        source,
+                        source: source.into(),
                     })?;
 
                 let Some(candidate) = candidate else {
@@ -700,7 +706,7 @@ impl PgStore {
                     )
                     .map_err(|source| StoreError::Db {
                         context: "install placed segment shard repair claim",
-                        source,
+                        source: source.into(),
                     })?;
 
                 let reload_sql = durable_repair_claim_select_sql(
@@ -720,7 +726,7 @@ impl PgStore {
                     .optional()
                     .map_err(|source| StoreError::Db {
                         context: "reload placed segment shard repair claim",
-                        source,
+                        source: source.into(),
                     })
             },
         )
@@ -748,7 +754,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "complete placed segment shard repair claim",
-                source,
+                source: source.into(),
             })?;
         Ok(updated > 0)
     }
@@ -767,7 +773,7 @@ impl PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|source| StoreError::Db {
                 context: begin_context,
-                source,
+                source: source.into(),
             })?;
         let result = body(self);
         match result {
@@ -776,7 +782,7 @@ impl PgStore {
                     .execute_batch("COMMIT")
                     .map_err(|source| StoreError::Db {
                         context: commit_context,
-                        source,
+                        source: source.into(),
                     })?;
                 Ok(value)
             }
@@ -821,7 +827,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "record placed segment shard repair claim error",
-                source,
+                source: source.into(),
             })?;
         Ok(updated > 0)
     }
@@ -868,7 +874,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "record placed segment shard backfill claim error",
-                source,
+                source: source.into(),
             })?;
         Ok(updated > 0)
     }
@@ -921,7 +927,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "record shard scavenger observation",
-                source,
+                source: source.into(),
             })?;
         let _ = observability::emit_shard_scavenger_observation(
             TRACE_TARGET,
@@ -962,7 +968,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "resolve shard scavenger observation",
-                source,
+                source: source.into(),
             })?;
         Ok(updated > 0)
     }
@@ -981,7 +987,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "list shard scavenger observations (prepare)",
-                source,
+                source: source.into(),
             })?;
         let rows = stmt
             .query_map([], |row| {
@@ -1004,7 +1010,7 @@ impl PgStore {
             })
             .map_err(|source| StoreError::Db {
                 context: "list shard scavenger observations",
-                source,
+                source: source.into(),
             })?;
 
         let mut observations = Vec::new();
@@ -1026,7 +1032,7 @@ impl PgStore {
                 resolved_at,
             ) = row.map_err(|source| StoreError::Db {
                 context: "read shard scavenger observation",
-                source,
+                source: source.into(),
             })?;
             observations.push(ShardScavengerObservation {
                 key: ShardScavengerObservationKey {
@@ -1492,7 +1498,7 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "list shard inventory rows (prepare)",
-                source,
+                source: source.into(),
             })?;
         let rows = stmt
             .query_map([], |row| {
@@ -1505,13 +1511,13 @@ impl PgStore {
             })
             .map_err(|source| StoreError::Db {
                 context: "list shard inventory rows",
-                source,
+                source: source.into(),
             })?;
         let mut inventory_rows = Vec::new();
         for row in rows {
             let (key, stored_size, crc64, status) = row.map_err(|source| StoreError::Db {
                 context: "read shard inventory row",
-                source,
+                source: source.into(),
             })?;
             let status = u8::try_from(status)
                 .ok()
@@ -1541,7 +1547,10 @@ impl PgStore {
         let mut stmt = self
             .conn
             .prepare_cached(sql)
-            .map_err(|source| StoreError::Db { context, source })?;
+            .map_err(|source| StoreError::Db {
+                context,
+                source: source.into(),
+            })?;
         let rows = stmt
             .query_map([], |row| {
                 let okh_blob: Vec<u8> = row.get(1)?;
@@ -1571,9 +1580,15 @@ impl PgStore {
                     },
                 ))
             })
-            .map_err(|source| StoreError::Db { context, source })?;
+            .map_err(|source| StoreError::Db {
+                context,
+                source: source.into(),
+            })?;
         for row in rows {
-            references.push(row.map_err(|source| StoreError::Db { context, source })?);
+            references.push(row.map_err(|source| StoreError::Db {
+                context,
+                source: source.into(),
+            })?);
         }
         Ok(())
     }
@@ -1639,7 +1654,10 @@ impl PgStore {
         let mut stmt = self
             .conn
             .prepare_cached(sql)
-            .map_err(|source| StoreError::Db { context, source })?;
+            .map_err(|source| StoreError::Db {
+                context,
+                source: source.into(),
+            })?;
         let rows = stmt
             .query_map([], |row| {
                 let okh_blob: Vec<u8> = row.get(1)?;
@@ -1659,9 +1677,15 @@ impl PgStore {
                     },
                 ))
             })
-            .map_err(|source| StoreError::Db { context, source })?;
+            .map_err(|source| StoreError::Db {
+                context,
+                source: source.into(),
+            })?;
         for row in rows {
-            references.push(row.map_err(|source| StoreError::Db { context, source })?);
+            references.push(row.map_err(|source| StoreError::Db {
+                context,
+                source: source.into(),
+            })?);
         }
         Ok(())
     }
@@ -2061,7 +2085,7 @@ fn validate_placed_segment_shard_backfill_last_error(last_error: &str) -> Result
 fn durable_repair_u64_to_i64(value: u64, context: &'static str) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|source| StoreError::Db {
         context,
-        source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
     })
 }
 

@@ -793,7 +793,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch(PG_PRAGMAS)
         .map_err(|source| StoreError::Db {
             context: "configure PG database",
-            source,
+            source: source.into(),
         })?;
 
     let version = pg_schema_version(conn)?;
@@ -809,7 +809,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|source| StoreError::Db {
             context: "begin PG schema initialization",
-            source,
+            source: source.into(),
         })?;
     let result = (|| {
         let version = pg_schema_version(conn)?;
@@ -832,7 +832,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), StoreError> {
             )
             .map_err(|source| StoreError::Db {
                 context: "inspect unversioned PG database",
-                source,
+                source: source.into(),
             })?;
         if user_schema_object_count != 0 {
             return Err(StoreError::PgSchemaInvalid {
@@ -844,7 +844,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), StoreError> {
 
         create_current_pg_schema(conn).map_err(|source| StoreError::Db {
             context: "initialize current PG schema",
-            source,
+            source: source.into(),
         })
     })();
     match result {
@@ -852,7 +852,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), StoreError> {
             let _ = conn.execute_batch("ROLLBACK");
             StoreError::Db {
                 context: "commit PG schema initialization",
-                source,
+                source: source.into(),
             }
         }),
         Err(error) => {
@@ -877,7 +877,7 @@ fn pg_schema_version(conn: &Connection) -> Result<u32, StoreError> {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|source| StoreError::Db {
             context: "read PG schema version",
-            source,
+            source: source.into(),
         })?;
     u32::try_from(raw).map_err(|_| StoreError::PgSchemaInvalid {
         reason: format!("schema version is outside the supported integer range: {raw}"),

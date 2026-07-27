@@ -39,7 +39,6 @@ pub(crate) mod metadata_command;
 mod node_runtime;
 pub(crate) mod peering;
 pub mod pg_topology;
-pub mod schema;
 pub mod shard_key_hash;
 #[allow(dead_code)]
 pub(crate) mod storage_rpc;

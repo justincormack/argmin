@@ -1207,21 +1207,7 @@ impl SharedStorageNode {
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
-        pg.connection()
-            .execute(
-                "UPDATE objects SET became_noncurrent_at = ?1 \
-                 WHERE bucket = ?2 AND key = ?3 AND version_id = ?4",
-                rusqlite::params![
-                    became_noncurrent_at,
-                    bucket.as_str(),
-                    key.as_str(),
-                    version_id.to_u64()
-                ],
-            )
-            .map_err(|source| crate::error::StoreError::Db {
-                context: "force became_noncurrent_at in test helper",
-                source,
-            })?;
+        pg.test_force_object_became_noncurrent_at(bucket, key, version_id, became_noncurrent_at)?;
         pg.refresh_metadata_command_state_digest()?;
         Ok(())
     }
@@ -1305,15 +1291,7 @@ impl SharedStorageNode {
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
-        pg.connection()
-            .execute(
-                "UPDATE stream_uploads SET created_at = ?1 WHERE session_id = ?2",
-                rusqlite::params![created_at as i64, session_id.as_str()],
-            )
-            .map_err(|source| crate::error::StoreError::Db {
-                context: "force stream_upload created_at in test helper",
-                source,
-            })?;
+        pg.test_force_stream_upload_created_at(session_id, created_at)?;
         Ok(())
     }
 
@@ -2392,13 +2370,7 @@ mod tests {
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
         {
             let pg = node.get_pg(0).unwrap();
-            pg.connection()
-                .execute(
-                    "UPDATE metadata_command_replica_state \
-                     SET state_digest = state_digest + 1 \
-                     WHERE singleton = 0",
-                    [],
-                )
+            pg.test_increment_metadata_command_replica_state_digest()
                 .unwrap();
         }
 
@@ -2533,13 +2505,7 @@ mod tests {
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
         {
             let pg = node.get_pg(0).unwrap();
-            pg.connection()
-                .execute(
-                    "UPDATE metadata_command_replica_state \
-                     SET state_digest = state_digest + 1 \
-                     WHERE singleton = 0",
-                    [],
-                )
+            pg.test_increment_metadata_command_replica_state_digest()
                 .unwrap();
         }
 

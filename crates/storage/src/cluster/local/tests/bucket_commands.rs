@@ -2133,10 +2133,10 @@ fn invalid_bucket_property_command_does_not_poison_bucket_command_stream() {
         .put_bucket_object_lock_and_load_info(&bucket, invalid_object_lock)
         .unwrap_err();
     match err {
-        crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::Db {
+        crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::InvariantViolation {
             context: "put bucket object lock",
-            source: rusqlite::Error::SqliteFailure(_, Some(message)),
-        }) if message == "bucket object lock requires enabled versioning" => {}
+            reason,
+        }) if reason == "bucket object lock requires enabled versioning" => {}
         other => panic!("expected object-lock storage validation error, got {other:?}"),
     }
     assert!(
@@ -2585,10 +2585,10 @@ fn invalid_bucket_subresource_command_does_not_poison_bucket_command_stream() {
         )
         .unwrap_err();
     match err {
-        crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::Db {
+        crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::InvariantViolation {
             context: "put bucket subresource",
-            source: rusqlite::Error::InvalidParameterName(message),
-        }) if message.contains("Tagging does not support aux") => {}
+            reason,
+        }) if reason.contains("Tagging does not support aux") => {}
         other => panic!("expected subresource storage validation error, got {other:?}"),
     }
     assert!(

@@ -640,13 +640,11 @@ fn object_payload_reclaim_claim_count_for_test(map: &LocalClusterMap, pg_id: PgI
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
         .unwrap();
     let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
-    pg.connection()
-        .query_row(
-            "SELECT COUNT(*) FROM object_payload_reclaim_claims",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap() as usize
+    usize::from(
+        crate::PgMetadataStore::object_payload_reclaim_claim(&*pg)
+            .unwrap()
+            .is_some(),
+    )
 }
 
 fn insert_pending_metadata_command_for_test(
@@ -676,29 +674,8 @@ fn force_insert_pending_metadata_command_for_test(
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
         .unwrap();
     let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
-    let command_bytes = command.command_bytes();
-    pg.connection()
-            .execute(
-                "INSERT INTO metadata_command_pending_slot \
-                 (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) \
-                 VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6) \
-                 ON CONFLICT(singleton) DO UPDATE SET \
-                   cluster_epoch = excluded.cluster_epoch, \
-                   pg_id = excluded.pg_id, \
-                   log_index = excluded.log_index, \
-                   command_checksum = excluded.command_checksum, \
-                   command_bytes = excluded.command_bytes, \
-                   scope_bucket = excluded.scope_bucket",
-                rusqlite::params![
-                    command.id().cluster_epoch().get() as i64,
-                    command.id().pg_id().get() as i64,
-                    command.id().log_index().get() as i64,
-                    command.checksum_crc64() as i64,
-                    command_bytes,
-                    Some(bucket.as_str()),
-                ],
-            )
-            .unwrap();
+    pg.test_replace_pending_metadata_command_slot(command, Some(bucket))
+        .unwrap();
 }
 
 fn force_insert_pending_metadata_command_for_node_for_test(
@@ -714,28 +691,7 @@ fn force_insert_pending_metadata_command_for_node_for_test(
         .storage_node()
         .get_pg(pg_id.get())
         .unwrap();
-    let command_bytes = command.command_bytes();
-    pg.connection()
-        .execute(
-            "INSERT INTO metadata_command_pending_slot \
-             (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) \
-             VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6) \
-             ON CONFLICT(singleton) DO UPDATE SET \
-               cluster_epoch = excluded.cluster_epoch, \
-               pg_id = excluded.pg_id, \
-               log_index = excluded.log_index, \
-               command_checksum = excluded.command_checksum, \
-               command_bytes = excluded.command_bytes, \
-               scope_bucket = excluded.scope_bucket",
-            rusqlite::params![
-                command.id().cluster_epoch().get() as i64,
-                command.id().pg_id().get() as i64,
-                command.id().log_index().get() as i64,
-                command.checksum_crc64() as i64,
-                command_bytes,
-                Some(bucket.as_str()),
-            ],
-        )
+    pg.test_replace_pending_metadata_command_slot(command, Some(bucket))
         .unwrap();
 }
 
@@ -750,11 +706,7 @@ fn clear_pending_metadata_command_for_node_for_test(
         .storage_node()
         .get_pg(pg_id.get())
         .unwrap();
-    let removed = pg
-        .connection()
-        .execute("DELETE FROM metadata_command_pending_slot", [])
-        .unwrap();
-    assert_eq!(removed, 1);
+    assert!(pg.test_clear_pending_metadata_command_slot().unwrap());
 }
 
 fn force_insert_terminal_pending_metadata_command_for_test(
@@ -1015,17 +967,12 @@ fn assert_object_version_counter_on_acting_nodes(
     for node_id in node_ids {
         let node = map.node(*node_id).unwrap().storage_node();
         let pg = node.get_pg(object_pg).unwrap();
-        let next_version_id: i64 = pg
-            .connection()
-            .query_row(
-                "SELECT COALESCE(MAX(next_version_id), 0) \
-                     FROM object_version_counters WHERE bucket = ?1 AND key = ?2",
-                rusqlite::params![bucket.as_str(), key.as_str()],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let next_version_id = pg
+            .test_object_version_counter(bucket, key)
+            .unwrap()
+            .unwrap_or(0);
         assert_eq!(
-            next_version_id as u64, expected_next_version_id,
+            next_version_id, expected_next_version_id,
             "unexpected object version counter on node {node_id:?}"
         );
     }
@@ -1040,17 +987,9 @@ fn assert_bucket_execution_counter_on_acting_nodes(
     for node_id in node_ids {
         let node = map.node(*node_id).unwrap().storage_node();
         let pg = node.get_pg(bucket_pg).unwrap();
-        let next_generation: i64 = pg
-            .connection()
-            .query_row(
-                "SELECT next_bucket_execution_generation \
-                     FROM pg_counters WHERE singleton = 0",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let next_generation = pg.test_bucket_execution_generation().unwrap();
         assert_eq!(
-            next_generation as u64, expected_current_generation,
+            next_generation, expected_current_generation,
             "unexpected bucket execution counter on node {node_id:?}"
         );
     }

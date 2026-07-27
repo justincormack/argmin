@@ -214,21 +214,21 @@ fn unix_storage_node_client_reads_cluster_map_history_reference_summary() {
         )
         .unwrap();
         let pg = node.get_pg(0).unwrap();
-        pg.connection()
-            .execute(
-                "INSERT INTO object_segments \
-                 (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, \
-                  segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
-                 VALUES (?1, ?2, 1, 0, 1024, ?3, ?4, 10, 0, ?5, 4, 2)",
-                rusqlite::params![
-                    "unix-history-floor-bucket",
-                    "segment-object",
-                    0x1234_i64,
-                    [0x11_u8; 16].as_slice(),
-                    6_i64,
-                ],
-            )
-            .unwrap();
+        pg.test_insert_object_segment(&crate::ObjectSegmentRecord {
+            bucket: crate::BucketName::try_from("unix-history-floor-bucket").unwrap(),
+            key: crate::ObjectKey::try_from("segment-object").unwrap(),
+            version_id: VersionId::from_u64(1),
+            segment_index: 0,
+            size: 1024,
+            segment_crc64: 0x1234,
+            segment_okh: [0x11; 16],
+            segment_vid: GenerationId::new(10).unwrap(),
+            data_pg_id: 0,
+            placement_cluster_epoch: ClusterEpoch::new(6).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+        })
+        .unwrap();
         let backfill = crate::PlacedSegmentShardBackfillWorkItem {
             request: crate::SegmentStoredBytesRequest {
                 data_pg_id: 0,

@@ -13169,17 +13169,14 @@ impl StorageCluster {
                 continue;
             };
             let mut marker = None;
-            loop {
-                let Ok(page) = node
-                    .object_mutation_metadata_client()
-                    .list_all_stream_uploads_page(
-                        scan_pg_id,
-                        marker.as_ref(),
-                        STREAM_UPLOAD_SESSION_BEST_EFFORT_PAGE_LIMIT,
-                    )
-                else {
-                    break;
-                };
+            while let Ok(page) = node
+                .object_mutation_metadata_client()
+                .list_all_stream_uploads_page(
+                    scan_pg_id,
+                    marker.as_ref(),
+                    STREAM_UPLOAD_SESSION_BEST_EFFORT_PAGE_LIMIT,
+                )
+            {
                 if page.uploads.iter().any(|upload| {
                     self.object_metadata_pg_id(&upload.bucket, &upload.key) != pg_id.get()
                 }) {

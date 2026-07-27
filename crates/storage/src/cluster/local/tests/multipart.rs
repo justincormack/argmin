@@ -819,11 +819,7 @@ fn multipart_create_retry_rejects_same_request_with_mismatched_generation() {
         let upload = crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
         let mismatched_generation =
             crate::GenerationId::new(upload.object_generation_id.get() + 1).unwrap();
-        pg.connection()
-            .execute(
-                "UPDATE multipart_uploads SET object_generation_id = ?1 WHERE upload_id = ?2",
-                rusqlite::params![mismatched_generation.get() as i64, upload_id.as_str()],
-            )
+        pg.test_force_multipart_upload_object_generation(&upload_id, mismatched_generation)
             .unwrap();
     }
 
@@ -841,7 +837,7 @@ fn multipart_create_retry_rejects_same_request_with_mismatched_generation() {
     assert!(
         matches!(
             err,
-            crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::Db {
+            crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::InvariantViolation {
                 context: "create multipart upload existing upload mismatch",
                 ..
             })

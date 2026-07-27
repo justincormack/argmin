@@ -7605,11 +7605,9 @@ impl super::StorageCluster {
         } = route;
         if let BucketSubresourceMutation::Put { kind, aux, .. } = &mutation {
             if !kind.supports_aux(*aux) {
-                return Err(MetadataError::Db {
+                return Err(MetadataError::InvariantViolation {
                     context: "put bucket subresource",
-                    source: rusqlite::Error::InvalidParameterName(format!(
-                        "{kind:?} does not support aux {aux:?}"
-                    )),
+                    reason: format!("{kind:?} does not support aux {aux:?}"),
                 }
                 .into());
             }
@@ -10057,9 +10055,9 @@ impl super::StorageCluster {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
-                    return Err(MetadataError::Db {
+                    return Err(MetadataError::InvariantViolation {
                         context: "insert delete marker with disabled versioning",
-                        source: rusqlite::Error::InvalidQuery,
+                        reason: "delete markers require enabled or suspended versioning".into(),
                     }
                     .into());
                 }
@@ -13271,9 +13269,9 @@ impl super::StorageCluster {
 
             if req.part_records.is_empty() {
                 release_bucket_write_proof!()?;
-                return Err(MetadataError::Db {
+                return Err(MetadataError::InvariantViolation {
                     context: "complete multipart command empty parts",
-                    source: rusqlite::Error::InvalidQuery,
+                    reason: "multipart completion requires at least one part".into(),
                 }
                 .into());
             }

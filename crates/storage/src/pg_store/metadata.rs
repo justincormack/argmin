@@ -1,6 +1,18 @@
 use super::*;
 use crate::metadata_command::DeleteFinalizedBucketCommand;
 
+#[cfg(any(test, feature = "test-hooks"))]
+fn require_one_test_mutation(changed: usize) -> Result<(), StoreError> {
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(StoreError::IntegrityError {
+            expected: 1,
+            actual: changed as u64,
+        })
+    }
+}
+
 fn combined_stream_segment_payload_crc64(segments: &[StreamUploadSegmentRecord]) -> u64 {
     segments
         .iter()
@@ -14,6 +26,287 @@ impl PgStore {
     pub(crate) fn fail_next_metadata_txn_commit(&self) {
         self.fail_next_metadata_txn_commit
             .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_force_object_became_noncurrent_at(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        became_noncurrent_at: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE objects SET became_noncurrent_at = ?1 WHERE bucket = ?2 AND key = ?3 AND version_id = ?4",
+            params![became_noncurrent_at, bucket, key, version_id.to_u64()],
+            "force object became_noncurrent_at for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_force_stream_upload_created_at(
+        &self,
+        session_id: &SessionId,
+        created_at: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE stream_uploads SET created_at = ?1 WHERE session_id = ?2",
+            params![created_at as i64, session_id],
+            "force stream upload created_at for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_force_stream_upload_next_segment_vid(
+        &self,
+        session_id: &SessionId,
+        next_segment_vid: GenerationId,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE stream_uploads SET next_segment_vid = ?1 WHERE session_id = ?2",
+            params![next_segment_vid.get() as i64, session_id],
+            "force stream upload next segment VID for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_force_multipart_upload_object_generation(
+        &self,
+        upload_id: &UploadId,
+        generation_id: GenerationId,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE multipart_uploads SET object_generation_id = ?1 WHERE upload_id = ?2",
+            params![generation_id.get() as i64, upload_id],
+            "force multipart upload object generation for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_force_multipart_upload_initiated_object_identity(
+        &self,
+        upload_id: &UploadId,
+        identity: MultipartObjectIdentity,
+    ) -> Result<(), StoreError> {
+        let (kind, version_id, generation_or_sequence) = match identity {
+            MultipartObjectIdentity::Live {
+                version_id,
+                generation_id,
+            } => (1_i64, version_id.to_u64(), generation_id.get()),
+            MultipartObjectIdentity::DeleteMarker {
+                version_id,
+                write_sequence,
+            } => (2_i64, version_id.to_u64(), write_sequence),
+        };
+        let changed = self.execute_cached(
+            "UPDATE multipart_uploads SET initiated_object_kind = ?1, initiated_object_version_id = ?2, initiated_object_generation_or_write_sequence = ?3 WHERE upload_id = ?4",
+            params![
+                kind,
+                version_id as i64,
+                generation_or_sequence as i64,
+                upload_id,
+            ],
+            "force multipart upload initiated object identity for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_insert_object_segment(
+        &self,
+        segment: &ObjectSegmentRecord,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "INSERT INTO object_segments (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                segment.bucket,
+                segment.key,
+                segment.version_id.to_u64() as i64,
+                segment.segment_index,
+                segment.size as i64,
+                segment.segment_crc64 as i64,
+                segment.segment_okh.as_slice(),
+                segment.segment_vid.get() as i64,
+                segment.data_pg_id,
+                segment.placement_cluster_epoch.get() as i64,
+                segment.ec_k,
+                segment.ec_m,
+            ],
+            "insert object segment for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_insert_multipart_part_segments(
+        &self,
+        segments: &[MultipartPartSegmentRecord],
+    ) -> Result<(), MetadataError> {
+        self.insert_multipart_part_segments_explicit(segments)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_force_object_last_modified(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        last_modified: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE objects SET last_modified = ?1 WHERE bucket = ?2 AND key = ?3",
+            params![last_modified as i64, bucket, key],
+            "force object last-modified time for test",
+        )?;
+        if changed == 0 {
+            return Err(StoreError::IntegrityError {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_bucket_public_read(
+        &self,
+        bucket: &BucketName,
+        public_read: bool,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE buckets SET public_read = ?1 WHERE name = ?2",
+            params![public_read, bucket],
+            "force bucket public-read state for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_bucket_incarnation_generation(
+        &self,
+        bucket: &BucketName,
+        generation: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE buckets SET bucket_incarnation_generation = ?1 WHERE name = ?2",
+            params![generation as i64, bucket],
+            "force bucket incarnation generation for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_bucket_write_reservation_lease_deadline(
+        &self,
+        reservation_id: &str,
+        lease_deadline: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE bucket_write_reservations SET lease_deadline = ?1 WHERE reservation_id = ?2",
+            params![lease_deadline as i64, reservation_id],
+            "force bucket write reservation lease deadline for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_delete_bucket_row(&self, bucket: &BucketName) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "DELETE FROM buckets WHERE name = ?1",
+            params![bucket],
+            "delete bucket row for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_bucket_execution_generation(
+        &self,
+        generation: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE pg_counters SET next_bucket_execution_generation = ?1 WHERE singleton = 0",
+            params![generation as i64],
+            "force bucket execution generation for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_delete_multipart_part_segments_for_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<u64, StoreError> {
+        let changed = self.execute_cached(
+            "DELETE FROM multipart_part_segments WHERE upload_id = ?1",
+            params![upload_id],
+            "delete multipart part segments for test",
+        )?;
+        Ok(changed as u64)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_bucket_execution_generation(&self) -> Result<u64, MetadataError> {
+        self.query_row_cached_metadata(
+            "SELECT next_bucket_execution_generation FROM pg_counters WHERE singleton = 0",
+            [],
+            "inspect bucket execution generation for test",
+            |row| row.get::<_, i64>(0),
+        )?
+        .try_into()
+        .map_err(|_| MetadataError::Db {
+            context: "decode bucket execution generation for test",
+            source: crate::error::DatabaseError::from_sql_conversion_failure(
+                0,
+                rusqlite::types::Type::Integer,
+                Box::from("negative next_bucket_execution_generation"),
+            ),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_object_version_counter_rows_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<u64, MetadataError> {
+        let count = self.query_row_cached_metadata(
+            "SELECT COUNT(*) FROM object_version_counters WHERE bucket = ?1",
+            params![bucket],
+            "inspect object version counter rows for test",
+            |row| row.get::<_, i64>(0),
+        )?;
+        count.try_into().map_err(|source| MetadataError::Db {
+            context: "decode object version counter row count for test",
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_object_version_counter(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<u64>, MetadataError> {
+        self.query_row_cached_optional_metadata(
+            "SELECT next_version_id FROM object_version_counters WHERE bucket = ?1 AND key = ?2",
+            params![bucket, key],
+            "inspect object version counter for test",
+            |row| row.get::<_, i64>(0),
+        )?
+        .map(|raw| {
+            raw.try_into().map_err(|_| MetadataError::Db {
+                context: "decode object version counter for test",
+                source: crate::error::DatabaseError::from_sql_conversion_failure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::from("negative next_version_id"),
+                ),
+            })
+        })
+        .transpose()
     }
 
     #[cfg(test)]
@@ -38,13 +331,15 @@ impl PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "prepare test listing objects",
-                        source,
+                        source: source.into(),
                     })?;
                 for (index, key) in keys.iter().enumerate() {
                     let sequence =
                         i64::try_from(index + 1).map_err(|source| MetadataError::Db {
                             context: "convert test listing object sequence",
-                            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                            source: crate::error::DatabaseError::to_sql_conversion_failure(
+                                Box::new(source),
+                            ),
                         })?;
                     statement
                         .execute(params![
@@ -57,7 +352,7 @@ impl PgStore {
                         ])
                         .map_err(|source| MetadataError::Db {
                             context: "insert test listing object",
-                            source,
+                            source: source.into(),
                         })?;
                 }
                 Ok(())
@@ -88,13 +383,15 @@ impl PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "prepare test listing multipart uploads",
-                        source,
+                        source: source.into(),
                     })?;
                 for (index, (key, upload_id)) in uploads.iter().enumerate() {
                     let sequence =
                         i64::try_from(index + 1).map_err(|source| MetadataError::Db {
                             context: "convert test listing multipart upload sequence",
-                            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                            source: crate::error::DatabaseError::to_sql_conversion_failure(
+                                Box::new(source),
+                            ),
                         })?;
                     statement
                         .execute(params![
@@ -107,7 +404,7 @@ impl PgStore {
                         ])
                         .map_err(|source| MetadataError::Db {
                             context: "insert test listing multipart upload",
-                            source,
+                            source: source.into(),
                         })?;
                 }
                 Ok(())
@@ -120,9 +417,9 @@ impl PgStore {
             StoreError::Db { source, .. } => MetadataError::Db { context, source },
             other => MetadataError::Db {
                 context,
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
-                    other.to_string(),
-                ))),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(
+                    std::io::Error::other(other.to_string()),
+                )),
             },
         }
     }
@@ -141,7 +438,7 @@ impl PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|source| MetadataError::Db {
                 context: begin_context,
-                source,
+                source: source.into(),
             })?;
         let result = body(self);
         match result {
@@ -166,14 +463,19 @@ impl PgStore {
             self.invalidate_clean_metadata_digest_revision();
             return Err(MetadataError::Db {
                 context,
-                source: rusqlite::Error::InvalidQuery,
+                source: crate::error::DatabaseError::new(
+                    "injected metadata transaction commit failure",
+                ),
             });
         }
 
         if let Err(source) = self.conn.execute_batch("COMMIT") {
             let _ = self.conn.execute_batch("ROLLBACK");
             self.invalidate_clean_metadata_digest_revision();
-            return Err(MetadataError::Db { context, source });
+            return Err(MetadataError::Db {
+                context,
+                source: source.into(),
+            });
         }
         Ok(())
     }
@@ -195,7 +497,7 @@ impl PgStore {
         .and_then(|raw| {
             raw.try_into().map_err(|_| MetadataError::Db {
                 context: "decode next bucket execution generation",
-                source: rusqlite::Error::FromSqlConversionFailure(
+                source: crate::error::DatabaseError::from_sql_conversion_failure(
                     0,
                     rusqlite::types::Type::Integer,
                     Box::from("negative next_bucket_execution_generation"),
@@ -215,7 +517,7 @@ impl PgStore {
             .and_then(|raw| {
                 raw.try_into().map_err(|_| MetadataError::Db {
                     context: "decode next bucket execution generation candidate",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Integer,
                         Box::from("negative next_bucket_execution_generation"),
@@ -224,7 +526,7 @@ impl PgStore {
             })?;
         current.checked_add(1).ok_or_else(|| MetadataError::Db {
             context: "increment next bucket execution generation candidate",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::from(
                 "bucket execution generation exceeds u64",
             )),
         })
@@ -237,7 +539,7 @@ impl PgStore {
     ) -> Result<(), MetadataError> {
         let generation = i64::try_from(generation).map_err(|_| MetadataError::Db {
             context: "encode bucket execution generation",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::from(
                 "bucket execution generation exceeds i64",
             )),
         })?;
@@ -248,6 +550,33 @@ impl PgStore {
             params![generation],
             context,
         )?;
+        Ok(())
+    }
+
+    fn validate_bucket_object_lock_transition(
+        versioning: BucketVersioningState,
+        current: BucketObjectLockConfig,
+        target: BucketObjectLockConfig,
+        context: &'static str,
+    ) -> Result<(), MetadataError> {
+        if !target.enabled && target.default_retention.is_some() {
+            return Err(MetadataError::InvariantViolation {
+                context,
+                reason: "bucket object lock defaults require object lock enabled".into(),
+            });
+        }
+        if target.enabled && versioning != BucketVersioningState::Enabled {
+            return Err(MetadataError::InvariantViolation {
+                context,
+                reason: "bucket object lock requires enabled versioning".into(),
+            });
+        }
+        if current.enabled && !target.enabled {
+            return Err(MetadataError::InvariantViolation {
+                context,
+                reason: "bucket object lock cannot be disabled once enabled".into(),
+            });
+        }
         Ok(())
     }
 
@@ -280,10 +609,16 @@ impl PgStore {
             config.versioning,
             config.object_lock.enabled
         );
+        Self::validate_bucket_object_lock_transition(
+            config.versioning,
+            BucketObjectLockConfig::default(),
+            config.object_lock,
+            "create bucket",
+        )?;
         let created_at_millis =
             i64::try_from(created_at_millis).map_err(|_| MetadataError::Db {
                 context: "create bucket (encode created_at)",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::from(
                     "bucket created_at exceeds i64",
                 )),
             })?;
@@ -295,15 +630,15 @@ impl PgStore {
         ) = Self::bucket_object_lock_sql_values(config.object_lock).map_err(|e| {
             MetadataError::Db {
                 context: "create bucket (encode object lock)",
-                source: e,
+                source: e.into(),
             }
         })?;
         let multipart_upload_id_key =
             MultipartUploadIdKey::generate().map_err(|reason| MetadataError::Db {
                 context: "create bucket (generate multipart upload ID key)",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
-                    reason,
-                ))),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(
+                    std::io::Error::other(reason),
+                )),
             })?;
         self.with_immediate_txn(
             "create bucket (begin txn)",
@@ -356,7 +691,7 @@ impl PgStore {
                     }
                     Err(source) => Err(MetadataError::Db {
                         context: "create bucket",
-                        source,
+                        source: source.into(),
                     }),
                 }
             },
@@ -365,9 +700,15 @@ impl PgStore {
 
     fn insert_bucket_record_explicit(&self, bucket: &BucketRecord) -> Result<(), MetadataError> {
         let bucket = bucket.clone().command_metadata_projection();
+        Self::validate_bucket_object_lock_transition(
+            bucket.versioning,
+            BucketObjectLockConfig::default(),
+            bucket.object_lock,
+            "create bucket record",
+        )?;
         let created_at = i64::try_from(bucket.created_at).map_err(|_| MetadataError::Db {
             context: "create bucket record (encode created_at)",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::from(
                 "bucket created_at exceeds i64",
             )),
         })?;
@@ -375,7 +716,7 @@ impl PgStore {
             i64::try_from(bucket.multipart_completion_barrier_sequence).map_err(|_| {
                 MetadataError::Db {
                     context: "create bucket record (encode multipart completion barrier sequence)",
-                    source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                    source: crate::error::DatabaseError::to_sql_conversion_failure(Box::from(
                         "bucket multipart completion barrier sequence exceeds i64",
                     )),
                 }
@@ -388,7 +729,7 @@ impl PgStore {
         ) = Self::bucket_object_lock_sql_values(bucket.object_lock).map_err(|e| {
             MetadataError::Db {
                 context: "create bucket record (encode object lock)",
-                source: e,
+                source: e.into(),
             }
         })?;
         let (
@@ -452,7 +793,7 @@ impl PgStore {
                     }
                     Err(source) => Err(MetadataError::Db {
                         context: "create bucket record",
-                        source,
+                        source: source.into(),
                     }),
                 }
             },
@@ -471,9 +812,9 @@ impl PgStore {
             return Ok(());
         }
         if current.bucket_execution_generation == target.bucket_execution_generation {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: conflict_context,
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
         if current.bucket_execution_generation > target.bucket_execution_generation {
@@ -483,9 +824,9 @@ impl PgStore {
             });
         }
         if !Self::bucket_record_preimage_matches_update(&current, target, effect) {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: conflict_context,
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
         if matches!(effect, BucketRecordUpdateEffect::Versioning)
@@ -496,6 +837,25 @@ impl PgStore {
                 from: current.versioning,
                 to: target.versioning,
             });
+        }
+        if matches!(effect, BucketRecordUpdateEffect::Versioning)
+            || matches!(
+                effect,
+                BucketRecordUpdateEffect::Property(BucketPropertyEffect::ObjectLock)
+            )
+        {
+            Self::validate_bucket_object_lock_transition(
+                target.versioning,
+                current.object_lock,
+                target.object_lock,
+                match effect {
+                    BucketRecordUpdateEffect::Versioning => "put bucket versioning",
+                    BucketRecordUpdateEffect::Property(BucketPropertyEffect::ObjectLock) => {
+                        "put bucket object lock"
+                    }
+                    _ => unreachable!("effect was filtered above"),
+                },
+            )?;
         }
 
         self.with_immediate_txn(
@@ -522,7 +882,7 @@ impl PgStore {
                         )
                         .map_err(|source| MetadataError::Db {
                             context: "put bucket state",
-                            source,
+                            source: source.into(),
                         })?,
                     BucketRecordUpdateEffect::Versioning => store
                         .conn
@@ -539,7 +899,7 @@ impl PgStore {
                         )
                         .map_err(|source| MetadataError::Db {
                             context: "put bucket versioning",
-                            source,
+                            source: source.into(),
                         })?,
                     BucketRecordUpdateEffect::Acl => store
                         .conn
@@ -560,14 +920,14 @@ impl PgStore {
                         )
                         .map_err(|source| MetadataError::Db {
                             context: "put bucket acl",
-                            source,
+                            source: source.into(),
                         })?,
                     BucketRecordUpdateEffect::Property(BucketPropertyEffect::ObjectLock) => {
                         let (enabled, default_mode, default_days, default_years) =
                             Self::bucket_object_lock_sql_values(target.object_lock).map_err(
                                 |e| MetadataError::Db {
                                     context: "put bucket object lock (encode)",
-                                    source: e,
+                                    source: e.into(),
                                 },
                             )?;
                         store
@@ -591,7 +951,7 @@ impl PgStore {
                             )
                             .map_err(|source| MetadataError::Db {
                                 context: "put bucket object lock",
-                                source,
+                                source: source.into(),
                             })?
                     }
                     BucketRecordUpdateEffect::Property(BucketPropertyEffect::Encryption) => store
@@ -614,7 +974,7 @@ impl PgStore {
                         )
                         .map_err(|source| MetadataError::Db {
                             context: "put bucket encryption",
-                            source,
+                            source: source.into(),
                         })?,
                     BucketRecordUpdateEffect::Property(BucketPropertyEffect::PublicAccessBlock) => {
                         let (
@@ -647,7 +1007,7 @@ impl PgStore {
                             )
                             .map_err(|source| MetadataError::Db {
                                 context: "put bucket public access block",
-                                source,
+                                source: source.into(),
                             })?
                     }
                     BucketRecordUpdateEffect::Property(BucketPropertyEffect::OwnershipControls) => {
@@ -666,7 +1026,7 @@ impl PgStore {
                             )
                             .map_err(|source| MetadataError::Db {
                                 context: "put bucket ownership controls",
-                                source,
+                                source: source.into(),
                             })?
                     }
                     BucketRecordUpdateEffect::Property(BucketPropertyEffect::AbacEnabled) => store
@@ -684,7 +1044,7 @@ impl PgStore {
                         )
                         .map_err(|source| MetadataError::Db {
                             context: "put bucket abac enabled",
-                            source,
+                            source: source.into(),
                         })?,
                 };
                 if updated == 0 {
@@ -738,15 +1098,15 @@ impl PgStore {
         command: &MetadataCommandEnvelope,
     ) -> Result<(), MetadataError> {
         if command.id().pg_id().get() != self.pg_id {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "apply metadata command PG mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
         if !command.verify_checksum() {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "apply metadata command checksum",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
         match command.payload() {
@@ -839,7 +1199,7 @@ impl PgStore {
             .map_err(|source| {
                 BucketSnapshotLoadError::Metadata(MetadataError::Db {
                     context: "apply metadata command and record (begin txn)",
-                    source,
+                    source: source.into(),
                 })
             })?;
 
@@ -986,7 +1346,7 @@ impl PgStore {
             .optional()
             .map_err(|source| MetadataError::Db {
                 context: "delete finalized bucket (load state)",
-                source,
+                source: source.into(),
             })?;
         let Some((state, bucket_execution_generation, bucket_incarnation_generation)) = row else {
             let _ = observability::event(
@@ -1018,7 +1378,7 @@ impl PgStore {
         }
         let state = BucketState::from_u8(state).ok_or_else(|| MetadataError::Db {
             context: "delete finalized bucket (invalid bucket state)",
-            source: rusqlite::Error::InvalidQuery,
+            source: crate::error::DatabaseError::new("invalid stored bucket state"),
         })?;
         if state != BucketState::Deleting {
             let _ = observability::event(
@@ -1047,7 +1407,7 @@ impl PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "delete finalized bucket (delete row)",
-                source,
+                source: source.into(),
             })?;
         if deleted != 0 {
             self.conn
@@ -1057,7 +1417,7 @@ impl PgStore {
                 )
                 .map_err(|source| MetadataError::Db {
                     context: "delete finalized bucket (delete version counters)",
-                    source,
+                    source: source.into(),
                 })?;
             self.conn
                 .execute(
@@ -1066,7 +1426,7 @@ impl PgStore {
                 )
                 .map_err(|source| MetadataError::Db {
                     context: "delete finalized bucket (delete write counters)",
-                    source,
+                    source: source.into(),
                 })?;
             if refresh_command_state_digest {
                 self.refresh_metadata_command_state_digest()
@@ -1160,9 +1520,9 @@ impl PgStore {
             &command.generation_reservation_id,
         )?;
         if reserved_generation != command.object.generation_id {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "commit direct put command reservation mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
 
@@ -1218,10 +1578,12 @@ impl PgStore {
                 Ok(())
             }
             Err(MetadataError::StreamSessionNotFound { .. }) if !requires_stream_session => Ok(()),
-            Ok(_) | Err(MetadataError::StreamSessionNotFound { .. }) => Err(MetadataError::Db {
-                context: "commit direct put command stream reservation mismatch",
-                source: rusqlite::Error::InvalidQuery,
-            }),
+            Ok(_) | Err(MetadataError::StreamSessionNotFound { .. }) => {
+                Err(MetadataError::InvariantViolation {
+                    context: "commit direct put command stream reservation mismatch",
+                    reason: "metadata state does not satisfy the operation invariant".into(),
+                })
+            }
             Err(error) => Err(error),
         }
     }
@@ -1277,7 +1639,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "commit standard object command (delete stream staging)",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -1384,19 +1746,13 @@ impl PgStore {
                     &stream_uploads,
                     &command.stream_uploads,
                 ) {
-                    return Err(MetadataError::Db {
-                        context: "commit multipart object command (stream uploads mismatch)",
-                        source: rusqlite::Error::InvalidQuery,
-                    });
+                    return Err(MetadataError::InvariantViolation {
+                        context: "commit multipart object command (stream uploads mismatch)", reason: "metadata state does not satisfy the operation invariant".into() });
                 }
                 let stream_upload_segments =
                     store.list_stream_segments_for_sessions(&stream_uploads)?;
                 if stream_upload_segments != command.stream_upload_segments {
-                    return Err(MetadataError::Db {
-                        context:
-                            "commit multipart object command (stream upload segments mismatch)",
-                        source: rusqlite::Error::InvalidQuery,
-                    });
+                    return Err(MetadataError::InvariantViolation { context: "commit multipart object command (stream upload segments mismatch)", reason: "metadata state does not satisfy the operation invariant".into() });
                 }
                 if let Some(stale_payload) = &command.stale_payload {
                     store.apply_multipart_overwrite_stale_payload_in_open_txn(
@@ -1426,9 +1782,8 @@ impl PgStore {
                             command.object.version_id.to_u64() as i64,
                         ],
                     )
-                    .map_err(|source| MetadataError::Db {
-                        context: "commit multipart object command (record replay identity)",
-                        source,
+                    .map_err(|source| MetadataError::Db { context: "commit multipart object command (record replay identity)",
+                        source: source.into(),
                     })?;
                 store.delete_multipart_part_segments_direct(
                     &command.object.bucket,
@@ -1539,7 +1894,7 @@ impl PgStore {
             .optional()
             .map_err(|source| MetadataError::Db {
                 context: "read multipart completion identity",
-                source,
+                source: source.into(),
             })?;
         let Some((upload_id, fingerprint)) = row else {
             return Ok(None);
@@ -1549,12 +1904,16 @@ impl PgStore {
             (Some(upload_id), Some(fingerprint)) => {
                 let upload_id = UploadId::try_from(upload_id).map_err(|_| MetadataError::Db {
                     context: "read multipart completion identity (invalid upload ID)",
-                    source: rusqlite::Error::InvalidQuery,
+                    source: crate::error::DatabaseError::new(
+                        "invalid stored multipart completion upload ID",
+                    ),
                 })?;
                 let fingerprint: [u8; 32] =
                     fingerprint.try_into().map_err(|_| MetadataError::Db {
                         context: "read multipart completion identity (invalid fingerprint)",
-                        source: rusqlite::Error::InvalidQuery,
+                        source: crate::error::DatabaseError::new(
+                            "invalid stored multipart completion fingerprint",
+                        ),
                     })?;
                 Ok(Some((
                     upload_id,
@@ -1563,7 +1922,9 @@ impl PgStore {
             }
             _ => Err(MetadataError::Db {
                 context: "read multipart completion identity (incomplete pair)",
-                source: rusqlite::Error::InvalidQuery,
+                source: crate::error::DatabaseError::new(
+                    "incomplete stored multipart completion identity",
+                ),
             }),
         }
     }
@@ -1586,7 +1947,7 @@ impl PgStore {
             .optional()
             .map_err(|source| MetadataError::Db {
                 context: "read multipart completion replay identity",
-                source,
+                source: source.into(),
             })?;
         let Some((version_id, fingerprint)) = row else {
             return Ok(None);
@@ -1594,16 +1955,22 @@ impl PgStore {
         let version_id =
             VersionId::from_u64(version_id.try_into().map_err(|_| MetadataError::Db {
                 context: "read multipart completion replay (invalid version ID)",
-                source: rusqlite::Error::InvalidQuery,
+                source: crate::error::DatabaseError::new(
+                    "invalid stored multipart completion version ID",
+                ),
             })?);
         let fingerprint: [u8; 32] = fingerprint.try_into().map_err(|_| MetadataError::Db {
             context: "read multipart completion replay (invalid fingerprint)",
-            source: rusqlite::Error::InvalidQuery,
+            source: crate::error::DatabaseError::new(
+                "invalid stored multipart completion fingerprint",
+            ),
         })?;
         let StoredObject::Live(object) = self.get_object_version(bucket, key, version_id)? else {
             return Err(MetadataError::Db {
                 context: "read multipart completion replay (delete marker)",
-                source: rusqlite::Error::InvalidQuery,
+                source: crate::error::DatabaseError::new(
+                    "stored multipart completion references a delete marker",
+                ),
             });
         };
         Ok(Some(MultipartCompletionReplay {
@@ -1634,9 +2001,8 @@ impl PgStore {
                   segment_crc64, segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )
-            .map_err(|e| MetadataError::Db {
-                context: "commit multipart object command (prepare insert part segments)",
-                source: e,
+            .map_err(|e| MetadataError::Db { context: "commit multipart object command (prepare insert part segments)",
+                source: e.into(),
             })?;
 
         for segment in segments {
@@ -1646,7 +2012,7 @@ impl PgStore {
             {
                 return Err(MetadataError::Db {
                     context: "commit multipart object command (segment object mismatch)",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Null,
                         Box::from("multipart part segment row does not match object identity"),
@@ -1671,7 +2037,7 @@ impl PgStore {
             ])
             .map_err(|e| MetadataError::Db {
                 context: "commit multipart object command (insert part segment)",
-                source: e,
+                source: e.into(),
             })?;
         }
 
@@ -1693,7 +2059,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "commit multipart object command (delete staging segments)",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -1705,7 +2071,7 @@ impl PgStore {
     ) -> Result<(), MetadataError> {
         let barrier_sequence = i64::try_from(barrier_sequence).map_err(|_| MetadataError::Db {
             context: "commit multipart object command (completion order overflow)",
-            source: rusqlite::Error::FromSqlConversionFailure(
+            source: crate::error::DatabaseError::from_sql_conversion_failure(
                 0,
                 rusqlite::types::Type::Integer,
                 Box::from("barrier_sequence exceeds SQLite integer range"),
@@ -1725,7 +2091,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "commit multipart object command (advance completed upload sequence)",
-                source: e,
+                source: e.into(),
             })?;
         if updated == 0 {
             return Err(bucket_not_found(bucket.as_str()));
@@ -1750,7 +2116,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "commit multipart object command (release generation reservation)",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -1766,7 +2132,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "commit multipart object command (delete upload)",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -1828,9 +2194,9 @@ impl PgStore {
         if matches_root {
             Ok(())
         } else {
-            Err(MetadataError::Db {
+            Err(MetadataError::InvariantViolation {
                 context: "delete object payload reclaim command root mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             })
         }
     }
@@ -1840,9 +2206,9 @@ impl PgStore {
         command: &DeleteObjectPayloadReclaimCommand,
     ) -> Result<bool, MetadataError> {
         if command.payload.kind() != command.reclaim_claim.reclaim_kind {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "delete object payload reclaim command claim kind mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
         let bucket_incarnation_generation = i64::try_from(
@@ -1850,7 +2216,7 @@ impl PgStore {
         )
         .map_err(|source| MetadataError::Db {
             context: "delete object payload reclaim command claim incarnation",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let deleted = self
             .conn
@@ -1872,7 +2238,7 @@ impl PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "delete object payload reclaim command claim release",
-                source,
+                source: source.into(),
             })?;
         Ok(deleted != 0)
     }
@@ -1894,7 +2260,7 @@ impl PgStore {
             .optional()
             .map_err(|source| MetadataError::Db {
                 context: "delete object payload reclaim command claim conflict check",
-                source,
+                source: source.into(),
             })?
             .is_some();
         if claim_exists {
@@ -1927,9 +2293,9 @@ impl PgStore {
                             command.generation_id,
                         )
                     }
-                    Some(_) => Err(MetadataError::Db {
+                    Some(_) => Err(MetadataError::InvariantViolation {
                         context: "delete object payload reclaim command segment mismatch",
-                        source: rusqlite::Error::InvalidQuery,
+                        reason: "metadata state does not satisfy the operation invariant".into(),
                     }),
                     None => {
                         if self
@@ -1940,9 +2306,10 @@ impl PgStore {
                             )?
                             .is_some()
                         {
-                            return Err(MetadataError::Db {
+                            return Err(MetadataError::InvariantViolation {
                                 context: "delete object payload reclaim command kind mismatch",
-                                source: rusqlite::Error::InvalidQuery,
+                                reason: "metadata state does not satisfy the operation invariant"
+                                    .into(),
                             });
                         }
                         Ok(())
@@ -1965,9 +2332,9 @@ impl PgStore {
                             command.generation_id,
                         )
                     }
-                    Some(_) => Err(MetadataError::Db {
+                    Some(_) => Err(MetadataError::InvariantViolation {
                         context: "delete object payload reclaim command multipart mismatch",
-                        source: rusqlite::Error::InvalidQuery,
+                        reason: "metadata state does not satisfy the operation invariant".into(),
                     }),
                     None => {
                         if self
@@ -1978,9 +2345,10 @@ impl PgStore {
                             )?
                             .is_some()
                         {
-                            return Err(MetadataError::Db {
+                            return Err(MetadataError::InvariantViolation {
                                 context: "delete object payload reclaim command kind mismatch",
-                                source: rusqlite::Error::InvalidQuery,
+                                reason: "metadata state does not satisfy the operation invariant"
+                                    .into(),
                             });
                         }
                         Ok(())
@@ -2040,9 +2408,10 @@ impl PgStore {
                         StoredObject::Live(record),
                     ) => {
                         if record.generation_id != *generation_id || record.layout != *layout {
-                            return Err(MetadataError::Db {
+                            return Err(MetadataError::InvariantViolation {
                                 context: "delete object version command target mismatch",
-                                source: rusqlite::Error::InvalidQuery,
+                                reason: "metadata state does not satisfy the operation invariant"
+                                    .into(),
                             });
                         }
                         match payload {
@@ -2070,9 +2439,10 @@ impl PgStore {
                         }
                     }
                     _ => {
-                        return Err(MetadataError::Db {
+                        return Err(MetadataError::InvariantViolation {
                             context: "delete object version command kind mismatch",
-                            source: rusqlite::Error::InvalidQuery,
+                            reason: "metadata state does not satisfy the operation invariant"
+                                .into(),
                         });
                     }
                 }
@@ -2109,9 +2479,10 @@ impl PgStore {
                     Ok(StoredObject::Live(_)) if command.version_id.is_null() => {}
                     Ok(StoredObject::DeleteMarker(_)) if command.version_id.is_null() => {}
                     Ok(_) => {
-                        return Err(MetadataError::Db {
+                        return Err(MetadataError::InvariantViolation {
                             context: "insert delete marker command existing object mismatch",
-                            source: rusqlite::Error::InvalidQuery,
+                            reason: "metadata state does not satisfy the operation invariant"
+                                .into(),
                         });
                     }
                     Err(MetadataError::ObjectNotFound) => {}
@@ -2185,9 +2556,9 @@ impl PgStore {
             return Ok(());
         }
         if !Self::put_object_metadata_preimage_matches(&stored, object) {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "put object metadata command preimage mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
 
@@ -2195,7 +2566,7 @@ impl PgStore {
         let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
             Self::object_lock_sql_values(object.object_lock).map_err(|e| MetadataError::Db {
                 context: "put object metadata command (encode object lock)",
-                source: e,
+                source: e.into(),
             })?;
         let updated = self.execute_cached_metadata(
             "UPDATE objects \
@@ -2280,7 +2651,7 @@ impl PgStore {
             .transpose()
             .map_err(|source| MetadataError::Db {
                 context: "create stream upload cleanup deadline",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let target_context =
             bucket_write_reservation.and_then(|proof| proof.target_context.as_deref());
@@ -2317,7 +2688,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "create stream upload explicit",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -2338,9 +2709,9 @@ impl PgStore {
             {
                 Ok(())
             }
-            Ok(_) => Err(MetadataError::Db {
+            Ok(_) => Err(MetadataError::InvariantViolation {
                 context: "create stream upload command existing session mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             }),
             Err(MetadataError::StreamSessionNotFound { .. }) => {
                 let bucket_write_reservation = (command.session.target
@@ -2366,9 +2737,9 @@ impl PgStore {
                 if command.session.state == StreamUploadState::InProgress {
                     Ok(())
                 } else {
-                    Err(MetadataError::Db {
+                    Err(MetadataError::InvariantViolation {
                         context: "create stream upload command state mismatch",
-                        source: rusqlite::Error::InvalidQuery,
+                        reason: "metadata state does not satisfy the operation invariant".into(),
                     })
                 }
             }
@@ -2383,17 +2754,17 @@ impl PgStore {
                     });
                 }
                 if upload.encryption != command.session.encryption {
-                    return Err(MetadataError::Db {
+                    return Err(MetadataError::InvariantViolation {
                         context: "create stream upload command upload encryption mismatch",
-                        source: rusqlite::Error::InvalidQuery,
+                        reason: "metadata state does not satisfy the operation invariant".into(),
                     });
                 }
                 if command.session.state == StreamUploadState::InProgress {
                     Ok(())
                 } else {
-                    Err(MetadataError::Db {
+                    Err(MetadataError::InvariantViolation {
                         context: "create stream upload command state mismatch",
-                        source: rusqlite::Error::InvalidQuery,
+                        reason: "metadata state does not satisfy the operation invariant".into(),
                     })
                 }
             }
@@ -2410,9 +2781,9 @@ impl PgStore {
             |store| {
                 let session = store.get_stream_upload(&command.segment.session_id)?;
                 if session.bucket != command.bucket || session.key != command.key {
-                    return Err(MetadataError::Db {
+                    return Err(MetadataError::InvariantViolation {
                         context: "append stream segment command session binding mismatch",
-                        source: rusqlite::Error::InvalidQuery,
+                        reason: "metadata state does not satisfy the operation invariant".into(),
                     });
                 }
                 if session.state != StreamUploadState::InProgress {
@@ -2467,9 +2838,9 @@ impl PgStore {
             |store| {
                 let session = store.get_stream_upload(&command.session_id)?;
                 if session.bucket != command.bucket || session.key != command.key {
-                    return Err(MetadataError::Db {
+                    return Err(MetadataError::InvariantViolation {
                         context: "abort stream upload command session binding mismatch",
-                        source: rusqlite::Error::InvalidQuery,
+                        reason: "metadata state does not satisfy the operation invariant".into(),
                     });
                 }
                 if session.state != StreamUploadState::InProgress {
@@ -2488,16 +2859,16 @@ impl PgStore {
                     (None, Some(_)) | (Some(_), None) => false,
                 };
                 if !reservation_matches {
-                    return Err(MetadataError::Db {
+                    return Err(MetadataError::InvariantViolation {
                         context: "abort stream upload command reservation mismatch",
-                        source: rusqlite::Error::InvalidQuery,
+                        reason: "metadata state does not satisfy the operation invariant".into(),
                     });
                 }
                 let staged_segments = store.list_stream_segments(&command.session_id)?;
                 if staged_segments != command.staged_segments {
-                    return Err(MetadataError::Db {
+                    return Err(MetadataError::InvariantViolation {
                         context: "abort stream upload command staged segment mismatch",
-                        source: rusqlite::Error::InvalidQuery,
+                        reason: "metadata state does not satisfy the operation invariant".into(),
                     });
                 }
                 store.set_stream_upload_state_direct(
@@ -2563,9 +2934,9 @@ impl PgStore {
                 if part == command.part && segments == command.segments {
                     Ok(true)
                 } else {
-                    Err(MetadataError::Db {
+                    Err(MetadataError::InvariantViolation {
                         context: "commit stream part command applied result mismatch",
-                        source: rusqlite::Error::InvalidQuery,
+                        reason: "metadata state does not satisfy the operation invariant".into(),
                     })
                 }
             }
@@ -2582,9 +2953,9 @@ impl PgStore {
             || command.upload.state != UploadState::InProgress
             || command.part.upload_id != command.upload.upload_id
         {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "commit stream part command upload binding mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
         let expected_generation = match command.existing_part.as_ref() {
@@ -2592,25 +2963,25 @@ impl PgStore {
                 if existing.upload_id != command.upload.upload_id
                     || existing.part_number != command.part.part_number
                 {
-                    return Err(MetadataError::Db {
+                    return Err(MetadataError::InvariantViolation {
                         context: "commit stream part command existing part binding mismatch",
-                        source: rusqlite::Error::InvalidQuery,
+                        reason: "metadata state does not satisfy the operation invariant".into(),
                     });
                 }
                 existing
                     .generation
                     .checked_add(1)
-                    .ok_or(MetadataError::Db {
+                    .ok_or(MetadataError::InvariantViolation {
                         context: "commit stream part command generation overflow",
-                        source: rusqlite::Error::InvalidQuery,
+                        reason: "metadata state does not satisfy the operation invariant".into(),
                     })?
             }
             None => 0,
         };
         if command.part.generation != expected_generation {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "commit stream part command generation mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
 
@@ -2633,17 +3004,17 @@ impl PgStore {
             }
         }
         if session.bucket != command.bucket || session.key != command.key {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "commit stream part command session binding mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
 
         let upload = self.get_multipart_upload(&command.upload.upload_id)?;
         if upload != command.upload {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "commit stream part command upload mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
 
@@ -2654,9 +3025,9 @@ impl PgStore {
                 Err(error) => return Err(error),
             };
         if existing_part != command.existing_part {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "commit stream part command existing part mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
 
@@ -2667,9 +3038,9 @@ impl PgStore {
             command.part.part_number,
         )?;
         if displaced_segments != command.displaced_segments {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "commit stream part command displaced segments mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
 
@@ -2690,23 +3061,23 @@ impl PgStore {
                         || staged.ec_m != segment.ec_m
                 })
         {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "commit stream part command staged segments mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
         let staged_segments_total: u64 = staged_segments.iter().map(|segment| segment.size).sum();
         if staged_segments_total != command.part.size {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "commit stream part command staged payload size mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
         let staged_crc64 = combined_stream_segment_payload_crc64(&staged_segments);
         if staged_crc64 != command.part.payload_crc64 {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "commit stream part command staged payload CRC64 mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
         for segment in &command.segments {
@@ -2716,9 +3087,9 @@ impl PgStore {
                 || segment.version_id != PART_SEGMENT_STAGING_VERSION_ID.to_u64()
                 || segment.part_number != command.part.part_number
             {
-                return Err(MetadataError::Db {
+                return Err(MetadataError::InvariantViolation {
                     context: "commit stream part command segment binding mismatch",
-                    source: rusqlite::Error::InvalidQuery,
+                    reason: "metadata state does not satisfy the operation invariant".into(),
                 });
             }
         }
@@ -2753,7 +3124,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "insert multipart part explicit",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -2773,7 +3144,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete multipart part segments for upload part",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -2792,7 +3163,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare insert multipart part segments explicit",
-                source: e,
+                source: e.into(),
             })?;
         for segment in segments {
             stmt.execute(params![
@@ -2813,7 +3184,7 @@ impl PgStore {
             ])
             .map_err(|e| MetadataError::Db {
                 context: "insert multipart part segment explicit",
-                source: e,
+                source: e.into(),
             })?;
         }
         Ok(())
@@ -2824,9 +3195,9 @@ impl PgStore {
         command: &CreateMultipartUploadCommand,
     ) -> Result<(), MetadataError> {
         if command.upload.state != UploadState::InProgress {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "create multipart upload command state mismatch",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
         self.create_multipart_upload_explicit(&command.upload)
@@ -2909,7 +3280,7 @@ impl PgStore {
         let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
             Self::object_lock_sql_values(upload.object_lock).map_err(|e| MetadataError::Db {
                 context: "create multipart upload (encode object lock)",
-                source: e,
+                source: e.into(),
             })?;
         let encryption_type = upload.encryption.encryption_type() as u8;
         let encryption_state = upload.encryption.encode_state();
@@ -2918,7 +3289,7 @@ impl PgStore {
         let identity_sql_value = |value: u64| {
             i64::try_from(value).map_err(|_| MetadataError::Db {
                 context: "create multipart upload identity exceeds SQLite integer range",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::from(
                     "multipart upload identity exceeds SQLite integer range",
                 )),
             })
@@ -2950,14 +3321,14 @@ impl PgStore {
         let listing_cluster_epoch =
             i64::try_from(listing_cluster_epoch).map_err(|_| MetadataError::Db {
                 context: "create multipart upload listing cluster epoch",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::from(
                     "multipart upload listing cluster epoch exceeds SQLite integer range",
                 )),
             })?;
         let listing_log_index =
             i64::try_from(listing_log_index).map_err(|_| MetadataError::Db {
                 context: "create multipart upload listing log index",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::from(
                     "multipart upload listing log index exceeds SQLite integer range",
                 )),
             })?;
@@ -2993,20 +3364,17 @@ impl PgStore {
                             .optional()
                             .map_err(|e| MetadataError::Db {
                                 context: "create multipart upload explicit reservation lookup",
-                                source: e,
+                                source: e.into(),
                             })?;
                         if !matches!(existing_generation, Some(existing) if existing == upload.object_generation_id)
                         {
-                            return Err(MetadataError::Db {
-                                context: "create multipart upload explicit reservation mismatch",
-                                source: rusqlite::Error::InvalidQuery,
-                            });
+                            return Err(MetadataError::InvariantViolation {
+                                context: "create multipart upload explicit reservation mismatch", reason: "metadata state does not satisfy the operation invariant".into() });
                         }
                     }
                     Err(e) => {
-                        return Err(MetadataError::Db {
-                            context: "create multipart upload (reserve generation)",
-                            source: e,
+                        return Err(MetadataError::Db { context: "create multipart upload (reserve generation)",
+                            source: e.into(),
                         });
                     }
                 }
@@ -3049,16 +3417,13 @@ impl PgStore {
                     Err(rusqlite::Error::SqliteFailure(_, _)) => {
                         let existing = store.get_multipart_upload(&upload.upload_id)?;
                         if existing != *upload {
-                            return Err(MetadataError::Db {
-                                context: "create multipart upload explicit existing upload mismatch",
-                                source: rusqlite::Error::InvalidQuery,
-                            });
+                            return Err(MetadataError::InvariantViolation {
+                                context: "create multipart upload explicit existing upload mismatch", reason: "metadata state does not satisfy the operation invariant".into() });
                         }
                     }
                     Err(e) => {
-                        return Err(MetadataError::Db {
-                            context: "create multipart upload",
-                            source: e,
+                        return Err(MetadataError::Db { context: "create multipart upload",
+                            source: e.into(),
                         });
                     }
                 }
@@ -3079,7 +3444,7 @@ impl PgStore {
             .prepare_cached(&sql)
             .map_err(|e| MetadataError::Db {
                 context: "list stream uploads for multipart upload (prepare)",
-                source: e,
+                source: e.into(),
             })?;
         let rows = stmt
             .query_map(
@@ -3088,12 +3453,12 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "list stream uploads for multipart upload (query)",
-                source: e,
+                source: e.into(),
             })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| MetadataError::Db {
                 context: "list stream uploads for multipart upload (collect)",
-                source: e,
+                source: e.into(),
             })
     }
 
@@ -3229,15 +3594,17 @@ impl PgStore {
                 let upload_present = match store.get_multipart_upload(&command.upload_id) {
                     Ok(upload) => {
                         if upload.bucket != command.bucket || upload.key != command.key {
-                            return Err(MetadataError::Db {
+                            return Err(MetadataError::InvariantViolation {
                                 context: "abort multipart upload command (upload mismatch)",
-                                source: rusqlite::Error::InvalidQuery,
+                                reason: "metadata state does not satisfy the operation invariant"
+                                    .into(),
                             });
                         }
                         if upload != command.cleanup.upload {
-                            return Err(MetadataError::Db {
+                            return Err(MetadataError::InvariantViolation {
                                 context: "abort multipart upload command (cleanup mismatch)",
-                                source: rusqlite::Error::InvalidQuery,
+                                reason: "metadata state does not satisfy the operation invariant"
+                                    .into(),
                             });
                         }
                         true
@@ -3252,18 +3619,20 @@ impl PgStore {
                         &stream_uploads,
                         &command.cleanup.stream_uploads,
                     ) {
-                        return Err(MetadataError::Db {
+                        return Err(MetadataError::InvariantViolation {
                             context: "abort multipart upload command (stream uploads mismatch)",
-                            source: rusqlite::Error::InvalidQuery,
+                            reason: "metadata state does not satisfy the operation invariant"
+                                .into(),
                         });
                     }
                     let stream_upload_segments =
                         store.list_stream_segments_for_sessions(&stream_uploads)?;
                     if stream_upload_segments != command.cleanup.stream_upload_segments {
-                        return Err(MetadataError::Db {
+                        return Err(MetadataError::InvariantViolation {
                             context:
                                 "abort multipart upload command (stream upload segments mismatch)",
-                            source: rusqlite::Error::InvalidQuery,
+                            reason: "metadata state does not satisfy the operation invariant"
+                                .into(),
                         });
                     }
                     for session in &command.cleanup.stream_uploads {
@@ -3279,7 +3648,7 @@ impl PgStore {
                     )
                     .map_err(|e| MetadataError::Db {
                         context: "abort multipart upload command (delete generation reservation)",
-                        source: e,
+                        source: e.into(),
                     })?;
                 store
                     .conn
@@ -3289,7 +3658,7 @@ impl PgStore {
                     )
                     .map_err(|e| MetadataError::Db {
                         context: "abort multipart upload command (delete upload)",
-                        source: e,
+                        source: e.into(),
                     })?;
                 Ok(())
             },
@@ -3313,7 +3682,7 @@ impl PgStore {
         )
         .map_err(|e| MetadataError::Db {
             context: "put object meta (mark noncurrent delete marker)",
-            source: e,
+            source: e.into(),
         })?;
         self.advance_object_version_counter_in_open_txn(bucket, key, version_id)?;
         self.advance_object_write_counter_in_open_txn(bucket, key, write_sequence, None)?;
@@ -3378,7 +3747,7 @@ impl PgStore {
             self.clear_current_live_noncurrent(bucket.as_str(), key.as_str())
                 .map_err(|e| MetadataError::Db {
                     context: "delete object version (restore current)",
-                    source: e,
+                    source: e.into(),
                 })?;
         }
         Ok(())
@@ -3408,7 +3777,7 @@ impl PgStore {
                     BucketVersioningState::from_u8(raw_versioning).ok_or_else(|| {
                         MetadataError::Db {
                             context: "invalid versioning state in database",
-                            source: rusqlite::Error::FromSqlConversionFailure(
+                            source: crate::error::DatabaseError::from_sql_conversion_failure(
                                 0,
                                 rusqlite::types::Type::Integer,
                                 Box::from(format!("invalid versioning: {raw_versioning}")),
@@ -3417,7 +3786,7 @@ impl PgStore {
                     })?;
                 let generation = raw_generation.try_into().map_err(|_| MetadataError::Db {
                     context: "decode bucket execution generation",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         1,
                         rusqlite::types::Type::Integer,
                         Box::from("negative bucket_execution_generation"),
@@ -3430,15 +3799,15 @@ impl PgStore {
                 if current == state {
                     return Ok(());
                 }
-                return Err(MetadataError::Db {
+                return Err(MetadataError::InvariantViolation {
                     context: "apply conflicting bucket versioning command",
-                    source: rusqlite::Error::InvalidQuery,
+                    reason: "metadata state does not satisfy the operation invariant".into(),
                 });
             }
             if current_generation > explicit {
-                return Err(MetadataError::Db {
+                return Err(MetadataError::InvariantViolation {
                     context: "apply stale bucket versioning command",
-                    source: rusqlite::Error::InvalidQuery,
+                    reason: "metadata state does not satisfy the operation invariant".into(),
                 });
             }
         }
@@ -3448,6 +3817,13 @@ impl PgStore {
                 to: state,
             });
         }
+        let current_object_lock = self.head_bucket_raw(name)?.object_lock;
+        Self::validate_bucket_object_lock_transition(
+            state,
+            current_object_lock,
+            current_object_lock,
+            "put bucket versioning",
+        )?;
 
         self.with_immediate_txn(
             "put bucket versioning (begin txn)",
@@ -3514,11 +3890,11 @@ impl PgStore {
                     let acl_grants = Self::parse_acl_grants(raw_acl_grants, 0, "bucket acl")
                         .map_err(|source| MetadataError::Db {
                             context: "decode bucket acl",
-                            source,
+                            source: source.into(),
                         })?;
                     let generation = raw_generation.try_into().map_err(|_| MetadataError::Db {
                         context: "decode bucket execution generation",
-                        source: rusqlite::Error::FromSqlConversionFailure(
+                        source: crate::error::DatabaseError::from_sql_conversion_failure(
                             3,
                             rusqlite::types::Type::Integer,
                             Box::from("negative bucket_execution_generation"),
@@ -3535,15 +3911,15 @@ impl PgStore {
                 {
                     return Ok(());
                 }
-                return Err(MetadataError::Db {
+                return Err(MetadataError::InvariantViolation {
                     context: "apply conflicting bucket acl command",
-                    source: rusqlite::Error::InvalidQuery,
+                    reason: "metadata state does not satisfy the operation invariant".into(),
                 });
             }
             if current_generation > explicit {
-                return Err(MetadataError::Db {
+                return Err(MetadataError::InvariantViolation {
                     context: "apply stale bucket acl command",
-                    source: rusqlite::Error::InvalidQuery,
+                    reason: "metadata state does not satisfy the operation invariant".into(),
                 });
             }
         }
@@ -3626,17 +4002,25 @@ impl PgStore {
                 if self.bucket_property_matches(&info, mutation)? {
                     return Ok(());
                 }
-                return Err(MetadataError::Db {
+                return Err(MetadataError::InvariantViolation {
                     context: bucket_property_conflict_context(mutation.effect()),
-                    source: rusqlite::Error::InvalidQuery,
+                    reason: "metadata state does not satisfy the operation invariant".into(),
                 });
             }
             if info.bucket_execution_generation > explicit {
-                return Err(MetadataError::Db {
+                return Err(MetadataError::InvariantViolation {
                     context: bucket_property_stale_context(mutation.effect()),
-                    source: rusqlite::Error::InvalidQuery,
+                    reason: "metadata state does not satisfy the operation invariant".into(),
                 });
             }
+        }
+        if let BucketPropertyMutation::ObjectLock(config) = mutation {
+            Self::validate_bucket_object_lock_transition(
+                info.versioning,
+                info.object_lock,
+                *config,
+                "put bucket object lock",
+            )?;
         }
 
         self.with_immediate_txn(
@@ -3663,7 +4047,7 @@ impl PgStore {
                             Self::bucket_object_lock_sql_values(*config).map_err(|e| {
                                 MetadataError::Db {
                                     context: "put bucket object lock (encode)",
-                                    source: e,
+                                    source: e.into(),
                                 }
                             })?;
                         store.execute_cached_metadata(
@@ -3782,7 +4166,7 @@ impl PgStore {
             .prepare_cached(&sql)
             .map_err(|source| MetadataError::Db {
                 context: "prepare load bucket execution generations",
-                source,
+                source: source.into(),
             })?;
         let rows = stmt
             .query_map(
@@ -3791,19 +4175,19 @@ impl PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "query load bucket execution generations",
-                source,
+                source: source.into(),
             })?;
         let mut generations = HashMap::with_capacity(buckets.len());
         for row in rows {
             let (bucket, generation) = row.map_err(|source| MetadataError::Db {
                 context: "row load bucket execution generations",
-                source,
+                source: source.into(),
             })?;
             generations.insert(
                 bucket,
                 generation.try_into().map_err(|_| MetadataError::Db {
                     context: "decode bucket execution generation",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         1,
                         rusqlite::types::Type::Integer,
                         Box::from("negative bucket_execution_generation"),
@@ -3834,7 +4218,7 @@ impl PgStore {
             .prepare_cached(&sql)
             .map_err(|source| MetadataError::Db {
                 context: "prepare load bucket fast path identities",
-                source,
+                source: source.into(),
             })?;
         let rows = stmt
             .query_map(
@@ -3849,18 +4233,18 @@ impl PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "query load bucket fast path identities",
-                source,
+                source: source.into(),
             })?;
         let mut identities = HashMap::with_capacity(buckets.len());
         for row in rows {
             let (bucket, execution, incarnation) = row.map_err(|source| MetadataError::Db {
                 context: "row load bucket fast path identities",
-                source,
+                source: source.into(),
             })?;
             let bucket_execution_generation =
                 execution.try_into().map_err(|_| MetadataError::Db {
                     context: "decode bucket fast path execution generation",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         1,
                         rusqlite::types::Type::Integer,
                         Box::from("negative bucket_execution_generation"),
@@ -3869,7 +4253,7 @@ impl PgStore {
             let bucket_incarnation_generation =
                 incarnation.try_into().map_err(|_| MetadataError::Db {
                     context: "decode bucket fast path incarnation generation",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         2,
                         rusqlite::types::Type::Integer,
                         Box::from("negative bucket_incarnation_generation"),
@@ -3901,7 +4285,7 @@ impl PgStore {
         if let Some(value) = stored_next {
             return u64::try_from(value).map_err(|_| MetadataError::Db {
                 context: "negative object write counter in database",
-                source: rusqlite::Error::FromSqlConversionFailure(
+                source: crate::error::DatabaseError::from_sql_conversion_failure(
                     0,
                     rusqlite::types::Type::Integer,
                     Box::from(format!("negative next_write_sequence: {value}")),
@@ -3923,7 +4307,7 @@ impl PgStore {
             Some(value) => {
                 let current = u64::try_from(value).map_err(|_| MetadataError::Db {
                     context: "negative write_sequence in database",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Integer,
                         Box::from(format!("negative MAX(write_sequence): {value}")),
@@ -3931,7 +4315,7 @@ impl PgStore {
                 })?;
                 current.checked_add(1).ok_or_else(|| MetadataError::Db {
                     context: "write_sequence overflow",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Integer,
                         Box::from("MAX(write_sequence) overflow"),
@@ -3957,7 +4341,7 @@ impl PgStore {
             let next_write_sequence =
                 u64::try_from(next_write_sequence).map_err(|_| MetadataError::Db {
                     context: "negative object write counter in database",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Integer,
                         Box::from(format!(
@@ -3969,7 +4353,7 @@ impl PgStore {
                 .map(|value| {
                     u64::try_from(value).map_err(|_| MetadataError::Db {
                         context: "negative object write generation counter in database",
-                        source: rusqlite::Error::FromSqlConversionFailure(
+                        source: crate::error::DatabaseError::from_sql_conversion_failure(
                             1,
                             rusqlite::types::Type::Integer,
                             Box::from(format!("negative max_committed_generation: {value}")),
@@ -3993,7 +4377,7 @@ impl PgStore {
             Some(value) => {
                 let current = u64::try_from(value).map_err(|_| MetadataError::Db {
                     context: "negative write_sequence in database",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Integer,
                         Box::from(format!("negative MAX(write_sequence): {value}")),
@@ -4001,7 +4385,7 @@ impl PgStore {
                 })?;
                 current.checked_add(1).ok_or_else(|| MetadataError::Db {
                     context: "write_sequence overflow",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Integer,
                         Box::from("MAX(write_sequence) overflow"),
@@ -4013,7 +4397,7 @@ impl PgStore {
             .map(|value| {
                 u64::try_from(value).map_err(|_| MetadataError::Db {
                     context: "negative generation_id in database",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         1,
                         rusqlite::types::Type::Integer,
                         Box::from(format!("negative MAX(generation_id): {value}")),
@@ -4046,7 +4430,7 @@ impl PgStore {
                 .checked_add(1)
                 .ok_or_else(|| MetadataError::Db {
                     context: "write_sequence overflow",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Integer,
                         Box::from("object write counter overflow"),
@@ -4089,7 +4473,7 @@ impl PgStore {
             .checked_add(1)
             .ok_or_else(|| MetadataError::Db {
                 context: "advance object version counter",
-                source: rusqlite::Error::FromSqlConversionFailure(
+                source: crate::error::DatabaseError::from_sql_conversion_failure(
                     0,
                     rusqlite::types::Type::Integer,
                     Box::from("version_id overflow"),
@@ -4097,7 +4481,7 @@ impl PgStore {
             })?;
         let following = i64::try_from(following).map_err(|_| MetadataError::Db {
             context: "advance object version counter",
-            source: rusqlite::Error::FromSqlConversionFailure(
+            source: crate::error::DatabaseError::from_sql_conversion_failure(
                 0,
                 rusqlite::types::Type::Integer,
                 Box::from("version_id exceeds SQLite integer range"),
@@ -4121,9 +4505,9 @@ impl PgStore {
         version_id: VersionId,
     ) -> Result<(), MetadataError> {
         if version_id.is_null() {
-            return Err(MetadataError::Db {
+            return Err(MetadataError::InvariantViolation {
                 context: "reserve object version command null version",
-                source: rusqlite::Error::InvalidQuery,
+                reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
         let expected = self.next_version_id(bucket, key)?;
@@ -4155,14 +4539,13 @@ impl PgStore {
                 )
             })
             .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get object write sequence",
-                source: e,
+            .map_err(|e| MetadataError::Db { context: "get object write sequence",
+                source: e.into(),
             })?
             .map(|value| {
                 u64::try_from(value).map_err(|_| MetadataError::Db {
                     context: "negative write_sequence in database",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Integer,
                         Box::from(format!("negative write_sequence: {value}")),
@@ -4190,7 +4573,7 @@ impl PgStore {
                     )?
                     .ok_or_else(|| MetadataError::Db {
                         context: "load multipart delete-marker identity write sequence",
-                        source: rusqlite::Error::QueryReturnedNoRows,
+                        source: rusqlite::Error::QueryReturnedNoRows.into(),
                     })?;
                 Ok(MultipartObjectIdentity::DeleteMarker {
                     version_id: marker.version_id,
@@ -4265,7 +4648,7 @@ impl PgStore {
         .try_into()
         .map_err(|_| MetadataError::Db {
             context: "decode multipart completion barrier sequence",
-            source: rusqlite::Error::FromSqlConversionFailure(
+            source: crate::error::DatabaseError::from_sql_conversion_failure(
                 0,
                 rusqlite::types::Type::Integer,
                 Box::from("negative multipart completion barrier sequence"),
@@ -4307,7 +4690,7 @@ impl PgStore {
                         Ok(_) | Err(MetadataError::ObjectGenerationReservationNotFound { .. }) => {
                             Err(MetadataError::Db {
                                 context: "reserve object generation explicit",
-                                source,
+                                source: source.into(),
                             })
                         }
                         Err(error) => Err(error),
@@ -4321,7 +4704,7 @@ impl PgStore {
                 }
                 None => Err(MetadataError::Db {
                     context: "reserve object generation explicit",
-                    source,
+                    source: source.into(),
                 }),
             },
         }
@@ -4352,7 +4735,7 @@ impl PgStore {
             Self::parse_generation_id(raw.2, 2, "generation_id").map_err(|source| {
                 MetadataError::Db {
                     context: "parse object generation reservation by id",
-                    source,
+                    source: source.into(),
                 }
             })?;
         Ok(ObjectGenerationReservationIdentity {
@@ -4396,7 +4779,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "put object segments reclaim (root)",
-                source: e,
+                source: e.into(),
             })?;
 
         for segment in &reclaim.segments {
@@ -4420,7 +4803,7 @@ impl PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "put object segments reclaim (segment)",
-                    source: e,
+                    source: e.into(),
                 })?;
         }
         Ok(())
@@ -4443,7 +4826,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "put multipart reclaim (root)",
-                source: e,
+                source: e.into(),
             })?;
 
         for part in &reclaim.parts {
@@ -4461,7 +4844,7 @@ impl PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "put multipart reclaim (part)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             for segment in &part.segments {
@@ -4486,7 +4869,7 @@ impl PgStore {
                     )
                     .map_err(|e| MetadataError::Db {
                         context: "put multipart reclaim (part segment)",
-                        source: e,
+                        source: e.into(),
                     })?;
             }
         }
@@ -4502,7 +4885,7 @@ impl PgStore {
     ) -> Result<(), MetadataError> {
         obj.validate().map_err(|err| MetadataError::Db {
             context: "put explicit segment object (etag/layout mismatch)",
-            source: rusqlite::Error::FromSqlConversionFailure(
+            source: crate::error::DatabaseError::from_sql_conversion_failure(
                 0,
                 rusqlite::types::Type::Null,
                 Box::new(err),
@@ -4511,7 +4894,7 @@ impl PgStore {
         if obj.layout != ObjectLayout::Standard {
             return Err(MetadataError::Db {
                 context: "put explicit segment object (non-segment layout)",
-                source: rusqlite::Error::FromSqlConversionFailure(
+                source: crate::error::DatabaseError::from_sql_conversion_failure(
                     0,
                     rusqlite::types::Type::Null,
                     Box::from("put_object_with_segments requires Standard layout"),
@@ -4535,7 +4918,7 @@ impl PgStore {
         let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
             Self::object_lock_sql_values(obj.object_lock).map_err(|e| MetadataError::Db {
                 context: "put explicit segment object (encode object lock)",
-                source: e,
+                source: e.into(),
             })?;
         let encryption_type = obj.encryption.encryption_type() as u8;
         let encryption_state = obj.encryption.encode_state();
@@ -4547,7 +4930,7 @@ impl PgStore {
         )
         .map_err(|e| MetadataError::Db {
             context: "put explicit segment object (mark noncurrent)",
-            source: e,
+            source: e.into(),
         })?;
         self.advance_object_version_counter_in_open_txn(&obj.bucket, &obj.key, obj.version_id)?;
         self.advance_object_write_counter_in_open_txn(
@@ -4618,7 +5001,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "put explicit segment object (prepare insert segments)",
-                source: e,
+                source: e.into(),
             })?;
         for segment in segments {
             if segment.bucket != obj.bucket
@@ -4627,7 +5010,7 @@ impl PgStore {
             {
                 return Err(MetadataError::Db {
                     context: "put explicit segment object (segment object mismatch)",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Null,
                         Box::from("segment row does not match object identity"),
@@ -4650,7 +5033,7 @@ impl PgStore {
             ])
             .map_err(|e| MetadataError::Db {
                 context: "put explicit segment object (insert segment)",
-                source: e,
+                source: e.into(),
             })?;
         }
 
@@ -4666,7 +5049,7 @@ impl PgStore {
     ) -> Result<(), MetadataError> {
         obj.validate().map_err(|err| MetadataError::Db {
             context: "put explicit multipart object (etag/layout mismatch)",
-            source: rusqlite::Error::FromSqlConversionFailure(
+            source: crate::error::DatabaseError::from_sql_conversion_failure(
                 0,
                 rusqlite::types::Type::Null,
                 Box::new(err),
@@ -4675,7 +5058,7 @@ impl PgStore {
         if !matches!(obj.layout, ObjectLayout::MultipartManifest { .. }) {
             return Err(MetadataError::Db {
                 context: "put explicit multipart object (non-multipart layout)",
-                source: rusqlite::Error::FromSqlConversionFailure(
+                source: crate::error::DatabaseError::from_sql_conversion_failure(
                     0,
                     rusqlite::types::Type::Null,
                     Box::from("put multipart object requires MultipartManifest layout"),
@@ -4685,7 +5068,7 @@ impl PgStore {
         if parts.is_empty() {
             return Err(MetadataError::Db {
                 context: "put explicit multipart object (empty parts)",
-                source: rusqlite::Error::FromSqlConversionFailure(
+                source: crate::error::DatabaseError::from_sql_conversion_failure(
                     0,
                     rusqlite::types::Type::Null,
                     Box::from("multipart commit requires at least one part"),
@@ -4709,7 +5092,7 @@ impl PgStore {
         let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
             Self::object_lock_sql_values(obj.object_lock).map_err(|e| MetadataError::Db {
                 context: "put explicit multipart object (encode object lock)",
-                source: e,
+                source: e.into(),
             })?;
         let encryption_type = obj.encryption.encryption_type() as u8;
         let encryption_state = obj.encryption.encode_state();
@@ -4721,7 +5104,7 @@ impl PgStore {
         )
         .map_err(|e| MetadataError::Db {
             context: "put explicit multipart object (mark noncurrent)",
-            source: e,
+            source: e.into(),
         })?;
         self.advance_object_version_counter_in_open_txn(&obj.bucket, &obj.key, obj.version_id)?;
         self.advance_object_write_counter_in_open_txn(
@@ -4776,7 +5159,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "put explicit multipart object (write object)",
-                source: e,
+                source: e.into(),
             })?;
 
         self.conn
@@ -4787,7 +5170,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "put explicit multipart object (delete prior parts)",
-                source: e,
+                source: e.into(),
             })?;
 
         let mut stmt = self
@@ -4800,7 +5183,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "put explicit multipart object (prepare insert parts)",
-                source: e,
+                source: e.into(),
             })?;
         let mut ordered_parts: Vec<&ObjectPartRecord> = parts.iter().collect();
         ordered_parts.sort_by_key(|part| part.part_number);
@@ -4808,9 +5191,9 @@ impl PgStore {
         for part in ordered_parts {
             if part.bucket != obj.bucket || part.key != obj.key || part.version_id != obj.version_id
             {
-                return Err(MetadataError::Db {
+                return Err(MetadataError::InvariantViolation {
                     context: "put explicit multipart object (part identity mismatch)",
-                    source: rusqlite::Error::InvalidQuery,
+                    reason: "metadata state does not satisfy the operation invariant".into(),
                 });
             }
             stmt.execute(params![
@@ -4832,7 +5215,7 @@ impl PgStore {
             ])
             .map_err(|e| MetadataError::Db {
                 context: "put explicit multipart object (insert part)",
-                source: e,
+                source: e.into(),
             })?;
             object_offset_start += part.size;
         }
@@ -5436,7 +5819,7 @@ impl PgMetadataStore for PgStore {
             ))
             .map_err(|e| MetadataError::Db {
                 context: "prepare list buckets",
-                source: e,
+                source: e.into(),
             })?;
         let rows = stmt
             .query_map(
@@ -5445,14 +5828,14 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "list buckets query",
-                source: e,
+                source: e.into(),
             })?;
 
         let mut buckets = Vec::new();
         for row in rows {
             buckets.push(row.map_err(|e| MetadataError::Db {
                 context: "list buckets row",
-                source: e,
+                source: e.into(),
             })?);
         }
         Ok(buckets)
@@ -5477,20 +5860,20 @@ impl PgMetadataStore for PgStore {
             ))
             .map_err(|e| MetadataError::Db {
                 context: "prepare list buckets with lifecycle",
-                source: e,
+                source: e.into(),
             })?;
         let rows = stmt
             .query_map(params![BucketState::Active as u8], Self::row_to_bucket_info)
             .map_err(|e| MetadataError::Db {
                 context: "list buckets with lifecycle query",
-                source: e,
+                source: e.into(),
             })?;
 
         let mut buckets = Vec::new();
         for row in rows {
             buckets.push(row.map_err(|e| MetadataError::Db {
                 context: "list buckets with lifecycle row",
-                source: e,
+                source: e.into(),
             })?);
         }
         Ok(buckets)
@@ -5513,20 +5896,20 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare list buckets with aborting multipart uploads",
-                source: e,
+                source: e.into(),
             })?;
         let rows = stmt
             .query_map(params![UploadState::Aborting as u8], |row| row.get(0))
             .map_err(|e| MetadataError::Db {
                 context: "list buckets with aborting multipart uploads query",
-                source: e,
+                source: e.into(),
             })?;
 
         let mut buckets = Vec::new();
         for row in rows {
             buckets.push(row.map_err(|e| MetadataError::Db {
                 context: "list buckets with aborting multipart uploads row",
-                source: e,
+                source: e.into(),
             })?);
         }
         Ok(buckets)
@@ -5558,7 +5941,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "mark bucket deleting",
-                        source,
+                        source: source.into(),
                     })?;
                 if updated == 0 {
                     return Err(bucket_not_found(name.as_str()));
@@ -5574,12 +5957,12 @@ impl PgMetadataStore for PgStore {
     ) -> Result<BucketWriteReservationRecord, MetadataError> {
         let created_at = i64::try_from(acquire.created_at).map_err(|source| MetadataError::Db {
             context: "acquire durable bucket write reservation created_at",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let lease_deadline =
             i64::try_from(acquire.lease_deadline).map_err(|source| MetadataError::Db {
                 context: "acquire durable bucket write reservation lease_deadline",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let inserted = self
             .conn
@@ -5610,7 +5993,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "acquire durable bucket write reservation",
-                source,
+                source: source.into(),
             })?;
 
         if inserted == 0 {
@@ -5663,7 +6046,7 @@ impl PgMetadataStore for PgStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(source) => Err(MetadataError::Db {
                 context: "load durable bucket write reservation",
-                source,
+                source: source.into(),
             }),
         }
     }
@@ -5684,18 +6067,18 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "prepare list durable bucket write reservations",
-                source,
+                source: source.into(),
             })?;
         let rows = stmt
             .query_map(params![name.as_str()], bucket_write_reservation_from_row)
             .map_err(|source| MetadataError::Db {
                 context: "list durable bucket write reservations",
-                source,
+                source: source.into(),
             })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|source| MetadataError::Db {
                 context: "collect durable bucket write reservations",
-                source,
+                source: source.into(),
             })
     }
 
@@ -5707,31 +6090,37 @@ impl PgMetadataStore for PgStore {
             i64::try_from(heartbeat.bucket_execution_generation).map_err(|source| {
                 MetadataError::Db {
                     context: "heartbeat durable bucket write reservation generation",
-                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                    source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(
+                        source,
+                    )),
                 }
             })?;
         let incarnation =
             i64::try_from(heartbeat.bucket_incarnation_generation).map_err(|source| {
                 MetadataError::Db {
                     context: "heartbeat durable bucket write reservation incarnation",
-                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                    source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(
+                        source,
+                    )),
                 }
             })?;
         let lease_deadline =
             i64::try_from(heartbeat.lease_deadline).map_err(|source| MetadataError::Db {
                 context: "heartbeat durable bucket write reservation lease deadline",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let current_lease_deadline =
             i64::try_from(heartbeat.current_lease_deadline).map_err(|source| {
                 MetadataError::Db {
                     context: "heartbeat durable bucket write reservation current lease deadline",
-                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                    source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(
+                        source,
+                    )),
                 }
             })?;
         let now = i64::try_from(heartbeat.now).map_err(|source| MetadataError::Db {
             context: "heartbeat durable bucket write reservation now",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let updated = self
             .conn
@@ -5757,7 +6146,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "heartbeat durable bucket write reservation",
-                source,
+                source: source.into(),
             })?;
         if updated == 0 {
             return Err(MetadataError::BucketWriteReservationNotFound {
@@ -5783,17 +6172,17 @@ impl PgMetadataStore for PgStore {
         let generation =
             i64::try_from(bucket_execution_generation).map_err(|source| MetadataError::Db {
                 context: "release durable bucket write reservation generation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let incarnation =
             i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
                 context: "release durable bucket write reservation incarnation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let lease_deadline =
             i64::try_from(record.lease_deadline).map_err(|source| MetadataError::Db {
                 context: "release durable bucket write reservation lease deadline",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let deleted = self
             .conn
@@ -5816,7 +6205,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "release durable bucket write reservation",
-                source,
+                source: source.into(),
             })?;
         if deleted == 0 {
             return Err(MetadataError::BucketWriteReservationNotFound {
@@ -5837,7 +6226,7 @@ impl PgMetadataStore for PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|source| MetadataError::Db {
                 context: "begin release metadata command bucket write reservation",
-                source,
+                source: source.into(),
             })?;
 
         let result =
@@ -5849,20 +6238,26 @@ impl PgMetadataStore for PgStore {
                             .map_err(|source| MetadataError::Db {
                                 context:
                                     "release metadata command bucket write reservation generation",
-                                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                                source: crate::error::DatabaseError::to_sql_conversion_failure(
+                                    Box::new(source),
+                                ),
                             })?;
                         let incarnation = i64::try_from(record.bucket_incarnation_generation)
                             .map_err(|source| MetadataError::Db {
                                 context:
                                     "release metadata command bucket write reservation incarnation",
-                                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                                source: crate::error::DatabaseError::to_sql_conversion_failure(
+                                    Box::new(source),
+                                ),
                             })?;
                         let lease_deadline =
                             i64::try_from(record.lease_deadline).map_err(|source| {
                                 MetadataError::Db {
                             context:
                                 "release metadata command bucket write reservation lease deadline",
-                            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                            source: crate::error::DatabaseError::to_sql_conversion_failure(
+                                Box::new(source),
+                            ),
                         }
                             })?;
                         let deleted = self
@@ -5887,7 +6282,7 @@ impl PgMetadataStore for PgStore {
                             .map_err(|source| MetadataError::Db {
                                 context:
                                     "release metadata command durable bucket write reservation",
-                                source,
+                                source: source.into(),
                             })?;
                         if deleted != 1 {
                             return Err(MetadataError::BucketWriteReservationConflict {
@@ -5928,11 +6323,11 @@ impl PgMetadataStore for PgStore {
     ) -> Result<BucketWriteDrainRecord, MetadataError> {
         let created_at = i64::try_from(created_at).map_err(|source| MetadataError::Db {
             context: "begin durable bucket write drain created_at",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let lease_deadline = i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
             context: "begin durable bucket write drain lease_deadline",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let inserted = self
             .conn
@@ -5957,7 +6352,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "begin durable bucket write drain",
-                source,
+                source: source.into(),
             })?;
         if inserted == 0 {
             if let Some(existing) = self.durable_bucket_write_drain(name)? {
@@ -5998,7 +6393,7 @@ impl PgMetadataStore for PgStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(source) => Err(MetadataError::Db {
                 context: "load durable bucket write drain",
-                source,
+                source: source.into(),
             }),
         }
     }
@@ -6015,11 +6410,11 @@ impl PgMetadataStore for PgStore {
         let generation =
             i64::try_from(bucket_execution_generation).map_err(|source| MetadataError::Db {
                 context: "clear durable bucket write drain generation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let lease_deadline = i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
             context: "clear durable bucket write drain lease deadline",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let deleted = self
             .conn
@@ -6039,7 +6434,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "clear durable bucket write drain",
-                source,
+                source: source.into(),
             })?;
         if deleted == 0 {
             return Err(MetadataError::BucketWriteDrainNotFound {
@@ -6056,13 +6451,13 @@ impl PgMetadataStore for PgStore {
     ) -> Result<Option<BucketWriteDrainRecord>, MetadataError> {
         let now = i64::try_from(now).map_err(|source| MetadataError::Db {
             context: "clear expired durable bucket write drain now",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|source| MetadataError::Db {
                 context: "clear expired durable bucket write drain (begin txn)",
-                source,
+                source: source.into(),
             })?;
         let result = (|| {
             let Some(record) = (match self.conn.query_row(
@@ -6078,7 +6473,7 @@ impl PgMetadataStore for PgStore {
                 Err(source) => {
                     return Err(MetadataError::Db {
                         context: "clear expired durable bucket write drain (load drain)",
-                        source,
+                        source: source.into(),
                     });
                 }
             }) else {
@@ -6087,7 +6482,9 @@ impl PgMetadataStore for PgStore {
             let lease_deadline =
                 i64::try_from(record.lease_deadline).map_err(|source| MetadataError::Db {
                     context: "clear expired durable bucket write drain lease deadline",
-                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                    source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(
+                        source,
+                    )),
                 })?;
             if lease_deadline > now {
                 return Ok(None);
@@ -6113,7 +6510,9 @@ impl PgMetadataStore for PgStore {
                         i64::try_from(record.bucket_execution_generation).map_err(|source| {
                             MetadataError::Db {
                                 context: "clear expired durable bucket write drain generation",
-                                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                                source: crate::error::DatabaseError::to_sql_conversion_failure(
+                                    Box::new(source),
+                                ),
                             }
                         })?,
                         now,
@@ -6121,7 +6520,7 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|source| MetadataError::Db {
                     context: "clear expired durable bucket write drain (delete drain)",
-                    source,
+                    source: source.into(),
                 })?;
             if deleted == 0 {
                 return Ok(None);
@@ -6152,21 +6551,21 @@ impl PgMetadataStore for PgStore {
         let generation =
             i64::try_from(bucket_execution_generation).map_err(|source| MetadataError::Db {
                 context: "heartbeat durable bucket write drain generation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let lease_deadline = i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
             context: "heartbeat durable bucket write drain lease deadline",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let now = i64::try_from(now).map_err(|source| MetadataError::Db {
             context: "heartbeat durable bucket write drain now",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|source| MetadataError::Db {
                 context: "heartbeat durable bucket write drain (begin txn)",
-                source,
+                source: source.into(),
             })?;
         let result = (|| {
             let Some(record) = (match self.conn.query_row(
@@ -6182,7 +6581,7 @@ impl PgMetadataStore for PgStore {
                 Err(source) => {
                     return Err(MetadataError::Db {
                         context: "heartbeat durable bucket write drain (load drain)",
-                        source,
+                        source: source.into(),
                     });
                 }
             }) else {
@@ -6201,7 +6600,7 @@ impl PgMetadataStore for PgStore {
             }
             if i64::try_from(record.lease_deadline).map_err(|source| MetadataError::Db {
                 context: "heartbeat durable bucket write drain current lease deadline",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })? <= now
             {
                 return Err(MetadataError::BucketWriteDrainConflict {
@@ -6236,7 +6635,7 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|source| MetadataError::Db {
                     context: "heartbeat durable bucket write drain (update drain)",
-                    source,
+                    source: source.into(),
                 })?;
             if updated == 0 {
                 return Err(MetadataError::BucketWriteDrainNotFound {
@@ -6267,7 +6666,7 @@ impl PgMetadataStore for PgStore {
         if record.detail.len() > BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN {
             return Err(MetadataError::Db {
                 context: "record bucket delete attempt outcome detail length",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::from(
                     "bucket delete attempt outcome detail exceeds maximum length",
                 )),
             });
@@ -6275,12 +6674,12 @@ impl PgMetadataStore for PgStore {
         let generation = i64::try_from(record.bucket_execution_generation).map_err(|source| {
             MetadataError::Db {
                 context: "record bucket delete attempt outcome generation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             }
         })?;
         let updated_at = i64::try_from(record.updated_at).map_err(|source| MetadataError::Db {
             context: "record bucket delete attempt outcome updated_at",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let post_reservation_next_object_pg_id =
             record.post_reservation_next_object_pg_id.map(i64::from);
@@ -6318,7 +6717,7 @@ impl PgMetadataStore for PgStore {
             .map(|_| ())
             .map_err(|source| MetadataError::Db {
                 context: "record bucket delete attempt outcome",
-                source,
+                source: source.into(),
             })
     }
 
@@ -6339,7 +6738,7 @@ impl PgMetadataStore for PgStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(source) => Err(MetadataError::Db {
                 context: "load bucket delete attempt outcome",
-                source,
+                source: source.into(),
             }),
         }
     }
@@ -6355,11 +6754,11 @@ impl PgMetadataStore for PgStore {
         }
         let now = i64::try_from(now).map_err(|source| MetadataError::Db {
             context: "get bucket delete begin roots now",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let limit_i64 = i64::try_from(limit).map_err(|source| MetadataError::Db {
             context: "get bucket delete begin roots limit",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let mut stmt = self
             .conn
@@ -6379,7 +6778,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "prepare get bucket delete begin roots",
-                source,
+                source: source.into(),
             })?;
         let rows = stmt
             .query_map(
@@ -6423,13 +6822,13 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "query get bucket delete begin roots",
-                source,
+                source: source.into(),
             })?;
         let mut roots = Vec::new();
         for row in rows {
             roots.push(row.map_err(|source| MetadataError::Db {
                 context: "row get bucket delete begin roots",
-                source,
+                source: source.into(),
             })?);
         }
         Ok(roots)
@@ -6542,7 +6941,7 @@ impl PgMetadataStore for PgStore {
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "get bucket public access block",
-                source: e,
+                source: e.into(),
             })?
             .ok_or_else(|| bucket_not_found(name.as_str()))
     }
@@ -6583,7 +6982,7 @@ impl PgMetadataStore for PgStore {
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "get bucket ownership controls",
-                source: e,
+                source: e.into(),
             })?
             .ok_or_else(|| bucket_not_found(name.as_str()))
     }
@@ -6622,7 +7021,7 @@ impl PgMetadataStore for PgStore {
                 rusqlite::Error::QueryReturnedNoRows => bucket_not_found(name.as_str()),
                 source => MetadataError::Db {
                     context: "get bucket abac enabled",
-                    source,
+                    source: source.into(),
                 },
             })
     }
@@ -6672,7 +7071,7 @@ impl PgMetadataStore for PgStore {
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "get bucket encryption",
-                source: e,
+                source: e.into(),
             })?
             .ok_or_else(|| bucket_not_found(name.as_str()))
     }
@@ -6690,7 +7089,7 @@ impl PgMetadataStore for PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
                 context: "put object meta (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
         let result: Result<(), MetadataError> = (|| match req {
@@ -6699,7 +7098,7 @@ impl PgMetadataStore for PgStore {
                     self.next_object_write_sequence(req.bucket.as_str(), req.key.as_str())?;
                 req.validate().map_err(|err| MetadataError::Db {
                     context: "put object meta (etag/layout mismatch)",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Null,
                         Box::new(err),
@@ -6713,7 +7112,7 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "put object meta (mark noncurrent)",
-                    source: e,
+                    source: e.into(),
                 })?;
                 let data_layout_u8 = req.layout.data_layout() as u8;
                 let etag_kind_u8 = req.etag.etag_kind() as u8;
@@ -6732,7 +7131,7 @@ impl PgMetadataStore for PgStore {
                     Self::object_lock_sql_values(req.object_lock).map_err(|e| {
                         MetadataError::Db {
                             context: "put object meta (encode object lock)",
-                            source: e,
+                            source: e.into(),
                         }
                     })?;
                 let encryption_type = req.encryption.encryption_type() as u8;
@@ -6924,7 +7323,7 @@ impl PgMetadataStore for PgStore {
         let retain_until =
             i64::try_from(retention.retain_until_unix_seconds).map_err(|_| MetadataError::Db {
                 context: "put object retention (encode retain-until)",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::from(format!(
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::from(format!(
                     "object lock retain-until exceeds SQLite INTEGER: {}",
                     retention.retain_until_unix_seconds
                 ))),
@@ -7018,7 +7417,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete object meta",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -7043,7 +7442,7 @@ impl PgMetadataStore for PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
                 context: "delete object version (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
         let result: Result<(), MetadataError> =
@@ -7132,21 +7531,21 @@ impl PgMetadataStore for PgStore {
             .prepare_cached(&sql)
             .map_err(|e| MetadataError::Db {
                 context: "prepare list objects",
-                source: e,
+                source: e.into(),
             })?;
 
         let rows = stmt
             .query_map(params_refs.as_slice(), Self::row_to_object_record)
             .map_err(|e| MetadataError::Db {
                 context: "list objects query",
-                source: e,
+                source: e.into(),
             })?;
 
         let mut objects: Vec<StoredObject> = Vec::new();
         for row in rows {
             objects.push(row.map_err(|e| MetadataError::Db {
                 context: "list objects row",
-                source: e,
+                source: e.into(),
             })?);
         }
 
@@ -7251,21 +7650,21 @@ impl PgMetadataStore for PgStore {
             .prepare_cached(&sql)
             .map_err(|e| MetadataError::Db {
                 context: "prepare list object versions",
-                source: e,
+                source: e.into(),
             })?;
 
         let rows = stmt
             .query_map(params_refs.as_slice(), Self::row_to_object_record)
             .map_err(|e| MetadataError::Db {
                 context: "list object versions query",
-                source: e,
+                source: e.into(),
             })?;
 
         let mut versions: Vec<StoredObject> = Vec::new();
         for row in rows {
             versions.push(row.map_err(|e| MetadataError::Db {
                 context: "list object versions row",
-                source: e,
+                source: e.into(),
             })?);
         }
 
@@ -7307,21 +7706,21 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare list object versions for key",
-                source: e,
+                source: e.into(),
             })?;
 
         let rows = stmt
             .query_map(params![bucket, key], Self::row_to_object_record)
             .map_err(|e| MetadataError::Db {
                 context: "list object versions for key query",
-                source: e,
+                source: e.into(),
             })?;
 
         let mut versions = Vec::new();
         for row in rows {
             versions.push(row.map_err(|e| MetadataError::Db {
                 context: "list object versions for key row",
-                source: e,
+                source: e.into(),
             })?);
         }
         Ok(versions)
@@ -7347,7 +7746,7 @@ impl PgMetadataStore for PgStore {
             Some(v) => {
                 let current = u64::try_from(v).map_err(|_| MetadataError::Db {
                     context: "negative version_id in database",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Integer,
                         Box::from(format!("negative MAX(version_id): {v}")),
@@ -7355,7 +7754,7 @@ impl PgMetadataStore for PgStore {
                 })?;
                 current.checked_add(1).ok_or_else(|| MetadataError::Db {
                     context: "version_id overflow",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Integer,
                         Box::from("MAX(version_id) overflow"),
@@ -7368,7 +7767,7 @@ impl PgMetadataStore for PgStore {
             None => 1,
             Some(v) => u64::try_from(v).map_err(|_| MetadataError::Db {
                 context: "negative next_version_id in database",
-                source: rusqlite::Error::FromSqlConversionFailure(
+                source: crate::error::DatabaseError::from_sql_conversion_failure(
                     0,
                     rusqlite::types::Type::Integer,
                     Box::from(format!("negative next_version_id: {v}")),
@@ -7378,7 +7777,7 @@ impl PgMetadataStore for PgStore {
         let next = next_from_rows.max(next_from_counter);
         next.checked_add(1).ok_or_else(|| MetadataError::Db {
             context: "version_id overflow",
-            source: rusqlite::Error::FromSqlConversionFailure(
+            source: crate::error::DatabaseError::from_sql_conversion_failure(
                 0,
                 rusqlite::types::Type::Integer,
                 Box::from("next_version_id overflow"),
@@ -7416,7 +7815,7 @@ impl PgMetadataStore for PgStore {
             Some(v) => {
                 let current = u64::try_from(v).map_err(|_| MetadataError::Db {
                     context: "negative generation_id in database",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Integer,
                         Box::from(format!("negative MAX(generation_id): {v}")),
@@ -7424,7 +7823,7 @@ impl PgMetadataStore for PgStore {
                 })?;
                 current.checked_add(1).ok_or_else(|| MetadataError::Db {
                     context: "generation_id overflow",
-                    source: rusqlite::Error::FromSqlConversionFailure(
+                    source: crate::error::DatabaseError::from_sql_conversion_failure(
                         0,
                         rusqlite::types::Type::Integer,
                         Box::from("MAX(generation_id) overflow"),
@@ -7434,7 +7833,7 @@ impl PgMetadataStore for PgStore {
         };
         GenerationId::new(next).ok_or_else(|| MetadataError::Db {
             context: "invalid next generation id",
-            source: rusqlite::Error::FromSqlConversionFailure(
+            source: crate::error::DatabaseError::from_sql_conversion_failure(
                 0,
                 rusqlite::types::Type::Integer,
                 Box::from("next generation id must be nonzero"),
@@ -7453,7 +7852,7 @@ impl PgMetadataStore for PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
                 context: "reserve object generation (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
         let result: Result<GenerationId, MetadataError> = (|| {
@@ -7505,7 +7904,7 @@ impl PgMetadataStore for PgStore {
             })?;
         Self::parse_generation_id(raw, 0, "generation_id").map_err(|source| MetadataError::Db {
             context: "parse object generation reservation",
-            source,
+            source: source.into(),
         })
     }
 
@@ -7528,7 +7927,7 @@ impl PgMetadataStore for PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
                 context: "put object segments reclaim (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
         let result: Result<(), MetadataError> = (|| {
@@ -7545,7 +7944,7 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "put object segments reclaim (root)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             for segment in &reclaim.segments {
@@ -7569,7 +7968,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|e| MetadataError::Db {
                         context: "put object segments reclaim (segment)",
-                        source: e,
+                        source: e.into(),
                     })?;
             }
             Ok(())
@@ -7612,7 +8011,7 @@ impl PgMetadataStore for PgStore {
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "get object segments reclaim (root)",
-                source: e,
+                source: e.into(),
             })?;
 
         let Some((bucket_name, key_name, generation_id, created_at)) = root else {
@@ -7629,7 +8028,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "get object segments reclaim (prepare segments)",
-                source: e,
+                source: e.into(),
             })?;
 
         let segments = stmt
@@ -7657,12 +8056,12 @@ impl PgMetadataStore for PgStore {
             })
             .map_err(|e| MetadataError::Db {
                 context: "get object segments reclaim (query segments)",
-                source: e,
+                source: e.into(),
             })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| MetadataError::Db {
                 context: "get object segments reclaim (collect segments)",
-                source: e,
+                source: e.into(),
             })?;
 
         Ok(Some(ObjectSegmentsReclaimRecord {
@@ -7690,7 +8089,7 @@ impl PgMetadataStore for PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
                 context: "put multipart reclaim (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
         let result: Result<(), MetadataError> = (|| {
@@ -7707,7 +8106,7 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "put multipart reclaim (root)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             for part in &reclaim.parts {
@@ -7725,7 +8124,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|e| MetadataError::Db {
                         context: "put multipart reclaim (part)",
-                        source: e,
+                        source: e.into(),
                     })?;
 
                 for segment in &part.segments {
@@ -7750,7 +8149,7 @@ impl PgMetadataStore for PgStore {
                         )
                         .map_err(|e| MetadataError::Db {
                             context: "put multipart reclaim (part segment)",
-                            source: e,
+                            source: e.into(),
                         })?;
                 }
             }
@@ -7794,7 +8193,7 @@ impl PgMetadataStore for PgStore {
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "get multipart reclaim (root)",
-                source: e,
+                source: e.into(),
             })?;
 
         let Some((bucket_name, key_name, generation_id, created_at)) = root else {
@@ -7811,7 +8210,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "get multipart reclaim (prepare parts)",
-                source: e,
+                source: e.into(),
             })?;
 
         let rows = stmt
@@ -7820,14 +8219,14 @@ impl PgMetadataStore for PgStore {
             })
             .map_err(|e| MetadataError::Db {
                 context: "get multipart reclaim (query parts)",
-                source: e,
+                source: e.into(),
             })?;
 
         let mut parts = Vec::new();
         for row in rows {
             let part_number = row.map_err(|e| MetadataError::Db {
                 context: "get multipart reclaim (part row)",
-                source: e,
+                source: e.into(),
             })?;
             let mut segment_stmt = self
                         .conn
@@ -7839,7 +8238,7 @@ impl PgMetadataStore for PgStore {
                         )
                         .map_err(|e| MetadataError::Db {
                             context: "get multipart reclaim (prepare part segments)",
-                            source: e,
+                            source: e.into(),
                         })?;
 
             let segments = segment_stmt
@@ -7866,12 +8265,12 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "get multipart reclaim (query part segments)",
-                    source: e,
+                    source: e.into(),
                 })?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| MetadataError::Db {
                     context: "get multipart reclaim (collect part segments)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             parts.push(MultipartReclaimPartRecord {
@@ -7984,11 +8383,11 @@ impl PgMetadataStore for PgStore {
         }
         let now = i64::try_from(now).map_err(|source| MetadataError::Db {
             context: "get bucket delete finalize roots now",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let limit_i64 = i64::try_from(limit).map_err(|source| MetadataError::Db {
             context: "get bucket delete finalize roots limit",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
 
         let mut roots = Vec::new();
@@ -8032,7 +8431,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "prepare get bucket delete finalize roots",
-                source,
+                source: source.into(),
             })?;
         let rows = stmt
             .query_map(
@@ -8041,12 +8440,12 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "query get bucket delete finalize roots",
-                source,
+                source: source.into(),
             })?;
         for row in rows {
             let root = row.map_err(|source| MetadataError::Db {
                 context: "row get bucket delete finalize roots",
-                source,
+                source: source.into(),
             })?;
             if roots.iter().any(|existing| existing == &root) {
                 continue;
@@ -8070,11 +8469,11 @@ impl PgMetadataStore for PgStore {
         }
         let now = i64::try_from(now).map_err(|source| MetadataError::Db {
             context: "get lifecycle sweep roots now",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let limit_i64 = i64::try_from(limit).map_err(|source| MetadataError::Db {
             context: "get lifecycle sweep roots limit",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
 
         self.with_immediate_txn(
@@ -8115,7 +8514,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "clear stale expired lifecycle sweep claims",
-                        source,
+                        source: source.into(),
                     })?;
 
                 let mut roots = Vec::new();
@@ -8130,18 +8529,18 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "prepare get expired lifecycle sweep claim roots",
-                        source,
+                        source: source.into(),
                     })?;
                 let expired_rows = expired_stmt
                     .query_map(params![now, limit_i64], lifecycle_sweep_root_from_row)
                     .map_err(|source| MetadataError::Db {
                         context: "query get expired lifecycle sweep claim roots",
-                        source,
+                        source: source.into(),
                     })?;
                 for row in expired_rows {
                     roots.push(row.map_err(|source| MetadataError::Db {
                         context: "row get expired lifecycle sweep claim roots",
-                        source,
+                        source: source.into(),
                     })?);
                 }
                 drop(expired_stmt);
@@ -8153,7 +8552,7 @@ impl PgMetadataStore for PgStore {
                 let remaining_limit =
                     i64::try_from(limit - roots.len()).map_err(|source| MetadataError::Db {
                         context: "get lifecycle busy roots remaining limit",
-                        source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                        source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
                     })?;
 
                 let mut busy_stmt = store
@@ -8186,7 +8585,7 @@ impl PgMetadataStore for PgStore {
                     ))
                     .map_err(|source| MetadataError::Db {
                         context: "prepare get busy lifecycle sweep roots",
-                        source,
+                        source: source.into(),
                     })?;
                 let busy_rows = busy_stmt
                     .query_map(
@@ -8200,12 +8599,12 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "query get busy lifecycle sweep roots",
-                        source,
+                        source: source.into(),
                     })?;
                 for row in busy_rows {
                     let root = row.map_err(|source| MetadataError::Db {
                         context: "row get busy lifecycle sweep roots",
-                        source,
+                        source: source.into(),
                     })?;
                     roots.push(root);
                 }
@@ -8218,7 +8617,7 @@ impl PgMetadataStore for PgStore {
                 let remaining_limit =
                     i64::try_from(limit - roots.len()).map_err(|source| MetadataError::Db {
                         context: "get lifecycle sweep roots remaining limit",
-                        source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                        source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
                     })?;
 
                 let mut stmt = store
@@ -8261,7 +8660,7 @@ impl PgMetadataStore for PgStore {
                     ))
                     .map_err(|source| MetadataError::Db {
                         context: "prepare get lifecycle sweep roots",
-                        source,
+                        source: source.into(),
                     })?;
                 let rows = stmt
                     .query_map(
@@ -8274,12 +8673,12 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "query get lifecycle sweep roots",
-                        source,
+                        source: source.into(),
                     })?;
                 for row in rows {
                     let root = row.map_err(|source| MetadataError::Db {
                         context: "row get lifecycle sweep roots",
-                        source,
+                        source: source.into(),
                     })?;
                     roots.push(root);
                 }
@@ -8307,18 +8706,18 @@ impl PgMetadataStore for PgStore {
         let bucket_incarnation_generation =
             i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
                 context: "acquire object payload reclaim claim incarnation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let claimed_at = i64::try_from(claimed_at).map_err(|source| MetadataError::Db {
             context: "acquire object payload reclaim claim claimed_at",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let lease_deadline = lease_deadline
             .map(i64::try_from)
             .transpose()
             .map_err(|source| MetadataError::Db {
                 context: "acquire object payload reclaim claim lease_deadline",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
 
         self.with_immediate_txn(
@@ -8339,7 +8738,7 @@ impl PgMetadataStore for PgStore {
                     .optional()
                     .map_err(|source| MetadataError::Db {
                         context: "load object payload reclaim claim",
-                        source,
+                        source: source.into(),
                     })?;
                 let mut attempt_count = 1_i64;
                 if let Some(existing) = existing {
@@ -8366,7 +8765,7 @@ impl PgMetadataStore for PgStore {
                         i64::try_from(existing.attempt_count.saturating_add(1)).map_err(
                             |source| MetadataError::Db {
                                 context: "acquire object payload reclaim claim attempt_count",
-                                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
                             },
                         )?;
                     store
@@ -8377,7 +8776,7 @@ impl PgMetadataStore for PgStore {
                         )
                         .map_err(|source| MetadataError::Db {
                             context: "clear expired object payload reclaim claim",
-                            source,
+                            source: source.into(),
                         })?;
                 }
 
@@ -8398,7 +8797,7 @@ impl PgMetadataStore for PgStore {
                 .optional()
                 .map_err(|source| MetadataError::Db {
                     context: "acquire object payload reclaim claim (check root)",
-                    source,
+                    source: source.into(),
                 })?
                 .is_some();
                 if !root_exists {
@@ -8430,7 +8829,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "insert object payload reclaim claim",
-                        source,
+                        source: source.into(),
                     })?;
 
                 store
@@ -8447,7 +8846,7 @@ impl PgMetadataStore for PgStore {
                     .optional()
                     .map_err(|source| MetadataError::Db {
                         context: "reload object payload reclaim claim",
-                        source,
+                        source: source.into(),
                     })
             },
         )
@@ -8469,7 +8868,7 @@ impl PgMetadataStore for PgStore {
             .optional()
             .map_err(|source| MetadataError::Db {
                 context: "load object payload reclaim claim",
-                source,
+                source: source.into(),
             })
     }
 
@@ -8488,7 +8887,7 @@ impl PgMetadataStore for PgStore {
         let bucket_incarnation_generation =
             i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
                 context: "release object payload reclaim claim incarnation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         self.with_immediate_txn(
             "release object payload reclaim claim (begin txn)",
@@ -8514,7 +8913,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "release object payload reclaim claim",
-                        source,
+                        source: source.into(),
                     })?;
                 if deleted == 0 {
                     let claim_exists = store
@@ -8527,7 +8926,7 @@ impl PgMetadataStore for PgStore {
                         .optional()
                         .map_err(|source| MetadataError::Db {
                             context: "release object payload reclaim claim (check existing)",
-                            source,
+                            source: source.into(),
                         })?
                         .is_some();
                     let error = if claim_exists {
@@ -8561,18 +8960,18 @@ impl PgMetadataStore for PgStore {
         let bucket_incarnation_generation =
             i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
                 context: "acquire bucket delete finalize claim incarnation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let claimed_at = i64::try_from(claimed_at).map_err(|source| MetadataError::Db {
             context: "acquire bucket delete finalize claim claimed_at",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let lease_deadline = lease_deadline
             .map(i64::try_from)
             .transpose()
             .map_err(|source| MetadataError::Db {
                 context: "acquire bucket delete finalize claim lease_deadline",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
 
         self.with_immediate_txn(
@@ -8592,7 +8991,7 @@ impl PgMetadataStore for PgStore {
                     .optional()
                     .map_err(|source| MetadataError::Db {
                         context: "load bucket delete finalize claim",
-                        source,
+                        source: source.into(),
                     })?;
                 let mut attempt_count = 1_i64;
                 if let Some(existing) = existing {
@@ -8622,7 +9021,7 @@ impl PgMetadataStore for PgStore {
                             .optional()
                             .map_err(|source| MetadataError::Db {
                                 context: "acquire bucket delete finalize claim (check existing claim bucket)",
-                                source,
+                                source: source.into(),
                             })?
                             .is_some();
                         if existing_bucket_still_deleting {
@@ -8636,7 +9035,7 @@ impl PgMetadataStore for PgStore {
                             )
                             .map_err(|source| MetadataError::Db {
                                 context: "clear stale terminal bucket delete finalize claim",
-                                source,
+                                source: source.into(),
                             })?;
                     } else if existing.lease_deadline.is_none_or(|deadline| deadline > now) {
                         return Ok(None);
@@ -8645,7 +9044,7 @@ impl PgMetadataStore for PgStore {
                             i64::try_from(existing.attempt_count.saturating_add(1)).map_err(
                                 |source| MetadataError::Db {
                                     context: "acquire bucket delete finalize claim attempt_count",
-                                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                                    source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
                                 },
                             )?;
                         store
@@ -8656,7 +9055,7 @@ impl PgMetadataStore for PgStore {
                             )
                             .map_err(|source| MetadataError::Db {
                                 context: "clear expired bucket delete finalize claim",
-                                source,
+                                source: source.into(),
                             })?;
                     }
                 }
@@ -8676,7 +9075,7 @@ impl PgMetadataStore for PgStore {
                     .optional()
                     .map_err(|source| MetadataError::Db {
                         context: "acquire bucket delete finalize claim (check bucket)",
-                        source,
+                        source: source.into(),
                     })?
                     .is_some();
                 if !deleting_bucket_exists {
@@ -8704,7 +9103,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "insert bucket delete finalize claim",
-                        source,
+                        source: source.into(),
                     })?;
 
                 store
@@ -8720,7 +9119,7 @@ impl PgMetadataStore for PgStore {
                     .optional()
                     .map_err(|source| MetadataError::Db {
                         context: "reload bucket delete finalize claim",
-                        source,
+                        source: source.into(),
                     })
             },
         )
@@ -8737,7 +9136,7 @@ impl PgMetadataStore for PgStore {
         let bucket_incarnation_generation =
             i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
                 context: "release bucket delete finalize claim incarnation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         self.with_immediate_txn(
             "release bucket delete finalize claim (begin txn)",
@@ -8759,7 +9158,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "release bucket delete finalize claim",
-                        source,
+                        source: source.into(),
                     })?;
                 if deleted == 0 {
                     let claim_exists = store
@@ -8772,7 +9171,7 @@ impl PgMetadataStore for PgStore {
                         .optional()
                         .map_err(|source| MetadataError::Db {
                             context: "release bucket delete finalize claim (check existing)",
-                            source,
+                            source: source.into(),
                         })?
                         .is_some();
                     let error = if claim_exists {
@@ -8820,18 +9219,18 @@ impl PgMetadataStore for PgStore {
         let bucket_incarnation_generation =
             i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
                 context: "acquire lifecycle sweep claim incarnation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let claimed_at = i64::try_from(claimed_at).map_err(|source| MetadataError::Db {
             context: "acquire lifecycle sweep claim claimed_at",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let lease_deadline = lease_deadline
             .map(i64::try_from)
             .transpose()
             .map_err(|source| MetadataError::Db {
                 context: "acquire lifecycle sweep claim lease_deadline",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
 
         self.with_immediate_txn(
@@ -8852,7 +9251,7 @@ impl PgMetadataStore for PgStore {
                     .optional()
                     .map_err(|source| MetadataError::Db {
                         context: "load lifecycle sweep claim",
-                        source,
+                        source: source.into(),
                     })?;
                 let mut attempt_count = 1_i64;
                 let mut last_error: Option<String> = None;
@@ -8872,7 +9271,9 @@ impl PgMetadataStore for PgStore {
                     attempt_count = i64::try_from(existing.attempt_count.saturating_add(1))
                         .map_err(|source| MetadataError::Db {
                             context: "acquire lifecycle sweep claim attempt_count",
-                            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                            source: crate::error::DatabaseError::to_sql_conversion_failure(
+                                Box::new(source),
+                            ),
                         })?;
                     last_error = existing.last_error;
                     store
@@ -8884,7 +9285,7 @@ impl PgMetadataStore for PgStore {
                         )
                         .map_err(|source| MetadataError::Db {
                             context: "clear expired lifecycle sweep claim",
-                            source,
+                            source: source.into(),
                         })?;
                 }
 
@@ -8923,7 +9324,7 @@ impl PgMetadataStore for PgStore {
                     .optional()
                     .map_err(|source| MetadataError::Db {
                         context: "acquire lifecycle sweep claim (check bucket)",
-                        source,
+                        source: source.into(),
                     })?
                     .is_some();
                 if !claimable_bucket_exists {
@@ -8953,7 +9354,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "insert lifecycle sweep claim",
-                        source,
+                        source: source.into(),
                     })?;
 
                 store
@@ -8970,7 +9371,7 @@ impl PgMetadataStore for PgStore {
                     .optional()
                     .map_err(|source| MetadataError::Db {
                         context: "reload lifecycle sweep claim",
-                        source,
+                        source: source.into(),
                     })
             },
         )
@@ -8990,18 +9391,18 @@ impl PgMetadataStore for PgStore {
         let bucket_incarnation_generation =
             i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
                 context: "heartbeat lifecycle sweep claim incarnation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let heartbeat_at = i64::try_from(heartbeat_at).map_err(|source| MetadataError::Db {
             context: "heartbeat lifecycle sweep claim heartbeat_at",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let lease_deadline = lease_deadline
             .map(i64::try_from)
             .transpose()
             .map_err(|source| MetadataError::Db {
                 context: "heartbeat lifecycle sweep claim lease_deadline",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
 
         self.with_immediate_txn(
@@ -9027,7 +9428,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "heartbeat lifecycle sweep claim",
-                        source,
+                        source: source.into(),
                     })?;
                 if updated == 0 {
                     let claim_exists = store
@@ -9041,7 +9442,7 @@ impl PgMetadataStore for PgStore {
                         .optional()
                         .map_err(|source| MetadataError::Db {
                             context: "heartbeat lifecycle sweep claim (check existing)",
-                            source,
+                            source: source.into(),
                         })?
                         .is_some();
                     let error = if claim_exists {
@@ -9069,7 +9470,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "reload heartbeat lifecycle sweep claim",
-                        source,
+                        source: source.into(),
                     })
             },
         )
@@ -9088,7 +9489,7 @@ impl PgMetadataStore for PgStore {
         let bucket_incarnation_generation =
             i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
                 context: "record lifecycle sweep claim error incarnation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         self.with_immediate_txn(
             "record lifecycle sweep claim error (begin txn)",
@@ -9112,7 +9513,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "record lifecycle sweep claim error",
-                        source,
+                        source: source.into(),
                     })?;
                 if updated == 0 {
                     let claim_exists = store
@@ -9126,7 +9527,7 @@ impl PgMetadataStore for PgStore {
                         .optional()
                         .map_err(|source| MetadataError::Db {
                             context: "record lifecycle sweep claim error (check existing)",
-                            source,
+                            source: source.into(),
                         })?
                         .is_some();
                     let error = if claim_exists {
@@ -9154,7 +9555,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "reload lifecycle sweep claim error",
-                        source,
+                        source: source.into(),
                     })
             },
         )
@@ -9171,7 +9572,7 @@ impl PgMetadataStore for PgStore {
         let bucket_incarnation_generation =
             i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
                 context: "release lifecycle sweep claim incarnation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         self.with_immediate_txn(
             "release lifecycle sweep claim (begin txn)",
@@ -9193,7 +9594,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "release lifecycle sweep claim",
-                        source,
+                        source: source.into(),
                     })?;
                 if deleted == 0 {
                     let claim_exists = store
@@ -9207,7 +9608,7 @@ impl PgMetadataStore for PgStore {
                         .optional()
                         .map_err(|source| MetadataError::Db {
                             context: "release lifecycle sweep claim (check existing)",
-                            source,
+                            source: source.into(),
                         })?
                         .is_some();
                     let error = if claim_exists {
@@ -9449,7 +9850,7 @@ impl PgMetadataStore for PgStore {
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "get multipart upload",
-                source: e,
+                source: e.into(),
             })?
             .ok_or_else(|| MetadataError::NoSuchUpload {
                 upload_id: upload_id.to_string(),
@@ -9475,7 +9876,7 @@ impl PgMetadataStore for PgStore {
                 .optional()
                 .map_err(|e| MetadataError::Db {
                     context: "set upload state (exists check)",
-                    source: e,
+                    source: e.into(),
                 })?;
             return match current {
                 Some(state) => Err(MetadataError::UploadNotInProgress { state }),
@@ -9493,7 +9894,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "set upload state",
-                source: e,
+                source: e.into(),
             })?;
         if updated == 0 {
             // Either the upload doesn't exist or it's not InProgress.
@@ -9507,7 +9908,7 @@ impl PgMetadataStore for PgStore {
                 .optional()
                 .map_err(|e| MetadataError::Db {
                     context: "set upload state (check)",
-                    source: e,
+                    source: e.into(),
                 })?;
             return match current {
                 None => Err(MetadataError::NoSuchUpload {
@@ -9525,7 +9926,7 @@ impl PgMetadataStore for PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
                 context: "delete multipart upload (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
         let result = (|| -> Result<(), MetadataError> {
@@ -9537,7 +9938,7 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "delete multipart upload generation reservation",
-                    source: e,
+                    source: e.into(),
                 })?;
             let deleted = self
                 .conn
@@ -9547,7 +9948,7 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "delete multipart upload",
-                    source: e,
+                    source: e.into(),
                 })?;
             if deleted == 0 {
                 return Err(MetadataError::NoSuchUpload {
@@ -9665,7 +10066,7 @@ impl PgMetadataStore for PgStore {
             .prepare_cached(&sql)
             .map_err(|e| MetadataError::Db {
                 context: "prepare list multipart uploads",
-                source: e,
+                source: e.into(),
             })?;
 
         let rows = stmt
@@ -9764,14 +10165,14 @@ impl PgMetadataStore for PgStore {
             })
             .map_err(|e| MetadataError::Db {
                 context: "list multipart uploads query",
-                source: e,
+                source: e.into(),
             })?;
 
         let mut uploads: Vec<MultipartUploadRecord> = Vec::new();
         for row in rows {
             uploads.push(row.map_err(|e| MetadataError::Db {
                 context: "list multipart uploads row",
-                source: e,
+                source: e.into(),
             })?);
         }
 
@@ -9804,7 +10205,7 @@ impl PgMetadataStore for PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
                 context: "upsert part (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
         let result = (|| -> Result<Option<u32>, rusqlite::Error> {
@@ -9861,7 +10262,7 @@ impl PgMetadataStore for PgStore {
                 }
                 Err(MetadataError::Db {
                     context: "upsert multipart part",
-                    source: e,
+                    source: e.into(),
                 })
             }
         }
@@ -9877,7 +10278,7 @@ impl PgMetadataStore for PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
                 context: "upsert multipart part segments (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
         let result =
@@ -10022,7 +10423,7 @@ impl PgMetadataStore for PgStore {
                 }
                 Err(MetadataError::Db {
                     context: "upsert multipart part segments",
-                    source: e,
+                    source: e.into(),
                 })
             }
         }
@@ -10044,7 +10445,7 @@ impl PgMetadataStore for PgStore {
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "get multipart part",
-                source: e,
+                source: e.into(),
             })?
             .ok_or(MetadataError::PartNotFound {
                 upload_id: upload_id.to_string(),
@@ -10064,7 +10465,7 @@ impl PgMetadataStore for PgStore {
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "list parts (upload exists check)",
-                source: e,
+                source: e.into(),
             })?;
         if exists.is_none() {
             return Err(MetadataError::NoSuchUpload {
@@ -10109,21 +10510,21 @@ impl PgMetadataStore for PgStore {
             .prepare_cached(&sql)
             .map_err(|e| MetadataError::Db {
                 context: "prepare list multipart parts",
-                source: e,
+                source: e.into(),
             })?;
 
         let rows = stmt
             .query_map(params_refs.as_slice(), Self::row_to_multipart_part)
             .map_err(|e| MetadataError::Db {
                 context: "list multipart parts query",
-                source: e,
+                source: e.into(),
             })?;
 
         let mut parts: Vec<MultipartPartRecord> = Vec::new();
         for row in rows {
             parts.push(row.map_err(|e| MetadataError::Db {
                 context: "list multipart parts row",
-                source: e,
+                source: e.into(),
             })?);
         }
 
@@ -10150,10 +10551,10 @@ impl PgMetadataStore for PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
                 context: "commit object parts (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
-        let result = (|| {
+        let result: Result<(), rusqlite::Error> = (|| {
             let mut stmt = self.conn.prepare_cached(
                 "INSERT INTO object_parts \
                  (bucket, key, version_id, part_number, object_offset_start, size, payload_crc64, etag, etag_kind, \
@@ -10196,7 +10597,7 @@ impl PgMetadataStore for PgStore {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(MetadataError::Db {
                     context: "commit object parts",
-                    source: e,
+                    source: e.into(),
                 })
             }
         }
@@ -10219,7 +10620,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare get object parts",
-                source: e,
+                source: e.into(),
             })?;
 
         let rows = stmt
@@ -10229,14 +10630,14 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "get object parts query",
-                source: e,
+                source: e.into(),
             })?;
 
         let mut parts = Vec::new();
         for row in rows {
             parts.push(row.map_err(|e| MetadataError::Db {
                 context: "get object parts row",
-                source: e,
+                source: e.into(),
             })?);
         }
         Ok(parts)
@@ -10269,7 +10670,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare get object parts overlapping range first part",
-                source: e,
+                source: e.into(),
             })?;
 
         let first = first_stmt
@@ -10280,7 +10681,7 @@ impl PgMetadataStore for PgStore {
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "get object parts overlapping range first part",
-                source: e,
+                source: e.into(),
             })?;
 
         let Some(first) = first else {
@@ -10307,7 +10708,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare get object parts overlapping range tail parts",
-                source: e,
+                source: e.into(),
             })?;
 
         let rows = tail_stmt
@@ -10323,13 +10724,13 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "get object parts overlapping range tail parts",
-                source: e,
+                source: e.into(),
             })?;
 
         for row in rows {
             parts.push(row.map_err(|e| MetadataError::Db {
                 context: "get object parts overlapping range tail row",
-                source: e,
+                source: e.into(),
             })?);
         }
 
@@ -10347,7 +10748,6 @@ impl PgMetadataStore for PgStore {
     }
 
     #[cfg(test)]
-    #[cfg(test)]
     fn complete_multipart_commit(
         &self,
         upload_id: &UploadId,
@@ -10357,7 +10757,7 @@ impl PgMetadataStore for PgStore {
         if parts.is_empty() {
             return Err(MetadataError::Db {
                 context: "complete multipart commit (empty parts)",
-                source: rusqlite::Error::FromSqlConversionFailure(
+                source: crate::error::DatabaseError::from_sql_conversion_failure(
                     0,
                     rusqlite::types::Type::Null,
                     Box::from("multipart commit requires at least one part"),
@@ -10383,7 +10783,7 @@ impl PgMetadataStore for PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
                 context: "complete multipart commit (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
         let result = (|| -> Result<CompleteMultipartCommitCleanup, rusqlite::Error> {
@@ -10526,12 +10926,7 @@ impl PgMetadataStore for PgStore {
                 Self::object_lock_sql_values(obj.object_lock)?;
             let write_sequence = self
                 .next_object_write_sequence(obj.bucket.as_str(), obj.key.as_str())
-                .map_err(|error| match error {
-                    MetadataError::Db { source, .. } => source,
-                    other => rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        std::io::Error::other(other.to_string()),
-                    )),
-                })?;
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             self.mark_current_live_noncurrent(
                 obj.bucket.as_str(),
                 obj.key.as_str(),
@@ -10539,24 +10934,14 @@ impl PgMetadataStore for PgStore {
                 now,
             )?;
             self.advance_object_version_counter_in_open_txn(&obj.bucket, &obj.key, obj.version_id)
-                .map_err(|error| match error {
-                    MetadataError::Db { source, .. } => source,
-                    other => rusqlite::Error::ToSqlConversionFailure(Box::new(
-                        std::io::Error::other(other.to_string()),
-                    )),
-                })?;
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             self.advance_object_write_counter_in_open_txn(
                 &obj.bucket,
                 &obj.key,
                 write_sequence,
                 Some(obj.generation_id),
             )
-            .map_err(|error| match error {
-                MetadataError::Db { source, .. } => source,
-                other => rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
-                    other.to_string(),
-                ))),
-            })?;
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
 
             // 2. Write/overwrite object metadata row.
             let obj_sql = if obj.version_id.is_null() {
@@ -10731,7 +11116,7 @@ impl PgMetadataStore for PgStore {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(MetadataError::Db {
                     context: "complete multipart commit",
-                    source: e,
+                    source: e.into(),
                 })
             }
         }
@@ -10774,7 +11159,7 @@ impl PgMetadataStore for PgStore {
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "get stream upload",
-                source: e,
+                source: e.into(),
             })?
             .ok_or_else(|| MetadataError::StreamSessionNotFound {
                 session_id: session_id.as_str().to_owned(),
@@ -10796,33 +11181,33 @@ impl PgMetadataStore for PgStore {
         let current_cluster_epoch =
             i64::try_from(current.cluster_epoch.get()).map_err(|source| MetadataError::Db {
                 context: "update stream upload bucket write reservation current cluster epoch",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let current_execution_generation = i64::try_from(current.bucket_execution_generation)
             .map_err(|source| MetadataError::Db {
                 context:
                     "update stream upload bucket write reservation current execution generation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let current_incarnation_generation = i64::try_from(current.bucket_incarnation_generation)
             .map_err(|source| MetadataError::Db {
             context: "update stream upload bucket write reservation current incarnation generation",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
         let current_created_at =
             i64::try_from(current.created_at).map_err(|source| MetadataError::Db {
                 context: "update stream upload bucket write reservation current created_at",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let current_lease_deadline =
             i64::try_from(current.lease_deadline).map_err(|source| MetadataError::Db {
                 context: "update stream upload bucket write reservation current lease deadline",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let renewed_lease_deadline =
             i64::try_from(renewed.lease_deadline).map_err(|source| MetadataError::Db {
                 context: "update stream upload bucket write reservation renewed lease deadline",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let updated = self
             .conn
@@ -10858,7 +11243,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "update stream upload bucket write reservation",
-                source,
+                source: source.into(),
             })?;
         if updated == 0 {
             return Err(MetadataError::BucketWriteReservationConflict {
@@ -10885,7 +11270,7 @@ impl PgMetadataStore for PgStore {
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "allocate stream segment VID",
-                source: e,
+                source: e.into(),
             })?;
         match allocated {
             Some(vid) => Ok(vid),
@@ -10922,18 +11307,18 @@ impl PgMetadataStore for PgStore {
             .prepare_cached(STREAM_UPLOAD_SELECT)
             .map_err(|e| MetadataError::Db {
                 context: "list all stream uploads (prepare)",
-                source: e,
+                source: e.into(),
             })?;
         let rows = stmt
             .query_map([], parse_stream_upload_record)
             .map_err(|e| MetadataError::Db {
                 context: "list all stream uploads (query)",
-                source: e,
+                source: e.into(),
             })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| MetadataError::Db {
                 context: "list all stream uploads (collect)",
-                source: e,
+                source: e.into(),
             })
     }
 
@@ -10959,7 +11344,7 @@ impl PgMetadataStore for PgStore {
             .prepare_cached(&sql)
             .map_err(|e| MetadataError::Db {
                 context: "list all stream uploads page (prepare)",
-                source: e,
+                source: e.into(),
             })?;
         let rows = stmt
             .query_map(
@@ -10968,13 +11353,13 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "list all stream uploads page (query)",
-                source: e,
+                source: e.into(),
             })?;
         let mut uploads = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| MetadataError::Db {
                 context: "list all stream uploads page (collect)",
-                source: e,
+                source: e.into(),
             })?;
         let next_session_id_marker = if uploads.len() > limit as usize {
             uploads.pop();
@@ -11017,7 +11402,7 @@ impl PgMetadataStore for PgStore {
             .prepare_cached(&sql)
             .map_err(|e| MetadataError::Db {
                 context: "list stream uploads for bucket page (prepare)",
-                source: e,
+                source: e.into(),
             })?;
         let rows = stmt
             .query_map(
@@ -11026,13 +11411,13 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "list stream uploads for bucket page (query)",
-                source: e,
+                source: e.into(),
             })?;
         let mut uploads = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| MetadataError::Db {
                 context: "list stream uploads for bucket page (collect)",
-                source: e,
+                source: e.into(),
             })?;
         let next_session_id_marker = if uploads.len() > limit as usize {
             uploads.pop();
@@ -11067,7 +11452,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare list stream segments",
-                source: e,
+                source: e.into(),
             })?;
 
         let rows = stmt
@@ -11098,14 +11483,14 @@ impl PgMetadataStore for PgStore {
             })
             .map_err(|e| MetadataError::Db {
                 context: "list stream segments",
-                source: e,
+                source: e.into(),
             })?;
 
         let mut segments = Vec::new();
         for row in rows {
             segments.push(row.map_err(|e| MetadataError::Db {
                 context: "list stream segments row",
-                source: e,
+                source: e.into(),
             })?);
         }
         Ok(segments)
@@ -11119,7 +11504,7 @@ impl PgMetadataStore for PgStore {
     ) -> Result<(), MetadataError> {
         obj.validate().map_err(|err| MetadataError::Db {
             context: "put segment object (etag/layout mismatch)",
-            source: rusqlite::Error::FromSqlConversionFailure(
+            source: crate::error::DatabaseError::from_sql_conversion_failure(
                 0,
                 rusqlite::types::Type::Null,
                 Box::new(err),
@@ -11128,7 +11513,7 @@ impl PgMetadataStore for PgStore {
         if obj.layout != ObjectLayout::Standard {
             return Err(MetadataError::Db {
                 context: "put segment object (non-segment layout)",
-                source: rusqlite::Error::FromSqlConversionFailure(
+                source: crate::error::DatabaseError::from_sql_conversion_failure(
                     0,
                     rusqlite::types::Type::Null,
                     Box::from("put_object_with_segments requires Standard layout"),
@@ -11140,7 +11525,7 @@ impl PgMetadataStore for PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
                 context: "put segment object (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
         let result: Result<(), MetadataError> = (|| {
@@ -11161,7 +11546,7 @@ impl PgMetadataStore for PgStore {
             let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
                 Self::object_lock_sql_values(obj.object_lock).map_err(|e| MetadataError::Db {
                     context: "put segment object (encode object lock)",
-                    source: e,
+                    source: e.into(),
                 })?;
             let encryption_type = obj.encryption.encryption_type() as u8;
             let encryption_state = obj.encryption.encode_state();
@@ -11175,7 +11560,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "put segment object (mark noncurrent)",
-                source: e,
+                source: e.into(),
             })?;
             self.advance_object_version_counter_in_open_txn(&obj.bucket, &obj.key, obj.version_id)?;
 
@@ -11224,7 +11609,7 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "put segment object (write object)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             self.conn
@@ -11235,7 +11620,7 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "put segment object (delete prior segments)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             let mut stmt = self
@@ -11248,7 +11633,7 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "put segment object (prepare insert segments)",
-                    source: e,
+                    source: e.into(),
                 })?;
             for segment in segments {
                 if segment.bucket != obj.bucket
@@ -11257,7 +11642,7 @@ impl PgMetadataStore for PgStore {
                 {
                     return Err(MetadataError::Db {
                         context: "put segment object (segment object mismatch)",
-                        source: rusqlite::Error::FromSqlConversionFailure(
+                        source: crate::error::DatabaseError::from_sql_conversion_failure(
                             0,
                             rusqlite::types::Type::Null,
                             Box::from("segment row does not match object identity"),
@@ -11280,7 +11665,7 @@ impl PgMetadataStore for PgStore {
                 ])
                 .map_err(|e| MetadataError::Db {
                     context: "put segment object (insert segment)",
-                    source: e,
+                    source: e.into(),
                 })?;
             }
 
@@ -11310,7 +11695,7 @@ impl PgMetadataStore for PgStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
                 context: "commit stream part (begin txn)",
-                source: e,
+                source: e.into(),
             })?;
 
         let result: Result<Vec<MultipartPartSegmentRecord>, MetadataError> = (|| {
@@ -11345,7 +11730,7 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "commit stream part (set completing)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             // 2. Upsert multipart part metadata.
@@ -11360,7 +11745,7 @@ impl PgMetadataStore for PgStore {
                 .optional()
                 .map_err(|e| MetadataError::Db {
                     context: "commit stream part (read prev gen)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             let new_gen = prev_gen.map_or(0, |g| g + 1);
@@ -11389,7 +11774,7 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "commit stream part (upsert part)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             // 3. Capture prior part segments for this upload+part before deleting
@@ -11405,7 +11790,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|e| MetadataError::Db {
                         context: "commit stream part (prepare displaced segments)",
-                        source: e,
+                        source: e.into(),
                     })?;
 
                 let rows = stmt
@@ -11442,14 +11827,14 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|e| MetadataError::Db {
                         context: "commit stream part (query displaced segments)",
-                        source: e,
+                        source: e.into(),
                     })?;
 
                 let mut displaced = Vec::new();
                 for row in rows {
                     displaced.push(row.map_err(|e| MetadataError::Db {
                         context: "commit stream part (read displaced segment row)",
-                        source: e,
+                        source: e.into(),
                     })?);
                 }
                 displaced
@@ -11466,7 +11851,7 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "commit stream part (delete prior segments)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             // 5. Insert committed multipart part segment rows.
@@ -11481,7 +11866,7 @@ impl PgMetadataStore for PgStore {
                     )
                     .map_err(|e| MetadataError::Db {
                         context: "commit stream part (prepare insert segments)",
-                        source: e,
+                        source: e.into(),
                     })?;
                 for segment in segments {
                     if segment.bucket != sess_bucket
@@ -11512,7 +11897,7 @@ impl PgMetadataStore for PgStore {
                     ])
                     .map_err(|e| MetadataError::Db {
                         context: "commit stream part (insert segment)",
-                        source: e,
+                        source: e.into(),
                     })?;
                 }
             }
@@ -11525,7 +11910,7 @@ impl PgMetadataStore for PgStore {
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "commit stream part (delete staging)",
-                    source: e,
+                    source: e.into(),
                 })?;
 
             Ok(displaced_segments)
@@ -11559,7 +11944,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare get stream object segments",
-                source: e,
+                source: e.into(),
             })?;
 
         let rows = stmt
@@ -11591,14 +11976,14 @@ impl PgMetadataStore for PgStore {
             })
             .map_err(|e| MetadataError::Db {
                 context: "get stream object segments",
-                source: e,
+                source: e.into(),
             })?;
 
         let mut segments = Vec::new();
         for row in rows {
             segments.push(row.map_err(|e| MetadataError::Db {
                 context: "get stream object segments row",
-                source: e,
+                source: e.into(),
             })?);
         }
         Ok(segments)
@@ -11631,7 +12016,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare get multipart part segments",
-                source: e,
+                source: e.into(),
             })?;
 
         let rows = stmt
@@ -11668,14 +12053,14 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "get multipart part segments",
-                source: e,
+                source: e.into(),
             })?;
 
         let mut segments = Vec::new();
         for row in rows {
             segments.push(row.map_err(|e| MetadataError::Db {
                 context: "get multipart part segments row",
-                source: e,
+                source: e.into(),
             })?);
         }
         Ok(segments)
@@ -11699,7 +12084,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "prepare get multipart part segments for upload part",
-                source: e,
+                source: e.into(),
             })?;
 
         let rows = stmt
@@ -11733,13 +12118,13 @@ impl PgMetadataStore for PgStore {
             })
             .map_err(|e| MetadataError::Db {
                 context: "get multipart part segments for upload part",
-                source: e,
+                source: e.into(),
             })?;
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| MetadataError::Db {
                 context: "get multipart part segments for upload part row",
-                source: e,
+                source: e.into(),
             })
     }
 
@@ -11768,7 +12153,7 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "get all multipart part segments for upload (prepare)",
-                source: e,
+                source: e.into(),
             })?;
         let rows = stmt
             .query_map(params![upload_id.as_str()], |row| {
@@ -11801,12 +12186,12 @@ impl PgMetadataStore for PgStore {
             })
             .map_err(|e| MetadataError::Db {
                 context: "get all multipart part segments for upload (query)",
-                source: e,
+                source: e.into(),
             })?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| MetadataError::Db {
                 context: "get all multipart part segments for upload (collect)",
-                source: e,
+                source: e.into(),
             })
     }
 
@@ -11833,14 +12218,14 @@ impl PgStore {
         let bucket_incarnation_generation =
             i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
                 context: "test insert lifecycle sweep claim incarnation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         let lease_deadline = lease_deadline
             .map(i64::try_from)
             .transpose()
             .map_err(|source| MetadataError::Db {
                 context: "test insert lifecycle sweep claim lease deadline",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
             })?;
         self.conn
             .execute(
@@ -11860,7 +12245,7 @@ impl PgStore {
             )
             .map_err(|source| MetadataError::Db {
                 context: "test insert lifecycle sweep claim",
-                source,
+                source: source.into(),
             })?;
         Ok(())
     }
@@ -11879,7 +12264,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete object generation reservation",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -11898,7 +12283,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete object segments reclaim",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -11917,7 +12302,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete multipart reclaim",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -11936,7 +12321,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete object parts",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -11956,7 +12341,7 @@ impl PgStore {
             .optional()
             .map_err(|e| MetadataError::Db {
                 context: "get stream upload state",
-                source: e,
+                source: e.into(),
             })?
             .ok_or_else(|| MetadataError::StreamSessionNotFound {
                 session_id: session_id.as_str().to_owned(),
@@ -11973,7 +12358,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "set stream upload state",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -11989,7 +12374,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete stream upload",
-                source: e,
+                source: e.into(),
             })?;
         self.conn
             .execute(
@@ -11998,7 +12383,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete stream upload generation reservation",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -12028,7 +12413,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "append stream segment",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -12038,13 +12423,14 @@ impl PgStore {
         session_id: &SessionId,
         segment_vid: GenerationId,
     ) -> Result<(), MetadataError> {
-        let next_vid = segment_vid
-            .get()
-            .checked_add(1)
-            .ok_or_else(|| MetadataError::Db {
-                context: "advance stream segment VID floor overflow",
-                source: rusqlite::Error::InvalidQuery,
-            })?;
+        let next_vid =
+            segment_vid
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| MetadataError::InvariantViolation {
+                    context: "advance stream segment VID floor overflow",
+                    reason: "metadata state does not satisfy the operation invariant".into(),
+                })?;
         self.conn
             .execute(
                 "UPDATE stream_uploads \
@@ -12057,7 +12443,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "advance stream segment VID floor",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -12076,7 +12462,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete stream object segments",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -12095,7 +12481,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete multipart part segments",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }
@@ -12111,7 +12497,7 @@ impl PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete multipart part segments by upload_id",
-                source: e,
+                source: e.into(),
             })?;
         Ok(())
     }

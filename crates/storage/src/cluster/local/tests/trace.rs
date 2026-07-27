@@ -1296,23 +1296,25 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                         .unwrap();
                     crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
                     crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
-                    let (command_checksum, command_bytes, abandoned): (i64, Vec<u8>, i64) = pg
-                        .connection()
-                        .query_row(
-                            "SELECT command_checksum, command_bytes, abandoned \
-                                 FROM metadata_command_log \
-                                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
-                            rusqlite::params![
-                                current_epoch.get() as i64,
-                                pg_id.get() as i64,
-                                duplicate_index as i64 + 1,
-                            ],
-                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    let reissued_index = MetadataCommandLogIndex::new(duplicate_index + 1)
+                        .expect("trace duplicate index should not overflow");
+                    let entries = pg
+                        .retained_metadata_command_log_entries(
+                            node_id.as_u32(),
+                            current_epoch,
+                            reissued_index,
+                            reissued_index,
                         )
                         .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
-                    prop_assert_eq!(abandoned, 0);
-                    prop_assert_eq!(command_checksum as u64, reissued.checksum_crc64());
-                    prop_assert_eq!(command_bytes, reissued.command_bytes());
+                    prop_assert_eq!(entries.len(), 1);
+                    match &entries[0].kind {
+                        crate::metadata_command::MetadataCommandLogRangeEntryKind::Applied(
+                            command,
+                        ) => prop_assert_eq!(command.as_ref(), &reissued),
+                        crate::metadata_command::MetadataCommandLogRangeEntryKind::Abandoned {
+                            ..
+                        } => prop_assert!(false, "reissued command must not be abandoned"),
+                    }
                 }
                 assert_clean_metadata_command_stream(&map, &[0]);
             }

@@ -50,11 +50,32 @@ use crate::node_runtime::traits::{
     DurableBucketWriteReservationAcquire, DurableBucketWriteReservationHeartbeat, PgMetadataStore,
     ShardStore,
 };
-use crate::schema::{init_pg_schema, require_current_pg_schema};
 use crate::types::*;
 use placement::NodeId;
 
 const TRACE_TARGET: &str = "storage";
+
+impl From<rusqlite::Error> for crate::error::DatabaseError {
+    fn from(source: rusqlite::Error) -> Self {
+        Self::new(source.to_string())
+    }
+}
+
+impl crate::error::DatabaseError {
+    fn from_sql_conversion_failure(
+        index: usize,
+        value_type: rusqlite::types::Type,
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    ) -> Self {
+        rusqlite::Error::FromSqlConversionFailure(index, value_type, source).into()
+    }
+
+    fn to_sql_conversion_failure(
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    ) -> Self {
+        rusqlite::Error::ToSqlConversionFailure(source).into()
+    }
+}
 
 #[path = "pg_store/command_log.rs"]
 mod command_log;
@@ -64,8 +85,14 @@ mod metadata;
 mod rows;
 #[path = "pg_store/scavenger.rs"]
 mod scavenger;
+#[path = "pg_store/schema.rs"]
+mod schema;
 #[path = "pg_store/shards.rs"]
 mod shards;
+#[path = "pg_store/sql_types.rs"]
+mod sql_types;
+
+use schema::{init_pg_schema, require_current_pg_schema};
 
 pub(crate) use command_log::METADATA_CANONICAL_STATE_ENCODING_VERSION;
 #[cfg(test)]
@@ -336,7 +363,7 @@ fn parse_optional_cluster_epoch(
         .map(|raw| {
             let epoch = u64::try_from(raw).map_err(|_| StoreError::Db {
                 context,
-                source: rusqlite::Error::FromSqlConversionFailure(
+                source: crate::error::DatabaseError::from_sql_conversion_failure(
                     0,
                     rusqlite::types::Type::Integer,
                     Box::from("negative cluster epoch"),
@@ -344,7 +371,7 @@ fn parse_optional_cluster_epoch(
             })?;
             ClusterEpoch::new(epoch).ok_or_else(|| StoreError::Db {
                 context,
-                source: rusqlite::Error::FromSqlConversionFailure(
+                source: crate::error::DatabaseError::from_sql_conversion_failure(
                     0,
                     rusqlite::types::Type::Integer,
                     Box::from("zero cluster epoch"),
@@ -592,6 +619,14 @@ pub struct PgStore {
     metadata_command_log_replay_validation_entries: AtomicU64,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TestSqliteConfiguration {
+    pub(crate) temp_store: i64,
+    pub(crate) journal_mode: String,
+    pub(crate) synchronous: i64,
+}
+
 const PG_STORE_STATEMENT_CACHE_CAPACITY: usize = 1024;
 const SQLITE_PROFILE_DISABLED: u64 = u64::MAX;
 const UNCLEAN_METADATA_DIGEST_REVISION: u64 = u64::MAX;
@@ -650,7 +685,7 @@ pub fn initialize_pg_durable_identity(
         .optional()
         .map_err(|source| StoreError::Db {
             context: "load PG durable identity",
-            source,
+            source: source.into(),
         })?;
     match existing {
         Some((stored_pg_id, stored_identity))
@@ -671,7 +706,7 @@ pub fn initialize_pg_durable_identity(
                 )
                 .map_err(|source| StoreError::Db {
                     context: "persist PG durable identity",
-                    source,
+                    source: source.into(),
                 })?;
         }
     }
@@ -680,7 +715,7 @@ pub fn initialize_pg_durable_identity(
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
         .map_err(|source| StoreError::Db {
             context: "checkpoint PG durable identity",
-            source,
+            source: source.into(),
         })
 }
 
@@ -697,7 +732,7 @@ pub fn verify_pg_durable_identity(
         .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
         .map_err(|source| StoreError::Db {
             context: "check PG database integrity",
-            source,
+            source: source.into(),
         })?;
     if quick_check != "ok" {
         return Err(StoreError::PgDurableIdentityInvalid {
@@ -864,7 +899,7 @@ fn open_existing_pg_database_read_only(pg_dir: &Path) -> Result<Connection, Stor
     )
     .map_err(|source| StoreError::Db {
         context: "open existing PG database read-only",
-        source,
+        source: source.into(),
     })
 }
 
@@ -897,7 +932,7 @@ impl PgStore {
         let db_path = pg_dir.join("metadata.db");
         let conn = Connection::open(&db_path).map_err(|e| StoreError::Db {
             context: "open pg database",
-            source: e,
+            source: e.into(),
         })?;
         conn.set_prepared_statement_cache_capacity(PG_STORE_STATEMENT_CACHE_CAPACITY);
         install_sqlite_profile_hook(&conn);
@@ -905,17 +940,17 @@ impl PgStore {
         conn.execute_batch("PRAGMA recursive_triggers = ON")
             .map_err(|e| StoreError::Db {
                 context: "enable recursive pg database triggers",
-                source: e,
+                source: e.into(),
             })?;
         command_log::register_metadata_digest_sql_functions(&conn).map_err(|e| StoreError::Db {
             context: "register metadata digest SQL functions",
-            source: e,
+            source: e.into(),
         })?;
         init_pg_schema(&conn)?;
         conn.busy_timeout(std::time::Duration::from_millis(0))
             .map_err(|e| StoreError::Db {
                 context: "configure pg database busy timeout",
-                source: e,
+                source: e.into(),
             })?;
 
         // Clean up any orphaned temp files from previous crashes.
@@ -950,9 +985,47 @@ impl PgStore {
         self.pg_id
     }
 
-    /// Return a reference to the underlying SQLite connection.
-    pub fn connection(&self) -> &Connection {
-        &self.conn
+    #[cfg(test)]
+    pub(crate) fn test_set_busy_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .busy_timeout(timeout)
+            .map_err(|source| StoreError::Db {
+                context: "configure pg database busy timeout for test",
+                source: source.into(),
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_sqlite_configuration(&self) -> Result<TestSqliteConfiguration, StoreError> {
+        let temp_store = self
+            .conn
+            .query_row("PRAGMA temp_store", [], |row| row.get(0))
+            .map_err(|source| StoreError::Db {
+                context: "inspect SQLite temp store configuration for test",
+                source: source.into(),
+            })?;
+        let journal_mode = self
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(|source| StoreError::Db {
+                context: "inspect SQLite journal mode configuration for test",
+                source: source.into(),
+            })?;
+        let synchronous = self
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .map_err(|source| StoreError::Db {
+                context: "inspect SQLite synchronous configuration for test",
+                source: source.into(),
+            })?;
+        Ok(TestSqliteConfiguration {
+            temp_store,
+            journal_mode,
+            synchronous,
+        })
     }
 
     pub fn cluster_map_history_reference_summary(
@@ -1021,16 +1094,28 @@ impl PgStore {
         let mut stmt = self
             .conn
             .prepare_cached(sql)
-            .map_err(|source| StoreError::Db { context, source })?;
+            .map_err(|source| StoreError::Db {
+                context,
+                source: source.into(),
+            })?;
         let rows = stmt
             .query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, i64>(1)?)))
-            .map_err(|source| StoreError::Db { context, source })?;
+            .map_err(|source| StoreError::Db {
+                context,
+                source: source.into(),
+            })?;
         for row in rows {
-            let (pg_id, raw_epoch) = row.map_err(|source| StoreError::Db { context, source })?;
+            let (pg_id, raw_epoch) = row.map_err(|source| StoreError::Db {
+                context,
+                source: source.into(),
+            })?;
             references.insert(PgClusterMapHistoryRouteReference::new(
                 kind,
                 Self::parse_cluster_epoch(raw_epoch, 1, "cluster-map history route epoch")
-                    .map_err(|source| StoreError::Db { context, source })?,
+                    .map_err(|source| StoreError::Db {
+                        context,
+                        source: source.into(),
+                    })?,
                 PgId::new(pg_id),
             ))?;
         }
@@ -1100,7 +1185,10 @@ impl PgStore {
         self.conn
             .prepare_cached(sql)
             .and_then(|mut stmt| stmt.query_row(params, f))
-            .map_err(|e| StoreError::Db { context, source: e })
+            .map_err(|e| StoreError::Db {
+                context,
+                source: e.into(),
+            })
     }
 
     fn query_row_cached_optional<T, P, F>(
@@ -1117,7 +1205,10 @@ impl PgStore {
         self.conn
             .prepare_cached(sql)
             .and_then(|mut stmt| stmt.query_row(params, f).optional())
-            .map_err(|e| StoreError::Db { context, source: e })
+            .map_err(|e| StoreError::Db {
+                context,
+                source: e.into(),
+            })
     }
 
     fn execute_cached<P>(
@@ -1132,7 +1223,10 @@ impl PgStore {
         self.conn
             .prepare_cached(sql)
             .and_then(|mut stmt| stmt.execute(params))
-            .map_err(|e| StoreError::Db { context, source: e })
+            .map_err(|e| StoreError::Db {
+                context,
+                source: e.into(),
+            })
     }
 
     fn execute_cached_metadata<P>(
@@ -1147,7 +1241,10 @@ impl PgStore {
         self.conn
             .prepare_cached(sql)
             .and_then(|mut stmt| stmt.execute(params))
-            .map_err(|e| MetadataError::Db { context, source: e })
+            .map_err(|e| MetadataError::Db {
+                context,
+                source: e.into(),
+            })
     }
 
     fn query_row_cached_metadata<T, P, F>(
@@ -1164,7 +1261,10 @@ impl PgStore {
         self.conn
             .prepare_cached(sql)
             .and_then(|mut stmt| stmt.query_row(params, f))
-            .map_err(|e| MetadataError::Db { context, source: e })
+            .map_err(|e| MetadataError::Db {
+                context,
+                source: e.into(),
+            })
     }
 
     fn query_row_cached_optional_metadata<T, P, F>(
@@ -1181,7 +1281,10 @@ impl PgStore {
         self.conn
             .prepare_cached(sql)
             .and_then(|mut stmt| stmt.query_row(params, f).optional())
-            .map_err(|e| MetadataError::Db { context, source: e })
+            .map_err(|e| MetadataError::Db {
+                context,
+                source: e.into(),
+            })
     }
 
     /// Get the current unix timestamp in seconds.
