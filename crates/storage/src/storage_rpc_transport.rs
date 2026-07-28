@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
 
+use crate::deadline_io::DeadlineStream;
+
 pub const STORAGE_RPC_TLS_ALPN: &[u8] = b"argmin-storage-rpc/1";
 
 pub trait StorageRpcStream: Read + Write + Send {
@@ -101,8 +103,11 @@ impl StorageRpcClientEndpoint {
         match self {
             Self::Unix { socket_path } => {
                 let stream = UnixStream::connect(socket_path)?;
-                let stream = DeadlineUnixStream { stream, deadline };
-                stream.apply_deadline()?;
+                let stream = DeadlineStream::new(
+                    stream,
+                    deadline,
+                    "storage RPC absolute operation deadline expired",
+                )?;
                 Ok(Box::new(stream))
             }
             Self::Tcp {
@@ -149,162 +154,76 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
     Ok(remaining)
 }
 
-struct DeadlineUnixStream {
-    stream: UnixStream,
-    deadline: Instant,
-}
-
-impl DeadlineUnixStream {
-    fn apply_deadline(&self) -> io::Result<()> {
-        let remaining = remaining(self.deadline)?;
-        self.stream.set_read_timeout(Some(remaining))?;
-        self.stream.set_write_timeout(Some(remaining))
-    }
-}
-
-impl Read for DeadlineUnixStream {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.apply_deadline()?;
-        self.stream.read(buffer)
-    }
-}
-
-impl Write for DeadlineUnixStream {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.apply_deadline()?;
-        self.stream.write(buffer)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.apply_deadline()?;
-        self.stream.flush()
-    }
-}
-
-impl StorageRpcStream for DeadlineUnixStream {
+impl StorageRpcStream for DeadlineStream<UnixStream> {
     fn set_operation_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-        self.deadline = deadline;
-        self.apply_deadline()
+        self.set_deadline(deadline);
+        Ok(())
     }
 
     fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
-        self.stream.shutdown(how)
+        self.get_ref().shutdown(how)
     }
 }
 
 struct DeadlineTlsTcpStream {
-    stream: rustls::StreamOwned<rustls::ClientConnection, DeadlineTcpSocket>,
-    deadline: Instant,
+    stream: rustls::StreamOwned<rustls::ClientConnection, DeadlineStream<TcpStream>>,
 }
 
 struct DeadlineServerTlsTcpStream {
-    stream: rustls::StreamOwned<rustls::ServerConnection, DeadlineTcpSocket>,
-    deadline: Instant,
-}
-
-struct DeadlineTcpSocket {
-    stream: TcpStream,
-    deadline: Instant,
-}
-
-impl DeadlineTcpSocket {
-    fn apply_deadline(&self) -> io::Result<()> {
-        let remaining = remaining(self.deadline)?;
-        self.stream.set_read_timeout(Some(remaining))?;
-        self.stream.set_write_timeout(Some(remaining))
-    }
-}
-
-impl Read for DeadlineTcpSocket {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.apply_deadline()?;
-        self.stream.read(buffer)
-    }
-}
-
-impl Write for DeadlineTcpSocket {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.apply_deadline()?;
-        self.stream.write(buffer)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.apply_deadline()?;
-        self.stream.flush()
-    }
-}
-
-impl DeadlineServerTlsTcpStream {
-    fn apply_deadline(&self) -> io::Result<()> {
-        self.stream.sock.apply_deadline()
-    }
+    stream: rustls::StreamOwned<rustls::ServerConnection, DeadlineStream<TcpStream>>,
 }
 
 impl Read for DeadlineServerTlsTcpStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.apply_deadline()?;
         self.stream.read(buffer)
     }
 }
 
 impl Write for DeadlineServerTlsTcpStream {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.apply_deadline()?;
         self.stream.write(buffer)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.apply_deadline()?;
         self.stream.flush()
     }
 }
 
 impl StorageRpcStream for DeadlineServerTlsTcpStream {
     fn set_operation_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-        self.deadline = deadline;
-        self.stream.sock.deadline = deadline;
-        self.apply_deadline()
+        self.stream.sock.set_deadline(deadline);
+        Ok(())
     }
 
     fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
-        self.stream.sock.stream.shutdown(how)
-    }
-}
-
-impl DeadlineTlsTcpStream {
-    fn apply_deadline(&self) -> io::Result<()> {
-        self.stream.sock.apply_deadline()
+        self.stream.sock.get_ref().shutdown(how)
     }
 }
 
 impl Read for DeadlineTlsTcpStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.apply_deadline()?;
         self.stream.read(buffer)
     }
 }
 
 impl Write for DeadlineTlsTcpStream {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.apply_deadline()?;
         self.stream.write(buffer)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.apply_deadline()?;
         self.stream.flush()
     }
 }
 
 impl StorageRpcStream for DeadlineTlsTcpStream {
     fn set_operation_deadline(&mut self, deadline: Instant) -> io::Result<()> {
-        self.deadline = deadline;
-        self.stream.sock.deadline = deadline;
-        self.apply_deadline()
+        self.stream.sock.set_deadline(deadline);
+        Ok(())
     }
 
     fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
-        self.stream.sock.stream.shutdown(how)
+        self.stream.sock.get_ref().shutdown(how)
     }
 }
 
@@ -342,16 +261,15 @@ fn connect_tls_tcp(
     })?;
     let connection = rustls::ClientConnection::new(Arc::clone(tls_client_config), server_name)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let socket = DeadlineTcpSocket {
-        stream: tcp_stream,
+    let socket = DeadlineStream::new(
+        tcp_stream,
         deadline,
-    };
+        "storage RPC absolute operation deadline expired",
+    )?;
     let mut stream = DeadlineTlsTcpStream {
         stream: rustls::StreamOwned::new(connection, socket),
-        deadline,
     };
     while stream.stream.conn.is_handshaking() {
-        stream.apply_deadline()?;
         stream.stream.conn.complete_io(&mut stream.stream.sock)?;
     }
     if stream.stream.conn.alpn_protocol() != Some(STORAGE_RPC_TLS_ALPN) {
@@ -367,8 +285,11 @@ pub(crate) fn accepted_unix_stream(
     stream: UnixStream,
     deadline: Instant,
 ) -> io::Result<BoxStorageRpcStream> {
-    let stream = DeadlineUnixStream { stream, deadline };
-    stream.apply_deadline()?;
+    let stream = DeadlineStream::new(
+        stream,
+        deadline,
+        "storage RPC absolute operation deadline expired",
+    )?;
     Ok(Box::new(stream))
 }
 
@@ -386,13 +307,15 @@ pub(crate) fn accepted_tls_tcp_stream(
     stream.set_nodelay(true)?;
     let connection = rustls::ServerConnection::new(tls_server_config)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let socket = DeadlineTcpSocket { stream, deadline };
+    let socket = DeadlineStream::new(
+        stream,
+        deadline,
+        "storage RPC absolute operation deadline expired",
+    )?;
     let mut stream = DeadlineServerTlsTcpStream {
         stream: rustls::StreamOwned::new(connection, socket),
-        deadline,
     };
     while stream.stream.conn.is_handshaking() {
-        stream.apply_deadline()?;
         stream.stream.conn.complete_io(&mut stream.stream.sock)?;
     }
     if stream.stream.conn.alpn_protocol() != Some(STORAGE_RPC_TLS_ALPN) {
@@ -451,10 +374,12 @@ mod tests {
         });
         let stream = TcpStream::connect(address).unwrap();
         let started = Instant::now();
-        let mut stream = DeadlineTcpSocket {
+        let mut stream = DeadlineStream::new(
             stream,
-            deadline: started + Duration::from_millis(65),
-        };
+            started + Duration::from_millis(65),
+            "test storage RPC deadline expired",
+        )
+        .unwrap();
         let mut bytes = [0_u8; 3];
 
         let error = stream.read_exact(&mut bytes).unwrap_err();
@@ -468,5 +393,23 @@ mod tests {
             "trickled bytes extended the absolute storage RPC deadline"
         );
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn unix_operation_deadlines_do_not_install_socket_timeouts() {
+        let (server, _peer) = UnixStream::pair().unwrap();
+        let observer = server.try_clone().unwrap();
+        let mut stream =
+            accepted_unix_stream(server, Instant::now() + Duration::from_secs(1)).unwrap();
+
+        assert_eq!(observer.read_timeout().unwrap(), None);
+        assert_eq!(observer.write_timeout().unwrap(), None);
+
+        stream
+            .set_operation_deadline(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+
+        assert_eq!(observer.read_timeout().unwrap(), None);
+        assert_eq!(observer.write_timeout().unwrap(), None);
     }
 }
