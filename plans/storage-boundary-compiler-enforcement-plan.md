@@ -3560,6 +3560,27 @@ Seventy-ninth Phase 3 slice:
 - four focused bucket RPC regressions and all 2,361 storage tests pass, as do
   formatting, the storage boundary checker, and workspace-wide strict Clippy.
 
+Eightieth Phase 3 slice:
+
+- the transitional `StorageNodeClient` aggregate no longer exposes durable
+  bucket-write reservation acquisition, validation, heartbeat, release, or
+  bucket-write drain and delete-attempt coordination. These operations are
+  available only through `BucketWriteReservationNodeClient`, whose local
+  adapter now owns the sole embedded implementation as the Unix adapter
+  already did.
+- multipart completion barrier construction now validates its durable proof
+  through the reservation role rather than reaching back through the mixed
+  aggregate. Fenced acquisition, drain installation, and heartbeat continue
+  to enforce the admitted effect boundary immediately before the PG-store
+  mutation.
+- object mutation and multipart-state plus payload-reclaim/lifecycle
+  duplicates in the transitional aggregate, together with capability
+  requirements on the remaining role-specific node-client traits, remain open
+  in Phase 3.
+- five focused bucket reservation/drain RPC regressions and all 2,361 storage
+  tests pass, as do formatting, the storage boundary checker, and
+  workspace-wide strict Clippy.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
