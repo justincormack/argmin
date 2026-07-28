@@ -230,7 +230,7 @@ Initial ownership assessment:
 | PG schema and physical PG/shard layout | `storage` | SQL and the driver are now private to `PgStore`; remove SQLite magic, `metadata.db`, `pg-NNNN`, direct fsync, and raw shard-layout knowledge from `argmin-s3`. |
 | Metadata command log, checkpoints, and canonical metadata digests | `storage` | Codecs are largely crate-private; inventory every embedded nested format and keep recovery/corruption tests local. |
 | Storage-node RPC | `storage` | The main codec and wire error codes are private; `StorageNodeServer`, `StoreError`, and `StorageNodeFailureClass` form the logical facade. Remaining work is ALPN/TLS profile containment. |
-| Control-plane durable state, RPC, and auth envelope | `storage` | The client transport is contained behind typed Unix/TLS endpoints. Replace binary-owned server verification, dispatch, and response framing with a storage-controlled server facade. |
+| Control-plane durable state, RPC, and auth envelope | `storage` | Client and server transport are contained behind typed Unix/TLS endpoints and opaque storage-owned facades. |
 | Raft peer protocol, restart artifact, and WAL | `storage` | Hide raw frame decoders, framing helpers, WAL records/files, and layout helpers; move direct WAL construction tests into storage. |
 | Object user/system metadata blobs | `server-core` | Keep storage's carriers opaque; make serialization entry points crate-private unless another owner has a demonstrated need to interpret them. |
 | Tag and ACL canonical value formats | `s3-types` | Keep validation and canonical value codecs central; treat their embeddings in storage rows/RPCs as separately versioned containing formats. |
@@ -354,23 +354,29 @@ The public boundary and containment status for each surface are as follows.
   deadlines, and concrete transport-error classification into OpenRaft `Unreachable` or `Network`.
   The former public frame-transport extension and exchange value/error are private, their tests
   are storage-owned, and a repository check prevents their return outside `storage`.
-- The inbound server is also binary-owned. `argmin-s3/main.rs` binds listeners, establishes TLS,
-  reads the transport length prefix, decodes the shared authentication envelope, extracts frame
-  kind/identity/operation, validates admission, calls raw OpenRaft frame handlers through
-  `ControlPlaneRaftAuthority::raft()`, signs and writes the response, and coordinates durable
-  checkpoint publication before acknowledgement.
+- **Completed server-facade slice:** `ControlPlaneRaftPeerServerListener` and
+  `ControlPlaneRaftPeerServerPolicy` own Unix/TLS listener transport, TLS 1.3 and ALPN profile
+  construction, absolute handshake/request/dispatch deadlines and a fresh absolute response
+  deadline installed after publication admission, worker admission, the shared pre-authentication
+  allocation budget, authentication and peer admission ordering, OpenRaft dispatch, response
+  signing/framing/finalization, and exact-once publication. The
+  process supplies bound listeners, certificate material, logical peer policy, and an opaque
+  durability callback. Storage decides when snapshot responses require checkpointing and ensures
+  that checkpointing precedes every possible response write.
 - The resulting public representation includes peer request/response/snapshot types,
   `encode_frame`/`decode_frame`, frame-kind and identity decoders, transport read/write helpers,
   the raw frame handlers, shared auth-envelope codecs, the ALPN constant, and the underlying
   OpenRaft `Raft` handle. None is an appropriate binary-facing logical API.
 - Client retry classification is storage-owned and permanently tests that reachability failures
-  map to OpenRaft `Unreachable` while protocol failures map to `Network`. The inbound server still
-  exposes concrete transport errors and context through its binary-owned path.
+  map to OpenRaft `Unreachable` while protocol failures map to `Network`. The inbound server
+  returns only an opaque terminal listener failure to the process; request and transport
+  diagnostics remain storage-owned.
 - Raw codec, version, identity-binding, authentication, transport, and OpenRaft dispatch tests
-  already exist in `control_plane_raft.rs`. `argmin-s3` duplicates extensive raw-frame,
-  malformed-envelope, TLS/ALPN, admission, and response-publication testing. The protocol cases
-  belong in `storage`; only process lifecycle, crash, and durability-observation tests should
-  remain in the binary crate, using logical or opaque owner-provided facilities.
+  already exist in `control_plane_raft.rs`. The TLS/ALPN, admission-budget, checkpoint-ordering,
+  and response-publication cases now exercise the storage facade there. `argmin-s3` still
+  duplicates extensive raw-frame, malformed-envelope, and direct-dispatch testing. Those protocol
+  cases belong in `storage`; only process lifecycle, crash, and durability-observation tests
+  should remain in the binary crate, using logical or opaque owner-provided facilities.
 
 This completes the RPC inventory only; it does not satisfy Phase 1 containment. The bounded
 implementation order is:
@@ -385,8 +391,9 @@ implementation order is:
    diagnostics. Raw control-plane server symbols and ALPN are private and boundary-checked.
 3. **Complete:** replace the Raft raw client frame transport with storage-owned Unix and TLS/TCP
    peer endpoint configuration and owner-defined OpenRaft transport classification.
-4. Add a storage-owned peer server facade that preserves the existing pre-auth allocation bound
-   and durability-before-ack invariant.
+4. **Complete:** add a storage-owned peer server facade that preserves the existing pre-auth
+   allocation bound and durability-before-ack invariant. TLS/ALPN, worker admission, authenticated
+   dispatch, response signing and finalization are storage-owned and boundary-checked.
 5. After the peer facade exists, make the remaining raw Raft frame, auth-envelope, ALPN,
    OpenRaft-handle, and transport-error APIs private and add repository checks. The equivalent
    control-plane client and server cleanup is complete.
@@ -542,23 +549,21 @@ implementation-error matching. These remain explicit work below.
 ## Immediate Next Steps
 
 Completed in the current containment pass: the control-plane client and server boundaries and the
-Raft peer client transport are storage-owned and boundary-checked.
+Raft peer client and server transports are storage-owned and boundary-checked.
 
-1. Move inbound Raft peer serving behind a storage-owned facade, preserving the pre-auth
-   allocation bound and durability-before-ack invariant.
-2. Privatize the remaining raw Raft frame, auth-envelope, ALPN, OpenRaft-handle, and
+1. Privatize the remaining raw Raft frame, auth-envelope, OpenRaft-handle, and
    transport-error APIs and relocate malformed-wire tests into `storage`.
-3. Hide public WAL/restart-format constructors and move direct WAL/impossible-state tests into
+2. Hide public WAL/restart-format constructors and move direct WAL/impossible-state tests into
    the owner.
-4. Replace other higher-layer matching on database/RPC implementation errors with owner-defined
+3. Replace other higher-layer matching on database/RPC implementation errors with owner-defined
    semantic errors or classification methods.
-5. Inventory and restrict nested durable codecs for metadata, tags, ACLs, and encryption;
+4. Inventory and restrict nested durable codecs for metadata, tags, ACLs, and encryption;
    record how containing formats advance when a nested format changes.
-6. Audit existing version/fallback code and remove unsupported legacy compatibility where it
+5. Audit existing version/fallback code and remove unsupported legacy compatibility where it
    worsens current invariants.
-7. Add or tighten current-version rejection tests for existing versioned formats.
-8. Add boundary checks for the concrete leaks found in this audit, while relying on crate
+6. Add or tighten current-version rejection tests for existing versioned formats.
+7. Add boundary checks for the concrete leaks found in this audit, while relying on crate
     privacy for the durable enforcement.
-9. Remove the trigger-verification item from Phase 11 stabilisation tracking and keep this
+8. Remove the trigger-verification item from Phase 11 stabilisation tracking and keep this
     plan as the upgrade home for it; defer trigger body hashing/recreation until the upgrade
     framework is deliberately started.

@@ -2613,6 +2613,18 @@ fail_with_matches \
     "Raft peer client framing, TLS profile, and transport errors are private to storage; use ControlPlaneRaftPeerClientEndpoint" \
     "$raft_peer_client_wire_leaks"
 
+raft_peer_server_transport_leaks=$(
+    rg -n --color=never \
+        '\bCONTROL_PLANE_RAFT_TLS_ALPN\b|\bControlPlaneRaftPeerServerListenerKind\b|\bExperimentalRaftPeer(BoundListener|Listener|RpcWorkerContext)\b' \
+        . \
+        -g 'crates/**/*.rs' \
+        -g '!crates/storage/**' \
+        || true
+)
+fail_with_matches \
+    "Raft peer server listeners, TLS profile, and workers are private to storage; use ControlPlaneRaftPeerServerListener and ControlPlaneRaftPeerServerPolicy" \
+    "$raft_peer_server_transport_leaks"
+
 if [[ "$failed" -ne 0 ]]; then
     echo
     echo "storage cluster boundary checks failed" >&2

@@ -40,7 +40,6 @@ use storage::control_plane_command::ControlPlaneCommand;
 use storage::control_plane_raft::{
     validate_control_plane_command_replication_size, ControlPlaneRaftPeerClientEndpoint,
     ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
-    CONTROL_PLANE_RAFT_TLS_ALPN,
 };
 use storage::storage_node_server::StorageNodeRpcListenerConfig;
 use storage::storage_rpc_transport::{StorageRpcClientEndpoint, STORAGE_RPC_TLS_ALPN};
@@ -481,7 +480,7 @@ struct ResolvedStaticRaftListenerEndpoint {
     listen: EndpointAddress,
     advertise: EndpointAddress,
     transport_profile_id: String,
-    tls_server_config: Option<Arc<rustls::ServerConfig>>,
+    tls_certified_key: Option<Arc<CertifiedKey>>,
 }
 
 impl fmt::Debug for ResolvedStaticRaftListenerEndpoint {
@@ -491,7 +490,7 @@ impl fmt::Debug for ResolvedStaticRaftListenerEndpoint {
             .field("listen", &self.listen)
             .field("advertise", &self.advertise)
             .field("transport_profile_id", &self.transport_profile_id)
-            .field("tls", &self.tls_server_config.is_some())
+            .field("tls", &self.tls_certified_key.is_some())
             .finish()
     }
 }
@@ -1048,7 +1047,6 @@ impl ValidatedStaticClusterManifest {
             .find(|authority| authority.process_id == selected.id)
             .and_then(|authority| authority.raft_node_id)
             .ok_or_else(|| "selected replicated authority has no Raft node id".to_string())?;
-        let provider = rustls::crypto::ring::default_provider();
         let mut peers = BTreeMap::new();
         for (&node_id, canonical_endpoint) in &self.canonical_raft_peer_endpoints {
             let endpoint = self
@@ -1147,7 +1145,7 @@ impl ValidatedStaticClusterManifest {
             .map(|endpoint| {
                 let listen = parse_endpoint_address(&endpoint.listen, true)?;
                 let advertise = parse_endpoint_address(&endpoint.advertise, false)?;
-                let tls_server_config = match &advertise {
+                let tls_certified_key = match &advertise {
                     EndpointAddress::Unix(_) => None,
                     EndpointAddress::Tcp { .. } => {
                         let identity_id = endpoint
@@ -1161,19 +1159,7 @@ impl ValidatedStaticClusterManifest {
                                 endpoint.id
                             )
                             })?;
-                        let resolver = StaticSingleCertificateResolver {
-                            certified_key: Arc::clone(&identity.certified_key),
-                        };
-                        let mut server_config =
-                            rustls::ServerConfig::builder_with_provider(Arc::new(provider.clone()))
-                                .with_protocol_versions(&[&rustls::version::TLS13])
-                                .map_err(|_| {
-                                    "failed to select the static Raft TLS protocol".to_string()
-                                })?
-                                .with_no_client_auth()
-                                .with_cert_resolver(Arc::new(resolver));
-                        server_config.alpn_protocols = vec![CONTROL_PLANE_RAFT_TLS_ALPN.to_vec()];
-                        Some(Arc::new(server_config))
+                        Some(Arc::clone(&identity.certified_key))
                     }
                 };
                 Ok(ResolvedStaticRaftListenerEndpoint {
@@ -1181,7 +1167,7 @@ impl ValidatedStaticClusterManifest {
                     listen,
                     advertise,
                     transport_profile_id: endpoint.transport_profile_id.clone(),
-                    tls_server_config,
+                    tls_certified_key,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -1545,17 +1531,16 @@ impl ValidatedStaticClusterManifest {
                     io_timeout,
                 },
                 EndpointAddress::Tcp { host, port } => {
-                    let tls_server_config =
-                        listener.tls_server_config.as_ref().ok_or_else(|| {
-                            format!(
-                                "resolved TCP Raft listener {} has no TLS server configuration",
-                                listener.endpoint_id
-                            )
-                        })?;
+                    let certified_key = listener.tls_certified_key.as_ref().ok_or_else(|| {
+                        format!(
+                            "resolved TCP Raft listener {} has no TLS server configuration",
+                            listener.endpoint_id
+                        )
+                    })?;
                     ConfiguredControlPlaneRaftPeerListener::Tcp {
                         endpoint_id: listener.endpoint_id.clone(),
                         bind_addr: tcp_socket_address(host, *port),
-                        tls_server_config: Arc::clone(tls_server_config),
+                        certified_key: Arc::clone(certified_key),
                         max_connections,
                         io_timeout,
                     }
@@ -7390,8 +7375,7 @@ tls_server_name = "control-1-alt.internal"
             }
         );
         assert_eq!(listener.transport_profile_id, "internal");
-        let server_config = listener.tls_server_config.as_ref().unwrap();
-        assert_eq!(server_config.alpn_protocols, &[CONTROL_PLANE_RAFT_TLS_ALPN]);
+        assert!(!listener.tls_certified_key.as_ref().unwrap().cert.is_empty());
         assert_eq!(
             plan.peers.keys().copied().collect::<Vec<_>>(),
             [101, 102, 103]
@@ -7441,9 +7425,9 @@ transport_profile_id = "internal"
             plan.listeners[0].advertise,
             EndpointAddress::Unix(PathBuf::from("/run/argmin/raft-1-local.sock"))
         );
-        assert!(plan.listeners[0].tls_server_config.is_none());
+        assert!(plan.listeners[0].tls_certified_key.is_none());
         assert_eq!(plan.listeners[1].endpoint_id, "raft-1");
-        assert!(plan.listeners[1].tls_server_config.is_some());
+        assert!(plan.listeners[1].tls_certified_key.is_some());
         let local_peer = plan.peers.get(&plan.local_node_id).unwrap();
         assert_eq!(local_peer.endpoint_id, "raft-1");
         assert!(matches!(

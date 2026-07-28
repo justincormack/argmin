@@ -1,5 +1,6 @@
 use auth::SecretKey;
 use ec::EcConfig;
+use rustls::sign::CertifiedKey;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
@@ -74,7 +75,7 @@ pub(crate) enum ConfiguredControlPlaneRaftPeerListener {
     Tcp {
         endpoint_id: String,
         bind_addr: String,
-        tls_server_config: Arc<rustls::ServerConfig>,
+        certified_key: Arc<CertifiedKey>,
         max_connections: usize,
         io_timeout: Duration,
     },

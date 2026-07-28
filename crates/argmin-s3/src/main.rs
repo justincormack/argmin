@@ -7,15 +7,19 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
-use std::io::{self, Read, Write};
-use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
+use std::io;
+#[cfg(test)]
+use std::io::{Read, Write};
+use std::net::TcpListener as StdTcpListener;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc, Condvar, Mutex,
 };
 use std::thread;
@@ -25,6 +29,8 @@ use auth::{AccountIdentity, ConfiguredPrincipalIdentity, CredentialStore, Stored
 use ec::EcConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+#[cfg(test)]
+use rustls::sign::CertifiedKey;
 use server_core::coordinator::Coordinator;
 use server_core::sse::{
     ManagedWrappingKeyConfig, SseCustomerValidatorConfig, StaticManagedKeyProvider,
@@ -48,30 +54,38 @@ use storage::control_plane::{
     PgMetadataProof, PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane,
     UnixControlPlaneClient, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
 };
+#[cfg(test)]
 use storage::control_plane_auth::{
-    ControlPlaneAuthEnvelope, ControlPlaneAuthOperation, ControlPlaneAuthPrincipal,
-    ControlPlaneAuthRejectionReason, ControlPlaneAuthTarget, ControlPlaneScopedCredential,
-    ControlPlaneScopedCredentialInput, ControlPlaneScopedCredentialStore,
+    ControlPlaneAuthEnvelope, ControlPlaneAuthOperation, ControlPlaneAuthRejectionReason,
+    ControlPlaneAuthTarget,
+};
+use storage::control_plane_auth::{
+    ControlPlaneAuthPrincipal, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
+    ControlPlaneScopedCredentialStore,
 };
 use storage::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
 #[cfg(test)]
 use storage::control_plane_raft::read_control_plane_raft_peer_transport_frame;
+#[cfg(test)]
 use storage::control_plane_raft::{
     decode_control_plane_raft_peer_request_auth_operation,
     decode_control_plane_raft_peer_request_frame_identity,
-    decode_control_plane_raft_peer_request_frame_kind, durable_artifact_wal_path,
-    handle_control_plane_raft_peer_rpc_frame, handle_control_plane_raft_peer_snapshot_frame,
+    decode_control_plane_raft_peer_request_frame_kind, handle_control_plane_raft_peer_rpc_frame,
+    handle_control_plane_raft_peer_snapshot_frame,
     read_control_plane_raft_peer_transport_frame_with_reservation,
-    write_control_plane_raft_peer_transport_frame, ControlPlaneRaftAuthority,
-    ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome,
-    ControlPlaneRaftEstablishedPeerPolicyConvergence, ControlPlaneRaftLogId,
-    ControlPlaneRaftNodeId, ControlPlaneRaftPeerAuthPolicy, ControlPlaneRaftPeerFrameIdentity,
-    ControlPlaneRaftPeerFrameKind, ControlPlaneRaftPeerNetworkConfig,
-    ControlPlaneRaftPeerTransportPolicy, CONTROL_PLANE_RAFT_TLS_ALPN,
+    write_control_plane_raft_peer_transport_frame, ControlPlaneRaftPeerFrameIdentity,
+    ControlPlaneRaftPeerFrameKind,
 };
-use storage::deadline_io::DeadlineStream;
+use storage::control_plane_raft::{
+    durable_artifact_wal_path, ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus,
+    ControlPlaneRaftCommandOutcome, ControlPlaneRaftEstablishedPeerPolicyConvergence,
+    ControlPlaneRaftLogId, ControlPlaneRaftNodeId, ControlPlaneRaftPeerAuthPolicy,
+    ControlPlaneRaftPeerNetworkConfig, ControlPlaneRaftPeerServerDurability,
+    ControlPlaneRaftPeerServerListener, ControlPlaneRaftPeerServerPolicy,
+    ControlPlaneRaftPeerTransportPolicy,
+};
 #[cfg(test)]
-use storage::deadline_io::DeadlineTransport;
+use storage::deadline_io::{DeadlineStream, DeadlineTransport};
 use storage::storage_node_server::{
     PreparedStorageNodeServer, StorageNodeBootstrap, StorageNodeControlPlaneRefreshLoop,
     StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeProcessConfigParts, StorageNodeServer,
@@ -3122,22 +3136,6 @@ where
     }
 }
 
-enum ExperimentalRaftPeerBoundListener {
-    Unix(UnixListener),
-    Tcp {
-        listener: StdTcpListener,
-        tls_server_config: Arc<rustls::ServerConfig>,
-    },
-}
-
-struct ExperimentalRaftPeerListener {
-    endpoint_id: String,
-    listener: ExperimentalRaftPeerBoundListener,
-    policy: Arc<ControlPlaneRaftPeerTransportPolicy>,
-    max_connections: usize,
-    io_timeout: Duration,
-}
-
 fn build_experimental_raft_peer_transport_policy(
     config: &ServerConfig,
     cluster_name: &str,
@@ -3491,7 +3489,7 @@ fn bind_experimental_raft_peer_listener(
     config: &ServerConfig,
     cluster_name: &str,
     local_node_id: ControlPlaneRaftNodeId,
-) -> Result<Vec<ExperimentalRaftPeerListener>, String> {
+) -> Result<Vec<ControlPlaneRaftPeerServerListener>, String> {
     let policy =
         build_experimental_raft_peer_transport_policy(config, cluster_name, local_node_id)?;
     bind_experimental_raft_peer_listener_with_policy(config, policy)
@@ -3500,7 +3498,7 @@ fn bind_experimental_raft_peer_listener(
 fn bind_experimental_raft_peer_listener_with_policy(
     config: &ServerConfig,
     policy: Option<ControlPlaneRaftPeerTransportPolicy>,
-) -> Result<Vec<ExperimentalRaftPeerListener>, String> {
+) -> Result<Vec<ControlPlaneRaftPeerServerListener>, String> {
     let configured_listeners = if config.control_plane_raft_peer_listeners.is_empty() {
         config
             .control_plane_raft_peer_socket_path
@@ -3520,12 +3518,11 @@ fn bind_experimental_raft_peer_listener_with_policy(
     if configured_listeners.is_empty() {
         return Ok(Vec::new());
     }
-    let Some(policy) = policy else {
+    let Some(_policy) = policy else {
         return Err(
             "configured OpenRaft peer listeners are missing peer transport policy".to_string(),
         );
     };
-    let policy = Arc::new(policy);
     configured_listeners
         .into_iter()
         .map(|listener| match listener {
@@ -3534,19 +3531,17 @@ fn bind_experimental_raft_peer_listener_with_policy(
                 socket_path,
                 max_connections,
                 io_timeout,
-            } => Ok(ExperimentalRaftPeerListener {
+            } => ControlPlaneRaftPeerServerListener::unix(
                 endpoint_id,
-                listener: ExperimentalRaftPeerBoundListener::Unix(
-                    bind_control_plane_raft_peer_socket(Path::new(&socket_path))?,
-                ),
-                policy: Arc::clone(&policy),
+                bind_control_plane_raft_peer_socket(Path::new(&socket_path))?,
                 max_connections,
                 io_timeout,
-            }),
+            )
+            .map_err(|error| error.to_string()),
             ConfiguredControlPlaneRaftPeerListener::Tcp {
                 endpoint_id,
                 bind_addr,
-                tls_server_config,
+                certified_key,
                 max_connections,
                 io_timeout,
             } => {
@@ -3555,40 +3550,27 @@ fn bind_experimental_raft_peer_listener_with_policy(
                         "bind control-plane OpenRaft TCP peer listener {endpoint_id} at {bind_addr}: {error}"
                     )
                 })?;
-                Ok(ExperimentalRaftPeerListener {
+                ControlPlaneRaftPeerServerListener::tls_tcp(
                     endpoint_id,
-                    listener: ExperimentalRaftPeerBoundListener::Tcp {
-                        listener,
-                        tls_server_config,
-                    },
-                    policy: Arc::clone(&policy),
+                    listener,
+                    certified_key,
                     max_connections,
                     io_timeout,
-                })
+                )
+                .map_err(|error| error.to_string())
             }
         })
         .collect()
 }
 
-#[derive(Clone)]
-struct ExperimentalRaftPeerRpcWorkerContext {
-    runtime: Handle,
-    authority: Arc<ControlPlaneRaftAuthority>,
-    local_node_id: ControlPlaneRaftNodeId,
-    policy: Arc<ControlPlaneRaftPeerTransportPolicy>,
-    durability: Option<ExperimentalRaftPeerDurabilityContext>,
-    active_workers: Arc<AtomicUsize>,
-    worker_limit: usize,
-    connection_deadline: Instant,
-    pre_auth_byte_budget: Arc<ExperimentalRaftPeerPreAuthByteBudget>,
-}
-
+#[cfg(test)]
 #[derive(Debug)]
 struct ExperimentalRaftPeerPreAuthByteBudget {
     reserved_bytes: AtomicUsize,
     limit_bytes: usize,
 }
 
+#[cfg(test)]
 impl ExperimentalRaftPeerPreAuthByteBudget {
     fn new(limit_bytes: usize) -> Self {
         Self {
@@ -3628,12 +3610,14 @@ impl ExperimentalRaftPeerPreAuthByteBudget {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ExperimentalRaftPeerPreAuthByteReservation {
     budget: Arc<ExperimentalRaftPeerPreAuthByteBudget>,
     frame_bytes: usize,
 }
 
+#[cfg(test)]
 impl Drop for ExperimentalRaftPeerPreAuthByteReservation {
     fn drop(&mut self) {
         self.budget
@@ -3642,8 +3626,10 @@ impl Drop for ExperimentalRaftPeerPreAuthByteReservation {
     }
 }
 
+#[cfg(test)]
 const EXPERIMENTAL_RAFT_PEER_DEADLINE_EXPIRED: &str =
     "control-plane OpenRaft inbound peer connection deadline expired";
+#[cfg(test)]
 type ExperimentalRaftPeerDeadlineStream<Stream> = DeadlineStream<Stream>;
 
 #[derive(Clone)]
@@ -3653,6 +3639,49 @@ struct ExperimentalRaftPeerDurabilityContext {
     publication: ExperimentalRaftDurabilityPublication,
 }
 
+#[derive(Clone)]
+struct ExperimentalRaftPeerServerDurability {
+    runtime: Handle,
+    authority: Arc<ControlPlaneRaftAuthority>,
+    context: ExperimentalRaftPeerDurabilityContext,
+}
+
+impl ControlPlaneRaftPeerServerDurability for ExperimentalRaftPeerServerDurability {
+    fn is_poisoned(&self) -> bool {
+        self.context.publication.is_poisoned()
+    }
+
+    fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError> {
+        let path = self
+            .context
+            .artifact_path
+            .as_deref()
+            .ok_or_else(|| ControlPlaneError::RpcRemote {
+                message:
+                    "experimental OpenRaft snapshot peer RPC requires durable checkpoint path before response"
+                        .to_owned(),
+            })?;
+        let result = store_experimental_raft_durable_restart_artifact(
+            &self.runtime,
+            &self.authority,
+            path,
+            Some(&self.context.checkpoint_lock),
+        );
+        if result.is_err() {
+            self.context.publication.publish_poison(|| {});
+        }
+        result
+    }
+
+    fn publish_response(
+        &self,
+        publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+    ) -> Result<(), ControlPlaneError> {
+        self.context.publication.publish(publish)
+    }
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct ExperimentalRaftPeerRpcDurability<'a> {
     artifact_path: Option<&'a Path>,
@@ -3660,6 +3689,7 @@ struct ExperimentalRaftPeerRpcDurability<'a> {
     publication: Option<&'a ExperimentalRaftDurabilityPublication>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct ExperimentalRaftPeerRpcAdmission<'a> {
     local_node_id: ControlPlaneRaftNodeId,
@@ -3669,13 +3699,8 @@ struct ExperimentalRaftPeerRpcAdmission<'a> {
     pre_auth_byte_budget: &'a Arc<ExperimentalRaftPeerPreAuthByteBudget>,
 }
 
+#[cfg(test)]
 impl<'a> ExperimentalRaftPeerRpcDurability<'a> {
-    const NONE: Self = Self {
-        artifact_path: None,
-        checkpoint_lock: None,
-        publication: None,
-    };
-
     fn from_context(context: &'a ExperimentalRaftPeerDurabilityContext) -> Self {
         Self {
             artifact_path: context.artifact_path.as_deref().map(PathBuf::as_path),
@@ -3778,150 +3803,7 @@ impl Default for ExperimentalRaftPeerCheckpointTracker {
     }
 }
 
-fn spawn_experimental_raft_peer_rpc_worker(
-    stream: UnixStream,
-    context: ExperimentalRaftPeerRpcWorkerContext,
-) {
-    spawn_experimental_raft_peer_rpc_worker_with_stream(stream, context, |stream, deadline| {
-        ExperimentalRaftPeerDeadlineStream::new(
-            stream,
-            deadline,
-            EXPERIMENTAL_RAFT_PEER_DEADLINE_EXPIRED,
-        )
-        .map_err(|source| ControlPlaneError::Io {
-            context: "configure control-plane OpenRaft Unix peer deadline I/O",
-            source,
-        })
-    });
-}
-
-fn spawn_experimental_raft_tcp_peer_rpc_worker(
-    stream: StdTcpStream,
-    tls_server_config: Arc<rustls::ServerConfig>,
-    context: ExperimentalRaftPeerRpcWorkerContext,
-) {
-    spawn_experimental_raft_peer_rpc_worker_with_stream(
-        stream,
-        context,
-        move |stream, deadline| {
-            let mut stream = ExperimentalRaftPeerDeadlineStream::new(
-                stream,
-                deadline,
-                EXPERIMENTAL_RAFT_PEER_DEADLINE_EXPIRED,
-            )
-            .map_err(|source| ControlPlaneError::Io {
-                context: "configure control-plane OpenRaft TLS/TCP deadline I/O",
-                source,
-            })?;
-            let mut connection =
-                rustls::ServerConnection::new(tls_server_config).map_err(|source| {
-                    ControlPlaneError::RpcProtocol {
-                        message: format!(
-                            "create control-plane OpenRaft TLS server connection: {source}"
-                        ),
-                    }
-                })?;
-            while connection.is_handshaking() {
-                connection
-                    .complete_io(&mut stream)
-                    .map_err(|source| ControlPlaneError::Io {
-                        context: "complete control-plane OpenRaft TLS server handshake",
-                        source,
-                    })?;
-            }
-            if connection.alpn_protocol() != Some(CONTROL_PLANE_RAFT_TLS_ALPN) {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message:
-                        "control-plane OpenRaft TLS peer did not negotiate required argmin-raft/1 ALPN"
-                            .to_string(),
-                });
-            }
-            Ok(rustls::StreamOwned::new(connection, stream))
-        },
-    );
-}
-
-fn spawn_experimental_raft_peer_rpc_worker_with_stream<RawStream, Stream, Prepare>(
-    stream: RawStream,
-    context: ExperimentalRaftPeerRpcWorkerContext,
-    prepare: Prepare,
-) where
-    RawStream: Send + 'static,
-    Stream: Read + Write + Send + 'static,
-    Prepare: FnOnce(RawStream, Instant) -> Result<Stream, ControlPlaneError> + Send + 'static,
-{
-    let ExperimentalRaftPeerRpcWorkerContext {
-        runtime,
-        authority,
-        local_node_id,
-        policy,
-        durability,
-        active_workers,
-        worker_limit,
-        connection_deadline,
-        pre_auth_byte_budget,
-    } = context;
-    if durability
-        .as_ref()
-        .is_some_and(|durability| durability.publication.is_poisoned())
-    {
-        eprintln!(
-            "experimental OpenRaft control-plane peer RPC rejected: durable authority is poisoned"
-        );
-        return;
-    }
-    if !reserve_experimental_raft_peer_rpc_worker(&active_workers, worker_limit) {
-        eprintln!(
-            "experimental OpenRaft control-plane peer RPC rejected: worker limit {} reached",
-            worker_limit
-        );
-        return;
-    }
-
-    thread::spawn(move || {
-        let mut stream = match prepare(stream, connection_deadline) {
-            Ok(stream) => stream,
-            Err(error) => {
-                eprintln!("experimental OpenRaft control-plane peer RPC failed: {error}");
-                active_workers.fetch_sub(1, Ordering::AcqRel);
-                return;
-            }
-        };
-        let rpc_durability = durability
-            .as_ref()
-            .map_or(ExperimentalRaftPeerRpcDurability::NONE, |durability| {
-                ExperimentalRaftPeerRpcDurability::from_context(durability)
-            });
-        match handle_experimental_raft_peer_rpc_before_ack_until(
-            &runtime,
-            &authority,
-            &mut stream,
-            ExperimentalRaftPeerRpcAdmission {
-                local_node_id,
-                policy: &policy,
-                durability: rpc_durability,
-                connection_deadline,
-                pre_auth_byte_budget: &pre_auth_byte_budget,
-            },
-        ) {
-            Ok(()) => {}
-            Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(error)) => {
-                eprintln!("experimental OpenRaft control-plane peer RPC failed: {error}");
-            }
-            Err(ExperimentalRaftPeerRpcWorkerError::Checkpoint(error)) => {
-                if let Some(durability) = &durability {
-                    durability.publication.publish_poison(|| {});
-                }
-                eprintln!(
-                    "experimental OpenRaft control-plane durability checkpoint failed before peer RPC response; exiting to avoid acknowledging volatile Raft state: {error}"
-                );
-                std::process::exit(1);
-            }
-        }
-        active_workers.fetch_sub(1, Ordering::AcqRel);
-    });
-}
-
+#[cfg(test)]
 fn reserve_experimental_raft_peer_rpc_worker(
     active_workers: &AtomicUsize,
     worker_limit: usize,
@@ -3933,12 +3815,24 @@ fn reserve_experimental_raft_peer_rpc_worker(
         .is_ok()
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 enum ExperimentalRaftPeerRpcWorkerError {
     PeerRpc(ControlPlaneError),
     Checkpoint(ControlPlaneError),
 }
 
+#[cfg(test)]
+impl std::fmt::Display for ExperimentalRaftPeerRpcWorkerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PeerRpc(error) => write!(formatter, "peer RPC failed: {error}"),
+            Self::Checkpoint(error) => write!(formatter, "checkpoint failed: {error}"),
+        }
+    }
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct ExperimentalRaftValidatedPeerRequest<'a> {
     frame: &'a [u8],
@@ -3976,6 +3870,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn handle_experimental_raft_peer_rpc_before_ack_until<Stream>(
     runtime: &Handle,
     authority: &ControlPlaneRaftAuthority,
@@ -4026,6 +3921,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn handle_experimental_raft_peer_rpc_with_response_writer_until<Stream, WriteResponse>(
     runtime: &Handle,
     authority: &ControlPlaneRaftAuthority,
@@ -4129,6 +4025,7 @@ where
     })
 }
 
+#[cfg(test)]
 fn publish_experimental_raft_peer_response<T>(
     publication: Option<&ExperimentalRaftDurabilityPublication>,
     publish: impl FnOnce() -> Result<T, ControlPlaneError>,
@@ -4141,6 +4038,7 @@ fn publish_experimental_raft_peer_response<T>(
     }
 }
 
+#[cfg(test)]
 fn experimental_raft_peer_auth_envelope_identity(
     envelope: &ControlPlaneAuthEnvelope,
     expected_cluster_name: &str,
@@ -4194,6 +4092,7 @@ fn handle_experimental_raft_peer_rpc_validated_frame_before_ack(
     )
 }
 
+#[cfg(test)]
 fn handle_experimental_raft_peer_rpc_validated_frame_before_ack_until(
     runtime: &Handle,
     authority: &ControlPlaneRaftAuthority,
@@ -4272,6 +4171,7 @@ fn handle_experimental_raft_peer_rpc_validated_frame_before_ack_until(
     Ok(response_frame)
 }
 
+#[cfg(test)]
 fn ensure_experimental_raft_peer_not_durably_poisoned(
     publication: Option<&ExperimentalRaftDurabilityPublication>,
 ) -> Result<(), ExperimentalRaftPeerRpcWorkerError> {
@@ -4381,88 +4281,18 @@ fn publish_experimental_raft_checkpoint_monitor_poison(
 }
 
 fn spawn_experimental_raft_peer_listener_loop(
-    listener: ExperimentalRaftPeerListener,
+    listener: ControlPlaneRaftPeerServerListener,
     runtime: Handle,
     authority: Arc<ControlPlaneRaftAuthority>,
-    local_node_id: ControlPlaneRaftNodeId,
-    durability: ExperimentalRaftPeerDurabilityContext,
-    active_workers: Arc<AtomicUsize>,
-    pre_auth_byte_budget: Arc<ExperimentalRaftPeerPreAuthByteBudget>,
+    policy: ControlPlaneRaftPeerServerPolicy,
 ) -> thread::JoinHandle<()> {
-    let ExperimentalRaftPeerListener {
-        endpoint_id,
-        listener,
-        policy,
-        max_connections,
-        io_timeout,
-    } = listener;
-    match &listener {
-        ExperimentalRaftPeerBoundListener::Unix(listener) => listener.set_nonblocking(false),
-        ExperimentalRaftPeerBoundListener::Tcp { listener, .. } => {
-            listener.set_nonblocking(false)
-        }
-    }
-    .unwrap_or_else(|error| {
-        eprintln!(
-            "control-plane OpenRaft peer listener {endpoint_id} failed to enter blocking accept mode: {error}"
-        );
-        std::process::exit(1);
-    });
-    thread::spawn(move || match listener {
-        ExperimentalRaftPeerBoundListener::Unix(listener) => loop {
-            match listener.accept() {
-                Ok((stream, _addr)) => spawn_experimental_raft_peer_rpc_worker(
-                    stream,
-                    ExperimentalRaftPeerRpcWorkerContext {
-                        runtime: runtime.clone(),
-                        authority: Arc::clone(&authority),
-                        local_node_id,
-                        policy: Arc::clone(&policy),
-                        durability: Some(durability.clone()),
-                        active_workers: Arc::clone(&active_workers),
-                        worker_limit: max_connections,
-                        connection_deadline: Instant::now() + io_timeout,
-                        pre_auth_byte_budget: Arc::clone(&pre_auth_byte_budget),
-                    },
-                ),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => {
-                    eprintln!(
-                        "control-plane OpenRaft peer listener {endpoint_id} accept failed: {error}"
-                    );
-                    std::process::exit(1);
-                }
-            }
-        },
-        ExperimentalRaftPeerBoundListener::Tcp {
-            listener,
-            tls_server_config,
-        } => loop {
-            match listener.accept() {
-                Ok((stream, _addr)) => spawn_experimental_raft_tcp_peer_rpc_worker(
-                    stream,
-                    Arc::clone(&tls_server_config),
-                    ExperimentalRaftPeerRpcWorkerContext {
-                        runtime: runtime.clone(),
-                        authority: Arc::clone(&authority),
-                        local_node_id,
-                        policy: Arc::clone(&policy),
-                        durability: Some(durability.clone()),
-                        active_workers: Arc::clone(&active_workers),
-                        worker_limit: max_connections,
-                        connection_deadline: Instant::now() + io_timeout,
-                        pre_auth_byte_budget: Arc::clone(&pre_auth_byte_budget),
-                    },
-                ),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => {
-                    eprintln!(
-                        "control-plane OpenRaft peer TLS/TCP listener {endpoint_id} accept failed: {error}"
-                    );
-                    std::process::exit(1);
-                }
-            }
-        },
+    thread::spawn(move || loop {
+        listener
+            .accept_one(&runtime, Arc::clone(&authority), &policy)
+            .unwrap_or_else(|error| {
+                eprintln!("control-plane OpenRaft peer listener stopped: {error}");
+                std::process::exit(1);
+            });
     })
 }
 
@@ -4711,15 +4541,37 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         checkpoint_lock: Arc::clone(&durable_checkpoint_lock),
         publication: durable_publication.clone(),
     };
+    let raft_peer_server_durability: Arc<dyn ControlPlaneRaftPeerServerDurability> =
+        Arc::new(ExperimentalRaftPeerServerDurability {
+            runtime: runtime.clone(),
+            authority: Arc::clone(&authority),
+            context: raft_peer_durability.clone(),
+        });
+    let raft_peer_server_policy = raft_peer_policy.clone().map(|peer_policy| {
+        ControlPlaneRaftPeerServerPolicy::new(
+            node_id,
+            peer_policy,
+            CONTROL_PLANE_RAFT_PEER_PRE_AUTH_BYTE_BUDGET,
+        )
+        .map(|policy| {
+            policy
+                .with_durability(Arc::clone(&raft_peer_server_durability))
+                .with_fatal_error_handler(Arc::new(|| std::process::exit(1)))
+        })
+    });
+    let raft_peer_server_policy = match raft_peer_server_policy.transpose() {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("failed to configure control-plane OpenRaft peer server: {error}");
+            std::process::exit(1);
+        }
+    };
     let _raft_checkpoint_loop = spawn_experimental_raft_peer_checkpoint_loop(
         runtime.clone(),
         Arc::clone(&authority),
         raft_peer_durability.clone(),
         ExperimentalRaftPeerCheckpointPolicy::default(),
     );
-    let raft_peer_pre_auth_byte_budget = Arc::new(ExperimentalRaftPeerPreAuthByteBudget::new(
-        CONTROL_PLANE_RAFT_PEER_PRE_AUTH_BYTE_BUDGET,
-    ));
     let _raft_peer_listener_loops = raft_peer_listeners
         .into_iter()
         .map(|listener| {
@@ -4727,10 +4579,9 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 listener,
                 runtime.clone(),
                 Arc::clone(&authority),
-                node_id,
-                raft_peer_durability.clone(),
-                Arc::new(AtomicUsize::new(0)),
-                Arc::clone(&raft_peer_pre_auth_byte_budget),
+                raft_peer_server_policy
+                    .clone()
+                    .expect("bound Raft peer listeners require a server policy"),
             )
         })
         .collect::<Vec<_>>();
@@ -9490,74 +9341,6 @@ mod tests {
                 node_id: 1,
                 socket_path: "tcp://localhost:7401".to_string(),
             }];
-        let tls_server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(rustls::server::ResolvesServerCertUsingSni::new()));
-        config.control_plane_raft_peer_listeners =
-            vec![ConfiguredControlPlaneRaftPeerListener::Tcp {
-                endpoint_id: "raft-tcp-1".to_string(),
-                bind_addr: "127.0.0.1:0".to_string(),
-                tls_server_config: Arc::new(tls_server_config),
-                max_connections: 7,
-                io_timeout: Duration::from_secs(3),
-            }];
-
-        let listeners =
-            bind_experimental_raft_peer_listener(&config, "process-tcp-peer-listener-test", 1)
-                .expect("TCP peer listener should bind");
-
-        assert_eq!(listeners.len(), 1);
-        let ExperimentalRaftPeerListener {
-            endpoint_id,
-            listener,
-            max_connections,
-            io_timeout,
-            ..
-        } = &listeners[0];
-        assert_eq!(endpoint_id, "raft-tcp-1");
-        assert_eq!(*max_connections, 7);
-        assert_eq!(*io_timeout, Duration::from_secs(3));
-        let ExperimentalRaftPeerBoundListener::Tcp { listener, .. } = listener else {
-            panic!("configured TCP peer listener bound the wrong transport");
-        };
-        assert_ne!(listener.local_addr().unwrap().port(), 0);
-    }
-
-    #[test]
-    fn experimental_raft_tcp_peer_worker_authenticates_dispatches_and_requires_alpn() {
-        let harness = experimental_raft_test_harness("tls-tcp-authenticated-peer");
-        let cluster_name = format!(
-            "argmin-s3-experimental-raft-tls-tcp-authenticated-peer-{}",
-            std::process::id()
-        );
-        let server_policy = Arc::new(
-            ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
-                cluster_name.clone(),
-                [
-                    (1, "tcp://localhost:7401".to_string()),
-                    (2, "tcp://localhost:7402".to_string()),
-                ],
-                ControlPlaneRaftPeerTransportLimits::default(),
-            )
-            .with_auth_policy(experimental_raft_peer_auth_policy(&cluster_name, 1, 1)),
-        );
-        let client_auth = experimental_raft_peer_auth_policy(&cluster_name, 2, 1);
-        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 2, 1);
-        let raw_request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
-            vote: Vote::<ControlPlaneRaftLeaderId>::new(2, 2),
-            last_log_id: None,
-            leadership_transfer: false,
-        })
-        .encode_frame_for_peer(&identity)
-        .unwrap();
-        let request = client_auth
-            .sign_peer_frame(&identity, ControlPlaneAuthOperation::RaftVote, raw_request)
-            .unwrap();
-
         let certificates = CertificateDer::pem_slice_iter(include_bytes!(
             "../../s3-tests/testdata/localhost-cert.pem"
         ))
@@ -9567,178 +9350,31 @@ mod tests {
             "../../s3-tests/testdata/localhost-key.pem"
         ))
         .unwrap();
-        let mut tls_server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(certificates, private_key)
-        .unwrap();
-        tls_server_config.alpn_protocols = vec![CONTROL_PLANE_RAFT_TLS_ALPN.to_vec()];
-        let tls_server_config = Arc::new(tls_server_config);
-
-        let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(
-                CertificateDer::pem_slice_iter(include_bytes!(
-                    "../../s3-tests/testdata/ca-cert.pem"
-                ))
-                .next()
-                .unwrap()
-                .unwrap(),
-            )
+        let signing_key = rustls::crypto::ring::default_provider()
+            .key_provider
+            .load_private_key(private_key)
             .unwrap();
-        let mut tls_client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        tls_client_config.alpn_protocols = vec![CONTROL_PLANE_RAFT_TLS_ALPN.to_vec()];
-        let tls_client_config = Arc::new(tls_client_config);
+        let certified_key = Arc::new(CertifiedKey::new(certificates, signing_key));
+        config.control_plane_raft_peer_listeners =
+            vec![ConfiguredControlPlaneRaftPeerListener::Tcp {
+                endpoint_id: "raft-tcp-1".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+                certified_key,
+                max_connections: 7,
+                io_timeout: Duration::from_secs(3),
+            }];
 
-        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
-        let client_stream = StdTcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (server_stream, _) = listener.accept().unwrap();
-        client_stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        client_stream
-            .set_write_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let active_workers = Arc::new(AtomicUsize::new(0));
-        spawn_experimental_raft_tcp_peer_rpc_worker(
-            server_stream,
-            Arc::clone(&tls_server_config),
-            ExperimentalRaftPeerRpcWorkerContext {
-                runtime: harness.runtime.handle().clone(),
-                authority: Arc::clone(&harness.authority),
-                local_node_id: 1,
-                policy: Arc::clone(&server_policy),
-                durability: None,
-                active_workers: Arc::clone(&active_workers),
-                worker_limit: 1,
-                connection_deadline: Instant::now() + Duration::from_secs(1),
-                pre_auth_byte_budget: Arc::new(ExperimentalRaftPeerPreAuthByteBudget::new(
-                    CONTROL_PLANE_RAFT_PEER_PRE_AUTH_BYTE_BUDGET,
-                )),
-            },
-        );
-        let connection = rustls::ClientConnection::new(
-            Arc::clone(&tls_client_config),
-            rustls::pki_types::ServerName::try_from("localhost")
-                .unwrap()
-                .to_owned(),
-        )
-        .unwrap();
-        let mut client = rustls::StreamOwned::new(connection, client_stream);
+        let listeners =
+            bind_experimental_raft_peer_listener(&config, "process-tcp-peer-listener-test", 1)
+                .expect("TCP peer listener should bind");
 
-        write_control_plane_raft_peer_transport_frame(&mut client, &request).unwrap();
-        let response = read_control_plane_raft_peer_transport_frame(
-            &mut client,
-            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
-        )
-        .unwrap();
-        assert_eq!(
-            client.conn.alpn_protocol(),
-            Some(CONTROL_PLANE_RAFT_TLS_ALPN)
-        );
-        let response_identity = ControlPlaneRaftPeerFrameIdentity {
-            cluster_name: identity.cluster_name.clone(),
-            topology: identity.topology.clone(),
-            source: identity.target,
-            target: identity.source,
-        };
-        let response = client_auth
-            .verify_peer_frame(
-                &response,
-                &response_identity,
-                ControlPlaneAuthOperation::RaftVote,
-                ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
-            )
-            .unwrap();
-        let response =
-            ControlPlaneRaftPeerRpcResponse::decode_frame_for_peer(&response, &response_identity)
-                .unwrap();
-
-        assert!(matches!(response, ControlPlaneRaftPeerRpcResponse::Vote(_)));
-        for _ in 0..100 {
-            if active_workers.load(Ordering::Acquire) == 0 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(active_workers.load(Ordering::Acquire), 0);
-        assert_eq!(
-            server_policy
-                .auth_policy()
-                .unwrap()
-                .metrics_snapshot()
-                .accepted_total(),
-            1
-        );
-
-        let mut no_alpn_client_config = (*tls_client_config).clone();
-        no_alpn_client_config.alpn_protocols.clear();
-        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
-        let client_stream = StdTcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (server_stream, _) = listener.accept().unwrap();
-        client_stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        client_stream
-            .set_write_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        spawn_experimental_raft_tcp_peer_rpc_worker(
-            server_stream,
-            tls_server_config,
-            ExperimentalRaftPeerRpcWorkerContext {
-                runtime: harness.runtime.handle().clone(),
-                authority: Arc::clone(&harness.authority),
-                local_node_id: 1,
-                policy: Arc::clone(&server_policy),
-                durability: None,
-                active_workers: Arc::clone(&active_workers),
-                worker_limit: 1,
-                connection_deadline: Instant::now() + Duration::from_secs(1),
-                pre_auth_byte_budget: Arc::new(ExperimentalRaftPeerPreAuthByteBudget::new(
-                    CONTROL_PLANE_RAFT_PEER_PRE_AUTH_BYTE_BUDGET,
-                )),
-            },
-        );
-        let connection = rustls::ClientConnection::new(
-            Arc::new(no_alpn_client_config),
-            rustls::pki_types::ServerName::try_from("localhost")
-                .unwrap()
-                .to_owned(),
-        )
-        .unwrap();
-        let mut no_alpn_client = rustls::StreamOwned::new(connection, client_stream);
-
-        let _ = write_control_plane_raft_peer_transport_frame(&mut no_alpn_client, &request);
-        assert!(read_control_plane_raft_peer_transport_frame(
-            &mut no_alpn_client,
-            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
-        )
-        .is_err());
-        for _ in 0..100 {
-            if active_workers.load(Ordering::Acquire) == 0 {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(active_workers.load(Ordering::Acquire), 0);
-        assert_eq!(
-            server_policy
-                .auth_policy()
-                .unwrap()
-                .metrics_snapshot()
-                .accepted_total(),
-            1
-        );
-        harness.shutdown();
+        assert_eq!(listeners.len(), 1);
+        let debug = format!("{:?}", listeners[0]);
+        assert!(debug.contains("raft-tcp-1"));
+        assert!(debug.contains("tls-tcp"));
+        assert!(debug.contains("max_connections: 7"));
+        assert!(debug.contains("3s"));
+        assert!(!debug.contains("PRIVATE"));
     }
 
     #[test]

@@ -5,14 +5,14 @@ use std::future::Future;
 #[cfg(test)]
 use std::io::Cursor;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::ops::{Bound, RangeBounds};
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(test)]
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -51,6 +51,7 @@ use openraft::StoredMembership;
 use openraft::{AnyError, Config, SnapshotPolicy};
 use placement::NodeId;
 use rustls::pki_types::ServerName;
+use rustls::sign::CertifiedKey;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -73,6 +74,7 @@ use crate::control_plane_command::{
     ControlPlaneCommandResponse, ControlPlaneCommandStateMachine, ControlPlaneLogId,
     ControlPlaneSnapshotArtifact, ReplicatedControlPlaneStateMachine,
 };
+use crate::deadline_io::DeadlineStream;
 use crate::durable_journal::{
     DurableJournalAppendError, DurableJournalFile, DurableJournalFormat, DurableJournalIoContexts,
     DurableJournalObserver,
@@ -9698,7 +9700,7 @@ fn validate_raft_peer_frame_identity(
 }
 
 pub fn write_control_plane_raft_peer_transport_frame(
-    writer: &mut impl Write,
+    writer: &mut (impl Write + ?Sized),
     frame: &[u8],
 ) -> Result<(), ControlPlaneError> {
     let frame_len = u32::try_from(frame.len()).map_err(|_| ControlPlaneError::RpcProtocol {
@@ -9719,7 +9721,7 @@ pub fn write_control_plane_raft_peer_transport_frame(
 }
 
 pub fn read_control_plane_raft_peer_transport_frame(
-    reader: &mut impl Read,
+    reader: &mut (impl Read + ?Sized),
     max_frame_bytes: usize,
 ) -> Result<Vec<u8>, ControlPlaneError> {
     read_control_plane_raft_peer_transport_frame_with_reservation(reader, max_frame_bytes, |_| {
@@ -9729,7 +9731,7 @@ pub fn read_control_plane_raft_peer_transport_frame(
 }
 
 pub fn read_control_plane_raft_peer_transport_frame_with_reservation<Reservation>(
-    reader: &mut impl Read,
+    reader: &mut (impl Read + ?Sized),
     max_frame_bytes: usize,
     reserve: impl FnOnce(usize) -> Result<Reservation, ControlPlaneError>,
 ) -> Result<(Vec<u8>, Reservation), ControlPlaneError> {
@@ -9762,6 +9764,815 @@ pub fn read_control_plane_raft_peer_transport_frame_with_reservation<Reservation
             source,
         })?;
     Ok((frame, reservation))
+}
+
+const CONTROL_PLANE_RAFT_PEER_SERVER_DEADLINE_EXPIRED: &str =
+    "control-plane OpenRaft inbound peer connection deadline expired";
+
+/// Durability gate invoked by the storage-owned Raft peer server.
+///
+/// Implementations receive no transport or frame access. Storage decides
+/// when a snapshot response requires a checkpoint and owns the exact ordering
+/// of checkpoint, response publication, and acknowledgement.
+pub trait ControlPlaneRaftPeerServerDurability: Send + Sync {
+    fn is_poisoned(&self) -> bool;
+
+    fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError>;
+
+    fn publish_response(
+        &self,
+        publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+    ) -> Result<(), ControlPlaneError>;
+}
+
+#[derive(Clone)]
+struct ControlPlaneRaftPeerServerResources {
+    pre_auth_byte_budget: Arc<ControlPlaneRaftPeerServerPreAuthByteBudget>,
+}
+
+/// Logical policy shared by every inbound listener for one Raft authority.
+///
+/// Clones share the pre-authentication allocation budget. The transport
+/// policy owns peer identity, authentication, and frame limits; the server
+/// facade owns the order in which they are applied.
+#[derive(Clone)]
+pub struct ControlPlaneRaftPeerServerPolicy {
+    local_node_id: ControlPlaneRaftNodeId,
+    peer_policy: Arc<ControlPlaneRaftPeerTransportPolicy>,
+    resources: ControlPlaneRaftPeerServerResources,
+    durability: Option<Arc<dyn ControlPlaneRaftPeerServerDurability>>,
+    fatal_error_handler: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl fmt::Debug for ControlPlaneRaftPeerServerPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlPlaneRaftPeerServerPolicy")
+            .field("local_node_id", &self.local_node_id)
+            .field("peer_policy", &"configured")
+            .field("durability", &self.durability.is_some())
+            .field("fatal_error_handler", &self.fatal_error_handler.is_some())
+            .finish()
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPlaneRaftPeerServerConfigError {
+    #[error("control-plane Raft peer server endpoint id must not be empty")]
+    EmptyEndpointId,
+    #[error("control-plane Raft peer server local node is absent from the peer policy")]
+    InvalidLocalNode,
+    #[error("control-plane Raft peer server pre-authentication byte budget must be positive")]
+    ZeroPreAuthByteBudget,
+    #[error("control-plane Raft peer server connection limit must be positive")]
+    ZeroConnectionLimit,
+    #[error("control-plane Raft peer server I/O timeout must be positive")]
+    ZeroIoTimeout,
+    #[error("failed to configure the control-plane Raft peer server listener")]
+    ListenerConfigurationUnavailable,
+    #[error("failed to construct the control-plane Raft TLS server profile")]
+    TlsProfileUnavailable,
+}
+
+impl ControlPlaneRaftPeerServerPolicy {
+    pub fn new(
+        local_node_id: ControlPlaneRaftNodeId,
+        peer_policy: ControlPlaneRaftPeerTransportPolicy,
+        pre_auth_byte_budget: usize,
+    ) -> Result<Self, ControlPlaneRaftPeerServerConfigError> {
+        peer_policy
+            .validate_local_node(local_node_id)
+            .map_err(|_| ControlPlaneRaftPeerServerConfigError::InvalidLocalNode)?;
+        if pre_auth_byte_budget == 0 {
+            return Err(ControlPlaneRaftPeerServerConfigError::ZeroPreAuthByteBudget);
+        }
+        Ok(Self {
+            local_node_id,
+            peer_policy: Arc::new(peer_policy),
+            resources: ControlPlaneRaftPeerServerResources {
+                pre_auth_byte_budget: Arc::new(ControlPlaneRaftPeerServerPreAuthByteBudget::new(
+                    pre_auth_byte_budget,
+                )),
+            },
+            durability: None,
+            fatal_error_handler: None,
+        })
+    }
+
+    #[must_use]
+    pub fn with_durability(
+        mut self,
+        durability: Arc<dyn ControlPlaneRaftPeerServerDurability>,
+    ) -> Self {
+        self.durability = Some(durability);
+        self
+    }
+
+    #[must_use]
+    pub fn with_fatal_error_handler(
+        mut self,
+        fatal_error_handler: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.fatal_error_handler = Some(fatal_error_handler);
+        self
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn reserved_pre_auth_bytes(&self) -> usize {
+        self.resources.pre_auth_byte_budget.reserved_bytes()
+    }
+}
+
+#[derive(Debug)]
+struct ControlPlaneRaftPeerServerPreAuthByteBudget {
+    reserved_bytes: AtomicUsize,
+    limit_bytes: usize,
+}
+
+impl ControlPlaneRaftPeerServerPreAuthByteBudget {
+    fn new(limit_bytes: usize) -> Self {
+        Self {
+            reserved_bytes: AtomicUsize::new(0),
+            limit_bytes,
+        }
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        frame_bytes: usize,
+    ) -> Result<ControlPlaneRaftPeerServerPreAuthByteReservation, ControlPlaneError> {
+        let result =
+            self.reserved_bytes
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                    reserved
+                        .checked_add(frame_bytes)
+                        .filter(|total| *total <= self.limit_bytes)
+                });
+        match result {
+            Ok(_) => Ok(ControlPlaneRaftPeerServerPreAuthByteReservation {
+                budget: Arc::clone(self),
+                frame_bytes,
+            }),
+            Err(reserved) => Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "control-plane OpenRaft peer pre-authentication frame budget exhausted: requested {frame_bytes} bytes with {reserved} of {} bytes reserved",
+                    self.limit_bytes
+                ),
+            }),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn reserved_bytes(&self) -> usize {
+        self.reserved_bytes.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+struct ControlPlaneRaftPeerServerPreAuthByteReservation {
+    budget: Arc<ControlPlaneRaftPeerServerPreAuthByteBudget>,
+    frame_bytes: usize,
+}
+
+impl Drop for ControlPlaneRaftPeerServerPreAuthByteReservation {
+    fn drop(&mut self) {
+        self.budget
+            .reserved_bytes
+            .fetch_sub(self.frame_bytes, Ordering::AcqRel);
+    }
+}
+
+struct ControlPlaneRaftPeerTlsCertificateResolver {
+    certified_key: Arc<CertifiedKey>,
+}
+
+impl fmt::Debug for ControlPlaneRaftPeerTlsCertificateResolver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlPlaneRaftPeerTlsCertificateResolver")
+            .field("certificate", &"configured")
+            .finish()
+    }
+}
+
+impl rustls::server::ResolvesServerCert for ControlPlaneRaftPeerTlsCertificateResolver {
+    fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(&self.certified_key))
+    }
+}
+
+enum ControlPlaneRaftPeerServerListenerKind {
+    Unix(UnixListener),
+    TlsTcp {
+        listener: TcpListener,
+        tls_server_config: Arc<rustls::ServerConfig>,
+    },
+}
+
+/// Opaque bound listener for the storage-owned inbound Raft peer server.
+pub struct ControlPlaneRaftPeerServerListener {
+    endpoint_id: String,
+    kind: ControlPlaneRaftPeerServerListenerKind,
+    max_connections: usize,
+    io_timeout: Duration,
+    active_workers: Arc<AtomicUsize>,
+}
+
+impl fmt::Debug for ControlPlaneRaftPeerServerListener {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let transport = match self.kind {
+            ControlPlaneRaftPeerServerListenerKind::Unix(_) => "unix",
+            ControlPlaneRaftPeerServerListenerKind::TlsTcp { .. } => "tls-tcp",
+        };
+        formatter
+            .debug_struct("ControlPlaneRaftPeerServerListener")
+            .field("endpoint_id", &self.endpoint_id)
+            .field("transport", &transport)
+            .field("max_connections", &self.max_connections)
+            .field("io_timeout", &self.io_timeout)
+            .finish()
+    }
+}
+
+fn validate_control_plane_raft_peer_server_listener(
+    endpoint_id: &str,
+    max_connections: usize,
+    io_timeout: Duration,
+) -> Result<(), ControlPlaneRaftPeerServerConfigError> {
+    if endpoint_id.is_empty() {
+        return Err(ControlPlaneRaftPeerServerConfigError::EmptyEndpointId);
+    }
+    if max_connections == 0 {
+        return Err(ControlPlaneRaftPeerServerConfigError::ZeroConnectionLimit);
+    }
+    if io_timeout.is_zero() {
+        return Err(ControlPlaneRaftPeerServerConfigError::ZeroIoTimeout);
+    }
+    Ok(())
+}
+
+impl ControlPlaneRaftPeerServerListener {
+    pub fn unix(
+        endpoint_id: impl Into<String>,
+        listener: UnixListener,
+        max_connections: usize,
+        io_timeout: Duration,
+    ) -> Result<Self, ControlPlaneRaftPeerServerConfigError> {
+        let endpoint_id = endpoint_id.into();
+        validate_control_plane_raft_peer_server_listener(
+            &endpoint_id,
+            max_connections,
+            io_timeout,
+        )?;
+        listener
+            .set_nonblocking(false)
+            .map_err(|_| ControlPlaneRaftPeerServerConfigError::ListenerConfigurationUnavailable)?;
+        Ok(Self {
+            endpoint_id,
+            kind: ControlPlaneRaftPeerServerListenerKind::Unix(listener),
+            max_connections,
+            io_timeout,
+            active_workers: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    pub fn tls_tcp(
+        endpoint_id: impl Into<String>,
+        listener: TcpListener,
+        certified_key: Arc<CertifiedKey>,
+        max_connections: usize,
+        io_timeout: Duration,
+    ) -> Result<Self, ControlPlaneRaftPeerServerConfigError> {
+        let endpoint_id = endpoint_id.into();
+        validate_control_plane_raft_peer_server_listener(
+            &endpoint_id,
+            max_connections,
+            io_timeout,
+        )?;
+        listener
+            .set_nonblocking(false)
+            .map_err(|_| ControlPlaneRaftPeerServerConfigError::ListenerConfigurationUnavailable)?;
+        let resolver = ControlPlaneRaftPeerTlsCertificateResolver { certified_key };
+        let mut tls_server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| ControlPlaneRaftPeerServerConfigError::TlsProfileUnavailable)?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(resolver));
+        tls_server_config.alpn_protocols = vec![CONTROL_PLANE_RAFT_TLS_ALPN.to_vec()];
+        Ok(Self {
+            endpoint_id,
+            kind: ControlPlaneRaftPeerServerListenerKind::TlsTcp {
+                listener,
+                tls_server_config: Arc::new(tls_server_config),
+            },
+            max_connections,
+            io_timeout,
+            active_workers: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn active_workers(&self) -> usize {
+        self.active_workers.load(Ordering::Acquire)
+    }
+}
+
+/// Opaque failure returned when a Raft peer listener can no longer accept
+/// connections. Concrete transport diagnostics remain inside storage.
+pub struct ControlPlaneRaftPeerServerError;
+
+impl fmt::Debug for ControlPlaneRaftPeerServerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ControlPlaneRaftPeerServerError")
+    }
+}
+
+impl fmt::Display for ControlPlaneRaftPeerServerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("control-plane Raft peer server stopped accepting connections")
+    }
+}
+
+impl std::error::Error for ControlPlaneRaftPeerServerError {}
+
+trait ControlPlaneRaftPeerServerStream: Read + Write + Send {
+    fn begin_response(&mut self, timeout: Duration);
+
+    fn finish_response(&mut self) -> io::Result<()>;
+}
+
+impl ControlPlaneRaftPeerServerStream for DeadlineStream<UnixStream> {
+    fn begin_response(&mut self, timeout: Duration) {
+        self.set_deadline(
+            Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now),
+        );
+    }
+
+    fn finish_response(&mut self) -> io::Result<()> {
+        self.flush()
+    }
+}
+
+impl ControlPlaneRaftPeerServerStream
+    for rustls::StreamOwned<rustls::ServerConnection, DeadlineStream<TcpStream>>
+{
+    fn begin_response(&mut self, timeout: Duration) {
+        self.sock.set_deadline(
+            Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now),
+        );
+    }
+
+    fn finish_response(&mut self) -> io::Result<()> {
+        self.conn.send_close_notify();
+        self.flush()
+    }
+}
+
+struct ControlPlaneRaftPeerServerWorkerGuard {
+    active_workers: Arc<AtomicUsize>,
+}
+
+impl Drop for ControlPlaneRaftPeerServerWorkerGuard {
+    fn drop(&mut self) {
+        self.active_workers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl ControlPlaneRaftPeerServerListener {
+    pub fn accept_one(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        authority: Arc<ControlPlaneRaftAuthority>,
+        policy: &ControlPlaneRaftPeerServerPolicy,
+    ) -> Result<(), ControlPlaneRaftPeerServerError> {
+        match &self.kind {
+            ControlPlaneRaftPeerServerListenerKind::Unix(listener) => match listener.accept() {
+                Ok((stream, _)) => spawn_control_plane_raft_peer_server_worker(
+                    stream,
+                    runtime.clone(),
+                    authority,
+                    policy.clone(),
+                    self.max_connections,
+                    self.io_timeout,
+                    Arc::clone(&self.active_workers),
+                    |stream, deadline| {
+                        DeadlineStream::new(
+                            stream,
+                            deadline,
+                            CONTROL_PLANE_RAFT_PEER_SERVER_DEADLINE_EXPIRED,
+                        )
+                        .map(|stream| Box::new(stream) as Box<dyn ControlPlaneRaftPeerServerStream>)
+                        .map_err(|source| ControlPlaneError::Io {
+                            context: "configure control-plane OpenRaft Unix peer deadline I/O",
+                            source,
+                        })
+                    },
+                ),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    eprintln!(
+                        "control-plane OpenRaft peer listener {} accept failed: {error}",
+                        self.endpoint_id
+                    );
+                    return Err(ControlPlaneRaftPeerServerError);
+                }
+            },
+            ControlPlaneRaftPeerServerListenerKind::TlsTcp {
+                listener,
+                tls_server_config,
+            } => match listener.accept() {
+                Ok((stream, _)) => {
+                    let tls_server_config = Arc::clone(tls_server_config);
+                    spawn_control_plane_raft_peer_server_worker(
+                        stream,
+                        runtime.clone(),
+                        authority,
+                        policy.clone(),
+                        self.max_connections,
+                        self.io_timeout,
+                        Arc::clone(&self.active_workers),
+                        move |stream, deadline| {
+                            let socket =
+                                DeadlineStream::new(
+                                    stream,
+                                    deadline,
+                                    CONTROL_PLANE_RAFT_PEER_SERVER_DEADLINE_EXPIRED,
+                                )
+                                .map_err(|source| {
+                                    ControlPlaneError::Io {
+                                context:
+                                    "configure control-plane OpenRaft TLS/TCP peer deadline I/O",
+                                source,
+                            }
+                                })?;
+                            let connection = rustls::ServerConnection::new(tls_server_config)
+                                .map_err(|_| ControlPlaneError::RpcProtocol {
+                                    message: "failed to initialize control-plane OpenRaft TLS server connection".to_owned(),
+                                })?;
+                            let mut stream = rustls::StreamOwned::new(connection, socket);
+                            while stream.conn.is_handshaking() {
+                                stream
+                                    .conn
+                                    .complete_io(&mut stream.sock)
+                                    .map_err(|source| ControlPlaneError::Io {
+                                        context:
+                                            "complete control-plane OpenRaft TLS server handshake",
+                                        source,
+                                    })?;
+                            }
+                            if stream.conn.alpn_protocol() != Some(CONTROL_PLANE_RAFT_TLS_ALPN) {
+                                return Err(ControlPlaneError::RpcProtocol {
+                                    message: "control-plane OpenRaft TLS peer did not negotiate the required protocol profile".to_owned(),
+                                });
+                            }
+                            Ok(Box::new(stream) as Box<dyn ControlPlaneRaftPeerServerStream>)
+                        },
+                    );
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    eprintln!(
+                        "control-plane OpenRaft TLS/TCP peer listener {} accept failed: {error}",
+                        self.endpoint_id
+                    );
+                    return Err(ControlPlaneRaftPeerServerError);
+                }
+            },
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_control_plane_raft_peer_server_worker<RawStream, Prepare>(
+    stream: RawStream,
+    runtime: tokio::runtime::Handle,
+    authority: Arc<ControlPlaneRaftAuthority>,
+    policy: ControlPlaneRaftPeerServerPolicy,
+    worker_limit: usize,
+    io_timeout: Duration,
+    active_workers: Arc<AtomicUsize>,
+    prepare: Prepare,
+) where
+    RawStream: Send + 'static,
+    Prepare: FnOnce(
+            RawStream,
+            Instant,
+        ) -> Result<Box<dyn ControlPlaneRaftPeerServerStream>, ControlPlaneError>
+        + Send
+        + 'static,
+{
+    if policy
+        .durability
+        .as_deref()
+        .is_some_and(ControlPlaneRaftPeerServerDurability::is_poisoned)
+    {
+        eprintln!("control-plane OpenRaft peer RPC rejected: durable authority is poisoned");
+        return;
+    }
+    if active_workers
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < worker_limit).then_some(active + 1)
+        })
+        .is_err()
+    {
+        eprintln!("control-plane OpenRaft peer RPC rejected: worker limit reached");
+        return;
+    }
+    let connection_deadline = Instant::now()
+        .checked_add(io_timeout)
+        .unwrap_or_else(Instant::now);
+    std::thread::spawn(move || {
+        let _guard = ControlPlaneRaftPeerServerWorkerGuard { active_workers };
+        let mut stream = match prepare(stream, connection_deadline) {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("control-plane OpenRaft peer transport setup failed: {error}");
+                return;
+            }
+        };
+        match handle_control_plane_raft_peer_server_request(
+            &runtime,
+            &authority,
+            &mut *stream,
+            &policy,
+            connection_deadline,
+            io_timeout,
+        ) {
+            Ok(()) => {}
+            Err(ControlPlaneRaftPeerServerWorkerError::PeerRpc(error)) => {
+                eprintln!("control-plane OpenRaft peer RPC failed: {error}");
+            }
+            Err(ControlPlaneRaftPeerServerWorkerError::Checkpoint(error)) => {
+                eprintln!(
+                    "control-plane OpenRaft durability checkpoint failed before peer RPC response: {error}"
+                );
+                if let Some(fatal_error_handler) = &policy.fatal_error_handler {
+                    fatal_error_handler();
+                }
+            }
+        }
+    });
+}
+
+#[derive(Debug)]
+enum ControlPlaneRaftPeerServerWorkerError {
+    PeerRpc(ControlPlaneError),
+    Checkpoint(ControlPlaneError),
+}
+
+fn handle_control_plane_raft_peer_server_request(
+    runtime: &tokio::runtime::Handle,
+    authority: &ControlPlaneRaftAuthority,
+    stream: &mut dyn ControlPlaneRaftPeerServerStream,
+    policy: &ControlPlaneRaftPeerServerPolicy,
+    connection_deadline: Instant,
+    response_timeout: Duration,
+) -> Result<(), ControlPlaneRaftPeerServerWorkerError> {
+    ensure_control_plane_raft_peer_server_not_poisoned(policy)?;
+    let (received_frame, pre_auth_reservation) =
+        read_control_plane_raft_peer_transport_frame_with_reservation(
+            stream,
+            policy.peer_policy.limits().max_frame_bytes,
+            |frame_bytes| policy.resources.pre_auth_byte_budget.reserve(frame_bytes),
+        )
+        .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)?;
+    let request_frame = if let Some(auth_policy) = policy.peer_policy.auth_policy() {
+        let envelope = match ControlPlaneAuthEnvelope::decode_frame(
+            &received_frame,
+            policy.peer_policy.limits().max_frame_bytes,
+        ) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                auth_policy.record_peer_frame_rejection_without_operation(
+                    ControlPlaneAuthRejectionReason::Malformed,
+                );
+                return Err(ControlPlaneRaftPeerServerWorkerError::PeerRpc(error));
+            }
+        };
+        let operation = envelope.header().operation();
+        let identity = match control_plane_raft_peer_auth_envelope_identity(
+            &envelope,
+            policy.peer_policy.cluster_name(),
+            policy.peer_policy.topology_identity(),
+            policy.local_node_id,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                auth_policy.record_peer_frame_rejection(
+                    operation,
+                    ControlPlaneAuthRejectionReason::Malformed,
+                );
+                return Err(ControlPlaneRaftPeerServerWorkerError::PeerRpc(error));
+            }
+        };
+        auth_policy
+            .verify_peer_frame(
+                &received_frame,
+                &identity,
+                operation,
+                policy.peer_policy.limits().max_frame_bytes,
+            )
+            .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)?
+    } else {
+        received_frame
+    };
+    let frame_kind = decode_control_plane_raft_peer_request_frame_kind(&request_frame)
+        .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)?;
+    let identity = decode_control_plane_raft_peer_request_frame_identity(&request_frame)
+        .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)?;
+    let operation = decode_control_plane_raft_peer_request_auth_operation(&request_frame)
+        .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)?;
+    policy
+        .peer_policy
+        .validate_incoming_frame_identity(&identity, policy.local_node_id)
+        .map_err(|error| ControlPlaneError::RpcProtocol {
+            message: error.to_string(),
+        })
+        .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)?;
+    drop(pre_auth_reservation);
+
+    ensure_control_plane_raft_peer_server_not_poisoned(policy)?;
+    let raw_response_frame = block_on_control_plane_raft_peer_server(runtime, async {
+        tokio::time::timeout_at(tokio::time::Instant::from_std(connection_deadline), async {
+            match frame_kind {
+                ControlPlaneRaftPeerFrameKind::OrdinaryRpc => {
+                    handle_control_plane_raft_peer_rpc_frame(
+                        authority.raft(),
+                        &request_frame,
+                        &identity,
+                    )
+                    .await
+                }
+                ControlPlaneRaftPeerFrameKind::Snapshot => {
+                    handle_control_plane_raft_peer_snapshot_frame(
+                        authority.raft(),
+                        &request_frame,
+                        policy.peer_policy.limits().max_frame_bytes,
+                        policy.peer_policy.limits().max_snapshot_bytes,
+                        &identity,
+                    )
+                    .await
+                }
+            }
+        })
+        .await
+        .map_err(|_| ControlPlaneError::Io {
+            context: "dispatch control-plane OpenRaft inbound peer frame",
+            source: io::Error::new(
+                io::ErrorKind::TimedOut,
+                CONTROL_PLANE_RAFT_PEER_SERVER_DEADLINE_EXPIRED,
+            ),
+        })?
+    })
+    .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)?;
+
+    let response_frame = if let Some(auth_policy) = policy.peer_policy.auth_policy() {
+        let response_identity = reverse_raft_peer_frame_identity(&identity);
+        auth_policy
+            .sign_peer_frame(&response_identity, operation, raw_response_frame)
+            .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)?
+    } else {
+        raw_response_frame
+    };
+
+    if frame_kind == ControlPlaneRaftPeerFrameKind::Snapshot {
+        let durability = policy.durability.as_deref().ok_or_else(|| {
+            ControlPlaneRaftPeerServerWorkerError::Checkpoint(ControlPlaneError::RpcProtocol {
+                message:
+                    "control-plane OpenRaft snapshot peer RPC requires a durability checkpoint callback"
+                        .to_owned(),
+            })
+        })?;
+        durability
+            .checkpoint_before_snapshot_response()
+            .map_err(ControlPlaneRaftPeerServerWorkerError::Checkpoint)?;
+    }
+    ensure_control_plane_raft_peer_server_not_poisoned(policy)?;
+
+    let mut response_frame = Some(response_frame);
+    let mut publish = || {
+        let response_frame =
+            response_frame
+                .take()
+                .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                    message:
+                        "control-plane OpenRaft peer response publication attempted more than once"
+                            .to_owned(),
+                })?;
+        stream.begin_response(response_timeout);
+        write_control_plane_raft_peer_transport_frame(stream, &response_frame)?;
+        stream
+            .finish_response()
+            .map_err(|source| ControlPlaneError::Io {
+                context: "finalize control-plane OpenRaft peer response",
+                source,
+            })
+    };
+    publish_control_plane_raft_peer_server_response(policy.durability.as_deref(), &mut publish)
+        .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)
+}
+
+fn ensure_control_plane_raft_peer_server_not_poisoned(
+    policy: &ControlPlaneRaftPeerServerPolicy,
+) -> Result<(), ControlPlaneRaftPeerServerWorkerError> {
+    if policy
+        .durability
+        .as_deref()
+        .is_some_and(ControlPlaneRaftPeerServerDurability::is_poisoned)
+    {
+        return Err(ControlPlaneRaftPeerServerWorkerError::PeerRpc(
+            ControlPlaneError::RpcRemote {
+                message: "control-plane OpenRaft durable authority is poisoned; refusing peer RPC until restart".to_owned(),
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn publish_control_plane_raft_peer_server_response(
+    durability: Option<&dyn ControlPlaneRaftPeerServerDurability>,
+    publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+) -> Result<(), ControlPlaneError> {
+    let mut published = false;
+    let result = {
+        let mut publish_once = || {
+            if std::mem::replace(&mut published, true) {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message:
+                        "control-plane OpenRaft peer response publication attempted more than once"
+                            .to_owned(),
+                });
+            }
+            publish()
+        };
+        match durability {
+            Some(durability) => durability.publish_response(&mut publish_once),
+            None => publish_once(),
+        }
+    };
+    if result.is_ok() && !published {
+        return Err(ControlPlaneError::RpcProtocol {
+            message:
+                "control-plane OpenRaft peer response publication completed without publishing"
+                    .to_owned(),
+        });
+    }
+    result
+}
+
+fn control_plane_raft_peer_auth_envelope_identity(
+    envelope: &ControlPlaneAuthEnvelope,
+    expected_cluster_name: &str,
+    expected_topology: Option<&ControlPlaneRaftTopologyIdentity>,
+    local_node_id: ControlPlaneRaftNodeId,
+) -> Result<ControlPlaneRaftPeerFrameIdentity, ControlPlaneError> {
+    let source = match envelope.header().source() {
+        ControlPlaneAuthPrincipal::RaftPeer { node_id } => *node_id,
+        principal => {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "control-plane OpenRaft peer auth source is not a RaftPeer principal: {principal:?}"
+                ),
+            });
+        }
+    };
+    match envelope.header().target() {
+        ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer { .. }) => {}
+        target => {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "control-plane OpenRaft peer auth target is not a RaftPeer principal: {target:?}"
+                ),
+            });
+        }
+    }
+    let mut identity = ControlPlaneRaftPeerFrameIdentity::new(
+        expected_cluster_name.to_owned(),
+        source,
+        local_node_id,
+    );
+    identity.topology = expected_topology.cloned();
+    Ok(identity)
+}
+
+fn block_on_control_plane_raft_peer_server<F: Future>(
+    runtime: &tokio::runtime::Handle,
+    future: F,
+) -> F::Output {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| runtime.block_on(future))
+    } else {
+        runtime.block_on(future)
+    }
 }
 
 pub async fn handle_control_plane_raft_peer_rpc_frame(
@@ -12348,6 +13159,26 @@ mod tests {
             )
             .unwrap();
         roots
+    }
+
+    fn raft_peer_test_tls_certified_key() -> Arc<CertifiedKey> {
+        use rustls::pki_types::pem::PemObject as _;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let certificates = CertificateDer::pem_slice_iter(include_bytes!(
+            "../../s3-tests/testdata/localhost-cert.pem"
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let private_key = PrivateKeyDer::from_pem_slice(include_bytes!(
+            "../../s3-tests/testdata/localhost-key.pem"
+        ))
+        .unwrap();
+        let signing_key = rustls::crypto::ring::default_provider()
+            .key_provider
+            .load_private_key(private_key)
+            .unwrap();
+        Arc::new(CertifiedKey::new(certificates, signing_key))
     }
 
     fn raft_peer_test_tls_server_config(with_alpn: bool) -> Arc<rustls::ServerConfig> {
@@ -14955,6 +15786,564 @@ mod tests {
         )
         .unwrap();
         assert!(mismatch.validate_policy(&policy).is_err());
+    }
+
+    #[derive(Default)]
+    struct RecordingPeerServerDurability {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        poisoned: AtomicBool,
+    }
+
+    impl ControlPlaneRaftPeerServerDurability for RecordingPeerServerDurability {
+        fn is_poisoned(&self) -> bool {
+            self.poisoned.load(Ordering::Acquire)
+        }
+
+        fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError> {
+            self.events.lock().unwrap().push("checkpoint");
+            Ok(())
+        }
+
+        fn publish_response(
+            &self,
+            publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+        ) -> Result<(), ControlPlaneError> {
+            self.events.lock().unwrap().push("publish");
+            publish()?;
+            self.events.lock().unwrap().push("published");
+            Ok(())
+        }
+    }
+
+    struct RecordingPeerServerStream {
+        request: Cursor<Vec<u8>>,
+        response: Vec<u8>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        write_started: bool,
+        response_deadline: Option<Instant>,
+    }
+
+    impl RecordingPeerServerStream {
+        fn new(request: Vec<u8>, events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                request: Cursor::new(request),
+                response: Vec::new(),
+                events,
+                write_started: false,
+                response_deadline: None,
+            }
+        }
+
+        fn with_ingress_deadline(mut self, deadline: Instant) -> Self {
+            self.response_deadline = Some(deadline);
+            self
+        }
+    }
+
+    impl Read for RecordingPeerServerStream {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.request.read(buffer)
+        }
+    }
+
+    impl Write for RecordingPeerServerStream {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self
+                .response_deadline
+                .is_none_or(|deadline| Instant::now() >= deadline)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "recording peer response deadline expired",
+                ));
+            }
+            if !self.write_started {
+                self.write_started = true;
+                self.events.lock().unwrap().push("write");
+            }
+            self.response.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ControlPlaneRaftPeerServerStream for RecordingPeerServerStream {
+        fn begin_response(&mut self, timeout: Duration) {
+            self.events.lock().unwrap().push("begin_response");
+            self.response_deadline = Some(Instant::now() + timeout);
+        }
+
+        fn finish_response(&mut self) -> io::Result<()> {
+            self.events.lock().unwrap().push("finish");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn control_plane_raft_peer_server_snapshots_checkpoint_before_acknowledgement() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let authority = Arc::new(
+            runtime
+                .block_on(
+                    ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                        "peer-server-checkpoint-order",
+                        1,
+                    ),
+                )
+                .unwrap(),
+        );
+        let peer_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            "peer-server-checkpoint-order",
+            [(1, "node-1".to_owned())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let durability = Arc::new(RecordingPeerServerDurability::default());
+        let policy = ControlPlaneRaftPeerServerPolicy::new(1, peer_policy, 4096)
+            .unwrap()
+            .with_durability(durability.clone());
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        state_machine
+            .apply_entry(bootstrap_membership_entry(1))
+            .unwrap();
+        let request = ControlPlaneRaftPeerSnapshotRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(1, 1),
+            snapshot: state_machine.build_snapshot().unwrap(),
+        }
+        .encode_frame_for_peer(&ControlPlaneRaftPeerFrameIdentity::new(
+            "peer-server-checkpoint-order",
+            1,
+            1,
+        ))
+        .unwrap();
+        let mut transport_request = Vec::new();
+        write_control_plane_raft_peer_transport_frame(&mut transport_request, &request).unwrap();
+        let mut stream =
+            RecordingPeerServerStream::new(transport_request, Arc::clone(&durability.events));
+
+        handle_control_plane_raft_peer_server_request(
+            runtime.handle(),
+            &authority,
+            &mut stream,
+            &policy,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            *durability.events.lock().unwrap(),
+            [
+                "checkpoint",
+                "publish",
+                "begin_response",
+                "write",
+                "finish",
+                "published"
+            ]
+        );
+        assert!(!stream.response.is_empty());
+        runtime.block_on(authority.shutdown()).unwrap();
+    }
+
+    #[test]
+    fn control_plane_raft_peer_server_publication_must_publish_exactly_once() {
+        struct SkipPublication;
+        impl ControlPlaneRaftPeerServerDurability for SkipPublication {
+            fn is_poisoned(&self) -> bool {
+                false
+            }
+            fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError> {
+                Ok(())
+            }
+            fn publish_response(
+                &self,
+                _publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+            ) -> Result<(), ControlPlaneError> {
+                Ok(())
+            }
+        }
+
+        struct DuplicatePublication;
+        impl ControlPlaneRaftPeerServerDurability for DuplicatePublication {
+            fn is_poisoned(&self) -> bool {
+                false
+            }
+            fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError> {
+                Ok(())
+            }
+            fn publish_response(
+                &self,
+                publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+            ) -> Result<(), ControlPlaneError> {
+                publish()?;
+                publish()
+            }
+        }
+
+        let calls = AtomicUsize::new(0);
+        let mut publish = || {
+            calls.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        };
+        assert!(publish_control_plane_raft_peer_server_response(
+            Some(&SkipPublication),
+            &mut publish,
+        )
+        .is_err());
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        assert!(publish_control_plane_raft_peer_server_response(
+            Some(&DuplicatePublication),
+            &mut publish,
+        )
+        .is_err());
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn control_plane_raft_peer_server_response_deadline_starts_after_publication() {
+        struct SlowPublication {
+            delay: Duration,
+        }
+
+        impl ControlPlaneRaftPeerServerDurability for SlowPublication {
+            fn is_poisoned(&self) -> bool {
+                false
+            }
+
+            fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError> {
+                Ok(())
+            }
+
+            fn publish_response(
+                &self,
+                publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+            ) -> Result<(), ControlPlaneError> {
+                thread::sleep(self.delay);
+                publish()
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let cluster_name = "peer-server-response-deadline";
+        let authority = Arc::new(
+            runtime
+                .block_on(
+                    ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                        cluster_name,
+                        1,
+                    ),
+                )
+                .unwrap(),
+        );
+        let peer_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name,
+            [(1, "node-1".to_owned())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let ingress_timeout = Duration::from_millis(250);
+        let response_timeout = Duration::from_millis(100);
+        let policy = ControlPlaneRaftPeerServerPolicy::new(1, peer_policy, 4096)
+            .unwrap()
+            .with_durability(Arc::new(SlowPublication {
+                delay: ingress_timeout + Duration::from_millis(50),
+            }));
+        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 1, 1);
+        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(1, 1),
+            last_log_id: None,
+            leadership_transfer: false,
+        })
+        .encode_frame_for_peer(&identity)
+        .unwrap();
+        let mut transport_request = Vec::new();
+        write_control_plane_raft_peer_transport_frame(&mut transport_request, &request).unwrap();
+        let ingress_deadline = Instant::now() + ingress_timeout;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = RecordingPeerServerStream::new(transport_request, events)
+            .with_ingress_deadline(ingress_deadline);
+
+        handle_control_plane_raft_peer_server_request(
+            runtime.handle(),
+            &authority,
+            &mut stream,
+            &policy,
+            ingress_deadline,
+            response_timeout,
+        )
+        .unwrap();
+
+        assert!(!stream.response.is_empty());
+        runtime.block_on(authority.shutdown()).unwrap();
+    }
+
+    #[test]
+    fn control_plane_raft_peer_server_pre_auth_budget_is_held_until_frame_read_finishes() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let authority = Arc::new(
+            runtime
+                .block_on(
+                    ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                        "peer-server-pre-auth-budget",
+                        1,
+                    ),
+                )
+                .unwrap(),
+        );
+        let peer_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            "peer-server-pre-auth-budget",
+            [(1, "node-1".to_owned())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let policy = ControlPlaneRaftPeerServerPolicy::new(1, peer_policy, 64).unwrap();
+        let directory = test_util::tempdir();
+        let socket_path = directory.path().join("peer.sock");
+        let raw_listener = UnixListener::bind(&socket_path).unwrap();
+        raw_listener.set_nonblocking(true).unwrap();
+        let listener = Arc::new(
+            ControlPlaneRaftPeerServerListener::unix(
+                "peer-server-pre-auth-budget",
+                raw_listener,
+                1,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        let accept_listener = Arc::clone(&listener);
+        let accept_authority = Arc::clone(&authority);
+        let accept_policy = policy.clone();
+        let runtime_handle = runtime.handle().clone();
+        let accept = thread::spawn(move || {
+            accept_listener
+                .accept_one(&runtime_handle, accept_authority, &accept_policy)
+                .unwrap();
+        });
+        let mut client = UnixStream::connect(&socket_path).unwrap();
+        client.write_all(&32_u32.to_be_bytes()).unwrap();
+
+        for _ in 0..100 {
+            if policy.reserved_pre_auth_bytes() == 32 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(policy.reserved_pre_auth_bytes(), 32);
+        drop(client);
+        accept.join().unwrap();
+        for _ in 0..100 {
+            if policy.reserved_pre_auth_bytes() == 0 && listener.active_workers() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(policy.reserved_pre_auth_bytes(), 0);
+        assert_eq!(listener.active_workers(), 0);
+        runtime.block_on(authority.shutdown()).unwrap();
+    }
+
+    #[test]
+    fn control_plane_raft_tls_peer_server_authenticates_dispatches_and_requires_alpn() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let cluster_name = "control-plane-raft-peer-transport-test";
+        let authority = Arc::new(
+            runtime
+                .block_on(
+                    ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                        cluster_name,
+                        1,
+                    ),
+                )
+                .unwrap(),
+        );
+        let peer_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name,
+            [(1, "node-1".to_owned()), (2, "node-2".to_owned())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        )
+        .with_auth_policy(test_peer_auth_policy(1));
+        let policy = ControlPlaneRaftPeerServerPolicy::new(1, peer_policy, 4096).unwrap();
+        let client_auth = test_peer_auth_policy(2);
+        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 2, 1);
+        let raw_request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(2, 2),
+            last_log_id: None,
+            leadership_transfer: false,
+        })
+        .encode_frame_for_peer(&identity)
+        .unwrap();
+        let request = client_auth
+            .sign_peer_frame(&identity, ControlPlaneAuthOperation::RaftVote, raw_request)
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let listener = Arc::new(
+            ControlPlaneRaftPeerServerListener::tls_tcp(
+                "peer-server-tls",
+                listener,
+                raft_peer_test_tls_certified_key(),
+                1,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        let ControlPlaneRaftPeerServerListenerKind::TlsTcp {
+            tls_server_config, ..
+        } = &listener.kind
+        else {
+            panic!("TLS constructor returned a Unix listener");
+        };
+        assert_eq!(
+            tls_server_config.alpn_protocols,
+            [CONTROL_PLANE_RAFT_TLS_ALPN]
+        );
+        let accept_listener = Arc::clone(&listener);
+        let accept_authority = Arc::clone(&authority);
+        let accept_policy = policy.clone();
+        let runtime_handle = runtime.handle().clone();
+        let accept = thread::spawn(move || {
+            accept_listener
+                .accept_one(&runtime_handle, accept_authority, &accept_policy)
+                .unwrap();
+        });
+
+        let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(raft_peer_test_tls_roots())
+        .with_no_client_auth();
+        client_config.alpn_protocols = vec![CONTROL_PLANE_RAFT_TLS_ALPN.to_vec()];
+        let connection = rustls::ClientConnection::new(
+            Arc::new(client_config.clone()),
+            ServerName::try_from("localhost").unwrap().to_owned(),
+        )
+        .unwrap();
+        let stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut client = rustls::StreamOwned::new(connection, stream);
+        write_control_plane_raft_peer_transport_frame(&mut client, &request).unwrap();
+        let response = read_control_plane_raft_peer_transport_frame(
+            &mut client,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        )
+        .unwrap();
+        let response_identity = reverse_raft_peer_frame_identity(&identity);
+        let response = client_auth
+            .verify_peer_frame(
+                &response,
+                &response_identity,
+                ControlPlaneAuthOperation::RaftVote,
+                ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+            )
+            .unwrap();
+        assert!(matches!(
+            ControlPlaneRaftPeerRpcResponse::decode_frame_for_peer(&response, &response_identity)
+                .unwrap(),
+            ControlPlaneRaftPeerRpcResponse::Vote(_)
+        ));
+        accept.join().unwrap();
+        for _ in 0..100 {
+            if listener.active_workers() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(listener.active_workers(), 0);
+        assert_eq!(
+            policy
+                .peer_policy
+                .auth_policy()
+                .unwrap()
+                .metrics_snapshot()
+                .accepted_total(),
+            1
+        );
+
+        client_config.alpn_protocols.clear();
+        let no_alpn_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let no_alpn_address = no_alpn_listener.local_addr().unwrap();
+        let no_alpn_listener = Arc::new(
+            ControlPlaneRaftPeerServerListener::tls_tcp(
+                "peer-server-no-alpn",
+                no_alpn_listener,
+                raft_peer_test_tls_certified_key(),
+                1,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        let accept_listener = Arc::clone(&no_alpn_listener);
+        let accept_authority = Arc::clone(&authority);
+        let accept_policy = policy.clone();
+        let runtime_handle = runtime.handle().clone();
+        let accept = thread::spawn(move || {
+            accept_listener
+                .accept_one(&runtime_handle, accept_authority, &accept_policy)
+                .unwrap();
+        });
+        let connection = rustls::ClientConnection::new(
+            Arc::new(client_config),
+            ServerName::try_from("localhost").unwrap().to_owned(),
+        )
+        .unwrap();
+        let stream = TcpStream::connect(no_alpn_address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut client = rustls::StreamOwned::new(connection, stream);
+        let _ = write_control_plane_raft_peer_transport_frame(&mut client, &request);
+        assert!(read_control_plane_raft_peer_transport_frame(
+            &mut client,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        )
+        .is_err());
+        accept.join().unwrap();
+        for _ in 0..100 {
+            if no_alpn_listener.active_workers() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(no_alpn_listener.active_workers(), 0);
+        assert_eq!(
+            policy
+                .peer_policy
+                .auth_policy()
+                .unwrap()
+                .metrics_snapshot()
+                .accepted_total(),
+            1
+        );
+        runtime.block_on(authority.shutdown()).unwrap();
     }
 
     #[test]
