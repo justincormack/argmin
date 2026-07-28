@@ -3581,6 +3581,25 @@ Eightieth Phase 3 slice:
   tests pass, as do formatting, the storage boundary checker, and
   workspace-wide strict Clippy.
 
+Eighty-first Phase 3 slice:
+
+- the transitional `StorageNodeClient` aggregate no longer exposes object
+  metadata mutation snapshots and command construction, current/specific
+  delete snapshots and command construction, delete-marker construction, or
+  per-key lifecycle version loading. These operations are available only
+  through `ObjectMutationMetadataNodeClient`, whose local adapter now owns the
+  sole embedded implementation as the Unix adapter already did.
+- the role continues to bind typed object-metadata PG placement, expected
+  stored-object or version-list snapshots, delete targets, reservation proofs,
+  and command epochs at command construction. Moving the implementation does
+  not weaken the existing stale-subject and stale-payload checks.
+- multipart/stream-session and payload-reclaim/lifecycle duplicates in the
+  transitional aggregate, together with capability requirements on the
+  remaining role-specific node-client traits, remain open in Phase 3.
+- two focused object mutation RPC regressions and all 2,362 storage tests pass,
+  as do formatting, the storage boundary checker, and workspace-wide strict
+  Clippy.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

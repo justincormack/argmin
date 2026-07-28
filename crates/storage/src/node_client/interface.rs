@@ -1555,56 +1555,6 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
 pub(crate) trait StorageNodeClient:
     ShardScavengerNodeClient + MetadataCommandNodeClient
 {
-    fn load_put_object_metadata_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-    ) -> Result<StoredObject, ObjectPgActionError>;
-
-    fn build_put_object_metadata_command(
-        &self,
-        request: BuildPutObjectMetadataCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
-
-    fn load_current_object_delete_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError>;
-
-    fn load_specific_object_delete_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError>;
-
-    fn list_object_versions_for_lifecycle(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<Vec<StoredObject>, ObjectPgActionError>;
-
-    fn build_delete_specific_object_version_command(
-        &self,
-        request: BuildDeleteSpecificObjectVersionCommandReq<'_>,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
-
-    fn build_delete_current_object_command(
-        &self,
-        request: BuildDeleteCurrentObjectCommandReq<'_>,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
-
-    fn build_insert_delete_marker_command(
-        &self,
-        request: BuildInsertDeleteMarkerCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
-
     fn load_multipart_upload(
         &self,
         pg_id: ObjectMetadataPgId,

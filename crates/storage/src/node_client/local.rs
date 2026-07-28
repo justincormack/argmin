@@ -1707,16 +1707,63 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         version_id: Option<VersionId>,
     ) -> Result<StoredObject, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_put_object_metadata_snapshot(
-            self, pg_id, bucket, key, version_id,
-        )
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        match version_id {
+            Some(version_id) => Ok(PgMetadataStore::get_object_version(
+                &*pg, bucket, key, version_id,
+            )?),
+            None => Ok(PgMetadataStore::get_object_meta(&*pg, bucket, key)?),
+        }
     }
 
     fn build_put_object_metadata_command(
         &self,
         request: BuildPutObjectMetadataCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        <Self as StorageNodeClient>::build_put_object_metadata_command(self, request)
+        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let current = match request.requested_version_id {
+            Some(version_id) => {
+                PgMetadataStore::get_object_version(&*pg, request.bucket, request.key, version_id)
+            }
+            None => PgMetadataStore::get_object_meta(&*pg, request.bucket, request.key),
+        };
+        let current = match current {
+            Ok(current) => current,
+            Err(MetadataError::ObjectNotFound) => {
+                return Err(ObjectPgActionError::StaleObjectReadSubject);
+            }
+            Err(other) => return Err(other.into()),
+        };
+        if &current != request.expected_stored {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        if current.version_id() != request.version_id {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: format!(
+                    "object metadata action returned version {:?} for stored version {:?}",
+                    request.version_id,
+                    current.version_id()
+                ),
+            });
+        }
+        let live = current
+            .as_live()
+            .ok_or(MetadataError::MethodNotAllowedOnDeleteMarker)?;
+        let command_id = self.next_metadata_command_id_from_locked_pg(
+            request.pg_id.pg_id(),
+            request.cluster_epoch,
+            &pg,
+        )?;
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::PutObjectMetadata(Box::new(
+                PutObjectMetadataCommand::from_live_object_and_mutation(
+                    live.clone(),
+                    request.mutation,
+                    request.bucket_write_reservation.clone(),
+                ),
+            )),
+        ))
     }
 
     fn load_current_object_delete_snapshot(
@@ -1725,7 +1772,11 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_current_object_delete_snapshot(self, pg_id, bucket, key)
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let stored = load_current_object_optional_from_pg(&pg, bucket, key)?;
+        Ok(load_object_delete_snapshot_from_stored(
+            &pg, bucket, key, stored,
+        )?)
     }
 
     fn load_specific_object_delete_snapshot(
@@ -1735,9 +1786,11 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_specific_object_delete_snapshot(
-            self, pg_id, bucket, key, version_id,
-        )
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let stored = load_object_version_optional_from_pg(&pg, bucket, key, version_id)?;
+        Ok(load_object_delete_snapshot_from_stored(
+            &pg, bucket, key, stored,
+        )?)
     }
 
     fn list_object_versions_for_lifecycle(
@@ -1746,28 +1799,148 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
-        <Self as StorageNodeClient>::list_object_versions_for_lifecycle(self, pg_id, bucket, key)
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        match PgMetadataStore::list_object_versions_for_key(&*pg, bucket, key) {
+            Ok(versions) => Ok(versions),
+            Err(MetadataError::ObjectNotFound) => Ok(Vec::new()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn build_delete_specific_object_version_command(
         &self,
         request: BuildDeleteSpecificObjectVersionCommandReq<'_>,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        <Self as StorageNodeClient>::build_delete_specific_object_version_command(self, request)
+        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let current = if let Some(expected_version_list) = request.expected_version_list {
+            let versions = match PgMetadataStore::list_object_versions_for_key(
+                &*pg,
+                request.bucket,
+                request.key,
+            ) {
+                Ok(versions) => versions,
+                Err(MetadataError::ObjectNotFound) => Vec::new(),
+                Err(error) => return Err(error.into()),
+            };
+            if versions.as_slice() != expected_version_list {
+                return Err(ObjectPgActionError::StaleObjectReadSubject);
+            }
+            versions
+                .into_iter()
+                .find(|stored| stored.version_id() == request.version_id)
+        } else {
+            load_object_version_optional_from_pg(
+                &pg,
+                request.bucket,
+                request.key,
+                request.version_id,
+            )?
+        };
+        if current.as_ref() != request.expected_stored {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        let Some(target) =
+            delete_command_target_from_stored(&pg, request.bucket, request.key, current.as_ref())?
+        else {
+            return Ok(None);
+        };
+        if !delete_target_matches_expected(Some(&target), request.expected_target) {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        let command_id = self.next_metadata_command_id_from_locked_pg(
+            request.pg_id.pg_id(),
+            request.cluster_epoch,
+            &pg,
+        )?;
+        Ok(Some(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket_write_reservation: request.bucket_write_reservation.clone(),
+                bucket: request.bucket.clone(),
+                key: request.key.clone(),
+                version_id: request.version_id,
+                target,
+            })),
+        )))
     }
 
     fn build_delete_current_object_command(
         &self,
         request: BuildDeleteCurrentObjectCommandReq<'_>,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        <Self as StorageNodeClient>::build_delete_current_object_command(self, request)
+        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let current = load_current_object_optional_from_pg(&pg, request.bucket, request.key)?;
+        if current.as_ref() != request.expected_current {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        let Some(StoredObject::Live(record)) = current.as_ref() else {
+            return Ok(None);
+        };
+        let target = live_delete_command_target(&pg, request.bucket, request.key, record)?;
+        if !delete_target_matches_expected(Some(&target), request.expected_target) {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        let command_id = self.next_metadata_command_id_from_locked_pg(
+            request.pg_id.pg_id(),
+            request.cluster_epoch,
+            &pg,
+        )?;
+        Ok(Some(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket_write_reservation: request.bucket_write_reservation.clone(),
+                bucket: request.bucket.clone(),
+                key: request.key.clone(),
+                version_id: record.version_id,
+                target,
+            })),
+        )))
     }
 
     fn build_insert_delete_marker_command(
         &self,
         request: BuildInsertDeleteMarkerCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        <Self as StorageNodeClient>::build_insert_delete_marker_command(self, request)
+        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let current = load_current_object_optional_from_pg(&pg, request.bucket, request.key)?;
+        if current.as_ref() != request.expected_current {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        let stale_payload = match request.stale_payload {
+            InsertDeleteMarkerStalePayload::Explicit(stale_payload) => stale_payload,
+            InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive { created_at } => {
+                let (source, stale_payload) = snapshot_direct_put_stale_payload_for_snapshot(
+                    &pg,
+                    request.bucket,
+                    request.key,
+                    created_at,
+                )?;
+                if source.as_ref() != request.expected_stale_payload_source {
+                    return Err(ObjectPgActionError::StaleObjectReadSubject);
+                }
+                stale_payload
+            }
+        };
+        let write_sequence =
+            pg.next_object_write_sequence(request.bucket.as_str(), request.key.as_str())?;
+        let command_id = self.next_metadata_command_id_from_locked_pg(
+            request.pg_id.pg_id(),
+            request.cluster_epoch,
+            &pg,
+        )?;
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket_write_reservation: request.bucket_write_reservation.clone(),
+                bucket: request.bucket.clone(),
+                key: request.key.clone(),
+                version_id: request.version_id,
+                owner: request.owner.clone(),
+                write_sequence,
+                last_modified_millis: crate::clock::current_time_millis(),
+                stale_payload,
+            }),
+        ))
     }
 
     fn matching_stream_upload_exists(
@@ -2276,249 +2449,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
     fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
         self.storage_node.bucket_object_payload_lease_count(bucket)
     }
-    fn load_put_object_metadata_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-    ) -> Result<StoredObject, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        match version_id {
-            Some(version_id) => Ok(PgMetadataStore::get_object_version(
-                &*pg, bucket, key, version_id,
-            )?),
-            None => Ok(PgMetadataStore::get_object_meta(&*pg, bucket, key)?),
-        }
-    }
-
-    fn build_put_object_metadata_command(
-        &self,
-        request: BuildPutObjectMetadataCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(request.pg_id.get())?;
-        let current = match request.requested_version_id {
-            Some(version_id) => {
-                PgMetadataStore::get_object_version(&*pg, request.bucket, request.key, version_id)
-            }
-            None => PgMetadataStore::get_object_meta(&*pg, request.bucket, request.key),
-        };
-        let current = match current {
-            Ok(current) => current,
-            Err(MetadataError::ObjectNotFound) => {
-                return Err(ObjectPgActionError::StaleObjectReadSubject);
-            }
-            Err(other) => return Err(other.into()),
-        };
-        if &current != request.expected_stored {
-            return Err(ObjectPgActionError::StaleObjectReadSubject);
-        }
-        if current.version_id() != request.version_id {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: format!(
-                    "object metadata action returned version {:?} for stored version {:?}",
-                    request.version_id,
-                    current.version_id()
-                ),
-            });
-        }
-        let live = current
-            .as_live()
-            .ok_or(MetadataError::MethodNotAllowedOnDeleteMarker)?;
-        let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
-            &pg,
-        )?;
-        Ok(MetadataCommandEnvelope::new(
-            command_id,
-            MetadataCommandPayload::PutObjectMetadata(Box::new(
-                PutObjectMetadataCommand::from_live_object_and_mutation(
-                    live.clone(),
-                    request.mutation,
-                    request.bucket_write_reservation.clone(),
-                ),
-            )),
-        ))
-    }
-
-    fn load_current_object_delete_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let stored = load_current_object_optional_from_pg(&pg, bucket, key)?;
-        Ok(load_object_delete_snapshot_from_stored(
-            &pg, bucket, key, stored,
-        )?)
-    }
-
-    fn load_specific_object_delete_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let stored = load_object_version_optional_from_pg(&pg, bucket, key, version_id)?;
-        Ok(load_object_delete_snapshot_from_stored(
-            &pg, bucket, key, stored,
-        )?)
-    }
-
-    fn list_object_versions_for_lifecycle(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        match PgMetadataStore::list_object_versions_for_key(&*pg, bucket, key) {
-            Ok(versions) => Ok(versions),
-            Err(MetadataError::ObjectNotFound) => Ok(Vec::new()),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn build_delete_specific_object_version_command(
-        &self,
-        request: BuildDeleteSpecificObjectVersionCommandReq<'_>,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(request.pg_id.get())?;
-        let current = if let Some(expected_version_list) = request.expected_version_list {
-            let versions = match PgMetadataStore::list_object_versions_for_key(
-                &*pg,
-                request.bucket,
-                request.key,
-            ) {
-                Ok(versions) => versions,
-                Err(MetadataError::ObjectNotFound) => Vec::new(),
-                Err(error) => return Err(error.into()),
-            };
-            if versions.as_slice() != expected_version_list {
-                return Err(ObjectPgActionError::StaleObjectReadSubject);
-            }
-            versions
-                .into_iter()
-                .find(|stored| stored.version_id() == request.version_id)
-        } else {
-            load_object_version_optional_from_pg(
-                &pg,
-                request.bucket,
-                request.key,
-                request.version_id,
-            )?
-        };
-        if current.as_ref() != request.expected_stored {
-            return Err(ObjectPgActionError::StaleObjectReadSubject);
-        }
-        let Some(target) =
-            delete_command_target_from_stored(&pg, request.bucket, request.key, current.as_ref())?
-        else {
-            return Ok(None);
-        };
-        if !delete_target_matches_expected(Some(&target), request.expected_target) {
-            return Err(ObjectPgActionError::StaleObjectReadSubject);
-        }
-        let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
-            &pg,
-        )?;
-        Ok(Some(MetadataCommandEnvelope::new(
-            command_id,
-            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
-                bucket_write_reservation: request.bucket_write_reservation.clone(),
-                bucket: request.bucket.clone(),
-                key: request.key.clone(),
-                version_id: request.version_id,
-                target,
-            })),
-        )))
-    }
-
-    fn build_delete_current_object_command(
-        &self,
-        request: BuildDeleteCurrentObjectCommandReq<'_>,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(request.pg_id.get())?;
-        let current = load_current_object_optional_from_pg(&pg, request.bucket, request.key)?;
-        if current.as_ref() != request.expected_current {
-            return Err(ObjectPgActionError::StaleObjectReadSubject);
-        }
-        let Some(StoredObject::Live(record)) = current.as_ref() else {
-            return Ok(None);
-        };
-        let target = live_delete_command_target(&pg, request.bucket, request.key, record)?;
-        if !delete_target_matches_expected(Some(&target), request.expected_target) {
-            return Err(ObjectPgActionError::StaleObjectReadSubject);
-        }
-        let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
-            &pg,
-        )?;
-        Ok(Some(MetadataCommandEnvelope::new(
-            command_id,
-            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
-                bucket_write_reservation: request.bucket_write_reservation.clone(),
-                bucket: request.bucket.clone(),
-                key: request.key.clone(),
-                version_id: record.version_id,
-                target,
-            })),
-        )))
-    }
-
-    fn build_insert_delete_marker_command(
-        &self,
-        request: BuildInsertDeleteMarkerCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(request.pg_id.get())?;
-        let current = load_current_object_optional_from_pg(&pg, request.bucket, request.key)?;
-        if current.as_ref() != request.expected_current {
-            return Err(ObjectPgActionError::StaleObjectReadSubject);
-        }
-        let stale_payload = match request.stale_payload {
-            InsertDeleteMarkerStalePayload::Explicit(stale_payload) => stale_payload,
-            InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive { created_at } => {
-                let (source, stale_payload) = snapshot_direct_put_stale_payload_for_snapshot(
-                    &pg,
-                    request.bucket,
-                    request.key,
-                    created_at,
-                )?;
-                if source.as_ref() != request.expected_stale_payload_source {
-                    return Err(ObjectPgActionError::StaleObjectReadSubject);
-                }
-                stale_payload
-            }
-        };
-        let write_sequence =
-            pg.next_object_write_sequence(request.bucket.as_str(), request.key.as_str())?;
-        let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
-            &pg,
-        )?;
-        Ok(MetadataCommandEnvelope::new(
-            command_id,
-            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
-                bucket_write_reservation: request.bucket_write_reservation.clone(),
-                bucket: request.bucket.clone(),
-                key: request.key.clone(),
-                version_id: request.version_id,
-                owner: request.owner.clone(),
-                write_sequence,
-                last_modified_millis: crate::clock::current_time_millis(),
-                stale_payload,
-            }),
-        ))
-    }
-
     fn load_multipart_upload(
         &self,
         pg_id: ObjectMetadataPgId,
