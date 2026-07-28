@@ -320,9 +320,35 @@ The object-tag XML is embedded in these storage-owned containing formats:
 
 An incompatible change to the canonical object-tag XML requires an explicit new inner version and
 coordinated advancement of every containing format above; the current decoders have no legacy or
-prefix fallback. Bucket tags still use the generic bucket-subresource string carrier and remain a
-separate containment item, despite sharing the same logical tag grammar. ACL containment also
-remains outstanding.
+prefix fallback.
+
+Bucket tags use the same `s3-types` logical values and exact `TagSet::to_xml()` representation,
+with their separate 50-tag cardinality enforced by `storage::SerializedBucketTagSet`. The public
+storage API accepts and returns that typed carrier; generic string-based reads and deletes accept
+only `OpaqueBucketSubresourceKind`, which cannot represent tagging. The full persisted
+subresource discriminator, auxiliary data, and generic stored row are private to `storage`.
+Metadata-command and storage-RPC mutation decoders discriminate tagging before accepting its body,
+and PG, snapshot, command, and RPC reads require the exact current XML rather than merely
+well-formed tag XML. Metadata-checkpoint export and installation also verify tagging rows through
+the same storage-owned row decoder after validating row integrity, including the canonical body
+and null auxiliary-data invariant for both live rows and tombstones. A checksum-valid impossible
+tagging row therefore cannot cross that boundary. Exact owner-local representation tests and
+malformed/noncanonical decoder tests pin this boundary.
+
+The bucket-tag XML is embedded in these storage-owned containing formats:
+
+| Containing format | Current baseline | Bucket-tag embedding |
+| --- | --- | --- |
+| PG SQLite schema | schema version 1 | `bucket_subresources` stores canonical bucket-tag XML under the private tagging discriminator. |
+| Metadata command | encoding version 5 | Bucket-subresource put/delete commands carry the discriminated typed tag mutation. |
+| Storage-node RPC | frame encoding version 11 | Bucket snapshots, typed reads, and subresource mutations carry the opaque bucket-tag set. |
+| Canonical PG state | encoding version 4 | The bucket-subresource body participates in canonical row and state digests. |
+| Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry the bucket-subresource row and bind it into row, table, state, and checkpoint digests. |
+
+An incompatible change to the shared canonical XML therefore requires a new tag inner version and
+coordinated advancement of both the object-tag containing formats above and the bucket-tag
+containing formats here. Current decoders have no old-version, prefix, or alternate-XML fallback.
+ACL containment remains outstanding.
 
 ### Nested Durable Codec Inventory: Object Encryption State (2026-07-28)
 
@@ -718,10 +744,9 @@ Raft peer client and server transports are storage-owned and boundary-checked.
    diagnostics, and cannot construct raw `Io`, `RpcProtocol`, or `RpcRemote` variants.
 4. **In progress:** inventory and restrict nested durable codecs for metadata, tags, ACLs, and
    encryption; record how containing formats advance when a nested format changes. Object
-   encryption, user/system metadata, and object tags are complete: their private codecs are
-   owner-local and boundary-checked, their exact current representations are golden-tested, and
-   all five containing formats are recorded above. The generic bucket-tag subresource carrier and
-   ACLs remain.
+   encryption, user/system metadata, object tags, and bucket tags are complete: their private
+   codecs are owner-local and boundary-checked, their exact current representations are
+   golden-tested, and all containing formats are recorded above. ACLs remain.
 5. Audit existing version/fallback code and remove unsupported legacy compatibility where it
    worsens current invariants.
 6. Add or tighten current-version rejection tests for existing versioned formats.

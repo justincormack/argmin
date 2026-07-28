@@ -9,7 +9,7 @@ use super::test_hooks::{
     BUCKET_POLICY_LOAD_TEST_SERIAL,
 };
 use super::test_support::{
-    object_tag_set, open_test_storage_cluster, put_bucket_ownership_controls_test,
+    bucket_tag_set, object_tag_set, open_test_storage_cluster, put_bucket_ownership_controls_test,
     put_bucket_policy_test, NO_DELETE, NO_PUT_OBJECT_ACL,
 };
 use super::*;
@@ -1694,13 +1694,13 @@ mod harness {
             )
             .unwrap();
             self.coord
-                .put_bucket_tags(&PutBucketConfigRequest {
+                .put_bucket_tags(&PutBucketTagsRequest {
                     bucket: BucketRequest::new(
                         trusted_bucket_name(bucket),
                         Requester::authenticated(self.fixtures.owner_user.clone()),
                         None,
                     ),
-                    config: BOE_BUCKET_TAGS_XML,
+                    tags: bucket_tag_set(BOE_BUCKET_TAGS_XML),
                 })
                 .unwrap();
             self.coord
@@ -10351,13 +10351,13 @@ mod phase12_harness {
                 })
                 .unwrap_or_else(|err| panic!("failed to enable BOE for phase 12 bucket: {err:?}"));
             self.coord
-                .put_bucket_tags(&PutBucketConfigRequest {
+                .put_bucket_tags(&PutBucketTagsRequest {
                     bucket: BucketRequest::new(
                         trusted_bucket_name(bucket),
                         Requester::authenticated(self.fixtures.owner_user.clone()),
                         None,
                     ),
-                    config: PHASE12_BUCKET_TAGS_PUBLIC_XML,
+                    tags: bucket_tag_set(PHASE12_BUCKET_TAGS_PUBLIC_XML),
                 })
                 .unwrap_or_else(|err| panic!("failed to seed phase 12 bucket tags: {err:?}"));
             self.bucket_abac_enabled.set(false);
@@ -10478,7 +10478,7 @@ mod phase12_harness {
                                         None,
                                     ),
                                 },
-                                config,
+                                tags: bucket_tag_set(config),
                                 request_tags: &[],
                             })
                             .unwrap_or_else(|err| {
@@ -10486,13 +10486,13 @@ mod phase12_harness {
                             });
                     } else {
                         self.coord
-                            .put_bucket_tags(&PutBucketConfigRequest {
+                            .put_bucket_tags(&PutBucketTagsRequest {
                                 bucket: BucketRequest::new(
                                     trusted_bucket_name(bucket),
                                     owner_requester,
                                     None,
                                 ),
-                                config,
+                                tags: bucket_tag_set(config),
                             })
                             .unwrap_or_else(|err| {
                                 panic!("failed to set bucket tags through tagging API: {err:?}")

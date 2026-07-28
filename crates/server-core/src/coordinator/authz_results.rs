@@ -45,12 +45,12 @@ pub(super) struct AuthorizedDeleteBucketCors {
 #[derive(Debug)]
 pub(super) struct AuthorizedPutBucketTagging {
     pub(super) bucket: BucketName,
-    pub(super) body: String,
+    pub(super) tags: s3_types::TagSet,
 }
 
 #[derive(Debug)]
 pub(super) struct AuthorizedGetBucketTagging {
-    pub(super) body: Option<String>,
+    pub(super) tags: Option<s3_types::TagSet>,
 }
 
 #[derive(Debug)]

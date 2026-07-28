@@ -2013,7 +2013,7 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
     assert_eq!(active_bucket_route.head_bucket_info().unwrap().name, bucket);
     assert_eq!(
         active_bucket_route
-            .get_bucket_subresource(crate::BucketSubresourceKind::Cors)
+            .get_bucket_subresource(crate::OpaqueBucketSubresourceKind::Cors)
             .unwrap(),
         None
     );
@@ -3732,14 +3732,12 @@ fn frontend_unix_bucket_snapshot_pair_mode_uses_storage_node() {
             )
             .unwrap();
         }
+        let source_tags =
+            crate::SerializedBucketTagSet::new("<Tagging><TagSet></TagSet></Tagging>".to_string());
         crate::PgMetadataStore::put_bucket_subresource(
             &*remote_pg,
             &source_bucket,
-            crate::types::PutBucketSubresource {
-                kind: crate::types::BucketSubresourceKind::Tagging,
-                body: "<Tagging/>",
-                aux: crate::types::BucketSubresourceAux::None,
-            },
+            crate::types::PutBucketSubresource::tagging(&source_tags),
         )
         .unwrap();
         crate::PgMetadataStore::put_bucket_subresource(
@@ -3796,7 +3794,9 @@ fn frontend_unix_bucket_snapshot_pair_mode_uses_storage_node() {
         .unwrap();
     assert_eq!(
         pair.source().tags,
-        crate::LoadedBucketSubresource::Loaded("<Tagging/>".to_string())
+        crate::LoadedBucketSubresource::Loaded(crate::SerializedBucketTagSet::new(
+            "<Tagging><TagSet></TagSet></Tagging>".to_string(),
+        ))
     );
     assert_eq!(
         pair.destination().cors,

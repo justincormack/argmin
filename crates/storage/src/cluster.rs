@@ -93,11 +93,11 @@ use crate::types::{
     PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
     PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
     PreparedStreamPartCommit, PreparedStreamPutCommit, PublicAccessBlockConfig, RouteMapValidity,
-    SegmentStoredBytesRequest, SerializedTagSet, SessionId, ShardIndex, ShardKey,
-    ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
-    ShardScavengerObservationRecord, ShardScavengerPayloadReference,
-    ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus, StoredObject,
-    StreamPutFinalizeSnapshot, StreamUploadCommandRecord, StreamUploadPartSnapshot,
+    SegmentStoredBytesRequest, SerializedBucketTagSet, SerializedTagSet, SessionId, ShardIndex,
+    ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
+    ShardScavengerObservationReason, ShardScavengerObservationRecord,
+    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus,
+    StoredObject, StreamPutFinalizeSnapshot, StreamUploadCommandRecord, StreamUploadPartSnapshot,
     StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
     VersionId, WriteAck, WrittenShardAck,
 };
@@ -3314,7 +3314,7 @@ impl ActiveBucketRoute<'_> {
 
     pub fn get_bucket_subresource(
         &self,
-        kind: BucketSubresourceKind,
+        kind: crate::OpaqueBucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
         self.admission.require_valid_now()?;
         let cluster = &self.admission.cluster;
@@ -3322,7 +3322,19 @@ impl ActiveBucketRoute<'_> {
             .local_map
             .metadata_pg_primary_node(cluster.operation_epoch(), self.pg_id.pg_id())?
             .bucket_metadata_client()
-            .get_bucket_subresource(self.pg_id, &self.bucket, kind)
+            .get_bucket_subresource(self.pg_id, &self.bucket, kind.stored_kind())
+    }
+
+    pub fn get_bucket_tags(
+        &self,
+    ) -> Result<Option<SerializedBucketTagSet>, BucketSnapshotLoadError> {
+        self.admission.require_valid_now()?;
+        let cluster = &self.admission.cluster;
+        cluster
+            .local_map
+            .metadata_pg_primary_node(cluster.operation_epoch(), self.pg_id.pg_id())?
+            .bucket_metadata_client()
+            .get_bucket_tags(self.pg_id, &self.bucket)
     }
 
     pub fn load_bucket_snapshot(
@@ -3486,14 +3498,24 @@ impl ActiveBucketRoute<'_> {
 
     pub fn delete_bucket_subresource_and_load_info(
         &self,
-        kind: BucketSubresourceKind,
+        kind: crate::OpaqueBucketSubresourceKind,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.admission
             .cluster
             .delete_bucket_subresource_and_load_info_with_route_validation(
                 self.mutation_effect_route(),
                 || self.admission.require_valid_now(),
-                kind,
+                kind.stored_kind(),
+            )
+    }
+
+    pub fn delete_bucket_tags_and_load_info(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.admission
+            .cluster
+            .delete_bucket_subresource_and_load_info_with_route_validation(
+                self.mutation_effect_route(),
+                || self.admission.require_valid_now(),
+                BucketSubresourceKind::Tagging,
             )
     }
 

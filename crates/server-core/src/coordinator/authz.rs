@@ -59,8 +59,8 @@ use super::request_types::{
     PutBucketAclInput, PutBucketAclRequest, PutBucketConfigRequest, PutBucketEncryptionRequest,
     PutBucketObjectLockConfigurationRequest, PutBucketOwnershipControlsRequest,
     PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest, PutBucketTagControlRequest,
-    PutBucketTagsForUntagResourceRequest, PutBucketVersioningRequest, PutObjectAcl,
-    PutObjectPolicyContext, PutObjectWriteAcl, Requester, TaggingDirective,
+    PutBucketTagsForUntagResourceRequest, PutBucketTagsRequest, PutBucketVersioningRequest,
+    PutObjectAcl, PutObjectPolicyContext, PutObjectWriteAcl, Requester, TaggingDirective,
     UntagBucketTagControlRequest, UploadPartCopyRequest,
 };
 use super::response_types::{BucketSummary, GetBucketAclResult, ModernBucketSummary};
@@ -1186,7 +1186,7 @@ impl Coordinator {
 
         let raw_policy = self
             .storage_node()
-            .get_bucket_subresource(&bucket.name, storage::BucketSubresourceKind::Policy)
+            .get_bucket_subresource(&bucket.name, storage::OpaqueBucketSubresourceKind::Policy)
             .map_err(|error| match error {
                 storage::BucketSnapshotLoadError::Store(
                     storage::StoreError::MetadataCommandLogConflict { .. }
@@ -1274,9 +1274,7 @@ impl Coordinator {
         match bucket.tags() {
             LoadedBucketValue::NotRequested => Ok(None),
             LoadedBucketValue::Missing => Ok(Some(Vec::new())),
-            LoadedBucketValue::Loaded(tags_xml) => {
-                Self::parse_serialized_tag_set(tags_xml).map(Some)
-            }
+            LoadedBucketValue::Loaded(tags) => Ok(Some(tags.clone().into_pairs())),
         }
     }
 
@@ -1946,7 +1944,7 @@ impl Coordinator {
                 let cached_tags = if info.bucket_abac_enabled {
                     match &info.tags {
                         storage::BucketFastPathTags::Loaded(tags) => {
-                            Some(LoadedBucketValue::Loaded(tags.clone()))
+                            Some(LoadedBucketValue::Loaded(tags.tag_set().clone()))
                         }
                         storage::BucketFastPathTags::Missing => Some(LoadedBucketValue::Missing),
                         storage::BucketFastPathTags::NotApplicable => None,
@@ -2366,6 +2364,7 @@ impl Coordinator {
         Ok(tags.clone().into_pairs())
     }
 
+    #[cfg(test)]
     pub(super) fn parse_serialized_tag_set(
         tags_xml: &str,
     ) -> Result<Vec<(String, String)>, ServerError> {

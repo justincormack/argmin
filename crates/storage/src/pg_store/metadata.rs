@@ -6877,7 +6877,7 @@ impl PgMetadataStore for PgStore {
         name: &BucketName,
         req: PutBucketSubresource<'_>,
     ) -> Result<(), MetadataError> {
-        self.put_bucket_subresource_internal(name, req.kind, req.body, req.aux)
+        self.put_bucket_subresource_internal(name, req.kind(), req.body(), req.aux())
     }
 
     fn get_bucket_subresource(

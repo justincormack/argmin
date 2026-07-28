@@ -17,8 +17,8 @@ use super::{
     ListBucketsRequest, PutBucketAbacRequest, PutBucketAclInput, PutBucketAclRequest,
     PutBucketConfigRequest, PutBucketEncryptionRequest, PutBucketObjectLockConfigurationRequest,
     PutBucketOwnershipControlsRequest, PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest,
-    PutBucketTagControlRequest, PutBucketTagsForUntagResourceRequest, PutBucketVersioningRequest,
-    UntagBucketTagControlRequest, TRACE_TARGET,
+    PutBucketTagControlRequest, PutBucketTagsForUntagResourceRequest, PutBucketTagsRequest,
+    PutBucketVersioningRequest, UntagBucketTagControlRequest, TRACE_TARGET,
 };
 use crate::error::ServerError;
 
@@ -846,11 +846,7 @@ impl Coordinator {
         let info = self.store_bucket_subresource_on_admitted_route(
             admission,
             &authorized.bucket,
-            storage::PutBucketSubresource {
-                kind: storage::BucketSubresourceKind::Cors,
-                body: &authorized.body,
-                aux: storage::BucketSubresourceAux::None,
-            },
+            storage::PutBucketSubresource::cors(&authorized.body),
         )?;
         self.clear_bucket_fast_path(&info);
         Ok(())
@@ -899,7 +895,7 @@ impl Coordinator {
         admission
             .active_bucket_route(&authorized.bucket)
             .map_err(super::map_store_error)?
-            .get_bucket_subresource(storage::BucketSubresourceKind::Cors)
+            .get_bucket_subresource(storage::OpaqueBucketSubresourceKind::Cors)
             .map_err(Self::map_bucket_snapshot_load_error)
     }
 
@@ -919,7 +915,7 @@ impl Coordinator {
         let info = admission
             .active_bucket_route(&authorized.bucket)
             .map_err(super::map_store_error)?
-            .delete_bucket_subresource_and_load_info(storage::BucketSubresourceKind::Cors)
+            .delete_bucket_subresource_and_load_info(storage::OpaqueBucketSubresourceKind::Cors)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
@@ -934,32 +930,34 @@ impl Coordinator {
     pub fn put_bucket_tags_on_admitted_route(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
-        req: &PutBucketConfigRequest<'_>,
+        req: &PutBucketTagsRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_tags",
-            "bucket={:?} bytes={}",
+            "bucket={:?} tag_count={}",
             req.bucket.name,
-            req.config.len()
+            req.tags.len()
         );
         self.require_storage_route_admission(admission)?;
         let authorized = self.authorize_put_bucket_tagging_on_admitted_route(admission, req)?;
+        let stored_tags =
+            storage::SerializedBucketTagSet::from_tag_set(authorized.tags).map_err(|error| {
+                ServerError::InternalError {
+                    reason: format!("authorized bucket tags exceed the stored limit: {error}"),
+                }
+            })?;
         let info = self.store_bucket_subresource_on_admitted_route(
             admission,
             &authorized.bucket,
-            storage::PutBucketSubresource {
-                kind: storage::BucketSubresourceKind::Tagging,
-                body: &authorized.body,
-                aux: storage::BucketSubresourceAux::None,
-            },
+            storage::PutBucketSubresource::tagging(&stored_tags),
         )?;
         self.clear_bucket_fast_path(&info);
         Ok(())
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn put_bucket_tags(&self, req: &PutBucketConfigRequest<'_>) -> Result<(), ServerError> {
+    pub fn put_bucket_tags(&self, req: &PutBucketTagsRequest<'_>) -> Result<(), ServerError> {
         let admission = self.admit_storage_route_for_request()?;
         self.put_bucket_tags_on_admitted_route(&admission, req)
     }
@@ -968,7 +966,7 @@ impl Coordinator {
         &self,
         admission: &storage::StorageClusterRouteAdmission,
         req: &BucketRequest<'_>,
-    ) -> Result<Option<String>, ServerError> {
+    ) -> Result<Option<s3_types::TagSet>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_tags_on_admitted_route",
@@ -976,11 +974,14 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_get_bucket_tagging_on_admitted_route(admission, req)?;
-        Ok(authorized.body)
+        Ok(authorized.tags)
     }
 
     #[cfg(test)]
-    pub fn get_bucket_tags(&self, req: &BucketRequest<'_>) -> Result<Option<String>, ServerError> {
+    pub fn get_bucket_tags(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<s3_types::TagSet>, ServerError> {
         let admission = self.admit_storage_route_for_request()?;
         self.get_bucket_tags_on_admitted_route(&admission, req)
     }
@@ -1001,7 +1002,7 @@ impl Coordinator {
         let info = admission
             .active_bucket_route(&authorized.bucket)
             .map_err(super::map_store_error)?
-            .delete_bucket_subresource_and_load_info(storage::BucketSubresourceKind::Tagging)
+            .delete_bucket_tags_and_load_info()
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
@@ -1019,7 +1020,7 @@ impl Coordinator {
         req: &BucketTagControlRequest<'_>,
         request_tags: &[(String, String)],
         action: BucketTagControlAction,
-    ) -> Result<Option<String>, ServerError> {
+    ) -> Result<Option<s3_types::TagSet>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_tags_for_control_action",
@@ -1036,7 +1037,8 @@ impl Coordinator {
         admission
             .active_bucket_route(&authorized.bucket)
             .map_err(super::map_store_error)?
-            .get_bucket_subresource(storage::BucketSubresourceKind::Tagging)
+            .get_bucket_tags()
+            .map(|tags| tags.map(|tags| tags.tag_set().clone()))
             .map_err(Self::map_bucket_snapshot_load_error)
     }
 
@@ -1046,7 +1048,7 @@ impl Coordinator {
         req: &BucketTagControlRequest<'_>,
         request_tags: &[(String, String)],
         action: BucketTagControlAction,
-    ) -> Result<Option<String>, ServerError> {
+    ) -> Result<Option<s3_types::TagSet>, ServerError> {
         let admission = self.admit_storage_route_for_request()?;
         self.get_bucket_tags_for_control_action_on_admitted_route(
             &admission,
@@ -1064,20 +1066,22 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_tags_for_tag_resource",
-            "bucket={:?} bytes={}",
+            "bucket={:?} tag_count={}",
             req.control.bucket.name,
-            req.config.len()
+            req.tags.len()
         );
         self.require_storage_route_admission(admission)?;
         let authorized = self.authorize_put_bucket_tag_control_on_admitted_route(admission, req)?;
+        let stored_tags =
+            storage::SerializedBucketTagSet::from_tag_set(req.tags.clone()).map_err(|error| {
+                ServerError::InternalError {
+                    reason: format!("authorized bucket tags exceed the stored limit: {error}"),
+                }
+            })?;
         let info = self.store_bucket_subresource_on_admitted_route(
             admission,
             &authorized.bucket,
-            storage::PutBucketSubresource {
-                kind: storage::BucketSubresourceKind::Tagging,
-                body: req.config,
-                aux: storage::BucketSubresourceAux::None,
-            },
+            storage::PutBucketSubresource::tagging(&stored_tags),
         )?;
         self.clear_bucket_fast_path(&info);
         Ok(())
@@ -1102,19 +1106,21 @@ impl Coordinator {
             "Coordinator::put_bucket_tags_for_untag_resource",
             "bucket={:?} bytes={}",
             req.control.bucket.name,
-            req.config.len()
+            req.tags.len()
         );
         self.require_storage_route_admission(admission)?;
         let authorized =
             self.authorize_put_bucket_tags_for_untag_resource_on_admitted_route(admission, req)?;
+        let stored_tags =
+            storage::SerializedBucketTagSet::from_tag_set(req.tags.clone()).map_err(|error| {
+                ServerError::InternalError {
+                    reason: format!("authorized bucket tags exceed the stored limit: {error}"),
+                }
+            })?;
         let info = self.store_bucket_subresource_on_admitted_route(
             admission,
             &authorized.bucket,
-            storage::PutBucketSubresource {
-                kind: storage::BucketSubresourceKind::Tagging,
-                body: req.config,
-                aux: storage::BucketSubresourceAux::None,
-            },
+            storage::PutBucketSubresource::tagging(&stored_tags),
         )?;
         self.clear_bucket_fast_path(&info);
         Ok(())
@@ -1146,7 +1152,7 @@ impl Coordinator {
         let info = admission
             .active_bucket_route(&authorized.bucket)
             .map_err(super::map_store_error)?
-            .delete_bucket_subresource_and_load_info(storage::BucketSubresourceKind::Tagging)
+            .delete_bucket_tags_and_load_info()
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
@@ -1228,11 +1234,7 @@ impl Coordinator {
         let info = self.store_bucket_subresource_on_admitted_route(
             admission,
             &authorized.bucket,
-            storage::PutBucketSubresource {
-                kind: storage::BucketSubresourceKind::Policy,
-                body: &authorized.body,
-                aux: storage::BucketSubresourceAux::policy(authorized.policy_is_public),
-            },
+            storage::PutBucketSubresource::policy(&authorized.body, authorized.policy_is_public),
         )?;
         self.clear_bucket_fast_path(&info);
         Ok(())
@@ -1306,7 +1308,7 @@ impl Coordinator {
         let info = admission
             .active_bucket_route(&authorized.bucket)
             .map_err(super::map_store_error)?
-            .delete_bucket_subresource_and_load_info(storage::BucketSubresourceKind::Policy)
+            .delete_bucket_subresource_and_load_info(storage::OpaqueBucketSubresourceKind::Policy)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
@@ -1351,11 +1353,7 @@ impl Coordinator {
         let info = self.store_bucket_subresource_on_admitted_route(
             admission,
             &authorized.bucket,
-            storage::PutBucketSubresource {
-                kind: storage::BucketSubresourceKind::Lifecycle,
-                body: &authorized.body,
-                aux: storage::BucketSubresourceAux::None,
-            },
+            storage::PutBucketSubresource::lifecycle(&authorized.body),
         )?;
         self.clear_bucket_fast_path(&info);
         Ok(())
@@ -1411,7 +1409,9 @@ impl Coordinator {
         let info = admission
             .active_bucket_route(&authorized.bucket)
             .map_err(super::map_store_error)?
-            .delete_bucket_subresource_and_load_info(storage::BucketSubresourceKind::Lifecycle)
+            .delete_bucket_subresource_and_load_info(
+                storage::OpaqueBucketSubresourceKind::Lifecycle,
+            )
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())

@@ -2716,15 +2716,11 @@ mod tests {
         let bucket_pg = node
             .get_pg(node.pg_topology().bucket_pg_for(&bucket))
             .unwrap();
+        let tags = crate::SerializedBucketTagSet::new(
+            "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>".to_string(),
+        );
         bucket_pg
-            .put_bucket_subresource(
-                &bucket,
-                crate::types::PutBucketSubresource {
-                    kind: crate::types::BucketSubresourceKind::Tagging,
-                    body: "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
-                    aux: crate::types::BucketSubresourceAux::None,
-                },
-            )
+            .put_bucket_subresource(&bucket, crate::types::PutBucketSubresource::tagging(&tags))
             .unwrap();
         bucket_pg.put_bucket_abac_enabled(&bucket, true).unwrap();
         drop(bucket_pg);
@@ -2753,15 +2749,11 @@ mod tests {
         let bucket_pg = node
             .get_pg(node.pg_topology().bucket_pg_for(&bucket))
             .unwrap();
+        let tags = crate::SerializedBucketTagSet::new(
+            "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>".to_string(),
+        );
         bucket_pg
-            .put_bucket_subresource(
-                &bucket,
-                crate::types::PutBucketSubresource {
-                    kind: crate::types::BucketSubresourceKind::Tagging,
-                    body: "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
-                    aux: crate::types::BucketSubresourceAux::None,
-                },
-            )
+            .put_bucket_subresource(&bucket, crate::types::PutBucketSubresource::tagging(&tags))
             .unwrap();
         drop(bucket_pg);
 
@@ -2864,14 +2856,13 @@ mod tests {
         let bucket = create_bucket_for_snapshot_test(&node, "bucket");
         let bucket_pg_id = node.pg_topology().bucket_pg_for(&bucket);
         let bucket_pg = node.get_pg(bucket_pg_id).unwrap();
+        let public_tags = crate::SerializedBucketTagSet::new(
+            "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>".to_string(),
+        );
         bucket_pg
             .put_bucket_subresource(
                 &bucket,
-                crate::types::PutBucketSubresource {
-                    kind: crate::types::BucketSubresourceKind::Tagging,
-                    body: "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
-                    aux: crate::types::BucketSubresourceAux::None,
-                },
+                crate::types::PutBucketSubresource::tagging(&public_tags),
             )
             .unwrap();
         bucket_pg.put_bucket_abac_enabled(&bucket, true).unwrap();
@@ -2888,22 +2879,19 @@ mod tests {
             .unwrap();
 
         let bucket_pg = node.get_pg(bucket_pg_id).unwrap();
+        let private_tags = crate::SerializedBucketTagSet::new(
+            "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>".to_string(),
+        );
         bucket_pg
             .put_bucket_subresource(
                 &bucket,
-                crate::types::PutBucketSubresource {
-                    kind: crate::types::BucketSubresourceKind::Tagging,
-                    body: "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
-                    aux: crate::types::BucketSubresourceAux::None,
-                },
+                crate::types::PutBucketSubresource::tagging(&private_tags),
             )
             .unwrap();
 
         assert_eq!(
             snapshot.tags,
-            crate::types::LoadedBucketSubresource::Loaded(
-                "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>".to_owned()
-            )
+            crate::types::LoadedBucketSubresource::Loaded(public_tags)
         );
     }
 

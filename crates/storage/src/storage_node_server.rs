@@ -29808,7 +29808,7 @@ mod tests {
         let loaded = destination_pg.head_bucket(&bucket).unwrap();
         assert_eq!(loaded.name, bucket);
         let lifecycle = destination_pg
-            .get_bucket_subresource(&bucket, BucketSubresourceKind::Lifecycle)
+            .get_bucket_subresource(&bucket, crate::BucketSubresourceKind::Lifecycle)
             .unwrap()
             .unwrap();
         assert_eq!(lifecycle.body, "<LifecycleConfiguration/>");

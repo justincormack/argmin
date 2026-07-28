@@ -2168,12 +2168,10 @@ fn bucket_snapshot_pair_routes_to_bucket_pg_primaries() {
     cluster
         .put_bucket_subresource_and_load_info(
             &source_bucket,
-            crate::PutBucketSubresource {
-                kind: crate::BucketSubresourceKind::Tagging,
-                body:
-                    "<Tagging><TagSet><Tag><Key>src</Key><Value>1</Value></Tag></TagSet></Tagging>",
-                aux: crate::BucketSubresourceAux::None,
-            },
+            crate::PutBucketSubresource::tagging(&crate::SerializedBucketTagSet::new(
+                "<Tagging><TagSet><Tag><Key>src</Key><Value>1</Value></Tag></TagSet></Tagging>"
+                    .to_string(),
+            )),
         )
         .unwrap();
     cluster
@@ -2209,10 +2207,10 @@ fn bucket_snapshot_pair_routes_to_bucket_pg_primaries() {
     assert_eq!(pair.destination().bucket.name, destination_bucket);
     assert_eq!(
         pair.source().tags,
-        crate::LoadedBucketSubresource::Loaded(
+        crate::LoadedBucketSubresource::Loaded(crate::SerializedBucketTagSet::new(
             "<Tagging><TagSet><Tag><Key>src</Key><Value>1</Value></Tag></TagSet></Tagging>"
                 .to_string()
-        )
+        ))
     );
     assert_eq!(
         pair.destination().cors,
@@ -2540,11 +2538,7 @@ fn bucket_control_plane_pending_install_waits_behind_durable_delete_drain() {
             lifecycle_command_id,
             MetadataCommandPayload::PutBucketSubresource(PutBucketSubresourceCommand::new(
                 bucket.clone(),
-                BucketSubresourceMutation::Put {
-                    kind: crate::BucketSubresourceKind::Lifecycle,
-                    body: "<LifecycleConfiguration/>".to_string(),
-                    aux: crate::BucketSubresourceAux::None,
-                },
+                BucketSubresourceMutation::PutLifecycle("<LifecycleConfiguration/>".to_string()),
                 generation,
             )),
         )
@@ -2574,11 +2568,7 @@ fn bucket_control_plane_pending_install_waits_behind_durable_delete_drain() {
             cors_command_id,
             MetadataCommandPayload::PutBucketSubresource(PutBucketSubresourceCommand::new(
                 bucket.clone(),
-                BucketSubresourceMutation::Put {
-                    kind: crate::BucketSubresourceKind::Cors,
-                    body: "<CORSConfiguration/>".to_string(),
-                    aux: crate::BucketSubresourceAux::None,
-                },
+                BucketSubresourceMutation::PutCors("<CORSConfiguration/>".to_string()),
                 generation,
             )),
         )

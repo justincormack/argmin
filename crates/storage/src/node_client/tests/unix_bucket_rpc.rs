@@ -1943,11 +1943,9 @@ fn unix_bucket_metadata_client_loads_bucket_snapshot_pair() {
         PgMetadataStore::put_bucket_subresource(
             &*pg,
             &source_bucket,
-            crate::types::PutBucketSubresource {
-                kind: BucketSubresourceKind::Tagging,
-                body: "<Tagging/>",
-                aux: crate::types::BucketSubresourceAux::None,
-            },
+            crate::types::PutBucketSubresource::tagging(&crate::SerializedBucketTagSet::new(
+                "<Tagging><TagSet></TagSet></Tagging>".to_string(),
+            )),
         )
         .unwrap();
         PgMetadataStore::put_bucket_subresource(
@@ -1995,7 +1993,9 @@ fn unix_bucket_metadata_client_loads_bucket_snapshot_pair() {
     assert_eq!(pair.destination().bucket.name, destination_bucket);
     assert_eq!(
         pair.source().tags,
-        crate::types::LoadedBucketSubresource::Loaded("<Tagging/>".to_string())
+        crate::types::LoadedBucketSubresource::Loaded(crate::SerializedBucketTagSet::new(
+            "<Tagging><TagSet></TagSet></Tagging>".to_string(),
+        ))
     );
     assert_eq!(
         pair.destination().cors,
@@ -2200,11 +2200,8 @@ fn unix_bucket_metadata_client_routes_bucket_control_operations() {
         other => panic!("unexpected property command payload: {other:?}"),
     }
 
-    let subresource = BucketSubresourceMutation::Put {
-        kind: BucketSubresourceKind::Lifecycle,
-        body: "<LifecycleConfiguration/>".to_string(),
-        aux: crate::types::BucketSubresourceAux::None,
-    };
+    let subresource =
+        BucketSubresourceMutation::PutLifecycle("<LifecycleConfiguration/>".to_string());
     let subresource_command = BucketMetadataNodeClient::build_put_bucket_subresource_command(
         &client,
         BucketPgId::new_for_test(PgId::new(0)),

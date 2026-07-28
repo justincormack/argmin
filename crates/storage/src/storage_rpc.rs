@@ -47,13 +47,13 @@ use crate::{
         PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
         PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
         PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
-        PublicAccessBlockConfig, SegmentStoredBytesRequest, SerializedMetadataBlob,
-        SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardIndex, ShardKey,
-        ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
-        ShardScavengerObservationRecord, ShardScavengerPayloadReference,
-        ShardScavengerPlacedShardSetReference, ShardScavengerReclaimShardSetReference,
-        StorageClass, StoredLegalHoldStatus, StoredObject, StreamPutCommitInput,
-        StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
+        PublicAccessBlockConfig, SegmentStoredBytesRequest, SerializedBucketTagSet,
+        SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId,
+        ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
+        ShardScavengerObservationReason, ShardScavengerObservationRecord,
+        ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference,
+        ShardScavengerReclaimShardSetReference, StorageClass, StoredLegalHoldStatus, StoredObject,
+        StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
         StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
         StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
         VersionId, WriteAck, BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN,
@@ -13962,7 +13962,7 @@ impl<'a> StorageRpcDecoder<'a> {
             bucket: self.read_bucket_info()?,
             request: self.read_bucket_snapshot_request()?,
             policy: self.read_loaded_bucket_subresource()?,
-            tags: self.read_loaded_bucket_subresource()?,
+            tags: self.read_loaded_bucket_tags()?,
             lifecycle: self.read_loaded_bucket_subresource()?,
             cors: self.read_loaded_bucket_subresource()?,
         })
@@ -13990,6 +13990,23 @@ impl<'a> StorageRpcDecoder<'a> {
             0 => Ok(LoadedBucketSubresource::NotRequested),
             1 => Ok(LoadedBucketSubresource::Missing),
             2 => Ok(LoadedBucketSubresource::Loaded(self.read_string()?)),
+            _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "invalid loaded bucket subresource tag",
+            )),
+        }
+    }
+
+    fn read_loaded_bucket_tags(
+        &mut self,
+    ) -> Result<LoadedBucketSubresource<SerializedBucketTagSet>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(LoadedBucketSubresource::NotRequested),
+            1 => Ok(LoadedBucketSubresource::Missing),
+            2 => SerializedBucketTagSet::from_current_xml(self.read_string()?)
+                .map(LoadedBucketSubresource::Loaded)
+                .map_err(|_| {
+                    StorageRpcPayloadError::InvalidResponseEnvelope("invalid bucket tags")
+                }),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "invalid loaded bucket subresource tag",
             )),
@@ -15441,7 +15458,29 @@ impl<'a> StorageRpcDecoder<'a> {
                     ),
                 )?;
                 let aux = self.read_bucket_subresource_aux(kind)?;
-                Ok(BucketSubresourceMutation::Put { kind, body, aux })
+                match (kind, aux) {
+                    (BucketSubresourceKind::Cors, BucketSubresourceAux::None) => {
+                        Ok(BucketSubresourceMutation::PutCors(body))
+                    }
+                    (BucketSubresourceKind::Tagging, BucketSubresourceAux::None) => {
+                        SerializedBucketTagSet::from_current_xml(body)
+                            .map(BucketSubresourceMutation::PutTagging)
+                            .map_err(|_| {
+                                StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                                    "invalid bucket tags",
+                                )
+                            })
+                    }
+                    (BucketSubresourceKind::Policy, BucketSubresourceAux::Policy { is_public }) => {
+                        Ok(BucketSubresourceMutation::PutPolicy { body, is_public })
+                    }
+                    (BucketSubresourceKind::Lifecycle, BucketSubresourceAux::None) => {
+                        Ok(BucketSubresourceMutation::PutLifecycle(body))
+                    }
+                    _ => Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                        "bucket subresource kind and auxiliary data disagree",
+                    )),
+                }
             }
             2 => Ok(BucketSubresourceMutation::Delete {
                 kind: self.read_bucket_subresource_kind()?,
@@ -16255,7 +16294,7 @@ fn put_bucket_snapshot(out: &mut Vec<u8>, snapshot: &BucketSnapshot) {
     put_bucket_info(out, &snapshot.bucket);
     put_bucket_snapshot_request(out, snapshot.request);
     put_loaded_bucket_subresource(out, &snapshot.policy);
-    put_loaded_bucket_subresource(out, &snapshot.tags);
+    put_loaded_bucket_tags(out, &snapshot.tags);
     put_loaded_bucket_subresource(out, &snapshot.lifecycle);
     put_loaded_bucket_subresource(out, &snapshot.cors);
 }
@@ -16347,11 +16386,29 @@ fn put_bucket_encryption_config(out: &mut Vec<u8>, config: BucketEncryptionConfi
 
 fn put_bucket_subresource_mutation(out: &mut Vec<u8>, mutation: &BucketSubresourceMutation) {
     match mutation {
-        BucketSubresourceMutation::Put { kind, body, aux } => {
+        BucketSubresourceMutation::PutCors(body) => {
             put_u8(out, 1);
-            put_bucket_subresource_kind(out, *kind);
+            put_bucket_subresource_kind(out, BucketSubresourceKind::Cors);
             put_string(out, body);
-            put_bucket_subresource_aux(out, *aux);
+            put_bucket_subresource_aux(out, BucketSubresourceAux::None);
+        }
+        BucketSubresourceMutation::PutTagging(tags) => {
+            put_u8(out, 1);
+            put_bucket_subresource_kind(out, BucketSubresourceKind::Tagging);
+            put_string(out, tags.as_str());
+            put_bucket_subresource_aux(out, BucketSubresourceAux::None);
+        }
+        BucketSubresourceMutation::PutPolicy { body, is_public } => {
+            put_u8(out, 1);
+            put_bucket_subresource_kind(out, BucketSubresourceKind::Policy);
+            put_string(out, body);
+            put_bucket_subresource_aux(out, BucketSubresourceAux::policy(*is_public));
+        }
+        BucketSubresourceMutation::PutLifecycle(body) => {
+            put_u8(out, 1);
+            put_bucket_subresource_kind(out, BucketSubresourceKind::Lifecycle);
+            put_string(out, body);
+            put_bucket_subresource_aux(out, BucketSubresourceAux::None);
         }
         BucketSubresourceMutation::Delete { kind } => {
             put_u8(out, 2);
@@ -16381,6 +16438,20 @@ fn put_loaded_bucket_subresource(out: &mut Vec<u8>, subresource: &LoadedBucketSu
         LoadedBucketSubresource::Loaded(value) => {
             put_u8(out, 2);
             put_string(out, value);
+        }
+    }
+}
+
+fn put_loaded_bucket_tags(
+    out: &mut Vec<u8>,
+    tags: &LoadedBucketSubresource<SerializedBucketTagSet>,
+) {
+    match tags {
+        LoadedBucketSubresource::NotRequested => put_u8(out, 0),
+        LoadedBucketSubresource::Missing => put_u8(out, 1),
+        LoadedBucketSubresource::Loaded(tags) => {
+            put_u8(out, 2);
+            put_string(out, tags.as_str());
         }
     }
 }
@@ -17712,6 +17783,41 @@ mod tests {
         assert_eq!(
             decoded.tag_set().clone().into_pairs(),
             vec![("key".into(), "value".into())]
+        );
+    }
+
+    #[test]
+    fn storage_rpc_bucket_tags_require_current_canonical_xml() {
+        let noncanonical =
+            "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>";
+        let mut encoded = Vec::new();
+        put_u8(&mut encoded, 1);
+        put_bucket_subresource_kind(&mut encoded, BucketSubresourceKind::Tagging);
+        put_string(&mut encoded, noncanonical);
+        put_bucket_subresource_aux(&mut encoded, BucketSubresourceAux::None);
+        assert!(matches!(
+            StorageRpcDecoder::new(&encoded).read_bucket_subresource_mutation(),
+            Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                "invalid bucket tags"
+            ))
+        ));
+
+        let canonical = s3_types::TagSet::from_pairs(
+            vec![("key".to_string(), "value".to_string())],
+            s3_types::MAX_BUCKET_TAGS,
+        )
+        .unwrap()
+        .to_xml();
+        let mut encoded = Vec::new();
+        put_u8(&mut encoded, 1);
+        put_bucket_subresource_kind(&mut encoded, BucketSubresourceKind::Tagging);
+        put_string(&mut encoded, &canonical);
+        put_bucket_subresource_aux(&mut encoded, BucketSubresourceAux::None);
+        let decoded = StorageRpcDecoder::new(&encoded)
+            .read_bucket_subresource_mutation()
+            .unwrap();
+        assert!(
+            matches!(decoded, BucketSubresourceMutation::PutTagging(tags) if tags.tag_set().clone().into_pairs() == vec![("key".into(), "value".into())])
         );
     }
 
@@ -21518,7 +21624,9 @@ mod tests {
                 bucket: test_bucket_info("source-bucket"),
                 request: source.request,
                 policy: LoadedBucketSubresource::NotRequested,
-                tags: LoadedBucketSubresource::Loaded("<Tagging/>".to_string()),
+                tags: LoadedBucketSubresource::Loaded(SerializedBucketTagSet::new(
+                    "<Tagging><TagSet></TagSet></Tagging>".to_string(),
+                )),
                 lifecycle: LoadedBucketSubresource::NotRequested,
                 cors: LoadedBucketSubresource::NotRequested,
             }),
@@ -21545,7 +21653,7 @@ mod tests {
                 );
                 assert!(matches!(
                     pair.source().tags,
-                    LoadedBucketSubresource::Loaded(ref body) if body == "<Tagging/>"
+                    LoadedBucketSubresource::Loaded(ref tags) if tags.is_empty()
                 ));
                 assert!(matches!(
                     pair.destination().cors,

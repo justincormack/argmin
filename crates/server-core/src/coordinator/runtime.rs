@@ -2572,7 +2572,10 @@ impl ReadRuntime {
 
         let raw_config = self
             .storage_node()
-            .get_bucket_subresource(&bucket_info.name, storage::BucketSubresourceKind::Lifecycle)
+            .get_bucket_subresource(
+                &bucket_info.name,
+                storage::OpaqueBucketSubresourceKind::Lifecycle,
+            )
             .map_err(Self::map_bucket_snapshot_error)?;
 
         Self::parse_lifecycle_config(bucket_info.name.as_str(), raw_config.as_deref())

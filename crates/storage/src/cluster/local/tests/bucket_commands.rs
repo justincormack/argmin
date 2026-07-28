@@ -2235,15 +2235,9 @@ fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
     }
 
     let tags_body = "<Tagging><TagSet/></Tagging>";
+    let tags = crate::SerializedBucketTagSet::new(tags_body.to_string());
     let updated = cluster
-        .put_bucket_subresource_and_load_info(
-            &bucket,
-            crate::PutBucketSubresource {
-                kind: crate::BucketSubresourceKind::Tagging,
-                body: tags_body,
-                aux: crate::BucketSubresourceAux::None,
-            },
-        )
+        .put_bucket_subresource_and_load_info(&bucket, crate::PutBucketSubresource::tagging(&tags))
         .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
@@ -2258,15 +2252,13 @@ fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(stored.body, tags_body);
+        assert_eq!(stored.body, tags.as_str());
         assert_eq!(stored.generation, Some(1));
         assert_eq!(stored.aux, crate::BucketSubresourceAux::None);
         assert_eq!(info.bucket_execution_generation, previous_generation);
     }
 
-    let updated = cluster
-        .delete_bucket_subresource_and_load_info(&bucket, crate::BucketSubresourceKind::Tagging)
-        .unwrap();
+    let updated = cluster.delete_bucket_tags_and_load_info(&bucket).unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
     for node_id in node_ids {
@@ -2344,7 +2336,7 @@ fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
     }
 
     let updated = cluster
-        .delete_bucket_subresource_and_load_info(&bucket, crate::BucketSubresourceKind::Cors)
+        .delete_bucket_subresource_and_load_info(&bucket, crate::OpaqueBucketSubresourceKind::Cors)
         .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
@@ -2363,7 +2355,10 @@ fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
     }
 
     let updated = cluster
-        .delete_bucket_subresource_and_load_info(&bucket, crate::BucketSubresourceKind::Policy)
+        .delete_bucket_subresource_and_load_info(
+            &bucket,
+            crate::OpaqueBucketSubresourceKind::Policy,
+        )
         .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
@@ -2385,7 +2380,10 @@ fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
     }
 
     let updated = cluster
-        .delete_bucket_subresource_and_load_info(&bucket, crate::BucketSubresourceKind::Lifecycle)
+        .delete_bucket_subresource_and_load_info(
+            &bucket,
+            crate::OpaqueBucketSubresourceKind::Lifecycle,
+        )
         .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
@@ -2427,10 +2425,9 @@ fn bucket_subresource_command_retry_reuses_pending_partial_replica_command() {
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let policy_body = r#"{"Statement":[]}"#;
-    let expected_mutation = BucketSubresourceMutation::Put {
-        kind: crate::BucketSubresourceKind::Policy,
+    let expected_mutation = BucketSubresourceMutation::PutPolicy {
         body: policy_body.to_owned(),
-        aux: crate::BucketSubresourceAux::policy(false),
+        is_public: false,
     };
     let _serial = lock_metadata_command_apply_hook_test();
     let fail_once = Arc::new(AtomicBool::new(true));
@@ -2610,15 +2607,9 @@ fn invalid_bucket_subresource_command_does_not_poison_bucket_command_stream() {
     }
 
     let tags_body = "<Tagging><TagSet/></Tagging>";
+    let tags = crate::SerializedBucketTagSet::new(tags_body.to_string());
     let updated = cluster
-        .put_bucket_subresource_and_load_info(
-            &bucket,
-            crate::PutBucketSubresource {
-                kind: crate::BucketSubresourceKind::Tagging,
-                body: tags_body,
-                aux: crate::BucketSubresourceAux::None,
-            },
-        )
+        .put_bucket_subresource_and_load_info(&bucket, crate::PutBucketSubresource::tagging(&tags))
         .unwrap();
     assert!(updated.bucket_execution_generation > initial_generation);
 
@@ -2633,7 +2624,7 @@ fn invalid_bucket_subresource_command_does_not_poison_bucket_command_stream() {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(stored.body, tags_body);
+        assert_eq!(stored.body, tags.as_str());
         assert_eq!(
             info.bucket_execution_generation,
             updated.bucket_execution_generation

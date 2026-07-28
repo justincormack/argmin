@@ -1,5 +1,6 @@
 use super::*;
 use crate::BucketAclSummary;
+use crate::SerializedBucketTagSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MarkBucketDeletingCommandBuild {
@@ -142,6 +143,23 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError>;
+
+    fn get_bucket_tags(
+        &self,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+    ) -> Result<Option<SerializedBucketTagSet>, BucketSnapshotLoadError> {
+        self.get_bucket_subresource(pg_id, bucket, BucketSubresourceKind::Tagging)?
+            .map(SerializedBucketTagSet::from_current_xml)
+            .transpose()
+            .map_err(|error| {
+                MetadataError::InvariantViolation {
+                    context: "get bucket tags",
+                    reason: format!("stored bucket tags are invalid: {error}"),
+                }
+                .into()
+            })
+    }
 
     fn list_buckets(
         &self,

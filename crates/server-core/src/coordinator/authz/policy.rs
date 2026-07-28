@@ -61,7 +61,7 @@ pub(super) fn load_bucket_tags_for_policy_action(
 
     let tags = coord
         .storage_node()
-        .get_bucket_subresource(&bucket.name, storage::BucketSubresourceKind::Tagging)
+        .get_bucket_tags(&bucket.name)
         .map_err(|error| match error {
             storage::BucketSnapshotLoadError::Store(
                 storage::StoreError::MetadataCommandLogConflict { .. }
@@ -82,7 +82,7 @@ pub(super) fn load_bucket_tags_for_policy_action(
             storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
         })?;
     match tags {
-        Some(tags_xml) => Ok(Some(Coordinator::parse_serialized_tag_set(&tags_xml)?)),
+        Some(tags) => Ok(Some(tags.tag_set().clone().into_pairs())),
         None => Ok(Some(Vec::new())),
     }
 }

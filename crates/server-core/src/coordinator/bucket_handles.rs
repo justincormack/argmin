@@ -135,7 +135,7 @@ pub(super) struct LoadedBucketHandle {
     bucket_incarnation_generation: u64,
     request: BucketHandleRequest,
     policy: LoadedBucketValue<String>,
-    tags: LoadedBucketValue<String>,
+    tags: LoadedBucketValue<s3_types::TagSet>,
     lifecycle: LoadedBucketValue<String>,
     cors: LoadedBucketValue<String>,
 }
@@ -143,7 +143,7 @@ pub(super) struct LoadedBucketHandle {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct LoadedBucketSubresources {
     policy: LoadedBucketValue<String>,
-    tags: LoadedBucketValue<String>,
+    tags: LoadedBucketValue<s3_types::TagSet>,
     lifecycle: LoadedBucketValue<String>,
     cors: LoadedBucketValue<String>,
 }
@@ -151,7 +151,7 @@ pub(super) struct LoadedBucketSubresources {
 impl LoadedBucketSubresources {
     pub(super) const fn new(
         policy: LoadedBucketValue<String>,
-        tags: LoadedBucketValue<String>,
+        tags: LoadedBucketValue<s3_types::TagSet>,
         lifecycle: LoadedBucketValue<String>,
         cors: LoadedBucketValue<String>,
     ) -> Self {
@@ -211,7 +211,7 @@ impl LoadedBucketHandle {
         &self.policy
     }
 
-    pub(super) const fn tags(&self) -> &LoadedBucketValue<String> {
+    pub(super) const fn tags(&self) -> &LoadedBucketValue<s3_types::TagSet> {
         &self.tags
     }
 
@@ -443,7 +443,7 @@ impl<'a> BucketHandleLoader<'a> {
             request,
             LoadedBucketSubresources::new(
                 Self::from_storage_subresource(snapshot.policy),
-                Self::from_storage_subresource(snapshot.tags),
+                Self::from_storage_tags(snapshot.tags),
                 Self::from_storage_subresource(snapshot.lifecycle),
                 Self::from_storage_subresource(snapshot.cors),
             ),
@@ -457,6 +457,18 @@ impl<'a> BucketHandleLoader<'a> {
             storage::LoadedBucketSubresource::NotRequested => LoadedBucketValue::NotRequested,
             storage::LoadedBucketSubresource::Missing => LoadedBucketValue::Missing,
             storage::LoadedBucketSubresource::Loaded(value) => LoadedBucketValue::Loaded(value),
+        }
+    }
+
+    fn from_storage_tags(
+        value: storage::LoadedBucketSubresource<storage::SerializedBucketTagSet>,
+    ) -> LoadedBucketValue<s3_types::TagSet> {
+        match value {
+            storage::LoadedBucketSubresource::NotRequested => LoadedBucketValue::NotRequested,
+            storage::LoadedBucketSubresource::Missing => LoadedBucketValue::Missing,
+            storage::LoadedBucketSubresource::Loaded(value) => {
+                LoadedBucketValue::Loaded(value.tag_set().clone())
+            }
         }
     }
 
@@ -496,11 +508,11 @@ impl Coordinator {
 mod tests {
     use super::*;
     use crate::coordinator::test_support::{
-        bucket_request_with_expected_owner, put_bucket_lifecycle_test, put_bucket_policy_test,
-        setup_coordinator, setup_coordinator_with_pg_count, test_requester,
+        bucket_request_with_expected_owner, bucket_tag_set, put_bucket_lifecycle_test,
+        put_bucket_policy_test, setup_coordinator, setup_coordinator_with_pg_count, test_requester,
     };
     use crate::coordinator::{
-        CreateBucketAcl, CreateBucketRequest, PutBucketAbacRequest, PutBucketConfigRequest,
+        CreateBucketAcl, CreateBucketRequest, PutBucketAbacRequest, PutBucketTagsRequest,
     };
     use s3_types::BucketNamespace;
     use storage::BucketObjectOwnership;
@@ -533,9 +545,9 @@ mod tests {
         )
         .unwrap();
         coord
-            .put_bucket_tags(&PutBucketConfigRequest {
+            .put_bucket_tags(&PutBucketTagsRequest {
                 bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
-                config: "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+                tags: bucket_tag_set("<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>"),
             })
             .unwrap();
         put_bucket_lifecycle_test(
@@ -573,9 +585,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         create_bucket(&coord, "bucket");
         coord
-            .put_bucket_tags(&PutBucketConfigRequest {
+            .put_bucket_tags(&PutBucketTagsRequest {
                 bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
-                config: "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+                tags: bucket_tag_set("<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>"),
             })
             .unwrap();
         coord
@@ -603,9 +615,9 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
         create_bucket(&coord, "bucket");
         coord
-            .put_bucket_tags(&PutBucketConfigRequest {
+            .put_bucket_tags(&PutBucketTagsRequest {
                 bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
-                config: "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+                tags: bucket_tag_set("<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>"),
             })
             .unwrap();
 
@@ -660,9 +672,9 @@ mod tests {
         )
         .unwrap();
         coord
-            .put_bucket_tags(&PutBucketConfigRequest {
+            .put_bucket_tags(&PutBucketTagsRequest {
                 bucket: bucket_request_with_expected_owner("destination", test_requester(), None),
-                config: "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+                tags: bucket_tag_set("<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>"),
             })
             .unwrap();
 
@@ -716,9 +728,9 @@ mod tests {
         )
         .unwrap();
         coord
-            .put_bucket_tags(&PutBucketConfigRequest {
+            .put_bucket_tags(&PutBucketTagsRequest {
                 bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
-                config: "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+                tags: bucket_tag_set("<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>"),
             })
             .unwrap();
 

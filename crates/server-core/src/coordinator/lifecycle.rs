@@ -37,7 +37,7 @@ impl Coordinator {
         let raw_config = admission
             .active_bucket_route(&bucket.name)
             .map_err(super::map_store_error)?
-            .get_bucket_subresource(storage::BucketSubresourceKind::Lifecycle)
+            .get_bucket_subresource(storage::OpaqueBucketSubresourceKind::Lifecycle)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         match raw_config {
             Some(config_xml) => s3_types::parse_lifecycle_configuration_xml(config_xml.as_bytes())

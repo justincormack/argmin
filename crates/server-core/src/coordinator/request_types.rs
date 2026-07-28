@@ -525,6 +525,13 @@ pub struct PutBucketConfigRequest<'a> {
     pub config: &'a str,
 }
 
+/// Request for a bucket-tag configuration operation.
+#[derive(Debug)]
+pub struct PutBucketTagsRequest<'a> {
+    pub bucket: BucketRequest<'a>,
+    pub tags: s3_types::TagSet,
+}
+
 /// Request for a minimal `s3-control` bucket-tag operation.
 #[derive(Debug)]
 pub struct BucketTagControlRequest<'a> {
@@ -556,7 +563,7 @@ impl BucketTagControlAction {
 #[derive(Debug)]
 pub struct PutBucketTagControlRequest<'a> {
     pub control: BucketTagControlRequest<'a>,
-    pub config: &'a str,
+    pub tags: s3_types::TagSet,
     pub request_tags: &'a [(String, String)],
 }
 
@@ -572,7 +579,7 @@ pub struct UntagBucketTagControlRequest<'a> {
 #[derive(Debug)]
 pub struct PutBucketTagsForUntagResourceRequest<'a> {
     pub control: BucketTagControlRequest<'a>,
-    pub config: &'a str,
+    pub tags: s3_types::TagSet,
     pub request_tags: &'a [(String, String)],
 }
 

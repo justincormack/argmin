@@ -1131,6 +1131,68 @@ impl std::fmt::Debug for SerializedTagSet {
     }
 }
 
+/// Validated bucket tags carried by storage.
+///
+/// Bucket and object tags share the AWS tag grammar and canonical XML owner,
+/// but have distinct cardinality limits and durable carriers. The XML remains
+/// private to storage so callers cannot inject an alternative persisted
+/// spelling.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SerializedBucketTagSet {
+    xml: String,
+    tags: s3_types::TagSet,
+}
+
+impl SerializedBucketTagSet {
+    pub fn from_tag_set(tags: s3_types::TagSet) -> Result<Self, s3_types::TagSetValidationError> {
+        let tags = s3_types::TagSet::new(tags.as_slice().to_vec(), s3_types::MAX_BUCKET_TAGS)?;
+        Ok(Self {
+            xml: tags.to_xml(),
+            tags,
+        })
+    }
+
+    #[must_use]
+    pub fn tag_set(&self) -> &s3_types::TagSet {
+        &self.tags
+    }
+
+    pub(crate) fn from_current_xml(
+        xml: String,
+    ) -> Result<Self, s3_types::CanonicalTagSetParseError> {
+        let tags = s3_types::TagSet::parse_current_xml(&xml, s3_types::MAX_BUCKET_TAGS)?;
+        Ok(Self { xml, tags })
+    }
+
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.xml
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(xml: String) -> Self {
+        let tags = s3_types::TagSet::parse_canonical_xml(&xml, s3_types::MAX_BUCKET_TAGS)
+            .expect("storage tests must construct valid bucket tags");
+        Self::from_tag_set(tags).expect("storage tests must respect the bucket tag count limit")
+    }
+}
+
+impl std::ops::Deref for SerializedBucketTagSet {
+    type Target = s3_types::TagSet;
+
+    fn deref(&self) -> &Self::Target {
+        self.tag_set()
+    }
+}
+
+impl std::fmt::Debug for SerializedBucketTagSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SerializedBucketTagSet")
+            .field("tag_count", &self.tags.len())
+            .finish()
+    }
+}
+
 /// Storage-owned object encryption discriminator used by durable and wire codecs.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2832,10 +2894,32 @@ impl BucketState {
     }
 }
 
-/// Bucket subresources whose payloads are stored opaquely.
+/// Bucket subresources whose payloads remain opaque outside storage.
+///
+/// Tagging is deliberately absent: bucket tags cross the public storage
+/// boundary through [`SerializedBucketTagSet`] instead of the generic string
+/// interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpaqueBucketSubresourceKind {
+    Cors,
+    Policy,
+    Lifecycle,
+}
+
+impl OpaqueBucketSubresourceKind {
+    pub(crate) const fn stored_kind(self) -> BucketSubresourceKind {
+        match self {
+            Self::Cors => BucketSubresourceKind::Cors,
+            Self::Policy => BucketSubresourceKind::Policy,
+            Self::Lifecycle => BucketSubresourceKind::Lifecycle,
+        }
+    }
+}
+
+/// Storage-owned discriminator for all persisted bucket subresources.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BucketSubresourceKind {
+pub(crate) enum BucketSubresourceKind {
     Cors = 0,
     Tagging = 1,
     Policy = 4,
@@ -2844,7 +2928,7 @@ pub enum BucketSubresourceKind {
 
 impl BucketSubresourceKind {
     #[must_use]
-    pub fn from_u8(v: u8) -> Option<Self> {
+    pub(crate) fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::Cors),
             1 => Some(Self::Tagging),
@@ -2857,7 +2941,7 @@ impl BucketSubresourceKind {
 
 /// Typed auxiliary summary data associated with a stored bucket subresource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BucketSubresourceAux {
+pub(crate) enum BucketSubresourceAux {
     #[default]
     None,
     Policy {
@@ -2867,12 +2951,12 @@ pub enum BucketSubresourceAux {
 
 impl BucketSubresourceAux {
     #[must_use]
-    pub const fn policy(is_public: bool) -> Self {
+    pub(crate) const fn policy(is_public: bool) -> Self {
         Self::Policy { is_public }
     }
 
     #[must_use]
-    pub const fn policy_is_public(self) -> Option<bool> {
+    pub(crate) const fn policy_is_public(self) -> Option<bool> {
         match self {
             Self::None => None,
             Self::Policy { is_public, .. } => Some(is_public),
@@ -2882,7 +2966,7 @@ impl BucketSubresourceAux {
 
 impl BucketSubresourceKind {
     #[must_use]
-    pub const fn supports_aux(self, aux: BucketSubresourceAux) -> bool {
+    pub(crate) const fn supports_aux(self, aux: BucketSubresourceAux) -> bool {
         matches!(
             (self, aux),
             (BucketSubresourceKind::Cors, BucketSubresourceAux::None)
@@ -2896,20 +2980,77 @@ impl BucketSubresourceKind {
     }
 }
 
-/// Generic storage-layer request for bucket subresource writes.
+/// Storage-layer request for bucket subresource writes.
+///
+/// The representation tuple is storage-private. Public constructors keep the
+/// subresource kind, value representation, and auxiliary data consistent by
+/// construction, and tagging accepts only the validated bucket-tag carrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PutBucketSubresource<'a> {
-    pub kind: BucketSubresourceKind,
-    pub body: &'a str,
-    pub aux: BucketSubresourceAux,
+    pub(crate) kind: BucketSubresourceKind,
+    pub(crate) body: &'a str,
+    pub(crate) aux: BucketSubresourceAux,
+}
+
+impl<'a> PutBucketSubresource<'a> {
+    #[must_use]
+    pub const fn cors(body: &'a str) -> Self {
+        Self {
+            kind: BucketSubresourceKind::Cors,
+            body,
+            aux: BucketSubresourceAux::None,
+        }
+    }
+
+    #[must_use]
+    pub fn tagging(tags: &'a SerializedBucketTagSet) -> Self {
+        Self {
+            kind: BucketSubresourceKind::Tagging,
+            body: tags.as_str(),
+            aux: BucketSubresourceAux::None,
+        }
+    }
+
+    #[must_use]
+    pub const fn policy(body: &'a str, is_public: bool) -> Self {
+        Self {
+            kind: BucketSubresourceKind::Policy,
+            body,
+            aux: BucketSubresourceAux::Policy { is_public },
+        }
+    }
+
+    #[must_use]
+    pub const fn lifecycle(body: &'a str) -> Self {
+        Self {
+            kind: BucketSubresourceKind::Lifecycle,
+            body,
+            aux: BucketSubresourceAux::None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn kind(self) -> BucketSubresourceKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub(crate) fn body(self) -> &'a str {
+        self.body
+    }
+
+    #[must_use]
+    pub(crate) const fn aux(self) -> BucketSubresourceAux {
+        self.aux
+    }
 }
 
 /// Generic stored representation of an opaque bucket subresource.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredBucketSubresource {
-    pub body: String,
-    pub generation: Option<u64>,
-    pub aux: BucketSubresourceAux,
+pub(crate) struct StoredBucketSubresource {
+    pub(crate) body: String,
+    pub(crate) generation: Option<u64>,
+    pub(crate) aux: BucketSubresourceAux,
 }
 
 /// Durable bucket write reservation record.
@@ -3321,7 +3462,7 @@ pub struct BucketSnapshot {
     pub bucket: BucketInfo,
     pub request: BucketSnapshotRequest,
     pub policy: LoadedBucketSubresource<String>,
-    pub tags: LoadedBucketSubresource<String>,
+    pub tags: LoadedBucketSubresource<SerializedBucketTagSet>,
     pub lifecycle: LoadedBucketSubresource<String>,
     pub cors: LoadedBucketSubresource<String>,
 }
@@ -3472,7 +3613,7 @@ impl std::fmt::Debug for BucketFastPathPolicy {
 pub enum BucketFastPathTags {
     NotApplicable,
     Missing,
-    Loaded(String),
+    Loaded(SerializedBucketTagSet),
 }
 
 impl std::fmt::Debug for BucketFastPathTags {
@@ -5085,6 +5226,47 @@ mod tests {
     }
 
     #[test]
+    fn stored_bucket_tags_accept_only_the_exact_current_validated_representation() {
+        let tags = s3_types::TagSet::from_pairs(
+            vec![("key".to_string(), "value".to_string())],
+            s3_types::MAX_BUCKET_TAGS,
+        )
+        .unwrap();
+        let stored = SerializedBucketTagSet::from_tag_set(tags.clone()).unwrap();
+        assert_eq!(stored.tag_set(), &tags);
+        assert_eq!(
+            stored.as_str(),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>"
+        );
+        assert_eq!(
+            SerializedBucketTagSet::from_current_xml(stored.as_str().to_string()).unwrap(),
+            stored
+        );
+        assert!(matches!(
+            SerializedBucketTagSet::from_current_xml(
+                "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>"
+                    .to_string()
+            ),
+            Err(s3_types::CanonicalTagSetParseError::NonCanonical)
+        ));
+
+        let too_many = s3_types::TagSet::from_pairs(
+            (0..=s3_types::MAX_BUCKET_TAGS)
+                .map(|index| (format!("key-{index}"), "value".to_string()))
+                .collect(),
+            s3_types::MAX_BUCKET_TAGS + 1,
+        )
+        .unwrap();
+        assert!(matches!(
+            SerializedBucketTagSet::from_tag_set(too_many),
+            Err(s3_types::TagSetValidationError::TooMany {
+                actual: 51,
+                maximum: s3_types::MAX_BUCKET_TAGS,
+            })
+        ));
+    }
+
+    #[test]
     fn bucket_info_debug_summarizes_raw_configs() {
         let info = BucketInfo {
             name: BucketName::try_from("bucket-1").unwrap(),
@@ -5147,7 +5329,9 @@ mod tests {
                 bucket_incarnation_generation: info.bucket_incarnation_generation,
                 multipart_upload_id_key: info.multipart_upload_id_key.clone(),
                 bucket_abac_enabled: info.bucket_abac_enabled,
-                tags: BucketFastPathTags::Loaded("secret-tags".to_string()),
+                tags: BucketFastPathTags::Loaded(SerializedBucketTagSet::new(
+                    "<Tagging><TagSet><Tag><Key>secret</Key><Value>tags</Value></Tag></TagSet></Tagging>".to_string(),
+                )),
                 encryption: info.encryption,
             }
         );

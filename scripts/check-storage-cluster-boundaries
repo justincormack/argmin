@@ -2753,10 +2753,16 @@ fail_with_matches \
     "User/system metadata byte codecs are private to server-core and storage carries only their opaque serialized values" \
     "$metadata_blob_codec_leaks"
 
-object_tag_codec_leaks=$(
+tag_codec_leaks=$(
     {
         rg -n --color=never \
             '\bSerializedTagSet::(as_str|from_current_xml|new|from)\b' \
+            . \
+            -g 'crates/**/*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            '\bSerializedBucketTagSet::(as_str|from_current_xml|new)\b|\bBucketSubresourceKind::Tagging\b' \
             . \
             -g 'crates/**/*.rs' \
             -g '!crates/storage/**' \
@@ -2773,11 +2779,15 @@ object_tag_codec_leaks=$(
             crates \
             -g '*.rs' \
             || true
+        rg -n --color=never \
+            'pub (enum BucketSubresource(Aux|Kind)|struct StoredBucketSubresource)' \
+            crates/storage/src/types.rs \
+            || true
     }
 )
 fail_with_matches \
-    "Canonical object-tag XML and its exact-current decoder are private to s3-types/storage; other crates must pass logical TagSet values" \
-    "$object_tag_codec_leaks"
+    "Canonical object/bucket-tag XML, exact-current decoders, and generic tagging discriminators are private to s3-types/storage; other crates must pass logical or typed tag-set values" \
+    "$tag_codec_leaks"
 
 if [[ "$failed" -ne 0 ]]; then
     echo

@@ -472,7 +472,7 @@ fn tag_resource_bucket_policy_null_request_header_condition_matches_absent_heade
                     None,
                 ),
             },
-            config: "<Tagging><TagSet><Tag><Key>security</Key><Value>allow</Value></Tag></TagSet></Tagging>",
+            tags: bucket_tag_set("<Tagging><TagSet><Tag><Key>security</Key><Value>allow</Value></Tag></TagSet></Tagging>"),
             request_tags: &[("security".to_string(), "allow".to_string())],
         })
         .unwrap();
@@ -488,13 +488,13 @@ fn list_tags_for_resource_uses_its_distinct_bucket_policy_action() {
         .create_bucket_for_owner("111122223333", "bucket", false)
         .unwrap();
     coord
-        .put_bucket_tags(&PutBucketConfigRequest {
+        .put_bucket_tags(&PutBucketTagsRequest {
             bucket: bucket_request_with_expected_owner(
                 "bucket",
                 test_helpers::requester("111122223333"),
                 None,
             ),
-            config: tags,
+            tags: bucket_tag_set(tags),
         })
         .unwrap();
     put_bucket_policy_test(
@@ -521,7 +521,7 @@ fn list_tags_for_resource_uses_its_distinct_bucket_policy_action() {
                 BucketTagControlAction::ListTagsForResource,
             )
             .unwrap(),
-        Some(tags.to_string())
+        Some(bucket_tag_set(tags))
     );
 
     for action in [
@@ -2787,14 +2787,15 @@ fn upload_part_copy_boe_source_bucket_tag_abac_controls_access() {
     )
     .unwrap();
     coord
-        .put_bucket_tags(&PutBucketConfigRequest {
+        .put_bucket_tags(&PutBucketTagsRequest {
             bucket: bucket_request_with_expected_owner(
                 "src",
                 test_helpers::requester(owner),
                 None,
             ),
-            config:
+            tags: bucket_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+            ),
         })
         .unwrap();
     coord
@@ -2859,8 +2860,9 @@ fn upload_part_copy_boe_source_bucket_tag_abac_controls_access() {
                     None,
                 ),
             },
-            config:
+            tags: bucket_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+            ),
             request_tags: &[],
         })
         .unwrap();
@@ -4121,14 +4123,15 @@ fn begin_stream_part_bucket_policy_and_abac_same_pg_completes_without_deadlock()
         .create_bucket_for_owner("111122223333", bucket, false)
         .unwrap();
     coord
-        .put_bucket_tags(&PutBucketConfigRequest {
+        .put_bucket_tags(&PutBucketTagsRequest {
             bucket: bucket_request_with_expected_owner(
                 bucket,
                 test_helpers::requester("111122223333"),
                 None,
             ),
-            config:
+            tags: bucket_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+            ),
         })
         .unwrap();
     coord
@@ -4311,14 +4314,15 @@ fn begin_stream_put_bucket_policy_and_abac_same_pg_completes_without_deadlock() 
         .create_bucket_for_owner("111122223333", bucket, false)
         .unwrap();
     coord
-        .put_bucket_tags(&PutBucketConfigRequest {
+        .put_bucket_tags(&PutBucketTagsRequest {
             bucket: bucket_request_with_expected_owner(
                 bucket,
                 test_helpers::requester("111122223333"),
                 None,
             ),
-            config:
+            tags: bucket_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+            ),
         })
         .unwrap();
     coord

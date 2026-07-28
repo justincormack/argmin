@@ -1622,13 +1622,7 @@ impl HttpFrontend {
                         &[],
                         crate::coordinator::BucketTagControlAction::ListTagsForResource,
                     )?
-                    .map(|tagging_xml| {
-                        xml::TagSet::parse_tagging_xml(
-                            tagging_xml.as_bytes(),
-                            s3_types::MAX_BUCKET_TAGS,
-                        )
-                    })
-                    .transpose()?
+                    .map(xml::TagSet::from_aws_tag_set)
                     .unwrap_or_else(|| xml::TagSet::empty(s3_types::MAX_BUCKET_TAGS));
                 Ok(S3Response::list_tags_for_resource(
                     tags.to_list_tags_for_resource_xml(),
@@ -1649,22 +1643,15 @@ impl HttpFrontend {
                         request_tags.as_slice(),
                         crate::coordinator::BucketTagControlAction::TagResource,
                     )?
-                    .map(|tagging_xml| {
-                        xml::TagSet::parse_tagging_xml(
-                            tagging_xml.as_bytes(),
-                            s3_types::MAX_BUCKET_TAGS,
-                        )
-                    })
-                    .transpose()?
+                    .map(xml::TagSet::from_aws_tag_set)
                     .unwrap_or_else(|| xml::TagSet::empty(s3_types::MAX_BUCKET_TAGS));
                 let merged_tags = existing_tags.merge(&tags)?;
-                let merged_xml = merged_tags.to_xml();
                 self.coordinator
                     .put_bucket_tags_for_tag_resource_on_admitted_route(
                         storage_route_admission,
                         &crate::coordinator::PutBucketTagControlRequest {
                             control,
-                            config: &merged_xml,
+                            tags: merged_tags.as_aws_tag_set().clone(),
                             request_tags: request_tags.as_slice(),
                         },
                     )?;
@@ -1693,13 +1680,7 @@ impl HttpFrontend {
                         request_tags.as_slice(),
                         crate::coordinator::BucketTagControlAction::UntagResource,
                     )?
-                    .map(|tagging_xml| {
-                        xml::TagSet::parse_tagging_xml(
-                            tagging_xml.as_bytes(),
-                            s3_types::MAX_BUCKET_TAGS,
-                        )
-                    })
-                    .transpose()?
+                    .map(xml::TagSet::from_aws_tag_set)
                     .unwrap_or_else(|| xml::TagSet::empty(s3_types::MAX_BUCKET_TAGS));
                 // AWS treats invalid-character and overlong keys as a successful
                 // no-op when no resource tags exist. Once any tag exists, it
@@ -1719,13 +1700,12 @@ impl HttpFrontend {
                             },
                         )?;
                 } else {
-                    let remaining_xml = remaining_tags.to_xml();
                     self.coordinator
                         .put_bucket_tags_for_untag_resource_on_admitted_route(
                             storage_route_admission,
                             &crate::coordinator::PutBucketTagsForUntagResourceRequest {
                                 control,
-                                config: &remaining_xml,
+                                tags: remaining_tags.as_aws_tag_set().clone(),
                                 request_tags: request_tags.as_slice(),
                             },
                         )?;
@@ -2649,13 +2629,12 @@ impl HttpFrontend {
                     RequestChecksumRequirement::ContentMd5OrChecksumHeader,
                 )?;
                 let tags = xml::TagSet::parse_tagging_xml(&req.body, s3_types::MAX_BUCKET_TAGS)?;
-                let tags_xml = tags.to_xml();
                 let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.put_bucket_tags_on_admitted_route(
                     storage_route_admission,
-                    &crate::coordinator::PutBucketConfigRequest {
+                    &crate::coordinator::PutBucketTagsRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
-                        config: &tags_xml,
+                        tags: tags.as_aws_tag_set().clone(),
                     },
                 )?;
                 Ok(S3Response::put_bucket_tagging())
@@ -2666,7 +2645,7 @@ impl HttpFrontend {
                     storage_route_admission,
                     &bucket_request(&bucket, requester, expected_bucket_owner)?,
                 )? {
-                    Some(tags_xml) => Ok(S3Response::get_bucket_tagging(&tags_xml)),
+                    Some(tags) => Ok(S3Response::get_bucket_tagging(&tags.to_xml())),
                     None => Err(ServerError::NoSuchTagSet {
                         resource: bucket.to_string(),
                     }),

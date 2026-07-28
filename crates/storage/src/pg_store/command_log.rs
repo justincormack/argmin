@@ -156,6 +156,9 @@ pub enum MetadataCommandCheckpointValidationError {
         expected_digest: u64,
         actual_digest: u64,
     },
+    InvalidBucketTagRow {
+        row_index: usize,
+    },
     TableDigestMismatch {
         table_name: String,
         expected_digest: u64,
@@ -255,6 +258,7 @@ impl MetadataCommandCheckpoint {
                         },
                     );
                 }
+                Self::verify_row_semantics(table, row_index, &row.values)?;
                 stats.row_count += 1;
                 stats.row_hash_xor ^= row_digest;
                 stats.row_hash_sum = stats.row_hash_sum.wrapping_add(row_digest);
@@ -316,6 +320,46 @@ impl MetadataCommandCheckpoint {
                 },
             )
         }
+    }
+
+    fn verify_row_semantics(
+        table: &MetadataDigestTable,
+        row_index: usize,
+        values: &[MetadataCheckpointValue],
+    ) -> Result<(), MetadataCommandCheckpointValidationError> {
+        if table.name != "bucket_subresources"
+            || !matches!(
+                values.get(1),
+                Some(MetadataCheckpointValue::Integer(kind))
+                    if *kind == BucketSubresourceKind::Tagging as u8 as i64
+            )
+        {
+            return Ok(());
+        }
+
+        let body = match values.get(2) {
+            Some(MetadataCheckpointValue::Null) => None,
+            Some(MetadataCheckpointValue::Text(xml)) => Some(
+                String::from_utf8(xml.clone())
+                    .map_err(|_| Self::invalid_bucket_tag_row(row_index))?,
+            ),
+            _ => return Err(Self::invalid_bucket_tag_row(row_index)),
+        };
+        let aux_int_1 = match values.get(4) {
+            Some(MetadataCheckpointValue::Null) => None,
+            Some(MetadataCheckpointValue::Integer(value)) => Some(*value),
+            _ => return Err(Self::invalid_bucket_tag_row(row_index)),
+        };
+        let valid = PgStore::decode_bucket_tag_subresource_row(body, aux_int_1).is_ok();
+        if valid {
+            Ok(())
+        } else {
+            Err(Self::invalid_bucket_tag_row(row_index))
+        }
+    }
+
+    fn invalid_bucket_tag_row(row_index: usize) -> MetadataCommandCheckpointValidationError {
+        MetadataCommandCheckpointValidationError::InvalidBucketTagRow { row_index }
     }
 }
 
@@ -2948,7 +2992,14 @@ impl PgStore {
             checkpoint_crc64: 0,
         };
         checkpoint.checkpoint_crc64 = Self::metadata_command_checkpoint_crc64(&checkpoint);
-        debug_assert!(checkpoint.verify().is_ok());
+        checkpoint
+            .verify()
+            .map_err(|error| StoreError::MetadataCheckpointInvalid {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                reason: format!("{error:?}"),
+            })?;
         Ok(checkpoint)
     }
 
@@ -4982,6 +5033,49 @@ impl PgStore {
             }
         }
         hasher.finalize()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_reseal_metadata_command_checkpoint(
+        checkpoint: &mut MetadataCommandCheckpoint,
+    ) {
+        for ((table, summary), block) in METADATA_DIGEST_TABLES
+            .iter()
+            .zip(&mut checkpoint.table_digests)
+            .zip(&mut checkpoint.table_blocks)
+        {
+            let mut stats = MetadataTableDigestStats {
+                row_count: 0,
+                row_hash_xor: 0,
+                row_hash_sum: 0,
+            };
+            for row in &mut block.rows {
+                row.row_digest = Self::metadata_checkpoint_row_digest(table, &row.values);
+                stats.row_count += 1;
+                stats.row_hash_xor ^= row.row_digest;
+                stats.row_hash_sum = stats.row_hash_sum.wrapping_add(row.row_digest);
+            }
+            let table_digest = metadata_table_digest_from_stats(table, stats);
+            summary.row_count = stats.row_count;
+            summary.row_hash_xor = stats.row_hash_xor;
+            summary.row_hash_sum = stats.row_hash_sum;
+            summary.table_digest = table_digest;
+            block.row_count = stats.row_count;
+            block.row_hash_xor = stats.row_hash_xor;
+            block.row_hash_sum = stats.row_hash_sum;
+            block.table_digest = table_digest;
+        }
+        let mut state_hasher = checksum::crc64::Hasher::new();
+        Self::digest_canonical_pg_state_header(&mut state_hasher);
+        for (table, summary) in METADATA_DIGEST_TABLES.iter().zip(&checkpoint.table_digests) {
+            Self::digest_metadata_table_digest_entry(
+                &mut state_hasher,
+                table,
+                summary.table_digest,
+            );
+        }
+        checkpoint.state_digest = state_hasher.finalize();
+        checkpoint.checkpoint_crc64 = Self::metadata_command_checkpoint_crc64(checkpoint);
     }
 
     fn digest_canonical_pg_state_header(hasher: &mut checksum::crc64::Hasher) {

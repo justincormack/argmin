@@ -10,10 +10,7 @@ use s3_types::{
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use storage::{
-    install_bucket_scoped_test_hooks, BucketScopedTestHooks, BucketSubresourceAux,
-    BucketSubresourceKind, PutBucketSubresource,
-};
+use storage::{install_bucket_scoped_test_hooks, BucketScopedTestHooks, PutBucketSubresource};
 
 fn delete_bucket_test(coord: &Coordinator, name: &str) -> Result<(), ServerError> {
     coord.delete_bucket(&bucket_request_with_expected_owner(
@@ -242,12 +239,11 @@ fn put_bucket_tags_test(
     requester: Requester,
     expected_bucket_owner: Option<&str>,
 ) -> Result<(), ServerError> {
-    coord.put_bucket_tags(&put_bucket_config_request_with_expected_owner(
-        name,
-        config,
-        requester,
-        expected_bucket_owner,
-    ))
+    let tags = bucket_tag_set(config);
+    coord.put_bucket_tags(&PutBucketTagsRequest {
+        bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+        tags,
+    })
 }
 
 fn get_bucket_tags_test(
@@ -255,7 +251,7 @@ fn get_bucket_tags_test(
     name: &str,
     requester: Requester,
     expected_bucket_owner: Option<&str>,
-) -> Result<Option<String>, ServerError> {
+) -> Result<Option<s3_types::TagSet>, ServerError> {
     coord.get_bucket_tags(&bucket_request_with_expected_owner(
         name,
         requester,
@@ -283,11 +279,12 @@ fn put_bucket_tags_for_tag_resource_test(
     requester: Requester,
     expected_bucket_owner: Option<&str>,
 ) -> Result<(), ServerError> {
+    let tags = bucket_tag_set(config);
     coord.put_bucket_tags_for_tag_resource(&PutBucketTagControlRequest {
         control: BucketTagControlRequest {
             bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
         },
-        config,
+        tags,
         request_tags: &[],
     })
 }
@@ -2304,11 +2301,7 @@ fn lifecycle_sweep_failure_records_durable_claim_error() {
         .storage_node()
         .put_bucket_subresource_and_load_info(
             &bucket,
-            PutBucketSubresource {
-                kind: BucketSubresourceKind::Lifecycle,
-                body: "<LifecycleConfiguration><Rule><ID>broken",
-                aux: BucketSubresourceAux::None,
-            },
+            PutBucketSubresource::lifecycle("<LifecycleConfiguration><Rule><ID>broken"),
         )
         .unwrap();
 
@@ -5125,7 +5118,7 @@ fn get_bucket_tags_bucket_policy_allow_applies() {
         None,
     )
     .unwrap();
-    assert_eq!(config, Some(tags.to_string()));
+    assert_eq!(config, Some(bucket_tag_set(tags)));
 }
 
 #[test]
@@ -5480,7 +5473,7 @@ fn put_and_delete_bucket_tags_bucket_policy_allow_applies() {
             None
         )
         .unwrap(),
-        Some(tags.to_string())
+        Some(bucket_tag_set(tags))
     );
 
     delete_bucket_tags_test(

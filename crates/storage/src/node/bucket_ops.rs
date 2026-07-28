@@ -365,11 +365,10 @@ impl SharedStorageNode {
             request.policy,
             BucketSubresourceKind::Policy,
         )?;
-        let tags = Self::load_bucket_snapshot_subresource(
+        let tags = Self::load_bucket_snapshot_tags(
             bucket_pg,
             &bucket_info.name,
             request.tags.should_load(&bucket_info),
-            BucketSubresourceKind::Tagging,
         )?;
         let lifecycle = Self::load_bucket_snapshot_subresource(
             bucket_pg,
@@ -409,6 +408,33 @@ impl SharedStorageNode {
                 None => LoadedBucketSubresource::Missing,
             },
         )
+    }
+
+    fn load_bucket_snapshot_tags(
+        bucket_pg: &PgStore,
+        bucket: &BucketName,
+        requested: bool,
+    ) -> Result<LoadedBucketSubresource<crate::SerializedBucketTagSet>, BucketSnapshotLoadError>
+    {
+        if !requested {
+            return Ok(LoadedBucketSubresource::NotRequested);
+        }
+        match PgMetadataStore::get_bucket_subresource(
+            bucket_pg,
+            bucket,
+            BucketSubresourceKind::Tagging,
+        )? {
+            Some(stored) => crate::SerializedBucketTagSet::from_current_xml(stored.body)
+                .map(LoadedBucketSubresource::Loaded)
+                .map_err(|error| {
+                    crate::MetadataError::InvariantViolation {
+                        context: "load bucket tags",
+                        reason: format!("stored bucket tags are invalid: {error}"),
+                    }
+                    .into()
+                }),
+            None => Ok(LoadedBucketSubresource::Missing),
+        }
     }
 
     #[cfg(test)]

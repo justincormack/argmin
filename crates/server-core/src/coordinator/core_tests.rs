@@ -383,13 +383,13 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
             ),
             config: "<CORSConfiguration><CORSRule><AllowedOrigin>https://expired.example</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>",
         };
-        let put_bucket_tags_request = PutBucketConfigRequest {
+        let put_bucket_tags_request = PutBucketTagsRequest {
             bucket: bucket_request_with_expected_owner(
                 "bucket",
                 test_requester(),
                 None,
             ),
-            config: "<Tagging><TagSet><Tag><Key>expired</Key><Value>route</Value></Tag></TagSet></Tagging>",
+            tags: bucket_tag_set("<Tagging><TagSet><Tag><Key>expired</Key><Value>route</Value></Tag></TagSet></Tagging>"),
         };
         let put_lifecycle_request = PutBucketConfigRequest {
             bucket: bucket_request_with_expected_owner(
@@ -483,14 +483,14 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
             control: BucketTagControlRequest {
                 bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             },
-            config: put_bucket_tags_request.config,
+            tags: put_bucket_tags_request.tags.clone(),
             request_tags: &control_request_tags,
         };
         let put_untag_control_request = PutBucketTagsForUntagResourceRequest {
             control: BucketTagControlRequest {
                 bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             },
-            config: put_bucket_tags_request.config,
+            tags: put_bucket_tags_request.tags.clone(),
             request_tags: &control_request_tags,
         };
         let delete_untag_control_request = UntagBucketTagControlRequest {
@@ -2749,10 +2749,11 @@ fn bucket_subresource_mutation_expires_at_pending_install_effect_boundary() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
     let bucket_request = bucket_request_with_expected_owner("bucket", test_requester(), None);
-    let put_request = PutBucketConfigRequest {
+    let put_request = PutBucketTagsRequest {
         bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
-        config:
+        tags: bucket_tag_set(
             "<Tagging><TagSet><Tag><Key>late</Key><Value>write</Value></Tag></TagSet></Tagging>",
+        ),
     };
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
 
@@ -2787,8 +2788,8 @@ fn bucket_subresource_mutation_expires_at_pending_install_effect_boundary() {
         coord
             .get_bucket_tags_on_admitted_route(&admission, &bucket_request)
             .unwrap()
-            .as_deref(),
-        Some(put_request.config)
+            .as_ref(),
+        Some(&put_request.tags)
     );
     drop(admission);
 
@@ -2815,8 +2816,8 @@ fn bucket_subresource_mutation_expires_at_pending_install_effect_boundary() {
         coord
             .get_bucket_tags_on_admitted_route(&admission, &bucket_request)
             .unwrap()
-            .as_deref(),
-        Some(put_request.config)
+            .as_ref(),
+        Some(&put_request.tags)
     );
 }
 
@@ -3736,9 +3737,9 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
         config: "<CORSConfiguration><CORSRule><AllowedOrigin>https://baseline.example</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>",
     };
-    let baseline_tags_request = PutBucketConfigRequest {
+    let baseline_tags_request = PutBucketTagsRequest {
         bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
-        config: "<Tagging><TagSet><Tag><Key>domain</Key><Value>baseline</Value></Tag></TagSet></Tagging>",
+        tags: bucket_tag_set("<Tagging><TagSet><Tag><Key>domain</Key><Value>baseline</Value></Tag></TagSet></Tagging>"),
     };
     let baseline_lifecycle_request = PutBucketConfigRequest {
         bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
@@ -3861,9 +3862,9 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
         config: "<CORSConfiguration><CORSRule><AllowedOrigin>https://rejected.example</AllowedOrigin><AllowedMethod>PUT</AllowedMethod></CORSRule></CORSConfiguration>",
     };
-    let rejected_tags_request = PutBucketConfigRequest {
+    let rejected_tags_request = PutBucketTagsRequest {
         bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
-        config: "<Tagging><TagSet><Tag><Key>domain</Key><Value>rejected</Value></Tag></TagSet></Tagging>",
+        tags: bucket_tag_set("<Tagging><TagSet><Tag><Key>domain</Key><Value>rejected</Value></Tag></TagSet></Tagging>"),
     };
     let rejected_lifecycle_request = PutBucketConfigRequest {
         bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
@@ -3928,14 +3929,14 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         control: BucketTagControlRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
         },
-        config: rejected_tags_request.config,
+        tags: rejected_tags_request.tags.clone(),
         request_tags: &control_request_tags,
     };
     let put_untag_control_request = PutBucketTagsForUntagResourceRequest {
         control: BucketTagControlRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
         },
-        config: rejected_tags_request.config,
+        tags: rejected_tags_request.tags.clone(),
         request_tags: &control_request_tags,
     };
     let delete_untag_control_request = UntagBucketTagControlRequest {
@@ -16803,14 +16804,15 @@ fn head_object_uses_validated_boe_policy_and_abac_tags_fast_path_when_warm() {
     )
     .unwrap();
     admin
-        .put_bucket_tags(&PutBucketConfigRequest {
+        .put_bucket_tags(&PutBucketTagsRequest {
             bucket: bucket_request_with_expected_owner(
                 bucket,
                 test_helpers::requester("111122223333"),
                 None,
             ),
-            config:
+            tags: bucket_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+            ),
         })
         .unwrap();
     admin
@@ -16922,8 +16924,9 @@ fn head_object_uses_validated_boe_policy_and_abac_tags_fast_path_when_warm() {
                     None,
                 ),
             },
-            config:
+            tags: bucket_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+            ),
             request_tags: &[],
         })
         .unwrap();
@@ -16953,14 +16956,15 @@ fn head_object_fast_path_denies_with_non_matching_boe_abac_bucket_tags() {
     )
     .unwrap();
     admin
-        .put_bucket_tags(&PutBucketConfigRequest {
+        .put_bucket_tags(&PutBucketTagsRequest {
             bucket: bucket_request_with_expected_owner(
                 bucket,
                 test_helpers::requester("111122223333"),
                 None,
             ),
-            config:
+            tags: bucket_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+            ),
         })
         .unwrap();
     admin
@@ -17624,10 +17628,11 @@ fn head_object_validates_independent_fast_path_before_stale_abac_tags() {
     )
     .unwrap();
     admin
-        .put_bucket_tags(&PutBucketConfigRequest {
+        .put_bucket_tags(&PutBucketTagsRequest {
             bucket: bucket_request_with_expected_owner(bucket, owner_requester.clone(), None),
-            config:
+            tags: bucket_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+            ),
         })
         .unwrap();
     admin
@@ -17697,8 +17702,9 @@ fn head_object_validates_independent_fast_path_before_stale_abac_tags() {
             control: BucketTagControlRequest {
                 bucket: bucket_request_with_expected_owner(bucket, owner_requester, None),
             },
-            config:
+            tags: bucket_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+            ),
             request_tags: &[],
         })
         .unwrap();
@@ -18407,7 +18413,7 @@ fn bucket_fast_path_watcher_survives_first_cluster_handle_drop() {
     storage_cluster
         .delete_bucket_subresource_and_load_info(
             &bucket_name,
-            storage::BucketSubresourceKind::Policy,
+            storage::OpaqueBucketSubresourceKind::Policy,
         )
         .unwrap();
 
@@ -18493,7 +18499,7 @@ fn bucket_fast_path_watcher_observes_direct_storage_policy_mutation() {
     storage_cluster
         .delete_bucket_subresource_and_load_info(
             &bucket_name,
-            storage::BucketSubresourceKind::Policy,
+            storage::OpaqueBucketSubresourceKind::Policy,
         )
         .unwrap();
 
@@ -18779,10 +18785,11 @@ fn put_bucket_tags_invalidates_warm_fast_path_tags() {
     )
     .unwrap();
     coord
-        .put_bucket_tags(&PutBucketConfigRequest {
+        .put_bucket_tags(&PutBucketTagsRequest {
             bucket: bucket_request_with_expected_owner(bucket, owner_requester.clone(), None),
-            config:
+            tags: bucket_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+            ),
         })
         .unwrap();
     coord
@@ -18836,8 +18843,9 @@ fn put_bucket_tags_invalidates_warm_fast_path_tags() {
             control: BucketTagControlRequest {
                 bucket: bucket_request_with_expected_owner(bucket, owner_requester, None),
             },
-            config:
+            tags: bucket_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+            ),
             request_tags: &[],
         })
         .unwrap();

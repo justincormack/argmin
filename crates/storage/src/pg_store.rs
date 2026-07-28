@@ -523,7 +523,12 @@ fn bucket_property_conflict_context(effect: BucketPropertyEffect) -> &'static st
 
 fn bucket_subresource_conflict_context(mutation: &BucketSubresourceMutation) -> &'static str {
     match mutation {
-        BucketSubresourceMutation::Put { .. } => "apply conflicting put bucket subresource command",
+        BucketSubresourceMutation::PutCors(_)
+        | BucketSubresourceMutation::PutTagging(_)
+        | BucketSubresourceMutation::PutPolicy { .. }
+        | BucketSubresourceMutation::PutLifecycle(_) => {
+            "apply conflicting put bucket subresource command"
+        }
         BucketSubresourceMutation::Delete { .. } => {
             "apply conflicting delete bucket subresource command"
         }

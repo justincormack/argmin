@@ -18,6 +18,27 @@ impl PgStore {
         })
     }
 
+    pub(super) fn parse_bucket_tags(
+        xml: String,
+        column: usize,
+    ) -> rusqlite::Result<SerializedBucketTagSet> {
+        SerializedBucketTagSet::from_current_xml(xml).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+    }
+
+    pub(super) fn decode_bucket_tag_subresource_row(
+        body: Option<String>,
+        raw_aux_int_1: Option<i64>,
+    ) -> rusqlite::Result<Option<SerializedBucketTagSet>> {
+        Self::bucket_subresource_aux_from_sql(BucketSubresourceKind::Tagging, raw_aux_int_1)?;
+        body.map(|xml| Self::parse_bucket_tags(xml, 0)).transpose()
+    }
+
     pub(super) fn row_to_object_part(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<ObjectPartRecord> {
@@ -785,16 +806,22 @@ impl PgStore {
         mutation: &BucketSubresourceMutation,
     ) -> Result<bool, MetadataError> {
         match mutation {
-            BucketSubresourceMutation::Put { kind, body, aux } => {
+            BucketSubresourceMutation::PutCors(_)
+            | BucketSubresourceMutation::PutTagging(_)
+            | BucketSubresourceMutation::PutPolicy { .. }
+            | BucketSubresourceMutation::PutLifecycle(_) => {
+                let kind = mutation.kind();
+                let body = mutation.put_body().expect("put mutation has a body");
+                let aux = mutation.aux();
                 let Some(stored) =
-                    self.get_bucket_subresource_internal(info.name.as_str(), *kind)?
+                    self.get_bucket_subresource_internal(info.name.as_str(), kind)?
                 else {
                     return Ok(false);
                 };
-                if stored.body != *body || stored.aux != *aux {
+                if stored.body != body || stored.aux != aux {
                     return Ok(false);
                 }
-                Ok(match *kind {
+                Ok(match kind {
                     BucketSubresourceKind::Policy => {
                         info.bucket_policy_present
                             && info.bucket_policy_public == aux.policy_is_public().unwrap()
@@ -831,12 +858,6 @@ impl PgStore {
         mutation: &BucketSubresourceMutation,
         generation: BucketExecutionGeneration,
     ) -> Result<(), MetadataError> {
-        if let BucketSubresourceMutation::Put { kind, aux, .. } = mutation {
-            if !kind.supports_aux(*aux) {
-                return Err(Self::bucket_subresource_invalid_aux(*kind, *aux));
-            }
-        }
-
         let info = self.head_bucket_raw(name)?;
         match generation {
             BucketExecutionGeneration::Explicit(explicit) => {
@@ -870,10 +891,13 @@ impl PgStore {
                 )?;
 
                 let (kind, policy_public, subresource_generation) = match mutation {
-                    BucketSubresourceMutation::Put { kind, body, aux } => {
-                        if !kind.supports_aux(*aux) {
-                            return Err(Self::bucket_subresource_invalid_aux(*kind, *aux));
-                        }
+                    BucketSubresourceMutation::PutCors(_)
+                    | BucketSubresourceMutation::PutTagging(_)
+                    | BucketSubresourceMutation::PutPolicy { .. }
+                    | BucketSubresourceMutation::PutLifecycle(_) => {
+                        let kind = mutation.kind();
+                        let body = mutation.put_body().expect("put mutation has a body");
+                        let aux = mutation.aux();
                         let policy_public = match kind {
                             BucketSubresourceKind::Policy => Some(aux.policy_is_public().unwrap()),
                             BucketSubresourceKind::Lifecycle
@@ -891,9 +915,9 @@ impl PgStore {
                                  RETURNING generation",
                                 params![
                                     name.as_str(),
-                                    *kind as u8 as i64,
+                                    kind as u8 as i64,
                                     body,
-                                    Self::bucket_subresource_aux_int_1_to_sql(*aux),
+                                    Self::bucket_subresource_aux_int_1_to_sql(aux),
                                 ],
                                 "put bucket subresource command (upsert subresource row)",
                                 |row| row.get::<_, i64>(0),
@@ -907,7 +931,7 @@ impl PgStore {
                                     },
                                 )
                             })?;
-                        (*kind, policy_public, subresource_generation)
+                        (kind, policy_public, subresource_generation)
                     }
                     BucketSubresourceMutation::Delete { kind } => {
                         let policy_public = match kind {
@@ -1008,15 +1032,32 @@ impl PgStore {
         body: &str,
         aux: BucketSubresourceAux,
     ) -> Result<(), MetadataError> {
-        self.put_bucket_subresource_inner(
-            name,
-            &BucketSubresourceMutation::Put {
-                kind,
-                body: body.to_owned(),
-                aux,
-            },
-            BucketExecutionGeneration::Allocate,
-        )
+        let mutation = match (kind, aux) {
+            (BucketSubresourceKind::Cors, BucketSubresourceAux::None) => {
+                BucketSubresourceMutation::PutCors(body.to_owned())
+            }
+            (BucketSubresourceKind::Tagging, BucketSubresourceAux::None) => {
+                BucketSubresourceMutation::PutTagging(
+                    crate::SerializedBucketTagSet::from_current_xml(body.to_owned()).map_err(
+                        |error| MetadataError::InvariantViolation {
+                            context: "put bucket subresource",
+                            reason: format!("invalid bucket tags: {error}"),
+                        },
+                    )?,
+                )
+            }
+            (BucketSubresourceKind::Policy, BucketSubresourceAux::Policy { is_public }) => {
+                BucketSubresourceMutation::PutPolicy {
+                    body: body.to_owned(),
+                    is_public,
+                }
+            }
+            (BucketSubresourceKind::Lifecycle, BucketSubresourceAux::None) => {
+                BucketSubresourceMutation::PutLifecycle(body.to_owned())
+            }
+            _ => return Err(Self::bucket_subresource_invalid_aux(kind, aux)),
+        };
+        self.put_bucket_subresource_inner(name, &mutation, BucketExecutionGeneration::Allocate)
     }
 
     #[cfg(test)]
@@ -1049,6 +1090,25 @@ impl PgStore {
                     let body = row.get::<_, Option<String>>(0)?;
                     let generation = row.get::<_, Option<i64>>(1)?;
                     let aux_int_1 = row.get::<_, Option<i64>>(2)?;
+                    if kind == BucketSubresourceKind::Tagging {
+                        return match Self::decode_bucket_tag_subresource_row(body, aux_int_1)? {
+                            Some(tags) => Ok(Some(StoredBucketSubresource {
+                                body: tags.as_str().to_owned(),
+                                generation: Some(Self::parse_bucket_subresource_generation(
+                                    generation.ok_or_else(|| {
+                                        rusqlite::Error::FromSqlConversionFailure(
+                                            1,
+                                            rusqlite::types::Type::Null,
+                                            Box::from("missing bucket subresource generation"),
+                                        )
+                                    })?,
+                                    1,
+                                )?),
+                                aux: BucketSubresourceAux::None,
+                            })),
+                            None => Ok(None),
+                        };
+                    }
                     match body {
                         Some(body) => Ok(Some(StoredBucketSubresource {
                             body,

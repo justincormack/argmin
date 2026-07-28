@@ -242,6 +242,20 @@ fn put_probe_lifecycle_direct(store: &PgStore, bucket: &BucketName) {
         .unwrap();
 }
 
+fn put_probe_bucket_tags_direct(store: &PgStore, bucket: &BucketName) {
+    let tags = SerializedBucketTagSet::from_tag_set(
+        s3_types::TagSet::from_pairs(
+            vec![("key".to_string(), "value".to_string())],
+            s3_types::MAX_BUCKET_TAGS,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    store
+        .put_bucket_subresource(bucket, PutBucketSubresource::tagging(&tags))
+        .unwrap();
+}
+
 #[test]
 fn create_bucket_with_config_persists_required_ownership_controls() {
     let tmp = test_util::tempdir();
@@ -4527,6 +4541,79 @@ fn metadata_command_checkpoint_verification_rejects_tampered_row_payload() {
 }
 
 #[test]
+fn metadata_command_checkpoint_export_rejects_noncanonical_bucket_tags() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-checkpoint-invalid-tags");
+    create_probe_bucket_direct(&store, &bucket);
+    put_probe_bucket_tags_direct(&store, &bucket);
+
+    store
+        .conn
+        .execute(
+            "UPDATE bucket_subresources SET body = ?1 WHERE bucket_name = ?2 AND kind = ?3",
+            params![
+                "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>",
+                bucket,
+                BucketSubresourceKind::Tagging as u8 as i64,
+            ],
+        )
+        .unwrap();
+    store.refresh_metadata_command_state_digest().unwrap();
+
+    let err = store
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataCheckpointInvalid { reason, .. }
+            if reason == "InvalidBucketTagRow { row_index: 0 }"
+    ));
+}
+
+#[test]
+fn metadata_command_checkpoint_export_rejects_bucket_tag_aux_for_live_and_tombstone_rows() {
+    for tombstone in [false, true] {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name(if tombstone {
+            "metadata-checkpoint-invalid-tag-tombstone-aux"
+        } else {
+            "metadata-checkpoint-invalid-live-tag-aux"
+        });
+        create_probe_bucket_direct(&store, &bucket);
+        put_probe_bucket_tags_direct(&store, &bucket);
+        if tombstone {
+            PgMetadataStore::delete_bucket_subresource(
+                &store,
+                &bucket,
+                BucketSubresourceKind::Tagging,
+            )
+            .unwrap();
+        }
+
+        store
+            .conn
+            .execute(
+                "UPDATE bucket_subresources SET aux_int_1 = 0 \
+                 WHERE bucket_name = ?1 AND kind = ?2",
+                params![bucket, BucketSubresourceKind::Tagging as u8 as i64,],
+            )
+            .unwrap();
+        store.refresh_metadata_command_state_digest().unwrap();
+
+        let err = store
+            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::MetadataCheckpointInvalid { reason, .. }
+                if reason == "InvalidBucketTagRow { row_index: 0 }"
+        ));
+    }
+}
+
+#[test]
 fn metadata_command_checkpoint_exports_blob_backed_metadata_rows() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();
@@ -4726,6 +4813,152 @@ fn install_metadata_transfer_checkpoint_base_rejects_tampered_checkpoint_without
             .unwrap(),
         "failed checkpoint install must leave destination empty"
     );
+}
+
+#[test]
+fn install_metadata_transfer_checkpoint_base_rejects_resealed_noncanonical_bucket_tags() {
+    let source_tmp = test_util::tempdir();
+    let source = PgStore::open(source_tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-checkpoint-install-invalid-tags");
+    create_probe_bucket_direct(&source, &bucket);
+    put_probe_bucket_tags_direct(&source, &bucket);
+    source.refresh_metadata_command_state_digest().unwrap();
+    let mut checkpoint = source
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+
+    let tag_row = checkpoint
+        .table_blocks
+        .iter_mut()
+        .find(|block| block.table_name == "bucket_subresources")
+        .and_then(|block| {
+            block.rows.iter_mut().find(|row| {
+                matches!(
+                    row.values.get(1),
+                    Some(MetadataCheckpointValue::Integer(kind))
+                        if *kind == BucketSubresourceKind::Tagging as u8 as i64
+                )
+            })
+        })
+        .expect("checkpoint must contain the bucket-tag row");
+    tag_row.values[2] = MetadataCheckpointValue::Text(
+        b"<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>"
+            .to_vec(),
+    );
+    PgStore::test_reseal_metadata_command_checkpoint(&mut checkpoint);
+    assert_eq!(
+        checkpoint.verify(),
+        Err(MetadataCommandCheckpointValidationError::InvalidBucketTagRow { row_index: 0 })
+    );
+
+    let destination_tmp = test_util::tempdir();
+    let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
+    let before = destination.metadata_command_replica_state().unwrap();
+    let destination_epoch = ClusterEpoch::new(31).unwrap();
+    let err = destination
+        .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataCheckpointInvalid {
+            pg_id: 1,
+            cluster_epoch,
+            reason,
+            ..
+        } if cluster_epoch == destination_epoch
+            && reason == "InvalidBucketTagRow { row_index: 0 }"
+    ));
+    assert_eq!(
+        destination.metadata_command_replica_state().unwrap(),
+        before
+    );
+    assert!(
+        destination
+            .metadata_command_replica_state_can_initialize()
+            .unwrap(),
+        "rejected checkpoint must leave the destination empty"
+    );
+}
+
+#[test]
+fn install_metadata_transfer_checkpoint_base_rejects_resealed_bucket_tag_aux() {
+    for tombstone in [false, true] {
+        let source_tmp = test_util::tempdir();
+        let source = PgStore::open(source_tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name(if tombstone {
+            "metadata-checkpoint-install-tag-tombstone-aux"
+        } else {
+            "metadata-checkpoint-install-live-tag-aux"
+        });
+        create_probe_bucket_direct(&source, &bucket);
+        put_probe_bucket_tags_direct(&source, &bucket);
+        if tombstone {
+            PgMetadataStore::delete_bucket_subresource(
+                &source,
+                &bucket,
+                BucketSubresourceKind::Tagging,
+            )
+            .unwrap();
+        }
+        source.refresh_metadata_command_state_digest().unwrap();
+        let mut checkpoint = source
+            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+            .unwrap();
+
+        let tag_row = checkpoint
+            .table_blocks
+            .iter_mut()
+            .find(|block| block.table_name == "bucket_subresources")
+            .and_then(|block| {
+                block.rows.iter_mut().find(|row| {
+                    matches!(
+                        row.values.get(1),
+                        Some(MetadataCheckpointValue::Integer(kind))
+                            if *kind == BucketSubresourceKind::Tagging as u8 as i64
+                    )
+                })
+            })
+            .expect("checkpoint must contain the bucket-tag row");
+        assert_eq!(
+            matches!(tag_row.values.get(2), Some(MetadataCheckpointValue::Null)),
+            tombstone,
+            "checkpoint row must represent the intended live/tombstone case"
+        );
+        tag_row.values[4] = MetadataCheckpointValue::Integer(0);
+        PgStore::test_reseal_metadata_command_checkpoint(&mut checkpoint);
+        assert_eq!(
+            checkpoint.verify(),
+            Err(MetadataCommandCheckpointValidationError::InvalidBucketTagRow { row_index: 0 })
+        );
+
+        let destination_tmp = test_util::tempdir();
+        let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
+        let before = destination.metadata_command_replica_state().unwrap();
+        let destination_epoch = ClusterEpoch::new(if tombstone { 33 } else { 32 }).unwrap();
+        let err = destination
+            .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::MetadataCheckpointInvalid {
+                pg_id: 1,
+                cluster_epoch,
+                reason,
+                ..
+            } if cluster_epoch == destination_epoch
+                && reason == "InvalidBucketTagRow { row_index: 0 }"
+        ));
+        assert_eq!(
+            destination.metadata_command_replica_state().unwrap(),
+            before
+        );
+        assert!(
+            destination
+                .metadata_command_replica_state_can_initialize()
+                .unwrap(),
+            "rejected checkpoint must leave the destination empty"
+        );
+    }
 }
 
 #[test]
@@ -7905,10 +8138,9 @@ fn put_bucket_subresource_command_does_not_lower_execution_generation() {
         .unwrap();
 
     let policy_body = r#"{"Statement":[]}"#.to_owned();
-    let mutation = BucketSubresourceMutation::Put {
-        kind: BucketSubresourceKind::Policy,
+    let mutation = BucketSubresourceMutation::PutPolicy {
         body: policy_body.clone(),
-        aux: BucketSubresourceAux::policy(true),
+        is_public: true,
     };
     let newer = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
@@ -7956,10 +8188,9 @@ fn put_bucket_subresource_command_does_not_lower_execution_generation() {
         ),
         MetadataCommandPayload::PutBucketSubresource(PutBucketSubresourceCommand::new(
             bucket.clone(),
-            BucketSubresourceMutation::Put {
-                kind: BucketSubresourceKind::Policy,
+            BucketSubresourceMutation::PutPolicy {
                 body: r#"{"Statement":[{"Effect":"Deny"}]}"#.to_owned(),
-                aux: BucketSubresourceAux::policy(false),
+                is_public: false,
             },
             12,
         )),
@@ -8316,6 +8547,86 @@ fn stored_object_tags_reject_noncanonical_xml_when_decoded() {
         matches!(err, MetadataError::Db { .. }),
         "expected database error for noncanonical object tags, got: {err:?}"
     );
+}
+
+#[test]
+fn stored_bucket_tags_reject_noncanonical_xml_when_decoded() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    create_probe_bucket_direct(&store, &bucket);
+    let tags = SerializedBucketTagSet::from_tag_set(
+        s3_types::TagSet::from_pairs(
+            vec![("key".to_string(), "value".to_string())],
+            s3_types::MAX_BUCKET_TAGS,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    PgMetadataStore::put_bucket_subresource(&store, &bucket, PutBucketSubresource::tagging(&tags))
+        .unwrap();
+
+    store
+        .conn
+        .execute(
+            "UPDATE bucket_subresources SET body = ?1 WHERE bucket_name = ?2 AND kind = ?3",
+            params![
+                "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>",
+                bucket,
+                BucketSubresourceKind::Tagging as u8 as i64,
+            ],
+        )
+        .unwrap();
+
+    let err =
+        PgMetadataStore::get_bucket_subresource(&store, &bucket, BucketSubresourceKind::Tagging)
+            .unwrap_err();
+    assert!(
+        matches!(err, MetadataError::Db { .. }),
+        "expected database error for noncanonical bucket tags, got: {err:?}"
+    );
+}
+
+#[test]
+fn stored_bucket_tag_rows_reject_aux_for_live_and_tombstone_rows() {
+    for tombstone in [false, true] {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let bucket = trusted_bucket_name(if tombstone {
+            "stored-bucket-tag-tombstone-aux"
+        } else {
+            "stored-live-bucket-tag-aux"
+        });
+        create_probe_bucket_direct(&store, &bucket);
+        put_probe_bucket_tags_direct(&store, &bucket);
+        if tombstone {
+            PgMetadataStore::delete_bucket_subresource(
+                &store,
+                &bucket,
+                BucketSubresourceKind::Tagging,
+            )
+            .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE bucket_subresources SET aux_int_1 = 0 \
+                 WHERE bucket_name = ?1 AND kind = ?2",
+                params![bucket, BucketSubresourceKind::Tagging as u8 as i64,],
+            )
+            .unwrap();
+
+        let err = PgMetadataStore::get_bucket_subresource(
+            &store,
+            &bucket,
+            BucketSubresourceKind::Tagging,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, MetadataError::Db { .. }),
+            "expected invalid bucket-tag aux to fail closed, got: {err:?}"
+        );
+    }
 }
 
 #[test]

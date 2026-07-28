@@ -4102,6 +4102,11 @@ pub struct TagSet {
 }
 
 impl TagSet {
+    #[must_use]
+    pub fn from_aws_tag_set(inner: AwsTagSet) -> Self {
+        Self { inner }
+    }
+
     pub fn new(tags: Vec<(String, String)>, max_tags: usize) -> Result<Self, ServerError> {
         AwsTagSet::from_pairs(tags, max_tags)
             .map(|inner| Self { inner })

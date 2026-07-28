@@ -3094,12 +3094,11 @@ impl super::StorageCluster {
             BucketSubresourceKind::Policy,
         )?;
         require_valid_route()?;
-        let tags = Self::load_bucket_delete_authorization_subresource(
+        let tags = Self::load_bucket_delete_authorization_tags(
             &**client,
             bucket_pg_id,
             &bucket_info.name,
             request.tags.should_load(&bucket_info),
-            BucketSubresourceKind::Tagging,
         )?;
         require_valid_route()?;
         let lifecycle = Self::load_bucket_delete_authorization_subresource(
@@ -3228,6 +3227,21 @@ impl super::StorageCluster {
         }
         Ok(match client.get_bucket_subresource(pg_id, bucket, kind)? {
             Some(body) => LoadedBucketSubresource::Loaded(body),
+            None => LoadedBucketSubresource::Missing,
+        })
+    }
+
+    fn load_bucket_delete_authorization_tags(
+        client: &dyn crate::node_client::BucketMetadataNodeClient,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+        requested: bool,
+    ) -> Result<LoadedBucketSubresource<SerializedBucketTagSet>, BucketSnapshotLoadError> {
+        if !requested {
+            return Ok(LoadedBucketSubresource::NotRequested);
+        }
+        Ok(match client.get_bucket_tags(pg_id, bucket)? {
+            Some(tags) => LoadedBucketSubresource::Loaded(tags),
             None => LoadedBucketSubresource::Missing,
         })
     }
@@ -7346,13 +7360,28 @@ impl super::StorageCluster {
     pub fn get_bucket_subresource(
         &self,
         bucket: &BucketName,
-        kind: BucketSubresourceKind,
+        kind: OpaqueBucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .bucket_metadata_client()
-            .get_bucket_subresource(self.validated_bucket_metadata_pg(pg_id), bucket, kind)
+            .get_bucket_subresource(
+                self.validated_bucket_metadata_pg(pg_id),
+                bucket,
+                kind.stored_kind(),
+            )
+    }
+
+    pub fn get_bucket_tags(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Option<SerializedBucketTagSet>, BucketSnapshotLoadError> {
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .bucket_metadata_client()
+            .get_bucket_tags(self.validated_bucket_metadata_pg(pg_id), bucket)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -7926,14 +7955,16 @@ impl super::StorageCluster {
         require_valid_route: impl FnMut() -> Result<(), StoreError>,
         req: PutBucketSubresource<'_>,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        let mutation = BucketSubresourceMutation::from_put_request(req).map_err(|error| {
+            MetadataError::InvariantViolation {
+                context: "put bucket subresource",
+                reason: format!("bucket subresource request is invalid: {error}"),
+            }
+        })?;
         self.put_bucket_subresource_command_and_load_info_with_route_validation(
             route,
             require_valid_route,
-            BucketSubresourceMutation::Put {
-                kind: req.kind,
-                body: req.body.to_owned(),
-                aux: req.aux,
-            },
+            mutation,
         )
     }
 
@@ -7941,7 +7972,7 @@ impl super::StorageCluster {
     pub fn delete_bucket_subresource_and_load_info(
         &self,
         bucket: &BucketName,
-        kind: BucketSubresourceKind,
+        kind: OpaqueBucketSubresourceKind,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.delete_bucket_subresource_and_load_info_with_route_validation(
             super::BucketMetadataMutationEffectRoute {
@@ -7950,7 +7981,23 @@ impl super::StorageCluster {
                 effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
             },
             || Ok(()),
-            kind,
+            kind.stored_kind(),
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn delete_bucket_tags_and_load_info(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.delete_bucket_subresource_and_load_info_with_route_validation(
+            super::BucketMetadataMutationEffectRoute {
+                pg_id: self.bucket_metadata_pg(bucket),
+                bucket,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            || Ok(()),
+            BucketSubresourceKind::Tagging,
         )
     }
 
@@ -7979,16 +8026,6 @@ impl super::StorageCluster {
             bucket,
             effect_fence,
         } = route;
-        if let BucketSubresourceMutation::Put { kind, aux, .. } = &mutation {
-            if !kind.supports_aux(*aux) {
-                return Err(MetadataError::InvariantViolation {
-                    context: "put bucket subresource",
-                    reason: format!("{kind:?} does not support aux {aux:?}"),
-                }
-                .into());
-            }
-        }
-
         let pg_id = bucket_pg_id.pg_id();
         let primary_store = self
             .local_map

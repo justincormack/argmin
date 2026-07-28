@@ -770,26 +770,35 @@ fn file_bucket_metadata_config_roundtrip() {
 
     for kind in [BucketSubresourceKind::Cors, BucketSubresourceKind::Tagging] {
         let body = match kind {
-            BucketSubresourceKind::Cors => "<Cors/>",
-            BucketSubresourceKind::Tagging => "<Tagging/>",
+            BucketSubresourceKind::Cors => {
+                store
+                    .put_bucket_subresource(
+                        &bucket_name("bucket"),
+                        PutBucketSubresource::cors("<Cors/>"),
+                    )
+                    .unwrap();
+                "<Cors/>".to_string()
+            }
+            BucketSubresourceKind::Tagging => {
+                let tags = crate::SerializedBucketTagSet::new(
+                    "<Tagging><TagSet></TagSet></Tagging>".to_string(),
+                );
+                store
+                    .put_bucket_subresource(
+                        &bucket_name("bucket"),
+                        PutBucketSubresource::tagging(&tags),
+                    )
+                    .unwrap();
+                tags.as_str().to_string()
+            }
             _ => unreachable!(),
         };
-        store
-            .put_bucket_subresource(
-                &bucket_name("bucket"),
-                PutBucketSubresource {
-                    kind,
-                    body,
-                    aux: BucketSubresourceAux::None,
-                },
-            )
-            .unwrap();
         assert_eq!(
             store
                 .get_bucket_subresource(&bucket_name("bucket"), kind)
                 .unwrap()
                 .map(|stored| stored.body),
-            Some(body.to_string())
+            Some(body)
         );
         store
             .delete_bucket_subresource(&bucket_name("bucket"), kind)
@@ -1111,11 +1120,9 @@ fn file_bucket_execution_generation_tracks_bucket_mutations() {
     store
         .put_bucket_subresource(
             &bucket,
-            PutBucketSubresource {
-                kind: BucketSubresourceKind::Tagging,
-                body: "<Tagging/>",
-                aux: BucketSubresourceAux::None,
-            },
+            PutBucketSubresource::tagging(&crate::SerializedBucketTagSet::new(
+                "<Tagging><TagSet></TagSet></Tagging>".to_string(),
+            )),
         )
         .unwrap();
     assert_generation(4);
@@ -1327,22 +1334,17 @@ fn file_bucket_subresource_roundtrip() {
         None
     );
 
+    let tags =
+        crate::SerializedBucketTagSet::new("<Tagging><TagSet></TagSet></Tagging>".to_string());
     store
-        .put_bucket_subresource(
-            &bucket_name("bucket"),
-            PutBucketSubresource {
-                kind: BucketSubresourceKind::Tagging,
-                body: "<Tagging/>",
-                aux: BucketSubresourceAux::None,
-            },
-        )
+        .put_bucket_subresource(&bucket_name("bucket"), PutBucketSubresource::tagging(&tags))
         .unwrap();
     assert_eq!(
         store
             .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Tagging)
             .unwrap(),
         Some(StoredBucketSubresource {
-            body: "<Tagging/>".to_string(),
+            body: tags.as_str().to_string(),
             generation: Some(1),
             aux: BucketSubresourceAux::None,
         })

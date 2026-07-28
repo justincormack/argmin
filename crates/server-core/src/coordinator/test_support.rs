@@ -1113,6 +1113,11 @@ pub(crate) fn object_tag_set(xml: &str) -> s3_types::TagSet {
         .expect("server-core tests must use valid object tags")
 }
 
+pub(crate) fn bucket_tag_set(xml: &str) -> s3_types::TagSet {
+    s3_types::TagSet::parse_canonical_xml(xml, s3_types::MAX_BUCKET_TAGS)
+        .expect("test bucket tags must be valid")
+}
+
 pub(crate) fn put_object_retention_test(
     coord: &Coordinator,
     bucket: &str,

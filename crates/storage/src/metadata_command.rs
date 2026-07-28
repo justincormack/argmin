@@ -18,10 +18,11 @@ use crate::types::{
     MultipartUploadRecord, ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey,
     ObjectLayout, ObjectPartRecord, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind,
     ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
-    OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq, SerializedMetadataBlob,
-    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, StorageClass,
-    StreamUploadCommandRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
-    TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, MULTIPART_UPLOAD_ID_KEY_LEN,
+    OwnerIdentity, PgId, PublicAccessBlockConfig, PutBucketSubresource, PutLiveObjectReq,
+    SerializedBucketTagSet, SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet,
+    SessionId, StorageClass, StreamUploadCommandRecord, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
+    VersionId, MULTIPART_UPLOAD_ID_KEY_LEN,
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
@@ -847,14 +848,71 @@ impl PutBucketSubresourceCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BucketSubresourceMutation {
-    Put {
-        kind: BucketSubresourceKind,
-        body: String,
-        aux: BucketSubresourceAux,
-    },
-    Delete {
-        kind: BucketSubresourceKind,
-    },
+    PutCors(String),
+    PutTagging(SerializedBucketTagSet),
+    PutPolicy { body: String, is_public: bool },
+    PutLifecycle(String),
+    Delete { kind: BucketSubresourceKind },
+}
+
+impl BucketSubresourceMutation {
+    pub(crate) fn from_put_request(request: PutBucketSubresource<'_>) -> Result<Self, String> {
+        match (request.kind(), request.aux()) {
+            (BucketSubresourceKind::Cors, BucketSubresourceAux::None) => {
+                Ok(Self::PutCors(request.body().to_owned()))
+            }
+            (BucketSubresourceKind::Tagging, BucketSubresourceAux::None) => {
+                SerializedBucketTagSet::from_current_xml(request.body().to_owned())
+                    .map(Self::PutTagging)
+                    .map_err(|error| error.to_string())
+            }
+            (BucketSubresourceKind::Policy, BucketSubresourceAux::Policy { is_public }) => {
+                Ok(Self::PutPolicy {
+                    body: request.body().to_owned(),
+                    is_public,
+                })
+            }
+            (BucketSubresourceKind::Lifecycle, BucketSubresourceAux::None) => {
+                Ok(Self::PutLifecycle(request.body().to_owned()))
+            }
+            (kind, aux) => Err(format!("{kind:?} does not support aux {aux:?}")),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn kind(&self) -> BucketSubresourceKind {
+        match self {
+            Self::PutCors(_) => BucketSubresourceKind::Cors,
+            Self::PutTagging(_) => BucketSubresourceKind::Tagging,
+            Self::PutPolicy { .. } => BucketSubresourceKind::Policy,
+            Self::PutLifecycle(_) => BucketSubresourceKind::Lifecycle,
+            Self::Delete { kind } => *kind,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn put_body(&self) -> Option<&str> {
+        match self {
+            Self::PutCors(body) | Self::PutLifecycle(body) | Self::PutPolicy { body, .. } => {
+                Some(body)
+            }
+            Self::PutTagging(tags) => Some(tags.as_str()),
+            Self::Delete { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn aux(&self) -> BucketSubresourceAux {
+        match self {
+            Self::PutPolicy { is_public, .. } => BucketSubresourceAux::Policy {
+                is_public: *is_public,
+            },
+            Self::PutCors(_)
+            | Self::PutTagging(_)
+            | Self::PutLifecycle(_)
+            | Self::Delete { .. } => BucketSubresourceAux::None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3223,7 +3281,23 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 let kind = self.read_bucket_subresource_kind()?;
                 let body = self.read_string("bucket subresource body")?;
                 let aux = self.read_bucket_subresource_aux(kind)?;
-                Ok(BucketSubresourceMutation::Put { kind, body, aux })
+                match (kind, aux) {
+                    (BucketSubresourceKind::Cors, BucketSubresourceAux::None) => {
+                        Ok(BucketSubresourceMutation::PutCors(body))
+                    }
+                    (BucketSubresourceKind::Tagging, BucketSubresourceAux::None) => {
+                        SerializedBucketTagSet::from_current_xml(body)
+                            .map(BucketSubresourceMutation::PutTagging)
+                            .map_err(|error| format!("invalid bucket tags: {error}"))
+                    }
+                    (BucketSubresourceKind::Policy, BucketSubresourceAux::Policy { is_public }) => {
+                        Ok(BucketSubresourceMutation::PutPolicy { body, is_public })
+                    }
+                    (BucketSubresourceKind::Lifecycle, BucketSubresourceAux::None) => {
+                        Ok(BucketSubresourceMutation::PutLifecycle(body))
+                    }
+                    _ => Err("bucket subresource kind and auxiliary data disagree".to_string()),
+                }
             }
             2 => Ok(BucketSubresourceMutation::Delete {
                 kind: self.read_bucket_subresource_kind()?,
@@ -4128,11 +4202,29 @@ fn encode_object_payload_reclaim_claim_proof(
 
 fn encode_bucket_subresource_mutation(out: &mut Vec<u8>, mutation: &BucketSubresourceMutation) {
     match mutation {
-        BucketSubresourceMutation::Put { kind, body, aux } => {
+        BucketSubresourceMutation::PutCors(body) => {
             put_u8(out, 1);
-            encode_bucket_subresource_kind(out, *kind);
+            encode_bucket_subresource_kind(out, BucketSubresourceKind::Cors);
             put_str(out, body);
-            encode_bucket_subresource_aux(out, *aux);
+            encode_bucket_subresource_aux(out, BucketSubresourceAux::None);
+        }
+        BucketSubresourceMutation::PutTagging(tags) => {
+            put_u8(out, 1);
+            encode_bucket_subresource_kind(out, BucketSubresourceKind::Tagging);
+            put_str(out, tags.as_str());
+            encode_bucket_subresource_aux(out, BucketSubresourceAux::None);
+        }
+        BucketSubresourceMutation::PutPolicy { body, is_public } => {
+            put_u8(out, 1);
+            encode_bucket_subresource_kind(out, BucketSubresourceKind::Policy);
+            put_str(out, body);
+            encode_bucket_subresource_aux(out, BucketSubresourceAux::policy(*is_public));
+        }
+        BucketSubresourceMutation::PutLifecycle(body) => {
+            put_u8(out, 1);
+            encode_bucket_subresource_kind(out, BucketSubresourceKind::Lifecycle);
+            put_str(out, body);
+            encode_bucket_subresource_aux(out, BucketSubresourceAux::None);
         }
         BucketSubresourceMutation::Delete { kind } => {
             put_u8(out, 2);
@@ -4399,6 +4491,39 @@ mod tests {
         assert_eq!(
             decoded.tag_set().clone().into_pairs(),
             vec![("key".into(), "value".into())]
+        );
+    }
+
+    #[test]
+    fn metadata_command_bucket_tags_require_current_canonical_xml() {
+        let noncanonical =
+            "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>";
+        let mut encoded = Vec::new();
+        put_u8(&mut encoded, 1);
+        encode_bucket_subresource_kind(&mut encoded, BucketSubresourceKind::Tagging);
+        put_str(&mut encoded, noncanonical);
+        encode_bucket_subresource_aux(&mut encoded, BucketSubresourceAux::None);
+        let error = MetadataCommandLogEntryDecoder::new(&encoded)
+            .read_bucket_subresource_mutation()
+            .unwrap_err();
+        assert!(error.contains("not the current canonical representation"));
+
+        let canonical = s3_types::TagSet::from_pairs(
+            vec![("key".to_string(), "value".to_string())],
+            s3_types::MAX_BUCKET_TAGS,
+        )
+        .unwrap()
+        .to_xml();
+        let mut encoded = Vec::new();
+        put_u8(&mut encoded, 1);
+        encode_bucket_subresource_kind(&mut encoded, BucketSubresourceKind::Tagging);
+        put_str(&mut encoded, &canonical);
+        encode_bucket_subresource_aux(&mut encoded, BucketSubresourceAux::None);
+        let decoded = MetadataCommandLogEntryDecoder::new(&encoded)
+            .read_bucket_subresource_mutation()
+            .unwrap();
+        assert!(
+            matches!(decoded, BucketSubresourceMutation::PutTagging(tags) if tags.tag_set().clone().into_pairs() == vec![("key".into(), "value".into())])
         );
     }
 
@@ -5143,36 +5268,31 @@ mod tests {
             PgId::new(3),
             MetadataCommandLogIndex::new(19).unwrap(),
         );
+        let bucket_tags = SerializedBucketTagSet::from_tag_set(
+            s3_types::TagSet::from_pairs(
+                vec![("environment".to_owned(), "test".to_owned())],
+                s3_types::MAX_BUCKET_TAGS,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let mutations = [
-            BucketSubresourceMutation::Put {
-                kind: BucketSubresourceKind::Policy,
+            BucketSubresourceMutation::PutPolicy {
                 body: r#"{"Statement":[]}"#.to_owned(),
-                aux: BucketSubresourceAux::policy(true),
+                is_public: true,
             },
             BucketSubresourceMutation::Delete {
                 kind: BucketSubresourceKind::Policy,
             },
-            BucketSubresourceMutation::Put {
-                kind: BucketSubresourceKind::Tagging,
-                body: "<Tagging/>".to_owned(),
-                aux: BucketSubresourceAux::None,
-            },
+            BucketSubresourceMutation::PutTagging(bucket_tags),
             BucketSubresourceMutation::Delete {
                 kind: BucketSubresourceKind::Tagging,
             },
-            BucketSubresourceMutation::Put {
-                kind: BucketSubresourceKind::Lifecycle,
-                body: "<LifecycleConfiguration/>".to_owned(),
-                aux: BucketSubresourceAux::None,
-            },
+            BucketSubresourceMutation::PutLifecycle("<LifecycleConfiguration/>".to_owned()),
             BucketSubresourceMutation::Delete {
                 kind: BucketSubresourceKind::Lifecycle,
             },
-            BucketSubresourceMutation::Put {
-                kind: BucketSubresourceKind::Cors,
-                body: "<CORSConfiguration/>".to_owned(),
-                aux: BucketSubresourceAux::None,
-            },
+            BucketSubresourceMutation::PutCors("<CORSConfiguration/>".to_owned()),
             BucketSubresourceMutation::Delete {
                 kind: BucketSubresourceKind::Cors,
             },
@@ -5208,7 +5328,7 @@ mod tests {
             [
                 0x2e4f6ebfe974d377,
                 0xbc9268439216fef5,
-                0x82e64761ce767a9b,
+                0xd9b85252c7290d11,
                 0xe00914a32bdbdb3a,
                 0xe3469668f851fda5,
                 0x73ceb5edef1712a4,

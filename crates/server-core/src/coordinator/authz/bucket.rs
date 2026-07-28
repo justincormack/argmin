@@ -344,7 +344,15 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedGetBucketTagging {
-            body: Self::loaded_bucket_subresource_body(bucket.tags())?,
+            tags: match bucket.tags() {
+                LoadedBucketValue::Loaded(tags) => Some(tags.clone()),
+                LoadedBucketValue::Missing => None,
+                LoadedBucketValue::NotRequested => {
+                    return Err(ServerError::InternalError {
+                        reason: "bucket tags were not requested during handle load".to_string(),
+                    });
+                }
+            },
         })
     }
 
@@ -382,7 +390,7 @@ impl Coordinator {
     pub(in crate::coordinator) fn authorize_put_bucket_tagging_on_admitted_route(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
-        req: &PutBucketConfigRequest<'_>,
+        req: &PutBucketTagsRequest<'_>,
     ) -> Result<AuthorizedPutBucketTagging, ServerError> {
         let bucket = self.authorize_loaded_bucket_write_action_on_admitted_route(
             admission,
@@ -397,7 +405,7 @@ impl Coordinator {
         }
         Ok(AuthorizedPutBucketTagging {
             bucket: req.bucket.name_typed().clone(),
-            body: req.config.to_string(),
+            tags: req.tags.clone(),
         })
     }
 
