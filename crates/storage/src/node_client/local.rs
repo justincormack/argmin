@@ -221,6 +221,23 @@ impl PlacedShardNodeClient for LocalStorageNodeClient {
         self.storage_node.read_shard_file(data_pg_id.get(), key)
     }
 
+    fn read_placed_shard_into(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+        _expected_ack: WriteAck,
+        dst: &mut [u8],
+    ) -> Result<(), StoreError> {
+        self.storage_node
+            .read_shard_file_into(data_pg_id.get(), key, dst)
+    }
+
+    fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError> {
+        self.storage_node.delete_shard_file(data_pg_id.get(), key)
+    }
+}
+
+impl RetainedPlacedShardNodeClient for LocalStorageNodeClient {
     fn read_placed_shard_for_historical_inspection(
         &self,
         location: crate::cluster::ShardLocation,
@@ -238,19 +255,20 @@ impl PlacedShardNodeClient for LocalStorageNodeClient {
             .read_shard_file(location.data_pg_id().get(), key)
     }
 
-    fn read_placed_shard_into(
+    fn delete_placed_shard_for_historical_cleanup(
         &self,
-        data_pg_id: DataPgId,
+        location: crate::cluster::ShardLocation,
         key: &ShardKey,
-        _expected_ack: WriteAck,
-        dst: &mut [u8],
     ) -> Result<(), StoreError> {
+        if location.node_id() != self.node_id {
+            return Err(StoreError::NodeNotFound {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+            });
+        }
         self.storage_node
-            .read_shard_file_into(data_pg_id.get(), key, dst)
-    }
-
-    fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError> {
-        self.storage_node.delete_shard_file(data_pg_id.get(), key)
+            .delete_shard_file(location.data_pg_id().get(), key)
     }
 }
 
@@ -383,15 +401,6 @@ impl ShardAckNodeClient for LocalStorageNodeClient {
             crc64: stat.crc64,
             stored_size: stat.size,
         })
-    }
-
-    fn load_written_shard_ack_for_historical_inspection(
-        &self,
-        _route_cluster_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-    ) -> Result<WriteAck, StoreError> {
-        self.load_written_shard_ack(data_pg_id, key)
     }
 
     fn delete_written_shard_ack(
@@ -558,6 +567,32 @@ impl ShardAckNodeClient for LocalStorageNodeClient {
         let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.resolve_placed_segment_shard_backfill(work_item)
             .map(|_| ())
+    }
+}
+
+impl RetainedShardAckNodeClient for LocalStorageNodeClient {
+    fn load_written_shard_ack_for_historical_inspection(
+        &self,
+        _route_cluster_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> Result<WriteAck, StoreError> {
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
+        let stat = pg.stat_shard(key)?;
+        Ok(WriteAck {
+            crc64: stat.crc64,
+            stored_size: stat.size,
+        })
+    }
+
+    fn delete_written_shard_ack_at_retained_epoch(
+        &self,
+        _cluster_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
+        pg.delete_shard_record(key)
     }
 }
 

@@ -50,7 +50,7 @@ use crate::node::SharedStorageNode;
 use crate::node_client::{
     BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
     CreateStreamUploadPrecondition, MetadataCommandNodeClient, ObjectListingMetadataNodeClient,
-    ObjectPayloadLeaseNodeLease, ShardAckNodeClient,
+    ObjectPayloadLeaseNodeLease, RetainedShardAckNodeClient, ShardAckNodeClient,
 };
 pub use crate::peering::PgMetadataTransferArtifact;
 use crate::peering::{
@@ -8997,11 +8997,11 @@ impl StorageCluster {
         &self,
         operation_epoch: ClusterEpoch,
         pg_id: PgId,
-    ) -> Result<&Arc<dyn ShardAckNodeClient>, StoreError> {
+    ) -> Result<&Arc<dyn RetainedShardAckNodeClient>, StoreError> {
         let node = self
             .local_map
             .metadata_pg_primary_node_for_retained_cleanup(operation_epoch, pg_id)?;
-        Ok(node.shard_ack_client())
+        Ok(node.retained_shard_ack_client())
     }
 
     pub fn record_routine_metadata_command_checkpoints(
@@ -16305,7 +16305,7 @@ impl StorageCluster {
                 pg_id: data_pg_id.get(),
                 cluster_epoch: route.cluster_epoch(),
             })?;
-        node.shard_ack_client()
+        node.retained_shard_ack_client()
             .load_written_shard_ack_for_historical_inspection(
                 route.cluster_epoch(),
                 data_pg_id,

@@ -77,18 +77,6 @@ impl PlacedShardNodeClient for RecordingPlacedShardClient {
         })
     }
 
-    fn read_placed_shard_for_historical_inspection(
-        &self,
-        _location: ShardLocation,
-        _key: &ShardKey,
-        _expected_ack: WriteAck,
-    ) -> Result<Vec<u8>, StoreError> {
-        Err(StoreError::Io {
-            context: "recording shard client historical read",
-            source: std::io::Error::from(std::io::ErrorKind::Unsupported),
-        })
-    }
-
     fn read_placed_shard_into(
         &self,
         data_pg_id: DataPgId,
@@ -104,6 +92,28 @@ impl PlacedShardNodeClient for RecordingPlacedShardClient {
     fn delete_placed_shard(
         &self,
         _data_pg_id: DataPgId,
+        _key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
+impl RetainedPlacedShardNodeClient for RecordingPlacedShardClient {
+    fn read_placed_shard_for_historical_inspection(
+        &self,
+        _location: ShardLocation,
+        _key: &ShardKey,
+        _expected_ack: WriteAck,
+    ) -> Result<Vec<u8>, StoreError> {
+        Err(StoreError::Io {
+            context: "recording shard client historical read",
+            source: std::io::Error::from(std::io::ErrorKind::Unsupported),
+        })
+    }
+
+    fn delete_placed_shard_for_historical_cleanup(
+        &self,
+        _location: ShardLocation,
         _key: &ShardKey,
     ) -> Result<(), StoreError> {
         Ok(())
@@ -1121,15 +1131,6 @@ impl ShardAckNodeClient for RecordingShardAckClient {
         Err(StoreError::NotFound)
     }
 
-    fn load_written_shard_ack_for_historical_inspection(
-        &self,
-        _route_cluster_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-    ) -> Result<WriteAck, StoreError> {
-        self.load_written_shard_ack(data_pg_id, key)
-    }
-
     fn delete_written_shard_ack(
         &self,
         _data_pg_id: DataPgId,
@@ -1256,6 +1257,26 @@ impl ShardAckNodeClient for RecordingShardAckClient {
         _work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<(), StoreError> {
         Ok(())
+    }
+}
+
+impl RetainedShardAckNodeClient for RecordingShardAckClient {
+    fn load_written_shard_ack_for_historical_inspection(
+        &self,
+        _route_cluster_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> Result<WriteAck, StoreError> {
+        self.load_written_shard_ack(data_pg_id, key)
+    }
+
+    fn delete_written_shard_ack_at_retained_epoch(
+        &self,
+        _cluster_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        self.delete_written_shard_ack(data_pg_id, key)
     }
 }
 

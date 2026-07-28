@@ -22,7 +22,8 @@ use super::clients::{
     ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
     ObjectPayloadLeaseNodeClient, ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
     PlacedShardNodeClient, RetainedBucketWriteReservationNodeClient,
-    RetainedObjectMutationMetadataNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient,
+    RetainedObjectMutationMetadataNodeClient, RetainedPlacedShardNodeClient,
+    RetainedShardAckNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient,
     ShardScavengerNodeClient,
 };
 use super::{BucketPgId, DataPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
@@ -422,7 +423,9 @@ pub(crate) struct LocalNodeClients {
     pub(crate) object_read_metadata: Arc<dyn ObjectReadMetadataNodeClient>,
     pub(crate) metadata_command: Arc<dyn MetadataCommandNodeClient>,
     pub(crate) shard: Arc<dyn PlacedShardNodeClient>,
+    pub(crate) retained_shard: Arc<dyn RetainedPlacedShardNodeClient>,
     pub(crate) shard_ack: Arc<dyn ShardAckNodeClient>,
+    pub(crate) retained_shard_ack: Arc<dyn RetainedShardAckNodeClient>,
     pub(crate) shard_read_handle: Arc<dyn ShardReadHandleNodeClient>,
     pub(crate) shard_scavenger: Arc<dyn ShardScavengerNodeClient>,
 }
@@ -480,7 +483,9 @@ impl LocalNodeRuntime {
             object_read_metadata: self.client.clone(),
             metadata_command: self.client.clone(),
             shard: self.client.clone(),
+            retained_shard: self.client.clone(),
             shard_ack: self.client.clone(),
+            retained_shard_ack: self.client.clone(),
             shard_read_handle: self.client.clone(),
             shard_scavenger: self.client.clone(),
         }

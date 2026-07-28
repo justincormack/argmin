@@ -655,7 +655,8 @@ Node-client role classification (2026-07-19):
 | `ObjectMutationMetadataNodeClient` | object metadata | active object route for object, multipart, stream-session, and payload-reclaim mutation |
 | `RetainedObjectMutationMetadataNodeClient` | object metadata | retained subject-bound stream abort preparation and exact payload-reclaim claim release |
 | `ObjectReadMetadataNodeClient` | object metadata | active object route plus the existing subject identity/read lease |
-| `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active data route; historical inspection/deletion requires retained data cleanup authority |
+| `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active data route for serving I/O, current placement cleanup, and repair/backfill work |
+| `RetainedPlacedShardNodeClient`, `RetainedShardAckNodeClient` | data | retained exact-placement inspection and cleanup for historical shard bytes and acknowledgement rows |
 | `ShardScavengerNodeClient` | data for shard rows/files, generic metadata PG for durable observation rows | active or retained authority according to the scanned location; observation publication is primary-only |
 | `ShardReadHandleNodeClient` | data locations carried in the handle request | active/retained authority is inherited from each validated `ShardLocation`; the lease itself remains non-cloneable |
 | `ObjectPayloadLeaseNodeClient` | object subject rather than a caller-supplied PG | subject-bound payload lease/reclaim capability; placement is validated when shard locations are acquired |
@@ -3667,6 +3668,26 @@ Eighty-fourth Phase 3 slice:
   command subject binding, active mutation parity, and equivalent wrong-PG
   rejection. Opaque capability arguments for the remaining role-specific
   node-client traits remain open in Phase 3.
+- all 2,366 storage tests pass, as do formatting, the storage boundary checker,
+  and workspace-wide strict Clippy. The full 7,679-test workspace suite also
+  passes.
+
+Eighty-fifth Phase 3 slice:
+
+- active data-route operations and retained exact-placement operations are now
+  separate node-client roles. `PlacedShardNodeClient` and
+  `ShardAckNodeClient` retain current serving, mutation, repair, and backfill
+  work, while `RetainedPlacedShardNodeClient` and
+  `RetainedShardAckNodeClient` own historical shard/ack inspection and exact
+  retained cleanup.
+- local and Unix adapters implement both roles, but `LocalNodeStore` and
+  `LocalNodeClients` retain distinct trait objects. Historical reads and
+  retained-epoch cleanup therefore cannot be invoked through an active shard
+  or acknowledgement client.
+- focused Unix regressions cover historical shard inspection, cross-epoch
+  segment reads, and old-primary direct-PUT/CopyObject cleanup of both remote
+  shard files and acknowledgement rows. Opaque capability arguments for the
+  remaining role-specific node-client traits remain open in Phase 3.
 - all 2,366 storage tests pass, as do formatting, the storage boundary checker,
   and workspace-wide strict Clippy. The full 7,679-test workspace suite also
   passes.

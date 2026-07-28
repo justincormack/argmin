@@ -953,20 +953,6 @@ impl PlacedShardNodeClient for UnixStorageNodeClient {
         UnixStorageNodeClient::read_placed_shard(self, data_pg_id, key, expected_ack)
     }
 
-    fn read_placed_shard_for_historical_inspection(
-        &self,
-        location: crate::cluster::ShardLocation,
-        key: &ShardKey,
-        expected_ack: WriteAck,
-    ) -> Result<Vec<u8>, StoreError> {
-        UnixStorageNodeClient::read_placed_shard_for_historical_inspection(
-            self,
-            location,
-            key,
-            expected_ack,
-        )
-    }
-
     fn read_placed_shard_into(
         &self,
         data_pg_id: DataPgId,
@@ -998,6 +984,22 @@ impl PlacedShardNodeClient for UnixStorageNodeClient {
 
     fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError> {
         UnixStorageNodeClient::delete_placed_shard(self, data_pg_id, key)
+    }
+}
+
+impl RetainedPlacedShardNodeClient for UnixStorageNodeClient {
+    fn read_placed_shard_for_historical_inspection(
+        &self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+    ) -> Result<Vec<u8>, StoreError> {
+        UnixStorageNodeClient::read_placed_shard_for_historical_inspection(
+            self,
+            location,
+            key,
+            expected_ack,
+        )
     }
 
     fn delete_placed_shard_for_historical_cleanup(
@@ -1035,40 +1037,12 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
         UnixStorageNodeClient::load_written_shard_ack(self, data_pg_id, key)
     }
 
-    fn load_written_shard_ack_for_historical_inspection(
-        &self,
-        route_cluster_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-    ) -> Result<WriteAck, StoreError> {
-        UnixStorageNodeClient::load_written_shard_ack_for_historical_inspection(
-            self,
-            route_cluster_epoch,
-            data_pg_id,
-            key,
-        )
-    }
-
     fn delete_written_shard_ack(
         &self,
         data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<(), StoreError> {
         UnixStorageNodeClient::delete_written_shard_ack(self, data_pg_id, key)
-    }
-
-    fn delete_written_shard_ack_at_retained_epoch(
-        &self,
-        cluster_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-    ) -> Result<(), StoreError> {
-        UnixStorageNodeClient::delete_written_shard_ack_at_epoch(
-            self,
-            cluster_epoch,
-            data_pg_id,
-            key,
-        )
     }
 
     fn record_placed_segment_shard_repair(
@@ -1281,6 +1255,36 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<(), StoreError> {
         UnixStorageNodeClient::resolve_placed_segment_shard_backfill(self, data_pg_id, work_item)
+    }
+}
+
+impl RetainedShardAckNodeClient for UnixStorageNodeClient {
+    fn load_written_shard_ack_for_historical_inspection(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> Result<WriteAck, StoreError> {
+        UnixStorageNodeClient::load_written_shard_ack_for_historical_inspection(
+            self,
+            route_cluster_epoch,
+            data_pg_id,
+            key,
+        )
+    }
+
+    fn delete_written_shard_ack_at_retained_epoch(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        UnixStorageNodeClient::delete_written_shard_ack_at_epoch(
+            self,
+            cluster_epoch,
+            data_pg_id,
+            key,
+        )
     }
 }
 

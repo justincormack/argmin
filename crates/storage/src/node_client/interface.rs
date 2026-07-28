@@ -1032,15 +1032,6 @@ pub(crate) trait PlacedShardNodeClient: Send + Sync {
         expected_ack: WriteAck,
     ) -> Result<Vec<u8>, StoreError>;
 
-    /// Non-serving read used by repair/backfill to inspect reconstructed
-    /// historical placements without treating them as current route authority.
-    fn read_placed_shard_for_historical_inspection(
-        &self,
-        location: crate::cluster::ShardLocation,
-        key: &ShardKey,
-        expected_ack: WriteAck,
-    ) -> Result<Vec<u8>, StoreError>;
-
     fn read_placed_shard_into(
         &self,
         data_pg_id: DataPgId,
@@ -1050,14 +1041,23 @@ pub(crate) trait PlacedShardNodeClient: Send + Sync {
     ) -> Result<(), StoreError>;
 
     fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError>;
+}
+
+/// Retained access to exact shard placements which may outlive the active
+/// data route that originally wrote them.
+pub(crate) trait RetainedPlacedShardNodeClient: Send + Sync {
+    fn read_placed_shard_for_historical_inspection(
+        &self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+        expected_ack: WriteAck,
+    ) -> Result<Vec<u8>, StoreError>;
 
     fn delete_placed_shard_for_historical_cleanup(
         &self,
         location: crate::cluster::ShardLocation,
         key: &ShardKey,
-    ) -> Result<(), StoreError> {
-        self.delete_placed_shard(location.data_pg_id(), key)
-    }
+    ) -> Result<(), StoreError>;
 }
 
 pub(crate) trait ShardReadHandleLease: Send {
@@ -1149,27 +1149,11 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
         key: &ShardKey,
     ) -> Result<WriteAck, StoreError>;
 
-    fn load_written_shard_ack_for_historical_inspection(
-        &self,
-        route_cluster_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-    ) -> Result<WriteAck, StoreError>;
-
     fn delete_written_shard_ack(
         &self,
         data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<(), StoreError>;
-
-    fn delete_written_shard_ack_at_retained_epoch(
-        &self,
-        _cluster_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-    ) -> Result<(), StoreError> {
-        self.delete_written_shard_ack(data_pg_id, key)
-    }
 
     fn record_placed_segment_shard_repair(
         &self,
@@ -1261,6 +1245,23 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
         &self,
         data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
+    ) -> Result<(), StoreError>;
+}
+
+/// Retained access to acknowledgement rows for exact historical placements.
+pub(crate) trait RetainedShardAckNodeClient: Send + Sync {
+    fn load_written_shard_ack_for_historical_inspection(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> Result<WriteAck, StoreError>;
+
+    fn delete_written_shard_ack_at_retained_epoch(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
     ) -> Result<(), StoreError>;
 }
 
