@@ -81,25 +81,25 @@ use crate::types::{
     BucketWriteReservationRecord, CanonicalUserId, ClusterEpoch, CommitDirectPutObjectReq,
     CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest, CreateStreamUploadReq,
     DeleteCurrentObjectOutcome, DeleteSpecificObjectVersionOutcome, DirectPutCommitSnapshot,
-    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, FinalizeStreamPutOutcome,
-    GenerationId, InsertCurrentDeleteMarkerOutcome, ListedBucketMultipartUploads,
-    ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartParts,
-    MultipartCompletionSnapshot, MultipartUploadManagementLookup, MultipartUploadRecord,
-    ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot, ObjectReadSnapshotMode,
-    ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord, OwnerIdentity, PgId, PgState,
-    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
-    PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
-    PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
-    PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,
-    PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
-    PrepareStreamUploadSegmentAppendReq, PreparedStreamPutCommit, PublicAccessBlockConfig,
-    RouteMapValidity, SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey,
-    ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
-    ShardScavengerObservationRecord, ShardScavengerPayloadReference,
-    ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus, StoredObject,
-    StreamPutFinalizeSnapshot, StreamUploadCommandRecord, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, VersionId,
-    WriteAck, WrittenShardAck,
+    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, FinalizeStreamPartOutcome,
+    FinalizeStreamPutOutcome, GenerationId, InsertCurrentDeleteMarkerOutcome,
+    ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
+    ListedMultipartParts, MultipartCompletionSnapshot, MultipartUploadManagementLookup,
+    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot,
+    ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord,
+    OwnerIdentity, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
+    PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
+    PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
+    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,
+    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
+    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
+    PreparedStreamPartCommit, PreparedStreamPutCommit, PublicAccessBlockConfig, RouteMapValidity,
+    SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
+    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
+    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus,
+    StoredObject, StreamPutFinalizeSnapshot, StreamUploadCommandRecord, StreamUploadPartSnapshot,
+    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
+    VersionId, WriteAck, WrittenShardAck,
 };
 #[cfg(test)]
 use crate::types::{
@@ -2878,6 +2878,16 @@ impl ActiveMultipartObjectRoute<'_> {
         }
     }
 
+    fn stream_effect_route(&self) -> PutObjectMutationEffectRoute<'_> {
+        PutObjectMutationEffectRoute {
+            bucket_pg_id: self.admission.cluster.bucket_metadata_pg(&self.bucket),
+            object_pg_id: self.pg_id,
+            bucket: &self.bucket,
+            key: &self.key,
+            effect_fence: self.admission.effect_fence(),
+        }
+    }
+
     pub fn create_multipart_upload_with_ordered_id<T, E>(
         &self,
         request: BucketSnapshotRequest,
@@ -2930,6 +2940,124 @@ impl ActiveMultipartObjectRoute<'_> {
                 upload_id,
                 || self.admission.require_valid_now(),
             )
+    }
+
+    /// Create an UploadPart stream session for the exact upload authorized on
+    /// this admitted multipart route.
+    pub fn create_upload_part_stream_session(
+        &self,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+        part_number: u32,
+        session_id: &SessionId,
+    ) -> Result<SessionId, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .create_upload_part_stream_session_with_route_validation(
+                self.effect_route(),
+                authorized_upload,
+                part_number,
+                session_id,
+                self.admission.authority_valid_until_ms(),
+                || self.admission.require_valid_now(),
+            )
+    }
+
+    pub fn load_stream_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<StreamUploadRecord, ObjectPgActionError> {
+        self.admission.require_valid_now()?;
+        self.admission
+            .cluster
+            .load_stream_upload_session_on_route(self.stream_effect_route(), session_id)
+    }
+
+    pub fn prepare_stream_segment_append(
+        &self,
+        request: &PrepareStreamUploadSegmentAppendReq,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        self.admission
+            .cluster
+            .prepare_stream_segment_append_with_route_validation(
+                self.stream_effect_route(),
+                request,
+                || self.admission.require_valid_now(),
+            )
+    }
+
+    pub fn write_stream_segment_payload_shards(
+        &self,
+        session_id: &SessionId,
+        segment_record: &StreamUploadSegmentRecord,
+        data: &[u8],
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        if segment_record.session_id != *session_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "write UploadPart stream segment payload",
+            });
+        }
+        self.admission
+            .cluster
+            .write_stream_segment_payload_shards_with_route_validation(
+                segment_record,
+                data,
+                self.admission.effect_fence(),
+                || self.admission.require_valid_now(),
+            )
+    }
+
+    pub fn commit_stream_segment_append(
+        &self,
+        session_id: &SessionId,
+        segment_index: u32,
+        segment_record: &StreamUploadSegmentRecord,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<(), ObjectPgActionError> {
+        self.admission
+            .cluster
+            .commit_stream_segment_append_with_route_validation(
+                self.stream_effect_route(),
+                session_id,
+                segment_index,
+                segment_record,
+                shard_batch,
+                || self.admission.require_valid_now(),
+            )
+    }
+
+    pub fn finalize_stream_part<T, E>(
+        &self,
+        upload_id: &UploadId,
+        session_id: &SessionId,
+        part_number: u32,
+        action: impl FnMut(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
+    ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .finalize_upload_part_stream_with_route_validation(
+                self.effect_route(),
+                upload_id,
+                session_id,
+                part_number,
+                || self.admission.require_valid_now(),
+                action,
+            )
+    }
+
+    pub fn default_payload_ec_shape(&self) -> EcShape {
+        self.admission.cluster.default_payload_ec_shape()
+    }
+
+    pub fn operation_epoch(&self) -> ClusterEpoch {
+        self.admission.cluster.operation_epoch()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn try_probe_object_pg_available(&self) -> Result<bool, ObjectPgActionError> {
+        self.admission.require_valid_now()?;
+        self.admission
+            .cluster
+            .try_probe_object_pg_available(&self.bucket, &self.key)
     }
 
     #[cfg(feature = "test-hooks")]
@@ -8310,17 +8438,6 @@ impl StorageCluster {
         Ok(self.local_map.metadata_primary().test_node().as_ref())
     }
 
-    fn try_install_pending_metadata_command_for_bucket(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<bool, ObjectPgActionError> {
-        self.try_install_pending_metadata_command_for_bucket_with_effect_fence(
-            pg_id, bucket, command, None,
-        )
-    }
-
     fn try_install_pending_metadata_command_for_bucket_with_effect_fence(
         &self,
         pg_id: PgId,
@@ -13227,12 +13344,14 @@ impl StorageCluster {
         require_valid_route().map_err(ObjectPgActionError::Store)?;
         let mutation_client =
             self.object_mutation_metadata_primary_client(route.bucket, route.key)?;
-        let (target, mut segment_record) = mutation_client.prepare_stream_segment_append(
-            route.object_pg_id,
-            route.bucket,
-            route.key,
-            request,
-        )?;
+        let (target, mut segment_record) = mutation_client
+            .prepare_stream_segment_append_with_effect_fence(
+                route.object_pg_id,
+                route.bucket,
+                route.key,
+                request,
+                route.effect_fence,
+            )?;
         segment_record.placement_cluster_epoch = self.operation_epoch();
         Ok((target, segment_record))
     }

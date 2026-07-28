@@ -1431,6 +1431,64 @@ impl ObjectVersionMetadataNodeClient for UnixStorageNodeClient {
 }
 
 impl UnixStorageNodeClient {
+    fn prepare_stream_segment_append_rpc(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: &PrepareStreamUploadSegmentAppendReq,
+        effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        let expected_session =
+            self.load_stream_upload_session(pg_id, bucket, key, &request.session_id)?;
+        let expected_target = expected_session.target;
+        let rpc_request = StorageRpcStreamSegmentAppendPrepareRequest {
+            object: self.object_request(pg_id.pg_id(), bucket, key),
+            request: request.clone(),
+            effect_deadline,
+        };
+        let payload = encode_stream_segment_append_prepare_request(&rpc_request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_stream_segment_append_prepare_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode stream segment append prepare response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcStreamSegmentAppendPrepareOutcome::Prepared { target, segment } => {
+                self.validate_stream_segment_append_prepare_response(
+                    &segment,
+                    &target,
+                    &expected_target,
+                    request,
+                    "validate stream segment append prepare response",
+                )?;
+                Ok((target, *segment))
+            }
+            StorageRpcStreamSegmentAppendPrepareOutcome::NotFound {
+                session_id: returned_session_id,
+            } => {
+                if returned_session_id != request.session_id {
+                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        "validate stream segment append prepare response",
+                        "missing session id does not match request".to_string(),
+                    )));
+                }
+                Err(MetadataError::StreamSessionNotFound {
+                    session_id: request.session_id.as_str().to_string(),
+                }
+                .into())
+            }
+        }
+    }
+
     fn next_object_version_id_with_admission_class(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -2735,53 +2793,26 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        let expected_session =
-            self.load_stream_upload_session(pg_id, bucket, key, &request.session_id)?;
-        let expected_target = expected_session.target;
-        let rpc_request = StorageRpcStreamSegmentAppendPrepareRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
-            request: request.clone(),
-        };
-        let payload = encode_stream_segment_append_prepare_request(&rpc_request);
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_stream_segment_append_prepare_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode stream segment append prepare response",
-                    error.to_string(),
-                ))
-            })?;
-        match response.outcome {
-            StorageRpcStreamSegmentAppendPrepareOutcome::Prepared { target, segment } => {
-                self.validate_stream_segment_append_prepare_response(
-                    &segment,
-                    &target,
-                    &expected_target,
-                    request,
-                    "validate stream segment append prepare response",
-                )?;
-                Ok((target, *segment))
-            }
-            StorageRpcStreamSegmentAppendPrepareOutcome::NotFound {
-                session_id: returned_session_id,
-            } => {
-                if returned_session_id != request.session_id {
-                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                        "validate stream segment append prepare response",
-                        "missing session id does not match request".to_string(),
-                    )));
-                }
-                Err(MetadataError::StreamSessionNotFound {
-                    session_id: request.session_id.as_str().to_string(),
-                }
-                .into())
-            }
-        }
+        self.prepare_stream_segment_append_rpc(pg_id, bucket, key, request, None)
+    }
+
+    fn prepare_stream_segment_append_with_effect_fence(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: &PrepareStreamUploadSegmentAppendReq,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        effect_fence.require_valid_for(self.cluster_epoch)?;
+        let effect_deadline =
+            effect_fence
+                .deadline()
+                .map(|deadline| StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                });
+        self.prepare_stream_segment_append_rpc(pg_id, bucket, key, request, effect_deadline)
     }
 
     fn load_stream_put_finalize_snapshot(

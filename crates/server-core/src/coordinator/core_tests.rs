@@ -1655,6 +1655,157 @@ fn copy_object_expires_inside_destination_append_and_cleans_stream_state() {
 }
 
 #[test]
+fn upload_part_copy_expires_inside_destination_append_and_cleans_stream_state() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    test_helpers::put_object(
+        &initial_coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                "part-copy-source",
+                test_requester(),
+                None,
+            ),
+            data: b"UploadPartCopy payload must not publish after route expiry",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let upload = initial_coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                "bucket",
+                "late-part-copy-destination",
+                test_requester(),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
+    drop(initial_coord);
+    drop(initial);
+    let cluster = open_same_store_cluster_with_route_map_validity(
+        same_store_inputs,
+        RouteMapValidity::until_ms(5_000).unwrap(),
+    );
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+
+    let attempted_shards = Arc::new(Mutex::new(Vec::new()));
+    let hook_attempted_shards = Arc::clone(&attempted_shards);
+    let shard_hook = cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(
+        move |location, key| {
+            hook_attempted_shards
+                .lock()
+                .unwrap()
+                .push((*location, key.clone()));
+            Ok(())
+        },
+    ));
+    let hook_clock = Arc::clone(&clock);
+    let hook_cluster = Arc::clone(&cluster);
+    let append_hook =
+        cluster.test_install_before_stream_append_command_id_hook(Arc::new(move || {
+            let session = hook_cluster
+                .list_stream_upload_sessions_best_effort()
+                .into_iter()
+                .find(|session| {
+                    session.bucket.as_str() == "bucket"
+                        && session.key.as_str() == "late-part-copy-destination"
+                })
+                .expect("UploadPartCopy stream session must exist before append publication");
+            assert_eq!(
+                session.cleanup_after,
+                Some(5_000),
+                "the admitted multipart route must persist its captured authority deadline"
+            );
+            hook_clock.set(4_500);
+        }));
+    let error = coord
+        .upload_part_copy_on_admitted_route(
+            &admission,
+            &UploadPartCopyRequest {
+                source: copy_source("bucket", "part-copy-source", None),
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "late-part-copy-destination",
+                    &upload.upload_id,
+                    test_requester(),
+                    None,
+                ),
+                part_number: 1,
+                copy_source_range: None,
+                policy_context: PutObjectPolicyContext::default(),
+                source_sse_customer: None,
+                sse_customer: None,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(append_hook);
+    drop(shard_hook);
+    drop(admission);
+
+    let attempted = attempted_shards.lock().unwrap().clone();
+    assert!(
+        !attempted.is_empty(),
+        "UploadPartCopy must stage destination shards before append publication"
+    );
+    for (location, key) in attempted {
+        assert!(
+            !cluster
+                .test_placed_payload_shard_file_exists(location, &key)
+                .unwrap(),
+            "expired UploadPartCopy must remove every staged destination shard"
+        );
+    }
+    assert!(
+        cluster
+            .list_stream_upload_sessions_best_effort()
+            .into_iter()
+            .all(|session| session.bucket.as_str() != "bucket"
+                || session.key.as_str() != "late-part-copy-destination"),
+        "failed UploadPartCopy must abort its destination stream session"
+    );
+    cluster
+        .load_in_progress_multipart_upload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-part-copy-destination"),
+            &upload.upload_id,
+        )
+        .expect("failed UploadPartCopy must preserve the active multipart upload");
+}
+
+#[test]
 fn stream_put_finalization_expires_inside_command_build() {
     let tmp = test_util::tempdir();
     let initial = open_test_storage_cluster(tmp.path(), &[0]);
@@ -4049,6 +4200,27 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
     foreign
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
+    test_helpers::put_object(
+        &foreign,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                "multipart-domain-source",
+                test_requester(),
+                None,
+            ),
+            data: b"multipart publication-domain canary",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
 
     let metadata = MetadataBlob::new();
     let request = CreateMultipartUploadRequest {
@@ -4160,6 +4332,54 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
         .unwrap()
         .parts
         .is_empty());
+
+    foreign
+        .upload_part_copy_on_admitted_route(
+            &foreign_admission,
+            &UploadPartCopyRequest {
+                source: copy_source("bucket", "multipart-domain-source", None),
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "foreign-domain-multipart",
+                    &created.upload_id,
+                    test_requester(),
+                    None,
+                ),
+                part_number: 1,
+                copy_source_range: None,
+                policy_context: PutObjectPolicyContext::default(),
+                source_sse_customer: None,
+                sse_customer: None,
+            },
+        )
+        .unwrap();
+    let error = local
+        .upload_part_copy_on_admitted_route(
+            &foreign_admission,
+            &UploadPartCopyRequest {
+                source: copy_source("bucket", "multipart-domain-source", None),
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "foreign-domain-multipart",
+                    &created.upload_id,
+                    test_requester(),
+                    None,
+                ),
+                part_number: 2,
+                copy_source_range: None,
+                policy_context: PutObjectPolicyContext::default(),
+                source_sse_customer: None,
+                sse_customer: None,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    let parts = foreign
+        .list_parts_on_admitted_route(&foreign_admission, &list_request)
+        .unwrap()
+        .parts;
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].part_number, 1);
 
     let abort_request = multipart_object_request_with_expected_owner(
         "bucket",

@@ -76,7 +76,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU32;
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 9;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 10;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -440,7 +440,7 @@ const STORAGE_RPC_MAX_STREAM_UPLOAD_BUCKET_WRITE_RESERVATION_UPDATE_PAYLOAD_LEN:
 const STORAGE_RPC_MAX_STREAM_UPLOAD_SEGMENTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_STREAM_SEGMENT_APPEND_PREPARE_REQUEST_PAYLOAD_LEN: usize =
-    STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN + 4 + 8 + 8 + 8 + 4 + 16;
+    STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN + 4 + 8 + 8 + 8 + 4 + 16 + 1 + 8 + 8;
 const STORAGE_RPC_MAX_STREAM_FINALIZE_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MAX_MULTIPART_COMPLETION_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize =
     2 * 1024 * 1024;
@@ -2074,6 +2074,7 @@ pub(crate) struct StorageRpcStreamUploadsListResponse {
 pub(crate) struct StorageRpcStreamSegmentAppendPrepareRequest {
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) request: PrepareStreamUploadSegmentAppendReq,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6001,6 +6002,14 @@ pub(crate) fn encode_stream_segment_append_prepare_request(
 ) -> Vec<u8> {
     let mut out = encode_object_request(&request.object);
     put_prepare_stream_segment_append_req(&mut out, &request.request);
+    match request.effect_deadline {
+        Some(deadline) => {
+            put_u8(&mut out, 1);
+            put_u64(&mut out, deadline.authority_valid_until_ms);
+            put_u64(&mut out, deadline.portable_wall_valid_until_ms);
+        }
+        None => put_u8(&mut out, 0),
+    }
     out
 }
 
@@ -6010,8 +6019,31 @@ pub(crate) fn decode_stream_segment_append_prepare_request(
     let mut decoder = StorageRpcDecoder::new(bytes);
     let object = decoder.read_rpc_object_request()?;
     let request = decoder.read_prepare_stream_segment_append_req()?;
+    let effect_deadline = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(StorageRpcAdmittedRouteEffectDeadline {
+            authority_valid_until_ms: decoder.read_u64()?,
+            portable_wall_valid_until_ms: decoder.read_u64()?,
+        }),
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid stream segment append effect deadline",
+            ));
+        }
+    };
+    if effect_deadline
+        .is_some_and(|deadline| !admitted_route_effect_deadline_is_conservative(deadline))
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "stream segment append effect deadline exceeds authority",
+        ));
+    }
     decoder.finish()?;
-    Ok(StorageRpcStreamSegmentAppendPrepareRequest { object, request })
+    Ok(StorageRpcStreamSegmentAppendPrepareRequest {
+        object,
+        request,
+        effect_deadline,
+    })
 }
 
 pub(crate) fn encode_stream_segment_append_prepare_response(
@@ -17605,7 +17637,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&9u16.to_le_bytes());
+        expected.extend_from_slice(&10u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -17616,15 +17648,15 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_rejects_version_eight_fixture() {
+    fn storage_rpc_frame_rejects_version_nine_fixture() {
         let mut bytes =
             encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
         let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&8_u16.to_le_bytes());
+        bytes[version_offset..version_offset + 2].copy_from_slice(&9_u16.to_le_bytes());
 
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnsupportedVersion(8))
+            Err(StorageRpcFrameError::UnsupportedVersion(9))
         );
     }
 
@@ -21635,6 +21667,49 @@ mod tests {
         let bytes = encode_object_generation_reservation_response(&response);
         let decoded = decode_object_generation_reservation_response(&bytes).unwrap();
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn stream_segment_append_prepare_request_round_trips_effect_deadline_at_cap() {
+        let request = StorageRpcStreamSegmentAppendPrepareRequest {
+            object: StorageRpcObjectRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                pg_id: PgId::new(3),
+                bucket: BucketName::try_from("b".repeat(STORAGE_RPC_MAX_BUCKET_NAME_LEN)).unwrap(),
+                key: ObjectKey::try_from("k".repeat(STORAGE_RPC_MAX_OBJECT_KEY_LEN)).unwrap(),
+            },
+            request: PrepareStreamUploadSegmentAppendReq {
+                session_id: SessionId::try_from("a".repeat(SESSION_ID_LEN)).unwrap(),
+                segment_index: u32::MAX,
+                size: u64::MAX,
+                segment_crc64: u64::MAX,
+                payload_crc64: u64::MAX,
+                segment_okh: [u8::MAX; 16],
+            },
+            effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                authority_valid_until_ms: u64::MAX,
+                portable_wall_valid_until_ms: u64::MAX
+                    - crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+            }),
+        };
+
+        let payload = encode_stream_segment_append_prepare_request(&request);
+        assert_eq!(
+            payload.len(),
+            STORAGE_RPC_MAX_STREAM_SEGMENT_APPEND_PREPARE_REQUEST_PAYLOAD_LEN
+        );
+        let frame = encode_storage_rpc_frame(
+            17,
+            StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare,
+            &payload,
+        )
+        .unwrap();
+        let decoded_frame = read_storage_rpc_request_frame_from(&mut Cursor::new(frame)).unwrap();
+        assert_eq!(
+            decode_stream_segment_append_prepare_request(&decoded_frame.payload).unwrap(),
+            request
+        );
     }
 
     #[test]

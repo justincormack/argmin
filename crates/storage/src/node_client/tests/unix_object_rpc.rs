@@ -2175,6 +2175,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     let append_rpc_request = crate::storage_rpc::StorageRpcStreamSegmentAppendPrepareRequest {
         object: client.object_request(wrong_pg.pg_id(), &bucket, &key),
         request: append,
+        effect_deadline: None,
     };
     let wrong_append_error = client
         .rpc_request(

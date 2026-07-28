@@ -703,6 +703,15 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         request: &PrepareStreamUploadSegmentAppendReq,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError>;
 
+    fn prepare_stream_segment_append_with_effect_fence(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: &PrepareStreamUploadSegmentAppendReq,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError>;
+
     fn load_stream_put_finalize_snapshot(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -1972,6 +1981,15 @@ pub(crate) trait StorageNodeClient:
         bucket: &BucketName,
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError>;
+
+    fn prepare_stream_segment_append_with_effect_fence(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: &PrepareStreamUploadSegmentAppendReq,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError>;
 
     fn load_direct_put_commit_snapshot(

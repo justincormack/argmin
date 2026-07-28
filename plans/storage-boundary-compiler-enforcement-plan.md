@@ -3355,6 +3355,77 @@ Seventy-third Phase 3 review correction:
   POST Object and UploadPart handoff regressions continue to pin that frontend
   cleanup makes only one prompt attempt and cannot delay route publication.
 
+Seventy-fourth Phase 3 slice:
+
+- UploadPartCopy now consumes the buffered request's existing admission for
+  both source and destination. Source authorization and payload retention use
+  the exact `ActiveObjectReadRoute` matching the authorized snapshot. The
+  destination bucket, in-progress upload, and all later part effects use one
+  non-cloneable `ActiveMultipartObjectRoute`; the production raw coordinator
+  entry point is test-only.
+- `ActiveMultipartObjectRoute` now owns UploadPartCopy stream-session creation,
+  session/encryption reload, encrypted shard placement, segment-append
+  publication, and part finalization. Session creation revalidates the exact
+  authorized upload row before publication, and the immutable admitted effect
+  fence reaches each bucket-write reservation, shard-file write, and
+  create/append/finalize pending-command insertion rather than stopping at a
+  coordinator precheck.
+- retained stream cleanup authority is derived before the first destination
+  mutation and the stream session persists the admitted cleanup deadline.
+  Failed or expired copies make a bounded synchronous cleanup attempt without
+  relying on the expired active route, while durable recovery remains the
+  handoff if prompt cleanup cannot finish.
+- a deterministic same-epoch-renewal regression expires the captured
+  admission after destination shards are staged but before append command-ID
+  allocation. It requires `OperationAborted`, removes every staged shard and
+  the stream session, and preserves the in-progress multipart upload. A
+  same-cluster/different-runtime-map regression proves the owning coordinator
+  can publish one copied part while a foreign-domain admission cannot publish
+  another.
+- the metadata-command publisher registry, command-stream guide, boundary
+  checker allowlists, bucket-write-drain guide, and storage capability
+  invariants now identify the route-validating UploadPart stream-create and
+  stream-finalize publishers.
+- all 16 focused storage UploadPart-stream tests, 22 focused server-core
+  UploadPartCopy tests, three server-HTTP routing/response tests, and eight
+  endpoint-neutral multipart UploadPartCopy tests pass. Formatting, diff
+  validation, the storage boundary checker, and workspace-wide strict Clippy
+  pass.
+- ordinary streamed UploadPart, other remaining buffered coordinator
+  workflows, and capability requirements on node-client traits remain open in
+  Phase 3.
+
+Seventy-fourth Phase 3 review correction:
+
+- append preparation is now a fenced durable effect rather than a read-like
+  preflight. The admitted fence crosses Unix/TLS RPC as a host-portable
+  deadline, is rebound to the storage host's monotonic clock, and is validated
+  immediately beside `next_segment_vid` allocation. The RPC frame encoding is
+  advanced to version 10 and its maximum-size deadline-bearing request is
+  admitted exactly at the per-kind cap.
+- the raw unbounded UploadPart stream-create and stream-finalize
+  `StorageCluster` wrappers are test/test-hook-only. Production UploadPartCopy
+  can reach those effects only through `ActiveMultipartObjectRoute`.
+- `server-core/test-utils` explicitly forwards `storage/test-hooks`, so its raw
+  test adapter and the gated storage wrappers share one feature boundary even
+  when server-core is compiled independently rather than through server-http's
+  dev-dependency feature unification.
+- `ActiveMultipartObjectRoute` no longer accepts a caller-supplied cleanup
+  deadline. It derives and persists the captured admission authority deadline
+  itself, preventing `None` from creating an indefinitely unswept session.
+- a delayed-RPC regression renews the raw active route, delivers append
+  preparation after the original admitted deadline, and proves the durable
+  stream allocator does not consume a VID. The UploadPartCopy expiry
+  regression also inspects the live session before rejection and pins its
+  admission-derived cleanup deadline.
+- the 20-test focused storage stream/RPC matrix, all 22 server-core
+  UploadPartCopy tests, the three related PUT/CopyObject/UploadPartCopy effect
+  boundary regressions, and 14 endpoint-neutral UploadPart tests pass. Both
+  standalone `server-core --features test-utils` and `server-core
+  --all-features` checks pass. Formatting, diff validation, the storage
+  boundary checker, workspace-wide strict Clippy, and the full 7,671-test
+  workspace suite pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

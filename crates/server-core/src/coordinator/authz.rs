@@ -363,29 +363,34 @@ impl Coordinator {
         req: &UploadPartCopyRequest<'_>,
     ) -> Result<AuthorizedUploadPartCopy, ServerError> {
         let admission = self.admit_storage_route_for_request()?;
-        let storage_node = self.storage_node();
-        self.authorize_upload_part_copy_on_admitted_route(&admission, &storage_node, req)
+        self.authorize_upload_part_copy_on_admitted_route(&admission, req)
     }
 
     pub(in crate::coordinator) fn authorize_upload_part_copy_on_admitted_route(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
-        storage_node: &Arc<StorageCluster>,
         req: &UploadPartCopyRequest<'_>,
     ) -> Result<AuthorizedUploadPartCopy, ServerError> {
         self.require_storage_route_admission(admission)?;
-        let dst_bucket_handle = self.load_bucket_handle_for_object_policy_read_with_storage_node(
-            storage_node,
+        let multipart_route = admission
+            .active_multipart_object_route(req.upload.bucket_name_typed(), req.upload.key_typed())
+            .map_err(super::map_store_error)?;
+        let dst_bucket_handle = self.load_bucket_handle_for_object_policy_read_on_admitted_route(
+            admission,
             req.upload.bucket_name_typed(),
             req.expected_bucket_owner(),
         )?;
         match ObjectAuthLoadedBucketHandle::classify(&dst_bucket_handle) {
-            ObjectAuthLoadedBucketHandle::Boe(dst_bucket_handle) => {
-                self.authorize_upload_part_copy_boe(storage_node, admission, req, dst_bucket_handle)
-            }
+            ObjectAuthLoadedBucketHandle::Boe(dst_bucket_handle) => self
+                .authorize_upload_part_copy_boe(
+                    &multipart_route,
+                    admission,
+                    req,
+                    dst_bucket_handle,
+                ),
             ObjectAuthLoadedBucketHandle::NonBoe(dst_bucket_handle) => self
                 .authorize_upload_part_copy_non_boe(
-                    storage_node,
+                    &multipart_route,
                     admission,
                     req,
                     dst_bucket_handle,
@@ -1836,26 +1841,6 @@ impl Coordinator {
             storage_node,
             req.name_typed(),
             req.expected_bucket_owner(),
-            request,
-        )
-    }
-
-    pub(super) fn load_bucket_handle_for_object_policy_read_with_storage_node(
-        &self,
-        storage_node: &Arc<StorageCluster>,
-        bucket: &BucketName,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<LoadedBucketHandle, ServerError> {
-        let request = BucketHandleRequest::new()
-            .requiring_policy_view()
-            .requiring_bucket_tags_if_abac_enabled();
-
-        #[cfg(test)]
-        maybe_run_bucket_policy_storage_load_hook(bucket.as_str());
-        self.bucket_handle_loader().load_bucket_with_storage_node(
-            storage_node,
-            bucket,
-            expected_bucket_owner,
             request,
         )
     }

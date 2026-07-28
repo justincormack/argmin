@@ -584,14 +584,12 @@ impl Coordinator {
 
     pub(in crate::coordinator) fn authorize_upload_part_copy_non_boe(
         &self,
-        storage_node: &Arc<storage::StorageCluster>,
+        multipart_route: &storage::ActiveMultipartObjectRoute<'_>,
         admission: &storage::StorageClusterRouteAdmission,
         req: &UploadPartCopyRequest<'_>,
         dst_bucket_handle: NonBoeLoadedBucketHandle<'_>,
     ) -> Result<AuthorizedUploadPartCopy, ServerError> {
         let src_version_id = req.source.version_id;
-        let dst_bucket = req.upload.bucket_name_typed();
-        let dst_key = req.upload.key_typed();
         let upload_id = req.upload.upload_id();
         let part_number = req.part_number;
         let requester = req.upload.requester();
@@ -603,8 +601,8 @@ impl Coordinator {
         let dst_bucket_info = ValidatedBucket(dst_bucket_handle.bucket().clone());
         let dst_bucket_policy = self.cached_bucket_policy_for_loaded_handle(&dst_bucket_handle)?;
         let dst_bucket_tags = Self::loaded_bucket_tags_for_policy(&dst_bucket_handle)?;
-        let dst_upload = storage_node
-            .load_in_progress_multipart_upload(dst_bucket, dst_key, upload_id)
+        let dst_upload = multipart_route
+            .load_in_progress_multipart_upload(upload_id)
             .map_err(Self::map_object_pg_action_error)?;
         let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
             policy_context,

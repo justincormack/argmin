@@ -259,7 +259,7 @@ script in the same change.
 | `create_multipart_upload` | Epoch-fenced routed object metadata PG command apply for multipart upload row creation and upload generation reservation |
 | `abort_multipart_upload` | Epoch-fenced routed object metadata PG command apply for multipart upload row deletion, upload generation reservation release, and part staging metadata removal; the command carries the abort-preparation cleanup snapshot, and cluster-owned best-effort payload cleanup uses those retryable refs |
 | `abort_multipart_upload_if_due` | Bucket-lifecycle recheck under bucket-PG-primary lock, then epoch-fenced routed object metadata PG command apply through `abort_multipart_upload` |
-| `begin_upload_part_stream_session`, `create_upload_part_stream_session`, `finalize_upload_part_stream` | Epoch-fenced routed object metadata PG command apply for streamed UploadPart staging creation and finalization. `CreateStreamUpload` apply revalidates UploadPart targets against the current in-progress MPU row on each acting node |
+| `begin_upload_part_stream_session`, `create_upload_part_stream_session_with_route_validation`, `prepare_stream_segment_append_with_route_validation`, `finalize_upload_part_stream_with_route_validation` | Epoch-fenced routed object metadata PG effects for streamed UploadPart staging creation, segment-VID allocation, and finalization. UploadPartCopy carries its immutable admitted effect fence to reservation, allocator, shard-write, and pending-command boundaries. `CreateStreamUpload` apply revalidates UploadPart targets against the current in-progress MPU row on each acting node |
 | `load_multipart_upload`, `load_in_progress_multipart_upload`, `try_load_in_progress_multipart_upload`, `load_in_progress_multipart_upload_for_listing`, `load_multipart_completion_snapshot`, `load_multipart_completion_preflight`, `list_multipart_parts_for_upload`, `lookup_abort_multipart_upload` | Epoch-fenced routed metadata PG |
 | `list_multipart_uploads_for_bucket` | Epoch-fenced routed metadata PG fanout |
 | `test_from_local_map_with_epoch`, `test_install_before_stream_abort_storage_hook`, `test_install_after_direct_put_metadata_publish_hook`, `test_install_before_placed_payload_shard_delete_hook`, `test_install_before_metadata_primary_payload_ack_delete_hook`, `test_install_best_effort_payload_cleanup_error_hook`, `test_install_before_metadata_command_apply_hook`, `test_install_before_abort_multipart_pending_install_hook`, `test_install_before_stream_put_create_pending_install_hook`, `test_install_before_stream_put_create_command_id_hook`, `test_install_before_bucket_delete_command_id_hook`, `test_install_before_metadata_command_apply_context_hook`, `test_apply_metadata_command_to_acting_set_from_origin`, `test_establish_multipart_completion_barrier`, `test_pg_ids`, `object_payload_lease_count`, `bucket_object_payload_lease_count`, `try_take_reclaim_work`, `test_ec_scratch_allocation_count`, `test_bucket_pg_id_for`, `test_head_bucket_raw`, `test_object_pg_id_for`, `test_data_pg_id_for`, `test_object_generation_reservation_for`, `test_multipart_part_data_pg_id_for`, `test_get_object_meta`, `test_get_multipart_upload`, `test_get_multipart_part`, `test_list_multipart_parts`, `test_list_multipart_uploads_for_bucket`, `test_get_object_segments`, `test_replace_live_object_segments`, `test_get_object_parts`, `test_replace_object_parts`, `test_get_object_version`, `test_get_object_segments_reclaim`, `test_put_object_segments_reclaim`, `test_put_multipart_reclaim`, `test_payload_reclaim_exists`, `test_list_bucket_payload_reclaim_roots`, `test_force_became_noncurrent_at`, `test_create_deleting_bucket`, `test_delete_bucket_metadata`, `test_get_all_multipart_part_segments_for_upload`, `test_set_upload_state`, `test_list_stream_segments`, `test_force_stream_upload_created_at`, `test_list_all_stream_uploads`, `test_create_stream_upload`, `test_shard_exists`, `test_lock_bucket_pg`, `test_placed_payload_shard_file_exists`, `test_payload_shard_file_path`, `test_payload_shard_file_exists` | Test hook |
@@ -313,14 +313,26 @@ any pre-publication boundary releases transient reservations and removes only
 payload known to belong to the rejected attempt, including shards written
 earlier in a partially completed direct placement.
 
+`ActiveMultipartObjectRoute` is the corresponding non-cloneable authority for
+one multipart bucket/key/object-metadata-PG tuple. In addition to multipart
+control and completion, UploadPartCopy uses it for destination session
+creation, encrypted shard placement, segment append, and part finalization.
+The route binds the authorized upload row to the destination subject and
+carries the immutable request effect fence through every fresh durable
+reservation, segment-VID allocation, shard-file, and pending-command effect.
+The cleanup deadline is derived from the admission inside the capability and
+cannot be omitted by its caller, so recovery can remove abandoned state after
+prompt retained cleanup releases frontend admission. Unbounded create and
+finalize wrappers exist only for test support.
+
 `LeasedObjectReadSnapshot` is the non-cloneable broad-to-narrow handoff token.
 Its private fields bind the exact object snapshot, requested version, metadata
 route, originating cluster, and broad generation lease; callers may inspect the
 snapshot but cannot pair another snapshot with that lease. An
 `ActiveObjectReadRoute` can consume it only when all provenance matches.
-CopyObject reconstructs that exact admitted source route before consuming the
-handoff; UploadPartCopy remains on the transitional pinned-cluster path. Both
-forms derive every shard owner from the token's recorded placement epochs,
+CopyObject and UploadPartCopy reconstruct that exact admitted source route
+before consuming the handoff. Both forms derive every shard owner from the
+token's recorded placement epochs,
 acquire the narrow storage-node leases, and only then release the broad lease.
 Copy-source snapshot loading itself uses the request admission, so its retained
 repair fence captures the publication generation and immutable request

@@ -5062,6 +5062,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
     fn prepare_stream_segment_append(
         &self,
         request: &PrepareStreamUploadSegmentAppendReq,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), StorageNodeObjectRouteError> {
         self.route.require_valid_now()?;
         let local_client = LocalStorageNodeClient::new(
@@ -5069,12 +5070,13 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             Arc::clone(&self.route.handler.node),
         );
         let (target, mut segment) =
-            ObjectMutationMetadataNodeClient::prepare_stream_segment_append(
+            ObjectMutationMetadataNodeClient::prepare_stream_segment_append_with_effect_fence(
                 &local_client,
                 self.route.pg_id,
                 self.route.bucket,
                 self.route.key,
                 request,
+                effect_fence,
             )
             .map_err(StorageNodeObjectRouteError::Object)?;
         segment.placement_cluster_epoch = self.route.fence.cluster_epoch;
@@ -10923,7 +10925,9 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        let outcome = match route.prepare_stream_segment_append(&request.request) {
+        let effect_fence =
+            admitted_route_effect_fence(request.object.cluster_epoch, request.effect_deadline);
+        let outcome = match route.prepare_stream_segment_append(&request.request, effect_fence) {
             Ok((target, segment)) => StorageRpcStreamSegmentAppendPrepareOutcome::Prepared {
                 target,
                 segment: Box::new(segment),
@@ -23962,7 +23966,10 @@ mod tests {
                 .unwrap()
                 .is_empty());
             let (target, segment) = primary_route
-                .prepare_stream_segment_append(&stream_append_request)
+                .prepare_stream_segment_append(
+                    &stream_append_request,
+                    AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                )
                 .unwrap();
             assert_eq!(target, StreamUploadTarget::PutObject);
             assert_eq!(segment.session_id, reservation_id);
@@ -24957,6 +24964,50 @@ mod tests {
             Some(10_000)
         );
 
+        let next_segment_vid_before_delayed_rpc = server
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .get_stream_upload(&reservation_id)
+            .unwrap()
+            .next_segment_vid;
+        let delayed_append_response = crate::clock::with_time_override(6_000, || {
+            handler
+                .stream_segment_append_prepare_response(
+                    &active_permit,
+                    StorageRpcStreamSegmentAppendPrepareRequest {
+                        object: request.clone(),
+                        request: PrepareStreamUploadSegmentAppendReq {
+                            segment_index: 1,
+                            ..stream_append_request.clone()
+                        },
+                        effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                            authority_valid_until_ms: 5_000,
+                            portable_wall_valid_until_ms: 4_000,
+                        }),
+                    },
+                )
+                .unwrap()
+        });
+        let delayed_append_error = decode_storage_rpc_response_payload(&delayed_append_response)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            delayed_append_error.code,
+            StorageRpcErrorCode::StaleShardLocation
+        );
+        assert_eq!(
+            server
+                ._node
+                .get_pg(0)
+                .unwrap()
+                .get_stream_upload(&reservation_id)
+                .unwrap()
+                .next_segment_vid,
+            next_segment_vid_before_delayed_rpc,
+            "an expired delayed append RPC must not consume a segment VID"
+        );
+
         crate::clock::with_time_override(6_000, || {
             match primary_route.load_multipart_upload(&upload_id) {
                 Err(StorageNodeMultipartUploadRouteError::Route(error)) => {
@@ -25122,7 +25173,10 @@ mod tests {
                 (
                     "stream segment append preparation",
                     primary_route
-                        .prepare_stream_segment_append(&stream_append_request)
+                        .prepare_stream_segment_append(
+                            &stream_append_request,
+                            AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                        )
                         .map(|_| ()),
                 ),
                 (

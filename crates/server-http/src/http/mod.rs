@@ -4902,7 +4902,6 @@ impl HttpFrontend {
             .coordinator
             .finalize_stream_part_with_storage_admission(
                 &ctx.storage_route_admission,
-                &ctx.storage_node,
                 FinalizeStreamPartRequest {
                     upload: MultipartObjectRequest::new(
                         ctx.bucket().clone(),

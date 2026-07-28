@@ -206,10 +206,10 @@ Current production pending-command publishers:
 | `finalize_put_object_stream_with_route_validation` | `CommitDirectPutObject` | `TerminalSessionRetry` | Rebuild commit from current object preconditions and stream-session snapshot after unrelated contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching branch can finish it while the session state is still coherent. Production stream finalization carries the request admission's immutable effect fence and a durable bucket-write reservation proof; terminal convergence releases the proof before removing the pending slot. |
 | `create_multipart_upload_inner_with_route_validation` | `CreateMultipartUpload` | `SnapshotSensitive` | Revalidate the request-scoped multipart object route and rerun authorization/object snapshot after contention. The reservation acquisition and pending-command installation both enforce the admitted effect fence. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `begin_upload_part_stream_session_with_cleanup_deadline` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target and rerun the caller action against fresh MPU state using the request-entry authorization snapshot/capability after contention. The command carries the request-entry bucket-write reservation proof and optional durable cleanup deadline, and releases the proof only after convergence. |
-| `create_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target after contention. The low-level UploadPartCopy path acquires a durable bucket-write reservation before publishing the session command and releases it only after convergence. |
+| `create_upload_part_stream_session_with_route_validation` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate the admitted multipart object route and MPU/session target after contention. UploadPartCopy carries the immutable request effect fence through reservation acquisition and pending-command insertion, persists the admitted cleanup deadline, and releases the durable bucket-write proof only after convergence. |
 | `establish_multipart_completion_barrier` | `AdvanceMultipartCompletionBarrier` | `AllocatorCleanup` | Drain competing bucket-PG slots, validate the current completion bucket-write proof, allocate and replicate a fresh monotonic scalar, and only then publish the object-PG completion. A pre-existing or contender barrier is not proof for the current reservation because the command carries no reservation identity; return to the owner loop and build a fresh barrier after contention. No terminal upload row is created. |
 | `complete_multipart_upload_commit_serialized_with_route_validation` | `CommitMultipartObject` | `MatchingOutcomeRetry` | Revalidate the admitted multipart object route while rebuilding completion parts, cleanup snapshot, stale payload, and bucket-PG barrier after unrelated contention. The completion reservation, version reservation, barrier insertion, and final object-PG insertion all enforce the request admission's immutable effect fence. If the contender is the same completion request, finish that exact command through the matching-pending branch and return its computed outcome. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
-| `finalize_upload_part_stream` | `CommitStreamPart` | `TerminalSessionRetry` | Rebuild stream session, MPU row, staged segments, and displaced part refs after unrelated contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching branch can finish it. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
+| `finalize_upload_part_stream_with_route_validation` | `CommitStreamPart` | `TerminalSessionRetry` | Revalidate the admitted multipart object route while rebuilding the stream session, MPU row, staged segments, and displaced part refs after unrelated contention. Carry the immutable request effect fence through the finalization reservation and pending-command insertion. If an equivalent terminal command wins the pending slot, restart without draining so the matching branch can finish it. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `abort_multipart_upload_locked` | `AbortMultipartUpload` | `TerminalSessionRetry` | Rebuild upload, part, active stream session, staged segment, and cleanup snapshots after unrelated contention. If an equivalent abort wins the pending slot, restart without draining so the matching branch returns the successful abort outcome. |
 | `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `TerminalSessionRetry` | Rebuild authorized upload cleanup snapshot after unrelated contention and compare the current upload row to the authorized row before install. The foreground S3 path acquires its reservation and installs its pending command through the request admission's immutable effect fence. If an equivalent abort wins the pending slot, restart without draining so the matching branch returns the successful abort outcome. |
 
@@ -298,15 +298,16 @@ boundaries.
 Multipart publisher rules:
 
 - `begin_upload_part_stream_session_with_cleanup_deadline` and
-  `create_upload_part_stream_session` must reload the in-progress MPU row and
-  rerun the caller action against fresh MPU state after object-PG slot
-  contention. This uses the request-entry authorization snapshot/capability; it
-  does not mean storage reauthorizes against current bucket policy.
-- `finalize_upload_part_stream` must reload the stream session, MPU row,
-  existing part row, staged segments, and displaced part refs after contention.
-  Its `CommitStreamPart` command carries the bucket-write reservation proof;
-  live retry and open-time convergence must validate and release that proof
-  before clearing the terminal pending slot.
+  `create_upload_part_stream_session_with_route_validation` must reload the
+  in-progress MPU row and rerun the caller action against fresh MPU state after
+  object-PG slot contention. This uses the request-entry authorization
+  snapshot/capability; it does not mean storage reauthorizes against current
+  bucket policy.
+- `finalize_upload_part_stream_with_route_validation` must reload the stream
+  session, MPU row, existing part row, staged segments, and displaced part
+  refs after contention. Its `CommitStreamPart` command carries the
+  bucket-write reservation proof; live retry and open-time convergence must
+  validate and release that proof before clearing the terminal pending slot.
 - `abort_multipart_upload_locked` and
   `abort_authorized_multipart_upload_locked` must rebuild upload, part, active
   stream session, staged segment, and cleanup snapshots after contention.

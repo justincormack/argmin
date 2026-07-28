@@ -239,7 +239,7 @@ define_metadata_command_publishers! {
         SnapshotSensitive
     ),
     CreateUploadPartStreamSession => (
-        "create_upload_part_stream_session",
+        "create_upload_part_stream_session_with_route_validation",
         "CreateStreamUpload",
         SnapshotSensitive
     ),
@@ -254,7 +254,7 @@ define_metadata_command_publishers! {
         MatchingOutcomeRetry
     ),
     FinalizeUploadPartStream => (
-        "finalize_upload_part_stream",
+        "finalize_upload_part_stream_with_route_validation",
         "CommitStreamPart",
         TerminalSessionRetry
     ),

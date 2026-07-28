@@ -71,6 +71,55 @@ use crate::system_metadata::SystemMetadata;
 const COMPLETE_MULTIPART_TERMINAL_RACE_RETRIES: usize = 1;
 pub(super) const COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRY_BUDGET: Duration = Duration::from_secs(2);
 
+enum StreamPartFinalizeRoute<'a> {
+    #[cfg(any(test, feature = "test-utils"))]
+    Raw(&'a std::sync::Arc<storage::StorageCluster>),
+    Admitted(&'a storage::ActiveMultipartObjectRoute<'a>),
+}
+
+impl StreamPartFinalizeRoute<'_> {
+    fn default_payload_ec_shape(&self) -> storage::EcShape {
+        match self {
+            #[cfg(any(test, feature = "test-utils"))]
+            Self::Raw(storage_node) => storage_node.default_payload_ec_shape(),
+            Self::Admitted(route) => route.default_payload_ec_shape(),
+        }
+    }
+
+    fn operation_epoch(&self) -> storage::ClusterEpoch {
+        match self {
+            #[cfg(any(test, feature = "test-utils"))]
+            Self::Raw(storage_node) => storage_node.operation_epoch(),
+            Self::Admitted(route) => route.operation_epoch(),
+        }
+    }
+
+    fn finalize<T, E>(
+        &self,
+        _bucket: &BucketName,
+        _key: &ObjectKey,
+        upload_id: &UploadId,
+        session_id: &SessionId,
+        part_number: u32,
+        action: impl FnMut(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
+    ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, storage::ObjectPgActionError> {
+        match self {
+            #[cfg(any(test, feature = "test-utils"))]
+            Self::Raw(storage_node) => storage_node.finalize_upload_part_stream(
+                _bucket,
+                _key,
+                upload_id,
+                session_id,
+                part_number,
+                action,
+            ),
+            Self::Admitted(route) => {
+                route.finalize_stream_part(upload_id, session_id, part_number, action)
+            }
+        }
+    }
+}
+
 fn complete_multipart_part_checksum(
     part: &MultipartPartRecord,
     checksum_type: ChecksumType,
@@ -1371,9 +1420,18 @@ impl Coordinator {
         self.finalize_stream_part_with_storage_node(&self.storage_node(), req)
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn finalize_stream_part_with_storage_node(
         &self,
         storage_node: &std::sync::Arc<storage::StorageCluster>,
+        req: FinalizeStreamPartRequest,
+    ) -> Result<UploadPartResult, ServerError> {
+        self.finalize_stream_part_on_route(StreamPartFinalizeRoute::Raw(storage_node), req)
+    }
+
+    fn finalize_stream_part_on_route(
+        &self,
+        storage_route: StreamPartFinalizeRoute<'_>,
         req: FinalizeStreamPartRequest,
     ) -> Result<UploadPartResult, ServerError> {
         observability::trace_scope!(
@@ -1398,12 +1456,16 @@ impl Coordinator {
         let computed_checksum = req.computed_checksum;
         #[cfg(test)]
         if self.should_probe_finalize_stream_part_commit(req.upload.bucket_name()) {
-            let object_pg_ready = storage_node
-                .try_probe_object_pg_available(
-                    req.upload.bucket_name_typed(),
-                    req.upload.key_typed(),
-                )
-                .map_err(Coordinator::map_object_pg_action_error)?;
+            let object_pg_ready = match &storage_route {
+                #[cfg(any(test, feature = "test-utils"))]
+                StreamPartFinalizeRoute::Raw(storage_node) => storage_node
+                    .try_probe_object_pg_available(
+                        req.upload.bucket_name_typed(),
+                        req.upload.key_typed(),
+                    ),
+                StreamPartFinalizeRoute::Admitted(route) => route.try_probe_object_pg_available(),
+            }
+            .map_err(Coordinator::map_object_pg_action_error)?;
             if !object_pg_ready {
                 return Err(ServerError::InternalError {
                     reason: "test probe: object pg still locked before finalize_stream_part commit"
@@ -1411,11 +1473,13 @@ impl Coordinator {
                 });
             }
         }
+        let default_payload_ec = storage_route.default_payload_ec_shape();
+        let operation_epoch = storage_route.operation_epoch();
         let FinalizeStreamPartOutcome {
             value: mut result,
             last_modified,
-        } = storage_node
-            .finalize_upload_part_stream(
+        } = storage_route
+            .finalize(
                 req.upload.bucket_name_typed(),
                 req.upload.key_typed(),
                 upload_id,
@@ -1571,13 +1635,12 @@ impl Coordinator {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
-                    let ec = staging_segments.first().map_or(
-                        storage_node.default_payload_ec_shape(),
-                        |segment| storage::EcShape {
+                    let ec = staging_segments.first().map_or(default_payload_ec, |segment| {
+                        storage::EcShape {
                             k: segment.ec_k,
                             m: segment.ec_m,
-                        },
-                    );
+                        }
+                    });
 
                     let stored_checksum = if upload_checksum_algo.is_some() {
                         checksum.as_ref().map(ChecksumBytes::from)
@@ -1597,9 +1660,7 @@ impl Coordinator {
                             .expect("multipart part generation must be nonzero"),
                         placement_cluster_epoch: staging_segments
                             .first()
-                            .map_or(storage_node.operation_epoch(), |segment| {
-                                segment.placement_cluster_epoch
-                            }),
+                            .map_or(operation_epoch, |segment| segment.placement_cluster_epoch),
                         ec_k: ec.k,
                         ec_m: ec.m,
                         last_modified: now,
@@ -1624,14 +1685,24 @@ impl Coordinator {
         Ok(result)
     }
 
+    pub(super) fn finalize_stream_part_on_admitted_multipart_route(
+        &self,
+        route: &storage::ActiveMultipartObjectRoute<'_>,
+        req: FinalizeStreamPartRequest,
+    ) -> Result<UploadPartResult, ServerError> {
+        self.finalize_stream_part_on_route(StreamPartFinalizeRoute::Admitted(route), req)
+    }
+
     pub fn finalize_stream_part_with_storage_admission(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: FinalizeStreamPartRequest,
     ) -> Result<UploadPartResult, ServerError> {
-        self.require_admitted_storage_effect(admission, storage_node)?;
-        self.finalize_stream_part_with_storage_node(storage_node, req)
+        self.require_storage_route_admission(admission)?;
+        let route = admission
+            .active_multipart_object_route(req.upload.bucket_name_typed(), req.upload.key_typed())
+            .map_err(super::map_store_error)?;
+        self.finalize_stream_part_on_route(StreamPartFinalizeRoute::Admitted(&route), req)
     }
 
     #[cfg(test)]

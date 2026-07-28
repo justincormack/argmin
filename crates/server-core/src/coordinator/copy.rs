@@ -463,6 +463,7 @@ impl Coordinator {
     }
 
     /// Copy a byte range from an existing object as a multipart upload part.
+    #[cfg(test)]
     pub fn upload_part_copy(
         &self,
         req: &UploadPartCopyRequest,
@@ -495,11 +496,10 @@ impl Coordinator {
         let copy_source_range = req.copy_source_range;
         let source_sse_customer = req.source_sse_customer;
         self.require_storage_route_admission(admission)?;
-        let storage_node = self.storage_node();
         let AuthorizedUploadPartCopy {
             source,
             destination,
-        } = self.authorize_upload_part_copy_on_admitted_route(admission, &storage_node, req)?;
+        } = self.authorize_upload_part_copy_on_admitted_route(admission, req)?;
 
         let AuthorizedCopySourceRead {
             snapshot: source,
@@ -555,7 +555,15 @@ impl Coordinator {
                 });
             }
 
-            let retained = storage_node
+            let source_route = admission
+                .active_object_read_route(
+                    &req.source.bucket,
+                    &req.source.key,
+                    src_version_id,
+                    storage::ObjectReadSnapshotMode::FullPayloadLayout,
+                )
+                .map_err(super::map_store_error)?;
+            let retained = source_route
                 .retain_object_payload_read(source_payload_handoff)
                 .map_err(super::map_store_error)?
                 .ok_or_else(|| ServerError::InternalError {
@@ -585,8 +593,12 @@ impl Coordinator {
             upload,
             sse_customer,
         } = destination;
+        let multipart_route = admission
+            .active_multipart_object_route(&bucket, &key)
+            .map_err(super::map_store_error)?;
+        let stream_cleanup = self.retained_stream_upload_cleanup(admission, &bucket, &key)?;
         let session_id = Self::random_session_id("failed to generate session ID")?;
-        let session_id = storage_node
+        let session_id = multipart_route
             .create_upload_part_stream_session(&upload, part_number, &session_id)
             .map_err(Self::map_object_pg_action_error)?;
         #[cfg(test)]
@@ -602,14 +614,13 @@ impl Coordinator {
             .as_ref()
             .map(|ctx| ctx.request().response_headers());
         let result = (|| {
-            let write_encryption = self.load_stream_part_write_encryption_with_storage_node(
-                &storage_node,
-                &bucket,
-                &key,
-                session_id,
-                part_number,
-                req.sse_customer,
-            )?;
+            let write_encryption = self
+                .load_stream_part_write_encryption_on_admitted_multipart_route(
+                    &multipart_route,
+                    session_id,
+                    part_number,
+                    req.sse_customer,
+                )?;
             let mut crc64 = checksum::crc64::Hasher::new();
             let mut total_size = 0u64;
             let mut segment_index = 0u32;
@@ -629,8 +640,8 @@ impl Coordinator {
                 }
                 let chunk_crc64 = checksum::crc64::checksum(&chunk);
                 let storage_chunk = write_encryption.encrypt_segment(segment_index, &chunk)?;
-                self.append_stream_segment_for_storage_node(
-                    &storage_node,
+                self.append_stream_segment_on_admitted_multipart_route(
+                    &multipart_route,
                     &bucket,
                     &key,
                     session_id,
@@ -657,8 +668,8 @@ impl Coordinator {
                 .as_ref()
                 .map(|checksum| ChecksumClaim::from_raw(checksum.clone()));
 
-            self.finalize_stream_part_with_storage_node(
-                &storage_node,
+            self.finalize_stream_part_on_admitted_multipart_route(
+                &multipart_route,
                 FinalizeStreamPartRequest {
                     upload: MultipartObjectRequest::new(
                         bucket.clone(),
@@ -677,12 +688,8 @@ impl Coordinator {
             )
         })();
         if result.is_err() {
-            let _ = self.abort_stream_put_for_cleanup_with_storage_node(
-                &storage_node,
-                &bucket,
-                &key,
-                session_id,
-            );
+            let _ = self
+                .abort_stream_upload_with_retained_cleanup_retrying(&stream_cleanup, session_id);
         }
         let inner = result?;
         Ok(UploadPartCopyResult {

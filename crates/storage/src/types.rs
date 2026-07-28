@@ -138,6 +138,10 @@ impl AdmittedRouteEffectFence {
         self.deadline
     }
 
+    pub(crate) fn cluster_epoch(self) -> ClusterEpoch {
+        self.cluster_epoch
+    }
+
     pub(crate) fn require_valid_for(self, operation_epoch: ClusterEpoch) -> Result<(), StoreError> {
         if self.cluster_epoch != operation_epoch {
             return Err(StoreError::RouteAdmissionClusterMismatch {

@@ -39,6 +39,87 @@ impl LocalStorageNodeClient {
         }
     }
 
+    fn prepare_stream_segment_append_inner(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: &PrepareStreamUploadSegmentAppendReq,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let session = pg.get_stream_upload(&request.session_id)?;
+        validate_stream_upload_session_binding(&session, bucket, key)?;
+        reject_duplicate_stream_segment_index(&pg, &request.session_id, request.segment_index)?;
+        let pg_topology = self.storage_node.pg_topology();
+        let (segment_okh, segment_vid, data_pg_id) = match session.target {
+            StreamUploadTarget::PutObject => {
+                let generation_id =
+                    pg.get_object_generation_reservation(bucket, key, &request.session_id)?;
+                if let Some(effect_fence) = effect_fence {
+                    effect_fence.require_valid_for(effect_fence.cluster_epoch())?;
+                }
+                let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
+                (
+                    crate::segment_key_hash(
+                        bucket.as_str(),
+                        key.as_str(),
+                        generation_id,
+                        request.segment_index,
+                    ),
+                    segment_vid,
+                    pg_topology
+                        .object_generation_segment_data_pg(
+                            bucket,
+                            key,
+                            generation_id,
+                            request.segment_index,
+                        )
+                        .get(),
+                )
+            }
+            StreamUploadTarget::UploadPart {
+                ref upload_id,
+                part_number,
+            } => {
+                let upload =
+                    load_in_progress_multipart_upload_from_pg(&pg, bucket, key, upload_id)?;
+                if let Some(effect_fence) = effect_fence {
+                    effect_fence.require_valid_for(effect_fence.cluster_epoch())?;
+                }
+                let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
+                (
+                    request.segment_okh,
+                    segment_vid,
+                    pg_topology
+                        .object_generation_multipart_part_segment_data_pg(
+                            bucket,
+                            key,
+                            upload.object_generation_id,
+                            part_number,
+                            request.segment_index,
+                        )
+                        .get(),
+                )
+            }
+        };
+        let ec = self.storage_node.default_ec_shape();
+        let segment_record = StreamUploadSegmentRecord {
+            session_id: request.session_id.clone(),
+            segment_index: request.segment_index,
+            size: request.size,
+            segment_crc64: request.segment_crc64,
+            payload_crc64: request.payload_crc64,
+            segment_okh,
+            segment_vid,
+            data_pg_id,
+            placement_cluster_epoch: ClusterEpoch::INITIAL,
+            ec_k: ec.k,
+            ec_m: ec.m,
+        };
+        Ok((session.target, segment_record))
+    }
+
     fn next_metadata_command_id_from_locked_pg(
         &self,
         pg_id: PgId,
@@ -1658,6 +1739,24 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn prepare_stream_segment_append_with_effect_fence(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: &PrepareStreamUploadSegmentAppendReq,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        <Self as StorageNodeClient>::prepare_stream_segment_append_with_effect_fence(
+            self,
+            pg_id,
+            bucket,
+            key,
+            request,
+            effect_fence,
+        )
+    }
+
     fn load_stream_put_finalize_snapshot(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -3235,71 +3334,18 @@ impl StorageNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let session = pg.get_stream_upload(&request.session_id)?;
-        validate_stream_upload_session_binding(&session, bucket, key)?;
-        reject_duplicate_stream_segment_index(&pg, &request.session_id, request.segment_index)?;
-        let pg_topology = self.storage_node.pg_topology();
-        let (segment_okh, segment_vid, data_pg_id) = match session.target {
-            StreamUploadTarget::PutObject => {
-                let generation_id =
-                    pg.get_object_generation_reservation(bucket, key, &request.session_id)?;
-                let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
-                (
-                    crate::segment_key_hash(
-                        bucket.as_str(),
-                        key.as_str(),
-                        generation_id,
-                        request.segment_index,
-                    ),
-                    segment_vid,
-                    pg_topology
-                        .object_generation_segment_data_pg(
-                            bucket,
-                            key,
-                            generation_id,
-                            request.segment_index,
-                        )
-                        .get(),
-                )
-            }
-            StreamUploadTarget::UploadPart {
-                ref upload_id,
-                part_number,
-            } => {
-                let upload =
-                    load_in_progress_multipart_upload_from_pg(&pg, bucket, key, upload_id)?;
-                let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
-                (
-                    request.segment_okh,
-                    segment_vid,
-                    pg_topology
-                        .object_generation_multipart_part_segment_data_pg(
-                            bucket,
-                            key,
-                            upload.object_generation_id,
-                            part_number,
-                            request.segment_index,
-                        )
-                        .get(),
-                )
-            }
-        };
-        let ec = self.storage_node.default_ec_shape();
-        let segment_record = StreamUploadSegmentRecord {
-            session_id: request.session_id.clone(),
-            segment_index: request.segment_index,
-            size: request.size,
-            segment_crc64: request.segment_crc64,
-            payload_crc64: request.payload_crc64,
-            segment_okh,
-            segment_vid,
-            data_pg_id,
-            placement_cluster_epoch: ClusterEpoch::INITIAL,
-            ec_k: ec.k,
-            ec_m: ec.m,
-        };
-        Ok((session.target, segment_record))
+        self.prepare_stream_segment_append_inner(pg_id, bucket, key, request, None)
+    }
+
+    fn prepare_stream_segment_append_with_effect_fence(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: &PrepareStreamUploadSegmentAppendReq,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        self.prepare_stream_segment_append_inner(pg_id, bucket, key, request, Some(effect_fence))
     }
 
     fn load_direct_put_commit_snapshot(
