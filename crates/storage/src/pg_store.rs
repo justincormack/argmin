@@ -915,9 +915,13 @@ fn open_existing_pg_database_read_only(
     pg_dir: &Path,
     pg_id: u32,
 ) -> Result<Connection, StoreError> {
-    drop(open_and_validate_existing_pg_database_file(pg_dir, pg_id)?);
+    let canonical_pg_dir = canonicalize_real_pg_directory(pg_dir, pg_id)?;
+    drop(open_and_validate_existing_pg_database_file(
+        &canonical_pg_dir,
+        pg_id,
+    )?);
     Connection::open_with_flags(
-        pg_dir.join("metadata.db"),
+        canonical_pg_dir.join("metadata.db"),
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -925,6 +929,24 @@ fn open_existing_pg_database_read_only(
     .map_err(|source| StoreError::Db {
         context: "open existing PG database read-only",
         source: source.into(),
+    })
+}
+
+fn canonicalize_real_pg_directory(pg_dir: &Path, pg_id: u32) -> Result<PathBuf, StoreError> {
+    let metadata =
+        fs::symlink_metadata(pg_dir).map_err(|source| StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: format!("PG directory is unavailable: {source}"),
+        })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: "PG path is not a real directory".to_string(),
+        });
+    }
+    fs::canonicalize(pg_dir).map_err(|source| StoreError::PgDurableIdentityInvalid {
+        pg_id,
+        reason: format!("PG directory cannot be resolved: {source}"),
     })
 }
 
@@ -1412,6 +1434,19 @@ mod durable_identity_tests {
             StoreError::PgDurableIdentityInvalid { pg_id: 3, reason }
                 if reason.contains("metadata store is unavailable")
         ));
+    }
+
+    #[test]
+    fn pg_durable_identity_accepts_symlinked_ancestor() {
+        let temp = test_util::tempdir();
+        let real_parent = temp.path().join("real-parent");
+        fs::create_dir(&real_parent).unwrap();
+        let linked_parent = temp.path().join("linked-parent");
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+        let pg_dir = linked_parent.join("pg-0003");
+        initialize_pg_durable_identity(&pg_dir, 3, TEST_IDENTITY).unwrap();
+
+        verify_pg_durable_identity(&pg_dir, 3, TEST_IDENTITY).unwrap();
     }
 
     #[test]
