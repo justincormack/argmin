@@ -662,7 +662,8 @@ Node-client role classification (2026-07-19):
 | `ShardReadHandleNodeClient` | data locations carried in the handle request | active/retained authority is inherited from each validated `ShardLocation`; the lease itself remains non-cloneable |
 | `ObjectPayloadLeaseNodeClient` | object subject rather than a caller-supplied PG | active subject-bound lease acquisition, reclaim-begin, and observation; placement is validated when shard locations are acquired |
 | `RetainedObjectPayloadReclaimNodeClient` | object subject rather than a caller-supplied PG | retained exact-claim reclaim completion and fence cleanup; opaque lease objects retain their own release authority |
-| `MetadataCommandNodeClient` | genuinely generic metadata PG | active publisher authority, retained recovery authority, or peering/transfer authority selected from the command/recovery operation class |
+| `MetadataCommandNodeClient` | genuinely generic metadata PG | active publisher/convergence authority; broader recovery and peering/transfer separation remains open |
+| `RetainedMetadataCommandNodeClient` | genuinely generic metadata PG | exact retained-route authority for applying and finishing a previously prepared stream-upload abort |
 | `StorageNodeClient` | removed transitional mixed aggregate | production and cross-boundary test callers use role-specific interfaces; deliberately process-local assertions use the sanctioned raw-node test facade; private local helpers implement the embedded adapter without exposing another trait surface |
 
 The generic classifications are intentional. A metadata command can target a
@@ -3734,6 +3735,28 @@ Eighty-seventh Phase 3 slice:
 - all 2,366 storage tests pass, as do the focused Unix parity regression,
   formatting, the storage boundary checker, workspace-wide strict Clippy, and
   the full workspace test suite.
+
+Eighty-eighth Phase 3 slice:
+
+- retained stream-abort application and pending-slot finish are no longer
+  callable through the ordinary metadata-command publisher interface. The new
+  `RetainedMetadataCommandNodeClient` contains only those two exact retained-
+  route operations; `MetadataCommandNodeClient` retains active publication,
+  convergence, and the not-yet-separated recovery/peering method families.
+- local and Unix adapters implement both roles, but `LocalNodeStore` and
+  `LocalNodeClients` keep distinct trait objects. Both the full Unix-node
+  installer and the metadata-command-only installer wire the retained role,
+  while retained stream cleanup explicitly selects it from each historical
+  acting-set node.
+- the existing Unix retained-abort regressions now invoke the retained role
+  directly and continue to pin expired-route cleanup, wrong-PG rejection,
+  subject binding, PutObject cleanup, and UploadPart cleanup. Splitting broader
+  recovery/reissue from active publication, separating peering/transfer, and
+  requiring opaque capabilities on the resulting stateful traits remain open
+  in Phase 3.
+- both focused retained-abort Unix regressions and the full storage suite pass,
+  as do formatting, the storage boundary checker, and workspace-wide strict
+  Clippy. The full 7,688-test workspace suite also passes.
 
 ### Phase 4 — type metadata-command publication
 

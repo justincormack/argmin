@@ -275,7 +275,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
         }))
     ));
     assert!(matches!(
-        MetadataCommandNodeClient::apply_retained_stream_upload_abort(
+        RetainedMetadataCommandNodeClient::apply_retained_stream_upload_abort(
             &client,
             PgId::new(wrong_pg_id),
             &wrong_command,
@@ -286,7 +286,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
         }))
     ));
     assert!(matches!(
-        MetadataCommandNodeClient::finish_retained_stream_upload_abort(
+        RetainedMetadataCommandNodeClient::finish_retained_stream_upload_abort(
             &client,
             PgId::new(wrong_pg_id),
             &wrong_command,
@@ -315,14 +315,14 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
                 && abort.session_id == session_id
                 && abort.staged_segments == vec![segment.clone()]
     ));
-    MetadataCommandNodeClient::apply_retained_stream_upload_abort(
+    RetainedMetadataCommandNodeClient::apply_retained_stream_upload_abort(
         &client,
         PgId::new(correct_pg_id),
         &command,
     )
     .unwrap();
     assert!(
-        MetadataCommandNodeClient::finish_retained_stream_upload_abort(
+        RetainedMetadataCommandNodeClient::finish_retained_stream_upload_abort(
             &client,
             PgId::new(correct_pg_id),
             &command,
@@ -350,14 +350,14 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
                 && abort.staged_segments == vec![part_segment.clone()]
                 && abort.stream_create_bucket_write_reservation.is_none()
     ));
-    MetadataCommandNodeClient::apply_retained_stream_upload_abort(
+    RetainedMetadataCommandNodeClient::apply_retained_stream_upload_abort(
         &client,
         PgId::new(correct_pg_id),
         &part_command,
     )
     .unwrap();
     assert!(
-        MetadataCommandNodeClient::finish_retained_stream_upload_abort(
+        RetainedMetadataCommandNodeClient::finish_retained_stream_upload_abort(
             &client,
             PgId::new(correct_pg_id),
             &part_command,

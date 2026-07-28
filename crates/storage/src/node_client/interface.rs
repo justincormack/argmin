@@ -1313,23 +1313,24 @@ pub(crate) trait ShardScavengerObservationNodeClient: Send + Sync {
     ) -> Result<(), StoreError>;
 }
 
-pub(crate) trait MetadataCommandNodeClient: Send + Sync {
+/// Exact retained-route authority for applying and finishing a previously
+/// prepared stream-upload abort. Keeping this separate prevents ordinary
+/// metadata-command publishers from invoking retained cleanup operations.
+pub(crate) trait RetainedMetadataCommandNodeClient: Send + Sync {
     fn apply_retained_stream_upload_abort(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        self.apply_metadata_command_and_record(pg_id, command)
-    }
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
 
     fn finish_retained_stream_upload_abort(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
-    ) -> Result<bool, StoreError> {
-        self.remove_pending_metadata_command_slot(pg_id, command)
-    }
+    ) -> Result<bool, StoreError>;
+}
 
+pub(crate) trait MetadataCommandNodeClient: Send + Sync {
     fn open_metadata_command_critical_section(
         &self,
         pg_id: PgId,

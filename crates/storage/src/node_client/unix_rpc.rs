@@ -3026,7 +3026,7 @@ impl UnixStorageNodeClient {
     }
 }
 
-impl MetadataCommandNodeClient for UnixStorageNodeClient {
+impl RetainedMetadataCommandNodeClient for UnixStorageNodeClient {
     fn apply_retained_stream_upload_abort(
         &self,
         pg_id: PgId,
@@ -3070,7 +3070,9 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
                 )
             })
     }
+}
 
+impl MetadataCommandNodeClient for UnixStorageNodeClient {
     fn open_metadata_command_critical_section(
         &self,
         pg_id: PgId,

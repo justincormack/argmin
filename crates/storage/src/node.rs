@@ -22,9 +22,10 @@ use super::clients::{
     ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
     ObjectPayloadLeaseNodeClient, ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
     PlacedShardNodeClient, RetainedBucketWriteReservationNodeClient,
-    RetainedObjectMutationMetadataNodeClient, RetainedObjectPayloadReclaimNodeClient,
-    RetainedPlacedShardNodeClient, RetainedShardAckNodeClient, ShardAckNodeClient,
-    ShardReadHandleNodeClient, ShardScavengerNodeClient, ShardScavengerObservationNodeClient,
+    RetainedMetadataCommandNodeClient, RetainedObjectMutationMetadataNodeClient,
+    RetainedObjectPayloadReclaimNodeClient, RetainedPlacedShardNodeClient,
+    RetainedShardAckNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient,
+    ShardScavengerNodeClient, ShardScavengerObservationNodeClient,
 };
 use super::{BucketPgId, DataPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 use crate::cluster::ProcessLocalRegistryKey;
@@ -423,6 +424,7 @@ pub(crate) struct LocalNodeClients {
     pub(crate) retained_object_mutation_metadata: Arc<dyn RetainedObjectMutationMetadataNodeClient>,
     pub(crate) object_read_metadata: Arc<dyn ObjectReadMetadataNodeClient>,
     pub(crate) metadata_command: Arc<dyn MetadataCommandNodeClient>,
+    pub(crate) retained_metadata_command: Arc<dyn RetainedMetadataCommandNodeClient>,
     pub(crate) shard: Arc<dyn PlacedShardNodeClient>,
     pub(crate) retained_shard: Arc<dyn RetainedPlacedShardNodeClient>,
     pub(crate) shard_ack: Arc<dyn ShardAckNodeClient>,
@@ -485,6 +487,7 @@ impl LocalNodeRuntime {
             retained_object_mutation_metadata: self.client.clone(),
             object_read_metadata: self.client.clone(),
             metadata_command: self.client.clone(),
+            retained_metadata_command: self.client.clone(),
             shard: self.client.clone(),
             retained_shard: self.client.clone(),
             shard_ack: self.client.clone(),

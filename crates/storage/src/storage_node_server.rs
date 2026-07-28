@@ -38,6 +38,8 @@ use crate::metadata_command::{
     UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
     UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
 };
+#[cfg(test)]
+use crate::node_client::MetadataCommandNodeClient;
 use crate::node_client::{
     complete_multipart_expected_object_parts, BucketMetadataNodeClient,
     BucketWriteReservationNodeClient, BuildAbortMultipartUploadCommandReq,
@@ -48,12 +50,12 @@ use crate::node_client::{
     BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
     BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
     DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
-    MetadataCommandNodeClient, ObjectDeleteStorageSnapshot, ObjectGenerationMetadataNodeClient,
+    ObjectDeleteStorageSnapshot, ObjectGenerationMetadataNodeClient,
     ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
-    RetainedBucketWriteReservationNodeClient, RetainedObjectMutationMetadataNodeClient,
-    ShardAckNodeClient, ShardScavengerNodeClient, ShardScavengerObservationNodeClient,
-    UpdateStreamUploadBucketWriteReservationReq,
+    RetainedBucketWriteReservationNodeClient, RetainedMetadataCommandNodeClient,
+    RetainedObjectMutationMetadataNodeClient, ShardAckNodeClient, ShardScavengerNodeClient,
+    ShardScavengerObservationNodeClient, UpdateStreamUploadBucketWriteReservationReq,
 };
 use crate::node_runtime::pg_store::{
     initialize_pg_durable_identity, inspect_pg_shard_inventory, sync_initialized_pg_store_layout,
@@ -6909,7 +6911,7 @@ impl StorageNodeRetainedStreamAbortCommandRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        MetadataCommandNodeClient::apply_retained_stream_upload_abort(
+        RetainedMetadataCommandNodeClient::apply_retained_stream_upload_abort(
             &local_client,
             self.route.raw_pg_id,
             self.command,
@@ -6927,7 +6929,7 @@ impl StorageNodeRetainedPrimaryStreamAbortCommandRoute<'_> {
             self.route.route.handler.config.node_id,
             Arc::clone(&self.route.route.handler.node),
         );
-        MetadataCommandNodeClient::finish_retained_stream_upload_abort(
+        RetainedMetadataCommandNodeClient::finish_retained_stream_upload_abort(
             &local_client,
             self.route.route.raw_pg_id,
             self.command,

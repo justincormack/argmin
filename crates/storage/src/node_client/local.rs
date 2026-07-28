@@ -3703,6 +3703,44 @@ impl LocalStorageNodeClient {
     }
 }
 
+impl LocalStorageNodeClient {
+    fn apply_metadata_command_and_record_inner(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.apply_metadata_command_and_record(self.node_id.as_u32(), command)
+    }
+
+    fn remove_pending_metadata_command_slot_inner(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.remove_pending_metadata_command_slot(self.node_id.as_u32(), command)
+    }
+}
+
+impl RetainedMetadataCommandNodeClient for LocalStorageNodeClient {
+    fn apply_retained_stream_upload_abort(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        self.apply_metadata_command_and_record_inner(pg_id, command)
+    }
+
+    fn finish_retained_stream_upload_abort(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        self.remove_pending_metadata_command_slot_inner(pg_id, command)
+    }
+}
+
 impl MetadataCommandNodeClient for LocalStorageNodeClient {
     fn open_metadata_command_critical_section(
         &self,
@@ -3802,8 +3840,7 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.remove_pending_metadata_command_slot(self.node_id.as_u32(), command)
+        self.remove_pending_metadata_command_slot_inner(pg_id, command)
     }
 
     fn replace_pending_metadata_command_slot_for_reissue(
@@ -4057,8 +4094,7 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.apply_metadata_command_and_record(self.node_id.as_u32(), command)
+        self.apply_metadata_command_and_record_inner(pg_id, command)
     }
 
     fn apply_metadata_command_and_record_for_recovery(
