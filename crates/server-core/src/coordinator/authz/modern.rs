@@ -976,8 +976,8 @@ fn bucket_policy_decision_for_put_object_action_modern(
     };
 
     let request_object_tags = if policy.requires_request_object_tags_for_action(action) {
-        match policy_context.request_object_tags_xml {
-            Some(tags_xml) => Coordinator::parse_serialized_tag_set(tags_xml)?,
+        match policy_context.request_object_tags {
+            Some(tags) => tags.clone().into_pairs(),
             None => Vec::new(),
         }
     } else {
@@ -1057,7 +1057,7 @@ pub(in crate::coordinator) fn put_object_authorization_with_bucket_policy(
         return Ok(ModernObjectWriteAuthorization::Denied);
     }
 
-    if policy_context.request_object_tags_xml.is_some() {
+    if policy_context.request_object_tags.is_some() {
         let tagging_decision = bucket_policy_decision_for_put_object_action_modern(
             requester,
             bucket,

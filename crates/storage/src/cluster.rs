@@ -92,10 +92,11 @@ use crate::types::{
     PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
     PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
     PreparedStreamPartCommit, PreparedStreamPutCommit, PublicAccessBlockConfig, RouteMapValidity,
-    SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
-    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
-    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus,
-    StoredObject, StreamPutFinalizeSnapshot, StreamUploadCommandRecord, StreamUploadPartSnapshot,
+    SegmentStoredBytesRequest, SerializedTagSet, SessionId, ShardIndex, ShardKey,
+    ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
+    ShardScavengerObservationRecord, ShardScavengerPayloadReference,
+    ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus, StoredObject,
+    StreamPutFinalizeSnapshot, StreamUploadCommandRecord, StreamUploadPartSnapshot,
     StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
     VersionId, WriteAck, WrittenShardAck,
 };
@@ -2428,7 +2429,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
 
     pub fn put_tags_if<E>(
         &self,
-        tags: &str,
+        tags: &SerializedTagSet,
         mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
         self.admission
@@ -2441,7 +2442,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
                     Ok((
                         version_id,
                         version_id,
-                        PutObjectMetadataMutation::PutTags(tags.to_string()),
+                        PutObjectMetadataMutation::PutTags(tags.clone()),
                     ))
                 },
             )

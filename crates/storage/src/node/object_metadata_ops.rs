@@ -27,7 +27,7 @@ impl SharedStorageNode {
         key: &ObjectKey,
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
-    ) -> Result<Result<Option<String>, E>, ObjectPgActionError> {
+    ) -> Result<Result<Option<crate::SerializedTagSet>, E>, ObjectPgActionError> {
         self.with_object_metadata_if(bucket, key, version_id, |pg, stored| match action(stored) {
             Ok(version_id) => Ok(Ok(PgMetadataStore::get_object_tags(
                 pg, bucket, key, version_id,
@@ -43,7 +43,7 @@ impl SharedStorageNode {
         version_id: Option<VersionId>,
         expected_identity: &ObjectReadAuthSubjectIdentity,
         authorized_version_id: VersionId,
-    ) -> Result<Option<String>, ObjectPgActionError> {
+    ) -> Result<Option<crate::SerializedTagSet>, ObjectPgActionError> {
         let stored = match Self::load_stored_object_from_object_pg(pg, bucket, key, version_id) {
             Ok(stored) => stored,
             Err(ObjectPgActionError::Metadata(crate::error::MetadataError::ObjectNotFound)) => {
@@ -77,7 +77,7 @@ impl SharedStorageNode {
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
-        tags: &str,
+        tags: &crate::SerializedTagSet,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
         self.with_object_metadata_if(bucket, key, version_id, |pg, stored| match action(stored) {

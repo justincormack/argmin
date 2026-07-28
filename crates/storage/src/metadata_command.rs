@@ -1147,7 +1147,7 @@ impl InsertDeleteMarkerCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PutObjectMetadataMutation {
-    PutTags(String),
+    PutTags(SerializedTagSet),
     DeleteTags,
     PutRetention(ObjectRetention),
     PutLegalHold(StoredLegalHoldStatus),
@@ -1171,7 +1171,7 @@ impl PutObjectMetadataCommand {
     ) -> Self {
         match mutation {
             PutObjectMetadataMutation::PutTags(tags) => {
-                object.tags = Some(SerializedTagSet::new(tags));
+                object.tags = Some(tags);
             }
             PutObjectMetadataMutation::DeleteTags => {
                 object.tags = None;
@@ -2236,6 +2236,16 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_optional(|decoder| decoder.read_string(field))
     }
 
+    fn read_optional_object_tags(
+        &mut self,
+        field: &'static str,
+    ) -> Result<Option<SerializedTagSet>, String> {
+        self.read_optional_string(field)?
+            .map(SerializedTagSet::from_current_xml)
+            .transpose()
+            .map_err(|error| format!("invalid {field} in metadata command: {error}"))
+    }
+
     fn read_optional_bytes_value(&mut self) -> Result<Option<Vec<u8>>, String> {
         self.read_optional(|decoder| decoder.read_bytes().map(<[u8]>::to_vec))
     }
@@ -2386,9 +2396,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             etag: self.read_object_etag()?,
             ec: self.read_ec_shape()?,
             layout: self.read_object_layout()?,
-            tags: self
-                .read_optional_string("object tags")?
-                .map(SerializedTagSet::new),
+            tags: self.read_optional_object_tags("object tags")?,
             metadata_blob: self
                 .read_optional_bytes_value()?
                 .map(SerializedMetadataBlob::new),
@@ -2437,9 +2445,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 .ok_or_else(|| "invalid storage class".to_string())?,
             ec: self.read_ec_shape()?,
             layout: self.read_object_layout()?,
-            tags: self
-                .read_optional_string("object tags")?
-                .map(SerializedTagSet::new),
+            tags: self.read_optional_object_tags("object tags")?,
             metadata_blob: self
                 .read_optional_bytes_value()?
                 .map(SerializedMetadataBlob::new),
@@ -2766,9 +2772,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             initiated_at: self.read_u64()?,
             state: UploadState::from_u8(self.read_u8()?)
                 .ok_or_else(|| "invalid multipart upload state".to_string())?,
-            tags: self
-                .read_optional_string("multipart upload tags")?
-                .map(SerializedTagSet::new),
+            tags: self.read_optional_object_tags("multipart upload tags")?,
             metadata_blob: SerializedMetadataBlob::new(self.read_bytes()?.to_vec()),
             system_metadata_blob: SerializedSystemMetadataBlob::new(self.read_bytes()?.to_vec()),
             initiator: self.read_owner_identity()?,
@@ -3766,7 +3770,7 @@ fn encode_put_live_object(out: &mut Vec<u8>, object: &PutLiveObjectReq) {
     put_u8(out, object.ec.k);
     put_u8(out, object.ec.m);
     encode_object_layout(out, object.layout);
-    encode_optional_str(out, object.tags.as_deref());
+    encode_optional_str(out, object.tags.as_ref().map(SerializedTagSet::as_str));
     encode_optional_bytes(
         out,
         object.metadata_blob.as_ref().map(|blob| blob.as_slice()),
@@ -3798,7 +3802,7 @@ fn encode_live_object_record(out: &mut Vec<u8>, object: &LiveObjectRecord) {
     put_u8(out, object.ec.k);
     put_u8(out, object.ec.m);
     encode_object_layout(out, object.layout);
-    encode_optional_str(out, object.tags.as_deref());
+    encode_optional_str(out, object.tags.as_ref().map(SerializedTagSet::as_str));
     encode_optional_bytes(
         out,
         object.metadata_blob.as_ref().map(|blob| blob.as_slice()),
@@ -4370,6 +4374,35 @@ mod tests {
     }
 
     #[test]
+    fn metadata_command_object_tags_require_current_canonical_xml() {
+        let noncanonical =
+            "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>";
+        let mut encoded = Vec::new();
+        encode_optional_str(&mut encoded, Some(noncanonical));
+        let error = MetadataCommandLogEntryDecoder::new(&encoded)
+            .read_optional_object_tags("object tags")
+            .unwrap_err();
+        assert!(error.contains("not the current canonical representation"));
+
+        let canonical = s3_types::TagSet::from_pairs(
+            vec![("key".to_string(), "value".to_string())],
+            s3_types::MAX_OBJECT_TAGS,
+        )
+        .unwrap()
+        .to_xml();
+        let mut encoded = Vec::new();
+        encode_optional_str(&mut encoded, Some(&canonical));
+        let decoded = MetadataCommandLogEntryDecoder::new(&encoded)
+            .read_optional_object_tags("object tags")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decoded.tag_set().clone().into_pairs(),
+            vec![("key".into(), "value".into())]
+        );
+    }
+
+    #[test]
     fn commit_direct_put_object_rejects_missing_bucket_write_reservation_proof() {
         let bucket = BucketName::try_from("direct-proof-required".to_string()).unwrap();
         let key = ObjectKey::try_from("key".to_string()).unwrap();
@@ -4657,7 +4690,7 @@ mod tests {
                     storage_class: StorageClass::Standard,
                     ec: EcShape { k: 0, m: 0 },
                     layout: ObjectLayout::Standard,
-                    tags: Some(SerializedTagSet::new("<Tagging/>".to_string())),
+                    tags: Some(SerializedTagSet::default()),
                     metadata_blob: Some(SerializedMetadataBlob::default()),
                     system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
                     object_lock: ObjectLockState::default(),
@@ -5292,7 +5325,7 @@ mod tests {
             key: key.clone(),
             initiated_at: 560,
             state: crate::UploadState::Aborting,
-            tags: Some(crate::SerializedTagSet::new("<Tagging/>".to_string())),
+            tags: Some(crate::SerializedTagSet::default()),
             metadata_blob: SerializedMetadataBlob::new(vec![1, 2, 3]),
             system_metadata_blob: SerializedSystemMetadataBlob::new(vec![4, 5, 6]),
             initiator: OwnerIdentity::from_principal("initiator"),
@@ -5547,7 +5580,7 @@ mod tests {
                 bucket_write_reservation: bucket_write_reservation.clone(),
                 object: LiveObjectRecord {
                     version_id: VersionId::from_u64(8),
-                    tags: Some(SerializedTagSet::new("<Tagging/>".to_string())),
+                    tags: Some(SerializedTagSet::default()),
                     ..metadata_object.clone()
                 },
             })),
@@ -5590,7 +5623,7 @@ mod tests {
                         upload_id: upload_id.clone(),
                         bucket: bucket.clone(),
                         key: key.clone(),
-                        tags: Some(crate::SerializedTagSet::new("<Tagging/>".to_string())),
+                        tags: Some(crate::SerializedTagSet::default()),
                         metadata_blob: SerializedMetadataBlob::new(vec![1, 2, 3]),
                         system_metadata_blob: SerializedSystemMetadataBlob::new(vec![4, 5, 6]),
                         initiator: OwnerIdentity::from_principal("initiator"),
@@ -5775,19 +5808,19 @@ mod tests {
                 0xa264c0be34b003c1,
                 0x4064ab351da5ec23,
                 0x3a91a3f997d103e7,
-                0x7f7289dfb1e4f15f,
+                0xf2b7e5456bd29c36,
                 0xe5b35e4b9f7c4107,
                 0xd6f465d9206340d3,
                 0xfdb144ec475d7bfa,
-                0x20f184c613eb69d4,
-                0x8ccbd75a7a73b309,
-                0x8ac901084f1d05f6,
+                0x23ceaa148dd7d3f7,
+                0x738365ff641798ab,
+                0x425c1b74236a68d4,
                 0xb7b3e1f199758867,
                 0x81ab01dd33c13239,
                 0x51a1b4869d63136a,
                 0xd0c7bd9974fc9c90,
                 0x6593ee7f4757cef9,
-                0x00d8b7771aff75c4,
+                0xb389243e43e42623,
                 0xd31016e32f5ab5f3,
                 0x8b19b1d4d3975f49,
                 0xd98014e86ada7667,

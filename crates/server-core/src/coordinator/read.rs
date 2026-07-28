@@ -73,7 +73,7 @@ impl Coordinator {
             return Ok(None);
         };
 
-        let count = Self::parse_serialized_tag_set(tags.as_str())?.len();
+        let count = tags.tag_set().len();
         Ok((count > 0).then_some(count))
     }
 

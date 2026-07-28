@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use checksum::MultipartChecksumConfig;
-use storage::{
-    BucketName, ObjectEncryption, ObjectKey, ObjectLayout, SerializedTagSet, StoredObject,
-};
+use storage::{BucketName, ObjectEncryption, ObjectKey, ObjectLayout, StoredObject};
 
 use super::read_core::{
     segment_payloads_from_object_segments, snapshotted_multipart_parts_from_storage, ReadRuntime,
@@ -349,7 +347,7 @@ impl Coordinator {
         }
         let committed_tags = match &req.tagging {
             TaggingDirective::Copy => src_tags,
-            TaggingDirective::Replace(tags) => tags.map(SerializedTagSet::from),
+            TaggingDirective::Replace(tags) => Self::stored_object_tags(*tags)?,
         };
         let mut replacement_checksum = match directive {
             MetadataDirective::Replace {

@@ -1307,6 +1307,9 @@ fn local_cluster_reopen_preserves_mixed_storage_cluster_history() {
     set_route_primary(&mut reopened, object_pg, NodeId::new(2));
     let after_reopen = collect_metadata_replay_snapshot(&reopened, &node_ids, &pg_ids);
     assert_eq!(after_reopen, before_reopen);
+    let expected_tags = crate::tests::object_tags(
+        "<Tagging><TagSet><Tag><Key>phase</Key><Value>7.4</Value></Tag></TagSet></Tagging>",
+    );
 
     for node_id in node_ids {
         let pg = reopened
@@ -1320,10 +1323,8 @@ fn local_cluster_reopen_preserves_mixed_storage_cluster_history() {
                 .unwrap();
         let live = stored.as_live().unwrap();
         assert_eq!(
-            live.tags.as_ref().map(|tags| tags.as_str()),
-            Some(
-                "<Tagging><TagSet><Tag><Key>phase</Key><Value>7.4</Value></Tag></TagSet></Tagging>"
-            )
+            live.tags.as_ref().map(crate::SerializedTagSet::tag_set),
+            Some(expected_tags.tag_set())
         );
         assert_eq!(live.size, committed.payload.len() as u64);
     }

@@ -1204,16 +1204,18 @@ fn get_object_bucket_policy_existing_tag_controls_access() {
             test_helpers::requester("owner-a"), None)
         .unwrap();
 
-    let public_tags = "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag><Tag><Key>foo</Key><Value>bar</Value></Tag></TagSet></Tagging>";
-    let private_tags =
-        "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>";
-    let invalid_tags =
-        "<Tagging><TagSet><Tag><Key>security1</Key><Value>public</Value></Tag></TagSet></Tagging>";
+    let public_tags = object_tag_set("<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag><Tag><Key>foo</Key><Value>bar</Value></Tag></TagSet></Tagging>");
+    let private_tags = object_tag_set(
+        "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+    );
+    let invalid_tags = object_tag_set(
+        "<Tagging><TagSet><Tag><Key>security1</Key><Value>public</Value></Tag></TagSet></Tagging>",
+    );
 
     for (key, body, tags) in [
-        ("publictag", b"public".as_slice(), Some(public_tags)),
-        ("privatetag", b"private".as_slice(), Some(private_tags)),
-        ("invalidtag", b"invalid".as_slice(), Some(invalid_tags)),
+        ("publictag", b"public".as_slice(), Some(&public_tags)),
+        ("privatetag", b"private".as_slice(), Some(&private_tags)),
+        ("invalidtag", b"invalid".as_slice(), Some(&invalid_tags)),
     ] {
         test_helpers::put_object(
             &coord,
@@ -1298,9 +1300,9 @@ fn authorize_get_object_bucket_policy_existing_tag_controls_access() {
             data: b"public",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(
+            tags: Some(&object_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
-            ),
+            )),
             cond: NO_WRITE,
             acl: NO_PUT_OBJECT_ACL.into(),
         },
@@ -1491,6 +1493,7 @@ fn put_object_tagging_bucket_policy_uses_current_existing_tags() {
         "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
     let private_tags =
         "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>";
+    let public_tag_set = object_tag_set(public_tags);
 
     test_helpers::put_object(
         &coord,
@@ -1507,7 +1510,7 @@ fn put_object_tagging_bucket_policy_uses_current_existing_tags() {
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(public_tags),
+            tags: Some(&public_tag_set),
             cond: NO_WRITE,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -2145,9 +2148,9 @@ fn put_object_bucket_policy_request_object_tag_controls_access() {
             data: b"public",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(
+            tags: Some(&object_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
-            ),
+            )),
             cond: NO_WRITE,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -2177,8 +2180,10 @@ fn bucket_policy_decision_for_put_object_tagging_requires_matching_action() {
             bucket: &bucket,
             bucket_tags: None,
             action: auth::PolicyAction::PutObjectTagging,
-            policy_context: PutObjectPolicyContext::default().with_request_object_tags_xml(Some(
-                "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+            policy_context: PutObjectPolicyContext::default().with_request_object_tags(Some(
+                &object_tag_set(
+                    "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+                ),
             )),
             policy: policy.as_deref(),
         },
@@ -2210,8 +2215,10 @@ fn bucket_policy_decision_for_put_object_tagging_honors_inline_request_object_ta
             bucket: &bucket,
             bucket_tags: None,
             action: auth::PolicyAction::PutObjectTagging,
-            policy_context: PutObjectPolicyContext::default().with_request_object_tags_xml(Some(
-                "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+            policy_context: PutObjectPolicyContext::default().with_request_object_tags(Some(
+                &object_tag_set(
+                    "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+                ),
             )),
             policy: policy.as_deref(),
         },
@@ -2245,9 +2252,9 @@ fn put_object_bucket_policy_request_object_tag_requires_put_object_tagging_actio
             data: b"public",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(
+            tags: Some(&object_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
-            ),
+            )),
             cond: NO_WRITE,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -2454,9 +2461,9 @@ fn create_multipart_upload_bucket_policy_request_object_tag_controls_access() {
             object: object_request_with_expected_owner("bucket", "public-key", test_helpers::requester("other-user"), None),
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(
+            tags: Some(&object_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
-            ),
+            )),
             checksum: None,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -2491,9 +2498,9 @@ fn authorize_create_multipart_upload_bucket_policy_request_object_tag_controls_a
             ),
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(
+            tags: Some(&object_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
-            ),
+            )),
             checksum: None,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -2525,9 +2532,9 @@ fn create_multipart_upload_bucket_policy_request_object_tag_requires_put_object_
             object: object_request_with_expected_owner("bucket", "public-key", test_helpers::requester("other-user"), None),
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(
+            tags: Some(&object_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
-            ),
+            )),
             checksum: None,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -2571,6 +2578,7 @@ fn copy_object_bucket_policy_existing_tag_source_is_not_evaluable() {
             ),
         ),
     ] {
+        let tags = tags.map(object_tag_set);
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -2586,7 +2594,7 @@ fn copy_object_bucket_policy_existing_tag_source_is_not_evaluable() {
                 data: body,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                tags,
+                tags: tags.as_ref(),
                 cond: NO_WRITE,
                 acl: NO_PUT_OBJECT_ACL.into(),
             },
@@ -2909,6 +2917,7 @@ fn upload_part_copy_bucket_policy_existing_tag_source_controls_access() {
             ),
         ),
     ] {
+        let tags = tags.map(object_tag_set);
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -2924,7 +2933,7 @@ fn upload_part_copy_bucket_policy_existing_tag_source_controls_access() {
                 data: body,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                tags,
+                tags: tags.as_ref(),
                 cond: NO_WRITE,
                 acl: NO_PUT_OBJECT_ACL.into(),
             },
@@ -3173,6 +3182,7 @@ fn get_object_acl_bucket_policy_existing_tag_controls_access_real_api() {
             Some("<Tagging><TagSet><Tag><Key>security1</Key><Value>public</Value></Tag></TagSet></Tagging>"),
         ),
     ] {
+        let tags = tags.map(object_tag_set);
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -3188,7 +3198,7 @@ fn get_object_acl_bucket_policy_existing_tag_controls_access_real_api() {
                 data: body,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                tags,
+                tags: tags.as_ref(),
                 cond: NO_WRITE,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -3264,9 +3274,9 @@ fn get_object_acl_bucket_policy_existing_tag_controls_access_direct_api() {
             data: b"public",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(
+            tags: Some(&object_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
-            ),
+            )),
             cond: NO_WRITE,
             acl: NO_PUT_OBJECT_ACL.into(),
         },
@@ -3745,7 +3755,7 @@ fn bucket_policy_cache_invalidates_across_coordinators_on_replace() {
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(tags_xml),
+            tags: Some(&object_tag_set(tags_xml)),
             cond: NO_WRITE,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -4537,9 +4547,9 @@ fn get_object_bucket_policy_same_pg_completes_without_deadlock() {
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(
+            tags: Some(&object_tag_set(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
-            ),
+            )),
             cond: NO_WRITE,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -4606,7 +4616,7 @@ fn get_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(tags_xml),
+            tags: Some(&object_tag_set(tags_xml)),
             cond: NO_WRITE,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -5467,9 +5477,9 @@ fn bucket_owner_enforced_same_account_standard_requester_cannot_read_acl_attribu
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(
+            tags: Some(&object_tag_set(
                 "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>",
-            ),
+            )),
             cond: NO_WRITE,
             acl: NO_PUT_OBJECT_ACL.into(),
         },
@@ -5672,9 +5682,9 @@ fn bucket_owner_enforced_same_account_standard_requester_cannot_manage_object_ta
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(
+            tags: Some(&object_tag_set(
                 "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>",
-            ),
+            )),
             cond: NO_WRITE,
             acl: NO_PUT_OBJECT_ACL.into(),
         },
@@ -5803,9 +5813,9 @@ fn bucket_owner_enforced_shared_canonical_standard_requester_is_not_object_owner
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(
+            tags: Some(&object_tag_set(
                 "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>",
-            ),
+            )),
             cond: NO_WRITE,
             acl: NO_PUT_OBJECT_ACL.into(),
         },
@@ -6020,9 +6030,9 @@ fn bucket_owner_enforced_admin_tagging_preserves_delete_marker_and_missing_versi
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(
+            tags: Some(&object_tag_set(
                 "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>",
-            ),
+            )),
             cond: NO_WRITE,
             acl: NO_PUT_OBJECT_ACL.into(),
         },
@@ -6117,7 +6127,7 @@ fn get_object_tags_rejects_public_read_for_anonymous_real_api() {
             data: b"public",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(tags_xml),
+            tags: Some(&object_tag_set(tags_xml)),
             cond: NO_WRITE,
 
             acl: PutObjectAcl::PublicRead.into(),
@@ -6154,7 +6164,7 @@ fn get_object_tags_rejects_public_read_for_anonymous_direct_api() {
             data: b"public",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(tags_xml),
+            tags: Some(&object_tag_set(tags_xml)),
             cond: NO_WRITE,
             acl: PutObjectAcl::PublicRead.into(),
         },

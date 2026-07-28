@@ -1195,6 +1195,7 @@ fn copy_object_tagging_copy_preserves_source_tags() {
 
     let tags_xml =
         "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
+    let tags = object_tag_set(tags_xml);
     test_helpers::put_object(
         &coord,
         &PutObjectRequest {
@@ -1205,7 +1206,7 @@ fn copy_object_tagging_copy_preserves_source_tags() {
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(tags_xml),
+            tags: Some(&tags),
             cond: NO_WRITE,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -1236,7 +1237,8 @@ fn copy_object_tagging_copy_preserves_source_tags() {
         .unwrap();
 
     let tags = get_object_tags_test(&coord, "bucket", "dst", None, test_requester(), None).unwrap();
-    assert_eq!(tags.as_deref(), Some(tags_xml));
+    let expected_tags = object_tag_set(tags_xml).to_xml();
+    assert_eq!(tags.as_deref(), Some(expected_tags.as_str()));
 }
 
 #[test]
@@ -1247,7 +1249,9 @@ fn copy_object_commits_authorized_acl_and_trusted_copied_tags() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    let tags = "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
+    let tags_xml =
+        "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
+    let tags = object_tag_set(tags_xml);
     test_helpers::put_object(
         &coord,
         &PutObjectRequest {
@@ -1258,7 +1262,7 @@ fn copy_object_commits_authorized_acl_and_trusted_copied_tags() {
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(tags),
+            tags: Some(&tags),
             cond: NO_WRITE,
             acl: NO_PUT_OBJECT_ACL.into(),
         },
@@ -1302,7 +1306,8 @@ fn copy_object_commits_authorized_acl_and_trusted_copied_tags() {
     assert_eq!(read_all_body(object.body).unwrap(), b"data");
     let object_tags =
         get_object_tags_test(&coord, "bucket", "dst", None, test_requester(), None).unwrap();
-    assert_eq!(object_tags.as_deref(), Some(tags));
+    let expected_tags = object_tag_set(tags_xml).to_xml();
+    assert_eq!(object_tags.as_deref(), Some(expected_tags.as_str()));
 }
 
 #[test]
@@ -1317,6 +1322,8 @@ fn copy_object_tagging_replace_overwrites_source_tags() {
         "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
     let dst_tags =
         "<Tagging><TagSet><Tag><Key>tier</Key><Value>gold</Value></Tag></TagSet></Tagging>";
+    let src_tag_set = object_tag_set(src_tags);
+    let dst_tag_set = object_tag_set(dst_tags);
     test_helpers::put_object(
         &coord,
         &PutObjectRequest {
@@ -1327,7 +1334,7 @@ fn copy_object_tagging_replace_overwrites_source_tags() {
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(src_tags),
+            tags: Some(&src_tag_set),
             cond: NO_WRITE,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -1347,7 +1354,7 @@ fn copy_object_tagging_replace_overwrites_source_tags() {
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
             website_redirect_location: None,
-            tagging: TaggingDirective::Replace(Some(dst_tags)),
+            tagging: TaggingDirective::Replace(Some(&dst_tag_set)),
 
             acl: NO_PUT_OBJECT_ACL.into(),
             policy_context: PutObjectPolicyContext::default(),
@@ -1358,7 +1365,8 @@ fn copy_object_tagging_replace_overwrites_source_tags() {
         .unwrap();
 
     let tags = get_object_tags_test(&coord, "bucket", "dst", None, test_requester(), None).unwrap();
-    assert_eq!(tags.as_deref(), Some(dst_tags));
+    let expected_tags = object_tag_set(dst_tags).to_xml();
+    assert_eq!(tags.as_deref(), Some(expected_tags.as_str()));
 }
 
 #[test]

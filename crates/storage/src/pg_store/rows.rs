@@ -5,6 +5,19 @@ pub(super) type BucketObjectLockSqlValues = (i64, Option<u8>, Option<i64>, Optio
 pub(super) type ObjectLockSqlValues = (Option<u8>, Option<i64>, u8);
 
 impl PgStore {
+    pub(super) fn parse_object_tags(
+        xml: String,
+        column: usize,
+    ) -> rusqlite::Result<SerializedTagSet> {
+        SerializedTagSet::from_current_xml(xml).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+    }
+
     pub(super) fn row_to_object_part(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<ObjectPartRecord> {
@@ -1200,9 +1213,10 @@ impl PgStore {
                 let storage_class = row.get::<_, u8>(8)?;
                 let ec_k = row.get::<_, u8>(9)?;
                 let ec_m = row.get::<_, u8>(10)?;
-                let tags: Option<SerializedTagSet> = row
+                let tags = row
                     .get::<_, Option<String>>(12)?
-                    .map(SerializedTagSet::from);
+                    .map(|xml| Self::parse_object_tags(xml, 12))
+                    .transpose()?;
                 let metadata_blob: Option<SerializedMetadataBlob> = row
                     .get::<_, Option<Vec<u8>>>(15)?
                     .map(SerializedMetadataBlob::from);
@@ -1307,7 +1321,8 @@ impl PgStore {
                     layout,
                     tags: row
                         .get::<_, Option<String>>(12)?
-                        .map(SerializedTagSet::from),
+                        .map(|xml| Self::parse_object_tags(xml, 12))
+                        .transpose()?,
                     metadata_blob: row
                         .get::<_, Option<Vec<u8>>>(15)?
                         .map(SerializedMetadataBlob::from),

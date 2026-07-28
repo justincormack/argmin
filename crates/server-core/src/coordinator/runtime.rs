@@ -2815,7 +2815,7 @@ impl ReadRuntime {
                 continue;
             };
             let tags = match record.tags.as_deref() {
-                Some(tags_xml) => Coordinator::parse_serialized_tag_set(tags_xml)?,
+                Some(tags) => tags.clone().into_pairs(),
                 None => Vec::new(),
             };
             let Some(expiration) = Coordinator::evaluate_current_object_lifecycle_expiration(
@@ -2959,7 +2959,7 @@ impl ReadRuntime {
                         return Ok::<bool, ServerError>(false);
                     };
                     let tags = match record.tags.as_deref() {
-                        Some(tags_xml) => Coordinator::parse_serialized_tag_set(tags_xml)?,
+                        Some(tags) => tags.clone().into_pairs(),
                         None => Vec::new(),
                     };
                     let Some(expiration) =

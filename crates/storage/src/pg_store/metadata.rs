@@ -9633,11 +9633,11 @@ impl PgMetadataStore for PgStore {
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-        tags: &str,
+        tags: &SerializedTagSet,
     ) -> Result<(), MetadataError> {
         let updated = self.execute_cached_metadata(
             "UPDATE objects SET tags = ?1 WHERE bucket = ?2 AND key = ?3 AND version_id = ?4 AND status = 0",
-            params![tags, bucket, key, version_id.to_u64() as i64],
+            params![tags.as_str(), bucket, key, version_id.to_u64() as i64],
             "put object tags",
         )?;
         if updated == 0 {
@@ -9660,13 +9660,17 @@ impl PgMetadataStore for PgStore {
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-    ) -> Result<Option<String>, MetadataError> {
+    ) -> Result<Option<SerializedTagSet>, MetadataError> {
         let result = self
             .query_row_cached_optional_metadata(
                 "SELECT tags FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND status = 0",
                 params![bucket, key, version_id.to_u64() as i64],
                 "get object tags",
-                |row| row.get(0),
+                |row| {
+                    row.get::<_, Option<String>>(0)?
+                        .map(|xml| Self::parse_object_tags(xml, 0))
+                        .transpose()
+                },
             )?;
         if let Some(tags) = result {
             Ok(tags)
@@ -9815,7 +9819,10 @@ impl PgMetadataStore for PgStore {
                                 Box::from(format!("invalid upload state: {state_raw}")),
                             )
                         })?,
-                        tags: row.get::<_, Option<String>>(5)?.map(SerializedTagSet::from),
+                        tags: row
+                            .get::<_, Option<String>>(5)?
+                            .map(|xml| Self::parse_object_tags(xml, 5))
+                            .transpose()?,
                         metadata_blob: SerializedMetadataBlob::from(row.get::<_, Vec<u8>>(6)?),
                         system_metadata_blob: SerializedSystemMetadataBlob::from(
                             row.get::<_, Vec<u8>>(7)?,
@@ -10132,7 +10139,10 @@ impl PgMetadataStore for PgStore {
                             Box::from(format!("invalid upload state: {state_raw}")),
                         )
                     })?,
-                    tags: row.get::<_, Option<String>>(5)?.map(SerializedTagSet::from),
+                    tags: row
+                        .get::<_, Option<String>>(5)?
+                        .map(|xml| Self::parse_object_tags(xml, 5))
+                        .transpose()?,
                     metadata_blob: SerializedMetadataBlob::from(row.get::<_, Vec<u8>>(6)?),
                     system_metadata_blob: SerializedSystemMetadataBlob::from(
                         row.get::<_, Vec<u8>>(7)?,

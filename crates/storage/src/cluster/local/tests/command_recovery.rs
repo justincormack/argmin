@@ -7422,7 +7422,15 @@ fn direct_put_commit_drains_unrelated_pending_command_before_publish() {
             .get_pg(object_pg)
             .unwrap();
         let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &pending_key).unwrap();
-        assert_eq!(stored.as_live().unwrap().tags.as_deref(), Some(tags));
+        assert_eq!(
+            stored
+                .as_live()
+                .unwrap()
+                .tags
+                .as_ref()
+                .map(crate::SerializedTagSet::as_str),
+            Some(crate::tests::object_tags(tags).as_str())
+        );
     }
 }
 
@@ -7518,7 +7526,7 @@ fn direct_put_commit_returns_contention_after_unrelated_partial_exact_pending_co
         MetadataCommandPayload::PutObjectMetadata(Box::new(
             PutObjectMetadataCommand::from_live_object_and_mutation(
                 live,
-                PutObjectMetadataMutation::PutTags(tags.to_string()),
+                PutObjectMetadataMutation::PutTags(crate::tests::object_tags(tags)),
                 proof,
             ),
         )),
@@ -7581,7 +7589,15 @@ fn direct_put_commit_returns_contention_after_unrelated_partial_exact_pending_co
             .get_pg(object_pg)
             .unwrap();
         let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &pending_key).unwrap();
-        assert_eq!(stored.as_live().unwrap().tags.as_deref(), Some(tags));
+        assert_eq!(
+            stored
+                .as_live()
+                .unwrap()
+                .tags
+                .as_ref()
+                .map(crate::SerializedTagSet::as_str),
+            Some(crate::tests::object_tags(tags).as_str())
+        );
         assert!(
             crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key)
                 .unwrap()

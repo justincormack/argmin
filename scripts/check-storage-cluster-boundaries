@@ -2732,6 +2732,32 @@ fail_with_matches \
     "User/system metadata byte codecs are private to server-core and storage carries only their opaque serialized values" \
     "$metadata_blob_codec_leaks"
 
+object_tag_codec_leaks=$(
+    {
+        rg -n --color=never \
+            '\bSerializedTagSet::(as_str|from_current_xml|new|from)\b' \
+            . \
+            -g 'crates/**/*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            '\bTagSet::parse_current_xml\b' \
+            . \
+            -g 'crates/**/*.rs' \
+            -g '!crates/s3-types/**' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            '\b(request_object_tags_xml|with_request_object_tags_xml)\b' \
+            crates \
+            -g '*.rs' \
+            || true
+    }
+)
+fail_with_matches \
+    "Canonical object-tag XML and its exact-current decoder are private to s3-types/storage; other crates must pass logical TagSet values" \
+    "$object_tag_codec_leaks"
+
 if [[ "$failed" -ne 0 ]]; then
     echo
     echo "storage cluster boundary checks failed" >&2

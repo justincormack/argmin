@@ -8277,6 +8277,48 @@ fn object_layout_schema_rejects_invalid_discriminant() {
 }
 
 #[test]
+fn stored_object_tags_reject_noncanonical_xml_when_decoded() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 100,
+            etag: ObjectEtag::SinglePart([1, 2, 3, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: Some(SerializedTagSet::default()),
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        }))
+        .unwrap();
+
+    store
+        .conn
+        .execute(
+            "UPDATE objects SET tags = ?1 WHERE bucket = ?2 AND key = ?3",
+            params!["<Tagging><TagSet></TagSet></Tagging>", bucket, key],
+        )
+        .unwrap();
+
+    let err = store.get_object_meta(&bucket, &key).unwrap_err();
+    assert!(
+        matches!(err, MetadataError::Db { .. }),
+        "expected database error for noncanonical object tags, got: {err:?}"
+    );
+}
+
+#[test]
 fn malformed_object_segment_okh_is_rejected_when_decoded() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();

@@ -83,7 +83,9 @@ fn object_metadata_pending_install_race_drains_winner_and_retries() {
                 MetadataCommandPayload::PutObjectMetadata(Box::new(
                     PutObjectMetadataCommand::from_live_object_and_mutation(
                         live,
-                        PutObjectMetadataMutation::PutTags(hook_second_tags.clone()),
+                        PutObjectMetadataMutation::PutTags(crate::tests::object_tags(
+                            &hook_second_tags,
+                        )),
                         hook_proof.clone(),
                     ),
                 )),
@@ -109,10 +111,9 @@ fn object_metadata_pending_install_race_drains_winner_and_retries() {
     assert!(hook_ran.load(Ordering::SeqCst));
     assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
 
-    for (key, tags) in [
-        (&first_key, first_tags),
-        (&second_key, second_tags.as_str()),
-    ] {
+    let first_tags = crate::tests::object_tags(first_tags);
+    let second_tags = crate::tests::object_tags(&second_tags);
+    for (key, tags) in [(&first_key, &first_tags), (&second_key, &second_tags)] {
         for node_id in node_ids {
             let pg = first_map
                 .node(node_id)
@@ -123,8 +124,8 @@ fn object_metadata_pending_install_race_drains_winner_and_retries() {
             let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, key).unwrap();
             let live = stored.as_live().expect("test object is live");
             assert_eq!(
-                live.tags.as_ref().map(crate::SerializedTagSet::as_str),
-                Some(tags)
+                live.tags.as_ref().map(crate::SerializedTagSet::tag_set),
+                Some(tags.tag_set())
             );
         }
     }
@@ -206,7 +207,9 @@ fn object_metadata_pending_install_race_reruns_precondition_action() {
                 MetadataCommandPayload::PutObjectMetadata(Box::new(
                     PutObjectMetadataCommand::from_live_object_and_mutation(
                         live,
-                        PutObjectMetadataMutation::PutTags(hook_winner_tags.clone()),
+                        PutObjectMetadataMutation::PutTags(crate::tests::object_tags(
+                            &hook_winner_tags,
+                        )),
                         hook_proof.clone(),
                     ),
                 )),
@@ -246,6 +249,7 @@ fn object_metadata_pending_install_race_reruns_precondition_action() {
         "request action must be rerun after slot contention changes object state"
     );
     assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
+    let winner_tags = crate::tests::object_tags(&winner_tags);
 
     for node_id in node_ids {
         let pg = first_map
@@ -257,8 +261,8 @@ fn object_metadata_pending_install_race_reruns_precondition_action() {
         let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
         let live = stored.as_live().expect("test object is live");
         assert_eq!(
-            live.tags.as_ref().map(crate::SerializedTagSet::as_str),
-            Some(winner_tags.as_str())
+            live.tags.as_ref().map(crate::SerializedTagSet::tag_set),
+            Some(winner_tags.tag_set())
         );
     }
     assert_bucket_write_reservations_released(&first_map, &bucket);

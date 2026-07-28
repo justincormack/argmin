@@ -9179,7 +9179,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         version_id: Option<VersionId>,
         mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
-    ) -> Result<Result<Option<String>, E>, ObjectPgActionError> {
+    ) -> Result<Result<Option<SerializedTagSet>, E>, ObjectPgActionError> {
         let object_pg_id = self.object_metadata_pg(bucket, key);
         let pg_id = object_pg_id.pg_id();
         let object_read_client = self
@@ -9478,7 +9478,7 @@ impl super::StorageCluster {
             Ok((
                 version_id,
                 version_id,
-                PutObjectMetadataMutation::PutTags(tags.to_string()),
+                PutObjectMetadataMutation::PutTags(crate::tests::object_tags(tags)),
             ))
         })
     }

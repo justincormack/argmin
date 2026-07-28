@@ -100,7 +100,7 @@ pub struct AuthorizedPutObjectWrite {
     pub(super) expected_bucket_owner: Option<String>,
     pub(super) acl: AuthorizedPutObjectWriteAcl,
     pub(super) requested_object_lock: ObjectLockState,
-    pub(super) tags: Option<String>,
+    pub(super) tags: Option<s3_types::TagSet>,
     pub(super) write_encryption: ActiveWriteEncryption,
 }
 
@@ -137,8 +137,8 @@ impl AuthorizedPutObjectWrite {
         self.requested_object_lock
     }
 
-    pub(super) fn tags(&self) -> Option<&str> {
-        self.tags.as_deref()
+    pub(super) fn tags(&self) -> Option<&s3_types::TagSet> {
+        self.tags.as_ref()
     }
 }
 

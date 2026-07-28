@@ -326,6 +326,9 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
             test_requester(),
             None,
         );
+        let put_tags = object_tag_set(
+            "<Tagging><TagSet><Tag><Key>expired</Key><Value>route</Value></Tag></TagSet></Tagging>",
+        );
         let put_tags_request = PutObjectTagsRequest {
             object: object_version_request_with_expected_owner(
                 "bucket",
@@ -334,7 +337,7 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
                 test_requester(),
                 None,
             ),
-            tags: "<Tagging><TagSet><Tag><Key>expired</Key><Value>route</Value></Tag></TagSet></Tagging>",
+            tags: &put_tags,
         };
         let put_retention_request = PutObjectRetentionRequest {
             object: object_version_request_with_expected_owner(
@@ -1056,6 +1059,9 @@ fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
             hook_clock.set(4_500)
         }));
+    let request_tags = object_tag_set(
+        "<Tagging><TagSet><Tag><Key>late</Key><Value>write</Value></Tag></TagSet></Tagging>",
+    );
     let request = PutObjectTagsRequest {
         object: object_version_request_with_expected_owner(
             "bucket",
@@ -1064,7 +1070,7 @@ fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
             test_requester(),
             None,
         ),
-        tags: "<Tagging><TagSet><Tag><Key>late</Key><Value>write</Value></Tag></TagSet></Tagging>",
+        tags: &request_tags,
     };
     let error = coord
         .put_object_tags_on_admitted_route(&admission, &request)
@@ -1088,7 +1094,7 @@ fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
         coord
             .get_object_tags_on_admitted_route(&fresh_admission, &request.object)
             .unwrap()
-            .as_deref(),
+            .as_ref(),
         Some(request.tags)
     );
 }
@@ -4732,8 +4738,9 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
     };
 
     let foreign_admission = foreign.admit_storage_route_for_request().unwrap();
-    let canary_tags =
-        "<Tagging><TagSet><Tag><Key>domain</Key><Value>canary</Value></Tag></TagSet></Tagging>";
+    let canary_tags = object_tag_set(
+        "<Tagging><TagSet><Tag><Key>domain</Key><Value>canary</Value></Tag></TagSet></Tagging>",
+    );
     let put_tags_request = PutObjectTagsRequest {
         object: object_version_request_with_expected_owner(
             "bucket",
@@ -4742,7 +4749,7 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
             test_requester(),
             None,
         ),
-        tags: canary_tags,
+        tags: &canary_tags,
     };
     let baseline_retention = ObjectRetention {
         mode: ObjectLockMode::Governance,
@@ -4838,6 +4845,9 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
         )
         .unwrap();
 
+    let rejected_tag_set = object_tag_set(
+        "<Tagging><TagSet><Tag><Key>foreign</Key><Value>mutation</Value></Tag></TagSet></Tagging>",
+    );
     let rejected_tags = PutObjectTagsRequest {
         object: object_version_request_with_expected_owner(
             "bucket",
@@ -4846,7 +4856,7 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
             test_requester(),
             None,
         ),
-        tags: "<Tagging><TagSet><Tag><Key>foreign</Key><Value>mutation</Value></Tag></TagSet></Tagging>",
+        tags: &rejected_tag_set,
     };
     let rejected_retention = PutObjectRetentionRequest {
         object: object_version_request_with_expected_owner(
@@ -5024,8 +5034,8 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
         foreign
             .get_object_tags_on_admitted_route(&foreign_admission, &metadata_request)
             .unwrap()
-            .as_deref(),
-        Some(canary_tags)
+            .as_ref(),
+        Some(&canary_tags)
     );
     assert_eq!(
         foreign
@@ -9231,12 +9241,11 @@ fn put_object_tags_epoch_change_before_metadata_apply_commits_once_on_pinned_rou
     );
 
     let tags = get_object_tags_test(&coord, bucket, key, None, test_requester(), None).unwrap();
-    assert_eq!(
-        tags.as_deref(),
-        Some(
-            "<Tagging><TagSet><Tag><Key>epoch</Key><Value>changed</Value></Tag></TagSet></Tagging>"
-        )
-    );
+    let expected_tags = object_tag_set(
+        "<Tagging><TagSet><Tag><Key>epoch</Key><Value>changed</Value></Tag></TagSet></Tagging>",
+    )
+    .to_xml();
+    assert_eq!(tags.as_deref(), Some(expected_tags.as_str()));
 }
 
 #[test]
@@ -13635,7 +13644,7 @@ fn put_object_metadata_request_maps_command_log_conflict_to_operation_aborted() 
         "bucket",
         "key",
         None,
-        "foo=bar",
+        "<Tagging><TagSet><Tag><Key>foo</Key><Value>bar</Value></Tag></TagSet></Tagging>",
         test_requester(),
         None,
     )
@@ -16156,7 +16165,7 @@ fn put_object_persists_tags_in_initial_write() {
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(tags_xml),
+            tags: Some(&object_tag_set(tags_xml)),
             cond: NO_WRITE,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -16165,7 +16174,8 @@ fn put_object_persists_tags_in_initial_write() {
     .unwrap();
 
     let tags = get_object_tags_test(&coord, "bucket", "key", None, test_requester(), None).unwrap();
-    assert_eq!(tags.as_deref(), Some(tags_xml));
+    let expected_tags = object_tag_set(tags_xml).to_xml();
+    assert_eq!(tags.as_deref(), Some(expected_tags.as_str()));
 }
 
 #[test]
@@ -16212,7 +16222,7 @@ fn put_object_with_tags_allows_same_account_owner_account() {
             data: b"data",
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
-            tags: Some(tags_xml),
+            tags: Some(&object_tag_set(tags_xml)),
             cond: NO_WRITE,
             acl: NO_PUT_OBJECT_ACL.into(),
         },
@@ -16228,7 +16238,8 @@ fn put_object_with_tags_allows_same_account_owner_account() {
         None,
     )
     .unwrap();
-    assert_eq!(tags.as_deref(), Some(tags_xml));
+    let expected_tags = object_tag_set(tags_xml).to_xml();
+    assert_eq!(tags.as_deref(), Some(expected_tags.as_str()));
 }
 
 #[test]

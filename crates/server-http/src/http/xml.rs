@@ -4137,7 +4137,7 @@ impl TagSet {
         }
         let tags = parse_tag_collection_xml(
             data,
-            50,
+            s3_types::MAX_BUCKET_TAGS,
             b"TagResourceRequest",
             b"Tags",
             "missing <TagResourceRequest> element in tagging XML",
@@ -4148,7 +4148,7 @@ impl TagSet {
             return Err(empty_s3_control_tag_set());
         }
         Ok(Self {
-            inner: AwsTagSet::from_pairs(tags, 50)
+            inner: AwsTagSet::from_pairs(tags, s3_types::MAX_BUCKET_TAGS)
                 .expect("S3 Control parser already validated every tag"),
         })
     }
@@ -4156,6 +4156,11 @@ impl TagSet {
     #[must_use]
     pub fn as_slice(&self) -> &[AwsTag] {
         self.inner.as_slice()
+    }
+
+    #[must_use]
+    pub fn as_aws_tag_set(&self) -> &AwsTagSet {
+        &self.inner
     }
 
     #[must_use]
@@ -4322,7 +4327,7 @@ pub fn parse_url_encoded_tags(input: &str) -> Result<Vec<(String, String)>, Serv
         tags.push((key, value));
     }
 
-    if tags.len() > 10 {
+    if tags.len() > s3_types::MAX_OBJECT_TAGS {
         return Err(ServerError::InvalidTag {
             reason: format!("Object tags cannot be greater than 10, got {}", tags.len()),
             tag_key: None,
@@ -4330,12 +4335,12 @@ pub fn parse_url_encoded_tags(input: &str) -> Result<Vec<(String, String)>, Serv
         });
     }
 
-    TagSet::new(tags, 10).map(TagSet::into_vec)
+    TagSet::new(tags, s3_types::MAX_OBJECT_TAGS).map(TagSet::into_vec)
 }
 
 /// Count tags in canonical stored tagging XML.
 pub fn count_tags_in_xml(xml: &str) -> Result<usize, ServerError> {
-    parse_tagging_xml(xml.as_bytes(), 10).map(|tags| tags.len())
+    parse_tagging_xml(xml.as_bytes(), s3_types::MAX_OBJECT_TAGS).map(|tags| tags.len())
 }
 
 /// Percent-decode a tag key or value from URL-encoded form.

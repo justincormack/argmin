@@ -1794,7 +1794,7 @@ pub(crate) struct StorageRpcObjectTagsForSubjectRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StorageRpcObjectTagsForSubjectOutcome {
-    Loaded(Option<String>),
+    Loaded(Option<SerializedTagSet>),
     StaleSubject,
 }
 
@@ -6823,7 +6823,7 @@ pub(crate) fn encode_object_tags_for_subject_response(
     match &response.outcome {
         StorageRpcObjectTagsForSubjectOutcome::Loaded(tags) => {
             put_u8(&mut out, 0);
-            put_optional_string(&mut out, tags.as_deref());
+            put_optional_string(&mut out, tags.as_ref().map(SerializedTagSet::as_str));
         }
         StorageRpcObjectTagsForSubjectOutcome::StaleSubject => put_u8(&mut out, 1),
     }
@@ -6835,7 +6835,9 @@ pub(crate) fn decode_object_tags_for_subject_response(
 ) -> Result<StorageRpcObjectTagsForSubjectResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let outcome = match decoder.read_u8()? {
-        0 => StorageRpcObjectTagsForSubjectOutcome::Loaded(decoder.read_optional_string()?),
+        0 => StorageRpcObjectTagsForSubjectOutcome::Loaded(
+            decoder.read_optional_serialized_tag_set()?,
+        ),
         1 => StorageRpcObjectTagsForSubjectOutcome::StaleSubject,
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
@@ -14324,7 +14326,15 @@ impl<'a> StorageRpcDecoder<'a> {
         &mut self,
     ) -> Result<PutObjectMetadataMutation, StorageRpcPayloadError> {
         match self.read_u8()? {
-            0 => Ok(PutObjectMetadataMutation::PutTags(self.read_string()?)),
+            0 => {
+                let tags =
+                    SerializedTagSet::from_current_xml(self.read_string()?).map_err(|_| {
+                        StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                            "invalid canonical object tags",
+                        )
+                    })?;
+                Ok(PutObjectMetadataMutation::PutTags(tags))
+            }
             1 => Ok(PutObjectMetadataMutation::DeleteTags),
             2 => Ok(PutObjectMetadataMutation::PutRetention(ObjectRetention {
                 retain_until_unix_seconds: self.read_u64()?,
@@ -15864,7 +15874,14 @@ impl<'a> StorageRpcDecoder<'a> {
     fn read_optional_serialized_tag_set(
         &mut self,
     ) -> Result<Option<SerializedTagSet>, StorageRpcPayloadError> {
-        Ok(self.read_optional_string()?.map(SerializedTagSet::new))
+        self.read_optional_string()?
+            .map(SerializedTagSet::from_current_xml)
+            .transpose()
+            .map_err(|_| {
+                StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "invalid canonical object tags",
+                )
+            })
     }
 
     fn read_optional_serialized_metadata_blob(
@@ -16550,7 +16567,7 @@ fn put_put_object_metadata_mutation(out: &mut Vec<u8>, mutation: &PutObjectMetad
     match mutation {
         PutObjectMetadataMutation::PutTags(tags) => {
             put_u8(out, 0);
-            put_string(out, tags);
+            put_string(out, tags.as_str());
         }
         PutObjectMetadataMutation::DeleteTags => put_u8(out, 1),
         PutObjectMetadataMutation::PutRetention(retention) => {
@@ -17666,6 +17683,37 @@ mod tests {
             CreateBucketConfig, GenerationId, ObjectKey, PgId, SessionId,
         },
     };
+
+    #[test]
+    fn storage_rpc_object_tags_require_current_canonical_xml() {
+        let noncanonical =
+            "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>";
+        let mut encoded = Vec::new();
+        put_optional_string(&mut encoded, Some(noncanonical));
+        assert!(matches!(
+            StorageRpcDecoder::new(&encoded).read_optional_serialized_tag_set(),
+            Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid canonical object tags"
+            ))
+        ));
+
+        let canonical = s3_types::TagSet::from_pairs(
+            vec![("key".to_string(), "value".to_string())],
+            s3_types::MAX_OBJECT_TAGS,
+        )
+        .unwrap()
+        .to_xml();
+        let mut encoded = Vec::new();
+        put_optional_string(&mut encoded, Some(&canonical));
+        let decoded = StorageRpcDecoder::new(&encoded)
+            .read_optional_serialized_tag_set()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decoded.tag_set().clone().into_pairs(),
+            vec![("key".into(), "value".into())]
+        );
+    }
 
     #[test]
     fn storage_rpc_frame_round_trips() {
@@ -22061,7 +22109,7 @@ mod tests {
 
         let response = StorageRpcObjectTagsForSubjectResponse {
             outcome: StorageRpcObjectTagsForSubjectOutcome::Loaded(Some(
-                "<Tagging><TagSet/></Tagging>".to_string(),
+                SerializedTagSet::default(),
             )),
         };
         let bytes = encode_object_tags_for_subject_response(&response);
@@ -22200,7 +22248,7 @@ mod tests {
             size: 12,
             etag_crc64: 99,
             ec: EcShape { k: 4, m: 2 },
-            tags: Some(SerializedTagSet::new("<Tagging/>".to_string())),
+            tags: Some(SerializedTagSet::default()),
             metadata_blob: SerializedMetadataBlob::new(vec![1, 2, 3]),
             system_metadata_blob: SerializedSystemMetadataBlob::new(vec![4, 5, 6]),
             object_lock: ObjectLockState::default(),

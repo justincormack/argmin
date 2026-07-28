@@ -437,8 +437,8 @@ pub(super) fn evaluate_bucket_policy_for_object_request(
         .policy
         .requires_request_object_tags_for_action(context.action)
     {
-        match context.policy_context.request_object_tags_xml {
-            Some(tags_xml) => Coordinator::parse_serialized_tag_set(tags_xml)?,
+        match context.policy_context.request_object_tags {
+            Some(tags) => tags.clone().into_pairs(),
             None => Vec::new(),
         }
     } else {
@@ -628,8 +628,8 @@ pub(super) fn bucket_policy_decision_for_put_object_action(
     };
 
     let request_object_tags = if policy.requires_request_object_tags_for_action(request.action) {
-        match request.policy_context.request_object_tags_xml {
-            Some(tags_xml) => Coordinator::parse_serialized_tag_set(tags_xml)?,
+        match request.policy_context.request_object_tags {
+            Some(tags) => tags.clone().into_pairs(),
             None => Vec::new(),
         }
     } else {

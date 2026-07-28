@@ -899,12 +899,15 @@ fn bucket_deletion_lifecycle() {
         .unwrap();
 
     // Add tags to the object.
+    let tags = crate::tests::object_tags(
+        "<Tagging><TagSet><Tag><Key>state</Key><Value>present</Value></Tag></TagSet></Tagging>",
+    );
     store
         .put_object_tags(
             &bucket_name("doomed"),
             &object_key("file.txt"),
             VersionId::Null,
-            "<t>v</t>",
+            &tags,
         )
         .unwrap();
 
@@ -1099,6 +1102,10 @@ fn object_tags_through_overwrite_and_versioned_delete() {
         )
         .unwrap();
 
+    let old_tags = crate::tests::object_tags(
+        "<Tagging><TagSet><Tag><Key>state</Key><Value>old</Value></Tag></TagSet></Tagging>",
+    );
+
     // Unversioned: put object, add tags, overwrite → tags gone.
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
@@ -1113,7 +1120,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
             size: 10,
             etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
             layout: ObjectLayout::Standard,
-            tags: Some("<t>old</t>".into()),
+            tags: Some(old_tags.clone()),
             metadata_blob: None,
             system_metadata_blob: None,
             object_lock: ObjectLockState::default(),
@@ -1124,7 +1131,10 @@ fn object_tags_through_overwrite_and_versioned_delete() {
     let tags = store
         .get_object_tags(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
-    assert_eq!(tags.as_deref(), Some("<t>old</t>"));
+    assert_eq!(
+        tags.as_ref().map(SerializedTagSet::tag_set),
+        Some(old_tags.tag_set())
+    );
 
     // Overwrite with no tags.
     store
@@ -1161,7 +1171,16 @@ fn object_tags_through_overwrite_and_versioned_delete() {
     let vid1 = VersionId::Versioned(NonZeroU64::new(10).unwrap());
     let vid2 = VersionId::Versioned(NonZeroU64::new(20).unwrap());
 
-    for (vid, tag) in [(vid1, "<t>v1</t>"), (vid2, "<t>v2</t>")] {
+    let version_one_tags = crate::tests::object_tags(
+        "<Tagging><TagSet><Tag><Key>version</Key><Value>v1</Value></Tag></TagSet></Tagging>",
+    );
+    let version_two_tags = crate::tests::object_tags(
+        "<Tagging><TagSet><Tag><Key>version</Key><Value>v2</Value></Tag></TagSet></Tagging>",
+    );
+    for (vid, tags) in [
+        (vid1, version_one_tags.clone()),
+        (vid2, version_two_tags.clone()),
+    ] {
         store
             .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
                 bucket: bucket_name("bucket"),
@@ -1175,7 +1194,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
                 size: 5,
                 etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
                 layout: ObjectLayout::Standard,
-                tags: Some(tag.into()),
+                tags: Some(tags),
                 metadata_blob: None,
                 system_metadata_blob: None,
                 object_lock: ObjectLockState::default(),
@@ -1188,15 +1207,17 @@ fn object_tags_through_overwrite_and_versioned_delete() {
         store
             .get_object_tags(&bucket_name("bucket"), &object_key("tagged"), vid1)
             .unwrap()
-            .as_deref(),
-        Some("<t>v1</t>")
+            .as_ref()
+            .map(SerializedTagSet::tag_set),
+        Some(version_one_tags.tag_set())
     );
     assert_eq!(
         store
             .get_object_tags(&bucket_name("bucket"), &object_key("tagged"), vid2)
             .unwrap()
-            .as_deref(),
-        Some("<t>v2</t>")
+            .as_ref()
+            .map(SerializedTagSet::tag_set),
+        Some(version_two_tags.tag_set())
     );
 
     // Delete version 1 — version 2 tags unaffected.
@@ -1213,8 +1234,9 @@ fn object_tags_through_overwrite_and_versioned_delete() {
         store
             .get_object_tags(&bucket_name("bucket"), &object_key("tagged"), vid2)
             .unwrap()
-            .as_deref(),
-        Some("<t>v2</t>")
+            .as_ref()
+            .map(SerializedTagSet::tag_set),
+        Some(version_two_tags.tag_set())
     );
 }
 

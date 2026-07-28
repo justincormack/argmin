@@ -81,7 +81,7 @@ impl Coordinator {
         admission: &storage::StorageClusterRouteAdmission,
         bucket: &BucketSummary,
         key: &str,
-        tags_xml: Option<&str>,
+        tags: Option<&s3_types::TagSet>,
         size: u64,
         last_modified: u64,
     ) -> Result<Option<LifecycleExpirationHeader>, ServerError> {
@@ -89,8 +89,8 @@ impl Coordinator {
         else {
             return Ok(None);
         };
-        let tags = match tags_xml {
-            Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
+        let tags = match tags {
+            Some(tags) => tags.clone().into_pairs(),
             None => Vec::new(),
         };
         Ok(Self::evaluate_current_object_lifecycle_expiration(
@@ -106,15 +106,15 @@ impl Coordinator {
         &self,
         bucket: &LoadedBucketHandle,
         key: &str,
-        tags_xml: Option<&str>,
+        tags: Option<&s3_types::TagSet>,
         size: u64,
         last_modified: u64,
     ) -> Result<Option<LifecycleExpirationHeader>, ServerError> {
         let Some(config) = self.cached_bucket_lifecycle_for_loaded_handle(bucket)? else {
             return Ok(None);
         };
-        let tags = match tags_xml {
-            Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
+        let tags = match tags {
+            Some(tags) => tags.clone().into_pairs(),
             None => Vec::new(),
         };
         Ok(Self::evaluate_current_object_lifecycle_expiration(
@@ -129,15 +129,15 @@ impl Coordinator {
     pub(super) fn current_object_write_lifecycle_expiration_for_config(
         lifecycle: Option<&BucketLifecycleConfiguration>,
         key: &str,
-        tags_xml: Option<&str>,
+        tags: Option<&s3_types::TagSet>,
         size: u64,
         last_modified: u64,
     ) -> Result<Option<LifecycleExpirationHeader>, ServerError> {
         let Some(config) = lifecycle else {
             return Ok(None);
         };
-        let tags = match tags_xml {
-            Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
+        let tags = match tags {
+            Some(tags) => tags.clone().into_pairs(),
             None => Vec::new(),
         };
         Ok(Self::evaluate_current_object_lifecycle_expiration(
@@ -236,7 +236,7 @@ impl Coordinator {
                 continue;
             };
             let tags = match record.tags.as_deref() {
-                Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
+                Some(tags) => tags.clone().into_pairs(),
                 None => Vec::new(),
             };
             candidates.push(NoncurrentVersionCandidate {

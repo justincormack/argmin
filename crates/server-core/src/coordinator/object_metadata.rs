@@ -390,8 +390,9 @@ impl Coordinator {
             req.object.version_id,
             can_discover_missing,
         )?;
+        let stored_tags = Self::stored_object_tag_set(req.tags)?;
         route
-            .put_tags_if(req.tags, |stored| {
+            .put_tags_if(&stored_tags, |stored| {
                 if !self.requester_can_manage_object_tags_with_bucket_policy(
                     BucketPolicyAccess {
                         requester: req.object.requester(),
@@ -731,7 +732,7 @@ impl Coordinator {
     pub fn get_object_tags(
         &self,
         req: &ObjectVersionRequest<'_>,
-    ) -> Result<Option<String>, ServerError> {
+    ) -> Result<Option<s3_types::TagSet>, ServerError> {
         let admission = self.admit_storage_route_for_request()?;
         self.get_object_tags_on_admitted_route(&admission, req)
     }
@@ -740,7 +741,7 @@ impl Coordinator {
         &self,
         admission: &StorageClusterRouteAdmission,
         req: &ObjectVersionRequest<'_>,
-    ) -> Result<Option<String>, ServerError> {
+    ) -> Result<Option<s3_types::TagSet>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_tags",
@@ -797,7 +798,7 @@ impl Coordinator {
                     return Err(ServerError::MethodNotAllowed);
                 }
                 let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
-                Ok(live.tags.clone().map(String::from))
+                Ok(live.tags.as_deref().cloned())
             })
             .map_err(|error| {
                 Self::map_object_metadata_access_error(

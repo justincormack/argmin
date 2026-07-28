@@ -1145,6 +1145,7 @@ fn object_metadata_update_commands_apply_to_all_acting_object_pg_nodes() {
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     write_committed_direct_segment_for(&cluster, &bucket, &key, b"object metadata");
     let tags = "<Tagging><TagSet><Tag><Key>tier</Key><Value>hot</Value></Tag></TagSet></Tagging>";
+    let expected_tags = crate::tests::object_tags(tags);
     let retention = crate::ObjectRetention {
         mode: crate::ObjectLockMode::Governance,
         retain_until_unix_seconds: 123_456,
@@ -1189,7 +1190,10 @@ fn object_metadata_update_commands_apply_to_all_acting_object_pg_nodes() {
             crate::PgMetadataStore::get_object_version(&*pg, &bucket, &key, crate::VersionId::Null)
                 .unwrap();
         let live = stored.as_live().unwrap();
-        assert_eq!(live.tags.as_ref().map(|tags| tags.as_str()), Some(tags));
+        assert_eq!(
+            live.tags.as_ref().map(crate::SerializedTagSet::tag_set),
+            Some(expected_tags.tag_set())
+        );
         assert_eq!(live.object_lock.retention, Some(retention));
         assert_eq!(
             live.object_lock.legal_hold,
@@ -1540,6 +1544,7 @@ fn object_metadata_update_retry_converges_pending_partial_replica_command() {
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     write_committed_direct_segment_for(&cluster, &bucket, &key, b"partial object metadata");
     let tags = "<Tagging><TagSet><Tag><Key>retry</Key><Value>yes</Value></Tag></TagSet></Tagging>";
+    let expected_tags = crate::tests::object_tags(tags);
     fn require_tags_absent(stored: &crate::StoredObject) -> Result<crate::VersionId, &'static str> {
         if stored.as_live().unwrap().tags.is_some() {
             Err("tags already visible before pending command convergence")
@@ -1608,8 +1613,9 @@ fn object_metadata_update_retry_converges_pending_partial_replica_command() {
         assert_eq!(
             crate::PgMetadataStore::get_object_tags(&*pg, &bucket, &key, crate::VersionId::Null,)
                 .unwrap()
-                .as_deref(),
-            Some(tags)
+                .as_ref()
+                .map(crate::SerializedTagSet::tag_set),
+            Some(expected_tags.tag_set())
         );
     }
 
@@ -1627,8 +1633,9 @@ fn object_metadata_update_retry_converges_pending_partial_replica_command() {
         assert_eq!(
             crate::PgMetadataStore::get_object_tags(&*pg, &bucket, &key, crate::VersionId::Null,)
                 .unwrap()
-                .as_deref(),
-            Some(tags)
+                .as_ref()
+                .map(crate::SerializedTagSet::tag_set),
+            Some(expected_tags.tag_set())
         );
     }
     assert_bucket_write_reservations_released(&map, &bucket);
@@ -1657,6 +1664,7 @@ fn object_metadata_partial_apply_reopens_and_converges() {
     write_committed_direct_segment_for(&cluster, &bucket, &key, b"object metadata reopen");
     let tags =
         "<Tagging><TagSet><Tag><Key>retry</Key><Value>reopen</Value></Tag></TagSet></Tagging>";
+    let expected_tags = crate::tests::object_tags(tags);
 
     let fail_once = Arc::new(AtomicBool::new(true));
     let hook_bucket = bucket.clone();
@@ -1718,8 +1726,9 @@ fn object_metadata_partial_apply_reopens_and_converges() {
         assert_eq!(
             crate::PgMetadataStore::get_object_tags(&*pg, &bucket, &key, crate::VersionId::Null,)
                 .unwrap()
-                .as_deref(),
-            Some(tags)
+                .as_ref()
+                .map(crate::SerializedTagSet::tag_set),
+            Some(expected_tags.tag_set())
         );
     }
     assert_clean_metadata_command_stream(&reopened_map, &[object_pg]);

@@ -1872,7 +1872,10 @@ fn mpu_create_and_get_upload() {
     assert_eq!(rec.bucket, "bucket");
     assert_eq!(rec.key, "k");
     assert_eq!(rec.state, UploadState::InProgress);
-    assert_eq!(rec.tags.as_deref(), Some(tags));
+    assert_eq!(
+        rec.tags.as_ref().map(SerializedTagSet::as_str),
+        Some(crate::tests::object_tags(tags).as_str())
+    );
     assert_eq!(rec.metadata_blob, vec![1, 2, 3].into());
     assert_eq!(rec.initiator, owner_identity("alice"));
     assert_eq!(rec.owner, owner_identity("alice"));
@@ -2187,7 +2190,10 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         .unwrap()
         .into_live()
         .unwrap();
-    assert_eq!(live.tags.as_deref(), Some(tags));
+    assert_eq!(
+        live.tags.as_ref().map(SerializedTagSet::as_str),
+        Some(crate::tests::object_tags(tags).as_str())
+    );
 }
 
 #[test]
@@ -7208,32 +7214,44 @@ fn object_tags_round_trip() {
     assert!(tags.is_none());
 
     // Put tags
+    let production_tags = crate::tests::object_tags(
+        "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>",
+    );
     store
         .put_object_tags(
             &bucket_name("bucket"),
             &object_key("k"),
             VersionId::Null,
-            "<tags>env=prod</tags>",
+            &production_tags,
         )
         .unwrap();
     let tags = store
         .get_object_tags(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
-    assert_eq!(tags.as_deref(), Some("<tags>env=prod</tags>"));
+    assert_eq!(
+        tags.as_ref().map(SerializedTagSet::tag_set),
+        Some(production_tags.tag_set())
+    );
 
     // Overwrite tags
+    let staging_tags = crate::tests::object_tags(
+        "<Tagging><TagSet><Tag><Key>env</Key><Value>staging</Value></Tag></TagSet></Tagging>",
+    );
     store
         .put_object_tags(
             &bucket_name("bucket"),
             &object_key("k"),
             VersionId::Null,
-            "<tags>env=staging</tags>",
+            &staging_tags,
         )
         .unwrap();
     let tags = store
         .get_object_tags(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
-    assert_eq!(tags.as_deref(), Some("<tags>env=staging</tags>"));
+    assert_eq!(
+        tags.as_ref().map(SerializedTagSet::tag_set),
+        Some(staging_tags.tag_set())
+    );
 
     // Delete tags
     store
@@ -7268,7 +7286,12 @@ fn object_tags_on_delete_marker() {
         .unwrap();
 
     let err = store
-        .put_object_tags(&bucket_name("bucket"), &object_key("k"), vid, "<tags/>")
+        .put_object_tags(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            vid,
+            &SerializedTagSet::default(),
+        )
         .unwrap_err();
     assert!(
         matches!(

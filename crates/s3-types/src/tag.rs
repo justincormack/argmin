@@ -12,6 +12,8 @@ use unicode_general_category::{get_general_category, GeneralCategory};
 
 pub const MAX_TAG_KEY_UTF16_UNITS: usize = 128;
 pub const MAX_TAG_VALUE_UTF16_UNITS: usize = 256;
+pub const MAX_OBJECT_TAGS: usize = 10;
+pub const MAX_BUCKET_TAGS: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TagValidationError {
@@ -47,6 +49,8 @@ pub enum TagSetValidationError {
 pub enum CanonicalTagSetParseError {
     #[error("stored tag XML is malformed: {reason}")]
     Malformed { reason: String },
+    #[error("stored tag XML is not the current canonical representation")]
+    NonCanonical,
     #[error("stored tag XML contains an invalid tag: {0}")]
     Invalid(#[from] TagSetValidationError),
 }
@@ -291,6 +295,11 @@ impl TagSet {
         self.tags.len()
     }
 
+    #[must_use]
+    pub const fn maximum(&self) -> usize {
+        self.maximum
+    }
+
     pub fn reverse(&mut self) {
         self.tags.reverse();
     }
@@ -464,6 +473,20 @@ impl TagSet {
 
         Self::from_pairs(pairs, maximum).map_err(CanonicalTagSetParseError::from)
     }
+
+    /// Decode the exact current stored representation.
+    ///
+    /// Request XML is intentionally more permissive and is parsed by each
+    /// service before being normalized through [`Self::to_xml`]. Durable and
+    /// internal wire decoders must use this method so accepted request syntax
+    /// cannot accidentally become an additional persisted representation.
+    pub fn parse_current_xml(xml: &str, maximum: usize) -> Result<Self, CanonicalTagSetParseError> {
+        let tags = Self::parse_canonical_xml(xml, maximum)?;
+        if tags.to_xml() != xml {
+            return Err(CanonicalTagSetParseError::NonCanonical);
+        }
+        Ok(tags)
+    }
 }
 
 fn decode_canonical_tag_text(
@@ -572,11 +595,36 @@ mod tests {
 
     #[test]
     fn canonical_xml_round_trips_through_validated_types() {
-        let tags = TagSet::from_pairs(vec![("key".to_string(), "value".to_string())], 10).unwrap();
+        let empty = TagSet::empty(MAX_OBJECT_TAGS);
+        let expected_empty = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                              <Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet></TagSet></Tagging>";
+        assert_eq!(empty.to_xml(), expected_empty);
         assert_eq!(
-            TagSet::parse_canonical_xml(&tags.to_xml(), 10).unwrap(),
-            tags
+            TagSet::parse_current_xml(expected_empty, MAX_OBJECT_TAGS).unwrap(),
+            empty
         );
+
+        let tags = TagSet::from_pairs(vec![("key".to_string(), "value".to_string())], 10).unwrap();
+        let expected = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                        <Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet>\
+                        <Tag><Key>key</Key><Value>value</Value></Tag>\
+                        </TagSet></Tagging>";
+        assert_eq!(tags.to_xml(), expected);
+        assert_eq!(TagSet::parse_current_xml(expected, 10).unwrap(), tags);
+    }
+
+    #[test]
+    fn current_xml_rejects_other_well_formed_tagging_representations() {
+        for xml in [
+            "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet><Tag><Key>k&#101;y</Key><Value>value</Value></Tag></TagSet></Tagging>",
+        ] {
+            assert_eq!(
+                TagSet::parse_current_xml(xml, 10),
+                Err(CanonicalTagSetParseError::NonCanonical)
+            );
+        }
     }
 
     #[test]

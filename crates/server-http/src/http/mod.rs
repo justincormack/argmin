@@ -257,7 +257,7 @@ fn validate_untag_resource_tag_key_members(tag_keys: &[String]) -> Result<(), Se
     if tag_keys.is_empty() {
         return Err(xml::empty_s3_control_tag_set());
     }
-    if tag_keys.len() > 50 || tag_keys.iter().any(String::is_empty) {
+    if tag_keys.len() > s3_types::MAX_BUCKET_TAGS || tag_keys.iter().any(String::is_empty) {
         return Err(xml::invalid_s3_control_tag());
     }
     let mut unique = std::collections::HashSet::new();
@@ -1622,9 +1622,14 @@ impl HttpFrontend {
                         &[],
                         crate::coordinator::BucketTagControlAction::ListTagsForResource,
                     )?
-                    .map(|tagging_xml| xml::TagSet::parse_tagging_xml(tagging_xml.as_bytes(), 50))
+                    .map(|tagging_xml| {
+                        xml::TagSet::parse_tagging_xml(
+                            tagging_xml.as_bytes(),
+                            s3_types::MAX_BUCKET_TAGS,
+                        )
+                    })
                     .transpose()?
-                    .unwrap_or_else(|| xml::TagSet::empty(50));
+                    .unwrap_or_else(|| xml::TagSet::empty(s3_types::MAX_BUCKET_TAGS));
                 Ok(S3Response::list_tags_for_resource(
                     tags.to_list_tags_for_resource_xml(),
                 ))
@@ -1644,9 +1649,14 @@ impl HttpFrontend {
                         request_tags.as_slice(),
                         crate::coordinator::BucketTagControlAction::TagResource,
                     )?
-                    .map(|tagging_xml| xml::TagSet::parse_tagging_xml(tagging_xml.as_bytes(), 50))
+                    .map(|tagging_xml| {
+                        xml::TagSet::parse_tagging_xml(
+                            tagging_xml.as_bytes(),
+                            s3_types::MAX_BUCKET_TAGS,
+                        )
+                    })
                     .transpose()?
-                    .unwrap_or_else(|| xml::TagSet::empty(50));
+                    .unwrap_or_else(|| xml::TagSet::empty(s3_types::MAX_BUCKET_TAGS));
                 let merged_tags = existing_tags.merge(&tags)?;
                 let merged_xml = merged_tags.to_xml();
                 self.coordinator
@@ -1683,9 +1693,14 @@ impl HttpFrontend {
                         request_tags.as_slice(),
                         crate::coordinator::BucketTagControlAction::UntagResource,
                     )?
-                    .map(|tagging_xml| xml::TagSet::parse_tagging_xml(tagging_xml.as_bytes(), 50))
+                    .map(|tagging_xml| {
+                        xml::TagSet::parse_tagging_xml(
+                            tagging_xml.as_bytes(),
+                            s3_types::MAX_BUCKET_TAGS,
+                        )
+                    })
                     .transpose()?
-                    .unwrap_or_else(|| xml::TagSet::empty(50));
+                    .unwrap_or_else(|| xml::TagSet::empty(s3_types::MAX_BUCKET_TAGS));
                 // AWS treats invalid-character and overlong keys as a successful
                 // no-op when no resource tags exist. Once any tag exists, it
                 // validates those values before applying the removal.
@@ -1977,16 +1992,19 @@ impl HttpFrontend {
                         None => MetadataDirective::Copy,
                     };
                     // Parse inline tags before writing so invalid tags don't leave orphan objects
-                    let replace_tags_xml = if req
+                    let replace_tags = if req
                         .header("x-amz-tagging-directive")
                         .is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"))
                     {
                         if let Some(tagging_header) = req.header("x-amz-tagging") {
-                            let tags = xml::parse_url_encoded_tags(tagging_header)?;
+                            let tags = xml::TagSet::new(
+                                xml::parse_url_encoded_tags(tagging_header)?,
+                                s3_types::MAX_OBJECT_TAGS,
+                            )?;
                             if tags.is_empty() {
                                 None
                             } else {
-                                Some(xml::get_tagging_xml(&tags)?)
+                                Some(tags)
                             }
                         } else {
                             None
@@ -1998,13 +2016,15 @@ impl HttpFrontend {
                         .header("x-amz-tagging-directive")
                         .is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"))
                     {
-                        TaggingDirective::Replace(replace_tags_xml.as_deref())
+                        TaggingDirective::Replace(
+                            replace_tags.as_ref().map(xml::TagSet::as_aws_tag_set),
+                        )
                     } else {
                         TaggingDirective::Copy
                     };
                     let policy_context = put_object_policy_context_from_request(
                         req,
-                        replace_tags_xml.as_deref(),
+                        replace_tags.as_ref().map(xml::TagSet::as_aws_tag_set),
                         Some(copy_source),
                         directive.policy_condition_value(),
                         acl.policy_condition_value(),
@@ -2054,13 +2074,15 @@ impl HttpFrontend {
                     let sse_customer = parse_sse_customer_request(req)?;
                     let sse_s3 =
                         parse_managed_encryption_request(req, sse_customer.is_some())?.is_some();
-                    let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging")
-                    {
-                        let tags = xml::parse_url_encoded_tags(tagging_header)?;
+                    let inline_tags = if let Some(tagging_header) = req.header("x-amz-tagging") {
+                        let tags = xml::TagSet::new(
+                            xml::parse_url_encoded_tags(tagging_header)?,
+                            s3_types::MAX_OBJECT_TAGS,
+                        )?;
                         if tags.is_empty() {
                             None
                         } else {
-                            Some(xml::get_tagging_xml(&tags)?)
+                            Some(tags)
                         }
                     } else {
                         None
@@ -2074,7 +2096,7 @@ impl HttpFrontend {
                     let acl = parse_put_object_write_acl(req)?;
                     let policy_context = put_object_policy_context_from_request(
                         req,
-                        inline_tags_xml.as_deref(),
+                        inline_tags.as_ref().map(xml::TagSet::as_aws_tag_set),
                         None,
                         None,
                         acl.policy_condition_value(),
@@ -2092,7 +2114,7 @@ impl HttpFrontend {
                             data: &req.body,
                             metadata: &metadata_blob,
                             system_metadata: &system_metadata,
-                            tags: inline_tags_xml.as_deref(),
+                            tags: inline_tags.as_ref().map(xml::TagSet::as_aws_tag_set),
                             cond: &cond,
                             acl,
                             policy_context,
@@ -2626,7 +2648,7 @@ impl HttpFrontend {
                     req,
                     RequestChecksumRequirement::ContentMd5OrChecksumHeader,
                 )?;
-                let tags = xml::TagSet::parse_tagging_xml(&req.body, 50)?;
+                let tags = xml::TagSet::parse_tagging_xml(&req.body, s3_types::MAX_BUCKET_TAGS)?;
                 let tags_xml = tags.to_xml();
                 let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.put_bucket_tags_on_admitted_route(
@@ -2791,8 +2813,7 @@ impl HttpFrontend {
             S3Operation::PutObjectTagging { bucket, key } => {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let vid = parse_version_id(req)?;
-                let tags = xml::TagSet::parse_tagging_xml(&req.body, 10)?;
-                let tags_xml = tags.to_xml();
+                let tags = xml::TagSet::parse_tagging_xml(&req.body, s3_types::MAX_OBJECT_TAGS)?;
                 let requester = self.requester_from_auth(auth, req)?;
                 self.coordinator.put_object_tags_on_admitted_route(
                     storage_route_admission,
@@ -2804,7 +2825,7 @@ impl HttpFrontend {
                             requester,
                             expected_bucket_owner,
                         )?,
-                        tags: &tags_xml,
+                        tags: tags.as_aws_tag_set(),
                     },
                 )?;
                 Ok(S3Response::put_object_tagging())
@@ -2812,16 +2833,15 @@ impl HttpFrontend {
             S3Operation::GetObjectTagging { bucket, key } => {
                 let vid = parse_version_id(req)?;
                 let requester = self.requester_from_auth(auth, req)?;
-                if let Some(tags_xml) = self.coordinator.get_object_tags_on_admitted_route(
+                if let Some(mut tags) = self.coordinator.get_object_tags_on_admitted_route(
                     storage_route_admission,
                     &object_version_request(&bucket, &key, vid, requester, expected_bucket_owner)?,
                 )? {
-                    let mut tags = xml::TagSet::parse_tagging_xml(tags_xml.as_bytes(), 10)?;
                     tags.reverse();
                     Ok(S3Response::get_object_tagging(&tags.to_xml()))
                 } else {
                     // S3 returns empty TagSet (not 404) for objects with no tags
-                    let empty = xml::TagSet::empty(10).to_xml();
+                    let empty = xml::TagSet::empty(s3_types::MAX_OBJECT_TAGS).to_xml();
                     Ok(S3Response::get_object_tagging(&empty))
                 }
             }
@@ -3169,12 +3189,15 @@ impl HttpFrontend {
                     )?),
                     None => None,
                 };
-                let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging") {
-                    let tags = xml::parse_url_encoded_tags(tagging_header)?;
+                let inline_tags = if let Some(tagging_header) = req.header("x-amz-tagging") {
+                    let tags = xml::TagSet::new(
+                        xml::parse_url_encoded_tags(tagging_header)?,
+                        s3_types::MAX_OBJECT_TAGS,
+                    )?;
                     if tags.is_empty() {
                         None
                     } else {
-                        Some(xml::get_tagging_xml(&tags)?)
+                        Some(tags)
                     }
                 } else {
                     None
@@ -3184,7 +3207,7 @@ impl HttpFrontend {
                 let object_lock = parse_object_lock_headers(req)?;
                 let policy_context = put_object_policy_context_from_request(
                     req,
-                    inline_tags_xml.as_deref(),
+                    inline_tags.as_ref().map(xml::TagSet::as_aws_tag_set),
                     None,
                     None,
                     acl.policy_condition_value(),
@@ -3198,7 +3221,7 @@ impl HttpFrontend {
                         object: object_request(&bucket, &key, requester, expected_bucket_owner)?,
                         metadata: &metadata,
                         system_metadata: &system_metadata,
-                        tags: inline_tags_xml.as_deref(),
+                        tags: inline_tags.as_ref().map(xml::TagSet::as_aws_tag_set),
                         checksum,
                         acl,
                         policy_context,
@@ -4045,12 +4068,15 @@ impl HttpFrontend {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         let (metadata_blob, system_metadata) = parse_request_metadata(hp_refs.iter().copied())?;
-        let tags_xml = if let Some(tagging_field) = field("tagging") {
-            let tags = xml::parse_tagging_xml(tagging_field.as_bytes(), 10)?;
+        let tags = if let Some(tagging_field) = field("tagging") {
+            let tags = xml::TagSet::parse_tagging_xml(
+                tagging_field.as_bytes(),
+                s3_types::MAX_OBJECT_TAGS,
+            )?;
             if tags.is_empty() {
                 None
             } else {
-                Some(xml::get_tagging_xml(&tags)?)
+                Some(tags)
             }
         } else {
             None
@@ -4097,9 +4123,9 @@ impl HttpFrontend {
                         sse_customer_request.as_ref().map(|req| req.algorithm()),
                     )
                     .with_website_redirect_location(field(WEBSITE_REDIRECT_LOCATION_HEADER_NAME))
-                    .with_request_object_tags_xml(tags_xml.as_deref()),
+                    .with_request_object_tags(tags.as_ref().map(xml::TagSet::as_aws_tag_set)),
                     object_lock: ObjectLockState::default(),
-                    tags: tags_xml.as_deref(),
+                    tags: tags.as_ref().map(xml::TagSet::as_aws_tag_set),
                     encryption: request_encryption,
                 },
                 storage_route_admission.authority_valid_until_ms(),
@@ -4384,12 +4410,15 @@ impl HttpFrontend {
             parse_managed_encryption_request(req, sse_customer_request.is_some())?;
 
         // Parse inline tags before starting the session.
-        let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging") {
-            let tags = xml::parse_url_encoded_tags(tagging_header)?;
+        let inline_tags = if let Some(tagging_header) = req.header("x-amz-tagging") {
+            let tags = xml::TagSet::new(
+                xml::parse_url_encoded_tags(tagging_header)?,
+                s3_types::MAX_OBJECT_TAGS,
+            )?;
             if tags.is_empty() {
                 None
             } else {
-                Some(xml::get_tagging_xml(&tags)?)
+                Some(tags)
             }
         } else {
             None
@@ -4459,7 +4488,7 @@ impl HttpFrontend {
                     ),
                     policy_context: put_object_policy_context_from_request_fields(
                         PutObjectPolicyContextFields {
-                            tags_xml: inline_tags_xml.as_deref(),
+                            tags: inline_tags.as_ref().map(xml::TagSet::as_aws_tag_set),
                             copy_source: None,
                             metadata_directive: None,
                             canned_acl: parse_put_object_acl(req.header("x-amz-acl"))
@@ -4486,7 +4515,7 @@ impl HttpFrontend {
                         },
                     ),
                     object_lock,
-                    tags: inline_tags_xml.as_deref(),
+                    tags: inline_tags.as_ref().map(xml::TagSet::as_aws_tag_set),
                     encryption: crate::coordinator::WriteEncryptionRequest::from_request_parts(
                         sse_customer_request.as_ref(),
                         managed_encryption,
@@ -6431,14 +6460,14 @@ fn parse_put_object_write_acl(
 
 fn put_object_policy_context_from_request<'a>(
     req: &'a S3Request,
-    tags_xml: Option<&'a str>,
+    tags: Option<&'a s3_types::TagSet>,
     copy_source: Option<&'a str>,
     metadata_directive: Option<&'a str>,
     canned_acl: Option<&'a str>,
     managed_encryption: Option<ManagedEncryptionAlgorithm>,
 ) -> crate::coordinator::PutObjectPolicyContext<'a> {
     put_object_policy_context_from_request_fields(PutObjectPolicyContextFields {
-        tags_xml,
+        tags,
         copy_source,
         metadata_directive,
         canned_acl,
@@ -6483,7 +6512,7 @@ struct PutObjectConditionalHeaders<'a> {
 
 #[derive(Clone, Copy, Default)]
 struct PutObjectPolicyContextFields<'a> {
-    tags_xml: Option<&'a str>,
+    tags: Option<&'a s3_types::TagSet>,
     copy_source: Option<&'a str>,
     metadata_directive: Option<&'a str>,
     canned_acl: Option<&'a str>,
@@ -6505,7 +6534,7 @@ fn put_object_policy_context_from_request_fields<'a>(
     .with_website_redirect_location(fields.website_redirect_location)
     .with_managed_encryption(fields.managed_encryption)
     .with_sse_customer_algorithm(fields.sse_customer_algorithm)
-    .with_request_object_tags_xml(fields.tags_xml)
+    .with_request_object_tags(fields.tags)
     .with_acl_grant_headers(
         fields.grants.grant_read,
         fields.grants.grant_write,

@@ -2341,7 +2341,7 @@ impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
         version_id: Option<VersionId>,
         expected_identity: &ObjectReadAuthSubjectIdentity,
         authorized_version_id: VersionId,
-    ) -> Result<Option<String>, ObjectPgActionError> {
+    ) -> Result<Option<crate::SerializedTagSet>, ObjectPgActionError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         SharedStorageNode::get_object_tags_for_subject_from_object_pg(
             &pg,

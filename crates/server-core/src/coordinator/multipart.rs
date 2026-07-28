@@ -3,9 +3,8 @@ use std::time::{Duration, Instant};
 use storage::{
     BucketName, CreateMultipartUploadOutcome, CreateMultipartUploadReq, FinalizeStreamPartOutcome,
     GenerationId, MultipartPartRecord, MultipartPartSegmentRecord, ObjectKey,
-    PreparedStreamPartCommit, SerializedMetadataBlob, SerializedSystemMetadataBlob,
-    SerializedTagSet, SessionId, StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget,
-    UploadId, UploadState,
+    PreparedStreamPartCommit, SerializedMetadataBlob, SerializedSystemMetadataBlob, SessionId,
+    StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
 };
 
 fn multipart_completion_fingerprint(
@@ -653,7 +652,7 @@ impl Coordinator {
                         upload_id: typed_upload_id.clone(),
                         bucket: authorized.bucket.clone(),
                         key: authorized.key.clone(),
-                        tags: authorized.tags.as_deref().map(SerializedTagSet::from),
+                        tags: Self::stored_object_tags(authorized.tags.as_ref())?,
                         metadata_blob: SerializedMetadataBlob::from(metadata_blob.clone()),
                         system_metadata_blob: SerializedSystemMetadataBlob::from(
                             system_metadata_blob.clone(),

@@ -1076,6 +1076,7 @@ pub(crate) fn put_object_tags_test(
     requester: Requester,
     expected_bucket_owner: Option<&str>,
 ) -> Result<(), ServerError> {
+    let tags = object_tag_set(tags);
     coord.put_object_tags(&PutObjectTagsRequest {
         object: object_version_request_with_expected_owner(
             bucket,
@@ -1084,7 +1085,7 @@ pub(crate) fn put_object_tags_test(
             requester,
             expected_bucket_owner,
         ),
-        tags,
+        tags: &tags,
     })
 }
 
@@ -1096,13 +1097,20 @@ pub(crate) fn get_object_tags_test(
     requester: Requester,
     expected_bucket_owner: Option<&str>,
 ) -> Result<Option<String>, ServerError> {
-    coord.get_object_tags(&object_version_request_with_expected_owner(
-        bucket,
-        key,
-        version_id,
-        requester,
-        expected_bucket_owner,
-    ))
+    coord
+        .get_object_tags(&object_version_request_with_expected_owner(
+            bucket,
+            key,
+            version_id,
+            requester,
+            expected_bucket_owner,
+        ))
+        .map(|tags| tags.map(|tags| tags.to_xml()))
+}
+
+pub(crate) fn object_tag_set(xml: &str) -> s3_types::TagSet {
+    s3_types::TagSet::parse_canonical_xml(xml, s3_types::MAX_OBJECT_TAGS)
+        .expect("server-core tests must use valid object tags")
 }
 
 pub(crate) fn put_object_retention_test(

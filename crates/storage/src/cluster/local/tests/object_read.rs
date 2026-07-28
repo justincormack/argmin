@@ -575,8 +575,11 @@ fn object_tag_read_retries_when_tags_change_after_auth_subject_load() {
             .unwrap();
 
     assert_eq!(call_count.get(), 2);
+    let expected = crate::tests::object_tags(
+        "<Tagging><TagSet><Tag><Key>state</Key><Value>new</Value></Tag></TagSet></Tagging>",
+    );
     assert_eq!(
-        tags.as_deref(),
-        Some("<Tagging><TagSet><Tag><Key>state</Key><Value>new</Value></Tag></TagSet></Tagging>")
+        tags.as_ref().map(crate::SerializedTagSet::tag_set),
+        Some(expected.tag_set())
     );
 }

@@ -290,6 +290,22 @@ impl<'a> ObjectAuthLoadedBucketHandle<'a> {
 }
 
 impl Coordinator {
+    pub(super) fn stored_object_tag_set(
+        tags: &s3_types::TagSet,
+    ) -> Result<storage::SerializedTagSet, ServerError> {
+        storage::SerializedTagSet::from_tag_set(tags.clone()).map_err(|error| {
+            ServerError::InternalError {
+                reason: format!("authorized object tags exceed the stored object limit: {error}"),
+            }
+        })
+    }
+
+    pub(super) fn stored_object_tags(
+        tags: Option<&s3_types::TagSet>,
+    ) -> Result<Option<storage::SerializedTagSet>, ServerError> {
+        tags.map(Self::stored_object_tag_set).transpose()
+    }
+
     pub(in crate::coordinator) fn authorize_put_object_write_with_existing_object(
         &self,
         req: &AuthorizePutObjectRequest<'_>,
@@ -585,7 +601,7 @@ impl Coordinator {
             expected_bucket_owner: req.object.expected_bucket_owner().map(str::to_string),
             acl: AuthorizedPutObjectWriteAcl::from_parsed(&req.acl),
             requested_object_lock: req.object_lock,
-            tags: req.tags.map(str::to_string),
+            tags: req.tags.cloned(),
             write_encryption,
         })
     }
@@ -612,7 +628,7 @@ impl Coordinator {
             lifecycle,
             bucket: req.object.bucket.name_typed().clone(),
             key: req.object.key_typed().clone(),
-            tags: req.tags.map(str::to_string),
+            tags: req.tags.cloned(),
             checksum: req.checksum,
             initiator,
             owner,
@@ -1513,13 +1529,12 @@ impl Coordinator {
         access: BucketPolicyAccess<'_>,
         object: &StoredObject,
         action: auth::PolicyAction,
-        request_object_tags_xml: Option<&str>,
+        request_object_tags: Option<&s3_types::TagSet>,
     ) -> Result<bool, ServerError> {
         self.requester_can_object_action_with_bucket_policy(
             access.request(
                 action,
-                PutObjectPolicyContext::default()
-                    .with_request_object_tags_xml(request_object_tags_xml),
+                PutObjectPolicyContext::default().with_request_object_tags(request_object_tags),
             ),
             object,
             || Self::requester_can_manage_object_tags(access.requester, access.bucket, object),
@@ -1757,7 +1772,7 @@ impl Coordinator {
             }
         }
 
-        if policy_context.request_object_tags_xml.is_none() {
+        if policy_context.request_object_tags.is_none() {
             return Ok(true);
         }
 
@@ -2345,10 +2360,10 @@ impl Coordinator {
     pub(super) fn parse_policy_existing_object_tags(
         object: &StoredObject,
     ) -> Result<Vec<(String, String)>, ServerError> {
-        let Some(tags_xml) = object.as_live().and_then(|record| record.tags.as_deref()) else {
+        let Some(tags) = object.as_live().and_then(|record| record.tags.as_deref()) else {
             return Ok(Vec::new());
         };
-        Self::parse_serialized_tag_set(tags_xml)
+        Ok(tags.clone().into_pairs())
     }
 
     pub(super) fn parse_serialized_tag_set(

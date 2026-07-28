@@ -1049,57 +1049,84 @@ impl std::fmt::Debug for SerializedSystemMetadataBlob {
     }
 }
 
-/// Serialized tag-set XML.
-#[derive(Clone, PartialEq, Eq, Default)]
-pub struct SerializedTagSet(String);
+/// Validated object tags carried by storage.
+///
+/// The canonical XML representation is private to storage and is decoded only
+/// through the `s3-types` owner. Callers can construct and inspect logical tag
+/// values, but cannot inject an arbitrary persisted representation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SerializedTagSet {
+    xml: String,
+    tags: s3_types::TagSet,
+}
 
 impl SerializedTagSet {
-    #[must_use]
-    pub fn new(xml: String) -> Self {
-        Self(xml)
+    pub fn from_tag_set(tags: s3_types::TagSet) -> Result<Self, s3_types::TagSetValidationError> {
+        let tags = s3_types::TagSet::new(tags.as_slice().to_vec(), s3_types::MAX_OBJECT_TAGS)?;
+        Ok(Self {
+            xml: tags.to_xml(),
+            tags,
+        })
     }
 
     #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn tag_set(&self) -> &s3_types::TagSet {
+        &self.tags
+    }
+
+    pub(crate) fn from_current_xml(
+        xml: String,
+    ) -> Result<Self, s3_types::CanonicalTagSetParseError> {
+        let tags = s3_types::TagSet::parse_current_xml(&xml, s3_types::MAX_OBJECT_TAGS)?;
+        Ok(Self { xml, tags })
     }
 
     #[must_use]
-    pub fn into_inner(self) -> String {
-        self.0
+    pub(crate) fn as_str(&self) -> &str {
+        &self.xml
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(xml: String) -> Self {
+        let tags = s3_types::TagSet::parse_canonical_xml(&xml, s3_types::MAX_OBJECT_TAGS)
+            .expect("storage tests must construct valid object tags");
+        Self::from_tag_set(tags).expect("storage tests must respect the object tag count limit")
+    }
+}
+
+impl Default for SerializedTagSet {
+    fn default() -> Self {
+        Self::from_tag_set(s3_types::TagSet::empty(s3_types::MAX_OBJECT_TAGS))
+            .expect("an empty object tag set is valid")
     }
 }
 
 impl std::ops::Deref for SerializedTagSet {
-    type Target = str;
+    type Target = s3_types::TagSet;
 
     fn deref(&self) -> &Self::Target {
-        self.as_str()
+        self.tag_set()
     }
 }
 
-impl From<String> for SerializedTagSet {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
+#[cfg(test)]
 impl From<&str> for SerializedTagSet {
     fn from(value: &str) -> Self {
-        Self(value.to_string())
+        Self::new(value.to_string())
     }
 }
 
-impl From<SerializedTagSet> for String {
-    fn from(value: SerializedTagSet) -> Self {
-        value.0
+#[cfg(test)]
+impl From<String> for SerializedTagSet {
+    fn from(value: String) -> Self {
+        Self::new(value)
     }
 }
 
 impl std::fmt::Debug for SerializedTagSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SerializedTagSet")
-            .field("xml_len", &self.0.len())
+            .field("tag_count", &self.tags.len())
             .finish()
     }
 }
@@ -4987,13 +5014,16 @@ mod tests {
     fn debug_redacts_blob_and_encryption_contents() {
         let metadata = SerializedMetadataBlob::from(b"top-secret-metadata".to_vec());
         let system_metadata = SerializedSystemMetadataBlob::from(b"checksum-secret".to_vec());
-        let tags = SerializedTagSet::from("<Tagging>secret-tag</Tagging>");
+        let tags = SerializedTagSet::new(
+            "<Tagging><TagSet><Tag><Key>secret</Key><Value>tag</Value></Tag></TagSet></Tagging>"
+                .to_string(),
+        );
         let metadata_debug = format!("{metadata:?}");
         let system_debug = format!("{system_metadata:?}");
         let tags_debug = format!("{tags:?}");
         assert!(metadata_debug.contains("len"));
         assert!(system_debug.contains("len"));
-        assert!(tags_debug.contains("xml_len"));
+        assert!(tags_debug.contains("tag_count"));
         assert!(!metadata_debug.contains("top-secret-metadata"));
         assert!(!system_debug.contains("checksum-secret"));
         assert!(!tags_debug.contains("secret-tag"));
@@ -5015,6 +5045,43 @@ mod tests {
         assert!(debug.contains("<redacted:sse_customer_state>"));
         assert!(!debug.contains("wrapped_dek"));
         assert!(!debug.contains("validator_hmac"));
+    }
+
+    #[test]
+    fn stored_object_tags_accept_only_the_exact_current_validated_representation() {
+        let tags = s3_types::TagSet::from_pairs(
+            vec![("key".to_string(), "value".to_string())],
+            s3_types::MAX_OBJECT_TAGS,
+        )
+        .unwrap();
+        let stored = SerializedTagSet::from_tag_set(tags.clone()).unwrap();
+        assert_eq!(stored.tag_set(), &tags);
+        assert_eq!(
+            SerializedTagSet::from_current_xml(stored.as_str().to_string()).unwrap(),
+            stored
+        );
+        assert!(matches!(
+            SerializedTagSet::from_current_xml(
+                "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>"
+                    .to_string()
+            ),
+            Err(s3_types::CanonicalTagSetParseError::NonCanonical)
+        ));
+
+        let too_many = s3_types::TagSet::from_pairs(
+            (0..=s3_types::MAX_OBJECT_TAGS)
+                .map(|index| (format!("key-{index}"), "value".to_string()))
+                .collect(),
+            s3_types::MAX_OBJECT_TAGS + 1,
+        )
+        .unwrap();
+        assert!(matches!(
+            SerializedTagSet::from_tag_set(too_many),
+            Err(s3_types::TagSetValidationError::TooMany {
+                actual: 11,
+                maximum: s3_types::MAX_OBJECT_TAGS,
+            })
+        ));
     }
 
     #[test]

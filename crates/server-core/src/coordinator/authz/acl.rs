@@ -471,7 +471,7 @@ impl Coordinator {
             req.policy_context,
         )?;
         let metadata_directive = req.directive.policy_condition_value();
-        let request_object_tags_xml = match &req.tagging {
+        let request_object_tags = match &req.tagging {
             TaggingDirective::Copy => None,
             TaggingDirective::Replace(tags) => *tags,
         };
@@ -487,7 +487,7 @@ impl Coordinator {
             acl_policy_context.grant_write_acp,
             acl_policy_context.grant_full_control,
         )
-        .with_request_object_tags_xml(request_object_tags_xml)
+        .with_request_object_tags(request_object_tags)
         .with_if_match(acl_policy_context.if_match)
         .with_if_none_match(acl_policy_context.if_none_match)
         .with_object_creation_operation(true);
@@ -506,7 +506,7 @@ impl Coordinator {
                 acl,
                 policy_context: dst_policy_context,
                 object_lock: req.object_lock,
-                tags: request_object_tags_xml,
+                tags: request_object_tags,
                 encryption: req.destination_encryption,
             },
         )?;

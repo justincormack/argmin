@@ -54,7 +54,7 @@ impl MetadataDirective<'_> {
 #[derive(Debug)]
 pub enum TaggingDirective<'a> {
     Copy,
-    Replace(Option<&'a str>),
+    Replace(Option<&'a s3_types::TagSet>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -70,7 +70,7 @@ pub struct PutObjectPolicyContext<'a> {
     pub grant_read_acp: Option<&'a str>,
     pub grant_write_acp: Option<&'a str>,
     pub grant_full_control: Option<&'a str>,
-    pub request_object_tags_xml: Option<&'a str>,
+    pub request_object_tags: Option<&'a s3_types::TagSet>,
     pub request_tags: Option<&'a [(String, String)]>,
     pub if_match: Option<&'a str>,
     pub if_none_match: Option<&'a str>,
@@ -101,7 +101,7 @@ impl<'a> PutObjectPolicyContext<'a> {
             grant_read_acp: None,
             grant_write_acp: None,
             grant_full_control: None,
-            request_object_tags_xml: None,
+            request_object_tags: None,
             request_tags: None,
             if_match: None,
             if_none_match: None,
@@ -142,11 +142,11 @@ impl<'a> PutObjectPolicyContext<'a> {
     }
 
     #[must_use]
-    pub const fn with_request_object_tags_xml(
+    pub const fn with_request_object_tags(
         mut self,
-        request_object_tags_xml: Option<&'a str>,
+        request_object_tags: Option<&'a s3_types::TagSet>,
     ) -> Self {
-        self.request_object_tags_xml = request_object_tags_xml;
+        self.request_object_tags = request_object_tags;
         self
     }
 
@@ -381,7 +381,7 @@ pub struct PutObjectRequest<'a> {
     pub data: &'a [u8],
     pub metadata: &'a MetadataBlob,
     pub system_metadata: &'a SystemMetadata,
-    pub tags: Option<&'a str>,
+    pub tags: Option<&'a s3_types::TagSet>,
     pub cond: &'a WriteCondition,
     pub acl: PutObjectWriteAcl<'a>,
     pub policy_context: PutObjectPolicyContext<'a>,
@@ -395,7 +395,7 @@ pub struct AuthorizePutObjectRequest<'a> {
     pub acl: PutObjectWriteAcl<'a>,
     pub policy_context: PutObjectPolicyContext<'a>,
     pub object_lock: ObjectLockState,
-    pub tags: Option<&'a str>,
+    pub tags: Option<&'a s3_types::TagSet>,
     pub encryption: WriteEncryptionRequest<'a>,
 }
 
@@ -418,7 +418,7 @@ pub struct AuthorizedFinalizeStreamPutRequest<'a> {
 
 pub(super) enum AuthorizedWriteTags<'a> {
     Bound,
-    TrustedDerived(Option<&'a str>),
+    TrustedDerived(Option<&'a s3_types::TagSet>),
 }
 
 /// Authenticated requester context needed by core-side authorization.
@@ -666,7 +666,7 @@ pub struct MultipartObjectRequest<'a> {
 #[derive(Debug)]
 pub struct PutObjectTagsRequest<'a> {
     pub object: ObjectVersionRequest<'a>,
-    pub tags: &'a str,
+    pub tags: &'a s3_types::TagSet,
 }
 
 /// Request for a PutObjectRetention operation.
@@ -798,7 +798,7 @@ pub struct CreateMultipartUploadRequest<'a> {
     pub object: ObjectRequest<'a>,
     pub metadata: &'a MetadataBlob,
     pub system_metadata: &'a SystemMetadata,
-    pub tags: Option<&'a str>,
+    pub tags: Option<&'a s3_types::TagSet>,
     pub checksum: Option<MultipartChecksumConfig>,
     pub acl: PutObjectWriteAcl<'a>,
     pub policy_context: PutObjectPolicyContext<'a>,
@@ -1210,7 +1210,7 @@ pub struct FinalizeStreamPutRequest<'a> {
     pub metadata_blob: &'a MetadataBlob,
     pub system_metadata: &'a SystemMetadata,
     pub write_encryption: ActiveWriteEncryptionRef<'a>,
-    pub tags: Option<&'a str>,
+    pub tags: Option<&'a s3_types::TagSet>,
     pub cond: &'a WriteCondition,
     pub acl: PutObjectWriteAcl<'a>,
     pub policy_context: PutObjectPolicyContext<'a>,
@@ -1704,7 +1704,7 @@ impl<'a> PutBucketAclRequest<'a> {
             || policy_context.metadata_directive.is_some()
             || policy_context.managed_encryption.is_some()
             || policy_context.sse_customer_algorithm.is_some()
-            || policy_context.request_object_tags_xml.is_some()
+            || policy_context.request_object_tags.is_some()
         {
             return Err(ServerError::InvalidArgument {
                 reason: "PutBucketAcl policy context contains unsupported fields".to_string(),
@@ -1783,7 +1783,7 @@ impl<'a> PutObjectAclRequest<'a> {
             || policy_context.metadata_directive.is_some()
             || policy_context.managed_encryption.is_some()
             || policy_context.sse_customer_algorithm.is_some()
-            || policy_context.request_object_tags_xml.is_some()
+            || policy_context.request_object_tags.is_some()
         {
             return Err(ServerError::InvalidArgument {
                 reason: "PutObjectAcl policy context contains unsupported fields".to_string(),
@@ -1990,10 +1990,10 @@ impl<'a> PutObjectRequest<'a> {
             .with_if_match(self.cond.if_match_policy_value())
             .with_if_none_match(self.cond.if_none_match_policy_value())
             .with_object_creation_operation(true);
-        if policy_context.request_object_tags_xml.is_some() {
+        if policy_context.request_object_tags.is_some() {
             Ok(policy_context)
         } else {
-            Ok(policy_context.with_request_object_tags_xml(self.tags))
+            Ok(policy_context.with_request_object_tags(self.tags))
         }
     }
 }
@@ -2016,10 +2016,10 @@ impl<'a> CreateMultipartUploadRequest<'a> {
             .encryption
             .with_policy_context(self.authorization_policy_context()?);
         let policy_context = policy_context.with_object_creation_operation(false);
-        if policy_context.request_object_tags_xml.is_some() {
+        if policy_context.request_object_tags.is_some() {
             Ok(policy_context)
         } else {
-            Ok(policy_context.with_request_object_tags_xml(self.tags))
+            Ok(policy_context.with_request_object_tags(self.tags))
         }
     }
 }

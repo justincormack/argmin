@@ -3639,7 +3639,7 @@ impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
         version_id: Option<VersionId>,
         expected_identity: &ObjectReadAuthSubjectIdentity,
         authorized_version_id: VersionId,
-    ) -> Result<Option<String>, ObjectPgActionError> {
+    ) -> Result<Option<crate::SerializedTagSet>, ObjectPgActionError> {
         let request = StorageRpcObjectTagsForSubjectRequest {
             object: StorageRpcObjectRequest {
                 node_id: self.node_id,

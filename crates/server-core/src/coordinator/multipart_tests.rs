@@ -1229,6 +1229,7 @@ fn create_multipart_upload_preserves_metadata() {
     let system_metadata = SystemMetadata::from_headers(&headers).unwrap();
     let tags_xml =
         "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
+    let tags = object_tag_set(tags_xml);
 
     let result = coord
         .create_multipart_upload(&CreateMultipartUploadRequest {
@@ -1240,7 +1241,7 @@ fn create_multipart_upload_preserves_metadata() {
             ),
             metadata: &metadata,
             system_metadata: &system_metadata,
-            tags: Some(tags_xml),
+            tags: Some(&tags),
             checksum: None,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -1261,7 +1262,7 @@ fn create_multipart_upload_preserves_metadata() {
         .unwrap();
     assert_eq!(record.bucket, "bucket");
     assert_eq!(record.key, "photo.png");
-    assert_eq!(record.tags.as_deref(), Some(tags_xml));
+    assert_eq!(record.tags.as_deref(), Some(&tags));
 
     // Deserialize and verify the metadata blob.
     let blob = MetadataBlob::deserialize(record.metadata_blob.as_slice()).unwrap();
@@ -6778,15 +6779,16 @@ fn put_object_from_authorized_write_commits_authorized_acl_and_tags() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    let tags = "<Tagging><TagSet><Tag><Key>scope</Key><Value>open</Value></Tag></TagSet></Tagging>";
+    let tags_xml =
+        "<Tagging><TagSet><Tag><Key>scope</Key><Value>open</Value></Tag></TagSet></Tagging>";
+    let tags = object_tag_set(tags_xml);
     let authorized = coord
         .authorize_put_object_write(&AuthorizePutObjectRequest {
             object: object_request_with_expected_owner("bucket", "obj", test_requester(), None),
             acl: PutObjectAcl::PublicRead.into(),
-            policy_context: PutObjectPolicyContext::default()
-                .with_request_object_tags_xml(Some(tags)),
+            policy_context: PutObjectPolicyContext::default().with_request_object_tags(Some(&tags)),
             object_lock: ObjectLockState::default(),
-            tags: Some(tags),
+            tags: Some(&tags),
             encryption: WriteEncryptionRequest::none(),
         })
         .unwrap();
@@ -6820,7 +6822,8 @@ fn put_object_from_authorized_write_commits_authorized_acl_and_tags() {
 
     let stored_tags =
         get_object_tags_test(&coord, "bucket", "obj", None, test_requester(), None).unwrap();
-    assert_eq!(stored_tags.as_deref(), Some(tags));
+    let expected_tags = object_tag_set(tags_xml).to_xml();
+    assert_eq!(stored_tags.as_deref(), Some(expected_tags.as_str()));
 }
 
 #[test]
@@ -6831,16 +6834,16 @@ fn finalize_stream_put_from_authorized_write_commits_authorized_acl_and_tags() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    let tags =
+    let tags_xml =
         "<Tagging><TagSet><Tag><Key>scope</Key><Value>stream</Value></Tag></TagSet></Tagging>";
+    let tags = object_tag_set(tags_xml);
     let authorized = coord
         .authorize_put_object_write(&AuthorizePutObjectRequest {
             object: object_request_with_expected_owner("bucket", "obj", test_requester(), None),
             acl: PutObjectAcl::PublicRead.into(),
-            policy_context: PutObjectPolicyContext::default()
-                .with_request_object_tags_xml(Some(tags)),
+            policy_context: PutObjectPolicyContext::default().with_request_object_tags(Some(&tags)),
             object_lock: ObjectLockState::default(),
-            tags: Some(tags),
+            tags: Some(&tags),
             encryption: WriteEncryptionRequest::none(),
         })
         .unwrap();
@@ -6881,7 +6884,8 @@ fn finalize_stream_put_from_authorized_write_commits_authorized_acl_and_tags() {
 
     let stored_tags =
         get_object_tags_test(&coord, "bucket", "obj", None, test_requester(), None).unwrap();
-    assert_eq!(stored_tags.as_deref(), Some(tags));
+    let expected_tags = object_tag_set(tags_xml).to_xml();
+    assert_eq!(stored_tags.as_deref(), Some(expected_tags.as_str()));
 }
 
 #[test]
@@ -7183,6 +7187,7 @@ fn finalize_stream_put_persists_tags_in_initial_commit() {
 
     let tags_xml =
         "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
+    let tags = object_tag_set(tags_xml);
     let result = coord
         .finalize_stream_put(&FinalizeStreamPutRequest {
             object: object_request("bucket", "mykey", test_requester()),
@@ -7192,7 +7197,7 @@ fn finalize_stream_put_persists_tags_in_initial_commit() {
             metadata_blob: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
             write_encryption: ActiveWriteEncryptionRef::None,
-            tags: Some(tags_xml),
+            tags: Some(&tags),
             cond: &WriteCondition::default(),
             acl: NO_PUT_OBJECT_ACL.into(),
             policy_context: PutObjectPolicyContext::default(),
@@ -7203,7 +7208,8 @@ fn finalize_stream_put_persists_tags_in_initial_commit() {
 
     let tags =
         get_object_tags_test(&coord, "bucket", "mykey", None, test_requester(), None).unwrap();
-    assert_eq!(tags.as_deref(), Some(tags_xml));
+    let expected_tags = object_tag_set(tags_xml).to_xml();
+    assert_eq!(tags.as_deref(), Some(expected_tags.as_str()));
 }
 
 #[test]

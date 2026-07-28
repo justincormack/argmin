@@ -13,6 +13,13 @@ pub(super) fn object_key(key: impl Into<String>) -> ObjectKey {
     ObjectKey::try_from(key.into()).expect("storage tests must use valid object keys")
 }
 
+pub(crate) fn object_tags(xml: &str) -> crate::SerializedTagSet {
+    let tags = s3_types::TagSet::parse_canonical_xml(xml, s3_types::MAX_OBJECT_TAGS)
+        .expect("storage tests must use valid object tags");
+    crate::SerializedTagSet::from_tag_set(tags)
+        .expect("storage tests must respect the object tag count limit")
+}
+
 pub(super) fn multipart_upload_id(upload_id: impl Into<String>) -> UploadId {
     let upload_id = upload_id.into();
     let mut encoded = String::with_capacity(UPLOAD_ID_LEN);

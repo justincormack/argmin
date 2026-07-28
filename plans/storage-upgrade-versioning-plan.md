@@ -289,6 +289,41 @@ by SSE-C and SSE-S3 is a private `server-core` version-1 codec nested inside the
 encryption state; changing it also requires advancing the corresponding encryption inner version
 and all of that format's containing versions.
 
+### Nested Durable Codec Inventory: Object Tags (2026-07-28)
+
+`s3-types` owns the shared AWS tag grammar and logical `TagKey`, `TagValue`, `Tag`, and `TagSet`
+types. The service layer chooses only the operation-specific cardinality: object tag sets permit
+at most `MAX_OBJECT_TAGS` (10), while bucket-resource tag sets permit at most `MAX_BUCKET_TAGS`
+(50). HTTP request parsers may accept the AWS request spellings established by their service
+oracles, but they normalize successful requests into the shared logical types before calling
+`server-core`.
+
+The current stored object-tag representation is the exact `TagSet::to_xml()` output: an XML 1.0
+UTF-8 declaration, newline, S3-namespaced `Tagging`/`TagSet` envelope, ordered `Tag` members, and
+canonical escaping. `storage::SerializedTagSet` is an opaque carrier containing that private XML
+and its validated logical value. External callers can construct it only from a logical `TagSet`
+and can inspect only that logical value. PG, metadata-command, and storage-RPC decoders reject
+malformed tag values and every well-formed but noncanonical XML spelling; request-parser
+tolerance therefore cannot create additional durable representations. Exact owner-local goldens
+pin the empty and representative current XML, and impossible-representation tests remain in
+`s3-types` and `storage`.
+
+The object-tag XML is embedded in these storage-owned containing formats:
+
+| Containing format | Current baseline | Object-tag embedding |
+| --- | --- | --- |
+| PG SQLite schema | schema version 1 | `objects`, `multipart_uploads`, and `stream_uploads` store optional canonical object-tag XML. |
+| Metadata command | encoding version 5 | Object, multipart-upload, and stream-session command values carry the opaque tag set. |
+| Storage-node RPC | frame encoding version 11 | Logical object, multipart, stream, mutation, and tag-read payloads carry the opaque tag set. |
+| Canonical PG state | encoding version 4 | The tag columns participate in canonical row and state digests. |
+| Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry tag columns and bind them into row, table, state, and checkpoint digests. |
+
+An incompatible change to the canonical object-tag XML requires an explicit new inner version and
+coordinated advancement of every containing format above; the current decoders have no legacy or
+prefix fallback. Bucket tags still use the generic bucket-subresource string carrier and remain a
+separate containment item, despite sharing the same logical tag grammar. ACL containment also
+remains outstanding.
+
 ### Nested Durable Codec Inventory: Object Encryption State (2026-07-28)
 
 `storage` owns the object-encryption discriminator and durable byte encoding. Its public logical
@@ -683,9 +718,10 @@ Raft peer client and server transports are storage-owned and boundary-checked.
    diagnostics, and cannot construct raw `Io`, `RpcProtocol`, or `RpcRemote` variants.
 4. **In progress:** inventory and restrict nested durable codecs for metadata, tags, ACLs, and
    encryption; record how containing formats advance when a nested format changes. Object
-   encryption and user/system metadata are complete: their private codecs are owner-local and
-   boundary-checked, their exact current representations are golden-tested, and all five
-   containing formats are recorded above. Tags and ACLs remain.
+   encryption, user/system metadata, and object tags are complete: their private codecs are
+   owner-local and boundary-checked, their exact current representations are golden-tested, and
+   all five containing formats are recorded above. The generic bucket-tag subresource carrier and
+   ACLs remain.
 5. Audit existing version/fallback code and remove unsupported legacy compatibility where it
    worsens current invariants.
 6. Add or tighten current-version rejection tests for existing versioned formats.

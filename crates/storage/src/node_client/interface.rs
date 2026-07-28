@@ -822,7 +822,7 @@ pub(crate) trait ObjectReadMetadataNodeClient: Send + Sync {
         version_id: Option<VersionId>,
         expected_identity: &ObjectReadAuthSubjectIdentity,
         authorized_version_id: VersionId,
-    ) -> Result<Option<String>, ObjectPgActionError>;
+    ) -> Result<Option<crate::SerializedTagSet>, ObjectPgActionError>;
 }
 
 pub(crate) struct BuildStreamPutCommitCommandReq<'a> {

@@ -5772,7 +5772,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         version_id: Option<s3_types::VersionId>,
         expected_identity: &crate::ObjectReadAuthSubjectIdentity,
         authorized_version_id: s3_types::VersionId,
-    ) -> Result<Option<String>, StorageNodeObjectRouteError> {
+    ) -> Result<Option<crate::SerializedTagSet>, StorageNodeObjectRouteError> {
         self.route.require_valid_now()?;
         let local_client = LocalStorageNodeClient::new(
             self.route.handler.config.node_id,
@@ -23958,6 +23958,7 @@ mod tests {
 
         let read_subject = crate::clock::with_time_override(1_000, || {
             let subject = primary_route.load_object_read_auth_subject(None).unwrap();
+            let expected_tags = crate::tests::object_tags(serialized_tags);
             let snapshot = primary_route
                 .load_object_read_snapshot_for_subject(
                     None,
@@ -23971,8 +23972,9 @@ mod tests {
                 primary_route
                     .get_object_tags_for_subject(None, &subject.identity, VersionId::Null,)
                     .unwrap()
-                    .as_deref(),
-                Some(serialized_tags)
+                    .as_ref()
+                    .map(crate::SerializedTagSet::tag_set),
+                Some(expected_tags.tag_set())
             );
             subject
         });
@@ -24954,7 +24956,7 @@ mod tests {
                 None,
                 &metadata_stored,
                 VersionId::Null,
-                PutObjectMetadataMutation::PutTags(serialized_tags.to_string()),
+                PutObjectMetadataMutation::PutTags(crate::tests::object_tags(serialized_tags)),
                 &mismatched_mutation_proof,
             )
         });
@@ -24984,7 +24986,7 @@ mod tests {
                     None,
                     &metadata_stored,
                     VersionId::Null,
-                    PutObjectMetadataMutation::PutTags(serialized_tags.to_string()),
+                    PutObjectMetadataMutation::PutTags(crate::tests::object_tags(serialized_tags)),
                     &mismatched_proof,
                 )
             });
@@ -25395,7 +25397,9 @@ mod tests {
                             None,
                             &metadata_stored,
                             VersionId::Null,
-                            PutObjectMetadataMutation::PutTags(serialized_tags.to_string()),
+                            PutObjectMetadataMutation::PutTags(crate::tests::object_tags(
+                                serialized_tags,
+                            )),
                             &metadata_proof,
                         )
                         .map(|_| ()),

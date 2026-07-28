@@ -628,7 +628,7 @@ fn multipart_create_command_applies_to_all_acting_object_pg_nodes() {
         upload_id: upload_id.clone(),
         bucket: bucket.clone(),
         key: key.clone(),
-        tags: Some(crate::SerializedTagSet::new("<Tagging/>".to_string())),
+        tags: Some(crate::SerializedTagSet::default()),
         metadata_blob: crate::SerializedMetadataBlob::new(vec![1, 2, 3]),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::new(vec![4, 5, 6]),
         initiator: crate::OwnerIdentity::from_principal("initiator"),

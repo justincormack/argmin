@@ -1594,7 +1594,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
                 requested_version_id: None,
                 expected_stored: &metadata_stored,
                 version_id: VersionId::Null,
-                mutation: PutObjectMetadataMutation::PutTags("<Tagging/>".to_string()),
+                mutation: PutObjectMetadataMutation::PutTags(SerializedTagSet::default()),
                 bucket_write_reservation: &proof,
             },
         )
@@ -1622,7 +1622,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
                 requested_version_id: None,
                 expected_stored: &metadata_stored,
                 version_id: VersionId::Null,
-                mutation: PutObjectMetadataMutation::PutTags("<Tagging/>".to_string()),
+                mutation: PutObjectMetadataMutation::PutTags(SerializedTagSet::default()),
                 bucket_write_reservation: &metadata_proof,
             },
         )
@@ -2855,9 +2855,12 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
         VersionId::Null,
     )
     .unwrap();
+    let expected_tags = crate::tests::object_tags(
+        "<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>",
+    );
     assert_eq!(
-        tags.as_deref(),
-        Some("<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>")
+        tags.as_ref().map(crate::SerializedTagSet::tag_set),
+        Some(expected_tags.tag_set())
     );
 
     for thread in server_threads {
@@ -3012,7 +3015,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
             requested_version_id: None,
             expected_stored: &stored,
             version_id: VersionId::Null,
-            mutation: PutObjectMetadataMutation::PutTags("<Tagging/>".to_string()),
+            mutation: PutObjectMetadataMutation::PutTags(SerializedTagSet::default()),
             bucket_write_reservation: &metadata_proof,
         },
     )

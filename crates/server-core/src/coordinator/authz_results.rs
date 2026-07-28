@@ -274,7 +274,7 @@ pub(super) struct AuthorizedCreateMultipartUpload {
     pub(super) lifecycle: Option<BucketLifecycleConfiguration>,
     pub(super) bucket: BucketName,
     pub(super) key: ObjectKey,
-    pub(super) tags: Option<String>,
+    pub(super) tags: Option<s3_types::TagSet>,
     pub(super) checksum: Option<MultipartChecksumConfig>,
     pub(super) initiator: OwnerIdentity,
     pub(super) owner: OwnerIdentity,

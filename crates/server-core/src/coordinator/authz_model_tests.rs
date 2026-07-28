@@ -9,8 +9,8 @@ use super::test_hooks::{
     BUCKET_POLICY_LOAD_TEST_SERIAL,
 };
 use super::test_support::{
-    open_test_storage_cluster, put_bucket_ownership_controls_test, put_bucket_policy_test,
-    NO_DELETE, NO_PUT_OBJECT_ACL,
+    object_tag_set, open_test_storage_cluster, put_bucket_ownership_controls_test,
+    put_bucket_policy_test, NO_DELETE, NO_PUT_OBJECT_ACL,
 };
 use super::*;
 use crate::conditional::{ReadCondition, WriteCondition};
@@ -2296,7 +2296,7 @@ mod harness {
             Action::PutObjectTagging => coord
                 .put_object_tags(&PutObjectTagsRequest {
                     object,
-                    tags: TAGS_XML,
+                    tags: &object_tag_set(TAGS_XML),
                 })
                 .map(|_| ()),
             Action::DeleteObjectTagging => coord.delete_object_tags(&object).map(|_| ()),
@@ -5963,7 +5963,7 @@ mod phase6_harness {
                 data: b"phase-6-source",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                tags: Some(REPLACEMENT_TAGS_XML),
+                tags: Some(&object_tag_set(REPLACEMENT_TAGS_XML)),
                 cond: NO_WRITE,
                 acl: PutObjectAcl::None.into(),
             },
@@ -6146,11 +6146,10 @@ mod phase6_harness {
         scenario: CopyObjectScenario,
     ) -> Result<(), ServerError> {
         let requester = copy_requester(fixtures, scenario.requester);
+        let replacement_tags = object_tag_set(REPLACEMENT_TAGS_XML);
         let tagging = match scenario.tagging {
             CopyTaggingShape::Copy => TaggingDirective::Copy,
-            CopyTaggingShape::ReplaceMatching => {
-                TaggingDirective::Replace(Some(REPLACEMENT_TAGS_XML))
-            }
+            CopyTaggingShape::ReplaceMatching => TaggingDirective::Replace(Some(&replacement_tags)),
         };
         let directive = match scenario.directive {
             CopyDirectiveShape::CopyImplicit => MetadataDirective::Copy,
@@ -8773,6 +8772,7 @@ mod phase8_harness {
         requester: Requester,
         replace_tags: bool,
     ) -> Result<(), ServerError> {
+        let replacement_tags = object_tag_set(PHASE8_TAGS_XML);
         coord
             .copy_object(&CopyObjectRequest {
                 source: CopySource::new(
@@ -8792,7 +8792,7 @@ mod phase8_harness {
                 directive: MetadataDirective::Copy,
                 website_redirect_location: None,
                 tagging: if replace_tags {
-                    TaggingDirective::Replace(Some(PHASE8_TAGS_XML))
+                    TaggingDirective::Replace(Some(&replacement_tags))
                 } else {
                     TaggingDirective::Copy
                 },

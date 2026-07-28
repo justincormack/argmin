@@ -697,14 +697,14 @@ pub(crate) trait PgMetadataStore {
         cluster_epoch: ClusterEpoch,
     ) -> Result<(), MetadataError>;
 
-    /// Store tags for an object version (serialized XML string).
+    /// Store validated tags for an object version.
     #[cfg(test)]
     fn put_object_tags(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-        tags: &str,
+        tags: &SerializedTagSet,
     ) -> Result<(), MetadataError>;
 
     /// Retrieve tags for an object version. Returns None if not set.
@@ -713,7 +713,7 @@ pub(crate) trait PgMetadataStore {
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-    ) -> Result<Option<String>, MetadataError>;
+    ) -> Result<Option<SerializedTagSet>, MetadataError>;
 
     /// Delete tags for an object version. Idempotent.
     #[cfg(test)]
