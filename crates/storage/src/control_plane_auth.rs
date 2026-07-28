@@ -58,7 +58,7 @@ impl ControlPlaneAuthPrincipal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ControlPlaneAuthTarget {
+pub(crate) enum ControlPlaneAuthTarget {
     Principal(ControlPlaneAuthPrincipal),
     Service(ControlPlaneAuthService),
 }
@@ -133,7 +133,7 @@ pub enum ControlPlaneAuthReplayPolicy {
 }
 
 #[must_use]
-pub fn control_plane_auth_payload_has_magic(bytes: &[u8]) -> bool {
+pub(crate) fn control_plane_auth_payload_has_magic(bytes: &[u8]) -> bool {
     bytes.starts_with(CONTROL_PLANE_AUTH_MAGIC)
 }
 
@@ -308,7 +308,7 @@ impl ControlPlaneScopedCredential {
         })
     }
 
-    pub fn sign_envelope(
+    pub(crate) fn sign_envelope(
         &self,
         input: ControlPlaneAuthSignInput,
     ) -> Result<ControlPlaneAuthEnvelope, ControlPlaneError> {
@@ -356,7 +356,7 @@ impl ControlPlaneScopedCredential {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct ControlPlaneAuthSignInput {
+pub(crate) struct ControlPlaneAuthSignInput {
     pub target: ControlPlaneAuthTarget,
     pub operation: ControlPlaneAuthOperation,
     pub issued_at_ms: Option<u64>,
@@ -390,7 +390,7 @@ impl fmt::Debug for ControlPlaneAuthSignInput {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct ControlPlaneAuthVerificationInput<'a> {
+pub(crate) struct ControlPlaneAuthVerificationInput<'a> {
     pub envelope: &'a ControlPlaneAuthEnvelope,
     pub expected_cluster_id: &'a str,
     pub expected_source: &'a ControlPlaneAuthPrincipal,
@@ -462,7 +462,7 @@ impl ControlPlaneScopedCredentialStore {
     }
 
     #[must_use]
-    pub fn verify_envelope(
+    pub(crate) fn verify_envelope(
         &self,
         input: ControlPlaneAuthVerificationInput<'_>,
     ) -> ControlPlaneAuthDecision {
@@ -564,7 +564,7 @@ fn validate_replay_policy(
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct ControlPlaneAuthEnvelopeHeader {
+pub(crate) struct ControlPlaneAuthEnvelopeHeader {
     cluster_id: String,
     credential_id: String,
     credential_version: u64,
@@ -595,7 +595,7 @@ impl fmt::Debug for ControlPlaneAuthEnvelopeHeader {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct ControlPlaneAuthEnvelopeHeaderInput {
+pub(crate) struct ControlPlaneAuthEnvelopeHeaderInput {
     pub cluster_id: String,
     pub credential_id: String,
     pub credential_version: u64,
@@ -697,7 +697,8 @@ impl ControlPlaneAuthEnvelopeHeader {
     }
 
     #[must_use]
-    pub fn nonce(&self) -> &[u8] {
+    #[cfg(test)]
+    pub(crate) fn nonce(&self) -> &[u8] {
         &self.nonce
     }
 
@@ -756,13 +757,13 @@ impl ControlPlaneAuthEnvelopeHeader {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct ControlPlaneAuthEnvelope {
+pub(crate) struct ControlPlaneAuthEnvelope {
     header: ControlPlaneAuthEnvelopeHeader,
     payload: Vec<u8>,
     authenticator: Vec<u8>,
 }
 
-pub struct ControlPlaneAuthEnvelopeInput {
+pub(crate) struct ControlPlaneAuthEnvelopeInput {
     pub header: ControlPlaneAuthEnvelopeHeader,
     pub payload: Vec<u8>,
     pub authenticator: Vec<u8>,

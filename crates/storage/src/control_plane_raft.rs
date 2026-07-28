@@ -89,7 +89,7 @@ pub type ControlPlaneRaftEntry =
     Entry<ControlPlaneRaftLeaderId, ControlPlaneCommand, ControlPlaneRaftNodeId, BasicNode>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControlPlaneRaftPeerFrameIdentity {
+pub(crate) struct ControlPlaneRaftPeerFrameIdentity {
     pub cluster_name: String,
     pub topology: Option<ControlPlaneRaftTopologyIdentity>,
     pub source: ControlPlaneRaftNodeId,
@@ -103,14 +103,14 @@ pub struct ControlPlaneRaftTopologyIdentity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlPlaneRaftPeerFrameKind {
+pub(crate) enum ControlPlaneRaftPeerFrameKind {
     OrdinaryRpc,
     Snapshot,
 }
 
 impl ControlPlaneRaftPeerFrameIdentity {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         cluster_name: impl Into<String>,
         source: ControlPlaneRaftNodeId,
         target: ControlPlaneRaftNodeId,
@@ -124,7 +124,8 @@ impl ControlPlaneRaftPeerFrameIdentity {
     }
 
     #[must_use]
-    pub fn with_topology(mut self, generation: u64, digest: impl Into<String>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_topology(mut self, generation: u64, digest: impl Into<String>) -> Self {
         self.topology = Some(ControlPlaneRaftTopologyIdentity {
             generation,
             digest: digest.into(),
@@ -134,7 +135,7 @@ impl ControlPlaneRaftPeerFrameIdentity {
 }
 
 #[derive(Debug, Clone)]
-pub enum ControlPlaneRaftPeerRpcRequest {
+pub(crate) enum ControlPlaneRaftPeerRpcRequest {
     AppendEntries(AppendEntriesRequest<ControlPlaneRaftTypeConfig>),
     Vote(VoteRequest<ControlPlaneRaftTypeConfig>),
     PreVote(VoteRequest<ControlPlaneRaftTypeConfig>),
@@ -142,29 +143,30 @@ pub enum ControlPlaneRaftPeerRpcRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ControlPlaneRaftPeerRpcResponse {
+pub(crate) enum ControlPlaneRaftPeerRpcResponse {
     AppendEntries(AppendEntriesResponse<ControlPlaneRaftTypeConfig>),
     Vote(VoteResponse<ControlPlaneRaftTypeConfig>),
     TransferLeader(TransferLeaderResponse<ControlPlaneRaftTypeConfig>),
 }
 
 #[derive(Debug, Clone)]
-pub struct ControlPlaneRaftPeerSnapshotRequest {
+pub(crate) struct ControlPlaneRaftPeerSnapshotRequest {
     pub vote: VoteOf<ControlPlaneRaftTypeConfig>,
     pub snapshot: ControlPlaneRaftSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControlPlaneRaftPeerSnapshotResponse {
+pub(crate) struct ControlPlaneRaftPeerSnapshotResponse {
     pub response: SnapshotResponse<ControlPlaneRaftTypeConfig>,
 }
 
 impl ControlPlaneRaftPeerRpcRequest {
-    pub fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
+    #[cfg(test)]
+    pub(crate) fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
         self.encode_frame_with_identity(None)
     }
 
-    pub fn encode_frame_for_peer(
+    pub(crate) fn encode_frame_for_peer(
         &self,
         identity: &ControlPlaneRaftPeerFrameIdentity,
     ) -> Result<Vec<u8>, ControlPlaneError> {
@@ -205,11 +207,13 @@ impl ControlPlaneRaftPeerRpcRequest {
         Ok(out)
     }
 
-    pub fn decode_frame(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+    #[cfg(test)]
+    pub(crate) fn decode_frame(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
         Self::decode_frame_with_identity(bytes, None)
     }
 
-    pub fn decode_frame_for_peer(
+    #[cfg(test)]
+    pub(crate) fn decode_frame_for_peer(
         bytes: &[u8],
         expected_identity: &ControlPlaneRaftPeerFrameIdentity,
     ) -> Result<Self, ControlPlaneError> {
@@ -246,11 +250,13 @@ impl ControlPlaneRaftPeerRpcRequest {
 }
 
 impl ControlPlaneRaftPeerRpcResponse {
-    pub fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
+    #[cfg(test)]
+    pub(crate) fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
         self.encode_frame_with_identity(None)
     }
 
-    pub fn encode_frame_for_peer(
+    #[cfg(test)]
+    pub(crate) fn encode_frame_for_peer(
         &self,
         identity: &ControlPlaneRaftPeerFrameIdentity,
     ) -> Result<Vec<u8>, ControlPlaneError> {
@@ -290,11 +296,12 @@ impl ControlPlaneRaftPeerRpcResponse {
         Ok(out)
     }
 
-    pub fn decode_frame(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+    #[cfg(test)]
+    pub(crate) fn decode_frame(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
         Self::decode_frame_with_identity(bytes, None)
     }
 
-    pub fn decode_frame_for_peer(
+    pub(crate) fn decode_frame_for_peer(
         bytes: &[u8],
         expected_identity: &ControlPlaneRaftPeerFrameIdentity,
     ) -> Result<Self, ControlPlaneError> {
@@ -328,11 +335,12 @@ impl ControlPlaneRaftPeerRpcResponse {
 }
 
 impl ControlPlaneRaftPeerSnapshotRequest {
-    pub fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
+    #[cfg(test)]
+    pub(crate) fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
         self.encode_frame_with_identity(None)
     }
 
-    pub fn encode_frame_for_peer(
+    pub(crate) fn encode_frame_for_peer(
         &self,
         identity: &ControlPlaneRaftPeerFrameIdentity,
     ) -> Result<Vec<u8>, ControlPlaneError> {
@@ -354,26 +362,13 @@ impl ControlPlaneRaftPeerSnapshotRequest {
         Ok(out)
     }
 
-    pub fn decode_frame(
+    #[cfg(test)]
+    pub(crate) fn decode_frame(
         bytes: &[u8],
         max_frame_bytes: usize,
         max_snapshot_bytes: usize,
     ) -> Result<Self, ControlPlaneError> {
         Self::decode_frame_with_identity(bytes, max_frame_bytes, max_snapshot_bytes, None)
-    }
-
-    pub fn decode_frame_for_peer(
-        bytes: &[u8],
-        max_frame_bytes: usize,
-        max_snapshot_bytes: usize,
-        expected_identity: &ControlPlaneRaftPeerFrameIdentity,
-    ) -> Result<Self, ControlPlaneError> {
-        Self::decode_frame_with_identity(
-            bytes,
-            max_frame_bytes,
-            max_snapshot_bytes,
-            Some(expected_identity),
-        )
     }
 
     fn decode_frame_with_identity(
@@ -404,11 +399,13 @@ impl ControlPlaneRaftPeerSnapshotRequest {
 }
 
 impl ControlPlaneRaftPeerSnapshotResponse {
-    pub fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
+    #[cfg(test)]
+    pub(crate) fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
         self.encode_frame_with_identity(None)
     }
 
-    pub fn encode_frame_for_peer(
+    #[cfg(test)]
+    pub(crate) fn encode_frame_for_peer(
         &self,
         identity: &ControlPlaneRaftPeerFrameIdentity,
     ) -> Result<Vec<u8>, ControlPlaneError> {
@@ -429,11 +426,12 @@ impl ControlPlaneRaftPeerSnapshotResponse {
         Ok(out)
     }
 
-    pub fn decode_frame(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+    #[cfg(test)]
+    pub(crate) fn decode_frame(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
         Self::decode_frame_with_identity(bytes, None)
     }
 
-    pub fn decode_frame_for_peer(
+    pub(crate) fn decode_frame_for_peer(
         bytes: &[u8],
         expected_identity: &ControlPlaneRaftPeerFrameIdentity,
     ) -> Result<Self, ControlPlaneError> {
@@ -475,7 +473,7 @@ impl ControlPlaneRaftPeerTransportLimits {
     pub const REPLICATION_REQUIRED_APPEND_ENTRIES: usize = 64;
 }
 
-pub const CONTROL_PLANE_RAFT_TLS_ALPN: &[u8] = b"argmin-raft/1";
+pub(crate) const CONTROL_PLANE_RAFT_TLS_ALPN: &[u8] = b"argmin-raft/1";
 
 impl Default for ControlPlaneRaftPeerTransportLimits {
     fn default() -> Self {
@@ -708,7 +706,7 @@ impl ControlPlaneRaftPeerAuthPolicy {
         self.metrics.record_rejected(operation, reason);
     }
 
-    pub fn sign_peer_frame(
+    pub(crate) fn sign_peer_frame(
         &self,
         identity: &ControlPlaneRaftPeerFrameIdentity,
         operation: ControlPlaneAuthOperation,
@@ -733,7 +731,7 @@ impl ControlPlaneRaftPeerAuthPolicy {
         envelope.encode_frame()
     }
 
-    pub fn verify_peer_frame(
+    pub(crate) fn verify_peer_frame(
         &self,
         envelope_bytes: &[u8],
         expected_identity: &ControlPlaneRaftPeerFrameIdentity,
@@ -1104,7 +1102,7 @@ impl ControlPlaneRaftPeerTransportPolicy {
         )))
     }
 
-    pub fn validate_target_node(
+    pub(crate) fn validate_target_node(
         &self,
         target: ControlPlaneRaftNodeId,
         node: &BasicNode,
@@ -1130,7 +1128,7 @@ impl ControlPlaneRaftPeerTransportPolicy {
         }
     }
 
-    pub fn frame_identity(
+    pub(crate) fn frame_identity(
         &self,
         source: ControlPlaneRaftNodeId,
         target: ControlPlaneRaftNodeId,
@@ -1154,7 +1152,7 @@ impl ControlPlaneRaftPeerTransportPolicy {
         Ok(identity)
     }
 
-    pub fn validate_incoming_frame_identity(
+    pub(crate) fn validate_incoming_frame_identity(
         &self,
         identity: &ControlPlaneRaftPeerFrameIdentity,
         local_node_id: ControlPlaneRaftNodeId,
@@ -1195,7 +1193,7 @@ impl ControlPlaneRaftPeerTransportPolicy {
         Ok(())
     }
 
-    pub fn validate_append_entries(
+    pub(crate) fn validate_append_entries(
         &self,
         target: ControlPlaneRaftNodeId,
         entries_len: usize,
@@ -1224,7 +1222,7 @@ impl ControlPlaneRaftPeerTransportPolicy {
         Ok(())
     }
 
-    pub fn validate_snapshot(
+    pub(crate) fn validate_snapshot(
         &self,
         target: ControlPlaneRaftNodeId,
         snapshot_bytes: usize,
@@ -1243,7 +1241,7 @@ impl ControlPlaneRaftPeerTransportPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ControlPlaneRaftPeerTransportRejection {
+pub(crate) enum ControlPlaneRaftPeerTransportRejection {
     ClusterMismatch {
         expected: String,
         actual: String,
@@ -4843,8 +4841,62 @@ impl ControlPlaneRaftAuthority {
     }
 
     #[must_use]
-    pub fn raft(&self) -> &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine> {
+    fn raft(&self) -> &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine> {
         &self.raft
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn durable_state_machine_snapshot_for_test(
+        &self,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        self.raft
+            .with_state_machine(|state_machine| {
+                let snapshot = state_machine.inner().snapshot().clone();
+                Box::pin(async move { snapshot })
+            })
+            .await
+            .map_err(|error| ControlPlaneError::RpcRemote {
+                message: format!("read test control-plane Raft state machine: {error}"),
+            })
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn force_step_down_for_test(
+        &self,
+        peer_node_id: ControlPlaneRaftNodeId,
+    ) -> Result<bool, ControlPlaneError> {
+        let status = self.status().await?;
+        let term = status
+            .current_term()
+            .ok_or_else(|| ControlPlaneError::RpcRemote {
+                message: "test control-plane Raft authority has no current term".to_owned(),
+            })?
+            .checked_add(1)
+            .ok_or_else(|| ControlPlaneError::RpcRemote {
+                message: "test control-plane Raft term overflow".to_owned(),
+            })?;
+        self.raft
+            .vote(VoteRequest {
+                vote: Vote::new(term, peer_node_id),
+                last_log_id: status.last_log_id(),
+                leadership_transfer: true,
+            })
+            .await
+            .map(|response| response.vote_granted)
+            .map_err(|error| ControlPlaneError::RpcRemote {
+                message: format!("force test control-plane Raft step-down: {error}"),
+            })
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn trigger_local_election_for_test(&self) -> Result<(), ControlPlaneError> {
+        self.raft
+            .trigger()
+            .elect(false)
+            .await
+            .map_err(|error| ControlPlaneError::RpcRemote {
+                message: format!("trigger test control-plane Raft election: {error}"),
+            })
     }
 
     #[must_use]
@@ -9481,7 +9533,7 @@ fn raft_peer_rpc_frame_reader(bytes: &[u8]) -> Result<RaftArtifactReader<'_>, Co
     Ok(reader)
 }
 
-pub fn decode_control_plane_raft_peer_request_frame_kind(
+pub(crate) fn decode_control_plane_raft_peer_request_frame_kind(
     bytes: &[u8],
 ) -> Result<ControlPlaneRaftPeerFrameKind, ControlPlaneError> {
     let mut reader = raft_peer_rpc_frame_reader(bytes)?;
@@ -9502,7 +9554,7 @@ pub fn decode_control_plane_raft_peer_request_frame_kind(
     }
 }
 
-pub fn decode_control_plane_raft_peer_request_frame_identity(
+pub(crate) fn decode_control_plane_raft_peer_request_frame_identity(
     bytes: &[u8],
 ) -> Result<ControlPlaneRaftPeerFrameIdentity, ControlPlaneError> {
     let mut reader = raft_peer_rpc_frame_reader(bytes)?;
@@ -9532,7 +9584,7 @@ pub fn decode_control_plane_raft_peer_request_frame_identity(
     })
 }
 
-pub fn decode_control_plane_raft_peer_request_auth_operation(
+pub(crate) fn decode_control_plane_raft_peer_request_auth_operation(
     bytes: &[u8],
 ) -> Result<ControlPlaneAuthOperation, ControlPlaneError> {
     let mut reader = raft_peer_rpc_frame_reader(bytes)?;
@@ -9699,7 +9751,7 @@ fn validate_raft_peer_frame_identity(
     Ok(())
 }
 
-pub fn write_control_plane_raft_peer_transport_frame(
+pub(crate) fn write_control_plane_raft_peer_transport_frame(
     writer: &mut (impl Write + ?Sized),
     frame: &[u8],
 ) -> Result<(), ControlPlaneError> {
@@ -9720,7 +9772,7 @@ pub fn write_control_plane_raft_peer_transport_frame(
         })
 }
 
-pub fn read_control_plane_raft_peer_transport_frame(
+pub(crate) fn read_control_plane_raft_peer_transport_frame(
     reader: &mut (impl Read + ?Sized),
     max_frame_bytes: usize,
 ) -> Result<Vec<u8>, ControlPlaneError> {
@@ -9730,7 +9782,7 @@ pub fn read_control_plane_raft_peer_transport_frame(
     .map(|(frame, ())| frame)
 }
 
-pub fn read_control_plane_raft_peer_transport_frame_with_reservation<Reservation>(
+pub(crate) fn read_control_plane_raft_peer_transport_frame_with_reservation<Reservation>(
     reader: &mut (impl Read + ?Sized),
     max_frame_bytes: usize,
     reserve: impl FnOnce(usize) -> Result<Reservation, ControlPlaneError>,
@@ -10098,6 +10150,230 @@ impl fmt::Display for ControlPlaneRaftPeerServerError {
 }
 
 impl std::error::Error for ControlPlaneRaftPeerServerError {}
+
+/// Opaque semantic peer client for cross-crate process tests.
+///
+/// The client deliberately exposes no frame, authentication-envelope, or
+/// OpenRaft request types. Tests can drive durable peer mutations while the
+/// protocol representation remains owned by storage.
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct ControlPlaneRaftPeerTestClient {
+    socket_path: PathBuf,
+    identity: ControlPlaneRaftPeerFrameIdentity,
+    auth_policy: Option<ControlPlaneRaftPeerAuthPolicy>,
+    limits: ControlPlaneRaftPeerTransportLimits,
+    io_timeout: Duration,
+}
+
+/// In-flight semantic peer request used by process tests that deliberately
+/// keep a connection open while observing a crash boundary.
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct ControlPlaneRaftPendingTestResponse {
+    stream: DeadlineStream<UnixStream>,
+    response_identity: ControlPlaneRaftPeerFrameIdentity,
+    operation: ControlPlaneAuthOperation,
+    auth_policy: Option<ControlPlaneRaftPeerAuthPolicy>,
+    max_frame_bytes: usize,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl ControlPlaneRaftPendingTestResponse {
+    pub fn wait(self) -> Result<(), ControlPlaneError> {
+        let operation = self.operation;
+        let response = self.receive()?;
+        if matches!(
+            (operation, response),
+            (
+                ControlPlaneAuthOperation::RaftAppendEntries,
+                ControlPlaneRaftPeerRpcResponse::AppendEntries(_)
+            ) | (
+                ControlPlaneAuthOperation::RaftVote | ControlPlaneAuthOperation::RaftPreVote,
+                ControlPlaneRaftPeerRpcResponse::Vote(_)
+            ) | (
+                ControlPlaneAuthOperation::RaftTransferLeader,
+                ControlPlaneRaftPeerRpcResponse::TransferLeader(_)
+            )
+        ) {
+            Ok(())
+        } else {
+            Err(ControlPlaneError::RpcProtocol {
+                message: "control-plane Raft peer test received a mismatched response".to_owned(),
+            })
+        }
+    }
+
+    fn receive(mut self) -> Result<ControlPlaneRaftPeerRpcResponse, ControlPlaneError> {
+        let response =
+            read_control_plane_raft_peer_transport_frame(&mut self.stream, self.max_frame_bytes)?;
+        let response = match &self.auth_policy {
+            Some(auth_policy) => auth_policy.verify_peer_frame(
+                &response,
+                &self.response_identity,
+                self.operation,
+                self.max_frame_bytes,
+            )?,
+            None => response,
+        };
+        ControlPlaneRaftPeerRpcResponse::decode_frame_for_peer(&response, &self.response_identity)
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl ControlPlaneRaftPeerTestClient {
+    pub fn unix(
+        socket_path: impl Into<PathBuf>,
+        cluster_name: impl Into<String>,
+        source_node_id: ControlPlaneRaftNodeId,
+        target_node_id: ControlPlaneRaftNodeId,
+        limits: ControlPlaneRaftPeerTransportLimits,
+        io_timeout: Duration,
+    ) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            identity: ControlPlaneRaftPeerFrameIdentity::new(
+                cluster_name,
+                source_node_id,
+                target_node_id,
+            ),
+            auth_policy: None,
+            limits,
+            io_timeout,
+        }
+    }
+
+    #[must_use]
+    pub fn with_auth_policy(mut self, auth_policy: ControlPlaneRaftPeerAuthPolicy) -> Self {
+        self.auth_policy = Some(auth_policy);
+        self
+    }
+
+    pub fn send_vote(
+        &self,
+        term: ControlPlaneRaftTerm,
+        last_log_id: Option<ControlPlaneRaftLogId>,
+        leadership_transfer: bool,
+    ) -> Result<bool, ControlPlaneError> {
+        let response = self.exchange(ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(term, self.identity.source),
+            last_log_id,
+            leadership_transfer,
+        }))?;
+        match response {
+            ControlPlaneRaftPeerRpcResponse::Vote(response) => Ok(response.vote_granted),
+            _ => Err(ControlPlaneError::RpcProtocol {
+                message: "control-plane Raft peer test vote received a mismatched response"
+                    .to_owned(),
+            }),
+        }
+    }
+
+    pub fn append_commands(
+        &self,
+        term: ControlPlaneRaftTerm,
+        previous_log_id: ControlPlaneRaftLogId,
+        leader_commit: Option<ControlPlaneRaftLogId>,
+        commands: Vec<ControlPlaneCommand>,
+    ) -> Result<ControlPlaneRaftLogId, ControlPlaneError> {
+        let (last_log_id, request) =
+            self.append_request(term, previous_log_id, leader_commit, commands)?;
+        self.begin_request(request)?.wait()?;
+        Ok(last_log_id)
+    }
+
+    pub fn begin_append_commands(
+        &self,
+        term: ControlPlaneRaftTerm,
+        previous_log_id: ControlPlaneRaftLogId,
+        leader_commit: Option<ControlPlaneRaftLogId>,
+        commands: Vec<ControlPlaneCommand>,
+    ) -> Result<(ControlPlaneRaftLogId, ControlPlaneRaftPendingTestResponse), ControlPlaneError>
+    {
+        let (last_log_id, request) =
+            self.append_request(term, previous_log_id, leader_commit, commands)?;
+        Ok((last_log_id, self.begin_request(request)?))
+    }
+
+    fn append_request(
+        &self,
+        term: ControlPlaneRaftTerm,
+        previous_log_id: ControlPlaneRaftLogId,
+        leader_commit: Option<ControlPlaneRaftLogId>,
+        commands: Vec<ControlPlaneCommand>,
+    ) -> Result<(ControlPlaneRaftLogId, ControlPlaneRaftPeerRpcRequest), ControlPlaneError> {
+        let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(term, self.identity.source);
+        let mut last_log_id = previous_log_id;
+        let entries = commands
+            .into_iter()
+            .map(|command| {
+                last_log_id = LogId::new(
+                    vote.leader_id,
+                    last_log_id.index().checked_add(1).ok_or_else(|| {
+                        ControlPlaneError::RpcProtocol {
+                            message: "control-plane Raft peer test log index overflow".to_owned(),
+                        }
+                    })?,
+                );
+                Ok(Entry {
+                    log_id: last_log_id,
+                    payload: EntryPayload::Normal(command),
+                })
+            })
+            .collect::<Result<Vec<_>, ControlPlaneError>>()?;
+        Ok((
+            last_log_id,
+            ControlPlaneRaftPeerRpcRequest::AppendEntries(AppendEntriesRequest {
+                vote,
+                prev_log_id: Some(previous_log_id),
+                entries,
+                leader_commit,
+            }),
+        ))
+    }
+
+    fn exchange(
+        &self,
+        request: ControlPlaneRaftPeerRpcRequest,
+    ) -> Result<ControlPlaneRaftPeerRpcResponse, ControlPlaneError> {
+        self.begin_request(request)?.receive()
+    }
+
+    fn begin_request(
+        &self,
+        request: ControlPlaneRaftPeerRpcRequest,
+    ) -> Result<ControlPlaneRaftPendingTestResponse, ControlPlaneError> {
+        let operation = ControlPlaneRaftPeerNetwork::auth_operation_for_request(&request);
+        let request = request.encode_frame_for_peer(&self.identity)?;
+        let request = match &self.auth_policy {
+            Some(auth_policy) => auth_policy.sign_peer_frame(&self.identity, operation, request)?,
+            None => request,
+        };
+        let stream =
+            UnixStream::connect(&self.socket_path).map_err(|source| ControlPlaneError::Io {
+                context: "connect control-plane Raft peer test client",
+                source,
+            })?;
+        let deadline = Instant::now()
+            .checked_add(self.io_timeout)
+            .unwrap_or_else(Instant::now);
+        let mut stream = DeadlineStream::new(
+            stream,
+            deadline,
+            "control-plane Raft peer test client deadline expired",
+        )
+        .map_err(|source| ControlPlaneError::Io {
+            context: "configure control-plane Raft peer test client deadline",
+            source,
+        })?;
+        write_control_plane_raft_peer_transport_frame(&mut stream, &request)?;
+        Ok(ControlPlaneRaftPendingTestResponse {
+            stream,
+            response_identity: reverse_raft_peer_frame_identity(&self.identity),
+            operation,
+            auth_policy: self.auth_policy.clone(),
+            max_frame_bytes: self.limits.max_frame_bytes,
+        })
+    }
+}
 
 trait ControlPlaneRaftPeerServerStream: Read + Write + Send {
     fn begin_response(&mut self, timeout: Duration);
@@ -10575,7 +10851,7 @@ fn block_on_control_plane_raft_peer_server<F: Future>(
     }
 }
 
-pub async fn handle_control_plane_raft_peer_rpc_frame(
+pub(crate) async fn handle_control_plane_raft_peer_rpc_frame(
     raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
     frame: &[u8],
     expected_identity: &ControlPlaneRaftPeerFrameIdentity,
@@ -10625,7 +10901,7 @@ async fn handle_control_plane_raft_peer_rpc_frame_with_identity(
     )
 }
 
-pub async fn handle_control_plane_raft_peer_snapshot_frame(
+pub(crate) async fn handle_control_plane_raft_peer_snapshot_frame(
     raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
     frame: &[u8],
     max_frame_bytes: usize,
@@ -15820,6 +16096,7 @@ mod tests {
         response: Vec<u8>,
         events: Arc<Mutex<Vec<&'static str>>>,
         write_started: bool,
+        fail_response_write: bool,
         response_deadline: Option<Instant>,
     }
 
@@ -15830,8 +16107,14 @@ mod tests {
                 response: Vec::new(),
                 events,
                 write_started: false,
+                fail_response_write: false,
                 response_deadline: None,
             }
+        }
+
+        fn with_failed_response_write(mut self) -> Self {
+            self.fail_response_write = true;
+            self
         }
 
         fn with_ingress_deadline(mut self, deadline: Instant) -> Self {
@@ -15848,6 +16131,12 @@ mod tests {
 
     impl Write for RecordingPeerServerStream {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.fail_response_write {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected peer response write failure",
+                ));
+            }
             if self
                 .response_deadline
                 .is_none_or(|deadline| Instant::now() >= deadline)
@@ -15949,6 +16238,88 @@ mod tests {
             ]
         );
         assert!(!stream.response.is_empty());
+        runtime.block_on(authority.shutdown()).unwrap();
+    }
+
+    #[test]
+    fn control_plane_raft_peer_server_poison_after_validation_prevents_dispatch() {
+        struct PoisonAfterAdmission {
+            checks: AtomicUsize,
+        }
+
+        impl ControlPlaneRaftPeerServerDurability for PoisonAfterAdmission {
+            fn is_poisoned(&self) -> bool {
+                self.checks.fetch_add(1, Ordering::AcqRel) >= 1
+            }
+
+            fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError> {
+                Ok(())
+            }
+
+            fn publish_response(
+                &self,
+                publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+            ) -> Result<(), ControlPlaneError> {
+                publish()
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let cluster_name = "peer-server-poison-after-validation";
+        let authority = Arc::new(
+            runtime
+                .block_on(
+                    ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                        cluster_name,
+                        1,
+                    ),
+                )
+                .unwrap(),
+        );
+        let before = runtime.block_on(authority.status()).unwrap();
+        let peer_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name,
+            [(1, "node-1".to_owned())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let policy = ControlPlaneRaftPeerServerPolicy::new(1, peer_policy, 4096)
+            .unwrap()
+            .with_durability(Arc::new(PoisonAfterAdmission {
+                checks: AtomicUsize::new(0),
+            }));
+        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(4, 1),
+            last_log_id: None,
+            leadership_transfer: false,
+        })
+        .encode_frame_for_peer(&ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 1, 1))
+        .unwrap();
+        let mut transport_request = Vec::new();
+        write_control_plane_raft_peer_transport_frame(&mut transport_request, &request).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = RecordingPeerServerStream::new(transport_request, events);
+
+        let result = handle_control_plane_raft_peer_server_request(
+            runtime.handle(),
+            &authority,
+            &mut stream,
+            &policy,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ControlPlaneRaftPeerServerWorkerError::PeerRpc(_))
+        ));
+        let after = runtime.block_on(authority.status()).unwrap();
+        assert_eq!(after.persisted_vote(), before.persisted_vote());
+        assert_eq!(after.current_term(), before.current_term());
+        assert!(stream.response.is_empty());
         runtime.block_on(authority.shutdown()).unwrap();
     }
 
@@ -16085,6 +16456,80 @@ mod tests {
         .unwrap();
 
         assert!(!stream.response.is_empty());
+        runtime.block_on(authority.shutdown()).unwrap();
+    }
+
+    #[test]
+    fn control_plane_raft_peer_server_response_failure_preserves_durable_mutation() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let directory = test_util::tempdir();
+        let artifact_path = directory.path().join("raft.state");
+        let wal_path = directory.path().join("raft.wal");
+        let cluster_name = "peer-server-response-failure-durability";
+        let authority = Arc::new(
+            runtime
+                .block_on(
+                    ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+                        cluster_name,
+                        1,
+                        &artifact_path,
+                        &wal_path,
+                    ),
+                )
+                .unwrap(),
+        );
+        let peer_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name,
+            [(1, "node-1".to_owned())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let policy = ControlPlaneRaftPeerServerPolicy::new(1, peer_policy, 4096).unwrap();
+        let expected_vote = Vote::<ControlPlaneRaftLeaderId>::new(4, 1);
+        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: expected_vote,
+            last_log_id: None,
+            leadership_transfer: false,
+        })
+        .encode_frame_for_peer(&ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 1, 1))
+        .unwrap();
+        let mut transport_request = Vec::new();
+        write_control_plane_raft_peer_transport_frame(&mut transport_request, &request).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut stream =
+            RecordingPeerServerStream::new(transport_request, events).with_failed_response_write();
+
+        let error = handle_control_plane_raft_peer_server_request(
+            runtime.handle(),
+            &authority,
+            &mut stream,
+            &policy,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .expect_err("injected response write should fail after dispatch");
+
+        assert!(matches!(
+            error,
+            ControlPlaneRaftPeerServerWorkerError::PeerRpc(ControlPlaneError::Io { source, .. })
+                if source.kind() == io::ErrorKind::BrokenPipe
+        ));
+        assert_eq!(
+            runtime
+                .block_on(authority.status())
+                .unwrap()
+                .persisted_vote(),
+            Some(expected_vote),
+            "response loss must not roll back the fsynced peer mutation"
+        );
+        let offsets = authority.durable_wal_monitor_snapshot().unwrap().offsets();
+        assert!(
+            offsets.clean_len() > offsets.base_offset(),
+            "the durable mutation must remain visible to checkpoint scheduling"
+        );
         runtime.block_on(authority.shutdown()).unwrap();
     }
 
@@ -19325,6 +19770,109 @@ mod tests {
                 "detached checkpoint should refresh the cached snapshot to its applied tip"
             );
 
+            authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_wal_monitor_does_not_enter_state_machine() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let directory = test_util::tempdir();
+            let artifact_path = directory.path().join("raft.state");
+            let wal_path = directory.path().join("raft.wal");
+            let authority = Arc::new(
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+                    "wal-monitor-state-machine-isolation",
+                    1,
+                    &artifact_path,
+                    &wal_path,
+                )
+                .await
+                .unwrap(),
+            );
+            let expected_offsets = authority.durable_wal_monitor_snapshot().unwrap().offsets();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let raft = authority.raft.clone();
+            let holder = tokio::spawn(async move {
+                raft.with_state_machine(move |_| {
+                    let _ = entered_tx.send(());
+                    Box::pin(async move {
+                        let _ = release_rx.await;
+                    })
+                })
+                .await
+                .unwrap();
+            });
+            entered_rx.await.unwrap();
+            let monitor_authority = Arc::clone(&authority);
+            let monitor = tokio::time::timeout(
+                Duration::from_secs(1),
+                tokio::task::spawn_blocking(move || {
+                    monitor_authority.durable_wal_monitor_snapshot()
+                }),
+            )
+            .await
+            .expect("WAL monitor must not wait for the state-machine boundary")
+            .unwrap()
+            .unwrap();
+            assert_eq!(monitor.offsets(), expected_offsets);
+            assert_eq!(monitor.poisoned(), None);
+            let _ = release_tx.send(());
+            holder.await.unwrap();
+            authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_captured_checkpoint_persists_outside_state_machine_boundary() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let directory = test_util::tempdir();
+            let artifact_path = directory.path().join("raft.state");
+            let wal_path = directory.path().join("raft.wal");
+            let authority = Arc::new(
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+                    "captured-checkpoint-state-machine-isolation",
+                    1,
+                    &artifact_path,
+                    &wal_path,
+                )
+                .await
+                .unwrap(),
+            );
+            let checkpoint = authority
+                .capture_durable_restart_checkpoint()
+                .await
+                .unwrap();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let raft = authority.raft.clone();
+            let holder = tokio::spawn(async move {
+                raft.with_state_machine(move |_| {
+                    let _ = entered_tx.send(());
+                    Box::pin(async move {
+                        let _ = release_rx.await;
+                    })
+                })
+                .await
+                .unwrap();
+            });
+            entered_rx.await.unwrap();
+            let persist_authority = Arc::clone(&authority);
+            let persist_path = artifact_path.clone();
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                tokio::task::spawn_blocking(move || {
+                    persist_authority.persist_durable_restart_checkpoint(checkpoint, &persist_path)
+                }),
+            )
+            .await
+            .expect("captured checkpoint persistence must not wait for the state machine")
+            .unwrap()
+            .unwrap();
+            ControlPlaneRaftRestartArtifact::load_durable_artifact(&artifact_path).unwrap();
+            let _ = release_tx.send(());
+            holder.await.unwrap();
             authority.shutdown().await.unwrap();
         });
     }

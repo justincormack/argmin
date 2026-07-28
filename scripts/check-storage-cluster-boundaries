@@ -2635,6 +2635,18 @@ fail_with_matches \
     "Raft peer server listeners, TLS profile, and workers are private to storage; use ControlPlaneRaftPeerServerListener and ControlPlaneRaftPeerServerPolicy" \
     "$raft_peer_server_transport_leaks"
 
+raft_peer_representation_leaks=$(
+    rg -n --color=never \
+        '\bControlPlaneRaftPeer(FrameIdentity|FrameKind|RpcRequest|RpcResponse|SnapshotRequest|SnapshotResponse|TransportRejection)\b|\b(decode_control_plane_raft_peer_request_[a-z_]+|handle_control_plane_raft_peer_[a-z_]+|read_control_plane_raft_peer_transport_frame(_with_reservation)?|write_control_plane_raft_peer_transport_frame)\b|\bControlPlaneAuth(Envelope|EnvelopeInput|EnvelopeHeader|EnvelopeHeaderInput|SignInput|VerificationInput|Target)\b|\.raft\(\)' \
+        . \
+        -g 'crates/**/*.rs' \
+        -g '!crates/storage/**' \
+        || true
+)
+fail_with_matches \
+    "Raft frames, shared auth envelopes, raw handlers, and the OpenRaft handle are private to storage; use logical authority APIs or opaque test hooks" \
+    "$raft_peer_representation_leaks"
+
 if [[ "$failed" -ne 0 ]]; then
     echo
     echo "storage cluster boundary checks failed" >&2

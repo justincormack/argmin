@@ -7,7 +7,6 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,7 +15,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use openraft::impls::leader_id_adv::LeaderId;
 use openraft::impls::Entry;
-use openraft::raft::AppendEntriesRequest;
 use openraft::storage::{RaftLogReader, RaftLogStorage};
 use openraft::{EntryPayload, LogId, Vote};
 use storage::control_plane::{
@@ -24,14 +22,13 @@ use storage::control_plane::{
     UnixControlPlaneClient,
 };
 use storage::control_plane_auth::{
-    ControlPlaneAuthOperation, ControlPlaneAuthPrincipal, ControlPlaneAuthSignInput,
-    ControlPlaneAuthTarget, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
+    ControlPlaneAuthPrincipal, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
+    ControlPlaneScopedCredentialStore,
 };
 use storage::control_plane_command::ControlPlaneCommand;
 use storage::control_plane_raft::{
-    durable_artifact_wal_path, read_control_plane_raft_peer_transport_frame,
-    write_control_plane_raft_peer_transport_frame, ControlPlaneRaftEntry, ControlPlaneRaftLeaderId,
-    ControlPlaneRaftLogId, ControlPlaneRaftPeerFrameIdentity, ControlPlaneRaftPeerRpcRequest,
+    durable_artifact_wal_path, ControlPlaneRaftEntry, ControlPlaneRaftLeaderId,
+    ControlPlaneRaftLogId, ControlPlaneRaftPeerAuthPolicy, ControlPlaneRaftPeerTestClient,
     ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftRestartArtifact, ControlPlaneRaftWalFile,
     ControlPlaneRaftWalFileConfig, ControlPlaneRaftWalRecord,
 };
@@ -216,28 +213,28 @@ impl ProcessTestControlPlaneAuth {
         .expect("process test storage-node credential should build")
     }
 
-    fn sign_raft_peer_frame(
-        &self,
-        source_node_id: u64,
-        target_node_id: u64,
-        operation: ControlPlaneAuthOperation,
-        payload: Vec<u8>,
-    ) -> Vec<u8> {
-        self.raft_peer_credential(source_node_id)
-            .sign_envelope(ControlPlaneAuthSignInput {
-                target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
-                    node_id: target_node_id,
-                }),
-                operation,
-                issued_at_ms: None,
-                expires_at_ms: None,
-                sequence: None,
-                nonce: Vec::new(),
-                payload,
+    fn raft_peer_auth_policy(&self, source_node_id: u64) -> ControlPlaneRaftPeerAuthPolicy {
+        let credentials = vec![
+            self.raft_peer_credential(101),
+            self.raft_peer_credential(102),
+            self.raft_peer_credential(103),
+        ];
+        let local_credential = credentials
+            .iter()
+            .find(|credential| {
+                credential.principal()
+                    == &ControlPlaneAuthPrincipal::RaftPeer {
+                        node_id: source_node_id,
+                    }
             })
-            .expect("process test Raft peer frame should sign")
-            .encode_frame()
-            .expect("process test Raft peer auth envelope should encode")
+            .expect("process test source credential should exist")
+            .clone();
+        ControlPlaneRaftPeerAuthPolicy::new(
+            local_credential,
+            ControlPlaneScopedCredentialStore::new(credentials)
+                .expect("process test credential store should build"),
+        )
+        .expect("process test Raft peer auth policy should build")
     }
 }
 
@@ -1244,21 +1241,6 @@ fn state_tmp_path_for_process(state_path: &Path, process_id: u32) -> PathBuf {
 
 fn wal_path(test_dir: &Path, node_id: u64) -> PathBuf {
     durable_artifact_wal_path(&state_path(test_dir, node_id))
-}
-
-fn sign_process_test_raft_peer_frame(
-    cluster_name: &str,
-    source_node_id: u64,
-    target_node_id: u64,
-    operation: ControlPlaneAuthOperation,
-    payload: Vec<u8>,
-) -> Vec<u8> {
-    ProcessTestControlPlaneAuth::new(cluster_name).sign_raft_peer_frame(
-        source_node_id,
-        target_node_id,
-        operation,
-        payload,
-    )
 }
 
 fn raft_wal_file(
@@ -2339,42 +2321,27 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
     let preparation_prev_log_id = follower_log_before_crash
         .last_log_id
         .expect("bootstrapped follower should have a log tip before append");
-    let append_vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(
-        follower_vote_before_crash
-            .term
-            .checked_add(1_000)
-            .expect("synthetic leader vote term should advance past local elections"),
-        101,
-    );
-    let preparation_request = AppendEntriesRequest {
-        vote: append_vote,
-        prev_log_id: Some(preparation_prev_log_id),
-        entries: Vec::new(),
-        leader_commit: follower_log_before_crash.committed,
-    };
-    let preparation_frame = ControlPlaneRaftPeerRpcRequest::AppendEntries(preparation_request)
-        .encode_frame_for_peer(&ControlPlaneRaftPeerFrameIdentity::new(
-            cluster_name.clone(),
-            101,
-            103,
-        ))
-        .expect("synthetic leader preparation should encode");
-    let preparation_frame = sign_process_test_raft_peer_frame(
-        &cluster_name,
+    let append_term = follower_vote_before_crash
+        .term
+        .checked_add(1_000)
+        .expect("synthetic leader vote term should advance past local elections");
+    let peer_client = ControlPlaneRaftPeerTestClient::unix(
+        follower_peer_socket.clone(),
+        cluster_name.clone(),
         101,
         103,
-        ControlPlaneAuthOperation::RaftAppendEntries,
-        preparation_frame,
-    );
-    let mut preparation_stream =
-        UnixStream::connect(&follower_peer_socket).expect("follower peer socket should connect");
-    write_control_plane_raft_peer_transport_frame(&mut preparation_stream, &preparation_frame)
-        .expect("synthetic leader preparation should be written");
-    read_control_plane_raft_peer_transport_frame(
-        &mut preparation_stream,
-        ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        ControlPlaneRaftPeerTransportLimits::default(),
+        Duration::from_secs(5),
     )
-    .expect("synthetic leader preparation should be acknowledged");
+    .with_auth_policy(ProcessTestControlPlaneAuth::new(&cluster_name).raft_peer_auth_policy(101));
+    peer_client
+        .append_commands(
+            append_term,
+            preparation_prev_log_id,
+            follower_log_before_crash.committed,
+            Vec::new(),
+        )
+        .expect("synthetic leader preparation should be acknowledged");
 
     let follower_log_before_crash =
         artifact_log_state_with_wal(&follower_state_path, &cluster_name, 103)
@@ -2387,49 +2354,20 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
 
     let padded_endpoint = "x".repeat(120 * 1024);
     let send_padded_append_batch = |prev_log_id: ControlPlaneRaftLogId| {
-        let mut entries = Vec::with_capacity(64);
-        let mut appended_log_id = prev_log_id;
-        for _ in 0..64 {
-            appended_log_id = LogId::new(
-                append_vote.leader_id,
-                appended_log_id
-                    .index()
-                    .checked_add(1)
-                    .expect("test log index should advance"),
-            );
-            entries.push(Entry {
-                log_id: appended_log_id,
-                payload: EntryPayload::Normal(ControlPlaneCommand::BootstrapInitialClusterMap {
-                    nodes: vec![(NodeId::new(1), padded_endpoint.clone())],
-                    pg_ids: vec![PgId::new(0)],
-                }),
-            });
-        }
-        let append_request = AppendEntriesRequest {
-            vote: append_vote,
-            prev_log_id: Some(prev_log_id),
-            entries,
-            leader_commit: follower_log_before_crash.committed,
-        };
-        let append_frame = ControlPlaneRaftPeerRpcRequest::AppendEntries(append_request)
-            .encode_frame_for_peer(&ControlPlaneRaftPeerFrameIdentity::new(
-                cluster_name.clone(),
-                101,
-                103,
-            ))
-            .expect("padded append request should encode");
-        let append_frame = sign_process_test_raft_peer_frame(
-            &cluster_name,
-            101,
-            103,
-            ControlPlaneAuthOperation::RaftAppendEntries,
-            append_frame,
-        );
-        let mut peer_stream = UnixStream::connect(&follower_peer_socket)
-            .expect("follower peer socket should connect");
-        write_control_plane_raft_peer_transport_frame(&mut peer_stream, &append_frame)
-            .expect("padded append frame should be written to follower peer socket");
-        (appended_log_id, peer_stream)
+        let commands = (0..64)
+            .map(|_| ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes: vec![(NodeId::new(1), padded_endpoint.clone())],
+                pg_ids: vec![PgId::new(0)],
+            })
+            .collect();
+        peer_client
+            .begin_append_commands(
+                append_term,
+                prev_log_id,
+                follower_log_before_crash.committed,
+                commands,
+            )
+            .expect("padded append should be written to follower peer socket")
     };
 
     // Keep the suffix just below the 64 MiB checkpoint threshold while the
@@ -2437,12 +2375,10 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
     // are blocked. This exercises the resource bound without waiting for the
     // one-minute age bound.
     for _ in 0..8 {
-        let (appended_log_id, mut peer_stream) = send_padded_append_batch(prev_log_id);
-        read_control_plane_raft_peer_transport_frame(
-            &mut peer_stream,
-            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
-        )
-        .expect("sub-threshold fsynced padded peer WAL append should be acknowledged");
+        let (appended_log_id, response) = send_padded_append_batch(prev_log_id);
+        response
+            .wait()
+            .expect("sub-threshold fsynced padded peer WAL append should be acknowledged");
         prev_log_id = appended_log_id;
     }
     let acknowledged_log_id = prev_log_id;
@@ -2456,7 +2392,7 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
     // Keep the threshold-crossing connection alive, but do not require its
     // response to race the independently scheduled checkpoint failure. The
     // eight preceding batches establish the acknowledged recovery prefix.
-    let (appended_log_id, _threshold_crossing_stream) =
+    let (appended_log_id, _threshold_crossing_response) =
         send_padded_append_batch(acknowledged_log_id);
 
     let status = wait_for_process_exit(&mut restarted103, Duration::from_secs(5));

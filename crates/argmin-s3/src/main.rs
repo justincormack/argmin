@@ -8,8 +8,6 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io;
-#[cfg(test)]
-use std::io::{Read, Write};
 use std::net::TcpListener as StdTcpListener;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
@@ -55,27 +53,12 @@ use storage::control_plane::{
     UnixControlPlaneClient, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
 };
 #[cfg(test)]
-use storage::control_plane_auth::{
-    ControlPlaneAuthEnvelope, ControlPlaneAuthOperation, ControlPlaneAuthRejectionReason,
-    ControlPlaneAuthTarget,
-};
+use storage::control_plane_auth::{ControlPlaneAuthOperation, ControlPlaneAuthRejectionReason};
 use storage::control_plane_auth::{
     ControlPlaneAuthPrincipal, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
     ControlPlaneScopedCredentialStore,
 };
 use storage::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
-#[cfg(test)]
-use storage::control_plane_raft::read_control_plane_raft_peer_transport_frame;
-#[cfg(test)]
-use storage::control_plane_raft::{
-    decode_control_plane_raft_peer_request_auth_operation,
-    decode_control_plane_raft_peer_request_frame_identity,
-    decode_control_plane_raft_peer_request_frame_kind, handle_control_plane_raft_peer_rpc_frame,
-    handle_control_plane_raft_peer_snapshot_frame,
-    read_control_plane_raft_peer_transport_frame_with_reservation,
-    write_control_plane_raft_peer_transport_frame, ControlPlaneRaftPeerFrameIdentity,
-    ControlPlaneRaftPeerFrameKind,
-};
 use storage::control_plane_raft::{
     durable_artifact_wal_path, ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus,
     ControlPlaneRaftCommandOutcome, ControlPlaneRaftEstablishedPeerPolicyConvergence,
@@ -84,8 +67,6 @@ use storage::control_plane_raft::{
     ControlPlaneRaftPeerServerListener, ControlPlaneRaftPeerServerPolicy,
     ControlPlaneRaftPeerTransportPolicy,
 };
-#[cfg(test)]
-use storage::deadline_io::{DeadlineStream, DeadlineTransport};
 use storage::storage_node_server::{
     PreparedStorageNodeServer, StorageNodeBootstrap, StorageNodeControlPlaneRefreshLoop,
     StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeProcessConfigParts, StorageNodeServer,
@@ -3563,75 +3544,6 @@ fn bind_experimental_raft_peer_listener_with_policy(
         .collect()
 }
 
-#[cfg(test)]
-#[derive(Debug)]
-struct ExperimentalRaftPeerPreAuthByteBudget {
-    reserved_bytes: AtomicUsize,
-    limit_bytes: usize,
-}
-
-#[cfg(test)]
-impl ExperimentalRaftPeerPreAuthByteBudget {
-    fn new(limit_bytes: usize) -> Self {
-        Self {
-            reserved_bytes: AtomicUsize::new(0),
-            limit_bytes,
-        }
-    }
-
-    fn reserve(
-        self: &Arc<Self>,
-        frame_bytes: usize,
-    ) -> Result<ExperimentalRaftPeerPreAuthByteReservation, ControlPlaneError> {
-        let result =
-            self.reserved_bytes
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
-                    reserved
-                        .checked_add(frame_bytes)
-                        .filter(|total| *total <= self.limit_bytes)
-                });
-        match result {
-            Ok(_) => Ok(ExperimentalRaftPeerPreAuthByteReservation {
-                budget: Arc::clone(self),
-                frame_bytes,
-            }),
-            Err(reserved) => Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "control-plane OpenRaft peer pre-authentication frame budget exhausted: requested {frame_bytes} bytes with {reserved} of {} bytes reserved",
-                    self.limit_bytes
-                ),
-            }),
-        }
-    }
-
-    #[cfg(test)]
-    fn reserved_bytes(&self) -> usize {
-        self.reserved_bytes.load(Ordering::Acquire)
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-struct ExperimentalRaftPeerPreAuthByteReservation {
-    budget: Arc<ExperimentalRaftPeerPreAuthByteBudget>,
-    frame_bytes: usize,
-}
-
-#[cfg(test)]
-impl Drop for ExperimentalRaftPeerPreAuthByteReservation {
-    fn drop(&mut self) {
-        self.budget
-            .reserved_bytes
-            .fetch_sub(self.frame_bytes, Ordering::AcqRel);
-    }
-}
-
-#[cfg(test)]
-const EXPERIMENTAL_RAFT_PEER_DEADLINE_EXPIRED: &str =
-    "control-plane OpenRaft inbound peer connection deadline expired";
-#[cfg(test)]
-type ExperimentalRaftPeerDeadlineStream<Stream> = DeadlineStream<Stream>;
-
 #[derive(Clone)]
 struct ExperimentalRaftPeerDurabilityContext {
     artifact_path: Option<Arc<PathBuf>>,
@@ -3678,35 +3590,6 @@ impl ControlPlaneRaftPeerServerDurability for ExperimentalRaftPeerServerDurabili
         publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
     ) -> Result<(), ControlPlaneError> {
         self.context.publication.publish(publish)
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-struct ExperimentalRaftPeerRpcDurability<'a> {
-    artifact_path: Option<&'a Path>,
-    checkpoint_lock: Option<&'a Arc<Mutex<()>>>,
-    publication: Option<&'a ExperimentalRaftDurabilityPublication>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-struct ExperimentalRaftPeerRpcAdmission<'a> {
-    local_node_id: ControlPlaneRaftNodeId,
-    policy: &'a ControlPlaneRaftPeerTransportPolicy,
-    durability: ExperimentalRaftPeerRpcDurability<'a>,
-    connection_deadline: Instant,
-    pre_auth_byte_budget: &'a Arc<ExperimentalRaftPeerPreAuthByteBudget>,
-}
-
-#[cfg(test)]
-impl<'a> ExperimentalRaftPeerRpcDurability<'a> {
-    fn from_context(context: &'a ExperimentalRaftPeerDurabilityContext) -> Self {
-        Self {
-            artifact_path: context.artifact_path.as_deref().map(PathBuf::as_path),
-            checkpoint_lock: Some(&context.checkpoint_lock),
-            publication: Some(&context.publication),
-        }
     }
 }
 
@@ -3801,388 +3684,6 @@ impl Default for ExperimentalRaftPeerCheckpointTracker {
     fn default() -> Self {
         Self::new(ExperimentalRaftPeerCheckpointPolicy::default())
     }
-}
-
-#[cfg(test)]
-fn reserve_experimental_raft_peer_rpc_worker(
-    active_workers: &AtomicUsize,
-    worker_limit: usize,
-) -> bool {
-    active_workers
-        .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < worker_limit).then_some(active + 1)
-        })
-        .is_ok()
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-enum ExperimentalRaftPeerRpcWorkerError {
-    PeerRpc(ControlPlaneError),
-    Checkpoint(ControlPlaneError),
-}
-
-#[cfg(test)]
-impl std::fmt::Display for ExperimentalRaftPeerRpcWorkerError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PeerRpc(error) => write!(formatter, "peer RPC failed: {error}"),
-            Self::Checkpoint(error) => write!(formatter, "checkpoint failed: {error}"),
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-struct ExperimentalRaftValidatedPeerRequest<'a> {
-    frame: &'a [u8],
-    kind: ControlPlaneRaftPeerFrameKind,
-    identity: &'a ControlPlaneRaftPeerFrameIdentity,
-    operation: ControlPlaneAuthOperation,
-}
-
-#[cfg(test)]
-fn handle_experimental_raft_peer_rpc_before_ack<Stream>(
-    runtime: &Handle,
-    authority: &ControlPlaneRaftAuthority,
-    stream: &mut Stream,
-    local_node_id: ControlPlaneRaftNodeId,
-    policy: &ControlPlaneRaftPeerTransportPolicy,
-    durability: ExperimentalRaftPeerRpcDurability<'_>,
-) -> Result<(), ExperimentalRaftPeerRpcWorkerError>
-where
-    Stream: Read + Write,
-{
-    let pre_auth_byte_budget = Arc::new(ExperimentalRaftPeerPreAuthByteBudget::new(
-        policy.limits().max_frame_bytes,
-    ));
-    handle_experimental_raft_peer_rpc_before_ack_until(
-        runtime,
-        authority,
-        stream,
-        ExperimentalRaftPeerRpcAdmission {
-            local_node_id,
-            policy,
-            durability,
-            connection_deadline: Instant::now() + Duration::from_secs(60),
-            pre_auth_byte_budget: &pre_auth_byte_budget,
-        },
-    )
-}
-
-#[cfg(test)]
-fn handle_experimental_raft_peer_rpc_before_ack_until<Stream>(
-    runtime: &Handle,
-    authority: &ControlPlaneRaftAuthority,
-    stream: &mut Stream,
-    admission: ExperimentalRaftPeerRpcAdmission<'_>,
-) -> Result<(), ExperimentalRaftPeerRpcWorkerError>
-where
-    Stream: Read + Write,
-{
-    handle_experimental_raft_peer_rpc_with_response_writer_until(
-        runtime,
-        authority,
-        stream,
-        admission,
-        write_control_plane_raft_peer_transport_frame,
-    )
-}
-
-#[cfg(test)]
-fn handle_experimental_raft_peer_rpc_with_response_writer<Stream, WriteResponse>(
-    runtime: &Handle,
-    authority: &ControlPlaneRaftAuthority,
-    stream: &mut Stream,
-    local_node_id: ControlPlaneRaftNodeId,
-    policy: &ControlPlaneRaftPeerTransportPolicy,
-    durability: ExperimentalRaftPeerRpcDurability<'_>,
-    write_response: WriteResponse,
-) -> Result<(), ExperimentalRaftPeerRpcWorkerError>
-where
-    Stream: Read + Write,
-    WriteResponse: FnOnce(&mut Stream, &[u8]) -> Result<(), ControlPlaneError>,
-{
-    let pre_auth_byte_budget = Arc::new(ExperimentalRaftPeerPreAuthByteBudget::new(
-        policy.limits().max_frame_bytes,
-    ));
-    handle_experimental_raft_peer_rpc_with_response_writer_until(
-        runtime,
-        authority,
-        stream,
-        ExperimentalRaftPeerRpcAdmission {
-            local_node_id,
-            policy,
-            durability,
-            connection_deadline: Instant::now() + Duration::from_secs(60),
-            pre_auth_byte_budget: &pre_auth_byte_budget,
-        },
-        write_response,
-    )
-}
-
-#[cfg(test)]
-fn handle_experimental_raft_peer_rpc_with_response_writer_until<Stream, WriteResponse>(
-    runtime: &Handle,
-    authority: &ControlPlaneRaftAuthority,
-    stream: &mut Stream,
-    admission: ExperimentalRaftPeerRpcAdmission<'_>,
-    write_response: WriteResponse,
-) -> Result<(), ExperimentalRaftPeerRpcWorkerError>
-where
-    Stream: Read + Write,
-    WriteResponse: FnOnce(&mut Stream, &[u8]) -> Result<(), ControlPlaneError>,
-{
-    let ExperimentalRaftPeerRpcAdmission {
-        local_node_id,
-        policy,
-        durability,
-        connection_deadline,
-        pre_auth_byte_budget,
-    } = admission;
-    ensure_experimental_raft_peer_not_durably_poisoned(durability.publication)?;
-    let (received_frame, pre_auth_reservation) =
-        read_control_plane_raft_peer_transport_frame_with_reservation(
-            stream,
-            policy.limits().max_frame_bytes,
-            |frame_bytes| pre_auth_byte_budget.reserve(frame_bytes),
-        )
-        .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
-    let request_frame = if let Some(auth_policy) = policy.auth_policy() {
-        let envelope = match ControlPlaneAuthEnvelope::decode_frame(
-            &received_frame,
-            policy.limits().max_frame_bytes,
-        ) {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                auth_policy.record_peer_frame_rejection_without_operation(
-                    ControlPlaneAuthRejectionReason::Malformed,
-                );
-                return Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(error));
-            }
-        };
-        // Header fields are decoded before verification only to select the
-        // expected metric bucket and peer identity. The safety boundary is in
-        // verify_peer_frame(): credential lookup, MAC verification, and the
-        // authenticated payload identity/operation binding check.
-        let operation = envelope.header().operation();
-        let identity = match experimental_raft_peer_auth_envelope_identity(
-            &envelope,
-            policy.cluster_name(),
-            policy.topology_identity(),
-            local_node_id,
-        ) {
-            Ok(identity) => identity,
-            Err(error) => {
-                auth_policy.record_peer_frame_rejection(
-                    operation,
-                    ControlPlaneAuthRejectionReason::Malformed,
-                );
-                return Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(error));
-            }
-        };
-        auth_policy
-            .verify_peer_frame(
-                &received_frame,
-                &identity,
-                operation,
-                policy.limits().max_frame_bytes,
-            )
-            .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?
-    } else {
-        received_frame
-    };
-    let frame_kind = decode_control_plane_raft_peer_request_frame_kind(&request_frame)
-        .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
-    let identity = decode_control_plane_raft_peer_request_frame_identity(&request_frame)
-        .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
-    let operation = decode_control_plane_raft_peer_request_auth_operation(&request_frame)
-        .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
-    policy
-        .validate_incoming_frame_identity(&identity, local_node_id)
-        .map_err(|error| ControlPlaneError::RpcProtocol {
-            message: error.to_string(),
-        })
-        .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
-    drop(pre_auth_reservation);
-
-    let response_frame = handle_experimental_raft_peer_rpc_validated_frame_before_ack_until(
-        runtime,
-        authority,
-        ExperimentalRaftValidatedPeerRequest {
-            frame: &request_frame,
-            kind: frame_kind,
-            identity: &identity,
-            operation,
-        },
-        policy,
-        durability,
-        connection_deadline,
-    )?;
-
-    publish_experimental_raft_peer_response(durability.publication, || {
-        write_response(stream, &response_frame)
-    })
-}
-
-#[cfg(test)]
-fn publish_experimental_raft_peer_response<T>(
-    publication: Option<&ExperimentalRaftDurabilityPublication>,
-    publish: impl FnOnce() -> Result<T, ControlPlaneError>,
-) -> Result<T, ExperimentalRaftPeerRpcWorkerError> {
-    match publication {
-        Some(publication) => publication
-            .publish(publish)
-            .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc),
-        None => publish().map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc),
-    }
-}
-
-#[cfg(test)]
-fn experimental_raft_peer_auth_envelope_identity(
-    envelope: &ControlPlaneAuthEnvelope,
-    expected_cluster_name: &str,
-    expected_topology: Option<&storage::control_plane_raft::ControlPlaneRaftTopologyIdentity>,
-    local_node_id: ControlPlaneRaftNodeId,
-) -> Result<ControlPlaneRaftPeerFrameIdentity, ControlPlaneError> {
-    let source = match envelope.header().source() {
-        ControlPlaneAuthPrincipal::RaftPeer { node_id } => *node_id,
-        principal => {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "control-plane OpenRaft peer auth source is not a RaftPeer principal: {principal:?}"
-                ),
-            });
-        }
-    };
-    match envelope.header().target() {
-        ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer { .. }) => {}
-        target => {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "control-plane OpenRaft peer auth target is not a RaftPeer principal: {target:?}"
-                ),
-            });
-        }
-    }
-    let mut identity = ControlPlaneRaftPeerFrameIdentity::new(
-        expected_cluster_name.to_string(),
-        source,
-        local_node_id,
-    );
-    identity.topology = expected_topology.cloned();
-    Ok(identity)
-}
-
-#[cfg(test)]
-fn handle_experimental_raft_peer_rpc_validated_frame_before_ack(
-    runtime: &Handle,
-    authority: &ControlPlaneRaftAuthority,
-    request: ExperimentalRaftValidatedPeerRequest<'_>,
-    policy: &ControlPlaneRaftPeerTransportPolicy,
-    durability: ExperimentalRaftPeerRpcDurability<'_>,
-) -> Result<Vec<u8>, ExperimentalRaftPeerRpcWorkerError> {
-    handle_experimental_raft_peer_rpc_validated_frame_before_ack_until(
-        runtime,
-        authority,
-        request,
-        policy,
-        durability,
-        Instant::now() + Duration::from_secs(60),
-    )
-}
-
-#[cfg(test)]
-fn handle_experimental_raft_peer_rpc_validated_frame_before_ack_until(
-    runtime: &Handle,
-    authority: &ControlPlaneRaftAuthority,
-    request: ExperimentalRaftValidatedPeerRequest<'_>,
-    policy: &ControlPlaneRaftPeerTransportPolicy,
-    durability: ExperimentalRaftPeerRpcDurability<'_>,
-    connection_deadline: Instant,
-) -> Result<Vec<u8>, ExperimentalRaftPeerRpcWorkerError> {
-    ensure_experimental_raft_peer_not_durably_poisoned(durability.publication)?;
-    let raw_response_frame = block_on_control_plane_raft(runtime, async {
-        tokio::time::timeout_at(tokio::time::Instant::from_std(connection_deadline), async {
-            match request.kind {
-                ControlPlaneRaftPeerFrameKind::OrdinaryRpc => {
-                    handle_control_plane_raft_peer_rpc_frame(
-                        authority.raft(),
-                        request.frame,
-                        request.identity,
-                    )
-                    .await
-                }
-                ControlPlaneRaftPeerFrameKind::Snapshot => {
-                    handle_control_plane_raft_peer_snapshot_frame(
-                        authority.raft(),
-                        request.frame,
-                        policy.limits().max_frame_bytes,
-                        policy.limits().max_snapshot_bytes,
-                        request.identity,
-                    )
-                    .await
-                }
-            }
-        })
-        .await
-        .map_err(|_| ControlPlaneError::Io {
-            context: "dispatch control-plane OpenRaft inbound peer frame",
-            source: io::Error::new(
-                io::ErrorKind::TimedOut,
-                "control-plane OpenRaft inbound peer connection deadline expired",
-            ),
-        })?
-    })
-    .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
-    let response_frame = if let Some(auth_policy) = policy.auth_policy() {
-        let mut response_identity = request.identity.clone();
-        std::mem::swap(&mut response_identity.source, &mut response_identity.target);
-        auth_policy
-            .sign_peer_frame(&response_identity, request.operation, raw_response_frame)
-            .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?
-    } else {
-        raw_response_frame
-    };
-
-    let checkpoint_before_response =
-        matches!(request.kind, ControlPlaneRaftPeerFrameKind::Snapshot);
-    if checkpoint_before_response {
-        let Some(path) = durability.artifact_path else {
-            return Err(ExperimentalRaftPeerRpcWorkerError::Checkpoint(
-                ControlPlaneError::RpcRemote {
-                    message:
-                        "experimental OpenRaft snapshot peer RPC requires durable checkpoint path before response"
-                            .to_string(),
-                },
-            ));
-        };
-        if let Err(error) = store_experimental_raft_durable_restart_artifact(
-            runtime,
-            authority,
-            path,
-            durability.checkpoint_lock,
-        ) {
-            return Err(ExperimentalRaftPeerRpcWorkerError::Checkpoint(error));
-        }
-    }
-
-    ensure_experimental_raft_peer_not_durably_poisoned(durability.publication)?;
-    Ok(response_frame)
-}
-
-#[cfg(test)]
-fn ensure_experimental_raft_peer_not_durably_poisoned(
-    publication: Option<&ExperimentalRaftDurabilityPublication>,
-) -> Result<(), ExperimentalRaftPeerRpcWorkerError> {
-    if publication.is_some_and(ExperimentalRaftDurabilityPublication::is_poisoned) {
-        return Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(
-            ControlPlaneError::RpcRemote {
-                message: "experimental OpenRaft control-plane durable authority is poisoned; refusing peer RPC until restart".to_string(),
-            },
-        ));
-    }
-    Ok(())
 }
 
 fn checkpoint_experimental_raft_peer_wal_if_due(
@@ -7321,17 +6822,12 @@ mod tests {
         ConfiguredControlPlaneRaftPeerSocket, SecretConfigValue,
     };
     use openraft::impls::{BasicNode, Vote};
-    use openraft::raft::{TransferLeaderRequest, VoteRequest};
     use storage::control_plane::{
         ControlPlaneHeartbeatSink, ControlPlaneRpcClientEndpoint, NodeAvailabilityState,
         NodeHeartbeat, NodeMembershipState, NodePgHeartbeatObservation, PgMetadataProof,
     };
-    use storage::control_plane_auth::{
-        ControlPlaneAuthEnvelope, ControlPlaneAuthSignInput, ControlPlaneAuthTarget,
-    };
     use storage::control_plane_raft::{
-        ControlPlaneRaftLeaderId, ControlPlaneRaftPeerFrameIdentity,
-        ControlPlaneRaftPeerRpcRequest, ControlPlaneRaftPeerRpcResponse,
+        ControlPlaneRaftLeaderId, ControlPlaneRaftPeerTestClient,
         ControlPlaneRaftPeerTransportLimits,
     };
 
@@ -7370,127 +6866,6 @@ mod tests {
                 .serve_shared_requests_for_test(authority, policy, authority_times_ms, |_| {})
                 .unwrap();
         })
-    }
-
-    #[test]
-    fn raft_peer_worker_admission_uses_configured_connection_limit() {
-        let active_workers = AtomicUsize::new(0);
-
-        assert!(reserve_experimental_raft_peer_rpc_worker(
-            &active_workers,
-            2
-        ));
-        assert!(reserve_experimental_raft_peer_rpc_worker(
-            &active_workers,
-            2
-        ));
-        assert!(!reserve_experimental_raft_peer_rpc_worker(
-            &active_workers,
-            2
-        ));
-        assert_eq!(active_workers.load(Ordering::Acquire), 2);
-    }
-
-    #[test]
-    fn raft_peer_pre_auth_budget_rejects_frame_before_payload_allocation() {
-        let budget = Arc::new(ExperimentalRaftPeerPreAuthByteBudget::new(8));
-        let held = budget.reserve(8).unwrap();
-        let mut framed_header = std::io::Cursor::new(1_u32.to_be_bytes());
-
-        let error = read_control_plane_raft_peer_transport_frame_with_reservation(
-            &mut framed_header,
-            8,
-            |frame_bytes| budget.reserve(frame_bytes),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ControlPlaneError::RpcProtocol { message }
-                if message.contains("pre-authentication frame budget exhausted")
-        ));
-        assert_eq!(framed_header.position(), 4);
-        assert_eq!(budget.reserved_bytes(), 8);
-        drop(held);
-        assert_eq!(budget.reserved_bytes(), 0);
-    }
-
-    #[test]
-    fn raft_peer_deadline_stream_bounds_trickled_reads_absolutely() {
-        struct TrickleSocket {
-            read_timeout: std::cell::Cell<Option<Duration>>,
-            reads: usize,
-        }
-
-        impl Read for TrickleSocket {
-            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                self.reads += 1;
-                let delay = Duration::from_millis(20);
-                let timeout = self.read_timeout.get().unwrap();
-                if timeout < delay {
-                    thread::sleep(timeout);
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "test timeout"));
-                }
-                thread::sleep(delay);
-                buf[0] = 1;
-                Ok(1)
-            }
-        }
-
-        impl Write for TrickleSocket {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl DeadlineTransport for TrickleSocket {
-            fn prepare_deadline_io(&self) -> io::Result<()> {
-                Ok(())
-            }
-
-            fn wait_readable_until(
-                &self,
-                deadline: Instant,
-                _timeout_message: &'static str,
-            ) -> io::Result<()> {
-                let remaining = deadline
-                    .checked_duration_since(Instant::now())
-                    .filter(|remaining| !remaining.is_zero())
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "test timeout"))?;
-                self.read_timeout.set(Some(remaining));
-                Ok(())
-            }
-
-            fn wait_writable_until(
-                &self,
-                _deadline: Instant,
-                _timeout_message: &'static str,
-            ) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let socket = TrickleSocket {
-            read_timeout: std::cell::Cell::new(None),
-            reads: 0,
-        };
-        let started_at = Instant::now();
-        let mut stream = ExperimentalRaftPeerDeadlineStream::new(
-            socket,
-            started_at + Duration::from_millis(30),
-            EXPERIMENTAL_RAFT_PEER_DEADLINE_EXPIRED,
-        )
-        .unwrap();
-        let mut frame_header = [0_u8; 4];
-
-        let error = stream.read_exact(&mut frame_header).unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(stream.get_ref().reads <= 2);
     }
 
     #[test]
@@ -8046,12 +7421,10 @@ mod tests {
         let policy = build_experimental_raft_peer_transport_policy(&config, "cluster-a", 1)
             .unwrap()
             .unwrap();
-        let identity = policy.frame_identity(1, 2).unwrap();
-
         assert_eq!(
-            identity.topology,
+            policy.topology_identity(),
             Some(
-                storage::control_plane_raft::ControlPlaneRaftTopologyIdentity {
+                &storage::control_plane_raft::ControlPlaneRaftTopologyIdentity {
                     generation: 7,
                     digest: "a".repeat(64),
                 }
@@ -9004,54 +8377,6 @@ mod tests {
         harness.shutdown();
     }
 
-    #[test]
-    fn wal_checkpoint_monitor_poison_suppresses_parked_peer_response_publication() {
-        let harness = experimental_raft_test_harness("monitor-response-poison");
-        let publication = harness.control_plane.durable_publication.clone();
-        let durability = ExperimentalRaftPeerDurabilityContext {
-            artifact_path: None,
-            checkpoint_lock: Arc::new(Mutex::new(())),
-            publication: publication.clone(),
-        };
-        let published = Arc::new(AtomicBool::new(false));
-        let worker_published = Arc::clone(&published);
-        let (checked_tx, checked_rx) = std::sync::mpsc::channel();
-        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-        let worker = thread::spawn(move || {
-            assert!(!publication.is_poisoned());
-            checked_tx
-                .send(())
-                .expect("response worker should report its early poison check");
-            resume_rx
-                .recv()
-                .expect("response worker should resume after monitor poison");
-            publish_experimental_raft_peer_response(Some(&publication), || {
-                worker_published.store(true, Ordering::Release);
-                Ok(())
-            })
-        });
-        checked_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("response worker should pass its early poison check");
-
-        publish_experimental_raft_checkpoint_monitor_poison(&durability);
-        resume_tx
-            .send(())
-            .expect("response worker should resume after monitor poison");
-        let error = worker
-            .join()
-            .expect("response worker should exit")
-            .expect_err("monitor poison must suppress parked response publication");
-        assert!(matches!(
-            error,
-            ExperimentalRaftPeerRpcWorkerError::PeerRpc(error)
-                if error.to_string().contains("poisoned before response publication")
-        ));
-        assert!(!published.load(Ordering::Acquire));
-        assert!(harness.control_plane.durable_publication.is_poisoned());
-        harness.shutdown();
-    }
-
     fn experimental_raft_peer_auth_credential(
         cluster_name: &str,
         node_id: ControlPlaneRaftNodeId,
@@ -9099,32 +8424,6 @@ mod tests {
                 .expect("test auth verifier store should build"),
         )
         .expect("test peer auth policy should build")
-    }
-
-    fn experimental_raft_signed_peer_frame(
-        cluster_name: &str,
-        credential: ControlPlaneScopedCredential,
-        target_node_id: ControlPlaneRaftNodeId,
-        operation: ControlPlaneAuthOperation,
-        payload: Vec<u8>,
-    ) -> Vec<u8> {
-        credential
-            .sign_envelope(ControlPlaneAuthSignInput {
-                target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
-                    node_id: target_node_id,
-                }),
-                operation,
-                issued_at_ms: None,
-                expires_at_ms: None,
-                sequence: None,
-                nonce: Vec::new(),
-                payload,
-            })
-            .unwrap_or_else(|error| {
-                panic!("test auth envelope should sign for cluster {cluster_name}: {error}")
-            })
-            .encode_frame()
-            .expect("test auth envelope should encode")
     }
 
     fn experimental_raft_durable_test_harness(
@@ -9940,20 +9239,10 @@ mod tests {
         );
         let durable_previous_deadline = harness
             .control_plane
-            .block_on(
-                harness
-                    .authority
-                    .raft()
-                    .with_state_machine(|state_machine| {
-                        let deadline = state_machine
-                            .inner()
-                            .snapshot()
-                            .pg(PgId::new(7))
-                            .and_then(|pg| pg.previous_primary_lease_deadline_ms());
-                        Box::pin(async move { deadline })
-                    }),
-            )
-            .expect("durable availability fence state should read");
+            .block_on(harness.authority.durable_state_machine_snapshot_for_test())
+            .expect("durable availability fence state should read")
+            .pg(PgId::new(7))
+            .and_then(|pg| pg.previous_primary_lease_deadline_ms());
         assert_eq!(durable_previous_deadline, Some(20_900));
 
         harness.shutdown();
@@ -10006,15 +9295,7 @@ mod tests {
         fn durable_snapshot(harness: &ExperimentalRaftTestHarness) -> ClusterControlSnapshot {
             harness
                 .control_plane
-                .block_on(
-                    harness
-                        .authority
-                        .raft()
-                        .with_state_machine(|state_machine| {
-                            let snapshot = state_machine.inner().snapshot().clone();
-                            Box::pin(async move { snapshot })
-                        }),
-                )
+                .block_on(harness.authority.durable_state_machine_snapshot_for_test())
                 .expect("durable state-machine snapshot should read")
         }
 
@@ -11331,20 +10612,10 @@ mod tests {
         assert!(matches!(rejected, ControlPlaneError::UnknownNode { .. }));
         let durable_promoted_deadline = harness
             .control_plane
-            .block_on(
-                harness
-                    .authority
-                    .raft()
-                    .with_state_machine(|state_machine| {
-                        let deadline = state_machine
-                            .inner()
-                            .snapshot()
-                            .node(NodeId::new(1))
-                            .and_then(|node| node.lease_deadline_ms());
-                        Box::pin(async move { deadline })
-                    }),
-            )
-            .expect("durable state should retain promotion before rejected command");
+            .block_on(harness.authority.durable_state_machine_snapshot_for_test())
+            .expect("durable state should retain promotion before rejected command")
+            .node(NodeId::new(1))
+            .and_then(|node| node.lease_deadline_ms());
         assert_eq!(
             durable_promoted_deadline,
             Some(41_200),
@@ -11533,567 +10804,6 @@ mod tests {
             .historical_pg_routes()
             .iter()
             .any(|route| route.cluster_epoch() == protected_epoch));
-
-        harness.shutdown();
-    }
-
-    #[test]
-    fn experimental_raft_peer_rpc_rejects_durable_poison_before_dispatch() {
-        let harness = experimental_raft_test_harness("peer-poison-before-dispatch");
-        let cluster_name = format!(
-            "argmin-s3-experimental-raft-peer-poison-before-dispatch-{}",
-            std::process::id()
-        );
-        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
-            cluster_name.clone(),
-            [(1, "node-1".to_string())],
-            ControlPlaneRaftPeerTransportLimits::default(),
-        );
-        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 1, 1);
-        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
-            vote: Vote::<ControlPlaneRaftLeaderId>::new(3, 1),
-            last_log_id: None,
-            leadership_transfer: false,
-        });
-        let request_frame = request
-            .encode_frame_for_peer(&identity)
-            .expect("peer request should encode");
-        let (mut client_stream, mut server_stream) =
-            UnixStream::pair().expect("test UnixStream pair should create");
-        write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
-            .expect("client should write request frame");
-        let publication = ExperimentalRaftDurabilityPublication::new();
-        publication.publish_poison(|| {});
-        let runtime_handle = harness.runtime.handle().clone();
-
-        let result = handle_experimental_raft_peer_rpc_before_ack(
-            &runtime_handle,
-            &harness.authority,
-            &mut server_stream,
-            1,
-            &policy,
-            ExperimentalRaftPeerRpcDurability {
-                artifact_path: None,
-                checkpoint_lock: None,
-                publication: Some(&publication),
-            },
-        );
-        assert!(
-            matches!(result, Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(_))),
-            "poisoned peer RPC should fail before dispatch: {result:?}"
-        );
-        drop(server_stream);
-
-        let response = read_control_plane_raft_peer_transport_frame(
-            &mut client_stream,
-            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
-        );
-        assert!(
-            response.is_err(),
-            "poisoned peer RPC must not write a response"
-        );
-
-        harness.shutdown();
-    }
-
-    #[test]
-    fn experimental_raft_peer_rpc_rejects_durable_poison_after_validation_before_dispatch() {
-        let harness = experimental_raft_test_harness("peer-poison-after-validation");
-        let cluster_name = format!(
-            "argmin-s3-experimental-raft-peer-poison-after-validation-{}",
-            std::process::id()
-        );
-        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
-            cluster_name.clone(),
-            [(1, "node-1".to_string())],
-            ControlPlaneRaftPeerTransportLimits::default(),
-        );
-        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 1, 1);
-        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
-            vote: Vote::<ControlPlaneRaftLeaderId>::new(3, 1),
-            last_log_id: None,
-            leadership_transfer: false,
-        });
-        let request_frame = request
-            .encode_frame_for_peer(&identity)
-            .expect("peer request should encode");
-        let frame_kind = decode_control_plane_raft_peer_request_frame_kind(&request_frame)
-            .expect("request kind should decode");
-        let decoded_identity =
-            decode_control_plane_raft_peer_request_frame_identity(&request_frame)
-                .expect("request identity should decode");
-        let operation = decode_control_plane_raft_peer_request_auth_operation(&request_frame)
-            .expect("request operation should decode");
-        policy
-            .validate_incoming_frame_identity(&decoded_identity, 1)
-            .expect("request identity should validate");
-        let before_status = harness
-            .runtime
-            .block_on(harness.authority.status())
-            .expect("status should read before poisoned dispatch");
-        let publication = ExperimentalRaftDurabilityPublication::new();
-        publication.publish_poison(|| {});
-
-        let result = handle_experimental_raft_peer_rpc_validated_frame_before_ack(
-            harness.runtime.handle(),
-            &harness.authority,
-            ExperimentalRaftValidatedPeerRequest {
-                frame: &request_frame,
-                kind: frame_kind,
-                identity: &decoded_identity,
-                operation,
-            },
-            &policy,
-            ExperimentalRaftPeerRpcDurability {
-                artifact_path: None,
-                checkpoint_lock: None,
-                publication: Some(&publication),
-            },
-        );
-        assert!(
-            matches!(result, Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(_))),
-            "poisoned validated peer RPC should fail before OpenRaft dispatch: {result:?}"
-        );
-        let after_status = harness
-            .runtime
-            .block_on(harness.authority.status())
-            .expect("status should read after poisoned dispatch");
-        assert_eq!(
-            after_status.persisted_vote(),
-            before_status.persisted_vote(),
-            "poisoned validated peer RPC must not mutate the Raft vote"
-        );
-
-        harness.shutdown();
-    }
-
-    #[test]
-    fn experimental_raft_peer_rpc_rejects_bad_auth_before_dispatch() {
-        let harness = experimental_raft_test_harness("peer-auth-before-dispatch");
-        let cluster_name = format!(
-            "argmin-s3-experimental-raft-peer-auth-before-dispatch-{}",
-            std::process::id()
-        );
-        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name.clone(), 1, 2);
-        let request_frame = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
-            vote: Vote::<ControlPlaneRaftLeaderId>::new(3, 1),
-            last_log_id: None,
-            leadership_transfer: false,
-        })
-        .encode_frame_for_peer(&identity)
-        .expect("peer request should encode");
-
-        let valid_source_credential = experimental_raft_peer_auth_credential(
-            &cluster_name,
-            1,
-            "raft-node-1",
-            1,
-            "node-1-test-secret",
-        );
-        let valid_signed_frame = experimental_raft_signed_peer_frame(
-            &cluster_name,
-            valid_source_credential.clone(),
-            2,
-            ControlPlaneAuthOperation::RaftVote,
-            request_frame.clone(),
-        );
-        let valid_envelope = ControlPlaneAuthEnvelope::decode_frame(
-            &valid_signed_frame,
-            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
-        )
-        .expect("valid test auth envelope should decode");
-        let mut tampered_authenticator = valid_envelope.authenticator().to_vec();
-        tampered_authenticator[0] ^= 0x01;
-        let bad_mac_frame = ControlPlaneAuthEnvelope::new(
-            storage::control_plane_auth::ControlPlaneAuthEnvelopeInput {
-                header: valid_envelope.header().clone(),
-                payload: valid_envelope.payload().to_vec(),
-                authenticator: tampered_authenticator,
-            },
-        )
-        .expect("tampered test auth envelope should rebuild")
-        .encode_frame()
-        .expect("tampered test auth envelope should encode");
-
-        let wrong_cluster_credential = experimental_raft_peer_auth_credential(
-            "wrong-cluster",
-            1,
-            "raft-node-1",
-            1,
-            "node-1-test-secret",
-        );
-        let wrong_cluster_frame = experimental_raft_signed_peer_frame(
-            "wrong-cluster",
-            wrong_cluster_credential,
-            2,
-            ControlPlaneAuthOperation::RaftVote,
-            request_frame.clone(),
-        );
-        let wrong_source_credential = experimental_raft_peer_auth_credential(
-            &cluster_name,
-            2,
-            "raft-node-2",
-            1,
-            "node-2-test-secret",
-        );
-        let wrong_source_frame = experimental_raft_signed_peer_frame(
-            &cluster_name,
-            wrong_source_credential,
-            2,
-            ControlPlaneAuthOperation::RaftVote,
-            request_frame.clone(),
-        );
-        let wrong_target_frame = experimental_raft_signed_peer_frame(
-            &cluster_name,
-            valid_source_credential.clone(),
-            1,
-            ControlPlaneAuthOperation::RaftVote,
-            request_frame.clone(),
-        );
-        let wrong_role_frame = experimental_raft_signed_peer_frame(
-            &cluster_name,
-            valid_source_credential.clone(),
-            2,
-            ControlPlaneAuthOperation::RaftPreVote,
-            request_frame.clone(),
-        );
-        let unknown_credential = experimental_raft_peer_auth_credential(
-            &cluster_name,
-            1,
-            "unknown-raft-node-1",
-            1,
-            "node-1-test-secret",
-        );
-        let unknown_credential_frame = experimental_raft_signed_peer_frame(
-            &cluster_name,
-            unknown_credential,
-            2,
-            ControlPlaneAuthOperation::RaftVote,
-            request_frame.clone(),
-        );
-        let mut tampered_payload = valid_envelope.payload().to_vec();
-        let last_payload_byte = tampered_payload
-            .last_mut()
-            .expect("vote request payload should be non-empty");
-        *last_payload_byte ^= 0x01;
-        let payload_bitflip_frame = ControlPlaneAuthEnvelope::new(
-            storage::control_plane_auth::ControlPlaneAuthEnvelopeInput {
-                header: valid_envelope.header().clone(),
-                payload: tampered_payload,
-                authenticator: valid_envelope.authenticator().to_vec(),
-            },
-        )
-        .expect("payload-bitflip test auth envelope should rebuild")
-        .encode_frame()
-        .expect("payload-bitflip test auth envelope should encode");
-        let stale_credential = experimental_raft_peer_auth_credential(
-            &cluster_name,
-            1,
-            "raft-node-1",
-            1,
-            "node-1-test-secret",
-        );
-        let stale_credential_frame = experimental_raft_signed_peer_frame(
-            &cluster_name,
-            stale_credential,
-            2,
-            ControlPlaneAuthOperation::RaftVote,
-            request_frame.clone(),
-        );
-
-        for (case_name, policy_node_1_version, frame) in [
-            ("missing-auth", 1, request_frame),
-            ("wrong-cluster", 1, wrong_cluster_frame),
-            ("wrong-source", 1, wrong_source_frame),
-            ("wrong-target", 1, wrong_target_frame),
-            ("wrong-role", 1, wrong_role_frame),
-            ("bad-mac", 1, bad_mac_frame),
-            ("payload-bitflip", 1, payload_bitflip_frame),
-            ("stale-credential", 2, stale_credential_frame),
-            ("unknown-credential", 1, unknown_credential_frame),
-        ] {
-            let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
-                cluster_name.clone(),
-                [(1, "node-1".to_string()), (2, "node-2".to_string())],
-                ControlPlaneRaftPeerTransportLimits::default(),
-            )
-            .with_auth_policy(experimental_raft_peer_auth_policy(
-                &cluster_name,
-                2,
-                policy_node_1_version,
-            ));
-            let before_status = harness
-                .runtime
-                .block_on(harness.authority.status())
-                .unwrap_or_else(|error| panic!("{case_name}: status should read before: {error}"));
-            let (mut client_stream, mut server_stream) =
-                UnixStream::pair().expect("test UnixStream pair should create");
-            write_control_plane_raft_peer_transport_frame(&mut client_stream, &frame)
-                .unwrap_or_else(|error| panic!("{case_name}: client should write frame: {error}"));
-
-            let result = handle_experimental_raft_peer_rpc_before_ack(
-                harness.runtime.handle(),
-                &harness.authority,
-                &mut server_stream,
-                2,
-                &policy,
-                ExperimentalRaftPeerRpcDurability {
-                    artifact_path: None,
-                    checkpoint_lock: None,
-                    publication: None,
-                },
-            );
-            assert!(
-                matches!(result, Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(_))),
-                "{case_name}: bad auth peer RPC should fail before dispatch: {result:?}"
-            );
-            let after_status = harness
-                .runtime
-                .block_on(harness.authority.status())
-                .unwrap_or_else(|error| panic!("{case_name}: status should read after: {error}"));
-            assert_eq!(
-                after_status.persisted_vote(),
-                before_status.persisted_vote(),
-                "{case_name}: bad auth peer RPC must not mutate persisted vote"
-            );
-            assert_eq!(
-                after_status.current_term(),
-                before_status.current_term(),
-                "{case_name}: bad auth peer RPC must not mutate current term"
-            );
-            drop(server_stream);
-
-            let mut client_stream = DeadlineStream::new(
-                &mut client_stream,
-                Instant::now() + Duration::from_millis(50),
-                "test peer response deadline expired",
-            )
-            .unwrap();
-            let response = read_control_plane_raft_peer_transport_frame(
-                &mut client_stream,
-                ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
-            );
-            assert!(
-                response.is_err(),
-                "{case_name}: bad auth peer RPC must not write a response"
-            );
-
-            let metrics = policy
-                .auth_policy()
-                .expect("test policy should have auth policy")
-                .metrics_snapshot();
-            assert_eq!(
-                metrics.accepted_total(),
-                0,
-                "{case_name}: bad auth peer RPC must not count as accepted"
-            );
-            assert_eq!(
-                metrics.rejected_total(),
-                1,
-                "{case_name}: bad auth peer RPC must be counted as rejected"
-            );
-            assert_eq!(
-                metrics.rejected_without_operation_total(),
-                u64::from(case_name == "missing-auth"),
-                "{case_name}: only malformed envelope frames should lack operation attribution"
-            );
-        }
-
-        harness.shutdown();
-    }
-
-    #[test]
-    fn experimental_raft_peer_rpc_worker_preserves_static_topology_through_auth() {
-        let harness = experimental_raft_test_harness("peer-static-topology-auth");
-        let cluster_name = format!(
-            "argmin-s3-experimental-raft-peer-static-topology-auth-{}",
-            std::process::id()
-        );
-        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name.clone(), 1, 1)
-            .with_topology(7, "topology-a");
-        let operation = ControlPlaneAuthOperation::RaftVote;
-        let request_frame = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
-            vote: Vote::<ControlPlaneRaftLeaderId>::new(3, 1),
-            last_log_id: None,
-            leadership_transfer: false,
-        })
-        .encode_frame_for_peer(&identity)
-        .expect("topology-bound peer request should encode");
-        let signed_request = experimental_raft_signed_peer_frame(
-            &cluster_name,
-            experimental_raft_peer_auth_credential(
-                &cluster_name,
-                1,
-                "raft-node-1",
-                1,
-                "node-1-test-secret",
-            ),
-            1,
-            operation,
-            request_frame,
-        );
-        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
-            cluster_name,
-            [(1, "node-1".to_string())],
-            ControlPlaneRaftPeerTransportLimits::default(),
-        )
-        .with_topology_identity(7, "topology-a")
-        .with_auth_policy(experimental_raft_peer_auth_policy(
-            &identity.cluster_name,
-            1,
-            1,
-        ));
-        let (mut client_stream, mut server_stream) =
-            UnixStream::pair().expect("test UnixStream pair should create");
-        write_control_plane_raft_peer_transport_frame(&mut client_stream, &signed_request)
-            .expect("client should write topology-bound authenticated frame");
-
-        handle_experimental_raft_peer_rpc_before_ack(
-            harness.runtime.handle(),
-            &harness.authority,
-            &mut server_stream,
-            1,
-            &policy,
-            ExperimentalRaftPeerRpcDurability {
-                artifact_path: None,
-                checkpoint_lock: None,
-                publication: None,
-            },
-        )
-        .expect("topology-bound authenticated worker request should succeed");
-
-        let signed_response = read_control_plane_raft_peer_transport_frame(
-            &mut client_stream,
-            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
-        )
-        .expect("worker should return an authenticated response");
-        let mut response_identity = identity;
-        std::mem::swap(&mut response_identity.source, &mut response_identity.target);
-        let response_frame = policy
-            .auth_policy()
-            .expect("test policy should have auth")
-            .verify_peer_frame(
-                &signed_response,
-                &response_identity,
-                operation,
-                ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
-            )
-            .expect("response auth should preserve topology identity");
-        ControlPlaneRaftPeerRpcResponse::decode_frame_for_peer(&response_frame, &response_identity)
-            .expect("authenticated topology-bound response should decode");
-
-        harness.shutdown();
-    }
-
-    #[test]
-    fn experimental_raft_peer_rpc_rejects_expired_transfer_leader_auth_before_dispatch() {
-        let harness = experimental_raft_test_harness("peer-transfer-leader-auth-before-dispatch");
-        let cluster_name = format!(
-            "argmin-s3-experimental-raft-peer-transfer-leader-auth-before-dispatch-{}",
-            std::process::id()
-        );
-        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name.clone(), 1, 2);
-        let request_frame = ControlPlaneRaftPeerRpcRequest::TransferLeader(
-            TransferLeaderRequest::new(Vote::<ControlPlaneRaftLeaderId>::new(3, 1), 2, None),
-        )
-        .encode_frame_for_peer(&identity)
-        .expect("transfer-leader peer request should encode");
-        let expired_frame = experimental_raft_peer_auth_credential(
-            &cluster_name,
-            1,
-            "raft-node-1",
-            1,
-            "node-1-test-secret",
-        )
-        .sign_envelope(ControlPlaneAuthSignInput {
-            target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
-                node_id: 2,
-            }),
-            operation: ControlPlaneAuthOperation::RaftTransferLeader,
-            issued_at_ms: Some(1),
-            expires_at_ms: Some(2),
-            sequence: None,
-            nonce: Vec::new(),
-            payload: request_frame,
-        })
-        .expect("expired transfer-leader auth envelope should sign")
-        .encode_frame()
-        .expect("expired transfer-leader auth envelope should encode");
-        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
-            cluster_name.clone(),
-            [(1, "node-1".to_string()), (2, "node-2".to_string())],
-            ControlPlaneRaftPeerTransportLimits::default(),
-        )
-        .with_auth_policy(experimental_raft_peer_auth_policy(&cluster_name, 2, 1));
-        let before_status = harness
-            .runtime
-            .block_on(harness.authority.status())
-            .expect("status should read before expired transfer-leader auth");
-        let (mut client_stream, mut server_stream) =
-            UnixStream::pair().expect("test UnixStream pair should create");
-        write_control_plane_raft_peer_transport_frame(&mut client_stream, &expired_frame)
-            .expect("client should write expired transfer-leader auth frame");
-
-        let result = handle_experimental_raft_peer_rpc_before_ack(
-            harness.runtime.handle(),
-            &harness.authority,
-            &mut server_stream,
-            2,
-            &policy,
-            ExperimentalRaftPeerRpcDurability {
-                artifact_path: None,
-                checkpoint_lock: None,
-                publication: None,
-            },
-        );
-        assert!(
-            matches!(result, Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(_))),
-            "expired transfer-leader auth should fail before dispatch: {result:?}"
-        );
-        let after_status = harness
-            .runtime
-            .block_on(harness.authority.status())
-            .expect("status should read after expired transfer-leader auth");
-        assert_eq!(
-            after_status.persisted_vote(),
-            before_status.persisted_vote(),
-            "expired transfer-leader auth must not mutate persisted vote"
-        );
-        assert_eq!(
-            after_status.current_term(),
-            before_status.current_term(),
-            "expired transfer-leader auth must not mutate current term"
-        );
-        drop(server_stream);
-
-        let mut client_stream = DeadlineStream::new(
-            &mut client_stream,
-            Instant::now() + Duration::from_millis(50),
-            "test peer response deadline expired",
-        )
-        .unwrap();
-        let response = read_control_plane_raft_peer_transport_frame(
-            &mut client_stream,
-            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
-        );
-        assert!(
-            response.is_err(),
-            "expired transfer-leader auth must not write a response"
-        );
-        let metrics = policy
-            .auth_policy()
-            .expect("test policy should have auth policy")
-            .metrics_snapshot();
-        assert_eq!(metrics.accepted_total(), 0);
-        assert_eq!(metrics.rejected_total(), 1);
-        assert_eq!(
-            metrics.rejected_for_operation(ControlPlaneAuthOperation::RaftTransferLeader),
-            1
-        );
-        assert_eq!(
-            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure),
-            1
-        );
 
         harness.shutdown();
     }
@@ -12447,6 +11157,7 @@ mod tests {
         fs::create_dir_all(&state_dir).expect("durable test directory should exist");
         let state_path = state_dir.join("control-plane.state");
         let wal_path = durable_artifact_wal_path(&state_path);
+        let peer_socket_path = state_dir.join("peer.sock");
         let cluster_name = format!(
             "argmin-s3-experimental-raft-peer-wal-ack-{}",
             std::process::id()
@@ -12479,25 +11190,11 @@ mod tests {
             "initial checkpoint should compact the WAL suffix"
         );
 
-        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+        let peer_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
             cluster_name.clone(),
             [(1, "node-1".to_string())],
             ControlPlaneRaftPeerTransportLimits::default(),
         );
-        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name.clone(), 1, 1);
-        let expected_vote = Vote::<ControlPlaneRaftLeaderId>::new(3, 1);
-        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
-            vote: expected_vote,
-            last_log_id: None,
-            leadership_transfer: false,
-        });
-        let request_frame = request
-            .encode_frame_for_peer(&identity)
-            .expect("peer request should encode");
-        let (mut client_stream, mut server_stream) =
-            UnixStream::pair().expect("test UnixStream pair should create");
-        write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
-            .expect("client should write request frame");
         let checkpoint_lock = Arc::new(Mutex::new(()));
         let publication = ExperimentalRaftDurabilityPublication::new();
         let durability_context = ExperimentalRaftPeerDurabilityContext {
@@ -12505,6 +11202,47 @@ mod tests {
             checkpoint_lock,
             publication,
         };
+        let server_policy = ControlPlaneRaftPeerServerPolicy::new(1, peer_policy, 4096)
+            .expect("test peer server policy should build")
+            .with_durability(Arc::new(ExperimentalRaftPeerServerDurability {
+                runtime: runtime.handle().clone(),
+                authority: Arc::clone(&authority),
+                context: durability_context.clone(),
+            }));
+        let listener = Arc::new(
+            ControlPlaneRaftPeerServerListener::unix(
+                "test-peer",
+                UnixListener::bind(&peer_socket_path).expect("test peer socket should bind"),
+                1,
+                Duration::from_secs(5),
+            )
+            .expect("test peer listener should build"),
+        );
+        let client = ControlPlaneRaftPeerTestClient::unix(
+            peer_socket_path,
+            cluster_name,
+            1,
+            1,
+            ControlPlaneRaftPeerTransportLimits::default(),
+            Duration::from_secs(5),
+        );
+        let send_vote = |term| {
+            let accept_listener = Arc::clone(&listener);
+            let accept_authority = Arc::clone(&authority);
+            let accept_policy = server_policy.clone();
+            let runtime_handle = runtime.handle().clone();
+            let accept = thread::spawn(move || {
+                accept_listener
+                    .accept_one(&runtime_handle, accept_authority, &accept_policy)
+                    .expect("test peer listener should accept");
+            });
+            let granted = client
+                .send_vote(term, None, false)
+                .expect("test peer vote should receive a response");
+            accept.join().expect("test peer accept should finish");
+            granted
+        };
+
         let mut checkpoint_tracker =
             ExperimentalRaftPeerCheckpointTracker::new(ExperimentalRaftPeerCheckpointPolicy {
                 max_wal_suffix_bytes: u64::MAX,
@@ -12525,26 +11263,10 @@ mod tests {
             .lock()
             .expect("checkpoint lock should acquire");
 
-        let result = handle_experimental_raft_peer_rpc_before_ack(
-            runtime.handle(),
-            &authority,
-            &mut server_stream,
-            1,
-            &policy,
-            ExperimentalRaftPeerRpcDurability::from_context(&durability_context),
-        );
+        let expected_vote = Vote::<ControlPlaneRaftLeaderId>::new(3, 1);
         assert!(
-            result.is_ok(),
-            "peer RPC should acknowledge after its WAL mutation is durable: {result:?}"
-        );
-        let response = read_control_plane_raft_peer_transport_frame(
-            &mut client_stream,
-            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
-        )
-        .expect("peer RPC should write a response frame");
-        assert!(
-            !response.is_empty(),
-            "peer RPC response frame should be non-empty"
+            send_vote(expected_vote.leader_id.term),
+            "peer RPC should acknowledge after its WAL mutation is durable"
         );
         assert_eq!(
             durable_raft_artifact_vote(&state_path),
@@ -12590,102 +11312,15 @@ mod tests {
             "bounded checkpoint should compact the acknowledged WAL suffix"
         );
 
-        let failed_response_vote = Vote::<ControlPlaneRaftLeaderId>::new(4, 1);
-        let failed_response_request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
-            vote: failed_response_vote,
-            last_log_id: None,
-            leadership_transfer: false,
-        });
-        let failed_response_frame = failed_response_request
-            .encode_frame_for_peer(&identity)
-            .expect("second peer request should encode");
-        let (mut second_client_stream, mut second_server_stream) =
-            UnixStream::pair().expect("second test UnixStream pair should create");
-        write_control_plane_raft_peer_transport_frame(
-            &mut second_client_stream,
-            &failed_response_frame,
-        )
-        .expect("second client should write request frame");
-        let failed_response = handle_experimental_raft_peer_rpc_with_response_writer(
-            runtime.handle(),
-            &authority,
-            &mut second_server_stream,
-            1,
-            &policy,
-            ExperimentalRaftPeerRpcDurability::from_context(&durability_context),
-            |_stream, _response_frame| {
-                Err(ControlPlaneError::Io {
-                    context: "write injected failed peer response",
-                    source: io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "injected post-dispatch response failure",
-                    ),
-                })
-            },
-        );
-        assert!(
-            matches!(
-                &failed_response,
-                Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(
-                    ControlPlaneError::Io {
-                        context: "write injected failed peer response",
-                        source,
-                    }
-                )) if source.kind() == io::ErrorKind::BrokenPipe
-            ),
-            "injected post-dispatch response write should fail: {failed_response:?}"
-        );
-        assert!(
-            checkpoint_experimental_raft_peer_wal_if_due(
-                runtime.handle(),
-                &authority,
-                &durability_context,
-                &mut checkpoint_tracker,
-                Instant::now(),
-            )
-            .expect("failed-response checkpoint should succeed"),
-            "WAL observer should see a durable mutation despite response failure"
-        );
-        assert_eq!(
-            durable_raft_artifact_vote(&state_path),
-            Some(failed_response_vote),
-            "failed response must not strand its durable WAL mutation outside checkpoint scheduling"
-        );
-
         let no_op_metrics_before = authority.durability_metric_snapshots();
         let no_op_offsets_before = runtime
             .block_on(authority.status())
             .expect("status before no-op vote should read")
             .durable_wal_offsets();
-        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
-            vote: failed_response_vote,
-            last_log_id: None,
-            leadership_transfer: false,
-        });
-        let request_frame = request
-            .encode_frame_for_peer(&identity)
-            .expect("peer request should encode");
-        let (mut client_stream, mut server_stream) =
-            UnixStream::pair().expect("test UnixStream pair should create");
-        write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
-            .expect("client should write request frame");
-        let result = handle_experimental_raft_peer_rpc_before_ack(
-            runtime.handle(),
-            &authority,
-            &mut server_stream,
-            1,
-            &policy,
-            ExperimentalRaftPeerRpcDurability::from_context(&durability_context),
-        );
         assert!(
-            result.is_ok(),
-            "unchanged durable Raft state should not require a new checkpoint: {result:?}"
+            send_vote(expected_vote.leader_id.term),
+            "unchanged durable Raft state should receive a response"
         );
-        read_control_plane_raft_peer_transport_frame(
-            &mut client_stream,
-            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
-        )
-        .expect("no-op peer vote should receive a response");
         assert_eq!(
             authority.durability_metric_snapshots().wal,
             no_op_metrics_before.wal,
@@ -12715,73 +11350,6 @@ mod tests {
             .block_on(authority.shutdown())
             .expect("WAL-backed authority should shut down");
         let _ = fs::remove_dir_all(&state_dir);
-    }
-
-    #[test]
-    fn experimental_raft_wal_monitor_does_not_enter_state_machine() {
-        let state_dir = short_unix_socket_test_dir("experimental-raft-wal-monitor-lock");
-        let state_path = state_dir.0.path().join("control-plane.state");
-        let harness = experimental_raft_durable_wal_test_harness(
-            "wal-monitor-state-machine-lock",
-            &state_path,
-        );
-        let expected_offsets = harness
-            .authority
-            .durable_wal_monitor_snapshot()
-            .expect("baseline WAL monitor snapshot should read")
-            .offsets();
-
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let runtime_handle = harness.runtime.handle().clone();
-        let boundary_authority = Arc::clone(&harness.authority);
-        let boundary_thread = thread::spawn(move || {
-            runtime_handle
-                .block_on(
-                    boundary_authority
-                        .raft()
-                        .with_state_machine(move |_state_machine| {
-                            entered_tx
-                                .send(())
-                                .expect("state-machine boundary entry should signal");
-                            Box::pin(async move {
-                                release_rx
-                                    .recv()
-                                    .expect("state-machine boundary release should arrive");
-                            })
-                        }),
-                )
-                .expect("state-machine boundary should remain available");
-        });
-        entered_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("state-machine boundary should be held");
-
-        let (monitor_tx, monitor_rx) = std::sync::mpsc::channel();
-        let monitor_authority = Arc::clone(&harness.authority);
-        let monitor_thread = thread::spawn(move || {
-            let result = monitor_authority.durable_wal_monitor_snapshot();
-            monitor_tx
-                .send(result)
-                .expect("WAL monitor result should be observed");
-        });
-        let monitor_result = monitor_rx.recv_timeout(Duration::from_secs(1));
-        release_tx
-            .send(())
-            .expect("state-machine boundary should release");
-        boundary_thread
-            .join()
-            .expect("state-machine boundary thread should finish");
-        monitor_thread
-            .join()
-            .expect("WAL monitor thread should finish");
-        let monitor_snapshot = monitor_result
-            .expect("WAL monitor must not wait for the state-machine boundary")
-            .expect("WAL monitor snapshot should read");
-        assert_eq!(monitor_snapshot.offsets(), expected_offsets);
-        assert_eq!(monitor_snapshot.poisoned(), None);
-
-        harness.shutdown();
     }
 
     #[test]
@@ -12832,23 +11400,11 @@ mod tests {
                 .store_durable_restart_artifact(&state_path)
                 .await
                 .expect("leader baseline authority state should checkpoint");
-            let status = authority
-                .status()
-                .await
-                .expect("baseline authority status should read before step-down");
-            let initial_term = status
-                .current_term()
-                .expect("baseline authority should have a current term");
-            let response = authority
-                .raft()
-                .vote(VoteRequest {
-                    vote: Vote::new(initial_term + 1, 2),
-                    last_log_id: status.last_log_id(),
-                    leadership_transfer: true,
-                })
+            let vote_granted = authority
+                .force_step_down_for_test(2)
                 .await
                 .expect("higher peer vote should step down the local leader");
-            assert!(response.vote_granted);
+            assert!(vote_granted);
             let stepped_down = authority
                 .status()
                 .await
@@ -12878,9 +11434,7 @@ mod tests {
 
         let elected_vote = runtime.block_on(async {
             authority
-                .raft()
-                .trigger()
-                .elect(false)
+                .trigger_local_election_for_test()
                 .await
                 .expect("local election should trigger");
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -12936,86 +11490,6 @@ mod tests {
             .block_on(authority.shutdown())
             .expect("WAL-backed authority should shut down");
         let _ = fs::remove_dir_all(&state_dir);
-    }
-
-    #[test]
-    fn experimental_raft_captured_checkpoint_persists_outside_state_machine_boundary() {
-        let state_dir = short_unix_socket_test_dir("captured-checkpoint-isolation");
-        let state_path = state_dir.0.path().join("control-plane.state");
-        let mut harness = experimental_raft_durable_wal_test_harness(
-            "captured-checkpoint-state-machine-isolation",
-            &state_path,
-        );
-        let mut config = test_server_config();
-        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
-            node_id: 1,
-            socket_path: "/tmp/argmin-checkpoint-isolation-node-1.sock".to_string(),
-        }];
-        config.storage_pg_ids = vec![0];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
-            .expect("checkpoint-isolation authority should bootstrap");
-        let checkpoint = harness
-            .control_plane
-            .block_on(harness.authority.capture_durable_restart_checkpoint())
-            .expect("restart checkpoint should capture before holding the state machine");
-        let state_path = harness
-            .control_plane
-            .durable_artifact_path
-            .as_ref()
-            .expect("durable harness should retain an artifact path")
-            .as_ref()
-            .clone();
-
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let runtime_handle = harness.runtime.handle().clone();
-        let boundary_authority = Arc::clone(&harness.authority);
-        let boundary_thread = thread::spawn(move || {
-            runtime_handle
-                .block_on(
-                    boundary_authority
-                        .raft()
-                        .with_state_machine(move |_state_machine| {
-                            entered_tx
-                                .send(())
-                                .expect("state-machine boundary entry should signal");
-                            Box::pin(async move {
-                                release_rx
-                                    .recv()
-                                    .expect("state-machine boundary release should arrive");
-                            })
-                        }),
-                )
-                .expect("state-machine boundary should remain available");
-        });
-        entered_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("state-machine boundary should be held");
-
-        let (persist_tx, persist_rx) = std::sync::mpsc::channel();
-        let persist_authority = Arc::clone(&harness.authority);
-        let persist_thread = thread::spawn(move || {
-            let result =
-                persist_authority.persist_durable_restart_checkpoint(checkpoint, &state_path);
-            persist_tx
-                .send(result)
-                .expect("checkpoint persistence result should be observed");
-        });
-        let persist_result = persist_rx.recv_timeout(Duration::from_secs(2));
-        release_tx
-            .send(())
-            .expect("state-machine boundary should release");
-        boundary_thread
-            .join()
-            .expect("state-machine boundary thread should finish");
-        persist_thread
-            .join()
-            .expect("checkpoint persistence thread should finish");
-        persist_result
-            .expect("captured checkpoint persistence must not wait for the state machine")
-            .expect("captured checkpoint should persist");
-
-        harness.shutdown();
     }
 
     #[test]
@@ -13372,15 +11846,7 @@ mod tests {
         );
         let expected = harness
             .control_plane
-            .block_on(
-                harness
-                    .authority
-                    .raft()
-                    .with_state_machine(|state_machine| {
-                        let snapshot = state_machine.inner().snapshot().clone();
-                        Box::pin(async move { snapshot })
-                    }),
-            )
+            .block_on(harness.authority.durable_state_machine_snapshot_for_test())
             .expect("pre-crash state-machine snapshot should read");
         harness.shutdown();
 
@@ -13391,11 +11857,7 @@ mod tests {
             .block_on(
                 restarted
                     .authority
-                    .raft()
-                    .with_state_machine(|state_machine| {
-                        let snapshot = state_machine.inner().snapshot().clone();
-                        Box::pin(async move { snapshot })
-                    }),
+                    .durable_state_machine_snapshot_for_test(),
             )
             .expect("artifact plus purge WAL restart should restore state");
         assert_eq!(restored, expected);
@@ -14741,20 +13203,10 @@ mod tests {
         assert_eq!(fenced_route.primary_lease_deadline_ms(), None);
         let durable_fence_deadline = harness
             .control_plane
-            .block_on(
-                harness
-                    .authority
-                    .raft()
-                    .with_state_machine(|state_machine| {
-                        let deadline = state_machine
-                            .inner()
-                            .snapshot()
-                            .pg(PgId::new(13))
-                            .and_then(|pg| pg.metadata_transfer_fence_source_lease_deadline_ms());
-                        Box::pin(async move { deadline })
-                    }),
-            )
-            .expect("durable metadata-transfer fence state should read");
+            .block_on(harness.authority.durable_state_machine_snapshot_for_test())
+            .expect("durable metadata-transfer fence state should read")
+            .pg(PgId::new(13))
+            .and_then(|pg| pg.metadata_transfer_fence_source_lease_deadline_ms());
         assert_eq!(
             durable_fence_deadline,
             Some(41_100),

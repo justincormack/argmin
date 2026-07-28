@@ -363,20 +363,24 @@ The public boundary and containment status for each surface are as follows.
   process supplies bound listeners, certificate material, logical peer policy, and an opaque
   durability callback. Storage decides when snapshot responses require checkpointing and ensures
   that checkpointing precedes every possible response write.
-- The resulting public representation includes peer request/response/snapshot types,
-  `encode_frame`/`decode_frame`, frame-kind and identity decoders, transport read/write helpers,
-  the raw frame handlers, shared auth-envelope codecs, the ALPN constant, and the underlying
-  OpenRaft `Raft` handle. None is an appropriate binary-facing logical API.
+- **Completed representation-containment slice:** peer request/response/snapshot types,
+  frame-kind and identity values, codecs, transport read/write helpers, raw frame handlers, the
+  shared auth-envelope representation, the ALPN constant, and the underlying OpenRaft `Raft`
+  handle are private to `storage`. Cross-crate process tests use an opaque semantic peer test
+  client for votes and command appends, including an opaque pending response for crash races;
+  binary durability tests use owner-provided snapshot, step-down, and election hooks rather than
+  OpenRaft types.
 - Client retry classification is storage-owned and permanently tests that reachability failures
   map to OpenRaft `Unreachable` while protocol failures map to `Network`. The inbound server
   returns only an opaque terminal listener failure to the process; request and transport
   diagnostics remain storage-owned.
-- Raw codec, version, identity-binding, authentication, transport, and OpenRaft dispatch tests
-  already exist in `control_plane_raft.rs`. The TLS/ALPN, admission-budget, checkpoint-ordering,
-  and response-publication cases now exercise the storage facade there. `argmin-s3` still
-  duplicates extensive raw-frame, malformed-envelope, and direct-dispatch testing. Those protocol
-  cases belong in `storage`; only process lifecycle, crash, and durability-observation tests
-  should remain in the binary crate, using logical or opaque owner-provided facilities.
+- Raw codec, version, identity-binding, authentication, transport, OpenRaft dispatch,
+  poison-before-dispatch, response-loss durability, state-machine-isolation, TLS/ALPN,
+  admission-budget, checkpoint-ordering, and response-publication tests are colocated in
+  `control_plane_raft.rs`. The duplicate binary raw-frame, malformed-envelope, and direct-dispatch
+  tests are removed. Process lifecycle, crash, and durability-observation tests remain in
+  `argmin-s3`, using logical or opaque owner-provided facilities. A repository check rejects raw
+  Raft frames, handlers, auth envelopes, ALPN, and `.raft()` access outside `storage`.
 
 This completes the RPC inventory only; it does not satisfy Phase 1 containment. The bounded
 implementation order is:
@@ -394,9 +398,10 @@ implementation order is:
 4. **Complete:** add a storage-owned peer server facade that preserves the existing pre-auth
    allocation bound and durability-before-ack invariant. TLS/ALPN, worker admission, authenticated
    dispatch, response signing and finalization are storage-owned and boundary-checked.
-5. After the peer facade exists, make the remaining raw Raft frame, auth-envelope, ALPN,
-   OpenRaft-handle, and transport-error APIs private and add repository checks. The equivalent
-   control-plane client and server cleanup is complete.
+5. **Complete:** make the remaining raw Raft frame, auth-envelope, ALPN, OpenRaft-handle, and
+   transport-error APIs private; relocate impossible-state tests into `storage`; retain process
+   coverage through logical or opaque semantic test facilities; and enforce the boundary with a
+   repository check. The equivalent control-plane client and server cleanup is also complete.
 
 Phase 1 exit criteria:
 
