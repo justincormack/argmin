@@ -620,6 +620,16 @@ enum BucketDeleteFinalizeWorkerDisposition {
     RetryAfter(Duration),
 }
 
+pub(super) fn object_payload_reclaim_worker_should_defer(
+    result: &Result<storage::cluster::ObjectPayloadReclaimAttempt, ServerError>,
+) -> bool {
+    matches!(
+        result,
+        Ok(storage::cluster::ObjectPayloadReclaimAttempt::Deferred)
+            | Err(ServerError::OperationAborted | ServerError::SlowDown)
+    )
+}
+
 fn bucket_delete_finalize_worker_disposition(
     result: &Result<storage::BucketDeleteFinalizeOutcome, ServerError>,
 ) -> BucketDeleteFinalizeWorkerDisposition {
@@ -1062,11 +1072,7 @@ impl ReclaimSweeper {
                                         &key,
                                         generation_id,
                                     );
-                                if matches!(
-                                    result,
-                                    Ok(storage::cluster::ObjectPayloadReclaimAttempt::Deferred)
-                                        | Err(ServerError::OperationAborted | ServerError::SlowDown)
-                                ) {
+                                if object_payload_reclaim_worker_should_defer(&result) {
                                     object_payload_reclaim_pg_retry_after.insert(
                                         pg_id,
                                         Instant::now() + OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN,
@@ -3333,18 +3339,6 @@ impl ReadRuntime {
         .expect("current storage cluster should acquire payload lease")
     }
 
-    #[cfg(test)]
-    pub(super) fn try_reclaim_object_payload_for(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<bool, ServerError> {
-        self.storage_node()
-            .reclaim_object_payload_if_unleased(bucket, key, generation_id)
-            .map_err(Coordinator::map_object_pg_action_error)
-    }
-
     fn try_reclaim_object_payload_for_with_outcome(
         &self,
         bucket: &BucketName,
@@ -3357,17 +3351,33 @@ impl ReadRuntime {
     }
 
     #[cfg(test)]
+    pub(super) fn try_reclaim_object_payload_with_outcome(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<storage::cluster::ObjectPayloadReclaimAttempt, ServerError> {
+        self.try_reclaim_object_payload_for_with_outcome(
+            &trusted_bucket_name(bucket),
+            &trusted_object_key(key),
+            generation_id,
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn try_reclaim_object_payload(
         &self,
         bucket: &str,
         key: &str,
         generation_id: GenerationId,
     ) -> Result<bool, ServerError> {
-        self.try_reclaim_object_payload_for(
-            &trusted_bucket_name(bucket),
-            &trusted_object_key(key),
-            generation_id,
-        )
+        self.storage_node()
+            .reclaim_object_payload_if_unleased(
+                &trusted_bucket_name(bucket),
+                &trusted_object_key(key),
+                generation_id,
+            )
+            .map_err(Coordinator::map_object_pg_action_error)
     }
 
     #[cfg(test)]
@@ -3680,6 +3690,16 @@ mod tests {
                 BUCKET_DELETE_FINALIZE_ERROR_RETRY_COOLDOWN
             ),
             "an error after durable bucket deletion must remain retryable so NotFound can clear the exact outstanding root"
+        );
+    }
+
+    #[test]
+    fn object_payload_reclaim_worker_finishes_missing_roots() {
+        let result = Ok(storage::cluster::ObjectPayloadReclaimAttempt::MissingRoot);
+
+        assert!(
+            !object_payload_reclaim_worker_should_defer(&result),
+            "a stale hint for an already-removed root must release its outstanding queue slot"
         );
     }
 

@@ -1,3 +1,4 @@
+use super::runtime::object_payload_reclaim_worker_should_defer;
 use super::test_support::open_test_storage_cluster;
 use super::*;
 use proptest::prelude::*;
@@ -112,6 +113,21 @@ fn seed_deleting_bucket(runtime: &ReadRuntime) -> storage::BucketDeleteFinalizeR
         bucket,
         bucket_incarnation_generation: info.bucket_incarnation_generation,
     }
+}
+
+fn execute_object_payload_reclaim_worker_step(
+    runtime: &ReadRuntime,
+    key: &str,
+    generation_id: GenerationId,
+) -> Result<bool, TestCaseError> {
+    let result = runtime.try_reclaim_object_payload_with_outcome(TRACE_BUCKET, key, generation_id);
+    let should_defer = object_payload_reclaim_worker_should_defer(&result);
+    result.map_err(|err| {
+        TestCaseError::fail(format!(
+            "try_reclaim_object_payload failed unexpectedly: {err:?}"
+        ))
+    })?;
+    Ok(!should_defer)
 }
 
 #[derive(Debug, Clone)]
@@ -1002,14 +1018,11 @@ impl ReclaimTraceHarness {
             }
             WorkerObjectStep => {
                 self.expect_trace_object_work()?;
-                let completed = self
-                    .runtime
-                    .try_reclaim_object_payload(TRACE_BUCKET, TRACE_KEY, trace_generation_id())
-                    .map_err(|err| {
-                        TestCaseError::fail(format!(
-                            "try_reclaim_object_payload failed unexpectedly: {err:?}"
-                        ))
-                    })?;
+                let completed = execute_object_payload_reclaim_worker_step(
+                    &self.runtime,
+                    TRACE_KEY,
+                    trace_generation_id(),
+                )?;
                 self.finish_or_defer_trace_object_work(completed);
             }
             WorkerBucketDeleteStep => {
@@ -1166,14 +1179,11 @@ impl ReclaimKindTraceHarness {
             }
             WorkerObjectStep => {
                 self.expect_trace_object_work()?;
-                let completed = self
-                    .runtime
-                    .try_reclaim_object_payload(TRACE_BUCKET, TRACE_KEY, trace_generation_id())
-                    .map_err(|err| {
-                        TestCaseError::fail(format!(
-                            "try_reclaim_object_payload failed unexpectedly: {err:?}"
-                        ))
-                    })?;
+                let completed = execute_object_payload_reclaim_worker_step(
+                    &self.runtime,
+                    TRACE_KEY,
+                    trace_generation_id(),
+                )?;
                 self.finish_or_defer_trace_object_work(completed);
             }
             WorkerBucketDeleteStep => {
@@ -1435,14 +1445,11 @@ impl TwoGenerationReclaimTraceHarness {
             expected,
             "worker dequeued object reclaim generation out of FIFO order"
         );
-        let completed = self
-            .runtime
-            .try_reclaim_object_payload(TRACE_BUCKET, TRACE_KEY, expected.generation_id())
-            .map_err(|err| {
-                TestCaseError::fail(format!(
-                    "try_reclaim_object_payload failed unexpectedly: {err:?}"
-                ))
-            })?;
+        let completed = execute_object_payload_reclaim_worker_step(
+            &self.runtime,
+            TRACE_KEY,
+            expected.generation_id(),
+        )?;
         self.finish_or_defer_generation_work(expected, completed);
         Ok(())
     }
@@ -1665,14 +1672,11 @@ impl TwoKeyReclaimTraceHarness {
             expected,
             "worker dequeued object reclaim key out of bucket-root order"
         );
-        let completed = self
-            .runtime
-            .try_reclaim_object_payload(TRACE_BUCKET, expected.key(), trace_generation_id())
-            .map_err(|err| {
-                TestCaseError::fail(format!(
-                    "try_reclaim_object_payload failed unexpectedly: {err:?}"
-                ))
-            })?;
+        let completed = execute_object_payload_reclaim_worker_step(
+            &self.runtime,
+            expected.key(),
+            trace_generation_id(),
+        )?;
         self.finish_or_defer_key_work(expected, completed);
         Ok(())
     }
