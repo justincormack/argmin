@@ -2053,6 +2053,7 @@ impl Coordinator {
             .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub(super) fn with_bucket_write_handle_for_command_with_storage_node<R, T>(
         &self,
         storage_node: &Arc<StorageCluster>,

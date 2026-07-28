@@ -233,11 +233,6 @@ define_metadata_command_publishers! {
         "CreateMultipartUpload",
         SnapshotSensitive
     ),
-    BeginUploadPartStreamSession => (
-        "begin_upload_part_stream_session_with_cleanup_deadline",
-        "CreateStreamUpload",
-        SnapshotSensitive
-    ),
     CreateUploadPartStreamSession => (
         "create_upload_part_stream_session_with_route_validation",
         "CreateStreamUpload",

@@ -3426,6 +3426,38 @@ Seventy-fourth Phase 3 review correction:
   boundary checker, workspace-wide strict Clippy, and the full 7,671-test
   workspace suite pass.
 
+Seventy-fifth Phase 3 slice:
+
+- ordinary streamed UploadPart now uses the request's admitted
+  `ActiveMultipartObjectRoute` for authorization-time upload loading, stream
+  session creation, encryption/session reload, segment allocation and shard
+  publication, and finalization. Its production frontend context no longer
+  carries a raw renewable `StorageCluster` handle.
+- session creation compares the current in-progress upload with the exact
+  request-entry authorized upload record and derives the durable cleanup
+  deadline from the admitted route. Append preparation, shard writes, pending
+  installation, and finalization therefore share the same immutable effect
+  fence already used by UploadPartCopy.
+- the superseded raw coordinator and `StorageCluster` UploadPart session-create,
+  encryption-load, and append adapters are test/test-hook-only. The duplicate
+  production `BeginUploadPartStreamSession` publisher classification is
+  removed; ordinary UploadPart and UploadPartCopy now share the single
+  route-validating `CreateUploadPartStreamSession` publisher.
+- a deterministic same-epoch-renewal regression expires admission after
+  ordinary UploadPart shards are staged but before append command-ID
+  allocation. It requires `OperationAborted`, proves the staged shards and
+  segment row are absent, cleans the session through retained authority, and
+  preserves the active MPU. The multipart publication-domain matrix now also
+  rejects foreign-domain ordinary UploadPart create, append, and finalize
+  while positive canaries publish through the owning coordinator.
+- all 62 focused server-core stream-part/UploadPart tests, 24 server-HTTP
+  UploadPart tests, and 44 endpoint-neutral S3 UploadPart tests pass, together
+  with both independent `server-core` feature checks, the storage boundary
+  checker, workspace-wide strict Clippy, and the full 7,667-test workspace
+  suite.
+- other remaining buffered coordinator workflows and capability requirements
+  on node-client traits remain open in Phase 3.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

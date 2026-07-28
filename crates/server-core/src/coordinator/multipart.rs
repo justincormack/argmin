@@ -310,6 +310,7 @@ impl Coordinator {
         self.append_stream_part_data_with_storage_node(&self.storage_node(), req)
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn append_stream_part_data_with_storage_node(
         &self,
         storage_node: &std::sync::Arc<storage::StorageCluster>,
@@ -361,14 +362,57 @@ impl Coordinator {
         })
     }
 
-    pub fn append_stream_part_data_with_storage_admission(
+    pub fn append_stream_part_data_on_admitted_route(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: &AppendStreamPartRequest<'_>,
     ) -> Result<(), ServerError> {
-        self.require_admitted_storage_effect(admission, storage_node)?;
-        self.append_stream_part_data_with_storage_node(storage_node, req)
+        self.require_storage_route_admission(admission)?;
+        let route = admission
+            .active_multipart_object_route(&req.bucket, &req.key)
+            .map_err(super::map_store_error)?;
+        let write_encryption = self
+            .load_stream_part_write_encryption_on_admitted_multipart_route(
+                &route,
+                req.session_id,
+                req.part_number,
+                req.sse_customer,
+            )
+            .map_err(|error| match error {
+                ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+                | ServerError::Metadata(storage::MetadataError::StreamSessionNotInProgress {
+                    ..
+                }) => ServerError::NoSuchUpload {
+                    upload_id: req.upload_id.to_string(),
+                },
+                other => other,
+            })?;
+        let payload_crc64 = checksum::crc64::checksum(req.data);
+        let storage_data = write_encryption.encrypt_segment(req.segment_index, req.data)?;
+        self.append_stream_segment_on_admitted_multipart_route(
+            &route,
+            &req.bucket,
+            &req.key,
+            req.session_id,
+            req.segment_index,
+            super::StreamSegmentAppendPayload::maybe_encrypted(
+                &storage_data,
+                payload_crc64,
+                matches!(
+                    write_encryption.as_ref(),
+                    super::ActiveWriteEncryptionRef::None
+                ),
+            ),
+        )
+        .map_err(|error| match error {
+            ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+            | ServerError::Metadata(storage::MetadataError::StreamSessionNotInProgress {
+                ..
+            }) => ServerError::NoSuchUpload {
+                upload_id: req.upload_id.to_string(),
+            },
+            other => other,
+        })
     }
 
     /// Begin a streaming UploadPart session.
@@ -383,6 +427,7 @@ impl Coordinator {
         self.begin_stream_part_with_storage_node(&self.storage_node(), req)
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn begin_stream_part_with_storage_node(
         &self,
         storage_node: &std::sync::Arc<storage::StorageCluster>,
@@ -391,6 +436,7 @@ impl Coordinator {
         self.begin_stream_part_with_storage_node_and_cleanup_deadline(storage_node, req, None)
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn begin_stream_part_with_storage_node_and_cleanup_deadline(
         &self,
         storage_node: &std::sync::Arc<storage::StorageCluster>,
@@ -479,19 +525,57 @@ impl Coordinator {
         )
     }
 
-    pub fn begin_stream_part_with_storage_admission_and_cleanup_deadline(
+    pub fn begin_stream_part_on_admitted_route(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: &BeginStreamPartRequest<'_>,
-        cleanup_after: Option<u64>,
     ) -> Result<BeginStreamPartResult, ServerError> {
-        self.require_admitted_storage_effect(admission, storage_node)?;
-        self.begin_stream_part_with_storage_node_and_cleanup_deadline(
-            storage_node,
-            req,
-            cleanup_after,
-        )
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::begin_stream_part",
+            "bucket={:?} key={:?} upload_id={:?} part_number={}",
+            req.upload.bucket_name(),
+            req.upload.key(),
+            req.upload.upload_id(),
+            req.part_number
+        );
+        Self::validate_upload_part_number(req.part_number)?;
+        self.require_storage_route_admission(admission)?;
+        let route = admission
+            .active_multipart_object_route(req.upload.bucket_name_typed(), req.upload.key_typed())
+            .map_err(super::map_store_error)?;
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+        let authorized = self.with_bucket_write_handle_on_admitted_route(
+            admission,
+            &req.upload,
+            request,
+            |bucket_handle| {
+                let upload = route
+                    .load_in_progress_multipart_upload(req.upload.upload_id())
+                    .map_err(Self::map_object_pg_action_error)?;
+                self.authorize_begin_stream_part_with_upload(req, &bucket_handle, &upload)
+            },
+        )?;
+        let checksum_algorithm = authorized
+            .upload
+            .record()
+            .checksum
+            .map(MultipartChecksumConfig::algorithm);
+        let session_id = Self::random_session_id("failed to generate session ID")?;
+        let session_id = route
+            .create_upload_part_stream_session(
+                &authorized.upload,
+                authorized.part_number,
+                &session_id,
+            )
+            .map_err(|error| Self::map_upload_part_stream_error(&authorized.upload_id, error))?;
+        Ok(BeginStreamPartResult {
+            session_id,
+            checksum_algorithm,
+            sse_customer: authorized.sse_customer,
+        })
     }
 
     pub(super) fn validate_upload_part_number(part_number: u32) -> Result<(), ServerError> {

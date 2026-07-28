@@ -13085,6 +13085,7 @@ impl super::StorageCluster {
             .load_multipart_upload(pg_id, bucket, key, upload_id)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn begin_upload_part_stream_session<T, E>(
         &self,
         req: BeginUploadPartStreamSessionReq,
@@ -13093,6 +13094,7 @@ impl super::StorageCluster {
         self.begin_upload_part_stream_session_with_cleanup_deadline(req, None, action)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn begin_upload_part_stream_session_with_cleanup_deadline<T, E>(
         &self,
         req: BeginUploadPartStreamSessionReq,
@@ -13101,7 +13103,7 @@ impl super::StorageCluster {
             &MultipartUploadRecord,
         ) -> Result<(AuthorizedMultipartUploadRecord, T), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        crate::metadata_command::metadata_command_publisher!(BeginUploadPartStreamSession);
+        crate::metadata_command::metadata_command_publisher!(CreateUploadPartStreamSession);
         let BeginUploadPartStreamSessionReq {
             bucket,
             key,

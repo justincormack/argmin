@@ -421,6 +421,7 @@ impl Coordinator {
         )
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn load_stream_part_write_encryption(
         &self,
         bucket: &BucketName,
@@ -439,6 +440,7 @@ impl Coordinator {
         )
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub(super) fn load_stream_part_write_encryption_with_storage_node(
         &self,
         storage_node: &std::sync::Arc<storage::StorageCluster>,

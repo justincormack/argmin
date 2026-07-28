@@ -4777,31 +4777,25 @@ impl HttpFrontend {
             &binding_bucket,
             &binding_key,
         )?;
-        let storage_node = self.coordinator.storage_node_for_request();
-        let begin = self
-            .coordinator
-            .begin_stream_part_with_storage_admission_and_cleanup_deadline(
-                &storage_route_admission,
-                &storage_node,
-                &BeginStreamPartRequest {
-                    upload,
-                    part_number,
-                    policy_context: crate::coordinator::PutObjectPolicyContext::default()
-                        .with_sse_customer_algorithm(
-                            sse_customer_request
-                                .as_ref()
-                                .map(SseCustomerRequest::algorithm),
-                        )
-                        .with_object_creation_operation(false),
-                    sse_customer: sse_customer_request.as_ref(),
-                },
-                storage_route_admission.authority_valid_until_ms(),
-            )?;
+        let begin = self.coordinator.begin_stream_part_on_admitted_route(
+            &storage_route_admission,
+            &BeginStreamPartRequest {
+                upload,
+                part_number,
+                policy_context: crate::coordinator::PutObjectPolicyContext::default()
+                    .with_sse_customer_algorithm(
+                        sse_customer_request
+                            .as_ref()
+                            .map(SseCustomerRequest::algorithm),
+                    )
+                    .with_object_creation_operation(false),
+                sse_customer: sse_customer_request.as_ref(),
+            },
+        )?;
         Ok(StreamingPartContext {
             trace: current_trace_context(),
             storage_route_admission,
             stream_cleanup,
-            storage_node,
             binding: StreamPartBinding::new(
                 StreamObjectBinding::new(begin.session_id, binding_bucket, binding_key),
                 binding_upload_id,
@@ -4840,24 +4834,22 @@ impl HttpFrontend {
             segment_index,
             data.len()
         );
-        self.coordinator
-            .append_stream_part_data_with_storage_admission(
-                &ctx.storage_route_admission,
-                &ctx.storage_node,
-                &crate::coordinator::AppendStreamPartRequest {
-                    bucket: ctx.bucket().clone(),
-                    key: ctx.key().clone(),
-                    upload_id: ctx.upload_id(),
-                    session_id: ctx.session_id(),
-                    part_number: ctx.part_number(),
-                    segment_index,
-                    data,
-                    sse_customer: ctx
-                        .sse_customer
-                        .as_ref()
-                        .map(SseCustomerWriteContext::request),
-                },
-            )
+        self.coordinator.append_stream_part_data_on_admitted_route(
+            &ctx.storage_route_admission,
+            &crate::coordinator::AppendStreamPartRequest {
+                bucket: ctx.bucket().clone(),
+                key: ctx.key().clone(),
+                upload_id: ctx.upload_id(),
+                session_id: ctx.session_id(),
+                part_number: ctx.part_number(),
+                segment_index,
+                data,
+                sse_customer: ctx
+                    .sse_customer
+                    .as_ref()
+                    .map(SseCustomerWriteContext::request),
+            },
+        )
     }
 
     /// Finalize a streaming `UploadPart` session and return an `S3Response`.
@@ -5077,7 +5069,6 @@ struct StreamingPartContext {
     trace: observability::TraceContext,
     storage_route_admission: storage::StorageClusterRouteAdmission,
     stream_cleanup: storage::RetainedStreamUploadCleanup,
-    storage_node: Arc<StorageCluster>,
     binding: StreamPartBinding,
     requester: crate::coordinator::Requester,
     expected_bucket_owner: Option<String>,
