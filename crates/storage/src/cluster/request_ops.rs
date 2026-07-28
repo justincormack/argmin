@@ -2101,7 +2101,7 @@ impl super::StorageCluster {
         })?;
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
             if node
-                .metadata_command_client()
+                .metadata_command_inspection_client()
                 .metadata_command_abandoned(pg_id, command)
                 .map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,

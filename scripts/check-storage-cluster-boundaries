@@ -491,17 +491,18 @@ migrated_metadata_pg_bypasses=$(
             || current_fn == "reissue_pending_metadata_command_with_route_mode") {
             next
         }
-        if ($0 ~ /\.metadata_command_client\(\)/ \
-            || $0 ~ /metadata_command_client[[:space:]]*$/ \
+        if ($0 ~ /\.metadata_command_(inspection_|peering_)?client\(\)/ \
+            || $0 ~ /metadata_command_(inspection_|peering_)?client[[:space:]]*$/ \
             || $0 ~ /(primary_metadata_client|metadata_client)[[:space:]]*$/) {
             pending_metadata_command_client = 1
         }
         if ($0 ~ /\.(max_metadata_command_log_index|pending_metadata_command_slot|pending_metadata_command_envelope|try_insert_pending_metadata_command_slot|try_insert_bucket_control_pending_metadata_command_slot|remove_pending_metadata_command_slot|replace_pending_metadata_command_slot_for_reissue|metadata_command_replica_state|validate_metadata_command_replay_state|validate_metadata_command_replay_state_preserving_pending_slot|metadata_command_acceptance|metadata_command_abandon_acceptance|applied_metadata_command_log_entry_hashes|has_matching_applied_metadata_command_log_entry|apply_metadata_command_and_record|record_metadata_command_abandoned|metadata_command_abandoned)\(/) {
-            if (pending_metadata_command_client || $0 ~ /\.metadata_command_client\(\)/) {
+            if (pending_metadata_command_client \
+                || $0 ~ /\.metadata_command_(inspection_|peering_)?client\(\)/) {
                 pending_metadata_command_client = 0
                 next
             }
-            if ($0 ~ /metadata_command_client\./) {
+            if ($0 ~ /metadata_command_(inspection_|peering_)?client\./) {
                 next
             }
             if ($0 ~ /(primary_metadata_client|metadata_client)\./) {
@@ -518,7 +519,7 @@ migrated_metadata_pg_bypasses=$(
       crates/storage/src/cluster/local.rs
 )
 fail_with_matches \
-    "Production pending metadata command slot operations must go through the node client boundary" \
+    "Production metadata command operations must go through a role-specific node client boundary" \
     "$migrated_metadata_pg_bypasses"
 
 migrated_bucket_write_coordination_bypasses=$(

@@ -3723,6 +3723,237 @@ impl LocalStorageNodeClient {
     }
 }
 
+impl MetadataCommandInspectionNodeClient for LocalStorageNodeClient {
+    fn max_metadata_command_log_index(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<u64, StoreError> {
+        MetadataCommandNodeClient::max_metadata_command_log_index(self, pg_id, cluster_epoch)
+    }
+
+    fn pending_metadata_command_envelope(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        MetadataCommandNodeClient::pending_metadata_command_envelope(self, pg_id, cluster_epoch)
+    }
+
+    fn metadata_command_replica_state(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        MetadataCommandNodeClient::metadata_command_replica_state(self, pg_id)
+    }
+
+    fn metadata_command_checkpoint(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandCheckpoint, StoreError> {
+        MetadataCommandNodeClient::metadata_command_checkpoint(self, pg_id, cluster_epoch)
+    }
+
+    fn metadata_command_checkpoint_candidates(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        max_applied_log_index: u64,
+        limit: usize,
+    ) -> Result<Vec<MetadataCommandCheckpoint>, StoreError> {
+        MetadataCommandNodeClient::metadata_command_checkpoint_candidates(
+            self,
+            pg_id,
+            cluster_epoch,
+            max_applied_log_index,
+            limit,
+        )
+    }
+
+    fn metadata_command_replica_state_can_initialize(
+        &self,
+        pg_id: PgId,
+        _cluster_epoch: ClusterEpoch,
+    ) -> Result<bool, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.metadata_command_replica_state_can_initialize()
+    }
+
+    fn metadata_command_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        MetadataCommandNodeClient::metadata_command_acceptance(self, pg_id, command)
+    }
+
+    fn metadata_command_abandon_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        MetadataCommandNodeClient::metadata_command_abandon_acceptance(self, pg_id, command)
+    }
+
+    fn applied_metadata_command_log_entry_hashes(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        MetadataCommandNodeClient::applied_metadata_command_log_entry_hashes(self, pg_id, command)
+    }
+
+    fn retained_metadata_command_log_hashes(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        first_log_index: MetadataCommandLogIndex,
+        last_log_index: MetadataCommandLogIndex,
+    ) -> Result<Vec<MetadataCommandLogHashRangeEntry>, StoreError> {
+        MetadataCommandNodeClient::retained_metadata_command_log_hashes(
+            self,
+            pg_id,
+            cluster_epoch,
+            first_log_index,
+            last_log_index,
+        )
+    }
+
+    fn retained_metadata_command_log_entries(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        first_log_index: MetadataCommandLogIndex,
+        last_log_index: MetadataCommandLogIndex,
+    ) -> Result<Vec<MetadataCommandLogRangeEntry>, StoreError> {
+        MetadataCommandNodeClient::retained_metadata_command_log_entries(
+            self,
+            pg_id,
+            cluster_epoch,
+            first_log_index,
+            last_log_index,
+        )
+    }
+
+    fn has_matching_applied_metadata_command_log_entry(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        expected_previous_log_hash: u64,
+    ) -> Result<bool, StoreError> {
+        MetadataCommandNodeClient::has_matching_applied_metadata_command_log_entry(
+            self,
+            pg_id,
+            command,
+            expected_previous_log_hash,
+        )
+    }
+
+    fn metadata_command_abandoned(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.metadata_command_abandoned(self.node_id.as_u32(), command)
+    }
+}
+
+impl MetadataCommandPeeringNodeClient for LocalStorageNodeClient {
+    fn validate_metadata_command_replay_state(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.validate_metadata_command_replay_state(self.node_id.as_u32(), cluster_epoch)
+    }
+
+    fn validate_metadata_command_replay_state_preserving_pending_slot(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.validate_metadata_command_replay_state_preserving_pending_slot(
+            self.node_id.as_u32(),
+            cluster_epoch,
+        )
+    }
+
+    fn initialize_metadata_transfer_empty_state(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.initialize_metadata_transfer_empty_state(
+            self.node_id.as_u32(),
+            cluster_epoch,
+            expected_state_digest,
+        )
+    }
+
+    fn initialize_metadata_transfer_matching_state(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        applied_log_index: u64,
+        applied_log_hash: u64,
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.initialize_metadata_transfer_matching_state(
+            self.node_id.as_u32(),
+            cluster_epoch,
+            applied_log_index,
+            applied_log_hash,
+            expected_state_digest,
+        )
+    }
+
+    fn adopt_metadata_transfer_state_from_rebased_commands(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        commands: &[MetadataTransferCommand],
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.adopt_metadata_transfer_state_from_rebased_commands(
+            self.node_id.as_u32(),
+            cluster_epoch,
+            commands,
+            expected_state_digest,
+        )
+    }
+
+    fn install_metadata_transfer_checkpoint_base(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        checkpoint: &MetadataCommandCheckpoint,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.install_metadata_transfer_checkpoint_base(
+            self.node_id.as_u32(),
+            cluster_epoch,
+            checkpoint,
+        )
+    }
+
+    fn replay_metadata_command_for_peering(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.apply_metadata_command_and_record(self.node_id.as_u32(), command)
+    }
+}
+
 impl RetainedMetadataCommandNodeClient for LocalStorageNodeClient {
     fn apply_retained_stream_upload_abort(
         &self,
@@ -3924,98 +4155,6 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         pg.compact_metadata_command_log(cluster_epoch)
     }
 
-    fn validate_metadata_command_replay_state(
-        &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-    ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.validate_metadata_command_replay_state(self.node_id.as_u32(), cluster_epoch)
-    }
-
-    fn validate_metadata_command_replay_state_preserving_pending_slot(
-        &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-    ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.validate_metadata_command_replay_state_preserving_pending_slot(
-            self.node_id.as_u32(),
-            cluster_epoch,
-        )
-    }
-
-    fn metadata_command_replica_state_can_initialize(
-        &self,
-        pg_id: PgId,
-        _cluster_epoch: ClusterEpoch,
-    ) -> Result<bool, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.metadata_command_replica_state_can_initialize()
-    }
-
-    fn initialize_metadata_transfer_empty_state(
-        &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-        expected_state_digest: u64,
-    ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.initialize_metadata_transfer_empty_state(
-            self.node_id.as_u32(),
-            cluster_epoch,
-            expected_state_digest,
-        )
-    }
-
-    fn initialize_metadata_transfer_matching_state(
-        &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-        applied_log_index: u64,
-        applied_log_hash: u64,
-        expected_state_digest: u64,
-    ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.initialize_metadata_transfer_matching_state(
-            self.node_id.as_u32(),
-            cluster_epoch,
-            applied_log_index,
-            applied_log_hash,
-            expected_state_digest,
-        )
-    }
-
-    fn adopt_metadata_transfer_state_from_rebased_commands(
-        &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-        commands: &[MetadataTransferCommand],
-        expected_state_digest: u64,
-    ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.adopt_metadata_transfer_state_from_rebased_commands(
-            self.node_id.as_u32(),
-            cluster_epoch,
-            commands,
-            expected_state_digest,
-        )
-    }
-
-    fn install_metadata_transfer_checkpoint_base(
-        &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-        checkpoint: &MetadataCommandCheckpoint,
-    ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.install_metadata_transfer_checkpoint_base(
-            self.node_id.as_u32(),
-            cluster_epoch,
-            checkpoint,
-        )
-    }
-
     fn metadata_command_acceptance(
         &self,
         pg_id: PgId,
@@ -4107,15 +4246,6 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         self.apply_metadata_command_and_record(pg_id, command)
     }
 
-    fn replay_metadata_command_for_peering(
-        &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.apply_metadata_command_and_record(self.node_id.as_u32(), command)
-    }
-
     fn record_metadata_command_abandoned(
         &self,
         pg_id: PgId,
@@ -4123,14 +4253,5 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         pg.record_metadata_command_abandoned(self.node_id.as_u32(), command)
-    }
-
-    fn metadata_command_abandoned(
-        &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<bool, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.metadata_command_abandoned(self.node_id.as_u32(), command)
     }
 }

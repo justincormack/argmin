@@ -1330,6 +1330,153 @@ pub(crate) trait RetainedMetadataCommandNodeClient: Send + Sync {
     ) -> Result<bool, StoreError>;
 }
 
+/// Read-only metadata-command state shared by active publication and peering.
+/// Implementations may validate stored invariants but must not publish,
+/// replay, compact, or otherwise mutate command state.
+pub(crate) trait MetadataCommandInspectionNodeClient: Send + Sync {
+    fn max_metadata_command_log_index(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<u64, StoreError>;
+
+    fn pending_metadata_command_envelope(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError>;
+
+    fn metadata_command_replica_state(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    fn metadata_command_checkpoint(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandCheckpoint, StoreError>;
+
+    fn metadata_command_checkpoint_candidates(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        max_applied_log_index: u64,
+        limit: usize,
+    ) -> Result<Vec<MetadataCommandCheckpoint>, StoreError>;
+
+    fn metadata_command_replica_state_can_initialize(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<bool, StoreError>;
+
+    fn metadata_command_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError>;
+
+    fn metadata_command_abandon_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError>;
+
+    fn applied_metadata_command_log_entry_hashes(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<(u64, u64)>, StoreError>;
+
+    #[allow(dead_code)]
+    fn retained_metadata_command_log_hashes(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        first_log_index: MetadataCommandLogIndex,
+        last_log_index: MetadataCommandLogIndex,
+    ) -> Result<Vec<MetadataCommandLogHashRangeEntry>, StoreError>;
+
+    #[allow(dead_code)]
+    fn retained_metadata_command_log_entries(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        first_log_index: MetadataCommandLogIndex,
+        last_log_index: MetadataCommandLogIndex,
+    ) -> Result<Vec<MetadataCommandLogRangeEntry>, StoreError>;
+
+    fn has_matching_applied_metadata_command_log_entry(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        expected_previous_log_hash: u64,
+    ) -> Result<bool, StoreError>;
+
+    fn metadata_command_abandoned(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError>;
+}
+
+/// Quiesced-PG replay and metadata-transfer mutations. This interface cannot
+/// allocate or publish ordinary request-path metadata commands.
+pub(crate) trait MetadataCommandPeeringNodeClient:
+    MetadataCommandInspectionNodeClient + Send + Sync
+{
+    fn validate_metadata_command_replay_state(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    fn validate_metadata_command_replay_state_preserving_pending_slot(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    fn initialize_metadata_transfer_empty_state(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    fn initialize_metadata_transfer_matching_state(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        applied_log_index: u64,
+        applied_log_hash: u64,
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    fn adopt_metadata_transfer_state_from_rebased_commands(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        commands: &[MetadataTransferCommand],
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    #[allow(dead_code)]
+    fn install_metadata_transfer_checkpoint_base(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        checkpoint: &MetadataCommandCheckpoint,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    fn replay_metadata_command_for_peering(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
+}
+
 pub(crate) trait MetadataCommandNodeClient: Send + Sync {
     fn open_metadata_command_critical_section(
         &self,
@@ -1450,56 +1597,6 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         cluster_epoch: ClusterEpoch,
     ) -> Result<MetadataCommandLogCompactionStatus, StoreError>;
 
-    fn validate_metadata_command_replay_state(
-        &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-    ) -> Result<MetadataCommandReplicaState, StoreError>;
-
-    fn validate_metadata_command_replay_state_preserving_pending_slot(
-        &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-    ) -> Result<MetadataCommandReplicaState, StoreError>;
-
-    fn metadata_command_replica_state_can_initialize(
-        &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-    ) -> Result<bool, StoreError>;
-
-    fn initialize_metadata_transfer_empty_state(
-        &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-        expected_state_digest: u64,
-    ) -> Result<MetadataCommandReplicaState, StoreError>;
-
-    fn initialize_metadata_transfer_matching_state(
-        &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-        applied_log_index: u64,
-        applied_log_hash: u64,
-        expected_state_digest: u64,
-    ) -> Result<MetadataCommandReplicaState, StoreError>;
-
-    fn adopt_metadata_transfer_state_from_rebased_commands(
-        &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-        commands: &[MetadataTransferCommand],
-        expected_state_digest: u64,
-    ) -> Result<MetadataCommandReplicaState, StoreError>;
-
-    #[allow(dead_code)]
-    fn install_metadata_transfer_checkpoint_base(
-        &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-        checkpoint: &MetadataCommandCheckpoint,
-    ) -> Result<MetadataCommandReplicaState, StoreError>;
-
     fn metadata_command_acceptance(
         &self,
         pg_id: PgId,
@@ -1557,21 +1654,9 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
 
-    fn replay_metadata_command_for_peering(
-        &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
-
     fn record_metadata_command_abandoned(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
-
-    fn metadata_command_abandoned(
-        &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<bool, StoreError>;
 }

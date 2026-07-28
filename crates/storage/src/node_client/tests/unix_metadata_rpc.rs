@@ -345,14 +345,15 @@ fn unix_storage_node_client_reads_metadata_command_state_and_acceptance() {
     );
 
     let state =
-        MetadataCommandNodeClient::metadata_command_replica_state(&client, PgId::new(0)).unwrap();
-    let max_log_index = MetadataCommandNodeClient::max_metadata_command_log_index(
+        MetadataCommandInspectionNodeClient::metadata_command_replica_state(&client, PgId::new(0))
+            .unwrap();
+    let max_log_index = MetadataCommandInspectionNodeClient::max_metadata_command_log_index(
         &client,
         PgId::new(0),
         ClusterEpoch::new(1).unwrap(),
     )
     .unwrap();
-    let pending_read = MetadataCommandNodeClient::pending_metadata_command_envelope(
+    let pending_read = MetadataCommandInspectionNodeClient::pending_metadata_command_envelope(
         &client,
         PgId::new(0),
         ClusterEpoch::new(1).unwrap(),
@@ -360,34 +361,40 @@ fn unix_storage_node_client_reads_metadata_command_state_and_acceptance() {
     .unwrap()
     .unwrap();
     let replay_state =
-        MetadataCommandNodeClient::validate_metadata_command_replay_state_preserving_pending_slot(
+        MetadataCommandPeeringNodeClient::validate_metadata_command_replay_state_preserving_pending_slot(
             &client,
             PgId::new(0),
             ClusterEpoch::new(1).unwrap(),
         )
         .unwrap();
-    let remote_hashes = MetadataCommandNodeClient::applied_metadata_command_log_entry_hashes(
+    let remote_hashes =
+        MetadataCommandInspectionNodeClient::applied_metadata_command_log_entry_hashes(
+            &client,
+            PgId::new(0),
+            &applied,
+        )
+        .unwrap();
+    let matching =
+        MetadataCommandInspectionNodeClient::has_matching_applied_metadata_command_log_entry(
+            &client,
+            PgId::new(0),
+            &applied,
+            applied_hashes.0,
+        )
+        .unwrap();
+    let abandoned = MetadataCommandInspectionNodeClient::metadata_command_abandoned(
         &client,
         PgId::new(0),
-        &applied,
+        &first,
     )
     .unwrap();
-    let matching = MetadataCommandNodeClient::has_matching_applied_metadata_command_log_entry(
-        &client,
-        PgId::new(0),
-        &applied,
-        applied_hashes.0,
-    )
-    .unwrap();
-    let abandoned =
-        MetadataCommandNodeClient::metadata_command_abandoned(&client, PgId::new(0), &first)
-            .unwrap();
-    let can_initialize = MetadataCommandNodeClient::metadata_command_replica_state_can_initialize(
-        &client,
-        PgId::new(0),
-        ClusterEpoch::new(1).unwrap(),
-    )
-    .unwrap();
+    let can_initialize =
+        MetadataCommandInspectionNodeClient::metadata_command_replica_state_can_initialize(
+            &client,
+            PgId::new(0),
+            ClusterEpoch::new(1).unwrap(),
+        )
+        .unwrap();
     let next_conflict = MetadataCommandNodeClient::next_metadata_command_id_at_least(
         &client,
         PgId::new(0),
@@ -395,9 +402,12 @@ fn unix_storage_node_client_reads_metadata_command_state_and_acceptance() {
         MetadataCommandLogIndex::new(5).unwrap(),
     )
     .unwrap_err();
-    let acceptance =
-        MetadataCommandNodeClient::metadata_command_acceptance(&client, PgId::new(0), &applied)
-            .unwrap();
+    let acceptance = MetadataCommandInspectionNodeClient::metadata_command_acceptance(
+        &client,
+        PgId::new(0),
+        &applied,
+    )
+    .unwrap();
 
     assert_eq!(state.cluster_epoch, ClusterEpoch::INITIAL);
     assert_eq!(state.applied_log_index, 2);
@@ -460,18 +470,19 @@ fn unix_storage_node_client_adopts_metadata_transfer_state() {
         config.socket_path.clone(),
     );
 
-    let state = MetadataCommandNodeClient::adopt_metadata_transfer_state_from_rebased_commands(
-        &client,
-        PgId::new(0),
-        destination_epoch,
-        &[MetadataTransferCommand {
-            command: rebased,
-            pre_state_digest: 0,
-            post_state_digest: expected_state_digest,
-        }],
-        expected_state_digest,
-    )
-    .unwrap();
+    let state =
+        MetadataCommandPeeringNodeClient::adopt_metadata_transfer_state_from_rebased_commands(
+            &client,
+            PgId::new(0),
+            destination_epoch,
+            &[MetadataTransferCommand {
+                command: rebased,
+                pre_state_digest: 0,
+                post_state_digest: expected_state_digest,
+            }],
+            expected_state_digest,
+        )
+        .unwrap();
     server_thread.join().unwrap();
 
     assert_eq!(state.cluster_epoch, destination_epoch);
@@ -580,7 +591,7 @@ fn unix_storage_node_client_exports_metadata_command_checkpoint() {
         config.socket_path.clone(),
     );
 
-    let checkpoint = MetadataCommandNodeClient::metadata_command_checkpoint(
+    let checkpoint = MetadataCommandInspectionNodeClient::metadata_command_checkpoint(
         &client,
         PgId::new(0),
         ClusterEpoch::INITIAL,
@@ -724,7 +735,7 @@ fn unix_storage_node_client_lists_metadata_command_checkpoint_candidates() {
         config.socket_path.clone(),
     );
 
-    let candidates = MetadataCommandNodeClient::metadata_command_checkpoint_candidates(
+    let candidates = MetadataCommandInspectionNodeClient::metadata_command_checkpoint_candidates(
         &client,
         PgId::new(0),
         ClusterEpoch::INITIAL,
@@ -754,7 +765,7 @@ fn unix_storage_node_client_exports_active_metadata_command_checkpoint() {
         config.socket_path.clone(),
     );
 
-    let checkpoint = MetadataCommandNodeClient::metadata_command_checkpoint(
+    let checkpoint = MetadataCommandInspectionNodeClient::metadata_command_checkpoint(
         &client,
         PgId::new(0),
         ClusterEpoch::INITIAL,
@@ -790,7 +801,7 @@ fn unix_storage_node_client_installs_metadata_transfer_checkpoint_base() {
         config.socket_path.clone(),
     );
 
-    let state = MetadataCommandNodeClient::install_metadata_transfer_checkpoint_base(
+    let state = MetadataCommandPeeringNodeClient::install_metadata_transfer_checkpoint_base(
         &client,
         PgId::new(0),
         destination_epoch,
@@ -836,7 +847,7 @@ fn unix_storage_node_client_rejects_active_metadata_transfer_checkpoint_base_ins
         config.socket_path.clone(),
     );
 
-    let err = MetadataCommandNodeClient::install_metadata_transfer_checkpoint_base(
+    let err = MetadataCommandPeeringNodeClient::install_metadata_transfer_checkpoint_base(
         &client,
         PgId::new(0),
         config.cluster_epoch,
@@ -887,14 +898,15 @@ fn unix_storage_node_client_rejects_empty_metadata_transfer_adoption() {
         config.socket_path.clone(),
     );
 
-    let err = MetadataCommandNodeClient::adopt_metadata_transfer_state_from_rebased_commands(
-        &client,
-        PgId::new(0),
-        destination_epoch,
-        &[],
-        before.state_digest,
-    )
-    .unwrap_err();
+    let err =
+        MetadataCommandPeeringNodeClient::adopt_metadata_transfer_state_from_rebased_commands(
+            &client,
+            PgId::new(0),
+            destination_epoch,
+            &[],
+            before.state_digest,
+        )
+        .unwrap_err();
     server_thread.join().unwrap();
 
     assert!(matches!(
@@ -1602,7 +1614,7 @@ fn unix_storage_node_client_preserves_applied_hash_log_conflict() {
         let client =
             UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
 
-        let err = MetadataCommandNodeClient::applied_metadata_command_log_entry_hashes(
+        let err = MetadataCommandInspectionNodeClient::applied_metadata_command_log_entry_hashes(
             &client,
             PgId::new(0),
             &test_metadata_command(0, 1),
@@ -2138,7 +2150,7 @@ fn unix_storage_node_client_preserves_bool_metadata_command_log_conflicts() {
 
         let err = match kind {
             StorageRpcMessageKind::MetadataCommandMatchingAppliedLog => {
-                MetadataCommandNodeClient::has_matching_applied_metadata_command_log_entry(
+                MetadataCommandInspectionNodeClient::has_matching_applied_metadata_command_log_entry(
                     &client,
                     PgId::new(0),
                     &command,
@@ -2147,7 +2159,7 @@ fn unix_storage_node_client_preserves_bool_metadata_command_log_conflicts() {
                 .unwrap_err()
             }
             StorageRpcMessageKind::MetadataCommandAbandoned => {
-                MetadataCommandNodeClient::metadata_command_abandoned(
+                MetadataCommandInspectionNodeClient::metadata_command_abandoned(
                     &client,
                     PgId::new(0),
                     &command,

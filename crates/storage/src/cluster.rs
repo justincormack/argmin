@@ -49,8 +49,9 @@ use crate::metadata_command::{
 use crate::node::SharedStorageNode;
 use crate::node_client::{
     BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
-    CreateStreamUploadPrecondition, MetadataCommandNodeClient, ObjectListingMetadataNodeClient,
-    ObjectPayloadLeaseNodeLease, RetainedShardAckNodeClient, ShardAckNodeClient,
+    CreateStreamUploadPrecondition, MetadataCommandInspectionNodeClient, MetadataCommandNodeClient,
+    MetadataCommandPeeringNodeClient, ObjectListingMetadataNodeClient, ObjectPayloadLeaseNodeLease,
+    RetainedShardAckNodeClient, ShardAckNodeClient,
 };
 pub use crate::peering::PgMetadataTransferArtifact;
 use crate::peering::{
@@ -5384,7 +5385,7 @@ fn checkpoint_import_resume_prefix_len(
 }
 
 fn classify_metadata_transfer_import_destination(
-    metadata_client: &dyn MetadataCommandNodeClient,
+    metadata_client: &dyn MetadataCommandPeeringNodeClient,
     node_id: NodeId,
     pg_id: PgId,
     cluster_epoch: ClusterEpoch,
@@ -5955,7 +5956,7 @@ impl StorageCluster {
         route_mode: MetadataCommandRouteMode,
     ) -> Result<bool, BucketSnapshotLoadError> {
         fn entry_hashes_or_not_retryable(
-            metadata_command_client: &dyn MetadataCommandNodeClient,
+            metadata_command_client: &dyn MetadataCommandInspectionNodeClient,
             pg_id: PgId,
             command: &MetadataCommandEnvelope,
         ) -> Result<Option<(u64, u64)>, BucketSnapshotLoadError> {
@@ -6022,7 +6023,7 @@ impl StorageCluster {
                 ),
         }?;
         let primary_state = primary
-            .metadata_command_client()
+            .metadata_command_inspection_client()
             .metadata_command_replica_state(pg_id)?;
         let command_log_index = command.id().log_index().get();
         let expected_previous_log_hash =
@@ -6030,7 +6031,7 @@ impl StorageCluster {
                 primary_state.applied_log_hash
             } else if command_log_index == primary_state.applied_log_index {
                 let Some((previous_log_hash, log_hash)) = entry_hashes_or_not_retryable(
-                    primary.metadata_command_client().as_ref(),
+                    primary.metadata_command_inspection_client().as_ref(),
                     pg_id,
                     command,
                 )?
@@ -6048,7 +6049,7 @@ impl StorageCluster {
         let mut expected_hashes = None;
         for (index, node) in nodes.into_iter().enumerate() {
             let hashes = entry_hashes_or_not_retryable(
-                node.metadata_command_client().as_ref(),
+                node.metadata_command_inspection_client().as_ref(),
                 pg_id,
                 command,
             )?;
@@ -6100,7 +6101,7 @@ impl StorageCluster {
         }?;
         for node in nodes {
             let Some(hashes) = node
-                .metadata_command_client()
+                .metadata_command_inspection_client()
                 .applied_metadata_command_log_entry_hashes(pg_id, command)?
             else {
                 return Ok(false);
@@ -6254,15 +6255,15 @@ impl StorageCluster {
         }?;
         for node in nodes {
             let node_max_log_index = node
-                .metadata_command_client()
+                .metadata_command_inspection_client()
                 .max_metadata_command_log_index(pg_id, route_epoch)?;
             let node_state = node
-                .metadata_command_client()
+                .metadata_command_inspection_client()
                 .metadata_command_replica_state(pg_id)?;
             let replacement_match = if node_max_log_index < current_log_index {
                 ReissuedPendingCommandReplicaMatch::BelowReplacement
             } else if node
-                .metadata_command_client()
+                .metadata_command_inspection_client()
                 .has_matching_applied_metadata_command_log_entry(
                     pg_id,
                     &current,
@@ -6620,7 +6621,7 @@ impl StorageCluster {
         let mut primary_applied_log_index = None;
         let mut replicas = Vec::with_capacity(nodes.len());
         for node in &nodes {
-            let metadata_client = node.metadata_command_client();
+            let metadata_client = node.metadata_command_inspection_client();
             let state = metadata_client.metadata_command_replica_state(pg_id)?;
             min_applied_log_index = min_applied_log_index.min(state.applied_log_index);
             if node.node_id() == primary {
@@ -6645,7 +6646,7 @@ impl StorageCluster {
             let last_log_index = MetadataCommandLogIndex::new(primary_applied_log_index)
                 .expect("primary applied log index must be nonzero when a replica is behind");
             replicas[primary_index].retained_log_hashes = nodes[primary_index]
-                .metadata_command_client()
+                .metadata_command_inspection_client()
                 .retained_metadata_command_log_hashes(
                     pg_id,
                     self.operation_epoch(),
@@ -6701,7 +6702,7 @@ impl StorageCluster {
                 .expect("catch-up retained entry range ends after zero");
             retained_log_entries.extend(
                 primary_node
-                    .metadata_command_client()
+                    .metadata_command_inspection_client()
                     .retained_metadata_command_log_entries(
                         pg_id,
                         self.operation_epoch(),
@@ -6723,7 +6724,7 @@ impl StorageCluster {
                 .ok_or(PgPeeringReconstructionError::ReplayTargetMissing {
                     node_id: replay_plan.node_id,
                 })?;
-            let metadata_client = target_node.metadata_command_client();
+            let metadata_client = target_node.metadata_command_peering_client();
             for command in replay_plan.commands {
                 metadata_client.replay_metadata_command_for_peering(pg_id, &command)?;
             }
@@ -6778,7 +6779,7 @@ impl StorageCluster {
             .ok_or(PgPeeringReconstructionError::PrimaryMissing {
                 primary: source_node_id,
             })?;
-        let metadata_client = source_node.metadata_command_client();
+        let metadata_client = source_node.metadata_command_inspection_client();
         let state = metadata_client.metadata_command_replica_state(pg_id)?;
         if state.cluster_epoch > self.operation_epoch() {
             return Err(PgPeeringReconstructionError::StaleReplicaEpoch {
@@ -6878,7 +6879,7 @@ impl StorageCluster {
             .ok_or(PgPeeringReconstructionError::PrimaryMissing {
                 primary: source_node_id,
             })?;
-        let metadata_client = source_node.metadata_command_client();
+        let metadata_client = source_node.metadata_command_inspection_client();
         let state = metadata_client.metadata_command_replica_state(pg_id)?;
         if state.cluster_epoch > self.operation_epoch() {
             return Err(PgPeeringReconstructionError::StaleReplicaEpoch {
@@ -6961,7 +6962,7 @@ impl StorageCluster {
                 primary: source_node_id,
             })?;
         let state = source_node
-            .metadata_command_client()
+            .metadata_command_inspection_client()
             .metadata_command_replica_state(pg_id)?;
         if state.cluster_epoch > self.operation_epoch() {
             return Err(PgPeeringReconstructionError::StaleReplicaEpoch {
@@ -6992,7 +6993,7 @@ impl StorageCluster {
                 primary: source_node_id,
             })?;
         Ok(source_node
-            .metadata_command_client()
+            .metadata_command_inspection_client()
             .metadata_command_checkpoint_candidates(
                 pg_id,
                 source_state.cluster_epoch,
@@ -7080,7 +7081,7 @@ impl StorageCluster {
             .ok_or(PgPeeringReconstructionError::PrimaryMissing {
                 primary: source_node_id,
             })?;
-        let metadata_client = source_node.metadata_command_client();
+        let metadata_client = source_node.metadata_command_inspection_client();
         let state = metadata_client.metadata_command_replica_state(pg_id)?;
         if state.cluster_epoch > self.operation_epoch() {
             return Err(PgPeeringReconstructionError::StaleReplicaEpoch {
@@ -7335,7 +7336,7 @@ impl StorageCluster {
 
         let mut reference: Option<(NodeId, PgMetadataProof)> = None;
         for node in nodes {
-            let metadata_client = node.metadata_command_client();
+            let metadata_client = node.metadata_command_peering_client();
             let state = if let Some(checkpoint) = checkpoint_base {
                 let checkpoint_destination_base_proof = PgMetadataProof {
                     applied_log_index: 0,

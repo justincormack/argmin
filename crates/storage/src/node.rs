@@ -18,7 +18,8 @@ use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState, Canonic
 
 use super::clients::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
-    LocalStorageNodeClient, MetadataCommandNodeClient, ObjectGenerationMetadataNodeClient,
+    LocalStorageNodeClient, MetadataCommandInspectionNodeClient, MetadataCommandNodeClient,
+    MetadataCommandPeeringNodeClient, ObjectGenerationMetadataNodeClient,
     ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
     ObjectPayloadLeaseNodeClient, ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
     PlacedShardNodeClient, RetainedBucketWriteReservationNodeClient,
@@ -424,6 +425,8 @@ pub(crate) struct LocalNodeClients {
     pub(crate) retained_object_mutation_metadata: Arc<dyn RetainedObjectMutationMetadataNodeClient>,
     pub(crate) object_read_metadata: Arc<dyn ObjectReadMetadataNodeClient>,
     pub(crate) metadata_command: Arc<dyn MetadataCommandNodeClient>,
+    pub(crate) metadata_command_inspection: Arc<dyn MetadataCommandInspectionNodeClient>,
+    pub(crate) metadata_command_peering: Arc<dyn MetadataCommandPeeringNodeClient>,
     pub(crate) retained_metadata_command: Arc<dyn RetainedMetadataCommandNodeClient>,
     pub(crate) shard: Arc<dyn PlacedShardNodeClient>,
     pub(crate) retained_shard: Arc<dyn RetainedPlacedShardNodeClient>,
@@ -487,6 +490,8 @@ impl LocalNodeRuntime {
             retained_object_mutation_metadata: self.client.clone(),
             object_read_metadata: self.client.clone(),
             metadata_command: self.client.clone(),
+            metadata_command_inspection: self.client.clone(),
+            metadata_command_peering: self.client.clone(),
             retained_metadata_command: self.client.clone(),
             shard: self.client.clone(),
             retained_shard: self.client.clone(),

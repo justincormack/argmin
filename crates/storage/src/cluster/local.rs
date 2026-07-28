@@ -29,7 +29,8 @@ use crate::node::{
 };
 use crate::node_client::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
-    LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandNodeClient,
+    LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandInspectionNodeClient,
+    MetadataCommandNodeClient, MetadataCommandPeeringNodeClient,
     ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
     ObjectMutationMetadataNodeClient, ObjectPayloadLeaseNodeClient, ObjectPayloadLeaseNodeLease,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
@@ -508,6 +509,8 @@ pub struct LocalNodeStore {
     retained_object_mutation_metadata_client: Arc<dyn RetainedObjectMutationMetadataNodeClient>,
     object_read_metadata_client: Arc<dyn ObjectReadMetadataNodeClient>,
     metadata_command_client: Arc<dyn MetadataCommandNodeClient>,
+    metadata_command_inspection_client: Arc<dyn MetadataCommandInspectionNodeClient>,
+    metadata_command_peering_client: Arc<dyn MetadataCommandPeeringNodeClient>,
     retained_metadata_command_client: Arc<dyn RetainedMetadataCommandNodeClient>,
     shard_client: Arc<dyn PlacedShardNodeClient>,
     retained_shard_client: Arc<dyn RetainedPlacedShardNodeClient>,
@@ -540,6 +543,8 @@ impl LocalNodeStore {
             retained_object_mutation_metadata_client: clients.retained_object_mutation_metadata,
             object_read_metadata_client: clients.object_read_metadata,
             metadata_command_client: clients.metadata_command,
+            metadata_command_inspection_client: clients.metadata_command_inspection,
+            metadata_command_peering_client: clients.metadata_command_peering,
             retained_metadata_command_client: clients.retained_metadata_command,
             shard_client: clients.shard,
             retained_shard_client: clients.retained_shard,
@@ -649,6 +654,18 @@ impl LocalNodeStore {
 
     pub(crate) fn metadata_command_client(&self) -> &Arc<dyn MetadataCommandNodeClient> {
         &self.metadata_command_client
+    }
+
+    pub(crate) fn metadata_command_inspection_client(
+        &self,
+    ) -> &Arc<dyn MetadataCommandInspectionNodeClient> {
+        &self.metadata_command_inspection_client
+    }
+
+    pub(crate) fn metadata_command_peering_client(
+        &self,
+    ) -> &Arc<dyn MetadataCommandPeeringNodeClient> {
+        &self.metadata_command_peering_client
     }
 
     pub(crate) fn retained_metadata_command_client(
@@ -2371,6 +2388,10 @@ impl LocalClusterMap {
                 dyn RetainedBucketWriteReservationNodeClient,
             > = client.clone();
             let metadata_command_client: Arc<dyn MetadataCommandNodeClient> = client.clone();
+            let metadata_command_inspection_client: Arc<dyn MetadataCommandInspectionNodeClient> =
+                client.clone();
+            let metadata_command_peering_client: Arc<dyn MetadataCommandPeeringNodeClient> =
+                client.clone();
             let retained_metadata_command_client: Arc<dyn RetainedMetadataCommandNodeClient> =
                 client.clone();
             let object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient> =
@@ -2406,6 +2427,8 @@ impl LocalClusterMap {
                 retained_bucket_write_reservation_client;
             node.bucket_write_reservation_unix_socket_path = unix_socket_path;
             node.metadata_command_client = metadata_command_client;
+            node.metadata_command_inspection_client = metadata_command_inspection_client;
+            node.metadata_command_peering_client = metadata_command_peering_client;
             node.retained_metadata_command_client = retained_metadata_command_client;
             node.object_generation_metadata_client = object_generation_metadata_client;
             node.object_version_metadata_client = object_version_metadata_client;
@@ -2516,9 +2539,15 @@ impl LocalClusterMap {
                 config.socket_path,
             ));
             let metadata_command_client: Arc<dyn MetadataCommandNodeClient> = client.clone();
+            let metadata_command_inspection_client: Arc<dyn MetadataCommandInspectionNodeClient> =
+                client.clone();
+            let metadata_command_peering_client: Arc<dyn MetadataCommandPeeringNodeClient> =
+                client.clone();
             let retained_metadata_command_client: Arc<dyn RetainedMetadataCommandNodeClient> =
                 client;
             node.metadata_command_client = metadata_command_client;
+            node.metadata_command_inspection_client = metadata_command_inspection_client;
+            node.metadata_command_peering_client = metadata_command_peering_client;
             node.retained_metadata_command_client = retained_metadata_command_client;
         }
         Ok(())
@@ -3808,7 +3837,7 @@ impl LocalClusterMap {
             })?;
 
         target_node
-            .metadata_command_client()
+            .metadata_command_inspection_client()
             .metadata_command_acceptance(target_pg_id, command)
     }
 
@@ -3893,7 +3922,7 @@ impl LocalClusterMap {
                 cluster_epoch: self.epoch,
             })?;
         target_node
-            .metadata_command_client()
+            .metadata_command_inspection_client()
             .metadata_command_abandon_acceptance(target_pg_id, command)
     }
 
@@ -4429,13 +4458,13 @@ fn validate_metadata_command_replay_state(
         for node in nodes.values() {
             let node_id = node.node_id();
             let state = if node_id == primary_node_id {
-                node.metadata_command_client()
+                node.metadata_command_peering_client()
                     .validate_metadata_command_replay_state_preserving_pending_slot(
                         pg_id,
                         cluster_epoch,
                     )
             } else {
-                node.metadata_command_client()
+                node.metadata_command_peering_client()
                     .validate_metadata_command_replay_state(pg_id, cluster_epoch)
             }
             .map_err(|source| ClusterBuildError::OpenLocalNode {
@@ -4443,7 +4472,7 @@ fn validate_metadata_command_replay_state(
                 source,
             })?;
             let pending_command = node
-                .metadata_command_client()
+                .metadata_command_inspection_client()
                 .pending_metadata_command_envelope(pg_id, cluster_epoch)
                 .map_err(|source| ClusterBuildError::OpenLocalNode {
                     node_id: node_id.as_u32(),
@@ -4592,7 +4621,7 @@ fn converge_in_flight_metadata_command_on_open(
     for node in nodes.values() {
         let node_id = node.node_id();
         let state = node
-            .metadata_command_client()
+            .metadata_command_peering_client()
             .validate_metadata_command_replay_state(pg_id, cluster_epoch)
             .map_err(|source| ClusterBuildError::OpenLocalNode {
                 node_id: node_id.as_u32(),
@@ -4822,7 +4851,7 @@ fn validate_metadata_command_replica_agreement_or_in_flight_recovery(
                 .get(node_id)
                 .expect("replica state node must exist in local node set");
             let matches_pending = node
-                .metadata_command_client()
+                .metadata_command_inspection_client()
                 .has_matching_applied_metadata_command_log_entry(
                     pg_id,
                     command,
@@ -4886,7 +4915,7 @@ fn validate_metadata_command_replica_agreement_or_in_flight_recovery(
             .get(node_id)
             .expect("replica state node must exist in local node set");
         let matches_pending = node
-            .metadata_command_client()
+            .metadata_command_inspection_client()
             .has_matching_applied_metadata_command_log_entry(
                 pg_id,
                 command,

@@ -4135,7 +4135,7 @@ fn metadata_transfer_import_replays_retained_suffix_over_checkpoint_base() {
     let partial_client = map
         .node(NodeId::new(1))
         .unwrap()
-        .metadata_command_client()
+        .metadata_command_peering_client()
         .clone();
     partial_client
         .install_metadata_transfer_checkpoint_base(pg_id, destination_epoch, &checkpoint)
@@ -4259,7 +4259,7 @@ proptest! {
         let partial_client = map
             .node(NodeId::new(1))
             .unwrap()
-            .metadata_command_client()
+            .metadata_command_peering_client()
             .clone();
         partial_client
             .install_metadata_transfer_checkpoint_base(pg_id, destination_epoch, &checkpoint)

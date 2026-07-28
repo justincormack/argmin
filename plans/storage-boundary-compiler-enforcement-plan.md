@@ -662,7 +662,9 @@ Node-client role classification (2026-07-19):
 | `ShardReadHandleNodeClient` | data locations carried in the handle request | active/retained authority is inherited from each validated `ShardLocation`; the lease itself remains non-cloneable |
 | `ObjectPayloadLeaseNodeClient` | object subject rather than a caller-supplied PG | active subject-bound lease acquisition, reclaim-begin, and observation; placement is validated when shard locations are acquired |
 | `RetainedObjectPayloadReclaimNodeClient` | object subject rather than a caller-supplied PG | retained exact-claim reclaim completion and fence cleanup; opaque lease objects retain their own release authority |
-| `MetadataCommandNodeClient` | genuinely generic metadata PG | active publisher/convergence authority; broader recovery and peering/transfer separation remains open |
+| `MetadataCommandInspectionNodeClient` | genuinely generic metadata PG | read-only command state, checkpoints, retained-log ranges, acceptance, and abandonment inspection |
+| `MetadataCommandNodeClient` | genuinely generic metadata PG | active publisher/convergence authority; broader recovery/reissue separation remains open |
+| `MetadataCommandPeeringNodeClient` | genuinely generic metadata PG | quiesced-PG replay validation, retained-log catch-up, and metadata-transfer initialization/adoption; no command-ID allocation or pending-slot publication |
 | `RetainedMetadataCommandNodeClient` | genuinely generic metadata PG | exact retained-route authority for applying and finishing a previously prepared stream-upload abort |
 | `StorageNodeClient` | removed transitional mixed aggregate | production and cross-boundary test callers use role-specific interfaces; deliberately process-local assertions use the sanctioned raw-node test facade; private local helpers implement the embedded adapter without exposing another trait surface |
 
@@ -3742,7 +3744,7 @@ Eighty-eighth Phase 3 slice:
   callable through the ordinary metadata-command publisher interface. The new
   `RetainedMetadataCommandNodeClient` contains only those two exact retained-
   route operations; `MetadataCommandNodeClient` retains active publication,
-  convergence, and the not-yet-separated recovery/peering method families.
+  convergence, and the not-yet-separated recovery/reissue method family.
 - local and Unix adapters implement both roles, but `LocalNodeStore` and
   `LocalNodeClients` keep distinct trait objects. Both the full Unix-node
   installer and the metadata-command-only installer wire the retained role,
@@ -3751,12 +3753,40 @@ Eighty-eighth Phase 3 slice:
 - the existing Unix retained-abort regressions now invoke the retained role
   directly and continue to pin expired-route cleanup, wrong-PG rejection,
   subject binding, PutObject cleanup, and UploadPart cleanup. Splitting broader
-  recovery/reissue from active publication, separating peering/transfer, and
-  requiring opaque capabilities on the resulting stateful traits remain open
-  in Phase 3.
+  recovery/reissue from active publication and requiring opaque capabilities
+  on the resulting stateful traits remain open in Phase 3; peering/transfer is
+  separated by the next slice below.
 - both focused retained-abort Unix regressions and the full storage suite pass,
   as do formatting, the storage boundary checker, and workspace-wide strict
   Clippy. The full 7,688-test workspace suite also passes.
+
+Eighty-ninth Phase 3 slice:
+
+- metadata-command state inspection and quiesced-PG peering/transfer mutation
+  are now distinct from ordinary publisher authority.
+  `MetadataCommandInspectionNodeClient` exposes only replica state,
+  checkpoint, retained-log, acceptance, and abandonment reads;
+  `MetadataCommandPeeringNodeClient` adds replay-state validation, retained-log
+  catch-up, and transfer initialization/adoption, but cannot allocate command
+  IDs or install pending request-path commands. `MetadataCommandNodeClient`
+  retains active publication/convergence and its still-combined recovery and
+  reissue operations.
+- local and Unix adapters implement the three roles separately, and both
+  Unix-client installers preserve distinct trait objects in `LocalNodeStore`.
+  Peering inspection/export paths select the read-only role, while startup
+  replay, catch-up, and transfer import explicitly select the peering role.
+  The locked metadata-command publisher session no longer exposes transfer or
+  peering replay methods.
+- existing Unix RPC and metadata-transfer regressions now invoke the narrow
+  inspection and peering interfaces directly. The storage boundary checker
+  recognizes the three role-specific accessors without treating their method
+  calls as raw PG access. Splitting recovery/reissue from active publication
+  and requiring opaque capabilities on the remaining stateful traits remain
+  open in Phase 3.
+- all 2,370 storage tests pass, including the focused 39-test Unix metadata-RPC
+  and 80-test metadata-transfer groups. Formatting, the storage boundary
+  checker, and workspace-wide strict Clippy pass, as does the full 7,689-test
+  workspace suite.
 
 ### Phase 4 — type metadata-command publication
 
