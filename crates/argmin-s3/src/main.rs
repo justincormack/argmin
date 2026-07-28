@@ -3789,21 +3789,26 @@ fn store_experimental_raft_durable_restart_artifact_while_locked(
     authority: &ControlPlaneRaftAuthority,
     path: &Path,
 ) -> Result<(), ControlPlaneError> {
-    let artifact_existed = path.exists();
-    let checkpoint =
-        block_on_control_plane_raft(runtime, authority.capture_durable_restart_checkpoint())?;
-    let committed_timestamp_high_water_ms =
-        authority.persist_durable_restart_checkpoint(checkpoint)?;
-    let binding = authority.authority_clock_checkpoint_binding();
-    if !artifact_existed && load_authority_clock_restart_checkpoint(path, binding)?.is_none() {
-        store_authority_clock_restart_checkpoint(
-            path,
-            binding,
-            1,
-            committed_timestamp_high_water_ms,
-        )?;
-    }
-    Ok(())
+    (|| {
+        let artifact_existed = path.exists();
+        let checkpoint =
+            block_on_control_plane_raft(runtime, authority.capture_durable_restart_checkpoint())?;
+        let committed_timestamp_high_water_ms =
+            authority.persist_durable_restart_checkpoint(checkpoint)?;
+        let binding = authority.authority_clock_checkpoint_binding();
+        if !artifact_existed && load_authority_clock_restart_checkpoint(path, binding)?.is_none() {
+            store_authority_clock_restart_checkpoint(
+                path,
+                binding,
+                1,
+                committed_timestamp_high_water_ms,
+            )?;
+        }
+        Ok(())
+    })()
+    .map_err(|error: ControlPlaneError| {
+        error.into_durability_failure("experimental OpenRaft durable restart checkpoint failed")
+    })
 }
 
 fn run_static_raft_control_plane_establishment_loop(
@@ -8830,7 +8835,7 @@ mod tests {
 
         let err = bootstrap_empty_experimental_raft_control_plane(&mut control_plane, &config)
             .expect_err("checkpoint failure should reject the bootstrap response");
-        assert!(err.to_string().contains("durable restart artifact"));
+        assert!(matches!(err, ControlPlaneError::DurabilityFailure { .. }));
         assert!(control_plane
             .durable_poison
             .lock()
@@ -10908,10 +10913,7 @@ mod tests {
         let error = verifier
             .verify_storage_node_heartbeat_request_payload(b"not an auth envelope", 2_000)
             .expect_err("missing auth envelope should reject");
-        assert!(
-            error.to_string().contains("auth magic"),
-            "unexpected error: {error}"
-        );
+        assert_eq!(error.to_string(), "control-plane RPC protocol failure");
 
         let diagnostics = format_control_plane_unix_auth_diagnostics(&verifier);
         assert!(diagnostics.contains("required=true"), "{diagnostics}");

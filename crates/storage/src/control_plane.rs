@@ -56,7 +56,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 9;
+const CONTROL_PLANE_RPC_VERSION: u16 = 10;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -200,11 +200,13 @@ impl ControlPlaneAuthorityClockCheckpointBinding {
         let mut binding = [0u8; CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN];
         ring::rand::SystemRandom::new()
             .fill(&mut binding)
-            .map_err(|_| ControlPlaneError::Io {
-                context: "generate single-authority control-plane durable identity",
-                source: std::io::Error::other(
-                    "secure random source failed while generating control-plane identity",
-                ),
+            .map_err(|_| {
+                ControlPlaneError::io(
+                    "generate single-authority control-plane durable identity",
+                    std::io::Error::other(
+                        "secure random source failed while generating control-plane identity",
+                    ),
+                )
             })?;
         Ok(Self(binding))
     }
@@ -4789,11 +4791,11 @@ fn pg_acting_set_preflight_route(
         .find(|route| route.pg_id() == pg_id)
         .cloned()
         .map(PgActingSetPreflightRoute::Present)
-        .ok_or_else(|| ControlPlaneError::RpcProtocol {
-            message: format!(
+        .ok_or_else(|| {
+            ControlPlaneError::rpc_protocol(format!(
                 "PG-specific runtime map response omitted requested PG {}",
                 pg_id.get()
-            ),
+            ))
         })
 }
 
@@ -6295,9 +6297,9 @@ pub trait ControlPlaneHeartbeatRuntimeMapSource {
         _authority_now_ms: u64,
         _lease_horizon_authority: LeaseHorizonAuthorityBinding,
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
-        Err(ControlPlaneError::RpcProtocol {
-            message: "control-plane heartbeat authority does not support lease horizons".to_owned(),
-        })
+        Err(ControlPlaneError::rpc_protocol(
+            "control-plane heartbeat authority does not support lease horizons".to_owned(),
+        ))
     }
 }
 
@@ -6406,11 +6408,9 @@ impl PendingMetadataCommandRecoveryDiscoveryFailureKind {
             1 => Ok(Self::HistoricalRouteInvalid),
             2 => Ok(Self::ReporterNotHistoricalPrimary),
             3 => Ok(Self::ConflictingIdentity),
-            _ => Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "invalid pending metadata command recovery discovery failure kind {value}"
-                ),
-            }),
+            _ => Err(ControlPlaneError::rpc_protocol(format!(
+                "invalid pending metadata command recovery discovery failure kind {value}"
+            ))),
         }
     }
 }
@@ -6642,10 +6642,9 @@ impl ControlPlaneRuntimeMapDiagnosticSnapshot {
                 .zip(runtime_map.nodes())
                 .all(|(lease, node)| lease.node_id == node.node_id())
         {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: "control-plane diagnostic node leases do not match runtime-map nodes"
-                    .to_owned(),
-            });
+            return Err(ControlPlaneError::rpc_protocol(
+                "control-plane diagnostic node leases do not match runtime-map nodes".to_owned(),
+            ));
         }
         Ok(Self {
             runtime_map,
@@ -6865,11 +6864,10 @@ pub trait ControlPlaneAdmin {
     fn authority_clock_context(
         &self,
     ) -> Result<ControlPlaneAuthorityClockContext, ControlPlaneError> {
-        Err(ControlPlaneError::RpcRemote {
-            message:
-                "control-plane authority clock administration is not supported by this authority"
-                    .to_owned(),
-        })
+        Err(ControlPlaneError::rpc_remote(
+            "control-plane authority clock administration is not supported by this authority"
+                .to_owned(),
+        ))
     }
 
     fn set_pg_acting_set(
@@ -6897,24 +6895,21 @@ pub trait ControlPlaneAdmin {
 
     fn transfer_raft_leadership_to(&mut self, node_id: u64) -> Result<(), ControlPlaneError> {
         let _ = node_id;
-        Err(ControlPlaneError::RpcRemote {
-            message: "control-plane Raft leadership transfer is not supported by this authority"
-                .to_owned(),
-        })
+        Err(ControlPlaneError::rpc_remote(
+            "control-plane Raft leadership transfer is not supported by this authority".to_owned(),
+        ))
     }
 
     fn trigger_raft_snapshot_and_purge(&mut self) -> Result<Option<u64>, ControlPlaneError> {
-        Err(ControlPlaneError::RpcRemote {
-            message: "control-plane Raft snapshot trigger is not supported by this authority"
-                .to_owned(),
-        })
+        Err(ControlPlaneError::rpc_remote(
+            "control-plane Raft snapshot trigger is not supported by this authority".to_owned(),
+        ))
     }
 
     fn trigger_raft_election(&mut self) -> Result<(), ControlPlaneError> {
-        Err(ControlPlaneError::RpcRemote {
-            message: "control-plane Raft election trigger is not supported by this authority"
-                .to_owned(),
-        })
+        Err(ControlPlaneError::rpc_remote(
+            "control-plane Raft election trigger is not supported by this authority".to_owned(),
+        ))
     }
 }
 
@@ -7165,12 +7160,12 @@ impl DurableJournalObserver for SingleAuthorityJournalObserver {
             .fail_next_file_sync
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(ControlPlaneError::Io {
-                context: "sync single-authority control-plane journal",
-                source: std::io::Error::other(
+            return Err(ControlPlaneError::io(
+                "sync single-authority control-plane journal",
+                std::io::Error::other(
                     "injected single-authority control-plane journal sync failure",
                 ),
-            });
+            ));
         }
         Ok(())
     }
@@ -7181,19 +7176,21 @@ impl DurableJournalObserver for SingleAuthorityJournalObserver {
             .fail_next_directory_sync
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(ControlPlaneError::Io {
-                context: "sync single-authority control-plane journal directory",
-                source: std::io::Error::other(
+            return Err(ControlPlaneError::io(
+                "sync single-authority control-plane journal directory",
+                std::io::Error::other(
                     "injected single-authority control-plane journal directory sync failure",
                 ),
-            });
+            ));
         }
         let parent = state_parent(path);
         std::fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
-            .map_err(|source| ControlPlaneError::Io {
-                context: "sync single-authority control-plane journal directory",
-                source,
+            .map_err(|source| {
+                ControlPlaneError::io(
+                    "sync single-authority control-plane journal directory",
+                    source,
+                )
             })
     }
 }
@@ -7559,7 +7556,7 @@ fn read_fixed_control_plane_sidecar<const N: usize>(
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(ControlPlaneError::Io { context, source }),
+        Err(source) => return Err(ControlPlaneError::io(context, source)),
     };
     if metadata.len() != N as u64 {
         return Err(ControlPlaneError::AuthorityClockCheckpoint {
@@ -7571,14 +7568,14 @@ fn read_fixed_control_plane_sidecar<const N: usize>(
         });
     }
     let mut file =
-        std::fs::File::open(path).map_err(|source| ControlPlaneError::Io { context, source })?;
+        std::fs::File::open(path).map_err(|source| ControlPlaneError::io(context, source))?;
     let mut bytes = [0u8; N];
     file.read_exact(&mut bytes)
-        .map_err(|source| ControlPlaneError::Io { context, source })?;
+        .map_err(|source| ControlPlaneError::io(context, source))?;
     let mut trailing = [0u8; 1];
     if file
         .read(&mut trailing)
-        .map_err(|source| ControlPlaneError::Io { context, source })?
+        .map_err(|source| ControlPlaneError::io(context, source))?
         != 0
     {
         return Err(ControlPlaneError::AuthorityClockCheckpoint {
@@ -7605,30 +7602,18 @@ fn store_control_plane_sidecar(
     let parent = state_parent(path);
     create_control_plane_directory_all_durable(parent)?;
     {
-        let mut file = std::fs::File::create(tmp_path).map_err(|source| ControlPlaneError::Io {
-            context: contexts.create,
-            source,
-        })?;
+        let mut file = std::fs::File::create(tmp_path)
+            .map_err(|source| ControlPlaneError::io(contexts.create, source))?;
         file.write_all(bytes)
-            .map_err(|source| ControlPlaneError::Io {
-                context: contexts.write,
-                source,
-            })?;
-        file.sync_all().map_err(|source| ControlPlaneError::Io {
-            context: contexts.sync,
-            source,
-        })?;
+            .map_err(|source| ControlPlaneError::io(contexts.write, source))?;
+        file.sync_all()
+            .map_err(|source| ControlPlaneError::io(contexts.sync, source))?;
     }
-    std::fs::rename(tmp_path, path).map_err(|source| ControlPlaneError::Io {
-        context: contexts.rename,
-        source,
-    })?;
+    std::fs::rename(tmp_path, path)
+        .map_err(|source| ControlPlaneError::io(contexts.rename, source))?;
     std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
-        .map_err(|source| ControlPlaneError::Io {
-            context: contexts.directory,
-            source,
-        })?;
+        .map_err(|source| ControlPlaneError::io(contexts.directory, source))?;
     Ok(())
 }
 
@@ -7789,10 +7774,10 @@ pub fn invalidate_authority_clock_restart_checkpoint(
         Ok(()) => true,
         Err(error) if error.kind() == ErrorKind::NotFound => false,
         Err(source) => {
-            return Err(ControlPlaneError::Io {
-                context: "invalidate control-plane authority clock checkpoint",
+            return Err(ControlPlaneError::io(
+                "invalidate control-plane authority clock checkpoint",
                 source,
-            });
+            ));
         }
     };
     if !removed {
@@ -7800,9 +7785,11 @@ pub fn invalidate_authority_clock_restart_checkpoint(
     }
     std::fs::File::open(state_parent(&checkpoint_path))
         .and_then(|directory| directory.sync_all())
-        .map_err(|source| ControlPlaneError::Io {
-            context: "sync invalidated control-plane authority clock checkpoint directory",
-            source,
+        .map_err(|source| {
+            ControlPlaneError::io(
+                "sync invalidated control-plane authority clock checkpoint directory",
+                source,
+            )
         })?;
     Ok(())
 }
@@ -8080,10 +8067,7 @@ impl ControlPlaneStore for FileControlPlaneStore {
             match std::fs::read_to_string(path) {
                 Ok(contents) => Ok(Some(contents)),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(source) => Err(ControlPlaneError::Io {
-                    context: "load control-plane state",
-                    source,
-                }),
+                Err(source) => Err(ControlPlaneError::io("load control-plane state", source)),
             }
         };
         let published_contents = read_snapshot_candidate(&self.path)?;
@@ -8655,12 +8639,12 @@ impl FileControlPlaneStore {
                 .fail_checkpoint_after_anchor
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
-                return Err(ControlPlaneError::Io {
-                    context: "publish prepared single-authority control-plane checkpoint",
-                    source: std::io::Error::other(
+                return Err(ControlPlaneError::io(
+                    "publish prepared single-authority control-plane checkpoint",
+                    std::io::Error::other(
                         "injected failure after single-authority checkpoint anchor",
                     ),
-                });
+                ));
             }
             self.publish_prepared_snapshot_file(&prepared_path)?;
             if load_single_authority_initialized_binding(&self.path)?.is_none() {
@@ -8699,19 +8683,21 @@ impl FileControlPlaneStore {
                 Ok(()) => removed = true,
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
                 Err(source) => {
-                    return Err(ControlPlaneError::Io {
-                        context: "discard incomplete single-authority initialization",
+                    return Err(ControlPlaneError::io(
+                        "discard incomplete single-authority initialization",
                         source,
-                    });
+                    ));
                 }
             }
         }
         if removed {
             std::fs::File::open(state_parent(&self.path))
                 .and_then(|directory| directory.sync_all())
-                .map_err(|source| ControlPlaneError::Io {
-                    context: "sync discarded single-authority initialization directory",
-                    source,
+                .map_err(|source| {
+                    ControlPlaneError::io(
+                        "sync discarded single-authority initialization directory",
+                        source,
+                    )
                 })?;
         }
         durability.initialized = true;
@@ -8762,12 +8748,10 @@ impl FileControlPlaneStore {
             .fail_checkpoint_after_anchor
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(ControlPlaneError::Io {
-                context: "publish prepared single-authority control-plane checkpoint",
-                source: std::io::Error::other(
-                    "injected failure after single-authority checkpoint anchor",
-                ),
-            });
+            return Err(ControlPlaneError::io(
+                "publish prepared single-authority control-plane checkpoint",
+                std::io::Error::other("injected failure after single-authority checkpoint anchor"),
+            ));
         }
         self.publish_prepared_snapshot_file(&prepared_path)?;
         self.journal.compact_through(compact_through)?;
@@ -8803,12 +8787,12 @@ impl FileControlPlaneStore {
                     .fail_initial_checkpoint_after_identity
                     .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
-                return Err(ControlPlaneError::Io {
-                    context: "initialize single-authority control-plane checkpoint",
-                    source: std::io::Error::other(
+                return Err(ControlPlaneError::io(
+                    "initialize single-authority control-plane checkpoint",
+                    std::io::Error::other(
                         "injected failure after single-authority durable identity creation",
                     ),
-                });
+                ));
             }
             if self
                 .load_authority_clock_restart_checkpoint(binding)?
@@ -8839,44 +8823,35 @@ impl FileControlPlaneStore {
         );
         let tmp_path = single_authority_snapshot_tmp_path(&self.path);
         {
-            let mut tmp_file =
-                std::fs::File::create(&tmp_path).map_err(|source| ControlPlaneError::Io {
-                    context: "create control-plane state",
-                    source,
-                })?;
+            let mut tmp_file = std::fs::File::create(&tmp_path)
+                .map_err(|source| ControlPlaneError::io("create control-plane state", source))?;
             tmp_file
                 .write_all(formatted_snapshot.as_bytes())
-                .map_err(|source| ControlPlaneError::Io {
-                    context: "write control-plane state",
-                    source,
-                })?;
+                .map_err(|source| ControlPlaneError::io("write control-plane state", source))?;
             let sync_started = Instant::now();
             let sync_result = tmp_file.sync_all();
             observability::record_control_plane_snapshot_sync(sync_started.elapsed());
-            sync_result.map_err(|source| ControlPlaneError::Io {
-                context: "sync control-plane state",
-                source,
-            })?;
+            sync_result
+                .map_err(|source| ControlPlaneError::io("sync control-plane state", source))?;
         }
         let sync_started = Instant::now();
         let sync_result =
             std::fs::File::open(state_parent(&tmp_path)).and_then(|directory| directory.sync_all());
         observability::record_control_plane_snapshot_sync(sync_started.elapsed());
-        sync_result.map_err(|source| ControlPlaneError::Io {
-            context: "sync prepared control-plane state directory",
-            source,
+        sync_result.map_err(|source| {
+            ControlPlaneError::io("sync prepared control-plane state directory", source)
         })?;
         #[cfg(test)]
         if self
             .fail_checkpoint_after_prepared_snapshot_sync
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(ControlPlaneError::Io {
-                context: "anchor prepared single-authority control-plane checkpoint",
-                source: std::io::Error::other(
+            return Err(ControlPlaneError::io(
+                "anchor prepared single-authority control-plane checkpoint",
+                std::io::Error::other(
                     "injected failure after prepared single-authority checkpoint sync",
                 ),
-            });
+            ));
         }
         Ok((tmp_path, snapshot_digest))
     }
@@ -8885,17 +8860,14 @@ impl FileControlPlaneStore {
         &self,
         prepared_path: &Path,
     ) -> Result<(), ControlPlaneError> {
-        std::fs::rename(prepared_path, &self.path).map_err(|source| ControlPlaneError::Io {
-            context: "commit control-plane state",
-            source,
-        })?;
+        std::fs::rename(prepared_path, &self.path)
+            .map_err(|source| ControlPlaneError::io("commit control-plane state", source))?;
         let sync_started = Instant::now();
         let sync_result = std::fs::File::open(state_parent(&self.path))
             .and_then(|directory| directory.sync_all());
         observability::record_control_plane_snapshot_sync(sync_started.elapsed());
-        sync_result.map_err(|source| ControlPlaneError::Io {
-            context: "sync control-plane state directory",
-            source,
+        sync_result.map_err(|source| {
+            ControlPlaneError::io("sync control-plane state directory", source)
         })?;
         Ok(())
     }
@@ -9589,9 +9561,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         self.durable_snapshot = next_snapshot.clone();
         self.snapshot = next_snapshot;
         *self.runtime_map_content_certificate.lock().map_err(|_| {
-            ControlPlaneError::RpcProtocol {
-                message: "control-plane runtime-map content certificate lock poisoned".to_owned(),
-            }
+            ControlPlaneError::rpc_protocol(
+                "control-plane runtime-map content certificate lock poisoned".to_owned(),
+            )
         })? = None;
         Ok(())
     }
@@ -9630,9 +9602,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         self.durable_snapshot = next_durable_snapshot;
         self.snapshot = next_live_snapshot.clone();
         *self.runtime_map_content_certificate.lock().map_err(|_| {
-            ControlPlaneError::RpcProtocol {
-                message: "control-plane runtime-map content certificate lock poisoned".to_owned(),
-            }
+            ControlPlaneError::rpc_protocol(
+                "control-plane runtime-map content certificate lock poisoned".to_owned(),
+            )
         })? = None;
         Ok(AppliedControlPlaneCommand::new(
             next_live_snapshot,
@@ -9692,9 +9664,9 @@ impl<S: ControlPlaneStore> ControlPlaneRuntimeMapSource for SingleAuthorityContr
     ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
         self.store.ensure_healthy()?;
         let mut cached = self.runtime_map_content_certificate.lock().map_err(|_| {
-            ControlPlaneError::RpcProtocol {
-                message: "control-plane runtime-map content certificate lock poisoned".to_owned(),
-            }
+            ControlPlaneError::rpc_protocol(
+                "control-plane runtime-map content certificate lock poisoned".to_owned(),
+            )
         })?;
         if let Some(certificate) = *cached {
             if let Some(status) =
@@ -9998,10 +9970,9 @@ fn publish_control_plane_rpc_response(
     let result = {
         let mut publish_once = || {
             if std::mem::replace(&mut published, true) {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: "control-plane response publication attempted more than once"
-                        .to_owned(),
-                });
+                return Err(ControlPlaneError::rpc_protocol(
+                    "control-plane response publication attempted more than once".to_owned(),
+                ));
             }
             publish()
         };
@@ -10011,9 +9982,9 @@ fn publish_control_plane_rpc_response(
         }
     };
     if result.is_ok() && !published {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "control-plane response publication completed without publishing".to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_protocol(
+            "control-plane response publication completed without publishing".to_owned(),
+        ));
     }
     result
 }
@@ -10267,12 +10238,10 @@ impl ControlPlaneRpcPreAuthByteBudget {
                 budget: Arc::clone(self),
                 frame_bytes,
             }),
-            Err(reserved) => Err(ControlPlaneError::RpcProtocol {
-                message: format!(
+            Err(reserved) => Err(ControlPlaneError::rpc_protocol(format!(
                     "control-plane RPC pre-authentication frame budget exhausted: requested {frame_bytes} bytes with {reserved} of {} bytes reserved",
                     self.limit_bytes
-                ),
-            }),
+                ))),
         }
     }
 }
@@ -11281,50 +11250,43 @@ fn connect_control_plane_tls_tcp(
         .min(deadline);
     let tcp_stream =
         connect_control_plane_tcp_until(host, port, connect_deadline).map_err(|source| {
-            ControlPlaneError::Io {
-                context: "connect control-plane TLS/TCP endpoint",
-                source,
-            }
+            ControlPlaneError::io("connect control-plane TLS/TCP endpoint", source)
         })?;
-    tcp_stream
-        .set_nodelay(true)
-        .map_err(|source| ControlPlaneError::Io {
-            context: "configure control-plane TLS/TCP endpoint",
-            source,
-        })?;
+    tcp_stream.set_nodelay(true).map_err(|source| {
+        ControlPlaneError::io("configure control-plane TLS/TCP endpoint", source)
+    })?;
     let server_name = ServerName::try_from(server_name.to_owned()).map_err(|_| {
-        ControlPlaneError::RpcProtocol {
-            message: "control-plane TLS/TCP endpoint has an invalid TLS server name".to_owned(),
-        }
+        ControlPlaneError::rpc_protocol(
+            "control-plane TLS/TCP endpoint has an invalid TLS server name".to_owned(),
+        )
     })?;
     let connection = rustls::ClientConnection::new(Arc::clone(tls_client_config), server_name)
-        .map_err(|error| ControlPlaneError::RpcProtocol {
-            message: format!("failed to initialize control-plane TLS client: {error}"),
+        .map_err(|error| {
+            ControlPlaneError::rpc_protocol(format!(
+                "failed to initialize control-plane TLS client: {error}"
+            ))
         })?;
     let socket = ControlPlaneDeadlineTcpSocket::new(
         tcp_stream,
         deadline,
         CONTROL_PLANE_RPC_DEADLINE_EXPIRED,
     )
-    .map_err(|source| ControlPlaneError::Io {
-        context: "configure control-plane TLS/TCP deadline I/O",
-        source,
+    .map_err(|source| {
+        ControlPlaneError::io("configure control-plane TLS/TCP deadline I/O", source)
     })?;
     let mut stream = rustls::StreamOwned::new(connection, socket);
     while stream.conn.is_handshaking() {
         stream
             .conn
             .complete_io(&mut stream.sock)
-            .map_err(|source| ControlPlaneError::Io {
-                context: "complete control-plane TLS client handshake",
-                source,
+            .map_err(|source| {
+                ControlPlaneError::io("complete control-plane TLS client handshake", source)
             })?;
     }
     if stream.conn.alpn_protocol() != Some(CONTROL_PLANE_RPC_TLS_ALPN) {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "control-plane TLS peer did not negotiate the required protocol profile"
-                .to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_protocol(
+            "control-plane TLS peer did not negotiate the required protocol profile".to_owned(),
+        ));
     }
     Ok(stream)
 }
@@ -11339,10 +11301,10 @@ impl ControlPlaneRpcClientEndpoint {
             ControlPlaneRpcClientEndpointKind::Unix { socket_path } => {
                 let mut stream =
                     connect_unix_stream_until(socket_path, deadline).map_err(|source| {
-                        ControlPlaneRpcFrameExchangeError::before_request(ControlPlaneError::Io {
-                            context: "connect control-plane socket",
+                        ControlPlaneRpcFrameExchangeError::before_request(ControlPlaneError::io(
+                            "connect control-plane socket",
                             source,
-                        })
+                        ))
                     })?;
                 let mut stream = DeadlineUnixStream::new(
                     &mut stream,
@@ -11350,18 +11312,16 @@ impl ControlPlaneRpcClientEndpoint {
                     CONTROL_PLANE_RPC_DEADLINE_EXPIRED,
                 )
                 .map_err(|source| {
-                    ControlPlaneRpcFrameExchangeError::before_request(ControlPlaneError::Io {
-                        context: "configure control-plane Unix deadline I/O",
+                    ControlPlaneRpcFrameExchangeError::before_request(ControlPlaneError::io(
+                        "configure control-plane Unix deadline I/O",
                         source,
-                    })
+                    ))
                 })?;
                 stream.write_all(request_frame).map_err(|source| {
-                    ControlPlaneRpcFrameExchangeError::after_request_started(
-                        ControlPlaneError::Io {
-                            context: "write control-plane RPC frame",
-                            source,
-                        },
-                    )
+                    ControlPlaneRpcFrameExchangeError::after_request_started(ControlPlaneError::io(
+                        "write control-plane RPC frame",
+                        source,
+                    ))
                 })?;
                 read_control_plane_rpc_frame(&mut stream)
                     .map_err(ControlPlaneRpcFrameExchangeError::after_request_started)
@@ -11384,12 +11344,10 @@ impl ControlPlaneRpcClientEndpoint {
                 )
                 .map_err(ControlPlaneRpcFrameExchangeError::before_request)?;
                 stream.write_all(request_frame).map_err(|source| {
-                    ControlPlaneRpcFrameExchangeError::after_request_started(
-                        ControlPlaneError::Io {
-                            context: "write control-plane TLS/TCP request frame",
-                            source,
-                        },
-                    )
+                    ControlPlaneRpcFrameExchangeError::after_request_started(ControlPlaneError::io(
+                        "write control-plane TLS/TCP request frame",
+                        source,
+                    ))
                 })?;
                 read_control_plane_rpc_frame(&mut stream)
                     .map_err(ControlPlaneRpcFrameExchangeError::after_request_started)
@@ -11414,19 +11372,17 @@ impl UnixControlPlaneClient {
     ) -> Result<Self, ControlPlaneError> {
         let socket_paths: Vec<PathBuf> = socket_paths.into_iter().collect();
         if socket_paths.is_empty() {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: "control-plane Unix client requires at least one socket path".to_owned(),
-            });
+            return Err(ControlPlaneError::rpc_protocol(
+                "control-plane Unix client requires at least one socket path".to_owned(),
+            ));
         }
         let mut unique = BTreeSet::new();
         for socket_path in &socket_paths {
             if !unique.insert(socket_path.clone()) {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: format!(
-                        "control-plane Unix client contains duplicate socket path {}",
-                        socket_path.display()
-                    ),
-                });
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "control-plane Unix client contains duplicate socket path {}",
+                    socket_path.display()
+                )));
             }
         }
         Ok(Self {
@@ -11446,19 +11402,17 @@ impl UnixControlPlaneClient {
     ) -> Result<Self, ControlPlaneError> {
         let endpoints: Vec<ControlPlaneRpcClientEndpoint> = endpoints.into_iter().collect();
         if endpoints.is_empty() {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: "control-plane client requires at least one endpoint".to_owned(),
-            });
+            return Err(ControlPlaneError::rpc_protocol(
+                "control-plane client requires at least one endpoint".to_owned(),
+            ));
         }
         let mut unique = BTreeSet::new();
         for endpoint in &endpoints {
             let advertised_endpoint = endpoint.advertised_endpoint();
             if !unique.insert(advertised_endpoint.clone()) {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: format!(
-                        "control-plane client contains duplicate endpoint {advertised_endpoint}"
-                    ),
-                });
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "control-plane client contains duplicate endpoint {advertised_endpoint}"
+                )));
             }
         }
         let socket_paths = endpoints
@@ -11610,12 +11564,10 @@ impl UnixControlPlaneClient {
             last_pre_request_error.expect("endpoint set is non-empty and every connect failed")
         })?;
         if response_kind != kind {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "response kind {:?} did not match request kind {:?}",
-                    response_kind, kind
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "response kind {:?} did not match request kind {:?}",
+                response_kind, kind
+            )));
         }
         Ok(response_payload)
     }
@@ -11925,12 +11877,10 @@ impl UnixControlPlaneClient {
                         .iter()
                         .find(|route| route.pg_id() == pg_id)
                     else {
-                        return Err(ControlPlaneError::RpcProtocol {
-                            message: format!(
-                                "PG-specific runtime map response omitted requested PG {}",
-                                pg_id.get()
-                            ),
-                        });
+                        return Err(ControlPlaneError::rpc_protocol(format!(
+                            "PG-specific runtime map response omitted requested PG {}",
+                            pg_id.get()
+                        )));
                     };
                     if route.acting_set() == acting_set {
                         return Ok(route.cluster_epoch());
@@ -12022,10 +11972,9 @@ impl UnixControlPlaneClient {
         let payload = self.send_request(ControlPlaneRpcKind::SetPgActingSet, &payload)?;
         let mut reader = PayloadReader::new(&payload);
         let raw_cluster_epoch = reader.read_u64()?;
-        let cluster_epoch =
-            ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: format!("invalid cluster epoch {raw_cluster_epoch}"),
-            })?;
+        let cluster_epoch = ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| {
+            ControlPlaneError::rpc_protocol(format!("invalid cluster epoch {raw_cluster_epoch}"))
+        })?;
         reader.finish()?;
         Ok(cluster_epoch)
     }
@@ -12125,10 +12074,9 @@ impl UnixControlPlaneClient {
         )?;
         let mut reader = PayloadReader::new(&payload);
         let raw_cluster_epoch = reader.read_u64()?;
-        let cluster_epoch =
-            ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: format!("invalid cluster epoch {raw_cluster_epoch}"),
-            })?;
+        let cluster_epoch = ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| {
+            ControlPlaneError::rpc_protocol(format!("invalid cluster epoch {raw_cluster_epoch}"))
+        })?;
         reader.finish()?;
         Ok(cluster_epoch)
     }
@@ -12442,12 +12390,14 @@ impl AuthenticatedUnixControlPlaneClient {
             let payload = build_payload()?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(last_routing_error.unwrap_or_else(|| ControlPlaneError::Io {
-                    context: "control-plane RPC endpoint failover deadline",
-                    source: std::io::Error::new(
-                        ErrorKind::TimedOut,
-                        format!("{kind:?} endpoint failover deadline expired"),
-                    ),
+                return Err(last_routing_error.unwrap_or_else(|| {
+                    ControlPlaneError::io(
+                        "control-plane RPC endpoint failover deadline",
+                        std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            format!("{kind:?} endpoint failover deadline expired"),
+                        ),
+                    )
                 }));
             }
             let response = self
@@ -12768,12 +12718,10 @@ impl AuthenticatedUnixControlPlaneClient {
                         .iter()
                         .find(|route| route.pg_id() == pg_id)
                     else {
-                        return Err(ControlPlaneError::RpcProtocol {
-                            message: format!(
-                                "PG-specific runtime map response omitted requested PG {}",
-                                pg_id.get()
-                            ),
-                        });
+                        return Err(ControlPlaneError::rpc_protocol(format!(
+                            "PG-specific runtime map response omitted requested PG {}",
+                            pg_id.get()
+                        )));
                     };
                     if route.acting_set() == acting_set {
                         return Ok(route.cluster_epoch());
@@ -12964,9 +12912,9 @@ impl AuthenticatedUnixControlPlaneClient {
             ControlPlaneAuthDecision::Accepted { .. } => {
                 read_authenticated_control_plane_rpc_payload(kind, envelope.payload())
             }
-            ControlPlaneAuthDecision::Rejected { reason } => Err(ControlPlaneError::RpcProtocol {
-                message: format!("control-plane admin response auth rejected: {reason:?}"),
-            }),
+            ControlPlaneAuthDecision::Rejected { reason } => Err(ControlPlaneError::rpc_protocol(
+                format!("control-plane admin response auth rejected: {reason:?}"),
+            )),
         }
     }
 
@@ -12986,10 +12934,9 @@ impl AuthenticatedUnixControlPlaneClient {
         )?;
         let mut reader = PayloadReader::new(&payload);
         let raw_cluster_epoch = reader.read_u64()?;
-        let cluster_epoch =
-            ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: format!("invalid cluster epoch {raw_cluster_epoch}"),
-            })?;
+        let cluster_epoch = ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| {
+            ControlPlaneError::rpc_protocol(format!("invalid cluster epoch {raw_cluster_epoch}"))
+        })?;
         reader.finish()?;
         Ok(cluster_epoch)
     }
@@ -13564,11 +13511,8 @@ impl AuthenticatedUnixControlPlaneClient {
                 .credential
                 .runtime_map_response_credential_for_storage_node()?,
             _ => {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message:
-                        "runtime-map response verification requires a frontend or storage-node credential"
-                            .to_owned(),
-                });
+                return Err(ControlPlaneError::rpc_protocol("runtime-map response verification requires a frontend or storage-node credential"
+                            .to_owned()));
             }
         };
         let verifier = ControlPlaneScopedCredentialStore::new(vec![response_credential])?;
@@ -13590,9 +13534,9 @@ impl AuthenticatedUnixControlPlaneClient {
             ControlPlaneAuthDecision::Accepted { .. } => {
                 read_authenticated_control_plane_rpc_payload(kind, envelope.payload())
             }
-            ControlPlaneAuthDecision::Rejected { reason } => Err(ControlPlaneError::RpcProtocol {
-                message: format!("control-plane runtime-map response auth rejected: {reason:?}"),
-            }),
+            ControlPlaneAuthDecision::Rejected { reason } => Err(ControlPlaneError::rpc_protocol(
+                format!("control-plane runtime-map response auth rejected: {reason:?}"),
+            )),
         }
     }
 }
@@ -13771,10 +13715,9 @@ fn insert_storage_node_auth_credential(
         existing.credential_id() == credential.credential_id()
             && existing.credential_version() == credential.credential_version()
     }) {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "control-plane storage-node auth credential repeats credential identity"
-                .to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_protocol(
+            "control-plane storage-node auth credential repeats credential identity".to_owned(),
+        ));
     }
     credentials.push(credential);
     Ok(())
@@ -13791,10 +13734,9 @@ fn insert_frontend_auth_credential(
         existing.credential_id() == credential.credential_id()
             && existing.credential_version() == credential.credential_version()
     }) {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "control-plane frontend auth credential repeats credential identity"
-                .to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_protocol(
+            "control-plane frontend auth credential repeats credential identity".to_owned(),
+        ));
     }
     credentials.push(credential);
     Ok(())
@@ -13811,9 +13753,9 @@ fn insert_admin_auth_credential(
         existing.credential_id() == credential.credential_id()
             && existing.credential_version() == credential.credential_version()
     }) {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "control-plane admin auth credential repeats credential identity".to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_protocol(
+            "control-plane admin auth credential repeats credential identity".to_owned(),
+        ));
     }
     credentials.push(credential);
     Ok(())
@@ -13830,8 +13772,10 @@ fn matching_storage_node_auth_credential<'a>(
             credential.credential_id() == credential_id
                 && credential.credential_version() == credential_version
         })
-        .ok_or_else(|| ControlPlaneError::RpcProtocol {
-            message: "accepted storage-node auth credential was not configured".to_owned(),
+        .ok_or_else(|| {
+            ControlPlaneError::rpc_protocol(
+                "accepted storage-node auth credential was not configured".to_owned(),
+            )
         })
 }
 
@@ -13846,8 +13790,10 @@ fn matching_frontend_auth_credential<'a>(
             credential.credential_id() == credential_id
                 && credential.credential_version() == credential_version
         })
-        .ok_or_else(|| ControlPlaneError::RpcProtocol {
-            message: "accepted frontend auth credential was not configured".to_owned(),
+        .ok_or_else(|| {
+            ControlPlaneError::rpc_protocol(
+                "accepted frontend auth credential was not configured".to_owned(),
+            )
         })
 }
 
@@ -13862,8 +13808,10 @@ fn matching_admin_auth_credential<'a>(
             credential.credential_id() == credential_id
                 && credential.credential_version() == credential_version
         })
-        .ok_or_else(|| ControlPlaneError::RpcProtocol {
-            message: "accepted admin auth credential was not configured".to_owned(),
+        .ok_or_else(|| {
+            ControlPlaneError::rpc_protocol(
+                "accepted admin auth credential was not configured".to_owned(),
+            )
         })
 }
 
@@ -13871,9 +13819,9 @@ impl ControlPlaneUnixAuthVerifier {
     pub fn new_empty(cluster_id: impl Into<String>) -> Result<Self, ControlPlaneError> {
         let cluster_id = cluster_id.into();
         if cluster_id.is_empty() {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: "control-plane auth cluster id must not be empty".to_owned(),
-            });
+            return Err(ControlPlaneError::rpc_protocol(
+                "control-plane auth cluster id must not be empty".to_owned(),
+            ));
         }
         Ok(Self {
             cluster_id,
@@ -13889,9 +13837,9 @@ impl ControlPlaneUnixAuthVerifier {
         storage_node_credentials: Vec<ControlPlaneStorageNodeAuthCredential>,
     ) -> Result<Self, ControlPlaneError> {
         if storage_node_credentials.is_empty() {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: "control-plane storage-node auth credential set is empty".to_owned(),
-            });
+            return Err(ControlPlaneError::rpc_protocol(
+                "control-plane storage-node auth credential set is empty".to_owned(),
+            ));
         }
         let mut verifier = Self::new_empty(cluster_id)?;
         let mut by_node = BTreeMap::new();
@@ -14045,9 +13993,9 @@ impl ControlPlaneUnixAuthVerifier {
             _ => {
                 self.metrics
                     .record_rejected(operation, ControlPlaneAuthRejectionReason::WrongRole);
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: "control-plane admin command auth source is not an admin".to_owned(),
-                });
+                return Err(ControlPlaneError::rpc_protocol(
+                    "control-plane admin command auth source is not an admin".to_owned(),
+                ));
             }
         };
         let ControlPlaneAuthPrincipal::Admin { instance_id } = &expected_source else {
@@ -14058,11 +14006,9 @@ impl ControlPlaneUnixAuthVerifier {
                 operation,
                 ControlPlaneAuthRejectionReason::UnknownCredential,
             );
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "control-plane admin command auth has no credential for instance {instance_id}"
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "control-plane admin command auth has no credential for instance {instance_id}"
+            )));
         };
         let credentials = match admin_credentials
             .iter()
@@ -14128,12 +14074,10 @@ impl ControlPlaneUnixAuthVerifier {
             }
             ControlPlaneAuthDecision::Rejected { reason } => {
                 self.metrics.record_rejected(operation, reason);
-                Err(ControlPlaneError::RpcProtocol {
-                    message: format!(
-                        "control-plane admin command auth rejected: {}",
-                        format_control_plane_auth_rejection(reason, &envelope, authority_now_ms)
-                    ),
-                })
+                Err(ControlPlaneError::rpc_protocol(format!(
+                    "control-plane admin command auth rejected: {}",
+                    format_control_plane_auth_rejection(reason, &envelope, authority_now_ms)
+                )))
             }
         }
     }
@@ -14187,11 +14131,10 @@ impl ControlPlaneUnixAuthVerifier {
             _ => {
                 self.metrics
                     .record_rejected(operation, ControlPlaneAuthRejectionReason::WrongRole);
-                return Err(ControlPlaneError::RpcProtocol {
-                    message:
-                        "control-plane frontend runtime-map read auth source is not a frontend"
-                            .to_owned(),
-                });
+                return Err(ControlPlaneError::rpc_protocol(
+                    "control-plane frontend runtime-map read auth source is not a frontend"
+                        .to_owned(),
+                ));
             }
         };
         let ControlPlaneAuthPrincipal::Frontend { instance_id } = &expected_source else {
@@ -14202,11 +14145,9 @@ impl ControlPlaneUnixAuthVerifier {
                 operation,
                 ControlPlaneAuthRejectionReason::UnknownCredential,
             );
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
+            return Err(ControlPlaneError::rpc_protocol(format!(
                     "control-plane frontend runtime-map read auth has no credential for instance {instance_id}"
-                ),
-            });
+                )));
         };
         let credentials = match frontend_credentials
             .iter()
@@ -14272,12 +14213,10 @@ impl ControlPlaneUnixAuthVerifier {
             }
             ControlPlaneAuthDecision::Rejected { reason } => {
                 self.metrics.record_rejected(operation, reason);
-                Err(ControlPlaneError::RpcProtocol {
-                    message: format!(
-                        "control-plane frontend runtime-map read auth rejected: {}",
-                        format_control_plane_auth_rejection(reason, &envelope, authority_now_ms)
-                    ),
-                })
+                Err(ControlPlaneError::rpc_protocol(format!(
+                    "control-plane frontend runtime-map read auth rejected: {}",
+                    format_control_plane_auth_rejection(reason, &envelope, authority_now_ms)
+                )))
             }
         }
     }
@@ -14338,12 +14277,10 @@ impl ControlPlaneUnixAuthVerifier {
                 ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
                 ControlPlaneAuthRejectionReason::UnknownCredential,
             );
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "control-plane storage-node heartbeat auth has no credential for node {}",
-                    heartbeat.node_id.as_u32()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "control-plane storage-node heartbeat auth has no credential for node {}",
+                heartbeat.node_id.as_u32()
+            )));
         };
         let credentials = match node_credentials
             .iter()
@@ -14412,12 +14349,10 @@ impl ControlPlaneUnixAuthVerifier {
             ControlPlaneAuthDecision::Rejected { reason } => {
                 self.metrics
                     .record_rejected(ControlPlaneAuthOperation::StorageRuntimeMapRefresh, reason);
-                Err(ControlPlaneError::RpcProtocol {
-                    message: format!(
-                        "control-plane storage-node heartbeat auth rejected: {}",
-                        format_control_plane_auth_rejection(reason, &envelope, authority_now_ms)
-                    ),
-                })
+                Err(ControlPlaneError::rpc_protocol(format!(
+                    "control-plane storage-node heartbeat auth rejected: {}",
+                    format_control_plane_auth_rejection(reason, &envelope, authority_now_ms)
+                )))
             }
         }
     }
@@ -14469,19 +14404,17 @@ fn read_authenticated_control_plane_rpc_payload(
     payload: &[u8],
 ) -> Result<Vec<u8>, ControlPlaneError> {
     if payload.len() < 2 {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "control-plane authenticated RPC payload missing kind".to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_protocol(
+            "control-plane authenticated RPC payload missing kind".to_owned(),
+        ));
     }
     let raw_kind = u16::from_be_bytes([payload[0], payload[1]]);
     let actual_kind = ControlPlaneRpcKind::from_u16(raw_kind)?;
     if actual_kind != expected_kind {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!(
-                "control-plane authenticated RPC kind {:?} did not match outer kind {:?}",
-                actual_kind, expected_kind
-            ),
-        });
+        return Err(ControlPlaneError::rpc_protocol(format!(
+            "control-plane authenticated RPC kind {:?} did not match outer kind {:?}",
+            actual_kind, expected_kind
+        )));
     }
     Ok(payload[2..].to_vec())
 }
@@ -14718,9 +14651,9 @@ fn unconfirmed_raft_admin_trigger(
 fn authority_clock_admin_remaining(deadline: Instant) -> Result<Duration, ControlPlaneError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(ControlPlaneError::RpcRemote {
-            message: "authority-clock admin operation deadline expired".to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_remote(
+            "authority-clock admin operation deadline expired".to_owned(),
+        ));
     }
     Ok(remaining)
 }
@@ -15147,19 +15080,18 @@ fn verify_control_plane_request(
                 ControlPlaneAuthRejectionReason::Missing,
             );
         }
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "control-plane RPC endpoint requires authenticated requests".to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_protocol(
+            "control-plane RPC endpoint requires authenticated requests".to_owned(),
+        ));
     }
     if matches!(
         kind,
         ControlPlaneRpcKind::AuthorityClockStatus | ControlPlaneRpcKind::ReestablishAuthorityClock
     ) && response_auth.is_none()
     {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "authority-clock administration requires configured admin authentication"
-                .to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_protocol(
+            "authority-clock administration requires configured admin authentication".to_owned(),
+        ));
     }
     Ok(VerifiedControlPlaneRpcRequest {
         kind,
@@ -15461,10 +15393,9 @@ where
         }
         ControlPlaneRpcKind::AuthorityClockStatus
         | ControlPlaneRpcKind::ReestablishAuthorityClock => {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: "authority-clock admin RPC requires the process-local clock handler"
-                    .to_owned(),
-            });
+            return Err(ControlPlaneError::rpc_protocol(
+                "authority-clock admin RPC requires the process-local clock handler".to_owned(),
+            ));
         }
     };
     build_control_plane_verified_response(
@@ -15584,15 +15515,14 @@ where
         kind,
         ControlPlaneRpcKind::AuthorityClockStatus | ControlPlaneRpcKind::ReestablishAuthorityClock
     ) {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!("expected authority-clock admin RPC, got {kind:?}"),
-        });
+        return Err(ControlPlaneError::rpc_protocol(format!(
+            "expected authority-clock admin RPC, got {kind:?}"
+        )));
     }
     let Some(response_auth) = response_auth else {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "authority-clock administration requires configured admin authentication"
-                .to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_protocol(
+            "authority-clock administration requires configured admin authentication".to_owned(),
+        ));
     };
     let mut successful_reestablishment_context = None;
     let response = match kind {
@@ -15707,9 +15637,9 @@ impl ControlPlaneRpcKind {
             14 => Ok(Self::AuthorityClockStatus),
             15 => Ok(Self::ReestablishAuthorityClock),
             16 => Ok(Self::RuntimeMapDiagnostics),
-            _ => Err(ControlPlaneError::RpcProtocol {
-                message: format!("unknown control-plane RPC kind {value}"),
-            }),
+            _ => Err(ControlPlaneError::rpc_protocol(format!(
+                "unknown control-plane RPC kind {value}"
+            ))),
         }
     }
 
@@ -15828,9 +15758,9 @@ where
         response_auth,
     } = request;
     if kind != ControlPlaneRpcKind::RefreshNodeHeartbeat {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!("expected RefreshNodeHeartbeat RPC, got {kind:?}"),
-        });
+        return Err(ControlPlaneError::rpc_protocol(format!(
+            "expected RefreshNodeHeartbeat RPC, got {kind:?}"
+        )));
     }
     debug_assert_eq!(
         kind.auth_operation(),
@@ -15974,18 +15904,15 @@ fn authenticate_and_admit_control_plane_rpc(
     let request = verify(request, policy.auth_verifier.as_deref(), authority_now_ms)
         .map_err(|error| ControlPlaneRpcAdmissionFailure::Unauthenticated(Box::new(error)))?;
     if !policy.role.accepts(&request) {
-        let error = ControlPlaneError::RpcProtocol {
-            message: match policy.role {
-                ControlPlaneRpcServerRole::Ordinary => {
-                    "authority-clock administration requires the dedicated recovery endpoint"
-                        .to_owned()
-                }
-                ControlPlaneRpcServerRole::AuthorityClockRecovery => {
-                    "dedicated authority-clock recovery endpoint rejects ordinary control-plane RPCs"
-                        .to_owned()
-                }
-            },
-        };
+        let error = ControlPlaneError::rpc_protocol(match policy.role {
+            ControlPlaneRpcServerRole::Ordinary => {
+                "authority-clock administration requires the dedicated recovery endpoint".to_owned()
+            }
+            ControlPlaneRpcServerRole::AuthorityClockRecovery => {
+                "dedicated authority-clock recovery endpoint rejects ordinary control-plane RPCs"
+                    .to_owned()
+            }
+        });
         return Err(ControlPlaneRpcAdmissionFailure::Authenticated {
             request: Box::new(request),
             error: Box::new(error),
@@ -16212,21 +16139,23 @@ impl ControlPlaneRpcServerListener {
                     worker_limit,
                     self.io_timeout,
                     move |stream, deadline| {
-                        stream
-                            .set_nonblocking(false)
-                            .map_err(|source| ControlPlaneError::Io {
-                                context: "set control-plane Unix RPC blocking mode",
+                        stream.set_nonblocking(false).map_err(|source| {
+                            ControlPlaneError::io(
+                                "set control-plane Unix RPC blocking mode",
                                 source,
-                            })?;
+                            )
+                        })?;
                         ControlPlaneDeadlineUnixSocket::new(
                             stream,
                             deadline,
                             CONTROL_PLANE_RPC_DEADLINE_EXPIRED,
                         )
                         .map(|stream| Box::new(stream) as Box<dyn ControlPlaneRpcServerStream>)
-                        .map_err(|source| ControlPlaneError::Io {
-                            context: "configure control-plane Unix RPC deadline I/O",
-                            source,
+                        .map_err(|source| {
+                            ControlPlaneError::io(
+                                "configure control-plane Unix RPC deadline I/O",
+                                source,
+                            )
                         })
                     },
                 ),
@@ -16257,31 +16186,32 @@ impl ControlPlaneRpcServerListener {
                                 CONTROL_PLANE_RPC_DEADLINE_EXPIRED,
                             )
                             .map_err(|source| {
-                                ControlPlaneError::Io {
-                                    context: "configure control-plane TLS/TCP deadline I/O",
+                                ControlPlaneError::io(
+                                    "configure control-plane TLS/TCP deadline I/O",
                                     source,
-                                }
+                                )
                             })?;
                             let connection = rustls::ServerConnection::new(tls_server_config)
-                                .map_err(|_| ControlPlaneError::RpcProtocol {
-                                    message:
+                                .map_err(|_| {
+                                    ControlPlaneError::rpc_protocol(
                                         "failed to initialize control-plane TLS server connection"
                                             .to_owned(),
+                                    )
                                 })?;
                             let mut stream = rustls::StreamOwned::new(connection, socket);
                             while stream.conn.is_handshaking() {
                                 stream
                                     .conn
                                     .complete_io(&mut stream.sock)
-                                    .map_err(|source| ControlPlaneError::Io {
-                                        context: "complete control-plane TLS server handshake",
-                                        source,
+                                    .map_err(|source| {
+                                        ControlPlaneError::io(
+                                            "complete control-plane TLS server handshake",
+                                            source,
+                                        )
                                     })?;
                             }
                             if stream.conn.alpn_protocol() != Some(CONTROL_PLANE_RPC_TLS_ALPN) {
-                                return Err(ControlPlaneError::RpcProtocol {
-                                    message: "control-plane TLS peer did not negotiate the required protocol profile".to_owned(),
-                                });
+                                return Err(ControlPlaneError::rpc_protocol("control-plane TLS peer did not negotiate the required protocol profile".to_owned()));
                             }
                             Ok(Box::new(stream) as Box<dyn ControlPlaneRpcServerStream>)
                         },
@@ -16344,11 +16274,9 @@ fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
             &mut stream,
             |frame_bytes| {
                 if frame_bytes > max_frame_bytes {
-                    return Err(ControlPlaneError::RpcProtocol {
-                        message: format!(
+                    return Err(ControlPlaneError::rpc_protocol(format!(
                             "control-plane RPC frame size {frame_bytes} bytes exceeds listener limit {max_frame_bytes}"
-                        ),
-                    });
+                        )));
                 }
                 policy.resources.pre_auth_byte_budget.reserve(frame_bytes)
             },
@@ -16391,11 +16319,10 @@ fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
                 let _operation_timer =
                     observability::control_plane_rpc_operation_timer(metrics_kind);
                 let authority_clock = policy.authority_clock.as_ref().ok_or_else(|| {
-                    ControlPlaneError::RpcProtocol {
-                        message:
-                            "authority-clock administration requires a process-local clock gate"
-                                .to_owned(),
-                    }
+                    ControlPlaneError::rpc_protocol(
+                        "authority-clock administration requires a process-local clock gate"
+                            .to_owned(),
+                    )
                 })?;
                 let context = authority.with_mut(metrics_kind, |authority| {
                     authority.authority_clock_context()
@@ -16413,9 +16340,7 @@ fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
                             policy
                                 .authority_clock_checkpoint_target
                                 .as_ref()
-                                .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                                    message: "authority-clock administration requires a durable checkpoint target".to_owned(),
-                                })?
+                                .ok_or_else(|| ControlPlaneError::rpc_protocol("authority-clock administration requires a durable checkpoint target".to_owned()))?
                                 .persist_established(context, authority_clock)
                         },
                         || Ok(policy.authority_now_ms()),
@@ -16423,10 +16348,11 @@ fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
                 policy
                     .authority_clock_checkpoint_target
                     .as_ref()
-                    .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                        message:
+                    .ok_or_else(|| {
+                        ControlPlaneError::rpc_protocol(
                             "authority-clock administration requires a durable checkpoint target"
                                 .to_owned(),
+                        )
                     })?
                     .invalidate_if_blocked(&authority_clock)?;
                 response
@@ -16533,12 +16459,11 @@ fn spawn_control_plane_rpc_server_worker<T, RawStream, Prepare>(
         stream.begin_response(io_timeout);
         let mut response = Some(response);
         let mut write_response = || {
-            let response = response
-                .take()
-                .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                    message: "control-plane response publication attempted more than once"
-                        .to_owned(),
-                })?;
+            let response = response.take().ok_or_else(|| {
+                ControlPlaneError::rpc_protocol(
+                    "control-plane response publication attempted more than once".to_owned(),
+                )
+            })?;
             stream.begin_response(io_timeout);
             write_control_plane_rpc_response_and_flush(&mut stream, response)
         };
@@ -16602,16 +16527,15 @@ fn write_control_plane_rpc_response_and_flush(
     response: ControlPlaneRpcResponse,
 ) -> Result<(), ControlPlaneError> {
     write_control_plane_unix_response(stream, response)?;
-    stream.flush().map_err(|source| ControlPlaneError::Io {
-        context: "flush control-plane RPC response",
-        source,
-    })
+    stream
+        .flush()
+        .map_err(|source| ControlPlaneError::io("flush control-plane RPC response", source))
 }
 
 fn control_plane_rpc_response_write_error_kind(
     error: &ControlPlaneError,
 ) -> observability::ControlPlaneRpcResponseWriteErrorKind {
-    let ControlPlaneError::Io { source, .. } = error else {
+    let ControlPlaneError::Io { diagnostic: source } = error else {
         return observability::ControlPlaneRpcResponseWriteErrorKind::Other;
     };
     match source.kind() {
@@ -16635,24 +16559,21 @@ fn write_control_plane_rpc_frame(
     let magic_len = CONTROL_PLANE_RPC_MAGIC.len();
     stream
         .write_all(&frame[..magic_len])
-        .map_err(|source| ControlPlaneError::Io {
-            context: "write control-plane RPC magic",
-            source,
-        })?;
+        .map_err(|source| ControlPlaneError::io("write control-plane RPC magic", source))?;
     stream
         .write_all(&frame[magic_len..])
-        .map_err(|source| ControlPlaneError::Io {
-            context: "write control-plane RPC frame",
-            source,
-        })
+        .map_err(|source| ControlPlaneError::io("write control-plane RPC frame", source))
 }
 
 fn encode_control_plane_rpc_frame(
     kind: ControlPlaneRpcKind,
     payload: &[u8],
 ) -> Result<Vec<u8>, ControlPlaneError> {
-    let payload_len = u32::try_from(payload.len()).map_err(|_| ControlPlaneError::RpcProtocol {
-        message: format!("control-plane RPC payload too large: {}", payload.len()),
+    let payload_len = u32::try_from(payload.len()).map_err(|_| {
+        ControlPlaneError::rpc_protocol(format!(
+            "control-plane RPC payload too large: {}",
+            payload.len()
+        ))
     })?;
     let mut frame = Vec::with_capacity(control_plane_rpc_frame_overhead() + payload.len());
     frame.extend_from_slice(CONTROL_PLANE_RPC_MAGIC);
@@ -16689,57 +16610,49 @@ fn read_control_plane_rpc_frame_with_reservation<R>(
     let mut magic = vec![0; CONTROL_PLANE_RPC_MAGIC.len()];
     stream
         .read_exact(&mut magic)
-        .map_err(|source| ControlPlaneError::Io {
-            context: "read control-plane RPC magic",
-            source,
-        })?;
+        .map_err(|source| ControlPlaneError::io("read control-plane RPC magic", source))?;
     if magic != CONTROL_PLANE_RPC_MAGIC {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "invalid control-plane RPC magic".to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_protocol(
+            "invalid control-plane RPC magic".to_owned(),
+        ));
     }
     let mut header = [0; 16];
     stream
         .read_exact(&mut header)
-        .map_err(|source| ControlPlaneError::Io {
-            context: "read control-plane RPC header",
-            source,
-        })?;
+        .map_err(|source| ControlPlaneError::io("read control-plane RPC header", source))?;
     let mut reader = PayloadReader::new(&header);
     let version = reader.read_u16()?;
     if version != CONTROL_PLANE_RPC_VERSION {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!("unsupported control-plane RPC version {version}"),
-        });
+        return Err(ControlPlaneError::rpc_protocol(format!(
+            "unsupported control-plane RPC version {version}"
+        )));
     }
     let kind = ControlPlaneRpcKind::from_u16(reader.read_u16()?)?;
     let raw_kind = kind as u16;
     let payload_len_u32 = reader.read_u32()?;
-    let payload_len =
-        usize::try_from(payload_len_u32).map_err(|_| ControlPlaneError::RpcProtocol {
-            message: "control-plane RPC payload length does not fit usize".to_owned(),
-        })?;
+    let payload_len = usize::try_from(payload_len_u32).map_err(|_| {
+        ControlPlaneError::rpc_protocol(
+            "control-plane RPC payload length does not fit usize".to_owned(),
+        )
+    })?;
     let expected_checksum = reader.read_u64()?;
     reader.finish()?;
     if payload_len > CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!("control-plane RPC payload too large: {payload_len}"),
-        });
+        return Err(ControlPlaneError::rpc_protocol(format!(
+            "control-plane RPC payload too large: {payload_len}"
+        )));
     }
     let reservation = reserve(control_plane_rpc_frame_overhead() + payload_len)?;
     let mut payload = vec![0; payload_len];
     stream
         .read_exact(&mut payload)
-        .map_err(|source| ControlPlaneError::Io {
-            context: "read control-plane RPC payload",
-            source,
-        })?;
+        .map_err(|source| ControlPlaneError::io("read control-plane RPC payload", source))?;
     if control_plane_rpc_frame_checksum(version, raw_kind, payload_len_u32, &payload)
         != expected_checksum
     {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "control-plane RPC frame checksum mismatch".to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_protocol(
+            "control-plane RPC frame checksum mismatch".to_owned(),
+        ));
     }
     Ok(((kind, payload), reservation))
 }
@@ -16854,9 +16767,17 @@ fn encode_control_plane_rpc_response(
             write_u32(&mut payload, pg_id);
             write_u32(&mut payload, node_id);
         }
+        Err(ControlPlaneError::AuthorityClockLeadershipChanged {
+            established_term,
+            current_term,
+        }) => {
+            write_u8(&mut payload, 14);
+            write_option_u64(&mut payload, established_term);
+            write_u64(&mut payload, current_term);
+        }
         Err(error) => {
             write_u8(&mut payload, 1);
-            write_string(&mut payload, &error.to_string())?;
+            write_string(&mut payload, &error.rpc_wire_error_message())?;
         }
     }
     Ok(payload)
@@ -16874,7 +16795,7 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
         1 => {
             let message = reader.read_string()?.to_owned();
             reader.finish()?;
-            Err(ControlPlaneError::RpcRemote { message })
+            Err(ControlPlaneError::rpc_remote(message))
         }
         2 => {
             let pg_id = reader.read_u32()?;
@@ -16883,9 +16804,9 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
             let pending_cluster_epoch =
                 read_cluster_epoch(&mut reader, "pending command cluster epoch")?;
             let pending_log_index = NonZeroU64::new(reader.read_u64()?).ok_or_else(|| {
-                ControlPlaneError::RpcProtocol {
-                    message: "pending command log index must be nonzero".to_owned(),
-                }
+                ControlPlaneError::rpc_protocol(
+                    "pending command log index must be nonzero".to_owned(),
+                )
             })?;
             let pending_command_checksum = reader.read_u64()?;
             reader.finish()?;
@@ -16988,9 +16909,18 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
             reader.finish()?;
             Err(ControlPlaneError::UnknownActingSetNode { pg_id, node_id })
         }
-        _ => Err(ControlPlaneError::RpcProtocol {
-            message: format!("invalid control-plane RPC response status {status}"),
-        }),
+        14 => {
+            let established_term = reader.read_option_u64()?;
+            let current_term = reader.read_u64()?;
+            reader.finish()?;
+            Err(ControlPlaneError::AuthorityClockLeadershipChanged {
+                established_term,
+                current_term,
+            })
+        }
+        _ => Err(ControlPlaneError::rpc_protocol(format!(
+            "invalid control-plane RPC response status {status}"
+        ))),
     }
 }
 
@@ -17091,12 +17021,10 @@ fn read_cluster_map_history_route_references(
         CONTROL_PLANE_RPC_HISTORY_ROUTE_REFERENCE_MIN_LEN,
     )?;
     if count > MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!(
-                "cluster-map history route reference count {count} exceeds {}",
-                MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES
-            ),
-        });
+        return Err(ControlPlaneError::rpc_protocol(format!(
+            "cluster-map history route reference count {count} exceeds {}",
+            MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES
+        )));
     }
     let mut decoded = Vec::with_capacity(count);
     let mut previous = None;
@@ -17107,18 +17035,17 @@ fn read_cluster_map_history_route_references(
             PgId::new(reader.read_u32()?),
         );
         if previous.is_some_and(|previous| reference <= previous) {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: "cluster-map history route references are not in canonical order"
-                    .to_owned(),
-            });
+            return Err(ControlPlaneError::rpc_protocol(
+                "cluster-map history route references are not in canonical order".to_owned(),
+            ));
         }
         previous = Some(reference);
         decoded.push(reference);
     }
     PgClusterMapHistoryRouteReferences::try_from_iter(decoded).map_err(|error| {
-        ControlPlaneError::RpcProtocol {
-            message: format!("invalid cluster-map history route references: {error}"),
-        }
+        ControlPlaneError::rpc_protocol(format!(
+            "invalid cluster-map history route references: {error}"
+        ))
     })
 }
 
@@ -17143,9 +17070,9 @@ fn read_cluster_map_history_route_reference_kind(
         3 => Ok(PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired),
         4 => Ok(PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand),
         5 => Ok(PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim),
-        value => Err(ControlPlaneError::RpcProtocol {
-            message: format!("invalid cluster-map history route reference kind {value}"),
-        }),
+        value => Err(ControlPlaneError::rpc_protocol(format!(
+            "invalid cluster-map history route reference kind {value}"
+        ))),
     }
 }
 
@@ -17226,9 +17153,9 @@ fn read_heartbeat_lease_summary(
     reader: &mut PayloadReader<'_>,
 ) -> Result<HeartbeatLease, ControlPlaneError> {
     let authority_incarnation = AuthorityIncarnation::new(reader.read_u64()?).ok_or_else(|| {
-        ControlPlaneError::RpcProtocol {
-            message: "heartbeat lease authority incarnation must be nonzero".to_owned(),
-        }
+        ControlPlaneError::rpc_protocol(
+            "heartbeat lease authority incarnation must be nonzero".to_owned(),
+        )
     })?;
     let cluster_epoch = read_cluster_epoch(reader, "heartbeat lease cluster epoch")?;
     let node_id = NodeId::new(reader.read_u32()?);
@@ -17265,16 +17192,15 @@ fn write_runtime_map_status(
             write_u8(out, 1);
             out.extend_from_slice(&renewal.content_digest().as_bytes());
             let Some(valid_until_ms) = renewal.validity().valid_until_ms() else {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: "runtime map status renewal validity must be bounded".to_owned(),
-                });
+                return Err(ControlPlaneError::rpc_protocol(
+                    "runtime map status renewal validity must be bounded".to_owned(),
+                ));
             };
             if !renewal.freshness_proof().is_serving_authority_read() {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message:
-                        "runtime map status renewal requires a serving-authority freshness proof"
-                            .to_owned(),
-                });
+                return Err(ControlPlaneError::rpc_protocol(
+                    "runtime map status renewal requires a serving-authority freshness proof"
+                        .to_owned(),
+                ));
             }
             write_u64(out, valid_until_ms);
             write_runtime_map_freshness_proof(out, &renewal.freshness_proof());
@@ -17290,43 +17216,42 @@ fn read_runtime_map_status(
     let cluster_epoch = read_cluster_epoch(reader, "runtime map status cluster epoch")?;
     let pg_routes = reader.read_u32()? as usize;
     let active_serving_pg_routes = reader.read_u32()? as usize;
-    let lease_renewal =
-        match reader.read_u8()? {
-            0 => None,
-            1 => {
-                let content_digest = RuntimeMapContentDigest::from_bytes(
-                    reader
-                        .read_exact(RUNTIME_MAP_CONTENT_DIGEST_LEN)?
-                        .try_into()
-                        .expect("runtime-map digest read must return 32 bytes"),
-                );
-                let valid_until_ms = reader.read_u64()?;
-                let validity = RouteMapValidity::from_valid_until_ms(Some(valid_until_ms))
-                    .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                        message:
-                            "runtime map status renewal validity uses reserved unbounded sentinel"
-                                .to_owned(),
-                    })?;
-                let freshness_proof = read_runtime_map_freshness_proof(reader)?;
-                if !freshness_proof.is_serving_authority_read() {
-                    return Err(ControlPlaneError::RpcProtocol {
-                    message:
-                        "runtime map status renewal requires a serving-authority freshness proof"
+    let lease_renewal = match reader.read_u8()? {
+        0 => None,
+        1 => {
+            let content_digest = RuntimeMapContentDigest::from_bytes(
+                reader
+                    .read_exact(RUNTIME_MAP_CONTENT_DIGEST_LEN)?
+                    .try_into()
+                    .expect("runtime-map digest read must return 32 bytes"),
+            );
+            let valid_until_ms = reader.read_u64()?;
+            let validity =
+                RouteMapValidity::from_valid_until_ms(Some(valid_until_ms)).ok_or_else(|| {
+                    ControlPlaneError::rpc_protocol(
+                        "runtime map status renewal validity uses reserved unbounded sentinel"
                             .to_owned(),
-                });
-                }
-                Some(ControlPlaneRuntimeMapLeaseRenewal {
-                    content_digest,
-                    validity,
-                    freshness_proof,
-                })
+                    )
+                })?;
+            let freshness_proof = read_runtime_map_freshness_proof(reader)?;
+            if !freshness_proof.is_serving_authority_read() {
+                return Err(ControlPlaneError::rpc_protocol(
+                    "runtime map status renewal requires a serving-authority freshness proof"
+                        .to_owned(),
+                ));
             }
-            value => {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: format!("invalid runtime map status renewal tag {value}"),
-                });
-            }
-        };
+            Some(ControlPlaneRuntimeMapLeaseRenewal {
+                content_digest,
+                validity,
+                freshness_proof,
+            })
+        }
+        value => {
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "invalid runtime map status renewal tag {value}"
+            )));
+        }
+    };
     Ok(ControlPlaneRuntimeMapStatus {
         cluster_epoch,
         pg_routes,
@@ -17504,18 +17429,19 @@ fn read_control_plane_runtime_map_diagnostics(
     let runtime_map = read_runtime_map_snapshot(reader)?;
     let metric_count = reader.read_collection_len("control-plane RPC metrics", 97)?;
     if metric_count > 16 {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!("control-plane RPC metric count {metric_count} exceeds 16"),
-        });
+        return Err(ControlPlaneError::rpc_protocol(format!(
+            "control-plane RPC metric count {metric_count} exceeds 16"
+        )));
     }
     let mut rpc_metrics = Vec::with_capacity(metric_count);
     let mut seen = BTreeSet::new();
     for _ in 0..metric_count {
         let kind = read_control_plane_rpc_metric_kind(reader.read_u8()?)?;
         if !seen.insert(control_plane_rpc_metric_kind_code(kind)) {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!("duplicate control-plane RPC metric kind {}", kind.as_str()),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "duplicate control-plane RPC metric kind {}",
+                kind.as_str()
+            )));
         }
         rpc_metrics.push(observability::ControlPlaneRpcMetricSample {
             kind,
@@ -17638,12 +17564,10 @@ fn read_control_plane_runtime_map_diagnostics(
     let history_reference_count =
         reader.read_collection_len("control-plane history reference samples", 31)?;
     if history_reference_count > runtime_map.nodes().len() {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!(
+        return Err(ControlPlaneError::rpc_protocol(format!(
                 "control-plane history reference sample count {history_reference_count} exceeds runtime node count {}",
                 runtime_map.nodes().len()
-            ),
-        });
+            )));
     }
     let runtime_node_ids = runtime_map
         .nodes()
@@ -17655,18 +17579,14 @@ fn read_control_plane_runtime_map_diagnostics(
     for _ in 0..history_reference_count {
         let node_id = reader.read_u32()?;
         if !runtime_node_ids.contains(&node_id) {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "control-plane history reference sample names unknown node {node_id}"
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "control-plane history reference sample names unknown node {node_id}"
+            )));
         }
         if !seen_nodes.insert(node_id) {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "duplicate control-plane history reference sample for node {node_id}"
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "duplicate control-plane history reference sample for node {node_id}"
+            )));
         }
         let observed_epoch = read_cluster_epoch(reader, "history reference observed epoch")?;
         let validation_epoch = read_cluster_epoch(reader, "history reference validation epoch")?;
@@ -17682,19 +17602,15 @@ fn read_control_plane_runtime_map_diagnostics(
             "history reference object payload reclaim claim epoch",
         )?;
         if observed_epoch > validation_epoch {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
+            return Err(ControlPlaneError::rpc_protocol(format!(
                     "history reference sample for node {node_id} observed epoch {observed_epoch} beyond validation epoch {validation_epoch}"
-                ),
-            });
+                )));
         }
         if validation_epoch > runtime_map.cluster_epoch() {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
+            return Err(ControlPlaneError::rpc_protocol(format!(
                     "history reference sample for node {node_id} has future validation epoch {validation_epoch} beyond runtime-map epoch {}",
                     runtime_map.cluster_epoch()
-                ),
-            });
+                )));
         }
         for (field, component_epoch) in [
             ("live placement", oldest_live_placement_epoch),
@@ -17712,11 +17628,9 @@ fn read_control_plane_runtime_map_diagnostics(
                 continue;
             };
             if component_epoch > validation_epoch {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: format!(
+                return Err(ControlPlaneError::rpc_protocol(format!(
                         "history reference sample for node {node_id} has future {field} epoch {component_epoch} beyond validation epoch {validation_epoch}"
-                    ),
-                });
+                    )));
             }
         }
         history_reference_samples.push(observability::ControlPlaneHistoryReferenceSample {
@@ -17737,24 +17651,20 @@ fn read_control_plane_runtime_map_diagnostics(
         CONTROL_PLANE_RPC_NODE_LEASE_DIAGNOSTIC_MIN_LEN,
     )?;
     if node_lease_count != runtime_map.nodes().len() {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!(
+        return Err(ControlPlaneError::rpc_protocol(format!(
                 "control-plane diagnostic node lease count {node_lease_count} does not match runtime node count {}",
                 runtime_map.nodes().len()
-            ),
-        });
+            )));
     }
     let mut node_leases = Vec::with_capacity(node_lease_count);
     for expected_node in runtime_map.nodes() {
         let node_id = NodeId::new(reader.read_u32()?);
         if node_id != expected_node.node_id() {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "control-plane diagnostic node lease names node {}, expected canonical node {}",
-                    node_id.as_u32(),
-                    expected_node.node_id().as_u32()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "control-plane diagnostic node lease names node {}, expected canonical node {}",
+                node_id.as_u32(),
+                expected_node.node_id().as_u32()
+            )));
         }
         node_leases.push(ControlPlaneRuntimeMapNodeLeaseDiagnostic {
             node_id,
@@ -17817,9 +17727,9 @@ fn read_control_plane_rpc_metric_kind(
         14 => Ok(Kind::ReestablishAuthorityClock),
         15 => Ok(Kind::RuntimeMapDiagnostics),
         16 => Ok(Kind::Unknown),
-        _ => Err(ControlPlaneError::RpcProtocol {
-            message: format!("invalid control-plane RPC metric kind {code}"),
-        }),
+        _ => Err(ControlPlaneError::rpc_protocol(format!(
+            "invalid control-plane RPC metric kind {code}"
+        ))),
     }
 }
 
@@ -17865,18 +17775,18 @@ fn read_pending_metadata_command_recovery_listing(
     for _ in 0..count {
         let pg_id = PgId::new(reader.read_u32()?);
         if !pg_ids.insert(pg_id) {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "pending metadata command recoveries repeat PG {}",
-                    pg_id.get()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "pending metadata command recoveries repeat PG {}",
+                pg_id.get()
+            )));
         }
         let reporting_node_id = NodeId::new(reader.read_u32()?);
         let pending = PendingMetadataCommandObservation::new(
             read_cluster_epoch(reader, "pending recovery command epoch")?,
-            NonZeroU64::new(reader.read_u64()?).ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: "pending recovery command log index must be nonzero".to_owned(),
+            NonZeroU64::new(reader.read_u64()?).ok_or_else(|| {
+                ControlPlaneError::rpc_protocol(
+                    "pending recovery command log index must be nonzero".to_owned(),
+                )
             })?,
             reader.read_u64()?,
         );
@@ -17893,12 +17803,10 @@ fn read_pending_metadata_command_recovery_listing(
     for _ in 0..failure_count {
         let pg_id = PgId::new(reader.read_u32()?);
         if !pg_ids.insert(pg_id) {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "pending metadata command recovery listing repeats PG {}",
-                    pg_id.get()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "pending metadata command recovery listing repeats PG {}",
+                pg_id.get()
+            )));
         }
         let kind = PendingMetadataCommandRecoveryDiscoveryFailureKind::from_u8(reader.read_u8()?)?;
         let detail = reader.read_string()?.to_owned();
@@ -17954,9 +17862,9 @@ fn read_authority_clock_blocked_reason(
         7 => Ok(Some(
             ControlPlaneAuthorityClockBlockedReason::CheckpointPersistenceFailure,
         )),
-        tag => Err(ControlPlaneError::RpcProtocol {
-            message: format!("invalid authority-clock blocked-reason tag {tag}"),
-        }),
+        tag => Err(ControlPlaneError::rpc_protocol(format!(
+            "invalid authority-clock blocked-reason tag {tag}"
+        ))),
     }
 }
 
@@ -18132,17 +18040,16 @@ fn read_runtime_map_snapshot(
         )?);
     }
     let Some(valid_until_ms) = valid_until_ms else {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "runtime map validity must be bounded on the wire".to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_protocol(
+            "runtime map validity must be bounded on the wire".to_owned(),
+        ));
     };
     let snapshot = ClusterRuntimeMapSnapshot {
         cluster_epoch,
         validity: RouteMapValidity::from_valid_until_ms(Some(valid_until_ms)).ok_or_else(|| {
-            ControlPlaneError::RpcProtocol {
-                message: "runtime map validity deadline uses reserved unbounded sentinel"
-                    .to_owned(),
-            }
+            ControlPlaneError::rpc_protocol(
+                "runtime map validity deadline uses reserved unbounded sentinel".to_owned(),
+            )
         })?,
         freshness_proof,
         nodes,
@@ -18160,38 +18067,32 @@ fn validate_runtime_map_snapshot(
     let mut previous_historical_epoch = None;
     for epoch in snapshot.historical_cluster_epochs() {
         if *epoch >= snapshot.cluster_epoch() {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "runtime map historical epoch {} is not older than current epoch {}",
-                    epoch.get(),
-                    snapshot.cluster_epoch().get()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "runtime map historical epoch {} is not older than current epoch {}",
+                epoch.get(),
+                snapshot.cluster_epoch().get()
+            )));
         }
         if previous_historical_epoch.is_some_and(|previous| previous >= *epoch) {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: "runtime map historical epochs are not strictly increasing".to_owned(),
-            });
+            return Err(ControlPlaneError::rpc_protocol(
+                "runtime map historical epochs are not strictly increasing".to_owned(),
+            ));
         }
         previous_historical_epoch = Some(*epoch);
     }
     let mut node_ids = BTreeSet::new();
     for node in snapshot.nodes() {
         if !node_ids.insert(node.node_id()) {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "runtime map contains duplicate node {}",
-                    node.node_id().as_u32()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "runtime map contains duplicate node {}",
+                node.node_id().as_u32()
+            )));
         }
         if node.endpoint().is_empty() {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "runtime map node {} has an empty endpoint",
-                    node.node_id().as_u32()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "runtime map node {} has an empty endpoint",
+                node.node_id().as_u32()
+            )));
         }
     }
 
@@ -18215,12 +18116,10 @@ fn validate_runtime_map_snapshot(
             .binary_search(&route.cluster_epoch())
             .is_err()
         {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "runtime map historical route epoch {} is not retained",
-                    route.cluster_epoch().get()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "runtime map historical route epoch {} is not retained",
+                route.cluster_epoch().get()
+            )));
         }
     }
     for route in snapshot.pg_routes() {
@@ -18228,37 +18127,31 @@ fn validate_runtime_map_snapshot(
             continue;
         };
         if route.state() != PgState::Peering {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "runtime map route for PG {} authorizes pending command recovery while {:?}",
-                    route.pg_id().get(),
-                    route.state()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "runtime map route for PG {} authorizes pending command recovery while {:?}",
+                route.pg_id().get(),
+                route.state()
+            )));
         }
         if recovery.pending().cluster_epoch() >= snapshot.cluster_epoch() {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
+            return Err(ControlPlaneError::rpc_protocol(format!(
                     "runtime map route for PG {} pending command epoch {} is not older than current epoch {}",
                     route.pg_id().get(),
                     recovery.pending().cluster_epoch().get(),
                     snapshot.cluster_epoch().get()
-                ),
-            });
+                )));
         }
         let historical = snapshot
             .reconstructed_pg_route_at_epoch(route.pg_id(), recovery.pending().cluster_epoch())?;
         if historical.state() != PgState::Active
             || historical.primary_node_id() != recovery.reporting_node_id()
         {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
+            return Err(ControlPlaneError::rpc_protocol(format!(
                     "runtime map route for PG {} pending command recovery reporter {} is not the Active historical primary at epoch {}",
                     route.pg_id().get(),
                     recovery.reporting_node_id().as_u32(),
                     recovery.pending().cluster_epoch().get()
-                ),
-            });
+                )));
         }
     }
     validate_runtime_map_transfer_sources(snapshot)
@@ -18279,35 +18172,29 @@ fn validate_runtime_map_transfer_sources(
             .peering_metadata_transfer_source_node_id()
             .expect("metadata transfer source route fields validated as complete");
         if source_route_epoch >= route.cluster_epoch() {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
+            return Err(ControlPlaneError::rpc_protocol(format!(
                     "runtime map route for PG {} metadata transfer source route epoch {} must be older than transfer route epoch {}",
                     route.pg_id().get(),
                     source_route_epoch.get(),
                     route.cluster_epoch().get()
-                ),
-            });
+                )));
         }
         let source_route =
             runtime_map_route_at_epoch(snapshot, route.pg_id(), source_route_epoch).ok_or_else(
-                || ControlPlaneError::RpcProtocol {
-                    message: format!(
+                || ControlPlaneError::rpc_protocol(format!(
                         "runtime map route for PG {} references missing metadata transfer source route epoch {}",
                         route.pg_id().get(),
                         source_route_epoch.get()
-                    ),
-                },
+                    )),
             )?;
         if source_route.primary_node_id() != source_node_id {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
+            return Err(ControlPlaneError::rpc_protocol(format!(
                     "runtime map route for PG {} metadata transfer source node {} does not match source route primary {} at epoch {}",
                     route.pg_id().get(),
                     source_node_id.as_u32(),
                     source_route.primary_node_id().as_u32(),
                     source_route_epoch.get()
-                ),
-            });
+                )));
         }
     }
     Ok(())
@@ -18342,80 +18229,64 @@ fn validate_runtime_map_routes(
     for route in routes {
         let route_key = (route.cluster_epoch(), route.pg_id());
         if !seen_routes.insert(route_key) {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "{label} contains duplicate route for PG {} at epoch {}",
-                    route.pg_id().get(),
-                    route.cluster_epoch().get()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "{label} contains duplicate route for PG {} at epoch {}",
+                route.pg_id().get(),
+                route.cluster_epoch().get()
+            )));
         }
         if is_current_route_set && route.cluster_epoch() != current_cluster_epoch {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "runtime map route for PG {} has epoch {}, expected {}",
-                    route.pg_id().get(),
-                    route.cluster_epoch().get(),
-                    current_cluster_epoch.get()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "runtime map route for PG {} has epoch {}, expected {}",
+                route.pg_id().get(),
+                route.cluster_epoch().get(),
+                current_cluster_epoch.get()
+            )));
         }
         if !is_current_route_set && route.cluster_epoch() >= current_cluster_epoch {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "{label} route for PG {} has epoch {}, expected an epoch older than {}",
-                    route.pg_id().get(),
-                    route.cluster_epoch().get(),
-                    current_cluster_epoch.get()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "{label} route for PG {} has epoch {}, expected an epoch older than {}",
+                route.pg_id().get(),
+                route.cluster_epoch().get(),
+                current_cluster_epoch.get()
+            )));
         }
         if route.acting_set().is_empty() {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "{label} route for PG {} has an empty acting set",
-                    route.pg_id().get()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "{label} route for PG {} has an empty acting set",
+                route.pg_id().get()
+            )));
         }
         let mut acting_set = BTreeSet::new();
         for &node_id in route.acting_set() {
             if !acting_set.insert(node_id) {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: format!(
-                        "{label} route for PG {} repeats acting-set node {}",
-                        route.pg_id().get(),
-                        node_id.as_u32()
-                    ),
-                });
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "{label} route for PG {} repeats acting-set node {}",
+                    route.pg_id().get(),
+                    node_id.as_u32()
+                )));
             }
             if !node_ids.contains(&node_id) {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: format!(
-                        "{label} route for PG {} references unknown acting-set node {}",
-                        route.pg_id().get(),
-                        node_id.as_u32()
-                    ),
-                });
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "{label} route for PG {} references unknown acting-set node {}",
+                    route.pg_id().get(),
+                    node_id.as_u32()
+                )));
             }
         }
         if !acting_set.contains(&route.primary_node_id()) {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "{label} route for PG {} primary {} is outside the acting set",
-                    route.pg_id().get(),
-                    route.primary_node_id().as_u32()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "{label} route for PG {} primary {} is outside the acting set",
+                route.pg_id().get(),
+                route.primary_node_id().as_u32()
+            )));
         }
         if route.primary_lease_deadline_ms().is_some() && route.state() != PgState::Active {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "{label} route for PG {} has serving authority but is {:?}",
-                    route.pg_id().get(),
-                    route.state()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "{label} route for PG {} has serving authority but is {:?}",
+                route.pg_id().get(),
+                route.state()
+            )));
         }
         if route.peering_metadata_transfer().is_some()
             && (route
@@ -18423,32 +18294,26 @@ fn validate_runtime_map_routes(
                 .is_none()
                 || route.peering_metadata_transfer_source_node_id().is_none())
         {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "{label} route for PG {} has incomplete metadata transfer source route",
-                    route.pg_id().get()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "{label} route for PG {} has incomplete metadata transfer source route",
+                route.pg_id().get()
+            )));
         }
         if let Some(source_node_id) = route.peering_metadata_transfer_source_node_id() {
             if !node_ids.contains(&source_node_id) {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: format!(
-                        "{label} route for PG {} references unknown metadata transfer source node {}",
-                        route.pg_id().get(),
-                        source_node_id.as_u32()
-                    ),
-                });
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "{label} route for PG {} references unknown metadata transfer source node {}",
+                    route.pg_id().get(),
+                    source_node_id.as_u32()
+                )));
             }
         }
         if route.peering_metadata_transfer().is_some() && route.state() != PgState::Peering {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "{label} route for PG {} has metadata transfer state but is {:?}",
-                    route.pg_id().get(),
-                    route.state()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "{label} route for PG {} has metadata transfer state but is {:?}",
+                route.pg_id().get(),
+                route.state()
+            )));
         }
         if route.peering_metadata_transfer().is_none()
             && (route
@@ -18456,22 +18321,18 @@ fn validate_runtime_map_routes(
                 .is_some()
                 || route.peering_metadata_transfer_source_node_id().is_some())
         {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "{label} route for PG {} has source route fields without metadata transfer",
-                    route.pg_id().get()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "{label} route for PG {} has source route fields without metadata transfer",
+                route.pg_id().get()
+            )));
         }
         if route.pending_metadata_command_recovery().is_some()
             && (!is_current_route_set || route.state() != PgState::Peering)
         {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
+            return Err(ControlPlaneError::rpc_protocol(format!(
                     "{label} route for PG {} has pending metadata command recovery outside a current Peering route",
                     route.pg_id().get()
-                ),
-            });
+                )));
         }
     }
     Ok(())
@@ -18503,17 +18364,19 @@ fn read_runtime_map_freshness_proof(
                 issued_at_ms: reader.read_u64()?,
             })
         }
-        other => Err(ControlPlaneError::RpcProtocol {
-            message: format!("invalid runtime map freshness proof tag {other}"),
-        }),
+        other => Err(ControlPlaneError::rpc_protocol(format!(
+            "invalid runtime map freshness proof tag {other}"
+        ))),
     }
 }
 
 fn read_runtime_map_proof_authority_incarnation(
     reader: &mut PayloadReader<'_>,
 ) -> Result<AuthorityIncarnation, ControlPlaneError> {
-    AuthorityIncarnation::new(reader.read_u64()?).ok_or_else(|| ControlPlaneError::RpcProtocol {
-        message: "runtime map freshness proof authority incarnation must be nonzero".to_owned(),
+    AuthorityIncarnation::new(reader.read_u64()?).ok_or_else(|| {
+        ControlPlaneError::rpc_protocol(
+            "runtime map freshness proof authority incarnation must be nonzero".to_owned(),
+        )
     })
 }
 
@@ -18523,12 +18386,14 @@ fn read_runtime_map_proof_log_id(
     let term = reader.read_u64()?;
     let index = reader.read_u64()?;
     if term == 0 {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "runtime map freshness proof read-index term must be nonzero".to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_protocol(
+            "runtime map freshness proof read-index term must be nonzero".to_owned(),
+        ));
     }
-    ControlPlaneLogId::new(term, index).ok_or_else(|| ControlPlaneError::RpcProtocol {
-        message: "runtime map freshness proof read-index index must be nonzero".to_owned(),
+    ControlPlaneLogId::new(term, index).ok_or_else(|| {
+        ControlPlaneError::rpc_protocol(
+            "runtime map freshness proof read-index index must be nonzero".to_owned(),
+        )
     })
 }
 
@@ -18557,9 +18422,10 @@ fn read_pg_route_snapshots(
                 let source_route_epoch = reader
                     .read_option_u64()?
                     .map(|epoch| {
-                        ClusterEpoch::new(epoch).ok_or_else(|| ControlPlaneError::RpcProtocol {
-                            message: "metadata transfer source route epoch must be nonzero"
-                                .to_owned(),
+                        ClusterEpoch::new(epoch).ok_or_else(|| {
+                            ControlPlaneError::rpc_protocol(
+                                "metadata transfer source route epoch must be nonzero".to_owned(),
+                            )
                         })
                     })
                     .transpose()?;
@@ -18575,9 +18441,9 @@ fn read_pg_route_snapshots(
                 )
             }
             tag => {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: format!("invalid PG route metadata transfer tag {tag}"),
-                });
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "invalid PG route metadata transfer tag {tag}"
+                )));
             }
         };
         let pending_metadata_command_recovery = match reader.read_u8()? {
@@ -18587,18 +18453,18 @@ fn read_pg_route_snapshots(
                 pending: PendingMetadataCommandObservation::new(
                     read_cluster_epoch(reader, "pending metadata command recovery epoch")?,
                     NonZeroU64::new(reader.read_u64()?).ok_or_else(|| {
-                        ControlPlaneError::RpcProtocol {
-                            message: "pending metadata command recovery log index must be nonzero"
+                        ControlPlaneError::rpc_protocol(
+                            "pending metadata command recovery log index must be nonzero"
                                 .to_owned(),
-                        }
+                        )
                     })?,
                     reader.read_u64()?,
                 ),
             }),
             tag => {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: format!("invalid pending metadata command recovery tag {tag}"),
-                });
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "invalid pending metadata command recovery tag {tag}"
+                )));
             }
         };
         let acting_set_len = reader.read_collection_len(
@@ -18655,9 +18521,9 @@ fn read_pending_metadata_command_observation(
             let cluster_epoch =
                 read_cluster_epoch(reader, "pending metadata command cluster epoch")?;
             let log_index = NonZeroU64::new(reader.read_u64()?).ok_or_else(|| {
-                ControlPlaneError::RpcProtocol {
-                    message: "pending metadata command log index must be nonzero".to_owned(),
-                }
+                ControlPlaneError::rpc_protocol(
+                    "pending metadata command log index must be nonzero".to_owned(),
+                )
             })?;
             let command_checksum = reader.read_u64()?;
             Ok(Some(PendingMetadataCommandObservation::new(
@@ -18666,9 +18532,9 @@ fn read_pending_metadata_command_observation(
                 command_checksum,
             )))
         }
-        present => Err(ControlPlaneError::RpcProtocol {
-            message: format!("invalid pending metadata command presence code {present}"),
-        }),
+        present => Err(ControlPlaneError::rpc_protocol(format!(
+            "invalid pending metadata command presence code {present}"
+        ))),
     }
 }
 
@@ -18702,9 +18568,9 @@ fn read_pg_state(reader: &mut PayloadReader<'_>) -> Result<PgState, ControlPlane
         3 => Ok(PgState::Degraded),
         4 => Ok(PgState::Backfilling),
         5 => Ok(PgState::Inconsistent),
-        state => Err(ControlPlaneError::RpcProtocol {
-            message: format!("invalid PG state code {state}"),
-        }),
+        state => Err(ControlPlaneError::rpc_protocol(format!(
+            "invalid PG state code {state}"
+        ))),
     }
 }
 
@@ -18712,9 +18578,8 @@ fn read_cluster_epoch(
     reader: &mut PayloadReader<'_>,
     field: &'static str,
 ) -> Result<ClusterEpoch, ControlPlaneError> {
-    ClusterEpoch::new(reader.read_u64()?).ok_or_else(|| ControlPlaneError::RpcProtocol {
-        message: format!("{field} must be nonzero"),
-    })
+    ClusterEpoch::new(reader.read_u64()?)
+        .ok_or_else(|| ControlPlaneError::rpc_protocol(format!("{field} must be nonzero")))
 }
 
 fn read_option_cluster_epoch(
@@ -18724,9 +18589,8 @@ fn read_option_cluster_epoch(
     reader
         .read_option_u64()?
         .map(|epoch| {
-            ClusterEpoch::new(epoch).ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: format!("{field} must be nonzero"),
-            })
+            ClusterEpoch::new(epoch)
+                .ok_or_else(|| ControlPlaneError::rpc_protocol(format!("{field} must be nonzero")))
         })
         .transpose()
 }
@@ -18778,8 +18642,8 @@ fn write_u64(out: &mut Vec<u8>, value: u64) {
 }
 
 fn len_as_u32(len: usize, field: &'static str) -> Result<u32, ControlPlaneError> {
-    u32::try_from(len).map_err(|_| ControlPlaneError::RpcProtocol {
-        message: format!("{field} length {len} exceeds u32::MAX"),
+    u32::try_from(len).map_err(|_| {
+        ControlPlaneError::rpc_protocol(format!("{field} length {len} exceeds u32::MAX"))
     })
 }
 
@@ -18797,28 +18661,20 @@ impl<'a> PayloadReader<'a> {
         if self.offset == self.payload.len() {
             Ok(())
         } else {
-            Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "control-plane RPC payload has {} trailing bytes",
-                    self.payload.len() - self.offset
-                ),
-            })
+            Err(ControlPlaneError::rpc_protocol(format!(
+                "control-plane RPC payload has {} trailing bytes",
+                self.payload.len() - self.offset
+            )))
         }
     }
 
     fn read_exact(&mut self, len: usize) -> Result<&'a [u8], ControlPlaneError> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: "control-plane RPC payload offset overflow".to_owned(),
-            })?;
-        let bytes =
-            self.payload
-                .get(self.offset..end)
-                .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                    message: "truncated control-plane RPC payload".to_owned(),
-                })?;
+        let end = self.offset.checked_add(len).ok_or_else(|| {
+            ControlPlaneError::rpc_protocol("control-plane RPC payload offset overflow".to_owned())
+        })?;
+        let bytes = self.payload.get(self.offset..end).ok_or_else(|| {
+            ControlPlaneError::rpc_protocol("truncated control-plane RPC payload".to_owned())
+        })?;
         self.offset = end;
         Ok(bytes)
     }
@@ -18848,9 +18704,9 @@ impl<'a> PayloadReader<'a> {
         match self.read_u8()? {
             0 => Ok(false),
             1 => Ok(true),
-            value => Err(ControlPlaneError::RpcProtocol {
-                message: format!("invalid boolean value {value}"),
-            }),
+            value => Err(ControlPlaneError::rpc_protocol(format!(
+                "invalid boolean value {value}"
+            ))),
         }
     }
 
@@ -18858,9 +18714,9 @@ impl<'a> PayloadReader<'a> {
         match self.read_u8()? {
             0 => Ok(None),
             1 => Ok(Some(self.read_u64()?)),
-            value => Err(ControlPlaneError::RpcProtocol {
-                message: format!("invalid optional u64 tag {value}"),
-            }),
+            value => Err(ControlPlaneError::rpc_protocol(format!(
+                "invalid optional u64 tag {value}"
+            ))),
         }
     }
 
@@ -18868,15 +18724,15 @@ impl<'a> PayloadReader<'a> {
         match self.read_u8()? {
             0 => Ok(None),
             1 => Ok(Some(self.read_u32()?)),
-            value => Err(ControlPlaneError::RpcProtocol {
-                message: format!("invalid optional u32 tag {value}"),
-            }),
+            value => Err(ControlPlaneError::rpc_protocol(format!(
+                "invalid optional u32 tag {value}"
+            ))),
         }
     }
 
     fn read_len(&mut self, field: &'static str) -> Result<usize, ControlPlaneError> {
-        usize::try_from(self.read_u32()?).map_err(|_| ControlPlaneError::RpcProtocol {
-            message: format!("{field} length does not fit usize"),
+        usize::try_from(self.read_u32()?).map_err(|_| {
+            ControlPlaneError::rpc_protocol(format!("{field} length does not fit usize"))
         })
     }
 
@@ -18889,11 +18745,9 @@ impl<'a> PayloadReader<'a> {
         let len = self.read_len(field)?;
         let max_items = self.remaining_len() / min_item_len;
         if len > max_items {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
+            return Err(ControlPlaneError::rpc_protocol(format!(
                     "{field} count {len} exceeds remaining control-plane RPC payload capacity {max_items}",
-                ),
-            });
+                )));
         }
         Ok(len)
     }
@@ -18904,8 +18758,10 @@ impl<'a> PayloadReader<'a> {
     }
 
     fn read_string(&mut self) -> Result<&'a str, ControlPlaneError> {
-        std::str::from_utf8(self.read_bytes()?).map_err(|source| ControlPlaneError::RpcProtocol {
-            message: format!("control-plane RPC string is not UTF-8: {source}"),
+        std::str::from_utf8(self.read_bytes()?).map_err(|source| {
+            ControlPlaneError::rpc_protocol(format!(
+                "control-plane RPC string is not UTF-8: {source}"
+            ))
         })
     }
 
@@ -18938,9 +18794,9 @@ impl ControlPlaneRaftOperationErrorKind {
             1 => Ok(Self::QuorumNotEnough),
             2 => Ok(Self::Fatal),
             3 => Ok(Self::Rejected),
-            _ => Err(ControlPlaneError::RpcProtocol {
-                message: format!("invalid OpenRaft operation error kind {tag}"),
-            }),
+            _ => Err(ControlPlaneError::rpc_protocol(format!(
+                "invalid OpenRaft operation error kind {tag}"
+            ))),
         }
     }
 }
@@ -18958,38 +18814,143 @@ impl fmt::Display for ControlPlaneRaftOperationErrorKind {
 
 /// Opaque diagnostic retained for a semantically classified control-plane failure.
 ///
-/// The classification is part of the public control-plane contract. The diagnostic text is
-/// deliberately not exposed through formatting or accessors, so callers cannot turn an
-/// implementation detail back into policy by parsing it.
-pub struct ControlPlaneFailureDiagnostic(Box<str>);
+/// The classification is part of the public control-plane contract. The retained diagnostic,
+/// including any classified cause, is deliberately not exposed through formatting or accessors,
+/// so callers cannot turn an implementation detail back into policy.
+pub struct ControlPlaneFailureDiagnostic(ControlPlaneFailureDiagnosticKind);
+
+enum ControlPlaneFailureDiagnosticKind {
+    Message(Box<str>),
+    ClassifiedCause {
+        context: &'static str,
+        source: Box<ControlPlaneError>,
+    },
+}
 
 impl ControlPlaneFailureDiagnostic {
     fn new(detail: impl Into<Box<str>>) -> Self {
-        Self(detail.into())
+        Self(ControlPlaneFailureDiagnosticKind::Message(detail.into()))
+    }
+
+    fn classified_cause(context: &'static str, source: ControlPlaneError) -> Self {
+        Self(ControlPlaneFailureDiagnosticKind::ClassifiedCause {
+            context,
+            source: Box::new(source),
+        })
+    }
+
+    fn retained_message(&self) -> String {
+        match &self.0 {
+            ControlPlaneFailureDiagnosticKind::Message(message) => message.to_string(),
+            ControlPlaneFailureDiagnosticKind::ClassifiedCause { context, source } => {
+                format!("{context}: {}", source.retained_diagnostic_message())
+            }
+        }
     }
 }
 
 impl fmt::Debug for ControlPlaneFailureDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self(_retained_detail) = self;
+        let Self(_retained_diagnostic) = self;
         formatter.write_str("ControlPlaneFailureDiagnostic(<redacted>)")
     }
 }
 
 impl fmt::Display for ControlPlaneFailureDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self(_retained_detail) = self;
+        let Self(_retained_diagnostic) = self;
         formatter.write_str("control-plane diagnostic redacted")
+    }
+}
+
+/// Opaque storage-owned diagnostic for a control-plane I/O failure.
+///
+/// Callers may classify the enclosing [`ControlPlaneError`] through its semantic helpers, but
+/// cannot recover the transport context or underlying operating-system error. Storage retains
+/// both values so its transport implementation can make the corresponding policy decisions.
+pub struct ControlPlaneIoDiagnostic {
+    context: &'static str,
+    source: std::io::Error,
+}
+
+impl ControlPlaneIoDiagnostic {
+    fn new(context: &'static str, source: std::io::Error) -> Self {
+        Self { context, source }
+    }
+
+    pub(crate) fn context(&self) -> &'static str {
+        self.context
+    }
+
+    pub(crate) fn kind(&self) -> ErrorKind {
+        self.source.kind()
+    }
+
+    pub(crate) fn into_source(self) -> std::io::Error {
+        self.source
+    }
+}
+
+impl fmt::Debug for ControlPlaneIoDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            context: _retained_context,
+            source: _retained_source,
+        } = self;
+        formatter.write_str("ControlPlaneIoDiagnostic(<redacted>)")
+    }
+}
+
+impl fmt::Display for ControlPlaneIoDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            context: _retained_context,
+            source: _retained_source,
+        } = self;
+        formatter.write_str("control-plane I/O diagnostic redacted")
+    }
+}
+
+/// Opaque storage-owned diagnostic text from the control-plane RPC implementation.
+///
+/// The wire codec and its owner-local tests may inspect the retained text. Public formatting is
+/// deliberately redacted so callers cannot turn implementation messages back into policy.
+pub struct ControlPlaneRpcDiagnostic(Box<str>);
+
+impl ControlPlaneRpcDiagnostic {
+    fn new(detail: impl Into<Box<str>>) -> Self {
+        Self(detail.into())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, pattern: &str) -> bool {
+        self.0.contains(pattern)
+    }
+}
+
+impl fmt::Debug for ControlPlaneRpcDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(_retained_detail) = self;
+        formatter.write_str("ControlPlaneRpcDiagnostic(<redacted>)")
+    }
+}
+
+impl fmt::Display for ControlPlaneRpcDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(_retained_detail) = self;
+        formatter.write_str("control-plane RPC diagnostic redacted")
     }
 }
 
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
-    #[error("{context}: {source}")]
+    #[error("control-plane transport I/O failure")]
     Io {
-        context: &'static str,
-        #[source]
-        source: std::io::Error,
+        diagnostic: ControlPlaneIoDiagnostic,
     },
 
     #[error("control-plane state parse error at line {line}: {message}")]
@@ -18998,8 +18959,10 @@ pub enum ControlPlaneError {
     #[error("control-plane authority clock checkpoint error: {message}")]
     AuthorityClockCheckpoint { message: String },
 
-    #[error("control-plane RPC protocol error: {message}")]
-    RpcProtocol { message: String },
+    #[error("control-plane RPC protocol failure")]
+    RpcProtocol {
+        diagnostic: ControlPlaneRpcDiagnostic,
+    },
 
     #[error("control-plane command decode error: {message}")]
     CommandDecode { message: String },
@@ -19063,8 +19026,10 @@ pub enum ControlPlaneError {
         last_applied: Option<ControlPlaneLogId>,
     },
 
-    #[error("control-plane RPC remote error: {message}")]
-    RpcRemote { message: String },
+    #[error("control-plane RPC remote failure")]
+    RpcRemote {
+        diagnostic: ControlPlaneRpcDiagnostic,
+    },
 
     #[error("local control-plane authority is not serving")]
     AuthorityNotServing,
@@ -19632,9 +19597,70 @@ pub enum ControlPlaneError {
 
 impl ControlPlaneError {
     #[must_use]
+    pub(crate) fn io(context: &'static str, source: std::io::Error) -> Self {
+        Self::Io {
+            diagnostic: ControlPlaneIoDiagnostic::new(context, source),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn rpc_protocol(diagnostic: impl Into<Box<str>>) -> Self {
+        Self::RpcProtocol {
+            diagnostic: ControlPlaneRpcDiagnostic::new(diagnostic),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn rpc_remote(diagnostic: impl Into<Box<str>>) -> Self {
+        Self::RpcRemote {
+            diagnostic: ControlPlaneRpcDiagnostic::new(diagnostic),
+        }
+    }
+
+    fn retained_diagnostic_message(&self) -> String {
+        match self {
+            Self::Io { diagnostic } => {
+                format!("{}: {}", diagnostic.context, diagnostic.source)
+            }
+            Self::RpcProtocol { diagnostic } => {
+                format!("control-plane RPC protocol error: {}", diagnostic.as_str())
+            }
+            Self::RpcRemote { diagnostic } => {
+                format!("control-plane RPC remote error: {}", diagnostic.as_str())
+            }
+            Self::DurabilityFailure { diagnostic }
+            | Self::InvariantFailure { diagnostic }
+            | Self::StartupTimeout { diagnostic }
+            | Self::StaticTopologyFailure { diagnostic } => diagnostic.retained_message(),
+            error => error.to_string(),
+        }
+    }
+
+    fn rpc_wire_error_message(&self) -> String {
+        self.retained_diagnostic_message()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_diagnostic_contains(&self, expected: &str) -> bool {
+        self.retained_diagnostic_message().contains(expected)
+    }
+
+    #[must_use]
     pub fn durability_failure(diagnostic: impl Into<Box<str>>) -> Self {
         Self::DurabilityFailure {
             diagnostic: ControlPlaneFailureDiagnostic::new(diagnostic),
+        }
+    }
+
+    /// Classify an implementation failure as a durability failure without discarding its cause.
+    ///
+    /// The returned error exposes only the semantic durability classification. Storage retains
+    /// the original error inside the opaque diagnostic for owner-local diagnosis; public
+    /// formatting and [`std::error::Error::source`] do not reveal it.
+    #[must_use]
+    pub fn into_durability_failure(self, context: &'static str) -> Self {
+        Self::DurabilityFailure {
+            diagnostic: ControlPlaneFailureDiagnostic::classified_cause(context, self),
         }
     }
 
@@ -19690,11 +19716,11 @@ impl ControlPlaneError {
 
     #[must_use]
     pub fn is_retryable_control_plane_rpc_transport_error(&self) -> bool {
-        let Self::Io { source, .. } = self else {
+        let Self::Io { diagnostic } = self else {
             return false;
         };
         matches!(
-            source.kind(),
+            diagnostic.kind(),
             ErrorKind::TimedOut
                 | ErrorKind::WouldBlock
                 | ErrorKind::UnexpectedEof
@@ -19722,16 +19748,16 @@ impl ControlPlaneError {
 
     #[must_use]
     pub fn is_maybe_applied_control_plane_rpc_response_loss(&self) -> bool {
-        let Self::Io { context, source } = self else {
+        let Self::Io { diagnostic } = self else {
             return false;
         };
         matches!(
-            *context,
+            diagnostic.context(),
             "read control-plane RPC magic"
                 | "read control-plane RPC header"
                 | "read control-plane RPC payload"
         ) && matches!(
-            source.kind(),
+            diagnostic.kind(),
             ErrorKind::TimedOut
                 | ErrorKind::WouldBlock
                 | ErrorKind::UnexpectedEof
@@ -22778,39 +22804,39 @@ fn create_control_plane_directory_all_durable_with(
         match std::fs::metadata(candidate) {
             Ok(metadata) if metadata.is_dir() => break,
             Ok(_) => {
-                return Err(ControlPlaneError::Io {
-                    context: "inspect control-plane state directory",
-                    source: std::io::Error::new(
+                return Err(ControlPlaneError::io(
+                    "inspect control-plane state directory",
+                    std::io::Error::new(
                         ErrorKind::NotADirectory,
                         format!(
                             "control-plane state directory component {} is not a directory",
                             candidate.display()
                         ),
                     ),
-                });
+                ));
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 missing.push(candidate.to_path_buf());
             }
             Err(source) => {
-                return Err(ControlPlaneError::Io {
-                    context: "inspect control-plane state directory",
+                return Err(ControlPlaneError::io(
+                    "inspect control-plane state directory",
                     source,
-                });
+                ));
             }
         }
         let parent = state_parent(candidate);
         if parent == candidate {
-            return Err(ControlPlaneError::Io {
-                context: "inspect control-plane state directory",
-                source: std::io::Error::new(
+            return Err(ControlPlaneError::io(
+                "inspect control-plane state directory",
+                std::io::Error::new(
                     ErrorKind::NotFound,
                     format!(
                         "control-plane state directory {} has no existing ancestor",
                         path.display()
                     ),
                 ),
-            });
+            ));
         }
         candidate = parent;
     }
@@ -22824,29 +22850,30 @@ fn create_control_plane_directory_all_durable_with(
         match std::fs::create_dir(&directory) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                let metadata =
-                    std::fs::metadata(&directory).map_err(|source| ControlPlaneError::Io {
-                        context: "inspect concurrently created control-plane state directory",
+                let metadata = std::fs::metadata(&directory).map_err(|source| {
+                    ControlPlaneError::io(
+                        "inspect concurrently created control-plane state directory",
                         source,
-                    })?;
+                    )
+                })?;
                 if !metadata.is_dir() {
-                    return Err(ControlPlaneError::Io {
-                        context: "create control-plane state directory",
-                        source: std::io::Error::new(
+                    return Err(ControlPlaneError::io(
+                        "create control-plane state directory",
+                        std::io::Error::new(
                             ErrorKind::NotADirectory,
                             format!(
                                 "control-plane state directory component {} is not a directory",
                                 directory.display()
                             ),
                         ),
-                    });
+                    ));
                 }
             }
             Err(source) => {
-                return Err(ControlPlaneError::Io {
-                    context: "create control-plane state directory",
+                return Err(ControlPlaneError::io(
+                    "create control-plane state directory",
                     source,
-                });
+                ));
             }
         }
         sync_parent(state_parent(&directory))?;
@@ -22858,9 +22885,8 @@ fn create_control_plane_directory_all_durable(path: &Path) -> Result<(), Control
     create_control_plane_directory_all_durable_with(path, |parent| {
         std::fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
-            .map_err(|source| ControlPlaneError::Io {
-                context: "sync control-plane state directory parent",
-                source,
+            .map_err(|source| {
+                ControlPlaneError::io("sync control-plane state directory parent", source)
             })
     })
 }
@@ -23079,7 +23105,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("pre-authentication frame budget exhausted")
         ));
         assert_eq!(
@@ -23094,10 +23120,10 @@ mod tests {
     #[test]
     fn control_plane_rpc_server_response_errors_use_bounded_categories() {
         let classify = |kind| {
-            control_plane_rpc_response_write_error_kind(&ControlPlaneError::Io {
-                context: "write test response",
-                source: std::io::Error::from(kind),
-            })
+            control_plane_rpc_response_write_error_kind(&ControlPlaneError::io(
+                "write test response",
+                std::io::Error::from(kind),
+            ))
         };
 
         assert_eq!(
@@ -23150,7 +23176,7 @@ mod tests {
             publish_control_plane_rpc_response(Some(&SkipPublication), &mut publish).unwrap_err();
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("without publishing")
         ));
         assert_eq!(calls.get(), 0);
@@ -23159,7 +23185,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("more than once")
         ));
         assert_eq!(calls.get(), 1);
@@ -23873,7 +23899,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::Io { source, .. }
+            ControlPlaneError::Io { diagnostic: source }
                 if source.kind() == ErrorKind::UnexpectedEof
         ));
         ambiguous_server.join().unwrap();
@@ -23991,10 +24017,10 @@ mod tests {
             _next_snapshot: &ClusterControlSnapshot,
         ) -> Result<(), ControlPlaneError> {
             if self.fail_saves.get() {
-                Err(ControlPlaneError::Io {
-                    context: "test save failure",
-                    source: std::io::Error::other("injected save failure"),
-                })
+                Err(ControlPlaneError::io(
+                    "test save failure",
+                    std::io::Error::other("injected save failure"),
+                ))
             } else {
                 Ok(())
             }
@@ -27527,7 +27553,7 @@ mod tests {
         follower.join().unwrap();
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("authentication envelope")
                     || message.contains("truncated")
                     || message.contains("magic")
@@ -27639,6 +27665,27 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_rpc_preserves_authority_clock_leadership_change_identity() {
+        for established_term in [None, Some(41)] {
+            let encoded = encode_control_plane_rpc_response(Err(
+                ControlPlaneError::AuthorityClockLeadershipChanged {
+                    established_term,
+                    current_term: 42,
+                },
+            ))
+            .unwrap();
+
+            assert!(matches!(
+                decode_control_plane_rpc_response(encoded),
+                Err(ControlPlaneError::AuthorityClockLeadershipChanged {
+                    established_term: decoded_established_term,
+                    current_term: 42,
+                }) if decoded_established_term == established_term
+            ));
+        }
+    }
+
+    #[test]
     fn runtime_map_observation_retry_classification_uses_semantic_errors() {
         let cluster_epoch = ClusterEpoch::new(44).unwrap();
         for error in [
@@ -27668,10 +27715,10 @@ mod tests {
                 ),
             },
             ControlPlaneError::AuthorityNotServing,
-            ControlPlaneError::Io {
-                context: "read control-plane RPC magic",
-                source: std::io::Error::from(ErrorKind::WouldBlock),
-            },
+            ControlPlaneError::io(
+                "read control-plane RPC magic",
+                std::io::Error::from(ErrorKind::WouldBlock),
+            ),
         ] {
             assert!(
                 error.is_retryable_runtime_map_observation_error(),
@@ -27679,14 +27726,14 @@ mod tests {
             );
         }
 
-        assert!(!ControlPlaneError::RpcRemote {
-            message: "PG 7 has no serving primary in cluster epoch 44".to_owned(),
-        }
+        assert!(!ControlPlaneError::rpc_remote(
+            "PG 7 has no serving primary in cluster epoch 44".to_owned()
+        )
         .is_retryable_runtime_map_observation_error());
-        assert!(!ControlPlaneError::RpcProtocol {
-            message: "invalid runtime-map response".to_owned(),
-        }
-        .is_retryable_runtime_map_observation_error());
+        assert!(
+            !ControlPlaneError::rpc_protocol("invalid runtime-map response".to_owned())
+                .is_retryable_runtime_map_observation_error()
+        );
         assert!(
             !ControlPlaneError::UnknownPg { pg_id: 7 }.is_retryable_runtime_map_observation_error()
         );
@@ -27709,6 +27756,96 @@ mod tests {
         ] {
             assert!(!error.to_string().contains(SECRET_DIAGNOSTIC));
             assert!(!format!("{error:?}").contains(SECRET_DIAGNOSTIC));
+        }
+    }
+
+    #[test]
+    fn durability_reclassification_retains_an_opaque_cause() {
+        const CLASSIFICATION_CONTEXT: &str = "restart-checkpoint classification context";
+        const SOURCE_CONTEXT: &str = "restart-checkpoint source context";
+        const SOURCE_DETAIL: &str = "restart-checkpoint source detail";
+
+        let error = ControlPlaneError::io(SOURCE_CONTEXT, std::io::Error::other(SOURCE_DETAIL))
+            .into_durability_failure(CLASSIFICATION_CONTEXT);
+
+        assert_eq!(error.to_string(), "control-plane durability is unavailable");
+        assert!(!format!("{error:?}").contains(CLASSIFICATION_CONTEXT));
+        assert!(!format!("{error:?}").contains(SOURCE_CONTEXT));
+        assert!(!format!("{error:?}").contains(SOURCE_DETAIL));
+        assert!(std::error::Error::source(&error).is_none());
+
+        let ControlPlaneError::DurabilityFailure { diagnostic } = &error else {
+            unreachable!("the error was classified as a durability failure")
+        };
+        let ControlPlaneFailureDiagnosticKind::ClassifiedCause { context, source } = &diagnostic.0
+        else {
+            unreachable!("the classified error retains its cause")
+        };
+        assert_eq!(*context, CLASSIFICATION_CONTEXT);
+        let ControlPlaneError::Io { diagnostic } = source.as_ref() else {
+            unreachable!("the original I/O failure is retained")
+        };
+        assert_eq!(diagnostic.context(), SOURCE_CONTEXT);
+        assert_eq!(diagnostic.source.to_string(), SOURCE_DETAIL);
+    }
+
+    #[test]
+    fn durability_reclassification_retains_opaque_diagnostics_across_rpc() {
+        const CLASSIFICATION_CONTEXT: &str = "restart-checkpoint classification context";
+        const SOURCE_CONTEXT: &str = "restart-checkpoint source context";
+        const SOURCE_DETAIL: &str = "restart-checkpoint source detail";
+
+        let encoded = encode_control_plane_rpc_response(Err(ControlPlaneError::io(
+            SOURCE_CONTEXT,
+            std::io::Error::other(SOURCE_DETAIL),
+        )
+        .into_durability_failure(CLASSIFICATION_CONTEXT)))
+        .unwrap();
+        let error = decode_control_plane_rpc_response(encoded).unwrap_err();
+
+        assert_eq!(error.to_string(), "control-plane RPC remote failure");
+        assert!(!format!("{error:?}").contains(CLASSIFICATION_CONTEXT));
+        assert!(!format!("{error:?}").contains(SOURCE_CONTEXT));
+        assert!(!format!("{error:?}").contains(SOURCE_DETAIL));
+        assert!(error.retained_diagnostic_contains(CLASSIFICATION_CONTEXT));
+        assert!(error.retained_diagnostic_contains(SOURCE_CONTEXT));
+        assert!(error.retained_diagnostic_contains(SOURCE_DETAIL));
+    }
+
+    #[test]
+    fn raw_control_plane_diagnostics_are_opaque() {
+        const SECRET_CONTEXT: &str = "secret control-plane transport context";
+        const SECRET_SOURCE: &str = "secret control-plane operating-system error";
+        const SECRET_RPC: &str = "secret control-plane RPC diagnostic";
+
+        let io_error = ControlPlaneError::io(SECRET_CONTEXT, std::io::Error::other(SECRET_SOURCE));
+        assert!(!io_error.to_string().contains(SECRET_CONTEXT));
+        assert!(!io_error.to_string().contains(SECRET_SOURCE));
+        assert!(!format!("{io_error:?}").contains(SECRET_CONTEXT));
+        assert!(!format!("{io_error:?}").contains(SECRET_SOURCE));
+        assert!(std::error::Error::source(&io_error).is_none());
+        let ControlPlaneError::Io { diagnostic } = io_error else {
+            unreachable!("constructed an I/O error")
+        };
+        assert!(!diagnostic.to_string().contains(SECRET_CONTEXT));
+        assert!(!diagnostic.to_string().contains(SECRET_SOURCE));
+        assert!(!format!("{diagnostic:?}").contains(SECRET_CONTEXT));
+        assert!(!format!("{diagnostic:?}").contains(SECRET_SOURCE));
+
+        for rpc_error in [
+            ControlPlaneError::rpc_protocol(SECRET_RPC),
+            ControlPlaneError::rpc_remote(SECRET_RPC),
+        ] {
+            assert!(!rpc_error.to_string().contains(SECRET_RPC));
+            assert!(!format!("{rpc_error:?}").contains(SECRET_RPC));
+            assert!(std::error::Error::source(&rpc_error).is_none());
+            let diagnostic = match rpc_error {
+                ControlPlaneError::RpcProtocol { diagnostic }
+                | ControlPlaneError::RpcRemote { diagnostic } => diagnostic,
+                _ => unreachable!("constructed an RPC diagnostic error"),
+            };
+            assert!(!diagnostic.to_string().contains(SECRET_RPC));
+            assert!(!format!("{diagnostic:?}").contains(SECRET_RPC));
         }
     }
 
@@ -28085,9 +28222,9 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::Io { context, source }
-                if context == "control-plane RPC endpoint failover deadline"
-                    && source.kind() == ErrorKind::TimedOut
+            ControlPlaneError::Io { diagnostic }
+                if diagnostic.context() == "control-plane RPC endpoint failover deadline"
+                    && diagnostic.kind() == ErrorKind::TimedOut
         ));
     }
 
@@ -28119,9 +28256,9 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             write_error,
-            ControlPlaneError::Io { context, source }
-                if context == "write control-plane RPC magic"
-                    && source.kind() == ErrorKind::TimedOut
+            ControlPlaneError::Io { diagnostic }
+                if diagnostic.context() == "write control-plane RPC magic"
+                    && diagnostic.kind() == ErrorKind::TimedOut
         ));
         write_peer.set_nonblocking(true).unwrap();
         let mut unexpected_byte = [0_u8; 1];
@@ -28140,9 +28277,9 @@ mod tests {
         let read_error = read_control_plane_rpc_frame(&mut read_stream).unwrap_err();
         assert!(matches!(
             read_error,
-            ControlPlaneError::Io { context, source }
-                if context == "read control-plane RPC magic"
-                    && source.kind() == ErrorKind::TimedOut
+            ControlPlaneError::Io { diagnostic }
+                if diagnostic.context() == "read control-plane RPC magic"
+                    && diagnostic.kind() == ErrorKind::TimedOut
         ));
     }
 
@@ -28248,7 +28385,7 @@ mod tests {
 
         server.join().unwrap();
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
             if message.contains("control-plane auth envelope")),
             "unexpected error: {error}"
         );
@@ -28294,7 +28431,7 @@ mod tests {
 
         server.join().unwrap();
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
             if message.contains("WrongTarget")),
             "unexpected error: {error}"
         );
@@ -28322,9 +28459,9 @@ mod tests {
                 response_signer.principal().clone(),
                 ControlPlaneAuthOperation::RuntimeMapResponse,
                 2_000,
-                encode_control_plane_rpc_response(Err(ControlPlaneError::RpcRemote {
-                    message: "synthetic signed runtime-map error".to_owned(),
-                }))
+                encode_control_plane_rpc_response(Err(ControlPlaneError::rpc_remote(
+                    "synthetic signed runtime-map error".to_owned(),
+                )))
                 .unwrap(),
             )
             .unwrap();
@@ -28341,7 +28478,7 @@ mod tests {
 
         server.join().unwrap();
         assert!(
-            matches!(error, ControlPlaneError::RpcRemote { ref message }
+            matches!(error, ControlPlaneError::RpcRemote { diagnostic: ref message }
             if message.contains("synthetic signed runtime-map error")),
             "unexpected error: {error}"
         );
@@ -28356,7 +28493,7 @@ mod tests {
             .expect_err("admin credentials must not derive runtime-map response credentials");
 
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
             if message.contains("requires a frontend scoped credential")),
             "unexpected error: {error}"
         );
@@ -28390,7 +28527,7 @@ mod tests {
             .admin_control_plane_response_credential_for_admin()
             .expect_err("frontend credentials must not derive admin response credentials");
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
             if message.contains("requires an admin scoped credential")),
             "unexpected error: {error}"
         );
@@ -28466,7 +28603,7 @@ mod tests {
             .err()
             .expect("mandatory-auth endpoints must reject unsigned runtime-map reads");
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
                 if message.contains("requires authenticated requests")),
             "unexpected error: {error}"
         );
@@ -28528,7 +28665,7 @@ mod tests {
         )
         .expect_err("duplicate storage-node credential identity should reject");
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
             if message.contains("repeats credential identity")),
             "unexpected error: {error}"
         );
@@ -28557,7 +28694,7 @@ mod tests {
             ])
             .expect_err("duplicate frontend credential identity should reject");
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
             if message.contains("repeats credential identity")),
             "unexpected error: {error}"
         );
@@ -28570,7 +28707,7 @@ mod tests {
             ])
             .expect_err("duplicate admin credential identity should reject");
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
             if message.contains("repeats credential identity")),
             "unexpected error: {error}"
         );
@@ -28604,7 +28741,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("source is not a frontend")),
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message } if message.contains("source is not a frontend")),
             "unexpected error: {error}"
         );
         assert_eq!(authority.snapshot(), &before);
@@ -28650,7 +28787,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("did not match outer kind")),
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message } if message.contains("did not match outer kind")),
             "unexpected error: {error}"
         );
         assert_eq!(authority.snapshot(), &before);
@@ -28950,8 +29087,10 @@ mod tests {
             )
             .and_then(decode_control_plane_rpc_response)
             .unwrap_err();
-        assert!(matches!(error, ControlPlaneError::RpcRemote { ref message }
-            if message.contains("generation changed")));
+        assert!(
+            matches!(error, ControlPlaneError::RpcRemote { diagnostic: ref message }
+            if message.contains("generation changed"))
+        );
         assert!(!clock
             .status(authority.authority_clock_context().unwrap())
             .established());
@@ -28988,10 +29127,10 @@ mod tests {
             ControlPlaneAuthorityClockAdminSample::new(1_001, 1_001, None),
             |_, _| {
                 checkpoint_callback_invoked.set(true);
-                Err(ControlPlaneError::Io {
-                    context: "unexpected status checkpoint callback",
-                    source: std::io::Error::other("status must not persist a checkpoint"),
-                })
+                Err(ControlPlaneError::io(
+                    "unexpected status checkpoint callback",
+                    std::io::Error::other("status must not persist a checkpoint"),
+                ))
             },
             || {
                 assert!(
@@ -29049,10 +29188,10 @@ mod tests {
             ControlPlaneAuthorityClockAdminSample::new(1_001, 1_001, Some(51)),
             |_, _| {
                 checkpoint_callback_invoked.set(true);
-                Err(ControlPlaneError::Io {
-                    context: "unexpected status checkpoint callback",
-                    source: std::io::Error::other("status must not persist a checkpoint"),
-                })
+                Err(ControlPlaneError::io(
+                    "unexpected status checkpoint callback",
+                    std::io::Error::other("status must not persist a checkpoint"),
+                ))
             },
             || Ok(1_001),
         )
@@ -29179,7 +29318,7 @@ mod tests {
                 |_, _| Ok(()),
                 || Ok(1_000),
             ),
-            Err(ControlPlaneError::RpcProtocol { ref message })
+            Err(ControlPlaneError::RpcProtocol { diagnostic: ref message })
                 if message.contains("requires configured admin authentication")
         ));
     }
@@ -29637,12 +29776,12 @@ mod tests {
 
         assert!(matches!(
             status_error,
-            ControlPlaneError::RpcRemote { ref message }
+            ControlPlaneError::RpcRemote { diagnostic: ref message }
                 if message.contains("authority-clock admin operation deadline expired")
         ));
         assert!(matches!(
             mutation_error,
-            ControlPlaneError::RpcRemote { ref message }
+            ControlPlaneError::RpcRemote { diagnostic: ref message }
                 if message.contains("authority-clock admin operation deadline expired")
         ));
     }
@@ -30171,8 +30310,8 @@ mod tests {
         let snapshot = server.join().unwrap();
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
-                if message == "PG-specific runtime map response omitted requested PG 7"
+            ControlPlaneError::RpcProtocol { diagnostic: message }
+                if message.as_str() == "PG-specific runtime map response omitted requested PG 7"
         ));
         assert_eq!(snapshot.cluster_epoch(), previous_epoch);
         assert!(snapshot.pg(pg_id).is_none());
@@ -30870,7 +31009,7 @@ mod tests {
 
         server.join().unwrap();
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
             if message.contains("control-plane auth envelope")),
             "unexpected error: {error}"
         );
@@ -30911,11 +31050,11 @@ mod tests {
                 payload,
                 CONTROL_PLANE_RPC_IO_TIMEOUT,
                 || {
-                    timestamps
-                        .next()
-                        .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                            message: "test admin response clock exhausted".to_owned(),
-                        })
+                    timestamps.next().ok_or_else(|| {
+                        ControlPlaneError::rpc_protocol(
+                            "test admin response clock exhausted".to_owned(),
+                        )
+                    })
                 },
             )
             .unwrap();
@@ -31130,10 +31269,9 @@ mod tests {
 
     impl RecordingRaftAdminAuthority {
         fn unsupported_snapshot_command() -> Result<ClusterControlSnapshot, ControlPlaneError> {
-            Err(ControlPlaneError::RpcRemote {
-                message: "recording Raft admin authority only supports Raft admin triggers"
-                    .to_owned(),
-            })
+            Err(ControlPlaneError::rpc_remote(
+                "recording Raft admin authority only supports Raft admin triggers".to_owned(),
+            ))
         }
     }
 
@@ -31157,10 +31295,9 @@ mod tests {
             &mut self,
             _pg_id: PgId,
         ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError> {
-            Err(ControlPlaneError::RpcRemote {
-                message: "recording Raft admin authority only supports Raft admin triggers"
-                    .to_owned(),
-            })
+            Err(ControlPlaneError::rpc_remote(
+                "recording Raft admin authority only supports Raft admin triggers".to_owned(),
+            ))
         }
 
         fn set_pg_acting_set_with_metadata_transfer(
@@ -31194,9 +31331,9 @@ mod tests {
             _heartbeat: NodeHeartbeat,
             _authority_now_ms: u64,
         ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
-            Err(ControlPlaneError::RpcRemote {
-                message: "recording Raft admin authority does not support heartbeats".to_owned(),
-            })
+            Err(ControlPlaneError::rpc_remote(
+                "recording Raft admin authority does not support heartbeats".to_owned(),
+            ))
         }
     }
 
@@ -31205,9 +31342,9 @@ mod tests {
             &self,
             _authority_now_ms: u64,
         ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-            Err(ControlPlaneError::RpcRemote {
-                message: "recording Raft admin authority does not support runtime maps".to_owned(),
-            })
+            Err(ControlPlaneError::rpc_remote(
+                "recording Raft admin authority does not support runtime maps".to_owned(),
+            ))
         }
 
         fn runtime_map_status(
@@ -31633,7 +31770,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("source is not an admin")),
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message } if message.contains("source is not an admin")),
             "unexpected error: {error}"
         );
         assert_eq!(authority.snapshot(), &before);
@@ -31696,8 +31833,10 @@ mod tests {
                     pg_observations: Vec::new(),
                 },
                 || {
-                    clock.next().ok_or_else(|| ControlPlaneError::RpcProtocol {
-                        message: "test heartbeat auth clock exhausted".to_owned(),
+                    clock.next().ok_or_else(|| {
+                        ControlPlaneError::rpc_protocol(
+                            "test heartbeat auth clock exhausted".to_owned(),
+                        )
                     })
                 },
             )
@@ -31955,11 +32094,9 @@ mod tests {
                     pg_observations: Vec::new(),
                 },
                 || {
-                    timestamps
-                        .next()
-                        .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                            message: "test heartbeat clock exhausted".to_owned(),
-                        })
+                    timestamps.next().ok_or_else(|| {
+                        ControlPlaneError::rpc_protocol("test heartbeat clock exhausted".to_owned())
+                    })
                 },
             )
             .unwrap();
@@ -32005,7 +32142,7 @@ mod tests {
 
         server.join().unwrap();
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
             if message.contains("control-plane auth envelope")),
             "unexpected error: {error}"
         );
@@ -32044,7 +32181,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("auth magic")),
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message } if message.contains("auth magic")),
             "unexpected error: {error}"
         );
         let metrics = verifier.metrics_snapshot();
@@ -32210,7 +32347,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("authenticated RPC kind")),
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message } if message.contains("authenticated RPC kind")),
             "unexpected error: {error}"
         );
         let metrics = verifier.metrics_snapshot();
@@ -32266,7 +32403,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("WrongSource")),
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message } if message.contains("WrongSource")),
             "unexpected error: {error}"
         );
         let metrics = verifier.metrics_snapshot();
@@ -32321,7 +32458,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
                 if message.contains("ReplayFreshnessFailure")
                     && message.contains("issued_at_ms=None")
                     && message.contains("expires_at_ms=None")
@@ -32381,7 +32518,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
                 if message.contains("ReplayFreshnessFailure")
                     && message.contains("issued_at_ms=Some(1999)")
                     && message.contains("expires_at_ms=Some(12000)")
@@ -33051,8 +33188,8 @@ mod tests {
         let snapshot = server.join().unwrap();
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
-                if message == "PG-specific runtime map response omitted requested PG 7"
+            ControlPlaneError::RpcProtocol { diagnostic: message }
+                if message.as_str() == "PG-specific runtime map response omitted requested PG 7"
         ));
         assert_eq!(snapshot.cluster_epoch(), previous_epoch);
         assert!(snapshot.pg(pg_id).is_none());
@@ -34564,7 +34701,7 @@ mod tests {
         assert!(
             matches!(
                 &malformed_error,
-                ControlPlaneError::RpcProtocol { message }
+                ControlPlaneError::RpcProtocol { diagnostic: message }
                     if message.contains("future durable backfill epoch")
             ),
             "unexpected malformed diagnostics error: {malformed_error}"
@@ -34630,24 +34767,24 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("checksum mismatch")
         ));
     }
 
     #[test]
-    fn control_plane_rpc_rejects_version_eight_fixture() {
+    fn control_plane_rpc_rejects_previous_version_fixture() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         writer.write_all(CONTROL_PLANE_RPC_MAGIC).unwrap();
-        write_u16_to_stream(&mut writer, 8);
+        write_u16_to_stream(&mut writer, 9);
         writer.write_all(&[0; 14]).unwrap();
 
         let error = read_control_plane_unix_request(&mut reader).unwrap_err();
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
-                if message == "unsupported control-plane RPC version 8"
+            ControlPlaneError::RpcProtocol { diagnostic: message }
+                if message.as_str() == "unsupported control-plane RPC version 9"
         ));
     }
 
@@ -34674,7 +34811,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("checksum mismatch")
         ));
     }
@@ -34702,7 +34839,7 @@ mod tests {
         server.join().unwrap();
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("checksum mismatch")
         ));
     }
@@ -34723,7 +34860,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("PG observations count")
         ));
     }
@@ -34779,7 +34916,7 @@ mod tests {
         let error = read_node_heartbeat(&mut reader).unwrap_err();
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("cluster-map history route references count")
         ));
     }
@@ -34811,7 +34948,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("invalid pending metadata command presence code 2")
         ));
     }
@@ -34829,7 +34966,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("runtime nodes count")
         ));
     }
@@ -34848,7 +34985,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("PG routes count")
         ));
     }
@@ -34875,7 +35012,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("PG route acting set count")
         ));
     }
@@ -34892,7 +35029,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("invalid runtime map freshness proof tag 99")
         ));
     }
@@ -34913,7 +35050,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("runtime map freshness proof authority incarnation must be nonzero")
         ));
     }
@@ -34933,7 +35070,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("runtime map freshness proof read-index index must be nonzero")
         ));
     }
@@ -34953,7 +35090,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("runtime map freshness proof read-index term must be nonzero")
         ));
     }
@@ -34966,7 +35103,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("runtime map contains duplicate node 1")
         ));
     }
@@ -34979,7 +35116,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("runtime map route for PG 7 references unknown acting-set node 99")
         ));
     }
@@ -34992,7 +35129,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("runtime map contains duplicate route for PG 7")
         ));
     }
@@ -35041,7 +35178,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("runtime map route for PG 7 has incomplete metadata transfer source route")
         ));
     }
@@ -35056,7 +35193,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("runtime map historical route for PG 7 has epoch")
                     && message.contains("expected an epoch older than")
         ));
@@ -35072,7 +35209,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("runtime map historical route for PG 7 has epoch")
                     && message.contains("expected an epoch older than")
         ));
@@ -35098,7 +35235,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("runtime map route for PG 7 references unknown metadata transfer source node 99")
         ));
     }
@@ -35110,7 +35247,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("runtime map route for PG 7 references missing metadata transfer source route epoch")
         ));
     }
@@ -35131,7 +35268,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("metadata transfer source node 1 does not match source route primary 2")
         ));
     }
@@ -35147,7 +35284,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("metadata transfer source route epoch")
                     && message.contains("must be older than transfer route epoch")
         ));
@@ -35171,7 +35308,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("metadata transfer source route epoch")
                     && message.contains("must be older than transfer route epoch")
         ));
@@ -35197,8 +35334,8 @@ mod tests {
 
         assert!(matches!(
             decode_runtime_map_test_snapshot(snapshot),
-            Err(ControlPlaneError::RpcProtocol { message })
-                if message == "runtime map historical epochs are not strictly increasing"
+            Err(ControlPlaneError::RpcProtocol { diagnostic: message })
+                if message.as_str() == "runtime map historical epochs are not strictly increasing"
         ));
     }
 
@@ -35397,7 +35534,7 @@ mod tests {
         let mut reader = PayloadReader::new(&unbounded);
         assert!(matches!(
             read_runtime_map_status(&mut reader),
-            Err(ControlPlaneError::RpcProtocol { message })
+            Err(ControlPlaneError::RpcProtocol { diagnostic: message })
                 if message.contains("reserved unbounded sentinel")
         ));
 
@@ -35417,7 +35554,7 @@ mod tests {
         let mut reader = PayloadReader::new(&reconstructed);
         assert!(matches!(
             read_runtime_map_status(&mut reader),
-            Err(ControlPlaneError::RpcProtocol { message })
+            Err(ControlPlaneError::RpcProtocol { diagnostic: message })
                 if message.contains("serving-authority freshness proof")
         ));
     }
@@ -35565,7 +35702,7 @@ mod tests {
         let mut reader = PayloadReader::new(&payload);
         assert!(matches!(
             read_runtime_map_snapshot(&mut reader),
-            Err(ControlPlaneError::RpcProtocol { message })
+            Err(ControlPlaneError::RpcProtocol { diagnostic: message })
                 if message.contains("reserved unbounded sentinel")
         ));
     }
@@ -35584,7 +35721,7 @@ mod tests {
         let mut reader = PayloadReader::new(&payload);
         assert!(matches!(
             read_runtime_map_snapshot(&mut reader),
-            Err(ControlPlaneError::RpcProtocol { message })
+            Err(ControlPlaneError::RpcProtocol { diagnostic: message })
                 if message.contains("validity must be bounded")
         ));
     }
@@ -37730,10 +37867,10 @@ mod tests {
         let error = create_control_plane_directory_all_durable_with(&second, |_| {
             sync_attempts += 1;
             if sync_attempts == 2 {
-                Err(ControlPlaneError::Io {
-                    context: "injected control-plane state parent sync",
-                    source: std::io::Error::other("injected parent sync failure"),
-                })
+                Err(ControlPlaneError::io(
+                    "injected control-plane state parent sync",
+                    std::io::Error::other("injected parent sync failure"),
+                ))
             } else {
                 Ok(())
             }
@@ -37742,10 +37879,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::Io {
-                context: "injected control-plane state parent sync",
-                ..
-            }
+            ControlPlaneError::Io { diagnostic } if diagnostic.context() == "injected control-plane state parent sync"
         ));
         assert!(first.is_dir());
         assert!(
@@ -37943,10 +38077,7 @@ mod tests {
         );
         assert!(matches!(
             checkpoint_error,
-            ControlPlaneError::Io {
-                context: "publish prepared single-authority control-plane checkpoint",
-                ..
-            }
+            ControlPlaneError::Io { diagnostic } if diagnostic.context() == "publish prepared single-authority control-plane checkpoint"
         ));
         assert!(matches!(
             command_error,
@@ -38182,10 +38313,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::Io {
-                context: "publish prepared single-authority control-plane checkpoint",
-                ..
-            }
+            ControlPlaneError::Io { diagnostic } if diagnostic.context() == "publish prepared single-authority control-plane checkpoint"
         ));
         assert!(single_authority_snapshot_tmp_path(&path).exists());
         drop(authority);
@@ -38224,10 +38352,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::Io {
-                context: "sync single-authority control-plane journal directory",
-                ..
-            }
+            ControlPlaneError::Io { diagnostic } if diagnostic.context() == "sync single-authority control-plane journal directory"
         ));
         assert!(single_authority_snapshot_tmp_path(&path).exists());
         drop(authority);
@@ -38254,10 +38379,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::Io {
-                context: "initialize single-authority control-plane checkpoint",
-                ..
-            }
+            ControlPlaneError::Io { diagnostic } if diagnostic.context() == "initialize single-authority control-plane checkpoint"
         ));
         assert!(single_authority_identity_path(&path).exists());
         assert!(!path.exists());
@@ -38278,10 +38400,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::Io {
-                context: "anchor prepared single-authority control-plane checkpoint",
-                ..
-            }
+            ControlPlaneError::Io { diagnostic } if diagnostic.context() == "anchor prepared single-authority control-plane checkpoint"
         ));
         assert!(single_authority_snapshot_tmp_path(&path).exists());
         assert!(!store.journal_path().exists());
@@ -38378,10 +38497,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::Io {
-                context: "publish prepared single-authority control-plane checkpoint",
-                ..
-            }
+            ControlPlaneError::Io { diagnostic } if diagnostic.context() == "publish prepared single-authority control-plane checkpoint"
         ));
         assert!(!path.exists());
         assert!(single_authority_snapshot_tmp_path(&path).exists());
@@ -38408,10 +38524,7 @@ mod tests {
         let error = SingleAuthorityControlPlane::open(failing_store).unwrap_err();
         assert!(matches!(
             error,
-            ControlPlaneError::Io {
-                context: "publish prepared single-authority control-plane checkpoint",
-                ..
-            }
+            ControlPlaneError::Io { diagnostic } if diagnostic.context() == "publish prepared single-authority control-plane checkpoint"
         ));
 
         let restarted =
@@ -43879,13 +43992,13 @@ mod tests {
                     })
                     .is_ok()
                 {
-                    return Err(ControlPlaneError::Io {
-                        context: "sentinel runtime-map read",
-                        source: std::io::Error::new(
+                    return Err(ControlPlaneError::io(
+                        "sentinel runtime-map read",
+                        std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
                             "sentinel-bucket/sentinel-object/sentinel-upload-id",
                         ),
-                    });
+                    ));
                 }
                 self.snapshot.runtime_map(authority_now_ms)
             }
@@ -50376,10 +50489,8 @@ mod tests {
         restarted.store.fail_saves();
         assert!(matches!(
             restarted.expire_heartbeat_leases(1_101),
-            Err(ControlPlaneError::Io {
-                context: "test save failure",
-                ..
-            })
+            Err(ControlPlaneError::Io { diagnostic })
+                if diagnostic.context() == "test save failure"
         ));
         assert_eq!(restarted.snapshot(), &visible_before_failure);
         assert_eq!(

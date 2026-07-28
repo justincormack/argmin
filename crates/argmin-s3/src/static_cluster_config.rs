@@ -8577,8 +8577,10 @@ tls_server_name = "control-1.internal""#,
 
         let error = parse_static_cluster_manifest(&oversized, "control-1").unwrap_err();
 
-        assert!(error.contains("static initial bootstrap is not replication-safe"));
-        assert!(error.contains("replication-safe per-entry limit"));
+        assert_eq!(
+            error,
+            "static initial bootstrap is not replication-safe: control-plane command is not accepted by the current replication policy"
+        );
     }
 
     #[test]

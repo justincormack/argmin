@@ -783,9 +783,9 @@ impl ControlPlaneRaftPeerAuthPolicy {
             }
             ControlPlaneAuthDecision::Rejected { reason } => {
                 self.metrics.record_rejected(expected_operation, reason);
-                Err(ControlPlaneError::RpcProtocol {
-                    message: format!("control-plane OpenRaft peer auth rejected: {reason:?}"),
-                })
+                Err(ControlPlaneError::rpc_protocol(format!(
+                    "control-plane OpenRaft peer auth rejected: {reason:?}"
+                )))
             }
         }
     }
@@ -809,13 +809,11 @@ impl ControlPlaneRaftPeerAuthPolicy {
         if self.local_credential.principal() == &expected {
             return Ok(());
         }
-        Err(ControlPlaneError::RpcProtocol {
-            message: format!(
-                "control-plane OpenRaft peer auth local credential {:?} cannot sign source node {}",
-                self.local_credential.principal(),
-                identity.source
-            ),
-        })
+        Err(ControlPlaneError::rpc_protocol(format!(
+            "control-plane OpenRaft peer auth local credential {:?} cannot sign source node {}",
+            self.local_credential.principal(),
+            identity.source
+        )))
     }
 }
 
@@ -828,8 +826,10 @@ fn peer_auth_replay_window_for_sign(
     let issued_at_ms = crate::clock::current_time_millis();
     let expires_at_ms = issued_at_ms
         .checked_add(CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS)
-        .ok_or_else(|| ControlPlaneError::RpcProtocol {
-            message: "control-plane OpenRaft transfer-leader auth freshness overflow".to_string(),
+        .ok_or_else(|| {
+            ControlPlaneError::rpc_protocol(
+                "control-plane OpenRaft transfer-leader auth freshness overflow".to_string(),
+            )
         })?;
     Ok((Some(issued_at_ms), Some(expires_at_ms)))
 }
@@ -1462,8 +1462,8 @@ fn raft_peer_transport_rpc_error(
 ) -> RPCError<ControlPlaneRaftTypeConfig> {
     let context = error.context;
     match *error.error {
-        ControlPlaneError::Io { source, .. } => {
-            raft_peer_io_rpc_error(transport_name, context, target, source)
+        ControlPlaneError::Io { diagnostic: source } => {
+            raft_peer_io_rpc_error(transport_name, context, target, source.into_source())
         }
         error => raft_rpc_protocol_error(context, error),
     }
@@ -1767,10 +1767,7 @@ fn exchange_unix_raft_peer_frame(
         .map_err(|source| {
             ControlPlaneRaftPeerFrameExchangeError::new(
                 raft_peer_exchange_context(exchange.context_prefix, "connect"),
-                ControlPlaneError::Io {
-                    context: "connect control-plane OpenRaft Unix peer transport",
-                    source,
-                },
+                ControlPlaneError::io("connect control-plane OpenRaft Unix peer transport", source),
             )
         })?;
     let mut stream = DeadlineUnixStream::new(
@@ -1781,10 +1778,10 @@ fn exchange_unix_raft_peer_frame(
     .map_err(|source| {
         ControlPlaneRaftPeerFrameExchangeError::new(
             raft_peer_exchange_context(exchange.context_prefix, "connect"),
-            ControlPlaneError::Io {
-                context: "configure control-plane OpenRaft Unix peer deadline I/O",
+            ControlPlaneError::io(
+                "configure control-plane OpenRaft Unix peer deadline I/O",
                 source,
-            },
+            ),
         )
     })?;
     write_control_plane_raft_peer_transport_frame(&mut stream, &exchange.request_frame).map_err(
@@ -1896,10 +1893,10 @@ fn configured_raft_peer_io_error(
 ) -> ControlPlaneRaftPeerFrameExchangeError {
     ControlPlaneRaftPeerFrameExchangeError::new(
         context,
-        ControlPlaneError::Io {
-            context: "exchange control-plane OpenRaft configured peer frame",
+        ControlPlaneError::io(
+            "exchange control-plane OpenRaft configured peer frame",
             source,
-        },
+        ),
     )
 }
 
@@ -3088,29 +3085,27 @@ fn current_serving_authority_node_id(
     let mut serving_node_id = None;
     for (directory_node_id, status) in statuses {
         if *directory_node_id != status.node_id() {
-            return Err(ControlPlaneError::RpcRemote {
-                message: format!(
-                    "raft authority directory status key {} disagrees with reported node {}",
-                    directory_node_id,
-                    status.node_id()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_remote(format!(
+                "raft authority directory status key {} disagrees with reported node {}",
+                directory_node_id,
+                status.node_id()
+            )));
         }
         if !status.linearized_authority_serving() {
             continue;
         }
         if let Some(existing_node_id) = serving_node_id {
-            return Err(ControlPlaneError::RpcRemote {
-                message: format!(
+            return Err(ControlPlaneError::rpc_remote(format!(
                     "raft authority directory found multiple serving raft authorities: {existing_node_id} and {}",
                     status.node_id()
-                ),
-            });
+                )));
         }
         serving_node_id = Some(status.node_id());
     }
-    serving_node_id.ok_or_else(|| ControlPlaneError::RpcRemote {
-        message: "raft authority directory found no serving raft authority".to_string(),
+    serving_node_id.ok_or_else(|| {
+        ControlPlaneError::rpc_remote(
+            "raft authority directory found no serving raft authority".to_string(),
+        )
     })
 }
 
@@ -3119,20 +3114,16 @@ fn validate_selected_linearized_authority_status(
     status: &ControlPlaneRaftAuthorityStatus,
 ) -> Result<(), ControlPlaneError> {
     if status.node_id() != selected_node_id {
-        return Err(ControlPlaneError::RpcRemote {
-            message: format!(
+        return Err(ControlPlaneError::rpc_remote(format!(
                 "raft linearized authority directory returned node {} for selected serving node {selected_node_id}",
                 status.node_id()
-            ),
-        });
+            )));
     }
     if !status.linearized_authority_serving() {
-        return Err(ControlPlaneError::RpcRemote {
-            message: format!(
+        return Err(ControlPlaneError::rpc_remote(format!(
                 "raft linearized authority directory selected node {selected_node_id}, but it is no longer serving: {:?}",
                 status.linearized_authority_readiness()
-            ),
-        });
+            )));
     }
     Ok(())
 }
@@ -4410,8 +4401,8 @@ fn experimental_raft_config(
             ..Default::default()
         }
         .validate()
-        .map_err(|error| ControlPlaneError::RpcRemote {
-            message: format!("OpenRaft experimental config failed: {error}"),
+        .map_err(|error| {
+            ControlPlaneError::rpc_remote(format!("OpenRaft experimental config failed: {error}"))
         })?,
     ))
 }
@@ -4434,7 +4425,7 @@ fn restore_experimental_raft_durable_artifact(
         Ok(artifact) => {
             let sentinel = ControlPlaneRaftRestartSentinel::load_durable_sentinel(&sentinel_path)
                 .map_err(|error| match error {
-                    ControlPlaneError::Io { source, .. }
+                    ControlPlaneError::Io { diagnostic: source }
                         if source.kind() == io::ErrorKind::NotFound =>
                     {
                         raft_artifact_protocol_error(format!(
@@ -4459,13 +4450,17 @@ fn restore_experimental_raft_durable_artifact(
                     validate_artifact,
                 )
             } else {
-                artifact.restore().map_err(|source| ControlPlaneError::Io {
-                    context: "restore control-plane OpenRaft durable restart artifact",
-                    source,
+                artifact.restore().map_err(|source| {
+                    ControlPlaneError::io(
+                        "restore control-plane OpenRaft durable restart artifact",
+                        source,
+                    )
                 })
             }
         }
-        Err(ControlPlaneError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+        Err(ControlPlaneError::Io { diagnostic: source })
+            if source.kind() == io::ErrorKind::NotFound =>
+        {
             match ControlPlaneRaftRestartSentinel::load_durable_sentinel(&sentinel_path) {
                 Ok(sentinel) => {
                     sentinel.validate_identity(cluster_name, node_id)?;
@@ -4477,7 +4472,7 @@ fn restore_experimental_raft_durable_artifact(
                         sentinel.local_node_id
                     )));
                 }
-                Err(ControlPlaneError::Io { source, .. })
+                Err(ControlPlaneError::Io { diagnostic: source })
                     if source.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
@@ -4493,10 +4488,10 @@ fn restore_experimental_raft_durable_artifact(
                     Ok(_) => {}
                     Err(source) if source.kind() == io::ErrorKind::NotFound => {}
                     Err(source) => {
-                        return Err(ControlPlaneError::Io {
-                            context: "stat control-plane OpenRaft WAL before empty startup",
+                        return Err(ControlPlaneError::io(
+                            "stat control-plane OpenRaft WAL before empty startup",
                             source,
-                        });
+                        ));
                     }
                 }
                 let wal = ControlPlaneRaftWalFile::new(ControlPlaneRaftWalFileConfig {
@@ -4509,9 +4504,11 @@ fn restore_experimental_raft_durable_artifact(
                     Some(Arc::new(wal)),
                 )
                 .map(|log_store| (log_store, ControlPlaneRaftStateMachine::empty()))
-                .map_err(|source| ControlPlaneError::Io {
-                    context: "restore empty WAL-backed control-plane OpenRaft log store",
-                    source,
+                .map_err(|source| {
+                    ControlPlaneError::io(
+                        "restore empty WAL-backed control-plane OpenRaft log store",
+                        source,
+                    )
                 });
             }
             Ok((
@@ -4528,9 +4525,9 @@ fn control_plane_raft_durable_purge_covers(
     target: LogIdOf<ControlPlaneRaftTypeConfig>,
 ) -> Result<bool, ControlPlaneError> {
     if let Some(reason) = &status.durability.wal_poisoned {
-        return Err(ControlPlaneError::RpcRemote {
-            message: format!("OpenRaft snapshot purge WAL durability failed: {reason}"),
-        });
+        return Err(ControlPlaneError::rpc_remote(format!(
+            "OpenRaft snapshot purge WAL durability failed: {reason}"
+        )));
     }
     let Some(purged) = status.durable_last_purged_log_id else {
         return Ok(false);
@@ -4539,11 +4536,9 @@ fn control_plane_raft_durable_purge_covers(
         std::cmp::Ordering::Less => Ok(false),
         std::cmp::Ordering::Greater => Ok(true),
         std::cmp::Ordering::Equal if purged == target => Ok(true),
-        std::cmp::Ordering::Equal => Err(ControlPlaneError::RpcRemote {
-            message: format!(
+        std::cmp::Ordering::Equal => Err(ControlPlaneError::rpc_remote(format!(
                 "OpenRaft durable snapshot purge watermark {purged} conflicts with requested log id {target} at the same index"
-            ),
-        }),
+            ))),
     }
 }
 
@@ -4876,8 +4871,10 @@ impl ControlPlaneRaftAuthority {
                 Box::pin(async move { snapshot })
             })
             .await
-            .map_err(|error| ControlPlaneError::RpcRemote {
-                message: format!("read test control-plane Raft state machine: {error}"),
+            .map_err(|error| {
+                ControlPlaneError::rpc_remote(format!(
+                    "read test control-plane Raft state machine: {error}"
+                ))
             })
     }
 
@@ -4889,12 +4886,14 @@ impl ControlPlaneRaftAuthority {
         let status = self.status().await?;
         let term = status
             .current_term()
-            .ok_or_else(|| ControlPlaneError::RpcRemote {
-                message: "test control-plane Raft authority has no current term".to_owned(),
+            .ok_or_else(|| {
+                ControlPlaneError::rpc_remote(
+                    "test control-plane Raft authority has no current term".to_owned(),
+                )
             })?
             .checked_add(1)
-            .ok_or_else(|| ControlPlaneError::RpcRemote {
-                message: "test control-plane Raft term overflow".to_owned(),
+            .ok_or_else(|| {
+                ControlPlaneError::rpc_remote("test control-plane Raft term overflow".to_owned())
             })?;
         self.raft
             .vote(VoteRequest {
@@ -4904,20 +4903,20 @@ impl ControlPlaneRaftAuthority {
             })
             .await
             .map(|response| response.vote_granted)
-            .map_err(|error| ControlPlaneError::RpcRemote {
-                message: format!("force test control-plane Raft step-down: {error}"),
+            .map_err(|error| {
+                ControlPlaneError::rpc_remote(format!(
+                    "force test control-plane Raft step-down: {error}"
+                ))
             })
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub async fn trigger_local_election_for_test(&self) -> Result<(), ControlPlaneError> {
-        self.raft
-            .trigger()
-            .elect(false)
-            .await
-            .map_err(|error| ControlPlaneError::RpcRemote {
-                message: format!("trigger test control-plane Raft election: {error}"),
-            })
+        self.raft.trigger().elect(false).await.map_err(|error| {
+            ControlPlaneError::rpc_remote(format!(
+                "trigger test control-plane Raft election: {error}"
+            ))
+        })
     }
 
     #[must_use]
@@ -4935,20 +4934,20 @@ impl ControlPlaneRaftAuthority {
     pub fn durable_wal_monitor_snapshot(
         &self,
     ) -> Result<ControlPlaneRaftWalMonitorSnapshot, ControlPlaneError> {
-        let log_store = self
-            .log_store
-            .as_ref()
-            .ok_or_else(|| ControlPlaneError::RpcRemote {
-                message: "OpenRaft WAL monitor requires a retained log store".to_string(),
-            })?;
+        let log_store = self.log_store.as_ref().ok_or_else(|| {
+            ControlPlaneError::rpc_remote(
+                "OpenRaft WAL monitor requires a retained log store".to_string(),
+            )
+        })?;
         log_store
             .wal_monitor_snapshot()
-            .map_err(|source| ControlPlaneError::Io {
-                context: "read control-plane OpenRaft WAL monitor snapshot",
-                source,
+            .map_err(|source| {
+                ControlPlaneError::io("read control-plane OpenRaft WAL monitor snapshot", source)
             })?
-            .ok_or_else(|| ControlPlaneError::RpcRemote {
-                message: "OpenRaft WAL monitor requires a WAL-backed log store".to_string(),
+            .ok_or_else(|| {
+                ControlPlaneError::rpc_remote(
+                    "OpenRaft WAL monitor requires a WAL-backed log store".to_string(),
+                )
             })
     }
 
@@ -5033,12 +5032,10 @@ impl ControlPlaneRaftAuthority {
         operation: &'static str,
     ) -> Result<(), ControlPlaneError> {
         if let Some(peer_policy) = &self.static_peer_policy {
-            return Err(ControlPlaneError::RpcRemote {
-                message: format!(
+            return Err(ControlPlaneError::rpc_remote(format!(
                     "OpenRaft {operation} is not supported for static configured peer policy in cluster {:?}; dynamic control-plane membership reconfiguration is outside Phase 12.3",
                     peer_policy.cluster_name()
-                ),
-            });
+                )));
         }
         Ok(())
     }
@@ -5073,11 +5070,11 @@ impl ControlPlaneRaftAuthority {
             }
         })
         .await
-        .map_err(|_| ControlPlaneError::RpcRemote {
-            message: format!(
+        .map_err(|_| {
+            ControlPlaneError::rpc_remote(format!(
                 "OpenRaft election trigger did not make node {} serving before timeout",
                 self.node_id
-            ),
+            ))
         })?
     }
 
@@ -5086,13 +5083,11 @@ impl ControlPlaneRaftAuthority {
     ) -> Result<Option<LogIdOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
         let status = self.status().await?;
         if !status.linearized_authority_serving() {
-            return Err(ControlPlaneError::RpcRemote {
-                message: format!(
-                    "OpenRaft snapshot purge requires the current serving authority; node {} is {:?}",
-                    status.node_id(),
-                    status.linearized_authority_readiness()
-                ),
-            });
+            return Err(ControlPlaneError::rpc_remote(format!(
+                "OpenRaft snapshot purge requires the current serving authority; node {} is {:?}",
+                status.node_id(),
+                status.linearized_authority_readiness()
+            )));
         }
         self.trigger_local_snapshot_applied().await
     }
@@ -5126,17 +5121,16 @@ impl ControlPlaneRaftAuthority {
             .get_snapshot()
             .await
             .map_err(|error| openraft_remote_error("get snapshot after trigger", error))?
-            .ok_or_else(|| ControlPlaneError::RpcRemote {
-                message: "OpenRaft snapshot trigger completed without a current snapshot"
-                    .to_string(),
+            .ok_or_else(|| {
+                ControlPlaneError::rpc_remote(
+                    "OpenRaft snapshot trigger completed without a current snapshot".to_string(),
+                )
             })?;
-        let snapshot_log_id =
-            snapshot
-                .meta
-                .last_log_id
-                .ok_or_else(|| ControlPlaneError::RpcRemote {
-                    message: "OpenRaft snapshot trigger produced an empty snapshot".to_string(),
-                })?;
+        let snapshot_log_id = snapshot.meta.last_log_id.ok_or_else(|| {
+            ControlPlaneError::rpc_remote(
+                "OpenRaft snapshot trigger produced an empty snapshot".to_string(),
+            )
+        })?;
         Ok(Some(snapshot_log_id))
     }
 
@@ -5149,16 +5143,16 @@ impl ControlPlaneRaftAuthority {
             .get_snapshot()
             .await
             .map_err(|error| openraft_remote_error("get snapshot before purge", error))?
-            .ok_or_else(|| ControlPlaneError::RpcRemote {
-                message: "OpenRaft snapshot purge requires a current snapshot".to_string(),
+            .ok_or_else(|| {
+                ControlPlaneError::rpc_remote(
+                    "OpenRaft snapshot purge requires a current snapshot".to_string(),
+                )
             })?;
         if snapshot.meta.last_log_id != Some(snapshot_log_id) {
-            return Err(ControlPlaneError::RpcRemote {
-                message: format!(
+            return Err(ControlPlaneError::rpc_remote(format!(
                     "OpenRaft snapshot purge log id {snapshot_log_id} does not match current snapshot {:?}",
                     snapshot.meta.last_log_id
-                ),
-            });
+                )));
         }
         self.raft
             .trigger()
@@ -5188,11 +5182,9 @@ impl ControlPlaneRaftAuthority {
                 }
             })
             .await
-            .map_err(|_| ControlPlaneError::RpcRemote {
-                message: format!(
+            .map_err(|_| ControlPlaneError::rpc_remote(format!(
                     "OpenRaft snapshot purge did not durably reach {snapshot_log_id:?} before timeout"
-                ),
-            })??;
+                )))??;
         }
         Ok(())
     }
@@ -5235,20 +5227,20 @@ impl ControlPlaneRaftAuthority {
                         if applied == log_id {
                             return Ok(());
                         }
-                        return Err(ControlPlaneError::RpcRemote {
-                            message: format!(
-                                "OpenRaft wait-applied-log-id observed mismatched log id: \
+                        return Err(ControlPlaneError::rpc_remote(format!(
+                            "OpenRaft wait-applied-log-id observed mismatched log id: \
                                  applied={applied:?}, expected={log_id:?}: {message}"
-                            ),
-                        });
+                        )));
                     }
                 }
                 ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .map_err(|_| ControlPlaneError::RpcRemote {
-            message: format!("OpenRaft wait-applied-log-id timed out after {timeout:?}: {message}"),
+        .map_err(|_| {
+            ControlPlaneError::rpc_remote(format!(
+                "OpenRaft wait-applied-log-id timed out after {timeout:?}: {message}"
+            ))
         })?
     }
 
@@ -5495,10 +5487,9 @@ impl ControlPlaneRaftAuthority {
             || current_status.current_term() != Some(authority_term)
             || current_status.applied() != Some(base_applied)
         {
-            return Err(ControlPlaneError::RpcRemote {
-                message: "OpenRaft authority changed while publishing volatile heartbeat"
-                    .to_string(),
-            });
+            return Err(ControlPlaneError::rpc_remote(
+                "OpenRaft authority changed while publishing volatile heartbeat".to_string(),
+            ));
         }
         *self.lock_volatile_heartbeat_overlay()? = Some(ControlPlaneRaftVolatileHeartbeatOverlay {
             authority_term,
@@ -5580,10 +5571,9 @@ impl ControlPlaneRaftAuthority {
         issued_at_ms: u64,
     ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
         let cached_certificate = *self.runtime_map_content_certificate.lock().map_err(|_| {
-            ControlPlaneError::RpcProtocol {
-                message: "control-plane OpenRaft runtime-map content certificate lock poisoned"
-                    .to_owned(),
-            }
+            ControlPlaneError::rpc_protocol(
+                "control-plane OpenRaft runtime-map content certificate lock poisoned".to_owned(),
+            )
         })?;
         let (durable_status, base_applied, certificate) =
             control_plane_runtime_map_status_via_openraft_read_index(
@@ -5594,10 +5584,10 @@ impl ControlPlaneRaftAuthority {
             .await?;
         if cached_certificate != Some((base_applied, certificate)) {
             *self.runtime_map_content_certificate.lock().map_err(|_| {
-                ControlPlaneError::RpcProtocol {
-                    message: "control-plane OpenRaft runtime-map content certificate lock poisoned"
+                ControlPlaneError::rpc_protocol(
+                    "control-plane OpenRaft runtime-map content certificate lock poisoned"
                         .to_owned(),
-                }
+                )
             })? = Some((base_applied, certificate));
         }
 
@@ -5620,10 +5610,11 @@ impl ControlPlaneRaftAuthority {
         let overlay_certificate = self
             .runtime_map_overlay_content_certificate
             .lock()
-            .map_err(|_| ControlPlaneError::RpcProtocol {
-                message:
+            .map_err(|_| {
+                ControlPlaneError::rpc_protocol(
                     "control-plane OpenRaft overlay runtime-map content certificate lock poisoned"
                         .to_owned(),
+                )
             })?
             .as_ref()
             .filter(|(term, applied, _)| *term == authority_term && *applied == base_applied)
@@ -5659,10 +5650,11 @@ impl ControlPlaneRaftAuthority {
         *self
             .runtime_map_overlay_content_certificate
             .lock()
-            .map_err(|_| ControlPlaneError::RpcProtocol {
-                message:
+            .map_err(|_| {
+                ControlPlaneError::rpc_protocol(
                     "control-plane OpenRaft overlay runtime-map content certificate lock poisoned"
                         .to_owned(),
+                )
             })? = Some((authority_term, base_applied, overlay_certificate));
         Ok(status)
     }
@@ -5764,11 +5756,11 @@ impl ControlPlaneRaftAuthority {
         &self,
     ) -> Result<MutexGuard<'_, Option<ControlPlaneRaftVolatileHeartbeatOverlay>>, ControlPlaneError>
     {
-        self.volatile_heartbeat_overlay
-            .lock()
-            .map_err(|_| ControlPlaneError::RpcRemote {
-                message: "OpenRaft volatile heartbeat overlay mutex poisoned".to_string(),
-            })
+        self.volatile_heartbeat_overlay.lock().map_err(|_| {
+            ControlPlaneError::rpc_remote(
+                "OpenRaft volatile heartbeat overlay mutex poisoned".to_string(),
+            )
+        })
     }
 
     pub async fn store_durable_restart_artifact(&self) -> Result<Option<u64>, ControlPlaneError> {
@@ -5789,8 +5781,10 @@ impl ControlPlaneRaftAuthority {
             )
         })
         .await
-        .map_err(|error| ControlPlaneError::RpcRemote {
-            message: format!("OpenRaft checkpoint persistence worker failed: {error}"),
+        .map_err(|error| {
+            ControlPlaneError::rpc_remote(format!(
+                "OpenRaft checkpoint persistence worker failed: {error}"
+            ))
         })?
     }
 
@@ -5822,9 +5816,7 @@ impl ControlPlaneRaftAuthority {
         self.durable_artifact_path
             .as_ref()
             .cloned()
-            .ok_or_else(|| ControlPlaneError::RpcRemote {
-                message: "OpenRaft durable checkpoint requested for an authority without configured durable state".to_owned(),
-            })
+            .ok_or_else(|| ControlPlaneError::rpc_remote("OpenRaft durable checkpoint requested for an authority without configured durable state".to_owned()))
     }
 
     fn persist_durable_restart_checkpoint_inner(
@@ -5836,39 +5828,37 @@ impl ControlPlaneRaftAuthority {
         path: &Path,
     ) -> Result<Option<u64>, ControlPlaneError> {
         if !Arc::ptr_eq(&checkpoint.authority_instance, checkpoint_instance) {
-            return Err(ControlPlaneError::RpcRemote {
-                message:
-                    "captured OpenRaft restart checkpoint belongs to another authority instance"
-                        .to_string(),
-            });
+            return Err(ControlPlaneError::rpc_remote(
+                "captured OpenRaft restart checkpoint belongs to another authority instance"
+                    .to_string(),
+            ));
         }
         let position = ControlPlaneRaftCheckpointPosition::for_artifact(&checkpoint.artifact);
-        let mut last_publication =
-            checkpoint_publication
-                .lock()
-                .map_err(|_| ControlPlaneError::RpcRemote {
-                    message: "OpenRaft checkpoint publication mutex poisoned".to_string(),
-                })?;
+        let mut last_publication = checkpoint_publication.lock().map_err(|_| {
+            ControlPlaneError::rpc_remote(
+                "OpenRaft checkpoint publication mutex poisoned".to_string(),
+            )
+        })?;
         if let Some(previous) = *last_publication {
             position.validate_at_or_after(previous)?;
         }
         if let Some(wal_status) = log_store
             .map(ControlPlaneRaftLogStore::wal_monitor_snapshot)
             .transpose()
-            .map_err(|source| ControlPlaneError::Io {
-                context: "validate captured OpenRaft checkpoint against current WAL",
-                source,
+            .map_err(|source| {
+                ControlPlaneError::io(
+                    "validate captured OpenRaft checkpoint against current WAL",
+                    source,
+                )
             })?
             .flatten()
         {
             if position.wal_replay_offset < wal_status.offsets().base_offset() {
-                return Err(ControlPlaneError::RpcRemote {
-                    message: format!(
+                return Err(ControlPlaneError::rpc_remote(format!(
                         "captured OpenRaft restart checkpoint WAL offset {} precedes the current WAL base offset {}",
                         position.wal_replay_offset,
                         wal_status.offsets().base_offset()
-                    ),
-                });
+                    )));
             }
         }
 
@@ -5895,9 +5885,11 @@ impl ControlPlaneRaftAuthority {
                 result.is_ok(),
             );
             checkpoint_metrics.record_compaction(compact_elapsed, result.is_ok());
-            result.map_err(|source| ControlPlaneError::Io {
-                context: "compact control-plane OpenRaft WAL after durable checkpoint",
-                source,
+            result.map_err(|source| {
+                ControlPlaneError::io(
+                    "compact control-plane OpenRaft WAL after durable checkpoint",
+                    source,
+                )
             })?;
         }
         Ok(committed_timestamp_high_water_ms)
@@ -5906,15 +5898,12 @@ impl ControlPlaneRaftAuthority {
     async fn capture_durable_restart_artifact(
         &self,
     ) -> Result<ControlPlaneRaftRestartArtifact, ControlPlaneError> {
-        let log_store =
-            self.log_store
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| ControlPlaneError::RpcRemote {
-                    message:
-                        "OpenRaft durable restart artifact requested without retained log store"
-                            .to_string(),
-                })?;
+        let log_store = self.log_store.as_ref().cloned().ok_or_else(|| {
+            ControlPlaneError::rpc_remote(
+                "OpenRaft durable restart artifact requested without retained log store"
+                    .to_string(),
+            )
+        })?;
 
         let capture_started = Instant::now();
         let capture_deadline = capture_started
@@ -5930,13 +5919,10 @@ impl ControlPlaneRaftAuthority {
                 let validation_error = last_validation_error.expect(
                     "a denied OpenRaft restart capture retry must follow a validation failure",
                 );
-                return Err(ControlPlaneError::Io {
-                    context: "capture consistent control-plane OpenRaft durable restart artifact",
-                    source: raft_log_store_error(format!(
+                return Err(ControlPlaneError::io("capture consistent control-plane OpenRaft durable restart artifact", raft_log_store_error(format!(
                         "control-plane OpenRaft restart artifact capture exhausted its {:?} retry budget after {attempts} attempts and {elapsed:?}: {validation_error}",
                         CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_BUDGET
-                    )),
-                });
+                    ))));
             }
             attempts = attempts.saturating_add(1);
             // Capture the state machine first. If Raft advances concurrently,
@@ -5950,9 +5936,11 @@ impl ControlPlaneRaftAuthority {
                 .await?;
             let (log_store_artifact, wal_replay_offset) = log_store
                 .export_restart_artifact_with_wal_replay_offset()
-                .map_err(|source| ControlPlaneError::Io {
-                    context: "export control-plane OpenRaft durable log-store restart artifact",
-                    source,
+                .map_err(|source| {
+                    ControlPlaneError::io(
+                        "export control-plane OpenRaft durable log-store restart artifact",
+                        source,
+                    )
                 })?;
             let artifact = ControlPlaneRaftRestartArtifact {
                 cluster_name: self.cluster_name.clone(),
@@ -6519,7 +6507,7 @@ pub async fn submit_control_plane_command_via_openraft(
     raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
     command: ControlPlaneCommand,
 ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
-    validate_control_plane_command_replication_size(&command)?;
+    validate_control_plane_command_replication_size_detailed(&command)?;
     let response = raft
         .client_write(command)
         .await
@@ -6546,7 +6534,20 @@ pub async fn submit_control_plane_command_via_openraft(
     })
 }
 
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("control-plane command is not accepted by the current replication policy")]
+pub struct ControlPlaneCommandReplicationSafetyError {
+    _private: (),
+}
+
 pub fn validate_control_plane_command_replication_size(
+    command: &ControlPlaneCommand,
+) -> Result<(), ControlPlaneCommandReplicationSafetyError> {
+    validate_control_plane_command_replication_size_detailed(command)
+        .map_err(|_| ControlPlaneCommandReplicationSafetyError { _private: () })
+}
+
+fn validate_control_plane_command_replication_size_detailed(
     command: &ControlPlaneCommand,
 ) -> Result<(), ControlPlaneError> {
     let entry = ControlPlaneRaftEntry {
@@ -6564,12 +6565,10 @@ pub fn validate_control_plane_command_replication_size(
     if encoded.len() <= CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES {
         return Ok(());
     }
-    Err(ControlPlaneError::RpcProtocol {
-        message: format!(
+    Err(ControlPlaneError::rpc_protocol(format!(
             "control-plane command encodes to {} OpenRaft entry bytes, exceeding the replication-safe per-entry limit {}",
             encoded.len(), CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
-        ),
-    })
+        )))
 }
 
 pub async fn runtime_map_via_openraft_read_index(
@@ -6722,9 +6721,7 @@ fn control_plane_error_to_io_error(context: &'static str, error: ControlPlaneErr
 }
 
 fn openraft_remote_error(context: &'static str, error: impl fmt::Display) -> ControlPlaneError {
-    ControlPlaneError::RpcRemote {
-        message: format!("OpenRaft {context} failed: {error}"),
-    }
+    ControlPlaneError::rpc_remote(format!("OpenRaft {context} failed: {error}"))
 }
 
 fn openraft_linearizable_read_error(
@@ -7001,46 +6998,36 @@ impl ControlPlaneRaftCheckpointPosition {
 
     fn validate_at_or_after(self, previous: Self) -> Result<(), ControlPlaneError> {
         if self.wal_replay_offset < previous.wal_replay_offset {
-            return Err(ControlPlaneError::RpcRemote {
-                message: format!(
+            return Err(ControlPlaneError::rpc_remote(format!(
                     "captured OpenRaft restart checkpoint WAL offset {} precedes the last publication offset {}",
                     self.wal_replay_offset, previous.wal_replay_offset
-                ),
-            });
+                )));
         }
         match (previous.last_applied, self.last_applied) {
-            (Some(previous), None) => Err(ControlPlaneError::RpcRemote {
-                message: format!(
+            (Some(previous), None) => Err(ControlPlaneError::rpc_remote(format!(
                     "captured OpenRaft restart checkpoint has no applied log ID after publishing {previous}"
-                ),
-            }),
+                ))),
             (Some(previous), Some(candidate)) if candidate.index < previous.index => {
-                Err(ControlPlaneError::RpcRemote {
-                    message: format!(
+                Err(ControlPlaneError::rpc_remote(format!(
                         "captured OpenRaft restart checkpoint applied index {} precedes the last publication index {}",
                         candidate.index, previous.index
-                    ),
-                })
+                    )))
             }
             (Some(previous), Some(candidate))
                 if candidate.index == previous.index && candidate != previous =>
             {
-                Err(ControlPlaneError::RpcRemote {
-                    message: format!(
+                Err(ControlPlaneError::rpc_remote(format!(
                         "captured OpenRaft restart checkpoint applied log ID {candidate} conflicts with the last publication log ID {previous} at the same index"
-                    ),
-                })
+                    )))
             }
             (Some(previous), Some(candidate))
                 if candidate.index > previous.index
                     && candidate.leader_id.term < previous.leader_id.term =>
             {
-                Err(ControlPlaneError::RpcRemote {
-                    message: format!(
+                Err(ControlPlaneError::rpc_remote(format!(
                         "captured OpenRaft restart checkpoint applied term {} regresses from the last publication term {}",
                         candidate.leader_id.term, previous.leader_id.term
-                    ),
-                })
+                    )))
             }
             _ => Ok(()),
         }
@@ -7794,10 +7781,10 @@ impl ControlPlaneRaftLogStore {
             replay_offset: 0,
         })?;
         Self::from_restart_artifact_inner(replayed, Some(Arc::new(wal))).map_err(|source| {
-            ControlPlaneError::Io {
-                context: "restore control-plane OpenRaft WAL-backed log store",
+            ControlPlaneError::io(
+                "restore control-plane OpenRaft WAL-backed log store",
                 source,
-            }
+            )
         })
     }
 
@@ -8415,9 +8402,8 @@ impl ControlPlaneRaftWalFile {
         let artifact = config
             .base
             .replay_wal_records(&records.records)
-            .map_err(|source| ControlPlaneError::Io {
-                context: "replay control-plane OpenRaft WAL records",
-                source,
+            .map_err(|source| {
+                ControlPlaneError::io("replay control-plane OpenRaft WAL records", source)
             })?;
         if records.truncated_tail {
             self.truncate_to_clean_len(records.clean_len)?;
@@ -8531,7 +8517,7 @@ fn write_control_plane_raft_wal_bytes(
 ) -> Result<(), ControlPlaneRaftWalAppendError> {
     writer
         .write_all(bytes)
-        .map_err(|source| ControlPlaneError::Io { context, source })
+        .map_err(|source| ControlPlaneError::io(context, source))
         .map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)
 }
 
@@ -8647,16 +8633,19 @@ impl ControlPlaneRaftRestartArtifact {
     }
 
     fn read_durable_artifact(path: &Path) -> Result<Vec<u8>, ControlPlaneError> {
-        let mut file = File::open(path).map_err(|source| ControlPlaneError::Io {
-            context: "open control-plane OpenRaft durable restart artifact",
-            source,
+        let mut file = File::open(path).map_err(|source| {
+            ControlPlaneError::io(
+                "open control-plane OpenRaft durable restart artifact",
+                source,
+            )
         })?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|source| ControlPlaneError::Io {
-                context: "read control-plane OpenRaft durable restart artifact",
+        file.read_to_end(&mut bytes).map_err(|source| {
+            ControlPlaneError::io(
+                "read control-plane OpenRaft durable restart artifact",
                 source,
-            })?;
+            )
+        })?;
         Ok(bytes)
     }
 
@@ -8685,17 +8674,18 @@ impl ControlPlaneRaftRestartArtifact {
         path: &Path,
         metrics: Option<&ControlPlaneRaftCheckpointMetrics>,
     ) -> Result<(), ControlPlaneError> {
-        self.validate_restart_pair()
-            .map_err(|source| ControlPlaneError::Io {
-                context: "validate control-plane OpenRaft durable restart artifact",
+        self.validate_restart_pair().map_err(|source| {
+            ControlPlaneError::io(
+                "validate control-plane OpenRaft durable restart artifact",
                 source,
-            })?;
+            )
+        })?;
         let sentinel_path = durable_artifact_sentinel_path(path);
         match ControlPlaneRaftRestartSentinel::load_durable_sentinel(&sentinel_path) {
             Ok(sentinel) => {
                 sentinel.validate_identity(&self.cluster_name, self.local_node_id)?;
             }
-            Err(ControlPlaneError::Io { source, .. })
+            Err(ControlPlaneError::Io { diagnostic: source })
                 if source.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
@@ -8712,9 +8702,11 @@ impl ControlPlaneRaftRestartArtifact {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            fs::create_dir_all(parent).map_err(|source| ControlPlaneError::Io {
-                context: "create control-plane OpenRaft durable restart artifact directory",
-                source,
+            fs::create_dir_all(parent).map_err(|source| {
+                ControlPlaneError::io(
+                    "create control-plane OpenRaft durable restart artifact directory",
+                    source,
+                )
             })?;
         }
         let tmp_path = durable_artifact_tmp_path(path);
@@ -8725,15 +8717,18 @@ impl ControlPlaneRaftRestartArtifact {
                 .truncate(true)
                 .mode(0o600)
                 .open(&tmp_path)
-                .map_err(|source| ControlPlaneError::Io {
-                    context: "create control-plane OpenRaft durable restart artifact temp file",
-                    source,
+                .map_err(|source| {
+                    ControlPlaneError::io(
+                        "create control-plane OpenRaft durable restart artifact temp file",
+                        source,
+                    )
                 })?;
-            file.write_all(&bytes)
-                .map_err(|source| ControlPlaneError::Io {
-                    context: "write control-plane OpenRaft durable restart artifact temp file",
+            file.write_all(&bytes).map_err(|source| {
+                ControlPlaneError::io(
+                    "write control-plane OpenRaft durable restart artifact temp file",
                     source,
-                })?;
+                )
+            })?;
             let sync_started = Instant::now();
             let result = file.sync_all();
             let sync_elapsed = sync_started.elapsed();
@@ -8741,14 +8736,18 @@ impl ControlPlaneRaftRestartArtifact {
             if let Some(metrics) = metrics {
                 metrics.record_file_sync(sync_elapsed);
             }
-            result.map_err(|source| ControlPlaneError::Io {
-                context: "sync control-plane OpenRaft durable restart artifact temp file",
-                source,
+            result.map_err(|source| {
+                ControlPlaneError::io(
+                    "sync control-plane OpenRaft durable restart artifact temp file",
+                    source,
+                )
             })?;
         }
-        fs::rename(&tmp_path, path).map_err(|source| ControlPlaneError::Io {
-            context: "commit control-plane OpenRaft durable restart artifact",
-            source,
+        fs::rename(&tmp_path, path).map_err(|source| {
+            ControlPlaneError::io(
+                "commit control-plane OpenRaft durable restart artifact",
+                source,
+            )
         })?;
         sync_durable_artifact_parent(path, metrics)?;
         Ok(())
@@ -8849,18 +8848,21 @@ impl ControlPlaneRaftRestartArtifact {
                 replay_offset: self.wal_replay_offset,
             })?;
         Self::validate_log_store_state_machine_pair(&log_store_artifact, &self.state_machine)
-            .map_err(|source| ControlPlaneError::Io {
-                context:
+            .map_err(|source| {
+                ControlPlaneError::io(
                     "validate control-plane OpenRaft durable restart artifact after WAL replay",
-                source,
+                    source,
+                )
             })?;
         Self::validate_cached_snapshot_replays_to_state_machine(
             &log_store_artifact,
             &self.state_machine,
         )
-        .map_err(|source| ControlPlaneError::Io {
-            context: "validate control-plane OpenRaft cached snapshot after WAL replay",
-            source,
+        .map_err(|source| {
+            ControlPlaneError::io(
+                "validate control-plane OpenRaft cached snapshot after WAL replay",
+                source,
+            )
         })?;
         let replayed_artifact = ControlPlaneRaftRestartArtifact {
             cluster_name: self.cluster_name,
@@ -8874,18 +8876,19 @@ impl ControlPlaneRaftRestartArtifact {
             log_store_artifact,
             Some(Arc::new(wal)),
         )
-        .map_err(|source| ControlPlaneError::Io {
-            context: "restore control-plane OpenRaft WAL-backed log store",
-            source,
+        .map_err(|source| {
+            ControlPlaneError::io(
+                "restore control-plane OpenRaft WAL-backed log store",
+                source,
+            )
         })?;
         let state_machine =
             ControlPlaneRaftStateMachine::from_restart_artifact(replayed_artifact.state_machine)
-                .map_err(|error| ControlPlaneError::Io {
-                    context: "restore control-plane OpenRaft state machine restart artifact",
-                    source: control_plane_error_to_io_error(
-                        "OpenRaft state-machine restart",
-                        error,
-                    ),
+                .map_err(|error| {
+                    ControlPlaneError::io(
+                        "restore control-plane OpenRaft state machine restart artifact",
+                        control_plane_error_to_io_error("OpenRaft state-machine restart", error),
+                    )
                 })?;
         Ok((log_store, state_machine))
     }
@@ -9418,16 +9421,19 @@ impl ControlPlaneRaftRestartSentinel {
     }
 
     fn load_durable_sentinel(path: &Path) -> Result<Self, ControlPlaneError> {
-        let mut file = File::open(path).map_err(|source| ControlPlaneError::Io {
-            context: "open control-plane OpenRaft durable restart sentinel",
-            source,
+        let mut file = File::open(path).map_err(|source| {
+            ControlPlaneError::io(
+                "open control-plane OpenRaft durable restart sentinel",
+                source,
+            )
         })?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|source| ControlPlaneError::Io {
-                context: "read control-plane OpenRaft durable restart sentinel",
+        file.read_to_end(&mut bytes).map_err(|source| {
+            ControlPlaneError::io(
+                "read control-plane OpenRaft durable restart sentinel",
                 source,
-            })?;
+            )
+        })?;
         Self::decode_durable_sentinel(&bytes)
     }
 
@@ -9441,9 +9447,11 @@ impl ControlPlaneRaftRestartSentinel {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            fs::create_dir_all(parent).map_err(|source| ControlPlaneError::Io {
-                context: "create control-plane OpenRaft durable restart sentinel directory",
-                source,
+            fs::create_dir_all(parent).map_err(|source| {
+                ControlPlaneError::io(
+                    "create control-plane OpenRaft durable restart sentinel directory",
+                    source,
+                )
             })?;
         }
         let tmp_path = durable_artifact_tmp_path(path);
@@ -9454,15 +9462,18 @@ impl ControlPlaneRaftRestartSentinel {
                 .truncate(true)
                 .mode(0o600)
                 .open(&tmp_path)
-                .map_err(|source| ControlPlaneError::Io {
-                    context: "create control-plane OpenRaft durable restart sentinel temp file",
-                    source,
+                .map_err(|source| {
+                    ControlPlaneError::io(
+                        "create control-plane OpenRaft durable restart sentinel temp file",
+                        source,
+                    )
                 })?;
-            file.write_all(&bytes)
-                .map_err(|source| ControlPlaneError::Io {
-                    context: "write control-plane OpenRaft durable restart sentinel temp file",
+            file.write_all(&bytes).map_err(|source| {
+                ControlPlaneError::io(
+                    "write control-plane OpenRaft durable restart sentinel temp file",
                     source,
-                })?;
+                )
+            })?;
             let sync_started = Instant::now();
             let result = file.sync_all();
             let sync_elapsed = sync_started.elapsed();
@@ -9470,14 +9481,18 @@ impl ControlPlaneRaftRestartSentinel {
             if let Some(metrics) = metrics {
                 metrics.record_file_sync(sync_elapsed);
             }
-            result.map_err(|source| ControlPlaneError::Io {
-                context: "sync control-plane OpenRaft durable restart sentinel temp file",
-                source,
+            result.map_err(|source| {
+                ControlPlaneError::io(
+                    "sync control-plane OpenRaft durable restart sentinel temp file",
+                    source,
+                )
             })?;
         }
-        fs::rename(&tmp_path, path).map_err(|source| ControlPlaneError::Io {
-            context: "commit control-plane OpenRaft durable restart sentinel",
-            source,
+        fs::rename(&tmp_path, path).map_err(|source| {
+            ControlPlaneError::io(
+                "commit control-plane OpenRaft durable restart sentinel",
+                source,
+            )
         })?;
         sync_durable_artifact_parent(path, metrics)?;
         Ok(())
@@ -9695,11 +9710,9 @@ fn validate_control_plane_raft_peer_auth_payload_binding(
     if operation_matches {
         Ok(())
     } else {
-        Err(ControlPlaneError::RpcProtocol {
-            message: format!(
+        Err(ControlPlaneError::rpc_protocol(format!(
                 "control-plane OpenRaft peer auth operation {expected_operation:?} does not match authenticated payload kind {kind}"
-            ),
-        })
+            )))
     }
 }
 
@@ -9767,20 +9780,19 @@ pub(crate) fn write_control_plane_raft_peer_transport_frame(
     writer: &mut (impl Write + ?Sized),
     frame: &[u8],
 ) -> Result<(), ControlPlaneError> {
-    let frame_len = u32::try_from(frame.len()).map_err(|_| ControlPlaneError::RpcProtocol {
-        message: format!(
+    let frame_len = u32::try_from(frame.len()).map_err(|_| {
+        ControlPlaneError::rpc_protocol(format!(
             "control-plane OpenRaft peer transport frame too large: {} bytes",
             frame.len()
-        ),
+        ))
     })?;
     let mut header = Vec::with_capacity(std::mem::size_of::<u32>());
     write_raft_u32(&mut header, frame_len);
     writer
         .write_all(&header)
         .and_then(|()| writer.write_all(frame))
-        .map_err(|source| ControlPlaneError::Io {
-            context: "write control-plane OpenRaft peer transport frame",
-            source,
+        .map_err(|source| {
+            ControlPlaneError::io("write control-plane OpenRaft peer transport frame", source)
         })
 }
 
@@ -9800,33 +9812,30 @@ pub(crate) fn read_control_plane_raft_peer_transport_frame_with_reservation<Rese
     reserve: impl FnOnce(usize) -> Result<Reservation, ControlPlaneError>,
 ) -> Result<(Vec<u8>, Reservation), ControlPlaneError> {
     let mut header = [0; std::mem::size_of::<u32>()];
-    reader
-        .read_exact(&mut header)
-        .map_err(|source| ControlPlaneError::Io {
-            context: "read control-plane OpenRaft peer transport frame header",
+    reader.read_exact(&mut header).map_err(|source| {
+        ControlPlaneError::io(
+            "read control-plane OpenRaft peer transport frame header",
             source,
-        })?;
+        )
+    })?;
     let frame_len = usize::try_from(u32::from_be_bytes(header)).map_err(|_| {
-        ControlPlaneError::RpcProtocol {
-            message: "control-plane OpenRaft peer transport frame length does not fit usize"
-                .to_string(),
-        }
+        ControlPlaneError::rpc_protocol(
+            "control-plane OpenRaft peer transport frame length does not fit usize".to_string(),
+        )
     })?;
     if frame_len > max_frame_bytes {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!(
+        return Err(ControlPlaneError::rpc_protocol(format!(
                 "control-plane OpenRaft peer transport frame size {frame_len} bytes exceeds limit {max_frame_bytes}"
-            ),
-        });
+            )));
     }
     let reservation = reserve(frame_len)?;
     let mut frame = vec![0; frame_len];
-    reader
-        .read_exact(&mut frame)
-        .map_err(|source| ControlPlaneError::Io {
-            context: "read control-plane OpenRaft peer transport frame payload",
+    reader.read_exact(&mut frame).map_err(|source| {
+        ControlPlaneError::io(
+            "read control-plane OpenRaft peer transport frame payload",
             source,
-        })?;
+        )
+    })?;
     Ok((frame, reservation))
 }
 
@@ -9978,12 +9987,10 @@ impl ControlPlaneRaftPeerServerPreAuthByteBudget {
                 budget: Arc::clone(self),
                 frame_bytes,
             }),
-            Err(reserved) => Err(ControlPlaneError::RpcProtocol {
-                message: format!(
+            Err(reserved) => Err(ControlPlaneError::rpc_protocol(format!(
                     "control-plane OpenRaft peer pre-authentication frame budget exhausted: requested {frame_bytes} bytes with {reserved} of {} bytes reserved",
                     self.limit_bytes
-                ),
-            }),
+                ))),
         }
     }
 
@@ -10284,9 +10291,11 @@ impl ControlPlaneRaftCheckpointWriteBlockerForTest {
         writer_process_id: u32,
     ) -> Result<Self, ControlPlaneError> {
         let path = durable_artifact_tmp_path_for_process(artifact_path, writer_process_id);
-        fs::create_dir(&path).map_err(|source| ControlPlaneError::Io {
-            context: "install control-plane OpenRaft checkpoint write blocker",
-            source,
+        fs::create_dir(&path).map_err(|source| {
+            ControlPlaneError::io(
+                "install control-plane OpenRaft checkpoint write blocker",
+                source,
+            )
         })?;
         Ok(Self { path })
     }
@@ -10313,18 +10322,13 @@ fn inspect_control_plane_raft_durable_state_for_test(
         });
         artifact.restore_with_wal_file(wal)?
     } else {
-        artifact.restore().map_err(|source| ControlPlaneError::Io {
-            context: "inspect control-plane OpenRaft checkpoint state",
-            source,
+        artifact.restore().map_err(|source| {
+            ControlPlaneError::io("inspect control-plane OpenRaft checkpoint state", source)
         })?
     };
-    let log_store_artifact =
-        log_store
-            .export_restart_artifact()
-            .map_err(|source| ControlPlaneError::Io {
-                context: "inspect control-plane OpenRaft recovered log state",
-                source,
-            })?;
+    let log_store_artifact = log_store.export_restart_artifact().map_err(|source| {
+        ControlPlaneError::io("inspect control-plane OpenRaft recovered log state", source)
+    })?;
     if let Some(committed) = log_store_artifact.committed {
         let start = state_machine
             .last_applied()
@@ -10380,9 +10384,9 @@ impl ControlPlaneRaftPendingTestResponse {
         ) {
             Ok(())
         } else {
-            Err(ControlPlaneError::RpcProtocol {
-                message: "control-plane Raft peer test received a mismatched response".to_owned(),
-            })
+            Err(ControlPlaneError::rpc_protocol(
+                "control-plane Raft peer test received a mismatched response".to_owned(),
+            ))
         }
     }
 
@@ -10444,10 +10448,9 @@ impl ControlPlaneRaftPeerTestClient {
         }))?;
         match response {
             ControlPlaneRaftPeerRpcResponse::Vote(response) => Ok(response.vote_granted),
-            _ => Err(ControlPlaneError::RpcProtocol {
-                message: "control-plane Raft peer test vote received a mismatched response"
-                    .to_owned(),
-            }),
+            _ => Err(ControlPlaneError::rpc_protocol(
+                "control-plane Raft peer test vote received a mismatched response".to_owned(),
+            )),
         }
     }
 
@@ -10492,9 +10495,9 @@ impl ControlPlaneRaftPeerTestClient {
                 last_log_id = LogId::new(
                     vote.leader_id,
                     last_log_id.index().checked_add(1).ok_or_else(|| {
-                        ControlPlaneError::RpcProtocol {
-                            message: "control-plane Raft peer test log index overflow".to_owned(),
-                        }
+                        ControlPlaneError::rpc_protocol(
+                            "control-plane Raft peer test log index overflow".to_owned(),
+                        )
                     })?,
                 );
                 Ok(Entry {
@@ -10531,11 +10534,9 @@ impl ControlPlaneRaftPeerTestClient {
             Some(auth_policy) => auth_policy.sign_peer_frame(&self.identity, operation, request)?,
             None => request,
         };
-        let stream =
-            UnixStream::connect(&self.socket_path).map_err(|source| ControlPlaneError::Io {
-                context: "connect control-plane Raft peer test client",
-                source,
-            })?;
+        let stream = UnixStream::connect(&self.socket_path).map_err(|source| {
+            ControlPlaneError::io("connect control-plane Raft peer test client", source)
+        })?;
         let deadline = Instant::now()
             .checked_add(self.io_timeout)
             .unwrap_or_else(Instant::now);
@@ -10544,9 +10545,11 @@ impl ControlPlaneRaftPeerTestClient {
             deadline,
             "control-plane Raft peer test client deadline expired",
         )
-        .map_err(|source| ControlPlaneError::Io {
-            context: "configure control-plane Raft peer test client deadline",
-            source,
+        .map_err(|source| {
+            ControlPlaneError::io(
+                "configure control-plane Raft peer test client deadline",
+                source,
+            )
         })?;
         write_control_plane_raft_peer_transport_frame(&mut stream, &request)?;
         Ok(ControlPlaneRaftPendingTestResponse {
@@ -10630,9 +10633,11 @@ impl ControlPlaneRaftPeerServerListener {
                             CONTROL_PLANE_RAFT_PEER_SERVER_DEADLINE_EXPIRED,
                         )
                         .map(|stream| Box::new(stream) as Box<dyn ControlPlaneRaftPeerServerStream>)
-                        .map_err(|source| ControlPlaneError::Io {
-                            context: "configure control-plane OpenRaft Unix peer deadline I/O",
-                            source,
+                        .map_err(|source| {
+                            ControlPlaneError::io(
+                                "configure control-plane OpenRaft Unix peer deadline I/O",
+                                source,
+                            )
                         })
                     },
                 ),
@@ -10648,64 +10653,55 @@ impl ControlPlaneRaftPeerServerListener {
             ControlPlaneRaftPeerServerListenerKind::TlsTcp {
                 listener,
                 tls_server_config,
-            } => match listener.accept() {
-                Ok((stream, _)) => {
-                    let tls_server_config = Arc::clone(tls_server_config);
-                    spawn_control_plane_raft_peer_server_worker(
-                        stream,
-                        runtime.clone(),
-                        authority,
-                        policy.clone(),
-                        self.max_connections,
-                        self.io_timeout,
-                        Arc::clone(&self.active_workers),
-                        move |stream, deadline| {
-                            let socket =
+            } => {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let tls_server_config = Arc::clone(tls_server_config);
+                        spawn_control_plane_raft_peer_server_worker(
+                            stream,
+                            runtime.clone(),
+                            authority,
+                            policy.clone(),
+                            self.max_connections,
+                            self.io_timeout,
+                            Arc::clone(&self.active_workers),
+                            move |stream, deadline| {
+                                let socket =
                                 DeadlineStream::new(
                                     stream,
                                     deadline,
                                     CONTROL_PLANE_RAFT_PEER_SERVER_DEADLINE_EXPIRED,
                                 )
                                 .map_err(|source| {
-                                    ControlPlaneError::Io {
-                                context:
-                                    "configure control-plane OpenRaft TLS/TCP peer deadline I/O",
-                                source,
-                            }
+                                    ControlPlaneError::io("configure control-plane OpenRaft TLS/TCP peer deadline I/O", source)
                                 })?;
-                            let connection = rustls::ServerConnection::new(tls_server_config)
-                                .map_err(|_| ControlPlaneError::RpcProtocol {
-                                    message: "failed to initialize control-plane OpenRaft TLS server connection".to_owned(),
-                                })?;
-                            let mut stream = rustls::StreamOwned::new(connection, socket);
-                            while stream.conn.is_handshaking() {
-                                stream
+                                let connection = rustls::ServerConnection::new(tls_server_config)
+                                .map_err(|_| ControlPlaneError::rpc_protocol("failed to initialize control-plane OpenRaft TLS server connection".to_owned()))?;
+                                let mut stream = rustls::StreamOwned::new(connection, socket);
+                                while stream.conn.is_handshaking() {
+                                    stream
                                     .conn
                                     .complete_io(&mut stream.sock)
-                                    .map_err(|source| ControlPlaneError::Io {
-                                        context:
-                                            "complete control-plane OpenRaft TLS server handshake",
-                                        source,
-                                    })?;
-                            }
-                            if stream.conn.alpn_protocol() != Some(CONTROL_PLANE_RAFT_TLS_ALPN) {
-                                return Err(ControlPlaneError::RpcProtocol {
-                                    message: "control-plane OpenRaft TLS peer did not negotiate the required protocol profile".to_owned(),
-                                });
-                            }
-                            Ok(Box::new(stream) as Box<dyn ControlPlaneRaftPeerServerStream>)
-                        },
-                    );
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => {
-                    eprintln!(
+                                    .map_err(|source| ControlPlaneError::io("complete control-plane OpenRaft TLS server handshake", source))?;
+                                }
+                                if stream.conn.alpn_protocol() != Some(CONTROL_PLANE_RAFT_TLS_ALPN)
+                                {
+                                    return Err(ControlPlaneError::rpc_protocol("control-plane OpenRaft TLS peer did not negotiate the required protocol profile".to_owned()));
+                                }
+                                Ok(Box::new(stream) as Box<dyn ControlPlaneRaftPeerServerStream>)
+                            },
+                        );
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        eprintln!(
                         "control-plane OpenRaft TLS/TCP peer listener {} accept failed: {error}",
                         self.endpoint_id
                     );
-                    return Err(ControlPlaneRaftPeerServerError);
+                        return Err(ControlPlaneRaftPeerServerError);
+                    }
                 }
-            },
+            }
         }
         Ok(())
     }
@@ -10854,9 +10850,7 @@ fn handle_control_plane_raft_peer_server_request(
     policy
         .peer_policy
         .validate_incoming_frame_identity(&identity, policy.local_node_id)
-        .map_err(|error| ControlPlaneError::RpcProtocol {
-            message: error.to_string(),
-        })
+        .map_err(|error| ControlPlaneError::rpc_protocol(error.to_string()))
         .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)?;
     drop(pre_auth_reservation);
 
@@ -10885,12 +10879,14 @@ fn handle_control_plane_raft_peer_server_request(
             }
         })
         .await
-        .map_err(|_| ControlPlaneError::Io {
-            context: "dispatch control-plane OpenRaft inbound peer frame",
-            source: io::Error::new(
-                io::ErrorKind::TimedOut,
-                CONTROL_PLANE_RAFT_PEER_SERVER_DEADLINE_EXPIRED,
-            ),
+        .map_err(|_| {
+            ControlPlaneError::io(
+                "dispatch control-plane OpenRaft inbound peer frame",
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    CONTROL_PLANE_RAFT_PEER_SERVER_DEADLINE_EXPIRED,
+                ),
+            )
         })?
     })
     .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)?;
@@ -10906,11 +10902,8 @@ fn handle_control_plane_raft_peer_server_request(
 
     if frame_kind == ControlPlaneRaftPeerFrameKind::Snapshot {
         let durability = policy.durability.as_deref().ok_or_else(|| {
-            ControlPlaneRaftPeerServerWorkerError::Checkpoint(ControlPlaneError::RpcProtocol {
-                message:
-                    "control-plane OpenRaft snapshot peer RPC requires a durability checkpoint callback"
-                        .to_owned(),
-            })
+            ControlPlaneRaftPeerServerWorkerError::Checkpoint(ControlPlaneError::rpc_protocol("control-plane OpenRaft snapshot peer RPC requires a durability checkpoint callback"
+                        .to_owned()))
         })?;
         durability
             .checkpoint_before_snapshot_response()
@@ -10920,22 +10913,17 @@ fn handle_control_plane_raft_peer_server_request(
 
     let mut response_frame = Some(response_frame);
     let mut publish = || {
-        let response_frame =
-            response_frame
-                .take()
-                .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                    message:
-                        "control-plane OpenRaft peer response publication attempted more than once"
-                            .to_owned(),
-                })?;
+        let response_frame = response_frame.take().ok_or_else(|| {
+            ControlPlaneError::rpc_protocol(
+                "control-plane OpenRaft peer response publication attempted more than once"
+                    .to_owned(),
+            )
+        })?;
         stream.begin_response(response_timeout);
         write_control_plane_raft_peer_transport_frame(stream, &response_frame)?;
-        stream
-            .finish_response()
-            .map_err(|source| ControlPlaneError::Io {
-                context: "finalize control-plane OpenRaft peer response",
-                source,
-            })
+        stream.finish_response().map_err(|source| {
+            ControlPlaneError::io("finalize control-plane OpenRaft peer response", source)
+        })
     };
     publish_control_plane_raft_peer_server_response(policy.durability.as_deref(), &mut publish)
         .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)
@@ -10950,9 +10938,7 @@ fn ensure_control_plane_raft_peer_server_not_poisoned(
         .is_some_and(ControlPlaneRaftPeerServerDurability::is_poisoned)
     {
         return Err(ControlPlaneRaftPeerServerWorkerError::PeerRpc(
-            ControlPlaneError::RpcRemote {
-                message: "control-plane OpenRaft durable authority is poisoned; refusing peer RPC until restart".to_owned(),
-            },
+            ControlPlaneError::rpc_remote("control-plane OpenRaft durable authority is poisoned; refusing peer RPC until restart".to_owned()),
         ));
     }
     Ok(())
@@ -10966,11 +10952,10 @@ fn publish_control_plane_raft_peer_server_response(
     let result = {
         let mut publish_once = || {
             if std::mem::replace(&mut published, true) {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message:
-                        "control-plane OpenRaft peer response publication attempted more than once"
-                            .to_owned(),
-                });
+                return Err(ControlPlaneError::rpc_protocol(
+                    "control-plane OpenRaft peer response publication attempted more than once"
+                        .to_owned(),
+                ));
             }
             publish()
         };
@@ -10980,11 +10965,10 @@ fn publish_control_plane_raft_peer_server_response(
         }
     };
     if result.is_ok() && !published {
-        return Err(ControlPlaneError::RpcProtocol {
-            message:
-                "control-plane OpenRaft peer response publication completed without publishing"
-                    .to_owned(),
-        });
+        return Err(ControlPlaneError::rpc_protocol(
+            "control-plane OpenRaft peer response publication completed without publishing"
+                .to_owned(),
+        ));
     }
     result
 }
@@ -10998,21 +10982,17 @@ fn control_plane_raft_peer_auth_envelope_identity(
     let source = match envelope.header().source() {
         ControlPlaneAuthPrincipal::RaftPeer { node_id } => *node_id,
         principal => {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
+            return Err(ControlPlaneError::rpc_protocol(format!(
                     "control-plane OpenRaft peer auth source is not a RaftPeer principal: {principal:?}"
-                ),
-            });
+                )));
         }
     };
     match envelope.header().target() {
         ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer { .. }) => {}
         target => {
-            return Err(ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "control-plane OpenRaft peer auth target is not a RaftPeer principal: {target:?}"
-                ),
-            });
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "control-plane OpenRaft peer auth target is not a RaftPeer principal: {target:?}"
+            )));
         }
     }
     let mut identity = ControlPlaneRaftPeerFrameIdentity::new(
@@ -11116,9 +11096,11 @@ async fn handle_control_plane_raft_peer_unix_stream(
         Instant::now() + io_timeout,
         "control-plane OpenRaft test peer deadline expired",
     )
-    .map_err(|source| ControlPlaneError::Io {
-        context: "configure control-plane OpenRaft test peer deadline I/O",
-        source,
+    .map_err(|source| {
+        ControlPlaneError::io(
+            "configure control-plane OpenRaft test peer deadline I/O",
+            source,
+        )
     })?;
     let request_frame =
         read_control_plane_raft_peer_transport_frame(&mut stream, limits.max_frame_bytes)?;
@@ -11146,9 +11128,11 @@ async fn handle_control_plane_raft_peer_unix_stream_detecting_frame_kind(
         Instant::now() + io_timeout,
         "control-plane OpenRaft test peer deadline expired",
     )
-    .map_err(|source| ControlPlaneError::Io {
-        context: "configure control-plane OpenRaft test peer deadline I/O",
-        source,
+    .map_err(|source| {
+        ControlPlaneError::io(
+            "configure control-plane OpenRaft test peer deadline I/O",
+            source,
+        )
     })?;
     let request_frame =
         read_control_plane_raft_peer_transport_frame(&mut stream, limits.max_frame_bytes)?;
@@ -11177,9 +11161,11 @@ async fn handle_control_plane_raft_peer_unix_stream_from_configured_peer(
         Instant::now() + io_timeout,
         "control-plane OpenRaft test peer deadline expired",
     )
-    .map_err(|source| ControlPlaneError::Io {
-        context: "configure control-plane OpenRaft test peer deadline I/O",
-        source,
+    .map_err(|source| {
+        ControlPlaneError::io(
+            "configure control-plane OpenRaft test peer deadline I/O",
+            source,
+        )
     })?;
     let request_frame =
         read_control_plane_raft_peer_transport_frame(&mut stream, policy.limits().max_frame_bytes)?;
@@ -11187,9 +11173,7 @@ async fn handle_control_plane_raft_peer_unix_stream_from_configured_peer(
     let identity = decode_control_plane_raft_peer_request_frame_identity(&request_frame)?;
     policy
         .validate_incoming_frame_identity(&identity, local_node_id)
-        .map_err(|error| ControlPlaneError::RpcProtocol {
-            message: error.to_string(),
-        })?;
+        .map_err(|error| ControlPlaneError::rpc_protocol(error.to_string()))?;
     handle_control_plane_raft_peer_unix_request_frame(
         raft,
         &mut stream,
@@ -11303,9 +11287,11 @@ fn sync_durable_artifact_parent(
     if let Some(metrics) = metrics {
         metrics.record_directory_sync(sync_elapsed);
     }
-    result.map_err(|source| ControlPlaneError::Io {
-        context: "sync control-plane OpenRaft durable restart artifact directory",
-        source,
+    result.map_err(|source| {
+        ControlPlaneError::io(
+            "sync control-plane OpenRaft durable restart artifact directory",
+            source,
+        )
     })
 }
 
@@ -11336,10 +11322,10 @@ fn inject_control_plane_raft_wal_file_sync_failure(path: &Path) -> Result<(), Co
             .expect("test WAL file-sync fault lock should not be poisoned");
         if injected_path.as_deref() == Some(path) {
             *injected_path = None;
-            return Err(ControlPlaneError::Io {
-                context: "sync control-plane OpenRaft WAL",
-                source: io::Error::other("injected control-plane OpenRaft WAL sync failure"),
-            });
+            return Err(ControlPlaneError::io(
+                "sync control-plane OpenRaft WAL",
+                io::Error::other("injected control-plane OpenRaft WAL sync failure"),
+            ));
         }
     }
 
@@ -11387,12 +11373,10 @@ fn sync_control_plane_raft_wal_parent(path: &Path) -> Result<(), ControlPlaneErr
             .expect("test WAL parent-sync fault lock should not be poisoned");
         if injected_path.as_deref() == Some(path) {
             *injected_path = None;
-            return Err(ControlPlaneError::Io {
-                context: "sync control-plane OpenRaft WAL directory",
-                source: io::Error::other(
-                    "injected control-plane OpenRaft WAL directory sync failure",
-                ),
-            });
+            return Err(ControlPlaneError::io(
+                "sync control-plane OpenRaft WAL directory",
+                io::Error::other("injected control-plane OpenRaft WAL directory sync failure"),
+            ));
         }
     }
 
@@ -11402,9 +11386,8 @@ fn sync_control_plane_raft_wal_parent(path: &Path) -> Result<(), ControlPlaneErr
         .unwrap_or_else(|| Path::new("."));
     File::open(parent)
         .and_then(|directory| directory.sync_all())
-        .map_err(|source| ControlPlaneError::Io {
-            context: "sync control-plane OpenRaft WAL directory",
-            source,
+        .map_err(|source| {
+            ControlPlaneError::io("sync control-plane OpenRaft WAL directory", source)
         })
 }
 
@@ -12728,11 +12711,13 @@ impl ControlPlaneRaftStateMachineRestartArtifact {
     async fn refresh_cached_snapshot_async(self) -> Result<Self, ControlPlaneError> {
         tokio::task::spawn_blocking(move || self.refresh_cached_snapshot())
             .await
-            .map_err(|error| ControlPlaneError::Io {
-                context: "refresh control-plane OpenRaft cached restart snapshot",
-                source: io::Error::other(format!(
-                    "control-plane OpenRaft cached restart snapshot worker failed: {error}"
-                )),
+            .map_err(|error| {
+                ControlPlaneError::io(
+                    "refresh control-plane OpenRaft cached restart snapshot",
+                    io::Error::other(format!(
+                        "control-plane OpenRaft cached restart snapshot worker failed: {error}"
+                    )),
+                )
             })?
     }
 }
@@ -14375,24 +14360,20 @@ mod tests {
         > {
             Box::pin(async move {
                 let entries = {
-                    let entries =
-                        self.entries
-                            .lock()
-                            .map_err(|_| ControlPlaneError::RpcRemote {
-                                message:
-                                    "in-memory test authority capability directory lock poisoned"
-                                        .to_string(),
-                            })?;
+                    let entries = self.entries.lock().map_err(|_| {
+                        ControlPlaneError::rpc_remote(
+                            "in-memory test authority capability directory lock poisoned"
+                                .to_string(),
+                        )
+                    })?;
                     entries.clone()
                 };
                 let mut statuses = BTreeMap::new();
                 for (node_id, entry) in entries {
                     let status = entry.status.status().await.map_err(|error| {
-                        ControlPlaneError::RpcRemote {
-                            message: format!(
+                        ControlPlaneError::rpc_remote(format!(
                                 "in-memory test authority capability directory status for node {node_id} failed: {error:?}"
-                            ),
-                        }
+                            ))
                     })?;
                     statuses.insert(node_id, status);
                 }
@@ -14410,21 +14391,17 @@ mod tests {
             Result<ControlPlaneRaftAuthorityBootstrapHandle, ControlPlaneError>,
         > {
             let result = (|| {
-                let entries = self
-                    .entries
-                    .lock()
-                    .map_err(|_| ControlPlaneError::RpcRemote {
-                        message: "in-memory test authority capability directory lock poisoned"
-                            .to_string(),
-                    })?;
+                let entries = self.entries.lock().map_err(|_| {
+                    ControlPlaneError::rpc_remote(
+                        "in-memory test authority capability directory lock poisoned".to_string(),
+                    )
+                })?;
                 entries
                     .get(&node_id)
                     .map(|entry| entry.bootstrap.clone())
-                    .ok_or_else(|| ControlPlaneError::RpcRemote {
-                        message: format!(
+                    .ok_or_else(|| ControlPlaneError::rpc_remote(format!(
                             "in-memory test authority capability directory has no bootstrap node {node_id}"
-                        ),
-                    })
+                        )))
             })();
             Box::pin(std::future::ready(result))
         }
@@ -14439,21 +14416,17 @@ mod tests {
             Result<ControlPlaneRaftAuthorityNodeLifecycleHandle, ControlPlaneError>,
         > {
             let result = (|| {
-                let entries = self
-                    .entries
-                    .lock()
-                    .map_err(|_| ControlPlaneError::RpcRemote {
-                        message: "in-memory test authority capability directory lock poisoned"
-                            .to_string(),
-                    })?;
+                let entries = self.entries.lock().map_err(|_| {
+                    ControlPlaneError::rpc_remote(
+                        "in-memory test authority capability directory lock poisoned".to_string(),
+                    )
+                })?;
                 entries
                     .get(&node_id)
                     .map(|entry| entry.node_lifecycle.clone())
-                    .ok_or_else(|| ControlPlaneError::RpcRemote {
-                        message: format!(
+                    .ok_or_else(|| ControlPlaneError::rpc_remote(format!(
                             "in-memory test authority capability directory has no node-lifecycle node {node_id}"
-                        ),
-                    })
+                        )))
             })();
             Box::pin(std::future::ready(result))
         }
@@ -14466,21 +14439,17 @@ mod tests {
         ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityHandle, ControlPlaneError>>
         {
             let result = (|| {
-                let entries = self
-                    .entries
-                    .lock()
-                    .map_err(|_| ControlPlaneError::RpcRemote {
-                        message: "in-memory test authority capability directory lock poisoned"
-                            .to_string(),
-                    })?;
+                let entries = self.entries.lock().map_err(|_| {
+                    ControlPlaneError::rpc_remote(
+                        "in-memory test authority capability directory lock poisoned".to_string(),
+                    )
+                })?;
                 entries
                     .get(&node_id)
                     .map(|entry| entry.linearized_authority.clone())
-                    .ok_or_else(|| ControlPlaneError::RpcRemote {
-                        message: format!(
+                    .ok_or_else(|| ControlPlaneError::rpc_remote(format!(
                             "in-memory test authority capability directory has no linearized node {node_id}"
-                        ),
-                    })
+                        )))
             })();
             Box::pin(std::future::ready(result))
         }
@@ -14495,21 +14464,17 @@ mod tests {
             Result<ControlPlaneRaftLeaderRoutedAdminHandle, ControlPlaneError>,
         > {
             let result = (|| {
-                let entries = self
-                    .entries
-                    .lock()
-                    .map_err(|_| ControlPlaneError::RpcRemote {
-                        message: "in-memory test authority capability directory lock poisoned"
-                            .to_string(),
-                    })?;
+                let entries = self.entries.lock().map_err(|_| {
+                    ControlPlaneError::rpc_remote(
+                        "in-memory test authority capability directory lock poisoned".to_string(),
+                    )
+                })?;
                 entries
                     .get(&node_id)
                     .map(|entry| entry.leader_routed_admin.clone())
-                    .ok_or_else(|| ControlPlaneError::RpcRemote {
-                        message: format!(
+                    .ok_or_else(|| ControlPlaneError::rpc_remote(format!(
                             "in-memory test authority capability directory has no leader-routed admin node {node_id}"
-                        ),
-                    })
+                        )))
             })();
             Box::pin(std::future::ready(result))
         }
@@ -16728,7 +16693,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneRaftPeerServerWorkerError::PeerRpc(ControlPlaneError::Io { source, .. })
+            ControlPlaneRaftPeerServerWorkerError::PeerRpc(ControlPlaneError::Io { diagnostic: source })
                 if source.kind() == io::ErrorKind::BrokenPipe
         ));
         assert_eq!(
@@ -17039,7 +17004,7 @@ mod tests {
             read_control_plane_raft_peer_transport_frame(&mut cursor, max_frame_bytes).unwrap_err();
         assert!(matches!(
             err,
-            ControlPlaneError::RpcProtocol { message }
+            ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.contains("peer transport frame size 9 bytes exceeds limit 8")
         ));
     }
@@ -18160,7 +18125,7 @@ mod tests {
 
             assert!(matches!(
                 err,
-                ControlPlaneError::RpcProtocol { message }
+                ControlPlaneError::RpcProtocol { diagnostic: message }
                     if message.contains("no configured source node")
                         && message.contains(&source_node_id.to_string())
             ));
@@ -18302,11 +18267,17 @@ mod tests {
             pg_ids: vec![PgId::new(0)],
         };
 
-        let error = validate_control_plane_command_replication_size(&command).unwrap_err();
+        let error = validate_control_plane_command_replication_size_detailed(&command).unwrap_err();
         assert!(matches!(error, ControlPlaneError::RpcProtocol { .. }));
-        assert!(error
-            .to_string()
-            .contains("exceeding the replication-safe per-entry limit"));
+        assert!(
+            error.retained_diagnostic_contains("exceeding the replication-safe per-entry limit")
+        );
+        assert_eq!(
+            validate_control_plane_command_replication_size(&command)
+                .unwrap_err()
+                .to_string(),
+            "control-plane command is not accepted by the current replication policy"
+        );
     }
 
     #[test]
@@ -18899,14 +18870,14 @@ mod tests {
         ]);
         assert!(matches!(
             current_serving_authority_node_id(&no_serving),
-            Err(ControlPlaneError::RpcRemote { message })
+            Err(ControlPlaneError::RpcRemote { diagnostic: message })
                 if message.contains("no serving raft authority")
         ));
 
         let key_mismatch = BTreeMap::from([(431, test_authority_status(432, false))]);
         assert!(matches!(
             current_serving_authority_node_id(&key_mismatch),
-            Err(ControlPlaneError::RpcRemote { message })
+            Err(ControlPlaneError::RpcRemote { diagnostic: message })
                 if message.contains("status key 431 disagrees with reported node 432")
         ));
 
@@ -18921,7 +18892,7 @@ mod tests {
         let lagging = BTreeMap::from([(433, lagging_leader)]);
         assert!(matches!(
             current_serving_authority_node_id(&lagging),
-            Err(ControlPlaneError::RpcRemote { message })
+            Err(ControlPlaneError::RpcRemote { diagnostic: message })
                 if message.contains("no serving raft authority")
         ));
 
@@ -18936,7 +18907,7 @@ mod tests {
         let same_index_mismatch = BTreeMap::from([(434, same_index_different_term)]);
         assert!(matches!(
             current_serving_authority_node_id(&same_index_mismatch),
-            Err(ControlPlaneError::RpcRemote { message })
+            Err(ControlPlaneError::RpcRemote { diagnostic: message })
                 if message.contains("no serving raft authority")
         ));
 
@@ -19015,7 +18986,7 @@ mod tests {
         match result {
             Ok(_) => panic!("expected error containing {expected:?}, got success"),
             Err(error) => assert!(
-                error.to_string().contains(expected),
+                error.retained_diagnostic_contains(expected),
                 "expected error {error:?} to contain {expected:?}"
             ),
         }
@@ -20157,7 +20128,7 @@ mod tests {
                 .persist_durable_restart_checkpoint(stale)
                 .expect_err("older captured checkpoint must not replace a newer publication");
             assert!(
-                error.to_string().contains("precedes the last publication"),
+                error.retained_diagnostic_contains("precedes the last publication"),
                 "unexpected stale-checkpoint error: {error}"
             );
             assert_eq!(fs::read(&artifact_path).unwrap(), artifact_before_stale);
@@ -20208,7 +20179,7 @@ mod tests {
                 .persist_durable_restart_checkpoint(checkpoint)
                 .expect_err("another authority instance must reject the captured checkpoint");
             assert!(
-                error.to_string().contains("another authority instance"),
+                error.retained_diagnostic_contains("another authority instance"),
                 "unexpected foreign-checkpoint error: {error}"
             );
             assert_eq!(fs::read(&artifact_path).unwrap(), b"unchanged");
@@ -21208,7 +21179,7 @@ mod tests {
         status.durable_last_purged_log_id = Some(raft_log_id(4, 1, 7));
         assert!(matches!(
             control_plane_raft_durable_purge_covers(&status, target),
-            Err(ControlPlaneError::RpcRemote { message })
+            Err(ControlPlaneError::RpcRemote { diagnostic: message })
                 if message.contains("conflicts with requested log id")
         ));
 
@@ -21216,7 +21187,7 @@ mod tests {
         status.durability.wal_poisoned = Some("injected post-sync failure".to_string());
         assert!(matches!(
             control_plane_raft_durable_purge_covers(&status, target),
-            Err(ControlPlaneError::RpcRemote { message })
+            Err(ControlPlaneError::RpcRemote { diagnostic: message })
                 if message.contains("injected post-sync failure")
         ));
     }
@@ -21245,7 +21216,7 @@ mod tests {
         );
         assert!(matches!(
             control_plane_raft_durable_purge_covers(&status, target),
-            Err(ControlPlaneError::RpcRemote { message })
+            Err(ControlPlaneError::RpcRemote { diagnostic: message })
                 if message.contains("injected durable purge poison")
         ));
     }
@@ -23410,7 +23381,7 @@ mod tests {
             let missing_bootstrap = bootstrap_directory.authority_bootstrap_for_node(499).await;
             assert!(matches!(
                 missing_bootstrap,
-                Err(ControlPlaneError::RpcRemote { message })
+                Err(ControlPlaneError::RpcRemote { diagnostic: message })
                     if message.contains("no bootstrap node 499")
             ));
             let missing_node_lifecycle = node_lifecycle_directory
@@ -23418,7 +23389,7 @@ mod tests {
                 .await;
             assert!(matches!(
                 missing_node_lifecycle,
-                Err(ControlPlaneError::RpcRemote { message })
+                Err(ControlPlaneError::RpcRemote { diagnostic: message })
                     if message.contains("no node-lifecycle node 499")
             ));
             let missing_linearized = linearized_directory
@@ -23426,13 +23397,13 @@ mod tests {
                 .await;
             assert!(matches!(
                 missing_linearized,
-                Err(ControlPlaneError::RpcRemote { message })
+                Err(ControlPlaneError::RpcRemote { diagnostic: message })
                     if message.contains("no linearized node 499")
             ));
             let missing_admin = admin_directory.leader_routed_admin_for_node(499).await;
             assert!(matches!(
                 missing_admin,
-                Err(ControlPlaneError::RpcRemote { message })
+                Err(ControlPlaneError::RpcRemote { diagnostic: message })
                     if message.contains("no leader-routed admin node 499")
             ));
 
@@ -23614,9 +23585,9 @@ mod tests {
                     loop {
                         match routed_client.current_serving_linearized_authority().await {
                             Ok(authority) => return Ok(authority),
-                            Err(ControlPlaneError::RpcRemote { message })
-                                if message.contains("no serving raft authority") =>
-                            {
+                            Err(ControlPlaneError::RpcRemote {
+                                diagnostic: message,
+                            }) if message.contains("no serving raft authority") => {
                                 ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
                             }
                             Err(error) => return Err(error),
@@ -23842,7 +23813,7 @@ mod tests {
             .await;
             assert!(matches!(
                 err,
-                ControlPlaneError::RpcRemote { message }
+                ControlPlaneError::RpcRemote { diagnostic: message }
                     if message.contains("multiple serving raft authorities")
             ));
 
@@ -23897,7 +23868,7 @@ mod tests {
             .await;
             assert!(matches!(
                 err,
-                ControlPlaneError::RpcRemote { message }
+                ControlPlaneError::RpcRemote { diagnostic: message }
                     if message.contains(
                         "linearized authority directory returned node 452 for selected serving node 451"
                     )
@@ -24235,7 +24206,7 @@ mod tests {
             let follower_error = authority2.trigger_snapshot_applied().await.unwrap_err();
             assert!(matches!(
                 follower_error,
-                ControlPlaneError::RpcRemote { message }
+                ControlPlaneError::RpcRemote { diagnostic: message }
                     if message.contains("requires the current serving authority")
                         && message.contains("NotLocalLeader")
             ));
@@ -24438,7 +24409,7 @@ mod tests {
                 .await
                 .expect_err("post-sync purge poison must override the durable watermark");
             assert!(
-                matches!(error, ControlPlaneError::RpcRemote { ref message }
+                matches!(error, ControlPlaneError::RpcRemote { diagnostic: ref message }
                     if message.contains("snapshot purge WAL durability failed")
                         && message.contains("WAL append failed after file sync")),
                 "unexpected post-sync purge error: {error:?}"
@@ -24615,7 +24586,7 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(
                 old_leader_replace_voters_err,
-                ControlPlaneError::RpcRemote { message }
+                ControlPlaneError::RpcRemote { diagnostic: message }
                     if message.contains("OpenRaft change-membership failed")
             ));
             let old_leader_add_learner_err = authority1
@@ -24624,7 +24595,7 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(
                 old_leader_add_learner_err,
-                ControlPlaneError::RpcRemote { message }
+                ControlPlaneError::RpcRemote { diagnostic: message }
                     if message.contains("OpenRaft add-learner failed")
             ));
 

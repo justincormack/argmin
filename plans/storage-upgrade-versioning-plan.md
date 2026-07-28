@@ -260,7 +260,7 @@ but no version negotiation or supported compatibility window:
 | Surface | Current wire baseline | Authentication baseline | Negotiation and current disposition |
 | --- | --- | --- | --- |
 | Storage-node RPC | `STORAGE_RPC_FRAME_ENCODING_VERSION = 11` in `storage_rpc.rs`; frame magic, message-kind tags, checksums, and payload codecs are crate-private. | Binding version 2 and transport-envelope version 1 in `storage_rpc_auth.rs`. | Exact versions are required before dispatch. There is no negotiation. Treat any other version as incompatible until mixed-version operation is designed. |
-| Control-plane RPC | `CONTROL_PLANE_RPC_VERSION = 9` in `control_plane.rs`; the frame contains magic, version, request kind, length, checksum, and payload. | Shared control-plane authentication-envelope version 1 in `control_plane_auth.rs`. | The frame and auth decoders reject non-current versions before logical dispatch. There is no negotiation. Treat any other version as incompatible. |
+| Control-plane RPC | `CONTROL_PLANE_RPC_VERSION = 10` in `control_plane.rs`; the frame contains magic, version, request kind, length, checksum, and payload. Version 10 preserves the semantic authority-clock leadership-change failure across the wire without exposing arbitrary remote diagnostics. | Shared control-plane authentication-envelope version 1 in `control_plane_auth.rs`. | The frame and auth decoders reject non-current versions before logical dispatch. There is no negotiation. Treat any other version as incompatible. |
 | Raft peer RPC | `CONTROL_PLANE_RAFT_PEER_RPC_VERSION = 2` in `control_plane_raft.rs`; request, response, snapshot, peer-identity, checksum, and numeric OpenRaft tags share this baseline. | Shared control-plane authentication-envelope version 1, with the authenticated operation and peer identity bound to the inner frame. | The decoder rejects non-current versions before OpenRaft dispatch. There is no negotiation, and OpenRaft peers currently require the same binary. Treat any other version as incompatible. |
 
 These are ephemeral wire formats, so there is no in-place migration or authoritative rebuild
@@ -350,9 +350,17 @@ The public boundary and containment status for each surface are as follows.
   between identity/topology validation and durable inspection or publication failure, so filesystem
   replacement and synchronization failures remain durability failures. The repository check now
   rejects any use of the three raw variants outside `storage`, rather than only destructuring them
-  for policy. Remaining work is to make the diagnostic payloads of the storage-internal raw variants
-  structurally opaque in the public Rust API; the repository check provides containment for
-  in-repository callers until that representation refactor is complete.
+  for policy. The raw variants now carry public wrapper types with private storage-owned state:
+  callers may identify `Io`, `RpcProtocol`, or `RpcRemote`, but cannot recover the retained I/O
+  context, operating-system error, or RPC text. Their public `Debug` and `Display` output is
+  redacted, and `Io` deliberately does not expose the underlying error through `Error::source()`.
+  Storage-private constructors and accessors preserve owner-local transport classification and
+  malformed-wire diagnostics without relying on the repository check for payload opacity. Static
+  configuration also validates bootstrap replication safety through an opaque semantic error;
+  encoded-entry diagnostics no longer cross into `argmin-s3` configuration errors. Storage-owned
+  semantic reclassification retains the original error as an opaque cause, including when the
+  process layer classifies restart-checkpoint failures as durability failures; public formatting
+  and `Error::source()` remain redacted.
 - Storage contains the codec, version, authentication, retry, resource-admission, TLS/ALPN, and
   client/server protocol tests. Process-level lifecycle and durability tests remain in
   `argmin-s3`, but use logical clients and the opaque storage-owned server facade.
@@ -576,9 +584,9 @@ The storage-owned PG layout slice is complete:
 - Native-lock symlink and replacement tests are owned by `storage`; the boundary check rejects
   exposing the constant or literal filename to `argmin-s3`.
 
-Residual containment work now starts with replacing the remaining higher-layer matching and
-construction of control-plane transport/implementation errors. The RPC transports, raw Raft
-representations, and durable Raft restart/WAL formats are contained and boundary-checked.
+The higher-layer control-plane error cleanup is complete. The RPC transports, their raw diagnostic
+payloads, raw Raft representations, and durable Raft restart/WAL formats are contained and
+boundary-checked. Residual containment work now starts with the nested durable codecs.
 
 ## Immediate Next Steps
 
@@ -589,11 +597,11 @@ Raft peer client and server transports are storage-owned and boundary-checked.
    transport-error APIs and relocate malformed-wire tests into `storage`.
 2. **Complete:** hide public WAL/restart-format constructors and move direct WAL/impossible-state
    tests into the owner.
-3. **In progress:** replace other higher-layer matching and construction of database/RPC
+3. **Complete:** replace other higher-layer matching and construction of database/RPC
    implementation errors with owner-defined semantic errors or exhaustive classification methods.
-   Start with `ControlPlaneError`: storage must own transport, response-loss, leader-routing, and
-   runtime-map readiness classification; callers must not parse rendered messages or construct raw
-   `Io`, `RpcProtocol`, or `RpcRemote` variants to drive policy tests.
+   `ControlPlaneError` transport, response-loss, leader-routing, and runtime-map readiness
+   classification is storage-owned. Callers cannot parse or recover retained implementation
+   diagnostics, and cannot construct raw `Io`, `RpcProtocol`, or `RpcRemote` variants.
 4. Inventory and restrict nested durable codecs for metadata, tags, ACLs, and encryption;
    record how containing formats advance when a nested format changes.
 5. Audit existing version/fallback code and remove unsupported legacy compatibility where it

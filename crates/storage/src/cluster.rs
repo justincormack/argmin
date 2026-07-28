@@ -1491,7 +1491,7 @@ impl StorageClusterRuntimeMapRefreshError {
 
 fn control_plane_refresh_error_diagnostic_kind(error: &ControlPlaneError) -> &'static str {
     match error {
-        ControlPlaneError::Io { source, .. } => match source.kind() {
+        ControlPlaneError::Io { diagnostic: source } => match source.kind() {
             io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => "control_plane_io_timeout",
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
                 "control_plane_unavailable"
@@ -5069,17 +5069,17 @@ mod runtime_map_refresh_invalidation_tests {
         ));
         assert!(
             !runtime_map_refresh_error_requires_current_map_invalidation(
-                &StorageClusterRuntimeMapRefreshError::ControlPlane(ControlPlaneError::RpcRemote {
-                    message: "connect timeout".to_string(),
-                }),
+                &StorageClusterRuntimeMapRefreshError::ControlPlane(ControlPlaneError::rpc_remote(
+                    "connect timeout".to_string()
+                )),
             )
         );
         assert!(
             !runtime_map_refresh_error_requires_current_map_invalidation(
-                &StorageClusterRuntimeMapRefreshError::ControlPlane(ControlPlaneError::Io {
-                    context: "connect control-plane RPC socket",
-                    source: io::Error::new(io::ErrorKind::TimedOut, "timeout"),
-                }),
+                &StorageClusterRuntimeMapRefreshError::ControlPlane(ControlPlaneError::io(
+                    "connect control-plane RPC socket",
+                    io::Error::new(io::ErrorKind::TimedOut, "timeout")
+                )),
             )
         );
     }

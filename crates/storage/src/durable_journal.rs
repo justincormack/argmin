@@ -181,10 +181,7 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
             .filter(|parent| !parent.as_os_str().is_empty())
         {
             fs::create_dir_all(parent)
-                .map_err(|source| ControlPlaneError::Io {
-                    context: self.contexts.create_directory,
-                    source,
-                })
+                .map_err(|source| ControlPlaneError::io(self.contexts.create_directory, source))
                 .map_err(DurableJournalAppendError::BeforeReplayableRecord)?;
         }
 
@@ -193,10 +190,7 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
             .read(true)
             .append(true)
             .open(&self.path)
-            .map_err(|source| ControlPlaneError::Io {
-                context: self.contexts.open_for_append,
-                source,
-            })
+            .map_err(|source| ControlPlaneError::io(self.contexts.open_for_append, source))
             .map_err(DurableJournalAppendError::BeforeReplayableRecord)?;
         self.ensure_file_header(&mut file)?;
         let mut frame_prefix = [0u8; FRAME_PREFIX_LEN];
@@ -207,10 +201,8 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
 
         let file_sync_started = Instant::now();
         let file_sync_result = self.observer.before_file_sync(&self.path).and_then(|()| {
-            file.sync_all().map_err(|source| ControlPlaneError::Io {
-                context: self.contexts.sync_file,
-                source,
-            })
+            file.sync_all()
+                .map_err(|source| ControlPlaneError::io(self.contexts.sync_file, source))
         });
         self.observer.record_file_sync(file_sync_started.elapsed());
         file_sync_result.map_err(DurableJournalAppendError::AmbiguousRecordMayExist)?;
@@ -229,7 +221,7 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
         let _guard = self.lock()?;
         let replay_offset = match self.read_file_base_offset_unlocked() {
             Ok(base_offset) => base_offset,
-            Err(ControlPlaneError::Io { source, .. })
+            Err(ControlPlaneError::Io { diagnostic: source })
                 if source.kind() == io::ErrorKind::NotFound =>
             {
                 return Ok(0);
@@ -250,10 +242,7 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
                 });
             }
             Err(source) => {
-                return Err(ControlPlaneError::Io {
-                    context: self.contexts.stat_for_status,
-                    source,
-                });
+                return Err(ControlPlaneError::io(self.contexts.stat_for_status, source));
             }
         };
         if file_len == 0 {
@@ -306,18 +295,12 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
                 });
             }
             Err(source) => {
-                return Err(ControlPlaneError::Io {
-                    context: self.contexts.open_for_replay,
-                    source,
-                });
+                return Err(ControlPlaneError::io(self.contexts.open_for_replay, source));
             }
         };
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
-            .map_err(|source| ControlPlaneError::Io {
-                context: self.contexts.read_for_replay,
-                source,
-            })?;
+            .map_err(|source| ControlPlaneError::io(self.contexts.read_for_replay, source))?;
         if bytes.is_empty() {
             if replay_offset != 0 {
                 return Err(self.protocol_error(format!(
@@ -429,9 +412,8 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
         let file = OpenOptions::new()
             .write(true)
             .open(&self.path)
-            .map_err(|source| ControlPlaneError::Io {
-                context: self.contexts.open_for_tail_truncation,
-                source,
+            .map_err(|source| {
+                ControlPlaneError::io(self.contexts.open_for_tail_truncation, source)
             })?;
         let physical_len = u64::try_from(self.format.header_len())
             .expect("header length fits u64")
@@ -440,14 +422,9 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
                 self.protocol_error(format!("{} physical length overflows", self.format.label))
             })?;
         file.set_len(physical_len)
-            .map_err(|source| ControlPlaneError::Io {
-                context: self.contexts.truncate_torn_tail,
-                source,
-            })?;
-        file.sync_all().map_err(|source| ControlPlaneError::Io {
-            context: self.contexts.sync_truncated_tail,
-            source,
-        })?;
+            .map_err(|source| ControlPlaneError::io(self.contexts.truncate_torn_tail, source))?;
+        file.sync_all()
+            .map_err(|source| ControlPlaneError::io(self.contexts.sync_truncated_tail, source))?;
         self.observer.sync_parent(&self.path)
     }
 
@@ -484,10 +461,8 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
             .record_compaction_lock_wait(lock_started.elapsed());
         let _guard = guard?;
 
-        let bytes = fs::read(&self.path).map_err(|source| ControlPlaneError::Io {
-            context: self.contexts.read_for_compaction,
-            source,
-        })?;
+        let bytes = fs::read(&self.path)
+            .map_err(|source| ControlPlaneError::io(self.contexts.read_for_compaction, source))?;
         let (base_offset, header_len) = self.decode_file_header(&bytes)?;
         if replay_offset < base_offset {
             return Err(self.protocol_error(format!(
@@ -535,29 +510,23 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
         let compacted = self.encode_file_bytes(replay_offset, &replacement);
         let tmp_path = self.tmp_path();
         {
-            let mut file = File::create(&tmp_path).map_err(|source| ControlPlaneError::Io {
-                context: self.contexts.create_compacted_temp,
-                source,
+            let mut file = File::create(&tmp_path).map_err(|source| {
+                ControlPlaneError::io(self.contexts.create_compacted_temp, source)
             })?;
-            file.write_all(&compacted)
-                .map_err(|source| ControlPlaneError::Io {
-                    context: self.contexts.write_compacted_temp,
-                    source,
-                })?;
+            file.write_all(&compacted).map_err(|source| {
+                ControlPlaneError::io(self.contexts.write_compacted_temp, source)
+            })?;
             self.observer.record_compaction_bytes(compacted.len());
             let file_sync_started = Instant::now();
-            let file_sync_result = file.sync_all().map_err(|source| ControlPlaneError::Io {
-                context: self.contexts.sync_compacted_temp,
-                source,
-            });
+            let file_sync_result = file
+                .sync_all()
+                .map_err(|source| ControlPlaneError::io(self.contexts.sync_compacted_temp, source));
             self.observer
                 .record_compaction_file_sync(file_sync_started.elapsed());
             file_sync_result?;
         }
-        fs::rename(&tmp_path, &self.path).map_err(|source| ControlPlaneError::Io {
-            context: self.contexts.commit_compacted,
-            source,
-        })?;
+        fs::rename(&tmp_path, &self.path)
+            .map_err(|source| ControlPlaneError::io(self.contexts.commit_compacted, source))?;
         let directory_sync_started = Instant::now();
         let directory_sync_result = self.observer.sync_parent(&self.path);
         self.observer
@@ -583,10 +552,10 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
                 )));
             }
             Err(source) => {
-                return Err(ControlPlaneError::Io {
-                    context: self.contexts.read_for_compaction,
+                return Err(ControlPlaneError::io(
+                    self.contexts.read_for_compaction,
                     source,
-                });
+                ));
             }
         };
         if bytes.is_empty() {
@@ -629,29 +598,23 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
         let compacted = self.encode_file_bytes(replay_offset, &suffix);
         let tmp_path = self.tmp_path();
         {
-            let mut file = File::create(&tmp_path).map_err(|source| ControlPlaneError::Io {
-                context: self.contexts.create_compacted_temp,
-                source,
+            let mut file = File::create(&tmp_path).map_err(|source| {
+                ControlPlaneError::io(self.contexts.create_compacted_temp, source)
             })?;
-            file.write_all(&compacted)
-                .map_err(|source| ControlPlaneError::Io {
-                    context: self.contexts.write_compacted_temp,
-                    source,
-                })?;
+            file.write_all(&compacted).map_err(|source| {
+                ControlPlaneError::io(self.contexts.write_compacted_temp, source)
+            })?;
             self.observer.record_compaction_bytes(compacted.len());
             let file_sync_started = Instant::now();
-            let file_sync_result = file.sync_all().map_err(|source| ControlPlaneError::Io {
-                context: self.contexts.sync_compacted_temp,
-                source,
-            });
+            let file_sync_result = file
+                .sync_all()
+                .map_err(|source| ControlPlaneError::io(self.contexts.sync_compacted_temp, source));
             self.observer
                 .record_compaction_file_sync(file_sync_started.elapsed());
             file_sync_result?;
         }
-        fs::rename(&tmp_path, &self.path).map_err(|source| ControlPlaneError::Io {
-            context: self.contexts.commit_compacted,
-            source,
-        })?;
+        fs::rename(&tmp_path, &self.path)
+            .map_err(|source| ControlPlaneError::io(self.contexts.commit_compacted, source))?;
         let directory_sync_started = Instant::now();
         let directory_sync_result = self.observer.sync_parent(&self.path);
         self.observer
@@ -722,10 +685,7 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
     fn ensure_file_header(&self, file: &mut File) -> Result<(), DurableJournalAppendError> {
         if file
             .metadata()
-            .map_err(|source| ControlPlaneError::Io {
-                context: self.contexts.stat_before_append,
-                source,
-            })
+            .map_err(|source| ControlPlaneError::io(self.contexts.stat_before_append, source))
             .map_err(DurableJournalAppendError::BeforeReplayableRecord)?
             .len()
             != 0
@@ -743,17 +703,12 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
 
     fn read_file_base_offset_unlocked(&self) -> Result<u64, ControlPlaneError> {
         let header_len = self.format.header_len();
-        let file = File::open(&self.path).map_err(|source| ControlPlaneError::Io {
-            context: self.contexts.open_file_header,
-            source,
-        })?;
+        let file = File::open(&self.path)
+            .map_err(|source| ControlPlaneError::io(self.contexts.open_file_header, source))?;
         let mut bytes = Vec::with_capacity(header_len);
         file.take(header_len as u64)
             .read_to_end(&mut bytes)
-            .map_err(|source| ControlPlaneError::Io {
-                context: self.contexts.read_file_header,
-                source,
-            })?;
+            .map_err(|source| ControlPlaneError::io(self.contexts.read_file_header, source))?;
         Ok(self.decode_file_header(&bytes)?.0)
     }
 
@@ -770,10 +725,9 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
         context: &'static str,
     ) -> Result<(), DurableJournalAppendError> {
         writer.write_all(bytes).map_err(|source| {
-            DurableJournalAppendError::AmbiguousRecordMayExist(ControlPlaneError::Io {
-                context,
-                source,
-            })
+            DurableJournalAppendError::AmbiguousRecordMayExist(ControlPlaneError::io(
+                context, source,
+            ))
         })
     }
 

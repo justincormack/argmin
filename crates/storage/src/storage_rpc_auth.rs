@@ -1461,9 +1461,7 @@ fn storage_rpc_frame_protocol_error(error: StorageRpcFrameError) -> ControlPlane
 }
 
 fn storage_rpc_auth_protocol_error(message: impl Into<String>) -> ControlPlaneError {
-    ControlPlaneError::RpcProtocol {
-        message: format!("storage RPC auth envelope: {}", message.into()),
-    }
+    ControlPlaneError::rpc_protocol(format!("storage RPC auth envelope: {}", message.into()))
 }
 
 struct BindingReader<'a> {
@@ -1833,7 +1831,7 @@ mod tests {
         );
         let error =
             MaintenanceStorageRpcClientCapability::new(credential, 9, TOPOLOGY_DIGEST).unwrap_err();
-        assert!(error.to_string().contains("maintenance capability"));
+        assert!(error.retained_diagnostic_contains("maintenance capability"));
     }
 
     fn sign_request(

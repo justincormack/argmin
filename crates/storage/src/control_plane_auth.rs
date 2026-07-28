@@ -1159,9 +1159,7 @@ fn len_as_u32(len: usize, field: &'static str) -> Result<u32, ControlPlaneError>
 }
 
 fn auth_protocol_error(message: impl Into<String>) -> ControlPlaneError {
-    ControlPlaneError::RpcProtocol {
-        message: format!("control-plane auth envelope: {}", message.into()),
-    }
+    ControlPlaneError::rpc_protocol(format!("control-plane auth envelope: {}", message.into()))
 }
 
 struct AuthPayloadReader<'a> {
