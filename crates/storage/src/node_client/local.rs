@@ -690,7 +690,9 @@ impl ShardScavengerNodeClient for LocalStorageNodeClient {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         pg.list_shard_scavenger_payload_references()
     }
+}
 
+impl ShardScavengerObservationNodeClient for LocalStorageNodeClient {
     fn record_shard_scavenger_observation(
         &self,
         data_pg_id: DataPgId,

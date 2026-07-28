@@ -657,7 +657,8 @@ Node-client role classification (2026-07-19):
 | `ObjectReadMetadataNodeClient` | object metadata | active object route plus the existing subject identity/read lease |
 | `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active data route for serving I/O, current placement cleanup, and repair/backfill work |
 | `RetainedPlacedShardNodeClient`, `RetainedShardAckNodeClient` | data | retained exact-placement inspection and cleanup for historical shard bytes and acknowledgement rows |
-| `ShardScavengerNodeClient` | data for shard rows/files, generic metadata PG for durable observation rows | active or retained authority according to the scanned location; observation publication is primary-only |
+| `ShardScavengerNodeClient` | data for shard rows/files and object-metadata reference scans | read-only inventory authority for the validated active or retained scan location |
+| `ShardScavengerObservationNodeClient` | data PG for durable observation rows | active primary-only authority to record, list, and resolve non-authoritative scavenger findings |
 | `ShardReadHandleNodeClient` | data locations carried in the handle request | active/retained authority is inherited from each validated `ShardLocation`; the lease itself remains non-cloneable |
 | `ObjectPayloadLeaseNodeClient` | object subject rather than a caller-supplied PG | active subject-bound lease acquisition, reclaim-begin, and observation; placement is validated when shard locations are acquired |
 | `RetainedObjectPayloadReclaimNodeClient` | object subject rather than a caller-supplied PG | retained exact-claim reclaim completion and fence cleanup; opaque lease objects retain their own release authority |
@@ -3714,6 +3715,25 @@ Eighty-sixth Phase 3 slice:
 - all 2,366 storage tests pass, as do formatting, the storage boundary checker,
   and workspace-wide strict Clippy. The full 7,679-test workspace suite also
   passes.
+
+Eighty-seventh Phase 3 slice:
+
+- shard inventory/reference scanning and durable observation state are now
+  separate node-client roles. `ShardScavengerNodeClient` is read-only and owns
+  route-history, shard-file, shard-row, and object-reference scans;
+  `ShardScavengerObservationNodeClient` owns primary-only observation record,
+  list, and resolution operations.
+- local and Unix adapters implement both roles, but `LocalNodeStore` and
+  `LocalNodeClients` retain distinct trait objects. The cluster audit selects
+  an observation client only from the routed data-PG primary, while per-node
+  file inventory remains available only through the scan client.
+- focused coverage includes all shard-scavenger tests and the Unix shard
+  client parity regression, pinning primary-only durable observation state and
+  read-only scan behavior. Opaque capability arguments for the remaining
+  role-specific node-client traits remain open in Phase 3.
+- all 2,366 storage tests pass, as do the focused Unix parity regression,
+  formatting, the storage boundary checker, workspace-wide strict Clippy, and
+  the full workspace test suite.
 
 ### Phase 4 — type metadata-command publication
 

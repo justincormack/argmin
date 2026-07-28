@@ -36,7 +36,8 @@ use crate::node_client::{
     RetainedBucketWriteReservationNodeClient, RetainedObjectMutationMetadataNodeClient,
     RetainedObjectPayloadReclaimNodeClient, RetainedPlacedShardNodeClient,
     RetainedShardAckNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient,
-    ShardScavengerNodeClient, UnixStorageNodeClient, UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
+    ShardScavengerNodeClient, ShardScavengerObservationNodeClient, UnixStorageNodeClient,
+    UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
     UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
@@ -513,6 +514,7 @@ pub struct LocalNodeStore {
     retained_shard_ack_client: Arc<dyn RetainedShardAckNodeClient>,
     shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient>,
     shard_scavenger_client: Arc<dyn ShardScavengerNodeClient>,
+    shard_scavenger_observation_client: Arc<dyn ShardScavengerObservationNodeClient>,
 }
 
 impl LocalNodeStore {
@@ -543,6 +545,7 @@ impl LocalNodeStore {
             retained_shard_ack_client: clients.retained_shard_ack,
             shard_read_handle_client: clients.shard_read_handle,
             shard_scavenger_client: clients.shard_scavenger,
+            shard_scavenger_observation_client: clients.shard_scavenger_observation,
         }
     }
 
@@ -668,6 +671,12 @@ impl LocalNodeStore {
 
     pub(crate) fn shard_scavenger_client(&self) -> &Arc<dyn ShardScavengerNodeClient> {
         &self.shard_scavenger_client
+    }
+
+    pub(crate) fn shard_scavenger_observation_client(
+        &self,
+    ) -> &Arc<dyn ShardScavengerObservationNodeClient> {
+        &self.shard_scavenger_observation_client
     }
 }
 
@@ -2306,13 +2315,16 @@ impl LocalClusterMap {
             let shard_ack_client: Arc<dyn ShardAckNodeClient> = client.clone();
             let retained_shard_ack_client: Arc<dyn RetainedShardAckNodeClient> = client.clone();
             let shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient> = client.clone();
-            let shard_scavenger_client: Arc<dyn ShardScavengerNodeClient> = client;
+            let shard_scavenger_client: Arc<dyn ShardScavengerNodeClient> = client.clone();
+            let shard_scavenger_observation_client: Arc<dyn ShardScavengerObservationNodeClient> =
+                client;
             node.shard_client = shard_client;
             node.retained_shard_client = retained_shard_client;
             node.shard_ack_client = shard_ack_client;
             node.retained_shard_ack_client = retained_shard_ack_client;
             node.shard_read_handle_client = shard_read_handle_client;
             node.shard_scavenger_client = shard_scavenger_client;
+            node.shard_scavenger_observation_client = shard_scavenger_observation_client;
         }
         Ok(())
     }
@@ -2373,7 +2385,9 @@ impl LocalClusterMap {
             let shard_ack_client: Arc<dyn ShardAckNodeClient> = client.clone();
             let retained_shard_ack_client: Arc<dyn RetainedShardAckNodeClient> = client.clone();
             let shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient> = client.clone();
-            let shard_scavenger_client: Arc<dyn ShardScavengerNodeClient> = client;
+            let shard_scavenger_client: Arc<dyn ShardScavengerNodeClient> = client.clone();
+            let shard_scavenger_observation_client: Arc<dyn ShardScavengerObservationNodeClient> =
+                client;
 
             node.bucket_metadata_client = bucket_metadata_client;
             node.bucket_metadata_unix_socket_path = unix_socket_path.clone();
@@ -2398,6 +2412,7 @@ impl LocalClusterMap {
             node.retained_shard_ack_client = retained_shard_ack_client;
             node.shard_read_handle_client = shard_read_handle_client;
             node.shard_scavenger_client = shard_scavenger_client;
+            node.shard_scavenger_observation_client = shard_scavenger_observation_client;
         }
         Ok(())
     }

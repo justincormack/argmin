@@ -13850,6 +13850,7 @@ impl StorageCluster {
             let data_pg = self.validated_data_pg(route.pg_id())?;
             let data_pg_id = data_pg.get();
             let scavenger_client = primary_node.shard_scavenger_client();
+            let observation_client = primary_node.shard_scavenger_observation_client();
             let shard_rows = scavenger_client.list_scavenger_shard_rows(data_pg)?;
             let rows_by_key: HashMap<ShardKey, WriteAck> = shard_rows
                 .iter()
@@ -13883,7 +13884,7 @@ impl StorageCluster {
             }
 
             if !reference_scan_errors.is_empty() {
-                scavenger_client.record_shard_scavenger_observation(
+                observation_client.record_shard_scavenger_observation(
                     data_pg,
                     &Self::shard_scavenger_scan_incomplete_observation(
                         primary_node_id,
@@ -13891,7 +13892,7 @@ impl StorageCluster {
                         &reference_scan_errors,
                     ),
                 )?;
-                observations.extend(scavenger_client.list_shard_scavenger_observations(data_pg)?);
+                observations.extend(observation_client.list_shard_scavenger_observations(data_pg)?);
                 continue;
             }
 
@@ -13901,14 +13902,14 @@ impl StorageCluster {
                     errors_by_node.entry(node_id).or_default().push(error);
                 }
                 for (node_id, errors) in errors_by_node {
-                    scavenger_client.record_shard_scavenger_observation(
+                    observation_client.record_shard_scavenger_observation(
                         data_pg,
                         &Self::shard_scavenger_scan_incomplete_observation(
                             node_id, data_pg_id, &errors,
                         ),
                     )?;
                 }
-                observations.extend(scavenger_client.list_shard_scavenger_observations(data_pg)?);
+                observations.extend(observation_client.list_shard_scavenger_observations(data_pg)?);
                 continue;
             }
 
@@ -13925,7 +13926,7 @@ impl StorageCluster {
                     };
                     let Some(row_ack) = rows_by_key.get(&file.key).copied() else {
                         active_observations.insert(observation_key.clone());
-                        scavenger_client.record_shard_scavenger_observation(
+                        observation_client.record_shard_scavenger_observation(
                             data_pg,
                             &ShardScavengerObservationRecord {
                                 key: observation_key,
@@ -13944,7 +13945,7 @@ impl StorageCluster {
                         continue;
                     }
                     active_observations.insert(observation_key.clone());
-                    scavenger_client.record_shard_scavenger_observation(
+                    observation_client.record_shard_scavenger_observation(
                         data_pg,
                         &ShardScavengerObservationRecord {
                             key: observation_key,
@@ -13977,7 +13978,7 @@ impl StorageCluster {
                             shard_key: row.key.clone(),
                         };
                         active_observations.insert(observation_key.clone());
-                        scavenger_client.record_shard_scavenger_observation(
+                        observation_client.record_shard_scavenger_observation(
                             data_pg,
                             &ShardScavengerObservationRecord {
                                 key: observation_key,
@@ -14015,7 +14016,7 @@ impl StorageCluster {
                     shard_key: row.key,
                 };
                 active_observations.insert(observation_key.clone());
-                scavenger_client.record_shard_scavenger_observation(
+                observation_client.record_shard_scavenger_observation(
                     data_pg,
                     &ShardScavengerObservationRecord {
                         key: observation_key,
@@ -14029,7 +14030,7 @@ impl StorageCluster {
                 )?;
             }
 
-            for observation in scavenger_client.list_shard_scavenger_observations(data_pg)? {
+            for observation in observation_client.list_shard_scavenger_observations(data_pg)? {
                 if observation.key.data_pg_id != data_pg_id
                     || observation.resolved_at.is_some()
                     || !matches!(
@@ -14043,12 +14044,12 @@ impl StorageCluster {
                     continue;
                 }
                 if !active_observations.contains(&observation.key) {
-                    scavenger_client
+                    observation_client
                         .resolve_shard_scavenger_observation(data_pg, &observation.key)?;
                 }
             }
 
-            observations.extend(scavenger_client.list_shard_scavenger_observations(data_pg)?);
+            observations.extend(observation_client.list_shard_scavenger_observations(data_pg)?);
         }
 
         Ok(observations)
@@ -16946,7 +16947,7 @@ impl StorageCluster {
         let pg_id = PgId::new(data_pg_id);
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .shard_scavenger_client()
+            .shard_scavenger_observation_client()
             .list_shard_scavenger_observations(self.validated_data_pg(pg_id)?)
     }
 

@@ -24,7 +24,7 @@ use super::clients::{
     PlacedShardNodeClient, RetainedBucketWriteReservationNodeClient,
     RetainedObjectMutationMetadataNodeClient, RetainedObjectPayloadReclaimNodeClient,
     RetainedPlacedShardNodeClient, RetainedShardAckNodeClient, ShardAckNodeClient,
-    ShardReadHandleNodeClient, ShardScavengerNodeClient,
+    ShardReadHandleNodeClient, ShardScavengerNodeClient, ShardScavengerObservationNodeClient,
 };
 use super::{BucketPgId, DataPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 use crate::cluster::ProcessLocalRegistryKey;
@@ -429,6 +429,7 @@ pub(crate) struct LocalNodeClients {
     pub(crate) retained_shard_ack: Arc<dyn RetainedShardAckNodeClient>,
     pub(crate) shard_read_handle: Arc<dyn ShardReadHandleNodeClient>,
     pub(crate) shard_scavenger: Arc<dyn ShardScavengerNodeClient>,
+    pub(crate) shard_scavenger_observation: Arc<dyn ShardScavengerObservationNodeClient>,
 }
 
 fn allocate_process_local_registry_key() -> Result<ProcessLocalRegistryKey, StoreError> {
@@ -490,6 +491,7 @@ impl LocalNodeRuntime {
             retained_shard_ack: self.client.clone(),
             shard_read_handle: self.client.clone(),
             shard_scavenger: self.client.clone(),
+            shard_scavenger_observation: self.client.clone(),
         }
     }
 

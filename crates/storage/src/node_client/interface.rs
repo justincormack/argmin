@@ -1289,7 +1289,12 @@ pub(crate) trait ShardScavengerNodeClient: Send + Sync {
         &self,
         pg_id: ObjectMetadataScanPgId,
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError>;
+}
 
+/// Primary-only durable state for shard-scavenger findings. Keeping this
+/// separate from scan access prevents an inventory client from publishing or
+/// resolving observations.
+pub(crate) trait ShardScavengerObservationNodeClient: Send + Sync {
     fn record_shard_scavenger_observation(
         &self,
         data_pg_id: DataPgId,

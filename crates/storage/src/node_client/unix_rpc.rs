@@ -1315,7 +1315,9 @@ impl ShardScavengerNodeClient for UnixStorageNodeClient {
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
         UnixStorageNodeClient::list_shard_scavenger_payload_references(self, pg_id)
     }
+}
 
+impl ShardScavengerObservationNodeClient for UnixStorageNodeClient {
     fn record_shard_scavenger_observation(
         &self,
         data_pg_id: DataPgId,

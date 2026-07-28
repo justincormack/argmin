@@ -52,7 +52,8 @@ use crate::node_client::{
     ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
     RetainedBucketWriteReservationNodeClient, RetainedObjectMutationMetadataNodeClient,
-    ShardAckNodeClient, ShardScavengerNodeClient, UpdateStreamUploadBucketWriteReservationReq,
+    ShardAckNodeClient, ShardScavengerNodeClient, ShardScavengerObservationNodeClient,
+    UpdateStreamUploadBucketWriteReservationReq,
 };
 use crate::node_runtime::pg_store::{
     initialize_pg_durable_identity, inspect_pg_shard_inventory, sync_initialized_pg_store_layout,

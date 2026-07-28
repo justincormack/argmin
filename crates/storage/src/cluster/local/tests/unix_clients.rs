@@ -1583,7 +1583,7 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
     };
     map.node(NodeId::new(1))
         .unwrap()
-        .shard_scavenger_client()
+        .shard_scavenger_observation_client()
         .record_shard_scavenger_observation(
             data_pg_id,
             &crate::ShardScavengerObservationRecord {
@@ -1600,7 +1600,7 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
     let observations = map
         .node(NodeId::new(1))
         .unwrap()
-        .shard_scavenger_client()
+        .shard_scavenger_observation_client()
         .list_shard_scavenger_observations(data_pg_id)
         .unwrap();
     assert_eq!(observations.len(), 1);
@@ -1616,7 +1616,7 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
         .is_empty());
     map.node(NodeId::new(1))
         .unwrap()
-        .shard_scavenger_client()
+        .shard_scavenger_observation_client()
         .resolve_shard_scavenger_observation(data_pg_id, &observation_key)
         .unwrap();
     let missing_key = ShardKey::new(&[0x62; 16], 100, 0);
