@@ -3311,7 +3311,7 @@ where
         .iter()
         .filter(|disk| disk.host_id == selected_host_id)
         .map(|disk| {
-            let normalized_mount = normalize_absolute_path(&disk.mount_path, "disk mount path")?;
+            let normalized_mount = normalize_disk_mount_path(&disk.mount_path)?;
             let metadata = std::fs::symlink_metadata(&normalized_mount).map_err(|error| {
                 format!(
                     "selected-host disk {} mount path cannot be inspected: {error}",
@@ -3324,7 +3324,7 @@ where
                     disk.id
                 ));
             }
-            validate_selected_host_path_permissions(
+            validate_selected_host_ancestor_permissions(
                 &metadata,
                 effective_uid,
                 &format!("selected-host disk {} mount path", disk.id),
@@ -3402,6 +3402,9 @@ fn validate_selected_host_mount_boundary(
     mount_metadata: &std::fs::Metadata,
     label: &str,
 ) -> Result<(), String> {
+    if mount_path == Path::new("/") {
+        return Ok(());
+    }
     let parent = mount_path
         .parent()
         .ok_or_else(|| format!("{label} has no parent filesystem boundary"))?;
@@ -3463,7 +3466,7 @@ fn validate_selected_host_durable_path(
                         "{label} crosses away from its declared disk device"
                     ));
                 }
-                validate_selected_host_path_permissions(&metadata, effective_uid, label)?;
+                validate_selected_host_ancestor_permissions(&metadata, effective_uid, label)?;
                 deepest_existing = current.clone();
                 final_metadata = Some(metadata);
             }
@@ -3515,6 +3518,25 @@ fn validate_selected_host_path_permissions(
     if mode & 0o022 != 0 {
         return Err(format!(
             "{label} must not be writable by group or other users"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_selected_host_ancestor_permissions(
+    metadata: &std::fs::Metadata,
+    effective_uid: u32,
+    label: &str,
+) -> Result<(), String> {
+    if metadata.uid() != effective_uid && metadata.uid() != 0 {
+        return Err(format!(
+            "{label} ancestors must be owned by root or the effective process user"
+        ));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "{label} ancestors must not be writable by group or other users"
         ));
     }
     Ok(())
@@ -3877,7 +3899,7 @@ fn validate_disks<'a>(
                 disk.id, disk.host_id
             ));
         }
-        let normalized = normalize_absolute_path(&disk.mount_path, "disk mount path")?;
+        let normalized = normalize_disk_mount_path(&disk.mount_path)?;
         if !host_paths.insert((disk.host_id.as_str(), normalized)) {
             return Err(format!(
                 "duplicate disk mount path on host {}",
@@ -4008,7 +4030,7 @@ fn validate_authorities<'a>(
             ));
         }
         let state_path = normalize_absolute_path(&authority.state_path, "authority state path")?;
-        let mount_path = normalize_absolute_path(&disk.mount_path, "disk mount path")?;
+        let mount_path = normalize_disk_mount_path(&disk.mount_path)?;
         if !state_path.starts_with(&mount_path) || state_path == mount_path {
             return Err(format!(
                 "authority {} state path is not contained by disk {}",
@@ -4091,7 +4113,7 @@ fn validate_storage_nodes<'a>(
             ));
         }
         let data_dir = normalize_absolute_path(&storage_node.data_dir, "storage data path")?;
-        let mount_path = normalize_absolute_path(&disk.mount_path, "disk mount path")?;
+        let mount_path = normalize_disk_mount_path(&disk.mount_path)?;
         if !data_dir.starts_with(&mount_path) || data_dir == mount_path {
             return Err(format!(
                 "storage node {} data path is not contained by disk {}",
@@ -5563,6 +5585,18 @@ fn validate_tcp_dns_or_ipv4_host(value: &str) -> Result<(), String> {
 }
 
 fn normalize_absolute_path(path: &Path, field: &str) -> Result<PathBuf, String> {
+    normalize_absolute_path_with_root_policy(path, field, false)
+}
+
+fn normalize_disk_mount_path(path: &Path) -> Result<PathBuf, String> {
+    normalize_absolute_path_with_root_policy(path, "disk mount path", true)
+}
+
+fn normalize_absolute_path_with_root_policy(
+    path: &Path,
+    field: &str,
+    allow_root: bool,
+) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!("{field} must be absolute"));
     }
@@ -5588,7 +5622,7 @@ fn normalize_absolute_path(path: &Path, field: &str) -> Result<PathBuf, String> 
     if result.as_os_str().as_encoded_bytes() != path.as_os_str().as_encoded_bytes() {
         return Err(format!("{field} is not canonical"));
     }
-    if result == Path::new("/") {
+    if !allow_root && result == Path::new("/") {
         return Err(format!("{field} must not be filesystem root"));
     }
     Ok(result)
@@ -7754,6 +7788,17 @@ transport_profile_id = "internal"
         assert!(validate_distinct_mount_devices(10, 10, "test mount")
             .unwrap_err()
             .contains("exact distinct-device mount boundary"));
+    }
+
+    #[test]
+    fn static_cluster_disk_mount_allows_explicit_filesystem_root() {
+        assert_eq!(
+            normalize_disk_mount_path(Path::new("/")).unwrap(),
+            Path::new("/")
+        );
+        assert!(normalize_absolute_path(Path::new("/"), "state path")
+            .unwrap_err()
+            .contains("must not be filesystem root"));
     }
 
     #[test]

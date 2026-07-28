@@ -12346,6 +12346,26 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   substitutes for the per-host durable-write profile. Add authenticated
   storage RPC over Unix and then TCP before treating the workload as a complete
   multihost data-plane release gate.
+- `./scripts/uat-multihost-raft` is the first authority-only implementation of
+  that real-host gate. It deploys one static-manifest authority to each of three
+  SSH-managed hosts, but all product traffic uses mutually authenticated
+  TLS/TCP Raft and control-plane endpoints. The gate validates the manifest and
+  initializes durable identity independently on each host, proves all-to-all
+  Raft reachability, commits 256 observed route-epoch advances over 116 PGs,
+  snapshots and purges, then transfers leadership to each voter in turn,
+  stops that leader, explicitly recovers the successor clock in a newer term,
+  and restarts and converges the old voter. Canonical no-op route commands do
+  not count toward the 256-epoch requirement. The default `persistent` profile
+  treats each configured state path as an operator-selected durability domain;
+  `volatile-test` is an explicit non-durability test policy. Filesystem type is
+  not inferred by platform-specific runtime probes.
+- The first complete three-host run on the `grey0`, `grey1`, and `grey2`
+  reference hosts passed all three transfer/loss/restart cycles and reached
+  Raft term 9. Its final authority artifacts were approximately 80 KiB with
+  bounded WAL suffixes. This establishes the static authenticated authority
+  path, not the complete multihost data-plane gate: storage-node placement,
+  authenticated storage RPC traffic, S3 workload correctness, and quantitative
+  per-host checkpoint/WAL/fsync metrics remain required before release cutover.
 - Add shared authenticated test helpers first, in
   [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
   so all replicated process and UAT tests can configure authenticated Unix

@@ -62,6 +62,7 @@ use crate::control_plane::{
     ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneRuntimeMapNodeLeaseDiagnostic,
     ControlPlaneRuntimeMapStatus, DeadlineUnixStream, NodeAvailabilityState, NodeMembershipState,
     RuntimeMapContentCertificate, RuntimeMapFreshnessProof,
+    CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS,
 };
 use crate::control_plane_auth::{
     ControlPlaneAuthDecision, ControlPlaneAuthEnvelope, ControlPlaneAuthOperation,
@@ -843,7 +844,7 @@ fn peer_auth_replay_policy(
     ControlPlaneAuthReplayPolicy::TimestampWindow {
         now_ms: crate::clock::current_time_millis(),
         max_window_ms: CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS,
-        allowed_future_skew_ms: 0,
+        allowed_future_skew_ms: CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS,
     }
 }
 
@@ -15436,7 +15437,21 @@ mod tests {
             raw_frame
         );
 
-        clock.set(9_999);
+        clock.set(10_000 - CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS);
+        assert_eq!(
+            verifier
+                .verify_peer_frame(
+                    &signed,
+                    &identity,
+                    ControlPlaneAuthOperation::RaftTransferLeader,
+                    4096,
+                )
+                .unwrap(),
+            raw_frame,
+            "in-budget cross-host clock skew must be accepted"
+        );
+
+        clock.set(10_000 - CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS - 1);
         assert!(
             verifier
                 .verify_peer_frame(
@@ -15446,7 +15461,7 @@ mod tests {
                     4096,
                 )
                 .is_err(),
-            "future-issued transfer-leader auth must fail"
+            "transfer-leader auth beyond the clock-skew budget must fail"
         );
 
         clock.set(10_000 + CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS);
@@ -15520,11 +15535,11 @@ mod tests {
         );
 
         let metrics = verifier.metrics_snapshot();
-        assert_eq!(metrics.accepted_total(), 1);
+        assert_eq!(metrics.accepted_total(), 2);
         assert_eq!(metrics.rejected_total(), 4);
         assert_eq!(
             metrics.accepted_for_operation(ControlPlaneAuthOperation::RaftTransferLeader),
-            1
+            2
         );
         assert_eq!(
             metrics.rejected_for_operation(ControlPlaneAuthOperation::RaftTransferLeader),

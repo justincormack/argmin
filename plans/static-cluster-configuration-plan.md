@@ -676,11 +676,22 @@ Path uniqueness is scoped by `(host_id, normalized_path)`: identical Unix,
 mount, state, or data paths on different hosts are valid. Every process parses
 and lexically validates every path, but only the selected process's host is
 checked against the local filesystem, canonical mount targets, ownership,
-permissions, and device identity. A selected-host disk mount must be the exact
-root of a distinct mounted device: its device id must differ from its parent
-directory's device id. An ordinary leftover mountpoint directory and a
-same-filesystem bind mount are rejected, preventing state/data fallback onto
-the parent filesystem. Remote-host paths must not be required to exist locally.
+permissions, and device identity. A selected-host disk mount must be either the
+explicit filesystem root or the exact root of a distinct mounted device. For a
+non-root mount, its device id must differ from its parent directory's device
+id. An ordinary leftover mountpoint directory and a same-filesystem bind mount
+are rejected, preventing state/data fallback onto the parent filesystem. Root
+and intermediate path components may be trusted root-owned directories; the
+deepest existing state/data ancestor and final durable objects remain owned by
+the service user and must not be writable by group or other users. Remote-host
+paths must not be required to exist locally.
+
+Filesystem persistence is a deployment and release-profile policy, not a
+property inferred portably from a pathname. Functional tests may explicitly
+use a volatile storage profile, but tmpfs/ram-backed runs are never durability
+release evidence. Persistent release runs record their selected mount and
+device inventory and remain distinct from the existing volatile CPU/locking
+profile.
 One process hosts at most one authority and at most one storage node in version
 1. Its `kind` must permit those roles.
 
@@ -959,16 +970,17 @@ Progress as of 2026-07-21:
   compatibility validation plus append identity/auth overhead, selected-host
   filesystem resolution, standalone and complete three-host replicated
   fixtures, and the offline validation command. Selected-host disk mounts and
-  existing state/data components must be owned by the effective process user,
-  must not be group/other writable, must not traverse a symlink below the
-  declared mount, and must remain on that mount's device. The declared mount
-  itself must be an exact distinct-device boundary rather than an unmounted
-  directory or same-filesystem bind path. Missing final state/data leaves
-  remain valid initialization inputs. All manifest filesystem paths are
-  lexically canonical: dot components, parent components, repeated separators,
-  and trailing separators are rejected so validation and runtime consume the
-  same path. Remote-host paths remain lexical-only and are never probed on the
-  selected host.
+  intermediate state/data ancestors may be owned by root or the effective
+  process user and must not be group/other writable. The deepest existing
+  state/data ancestor remains service-owned. Paths must not traverse a symlink
+  below the declared mount and must remain on that mount's device. The declared
+  mount must be either the explicit filesystem root or an exact distinct-device
+  boundary rather than an unmounted directory or same-filesystem bind path.
+  Missing final state/data leaves remain valid initialization inputs. All
+  manifest filesystem paths are lexically canonical: dot components, parent
+  components, repeated separators, and trailing separators are rejected so
+  validation and runtime consume the same path. Remote-host paths remain
+  lexical-only and are never probed on the selected host.
 - Slice 2 is implemented: dedicated versioned canonical binary encoders produce
   a cluster topology digest, selected-process durable identity digest, and full
   unresolved-config fingerprint. Collections are identity-sorted, fields and
@@ -1106,8 +1118,10 @@ Progress as of 2026-07-21:
   admin command is launched once so ambiguous outcomes remain governed by the
   operation-specific production confirmation contract.
   The smoke requires a private writable mount boundary because it deliberately
-  retains production filesystem validation; an explicit test-mount override is
-  supported where the per-user runtime mount is unavailable. Restart artifact
+  retains production path and ownership validation; an explicit test-mount
+  override is supported where the per-user runtime mount is unavailable. A
+  volatile per-user mount is classified only as functional transport/restart
+  coverage and not as persistent-storage release evidence. Restart artifact
   and sentinel publication now creates private `0600` files so later static
   command preflight can revalidate established state.
   The transport-independent storage RPC auth codec and role-policy foundation

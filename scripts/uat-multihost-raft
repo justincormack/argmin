@@ -1,0 +1,837 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+usage() {
+    cat <<'EOF'
+Usage: ./scripts/uat-multihost-raft [options]
+
+Run the authenticated static-manifest Raft authority soak across three real
+hosts. SSH is used only for deployment and process supervision; all Argmin
+traffic uses the configured TLS/TCP endpoints directly.
+
+Options:
+  --hosts H0,H1,H2       SSH host aliases (or ARGMIN_MULTIHOST_RAFT_HOSTS)
+  --addresses A0,A1,A2   Advertised IPv4 addresses (or ARGMIN_MULTIHOST_RAFT_ADDRS)
+  --binary PATH          Deploy an already-built argmin-s3 binary
+  --release              Build and deploy target/release/argmin-s3
+  --remote-root PATH     Common absolute remote root (default: /home/argmin-test/argmin-soak)
+  --storage-profile P    persistent or volatile-test (default: persistent)
+  --port-base PORT       Raft port; control/recovery/storage use the next three (default: 24000)
+  --pg-count N           Bootstrap PG count (default: 116)
+  --retained-epochs N    Committed route epoch advances before failover (default: 256)
+  --repeat N             Leader transfer/loss/restart cycles (default: 3)
+  --no-cleanup           Preserve remote and local state after every run
+  --no-cleanup-fail      Preserve remote and local state only after failure
+  -h, --help             Show this help
+
+Example:
+  ./scripts/uat-multihost-raft \
+    --hosts grey0,grey1,grey2 \
+    --addresses 192.168.1.124,192.168.1.155,192.168.1.116
+EOF
+}
+
+die() {
+    echo "error: $*" >&2
+    exit 2
+}
+
+print_command() {
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+}
+
+split_exact_three() {
+    local value="$1"
+    local label="$2"
+    local -n output="$3"
+    IFS=, read -r -a output <<<"$value"
+    ((${#output[@]} == 3)) || die "$label must contain exactly three comma-separated values"
+    local item
+    for item in "${output[@]}"; do
+        [[ -n "$item" ]] || die "$label cannot contain an empty value"
+    done
+}
+
+shell_join() {
+    local joined=""
+    local argument
+    for argument in "$@"; do
+        printf -v argument '%q' "$argument"
+        joined+="${joined:+ }$argument"
+    done
+    printf '%s\n' "$joined"
+}
+
+remote_exec() {
+    local host="$1"
+    shift
+    local command
+    command="$(shell_join "$@")"
+    print_command ssh "$host" "$command"
+    # shell_join quotes every remote argument.
+    # shellcheck disable=SC2029
+    ssh "$host" "$command"
+}
+
+remote_exec_quiet() {
+    local host="$1"
+    shift
+    local command
+    command="$(shell_join "$@")"
+    # shell_join quotes every remote argument.
+    # shellcheck disable=SC2029
+    ssh "$host" "$command"
+}
+
+hosts_value="${ARGMIN_MULTIHOST_RAFT_HOSTS:-}"
+addresses_value="${ARGMIN_MULTIHOST_RAFT_ADDRS:-}"
+binary=""
+release=0
+remote_root="${ARGMIN_MULTIHOST_RAFT_REMOTE_ROOT:-/home/argmin-test/argmin-soak}"
+storage_profile="${ARGMIN_MULTIHOST_RAFT_STORAGE_PROFILE:-persistent}"
+port_base="${ARGMIN_MULTIHOST_RAFT_PORT_BASE:-24000}"
+pg_count="${ARGMIN_MULTIHOST_RAFT_PG_COUNT:-116}"
+retained_epochs="${ARGMIN_MULTIHOST_RAFT_RETAINED_EPOCHS:-256}"
+repeat_count="${ARGMIN_MULTIHOST_RAFT_REPEAT:-3}"
+keep_always=0
+keep_failure=0
+
+while (($# > 0)); do
+    case "$1" in
+        --hosts)
+            [[ $# -ge 2 ]] || die "--hosts requires a value"
+            hosts_value="$2"
+            shift 2
+            ;;
+        --addresses)
+            [[ $# -ge 2 ]] || die "--addresses requires a value"
+            addresses_value="$2"
+            shift 2
+            ;;
+        --binary)
+            [[ $# -ge 2 ]] || die "--binary requires a value"
+            binary="$2"
+            shift 2
+            ;;
+        --release)
+            release=1
+            shift
+            ;;
+        --remote-root)
+            [[ $# -ge 2 ]] || die "--remote-root requires a value"
+            remote_root="$2"
+            shift 2
+            ;;
+        --storage-profile)
+            [[ $# -ge 2 ]] || die "--storage-profile requires a value"
+            storage_profile="$2"
+            shift 2
+            ;;
+        --port-base)
+            [[ $# -ge 2 ]] || die "--port-base requires a value"
+            port_base="$2"
+            shift 2
+            ;;
+        --pg-count)
+            [[ $# -ge 2 ]] || die "--pg-count requires a value"
+            pg_count="$2"
+            shift 2
+            ;;
+        --retained-epochs)
+            [[ $# -ge 2 ]] || die "--retained-epochs requires a value"
+            retained_epochs="$2"
+            shift 2
+            ;;
+        --repeat)
+            [[ $# -ge 2 ]] || die "--repeat requires a value"
+            repeat_count="$2"
+            shift 2
+            ;;
+        --no-cleanup)
+            keep_always=1
+            shift
+            ;;
+        --no-cleanup-fail)
+            keep_failure=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown option: $1"
+            ;;
+    esac
+done
+
+[[ -n "$hosts_value" ]] || die "--hosts is required"
+[[ -n "$addresses_value" ]] || die "--addresses is required"
+((release == 0 || ${#binary} == 0)) || die "--binary cannot be combined with --release"
+[[ "$remote_root" == /* && "$remote_root" != "/" ]] || die "--remote-root must be a non-root absolute path"
+[[ "$remote_root" != *[[:space:]]* ]] || die "--remote-root cannot contain whitespace"
+case "$storage_profile" in
+    persistent|volatile-test) ;;
+    *) die "--storage-profile must be persistent or volatile-test" ;;
+esac
+for numeric in "$port_base" "$pg_count" "$retained_epochs" "$repeat_count"; do
+    [[ "$numeric" =~ ^[1-9][0-9]*$ ]] || die "numeric options must be positive integers"
+done
+((port_base >= 1024 && port_base <= 65532)) || die "--port-base must be between 1024 and 65532"
+((pg_count <= 4096)) || die "--pg-count exceeds the manifest limit of 4096"
+
+declare -a hosts addresses
+split_exact_three "$hosts_value" "--hosts" hosts
+split_exact_three "$addresses_value" "--addresses" addresses
+for address in "${addresses[@]}"; do
+    [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] ||
+        die "--addresses currently requires literal IPv4 addresses: $address"
+done
+
+declare -A machine_id_hosts=()
+for host in "${hosts[@]}"; do
+    if ! machine_id="$(remote_exec_quiet "$host" cat /etc/machine-id)"; then
+        die "could not read /etc/machine-id from $host"
+    fi
+    [[ "$machine_id" =~ ^[0-9a-f]{32}$ ]] ||
+        die "$host returned an invalid /etc/machine-id"
+    [[ "$machine_id" != "00000000000000000000000000000000" ]] ||
+        die "$host returned an uninitialized /etc/machine-id"
+    if [[ -n "${machine_id_hosts[$machine_id]:-}" ]]; then
+        die "hosts ${machine_id_hosts[$machine_id]} and $host resolve to the same machine"
+    fi
+    machine_id_hosts["$machine_id"]="$host"
+done
+
+if [[ -z "$binary" ]]; then
+    if ((release)); then
+        print_command cargo build --release -p argmin-s3 --bin argmin-s3
+        cargo build --release -p argmin-s3 --bin argmin-s3
+        binary="$ROOT/target/release/argmin-s3"
+    else
+        print_command cargo build -p argmin-s3 --bin argmin-s3
+        cargo build -p argmin-s3 --bin argmin-s3
+        binary="$ROOT/target/debug/argmin-s3"
+    fi
+elif [[ "$binary" != /* ]]; then
+    binary="$ROOT/$binary"
+fi
+[[ -x "$binary" ]] || die "argmin-s3 binary is not executable: $binary"
+command -v openssl >/dev/null 2>&1 || die "openssl is required to generate the test PKI"
+command -v scp >/dev/null 2>&1 || die "scp is required"
+
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+run_name="argmin-multihost-raft-$run_id"
+remote_run="$remote_root/$run_name"
+local_run="$(mktemp -d "${TMPDIR:-/tmp}/$run_name.XXXXXX")"
+material_dir="$local_run/material"
+manifest_path="$local_run/cluster.toml"
+mkdir -p "$material_dir"
+chmod 700 "$local_run" "$material_dir"
+
+declare -a current_units=("" "" "")
+declare -a unit_generations=(0 0 0)
+cleanup_started=0
+
+collect_artifacts() {
+    local index host host_dir
+    for index in 0 1 2; do
+        host="${hosts[$index]}"
+        host_dir="$local_run/$host"
+        mkdir -p "$host_dir"
+        scp -q -r "$host:$remote_run/logs/." "$host_dir/logs" 2>/dev/null || true
+        remote_exec_quiet "$host" find "$remote_run" -maxdepth 3 -type f -printf '%P %s bytes\n' \
+            >"$host_dir/files.txt" 2>&1 || true
+        if [[ -n "${current_units[$index]}" ]]; then
+            remote_exec_quiet "$host" systemctl --user status "${current_units[$index]}" --no-pager \
+                >"$host_dir/unit-status.txt" 2>&1 || true
+            remote_exec_quiet "$host" journalctl --user-unit "${current_units[$index]}" --no-pager \
+                >"$host_dir/journal.txt" 2>&1 || true
+        fi
+        remote_exec_quiet "$host" chronyc tracking >"$host_dir/chronyc-tracking.txt" 2>&1 || true
+    done
+}
+
+stop_processes() {
+    local index
+    for index in 0 1 2; do
+        if [[ -n "${current_units[$index]}" ]]; then
+            remote_exec_quiet "${hosts[$index]}" systemctl --user stop "${current_units[$index]}" \
+                >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT INT TERM
+    ((cleanup_started == 0)) || exit "$status"
+    cleanup_started=1
+    set +e
+    stop_processes
+    if ((status != 0 || keep_always)); then
+        collect_artifacts
+    fi
+    if ((keep_always == 0 && !(status != 0 && keep_failure != 0))); then
+        local host
+        for host in "${hosts[@]}"; do
+            remote_exec_quiet "$host" rm -rf -- "$remote_run" >/dev/null 2>&1 || true
+        done
+        rm -rf -- "$local_run"
+    else
+        echo "preserved local artifacts: $local_run" >&2
+        echo "preserved remote state: $remote_run on ${hosts_value}" >&2
+    fi
+    exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+echo "== argmin-s3 multihost Raft soak =="
+echo "run_id=$run_id hosts=$hosts_value addresses=$addresses_value storage_profile=$storage_profile pg_count=$pg_count retained_epochs=$retained_epochs repeat=$repeat_count"
+echo "binary=$binary remote_run=$remote_run"
+if [[ "$storage_profile" == "volatile-test" ]]; then
+    echo "NOTE: volatile-test storage is a functional/locking profile and is not durability release evidence"
+fi
+
+openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 2 \
+    -subj "/CN=argmin-multihost-test-ca-$run_id" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    -keyout "$material_dir/ca.key" -out "$material_dir/ca.crt" >/dev/null 2>&1
+chmod 600 "$material_dir/ca.key"
+chmod 644 "$material_dir/ca.crt"
+
+cat >"$material_dir/server.ext" <<EOF
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=IP:${addresses[0]},IP:${addresses[1]},IP:${addresses[2]}
+EOF
+openssl req -new -newkey rsa:2048 -nodes -sha256 \
+    -subj "/CN=argmin-multihost-$run_id" \
+    -keyout "$material_dir/server.key" -out "$material_dir/server.csr" >/dev/null 2>&1
+openssl x509 -req -sha256 -days 2 -in "$material_dir/server.csr" \
+    -CA "$material_dir/ca.crt" -CAkey "$material_dir/ca.key" -CAcreateserial \
+    -extfile "$material_dir/server.ext" -out "$material_dir/server.crt" >/dev/null 2>&1
+chmod 600 "$material_dir/server.key"
+chmod 644 "$material_dir/server.crt"
+
+for role in raft storage admin; do
+    for number in 1 2 3; do
+        printf 'argmin-multihost-%s-%s-%s-secret\n' "$run_id" "$role" "$number" \
+            >"$material_dir/$role-$number.key"
+        chmod 600 "$material_dir/$role-$number.key"
+    done
+done
+
+declare -a mount_paths
+for index in 0 1 2; do
+    host="${hosts[$index]}"
+    remote_exec "$host" mkdir -p "$remote_run/material" "$remote_run/logs" "$remote_run/state-$((index + 1))"
+    remote_exec "$host" chmod 700 "$remote_run" "$remote_run/material" "$remote_run/logs" "$remote_run/state-$((index + 1))"
+    mount_paths[index]="$(remote_exec_quiet "$host" findmnt -n -o TARGET -T "$remote_run")"
+    [[ -n "${mount_paths[$index]}" ]] || die "could not determine filesystem mount for $remote_run on $host"
+done
+
+raft_port="$port_base"
+control_port=$((port_base + 1))
+recovery_port=$((port_base + 2))
+storage_port=$((port_base + 3))
+cluster_id="multihost-raft-$run_id"
+
+cat >"$manifest_path" <<EOF
+schema_version = 1
+
+[cluster]
+id = "$cluster_id"
+topology_generation = 1
+region = "us-east-1"
+
+[deployment]
+mode = "replicated"
+failure_domain = "host"
+failure_tolerance = 1
+internal_auth = "required"
+
+[storage]
+pg_count = $pg_count
+ec_data_shards = 1
+ec_parity_shards = 1
+initial_cluster_epoch = 1
+
+[raft]
+max_append_entries = 64
+max_append_bytes = 8388608
+max_snapshot_bytes = 15728640
+
+[[transport_profiles]]
+id = "raft"
+max_frame_bytes = 16777216
+max_connections = 256
+connect_timeout_ms = 1000
+io_timeout_ms = 5000
+
+[[transport_profiles]]
+id = "control"
+max_frame_bytes = 8388648
+max_connections = 256
+connect_timeout_ms = 1000
+io_timeout_ms = 15000
+
+[[transport_profiles]]
+id = "storage"
+max_frame_bytes = 67108864
+max_connections = 256
+connect_timeout_ms = 1000
+io_timeout_ms = 5000
+
+[[tls_trust_bundles]]
+id = "cluster-ca"
+ca_bundle_ref = "file:$remote_run/material/ca.crt"
+
+[[tls_identities]]
+id = "cluster-server"
+certificate_ref = "file:$remote_run/material/server.crt"
+private_key_ref = "file:$remote_run/material/server.key"
+EOF
+
+for index in 0 1 2; do
+    number=$((index + 1))
+    raft_node_id=$((100 + number))
+    address="${addresses[$index]}"
+    mount_path="${mount_paths[$index]}"
+    cat >>"$manifest_path" <<EOF
+
+[[hosts]]
+id = "host-$number"
+zone = "test-zone"
+rack = "rack-$number"
+
+[[disks]]
+id = "disk-$number"
+host_id = "host-$number"
+mount_path = "$mount_path"
+
+[[processes]]
+id = "control-$number"
+host_id = "host-$number"
+kind = "control-plane"
+admin_instance_id = "control-$number-admin"
+
+[[processes]]
+id = "storage-$number"
+host_id = "host-$number"
+kind = "storage-node"
+
+[[authorities]]
+id = "authority-$number"
+kind = "raft-voter"
+raft_node_id = $raft_node_id
+process_id = "control-$number"
+disk_id = "disk-$number"
+state_path = "$remote_run/state-$number/control.state"
+
+[[storage_nodes]]
+node_id = $number
+process_id = "storage-$number"
+disk_id = "disk-$number"
+data_dir = "$remote_run/storage-$number"
+
+[[endpoints]]
+id = "raft-$number"
+owner_process_id = "control-$number"
+protocol = "raft-peer"
+priority = 10
+listen = "tcp://$address:$raft_port"
+advertise = "tcp://$address:$raft_port"
+transport_profile_id = "raft"
+tls_identity_id = "cluster-server"
+tls_trust_bundle_id = "cluster-ca"
+tls_server_name = "$address"
+
+[[endpoints]]
+id = "control-$number"
+owner_process_id = "control-$number"
+protocol = "control-plane"
+priority = 10
+listen = "tcp://$address:$control_port"
+advertise = "tcp://$address:$control_port"
+transport_profile_id = "control"
+tls_identity_id = "cluster-server"
+tls_trust_bundle_id = "cluster-ca"
+tls_server_name = "$address"
+
+[[endpoints]]
+id = "clock-$number"
+owner_process_id = "control-$number"
+protocol = "authority-clock-recovery"
+priority = 10
+listen = "tcp://$address:$recovery_port"
+advertise = "tcp://$address:$recovery_port"
+transport_profile_id = "control"
+tls_identity_id = "cluster-server"
+tls_trust_bundle_id = "cluster-ca"
+tls_server_name = "$address"
+
+[[endpoints]]
+id = "storage-$number"
+owner_process_id = "storage-$number"
+protocol = "storage-rpc"
+priority = 10
+listen = "tcp://$address:$storage_port"
+advertise = "tcp://$address:$storage_port"
+transport_profile_id = "storage"
+tls_identity_id = "cluster-server"
+tls_trust_bundle_id = "cluster-ca"
+tls_server_name = "$address"
+
+[[auth_credentials]]
+principal = "raft-peer"
+node_id = $raft_node_id
+credential_id = "raft-$number"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:$remote_run/material/raft-$number.key"
+
+[[auth_credentials]]
+principal = "storage-node"
+node_id = $number
+credential_id = "storage-$number"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:$remote_run/material/storage-$number.key"
+
+[[auth_credentials]]
+principal = "admin"
+instance_id = "control-$number-admin"
+credential_id = "admin-$number"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:$remote_run/material/admin-$number.key"
+EOF
+done
+chmod 600 "$manifest_path"
+
+binary_digest="$(sha256sum "$binary" | awk '{print $1}')"
+printf '%s  argmin-s3\n' "$binary_digest" >"$local_run/binary.sha256"
+git rev-parse HEAD >"$local_run/git-commit"
+
+deploy_material=(
+    "$material_dir/ca.crt"
+    "$material_dir/server.crt"
+    "$material_dir/server.key"
+)
+for role in raft storage admin; do
+    for number in 1 2 3; do
+        deploy_material+=("$material_dir/$role-$number.key")
+    done
+done
+
+for index in 0 1 2; do
+    host="${hosts[$index]}"
+    echo "== deploy to $host =="
+    print_command scp -q "$binary" "$host:$remote_run/argmin-s3.next"
+    scp -q "$binary" "$host:$remote_run/argmin-s3.next"
+    print_command scp -q "$manifest_path" "$host:$remote_run/cluster.toml"
+    scp -q "$manifest_path" "$host:$remote_run/cluster.toml"
+    print_command scp -q "${deploy_material[@]}" "$host:$remote_run/material/"
+    scp -q "${deploy_material[@]}" "$host:$remote_run/material/"
+    remote_exec "$host" mv "$remote_run/argmin-s3.next" "$remote_run/argmin-s3"
+    remote_exec "$host" chmod 700 "$remote_run/argmin-s3"
+    sensitive_paths=(
+        "$remote_run/cluster.toml"
+        "$remote_run/material/server.key"
+    )
+    for role in raft storage admin; do
+        for number in 1 2 3; do
+            sensitive_paths+=("$remote_run/material/$role-$number.key")
+        done
+    done
+    remote_exec "$host" chmod 600 "${sensitive_paths[@]}"
+    remote_digest="$(remote_exec_quiet "$host" sha256sum "$remote_run/argmin-s3" | awk '{print $1}')"
+    [[ "$remote_digest" == "$binary_digest" ]] || die "deployed binary checksum mismatch on $host"
+done
+
+for index in 0 1 2; do
+    number=$((index + 1))
+    host="${hosts[$index]}"
+    remote_exec "$host" "$remote_run/argmin-s3" validate-cluster-config "$remote_run/cluster.toml" "control-$number"
+    remote_exec "$host" "$remote_run/argmin-s3" initialize-cluster-state "$remote_run/cluster.toml" "control-$number"
+done
+
+start_authority() {
+    local number="$1"
+    local index=$((number - 1))
+    local host="${hosts[$index]}"
+    unit_generations[index]=$((unit_generations[index] + 1))
+    local unit="$run_name-control-$number-${unit_generations[$index]}"
+    current_units[index]="$unit"
+    remote_exec "$host" systemd-run --user --collect --unit "$unit" \
+        --property "WorkingDirectory=$remote_run" \
+        --property "StandardOutput=append:$remote_run/logs/control-$number.log" \
+        --property "StandardError=append:$remote_run/logs/control-$number.log" \
+        --setenv "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
+        --setenv "ARGMIN_PROCESS_ID=control-$number" \
+        --setenv "ARGMIN_ACCOUNT_ID=111122223333" \
+        --setenv "ARGMIN_ACCESS_KEY_ID=argmin-multihost-primary" \
+        --setenv "ARGMIN_SECRET_ACCESS_KEY=argmin-multihost-primary-secret" \
+        --setenv "ARGMIN_SSE_S3_WRAPPING_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" \
+        "$remote_run/argmin-s3"
+}
+
+stop_authority() {
+    local number="$1"
+    local index=$((number - 1))
+    local host="${hosts[$index]}"
+    local unit="${current_units[$index]}"
+    [[ -n "$unit" ]] || return 0
+    remote_exec "$host" systemctl --user stop "$unit"
+    current_units[index]=""
+}
+
+wait_authority_listener() {
+    local number="$1"
+    local index=$((number - 1))
+    local host="${hosts[$index]}"
+    local unit="${current_units[$index]}"
+    local attempt
+    for ((attempt = 0; attempt < 300; attempt++)); do
+        if ! remote_exec_quiet "$host" systemctl --user is-active --quiet "$unit"; then
+            remote_exec_quiet "$host" systemctl --user status "$unit" --no-pager >&2 || true
+            remote_exec_quiet "$host" tail -n 200 "$remote_run/logs/control-$number.log" >&2 || true
+            die "control-$number exited before binding its Raft listener"
+        fi
+        if remote_exec_quiet "$host" timeout 1 bash -c \
+            "echo >/dev/tcp/${addresses[$index]}/$raft_port" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    remote_exec_quiet "$host" tail -n 200 "$remote_run/logs/control-$number.log" >&2 || true
+    die "control-$number did not bind ${addresses[$index]}:$raft_port"
+}
+
+wait_for_raft_network() {
+    local source_index target_index deadline
+    deadline=$((SECONDS + 30))
+    for source_index in 0 1 2; do
+        for target_index in 0 1 2; do
+            while ! remote_exec_quiet "${hosts[$source_index]}" timeout 1 bash -c \
+                "echo >/dev/tcp/${addresses[$target_index]}/$raft_port" >/dev/null 2>&1; do
+                if ((SECONDS >= deadline)); then
+                    die "${hosts[$source_index]} cannot reach ${addresses[$target_index]}:$raft_port"
+                fi
+                sleep 0.1
+            done
+        done
+    done
+}
+
+admin_command() {
+    remote_exec_quiet "${hosts[0]}" env \
+        "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
+        "ARGMIN_PROCESS_ID=control-1" \
+        "ARGMIN_ACCOUNT_ID=111122223333" \
+        "ARGMIN_ACCESS_KEY_ID=argmin-multihost-primary" \
+        "ARGMIN_SECRET_ACCESS_KEY=argmin-multihost-primary-secret" \
+        "ARGMIN_SSE_S3_WRAPPING_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" \
+        "$remote_run/argmin-s3" "$@"
+}
+
+status_field() {
+    local status="$1"
+    local field="$2"
+    local token
+    for token in $status; do
+        if [[ "$token" == "$field="* ]]; then
+            printf '%s\n' "${token#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+last_status=""
+wait_clock_status() {
+    local expected_established="$1"
+    local min_term="${2:-0}"
+    local deadline=$((SECONDS + 60))
+    local status term established last_error=""
+    while ((SECONDS < deadline)); do
+        if status="$(admin_command control-plane-authority-clock-status "$remote_run/unused.sock" 2>&1)"; then
+            term="$(status_field "$status" current_raft_term || true)"
+            established="$(status_field "$status" established || true)"
+            if [[ "$term" =~ ^[0-9]+$ && "$established" == "$expected_established" ]] && ((term >= min_term)); then
+                last_status="$status"
+                return 0
+            fi
+        else
+            last_error="$status"
+        fi
+        sleep 0.1
+    done
+    [[ -z "${status:-}" ]] || echo "last_authority_clock_status=$status" >&2
+    [[ -z "$last_error" ]] || echo "last_authority_clock_error=$last_error" >&2
+    die "authority clock did not reach established=$expected_established at term >= $min_term"
+}
+
+authority_clock_checkpoint_digest() {
+    local number="$1"
+    local index=$((number - 1))
+    remote_exec_quiet "${hosts[$index]}" sha256sum "$remote_run/state-$number/control.state.clock" 2>/dev/null |
+        awk '{print $1}'
+}
+
+stabilize_rejoined_clock() {
+    local min_term="$1"
+    local stable_observations=0
+    local deadline=$((SECONDS + 60))
+    local status term established blocked_reason
+    while ((SECONDS < deadline)); do
+        if status="$(admin_command control-plane-authority-clock-status "$remote_run/unused.sock" 2>/dev/null)"; then
+            term="$(status_field "$status" current_raft_term || true)"
+            established="$(status_field "$status" established || true)"
+            blocked_reason="$(status_field "$status" blocked_reason || true)"
+            if [[ "$term" =~ ^[0-9]+$ ]] && ((term >= min_term)); then
+                if [[ "$established" == "false" && "$blocked_reason" == "Some(RaftLeadershipChanged)" ]]; then
+                    admin_command control-plane-reestablish-authority-clock "$remote_run/unused.sock"
+                    min_term="$term"
+                    stable_observations=0
+                elif [[ "$established" == "true" ]]; then
+                    stable_observations=$((stable_observations + 1))
+                    if ((stable_observations >= 10)); then
+                        last_status="$status"
+                        return 0
+                    fi
+                else
+                    stable_observations=0
+                fi
+            fi
+        else
+            stable_observations=0
+        fi
+        sleep 0.5
+    done
+    [[ -z "${status:-}" ]] || echo "$status" >&2
+    die "rejoined voter did not converge in one established Raft term"
+}
+
+echo "== start static authenticated TCP authorities =="
+start_authority 2
+wait_authority_listener 2
+start_authority 3
+wait_authority_listener 3
+start_authority 1
+wait_authority_listener 1
+wait_for_raft_network
+wait_clock_status true
+echo "initial_authority_clock=$last_status"
+
+echo "== build retained route history =="
+baseline_output="$(admin_command control-plane-set-pg-acting-set-live "$remote_run/unused.sock" 0 1 2 2>&1)"
+printf '%s\n' "$baseline_output" >&2
+if [[ "$baseline_output" =~ control-plane\ set\ PG\ [0-9]+\ acting\ set\ at\ epoch\ ([0-9]+) ]]; then
+    last_route_epoch="${BASH_REMATCH[1]}"
+else
+    die "could not parse baseline route epoch from admin response"
+fi
+
+route_advances=0
+route_attempts=0
+max_route_attempts=$((retained_epochs + (3 * pg_count)))
+while ((route_advances < retained_epochs)); do
+    route_attempts=$((route_attempts + 1))
+    ((route_attempts <= max_route_attempts)) ||
+        die "only observed $route_advances route epoch advances after $max_route_attempts attempts"
+    pg_id=$(((route_attempts - 1) % pg_count))
+    if ((route_attempts % 3 == 1)); then
+        acting_set=(1 2)
+    elif ((route_attempts % 3 == 2)); then
+        acting_set=(2 3)
+    else
+        acting_set=(1 3)
+    fi
+    print_command admin_command control-plane-set-pg-acting-set-live "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}"
+    route_output="$(admin_command control-plane-set-pg-acting-set-live "$remote_run/unused.sock" "$pg_id" "${acting_set[@]}" 2>&1)"
+    printf '%s\n' "$route_output" >&2
+    if [[ "$route_output" =~ control-plane\ set\ PG\ [0-9]+\ acting\ set\ at\ epoch\ ([0-9]+) ]]; then
+        route_epoch="${BASH_REMATCH[1]}"
+    else
+        die "could not parse route epoch from admin response"
+    fi
+    if ((route_epoch == last_route_epoch + 1)); then
+        route_advances=$((route_advances + 1))
+        last_route_epoch="$route_epoch"
+    elif ((route_epoch != last_route_epoch)); then
+        die "route epoch changed non-sequentially from $last_route_epoch to $route_epoch"
+    fi
+done
+echo "retained_route_history advances=$route_advances attempts=$route_attempts final_epoch=$last_route_epoch"
+admin_command control-plane-trigger-raft-snapshot-purge "$remote_run/unused.sock"
+
+for ((iteration = 1; iteration <= repeat_count; iteration++)); do
+    target_number=$((((iteration - 1) % 3) + 1))
+    target_raft_node=$((100 + target_number))
+    echo "== failover iteration $iteration: transfer to and stop Raft node $target_raft_node =="
+    wait_clock_status true
+    previous_term="$(status_field "$last_status" current_raft_term)"
+    transfer_confirmed=0
+    for transfer_attempt in 1 2 3 4 5; do
+        target_clock_digest_before="$(authority_clock_checkpoint_digest "$target_number" || true)"
+        admin_command control-plane-transfer-raft-leadership "$remote_run/unused.sock" "$target_raft_node"
+        # OpenRaft returns after queuing the transfer broadcast. The target can
+        # subsequently reject it until its durable log reaches the advertised
+        # tip, in which case another voter can win the resulting term. Recover
+        # that observed term before deciding whether a retry is safe.
+        sleep 4
+        wait_clock_status false "$previous_term"
+        [[ "$(status_field "$last_status" blocked_reason)" == "Some(RaftLeadershipChanged)" ]] ||
+            die "leadership transfer produced an unexpected authority-clock state: $last_status"
+        admin_command control-plane-reestablish-authority-clock "$remote_run/unused.sock"
+        wait_clock_status true "$previous_term"
+        transferred_term="$(status_field "$last_status" current_raft_term)"
+        target_clock_digest_after="$(authority_clock_checkpoint_digest "$target_number" || true)"
+        if [[ -n "$target_clock_digest_after" && "$target_clock_digest_after" != "$target_clock_digest_before" ]]; then
+            transfer_confirmed=1
+            break
+        fi
+        echo "Raft transfer attempt $transfer_attempt settled on another voter at term $transferred_term; retrying target $target_raft_node"
+        previous_term="$transferred_term"
+    done
+    ((transfer_confirmed == 1)) ||
+        die "Raft node $target_raft_node did not publish a post-transfer authority-clock checkpoint"
+
+    stop_authority "$target_number"
+    wait_clock_status false "$((transferred_term + 1))"
+    [[ "$(status_field "$last_status" blocked_reason)" == "Some(RaftLeadershipChanged)" ]] ||
+        die "leader loss produced an unexpected authority-clock state: $last_status"
+    admin_command control-plane-reestablish-authority-clock "$remote_run/unused.sock"
+    wait_clock_status true "$((transferred_term + 1))"
+
+    start_authority "$target_number"
+    wait_authority_listener "$target_number"
+    stabilize_rejoined_clock "$((transferred_term + 1))"
+    admin_command control-plane-trigger-raft-snapshot-purge "$remote_run/unused.sock"
+done
+
+echo "== final durable state =="
+for index in 0 1 2; do
+    number=$((index + 1))
+    remote_exec "${hosts[$index]}" test -s "$remote_run/state-$number/control.state"
+    remote_exec "${hosts[$index]}" find "$remote_run/state-$number" -maxdepth 1 -type f -printf '%f %s bytes\n'
+done
+
+if diagnostics="$(admin_command control-plane-runtime-map-diagnostics "$remote_run/unused.sock" 2>/dev/null)"; then
+    echo "$diagnostics"
+fi
+
+echo "OK: argmin-s3 multihost Raft soak passed"

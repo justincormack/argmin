@@ -342,11 +342,14 @@ Status:
   write a peer response.
 - 2026-07-07: Added the first item 5 replay rule for transfer-leader Raft peer
   RPCs. Authenticated transfer-leader envelopes now carry a short issued/expires
-  freshness window; verification requires the complete window, rejects future or
-  expired envelopes, rejects overlong windows, and process-level coverage proves
-  expired transfer-leader auth fails before OpenRaft dispatch or vote/term
-  mutation. Remaining replay work is broader observability and any later
-  non-Raft transport freshness policy.
+  freshness window; verification requires the complete window, rejects envelopes
+  issued beyond the shared control-plane clock-skew budget, rejects expired or
+  overlong windows, and process-level coverage proves expired transfer-leader
+  auth fails before OpenRaft dispatch or vote/term mutation. The bounded future
+  skew is required for authenticated transfer between separately synchronized
+  hosts; the signed window itself remains capped at five seconds. Remaining
+  replay work is broader observability and any later non-Raft transport
+  freshness policy.
 - 2026-07-07: Started item 6 by adding compact Raft peer auth policy counters
   for accepted/rejected verification decisions keyed by operation and rejection
   reason, plus a no-operation bucket for malformed frames that fail before an
