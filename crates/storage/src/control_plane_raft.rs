@@ -27406,13 +27406,38 @@ mod tests {
                 ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
             )
             .await;
-            let bootstrap = authority
-                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
-                    nodes: vec![(NodeId::new(1), "node-1".to_owned())],
-                    pg_ids: vec![PgId::new(0)],
-                })
-                .await
-                .unwrap();
+            let bootstrap_command = ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes: vec![(NodeId::new(1), "node-1".to_owned())],
+                pg_ids: vec![PgId::new(0)],
+            };
+            let startup_retry_deadline = Instant::now()
+                .checked_add(Duration::from_secs(1))
+                .expect("WAL-only command startup retry deadline should fit");
+            let bootstrap = loop {
+                match authority
+                    .submit_control_plane_command(bootstrap_command.clone())
+                    .await
+                {
+                    Err(ControlPlaneError::AuthorityNotServing) => {
+                        let remaining = startup_retry_deadline
+                            .saturating_duration_since(Instant::now());
+                        if !remaining.is_zero() {
+                            ControlPlaneRaftTypeConfig::sleep(
+                                Duration::from_millis(10).min(remaining),
+                            )
+                            .await;
+                        }
+                        if Instant::now() >= startup_retry_deadline {
+                            let status = authority.status().await;
+                            panic!(
+                                "WAL-only command authority did not finish startup convergence; last status: {status:?}"
+                            );
+                        }
+                    }
+                    result => break result,
+                }
+            }
+            .unwrap();
             authority.store_durable_restart_artifact().await.unwrap();
             authority.shutdown().await.unwrap();
 
