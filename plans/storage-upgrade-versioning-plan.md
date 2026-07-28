@@ -246,6 +246,42 @@ old owner's access in the same change. Until then, `storage` exclusively owns th
 control-plane and Raft formats, and `argmin-s3` exclusively owns the static manifest and
 process-identity formats.
 
+### Nested Durable Codec Inventory: Object Encryption State (2026-07-28)
+
+`storage` owns the object-encryption discriminator and durable byte encoding. Its public logical
+surface is `ObjectEncryption` plus the typed `SseCustomerObjectState` and `SseS3ObjectState`
+constructors and cryptographic-component accessors. `server-core` owns the encryption operations
+that consume and produce those typed values, but it does not select a persisted discriminator,
+encode or decode bytes, inspect an encoding version, construct a concrete state layout directly,
+or receive storage decode errors.
+
+The private nested encoding currently has exact current-version decoding only:
+
+- SSE-C state version 3 contains the validator-key identity and proof, customer-derived wrapping
+  inputs, wrapped object DEK, segment nonce prefix, and sealed-checksum state.
+- SSE-S3 state version 1 contains the managed wrapping-key identity, wrapping inputs, wrapped
+  object DEK, segment nonce prefix, and sealed-checksum state.
+- discriminator values 0, 1, and 2 select unencrypted, SSE-C, and SSE-S3 state respectively.
+
+The same nested bytes are embedded in these storage-owned containing formats:
+
+| Containing format | Current baseline | Encryption-state embedding |
+| --- | --- | --- |
+| PG SQLite schema | schema version 1 | `objects`, `multipart_uploads`, and `stream_uploads` store `encryption_type` plus `encryption_state`. |
+| Metadata command | encoding version 5 | Object, multipart-upload, and stream-session command values carry the discriminator and nested state bytes. |
+| Storage-node RPC | frame encoding version 11 | Logical object, multipart, and stream request/response payloads carry the discriminator and nested state bytes. |
+| Canonical PG state | encoding version 4 | The three table representations above include both encryption columns in canonical digests. |
+| Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry the raw encryption columns and bind them into row, table, state, and checkpoint digests. |
+
+Changing either nested encryption encoding requires an explicit new inner version and coordinated
+advancement of every containing format that can persist, replay, hash, or transmit the changed
+bytes. Because upgrades are unsupported, current decoders reject every non-current inner or outer
+version; this containment work does not add fallback readers. Malformed nested-state tests remain
+inside `storage`, while cross-crate tests exercise only logical encryption behavior. Storage also
+enforces the nested checksum-metadata length when logical state is constructed, so every public
+state is encodable, and exact-byte goldens pin the discriminator, inner version, field order,
+endianness, and length encoding for all three encryption variants.
+
 ### RPC Boundary Inventory (2026-07-27)
 
 This inventory covers the storage-node, control-plane, and Raft peer RPC surfaces. All three
@@ -602,8 +638,11 @@ Raft peer client and server transports are storage-owned and boundary-checked.
    `ControlPlaneError` transport, response-loss, leader-routing, and runtime-map readiness
    classification is storage-owned. Callers cannot parse or recover retained implementation
    diagnostics, and cannot construct raw `Io`, `RpcProtocol`, or `RpcRemote` variants.
-4. Inventory and restrict nested durable codecs for metadata, tags, ACLs, and encryption;
-   record how containing formats advance when a nested format changes.
+4. **In progress:** inventory and restrict nested durable codecs for metadata, tags, ACLs, and
+   encryption; record how containing formats advance when a nested format changes. Object
+   encryption is complete: its discriminator, decode errors, versioned byte codecs, and concrete
+   state layout are storage-owned and boundary-checked, and all five containing formats are
+   recorded above. Metadata, tags, and ACLs remain.
 5. Audit existing version/fallback code and remove unsupported legacy compatibility where it
    worsens current invariants.
 6. Add or tighten current-version rejection tests for existing versioned formats.

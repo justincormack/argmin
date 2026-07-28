@@ -6616,7 +6616,7 @@ fn sse_c_checksum_metadata_is_not_stored_in_cleartext() {
         let ObjectEncryption::SseCustomer(state) = &live.encryption else {
             panic!("expected SSE-C encryption state");
         };
-        assert!(!state.encrypted_checksum_metadata.is_empty());
+        assert!(!state.encrypted_checksum_metadata().is_empty());
     }
 
     let head = coord

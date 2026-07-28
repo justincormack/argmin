@@ -1104,10 +1104,10 @@ impl std::fmt::Debug for SerializedTagSet {
     }
 }
 
-/// Stored object encryption discriminator.
+/// Storage-owned object encryption discriminator used by durable and wire codecs.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectEncryptionType {
+pub(crate) enum ObjectEncryptionType {
     None = 0,
     SseCustomer = 1,
     SseS3 = 2,
@@ -1115,7 +1115,7 @@ pub enum ObjectEncryptionType {
 
 impl ObjectEncryptionType {
     #[must_use]
-    pub fn from_u8(v: u8) -> Option<Self> {
+    pub(crate) fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::None),
             1 => Some(Self::SseCustomer),
@@ -1126,7 +1126,7 @@ impl ObjectEncryptionType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ObjectEncryptionDecodeError {
+pub(crate) enum ObjectEncryptionDecodeError {
     #[error("unexpected encryption_state for unencrypted object")]
     UnexpectedStateForUnencryptedObject,
     #[error("missing encryption_state for SSE-C object")]
@@ -1145,6 +1145,51 @@ pub enum ObjectEncryptionDecodeError {
     UnsupportedSseS3StateVersion { version: u8 },
     #[error("invalid SSE-S3 checksum metadata length {declared} (remaining {remaining})")]
     InvalidSseS3ChecksumMetadataLength { declared: usize, remaining: usize },
+}
+
+/// Logical object-encryption state could not be represented by storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ObjectEncryptionStateError {
+    #[error("encrypted checksum metadata exceeds the storage limit")]
+    EncryptedChecksumMetadataTooLong,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct EncryptedChecksumMetadata {
+    encoded_len: u16,
+    bytes: Vec<u8>,
+}
+
+impl EncryptedChecksumMetadata {
+    const fn empty() -> Self {
+        Self {
+            encoded_len: 0,
+            bytes: Vec::new(),
+        }
+    }
+
+    fn try_new(bytes: Vec<u8>) -> Result<Self, ObjectEncryptionStateError> {
+        let encoded_len = u16::try_from(bytes.len())
+            .map_err(|_| ObjectEncryptionStateError::EncryptedChecksumMetadataTooLong)?;
+        Ok(Self { encoded_len, bytes })
+    }
+
+    fn from_encoded(encoded_len: u16, bytes: Vec<u8>) -> Self {
+        debug_assert_eq!(usize::from(encoded_len), bytes.len());
+        Self { encoded_len, bytes }
+    }
+
+    const fn encoded_len(&self) -> u16 {
+        self.encoded_len
+    }
+
+    fn len(&self) -> usize {
+        usize::from(self.encoded_len)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// Service-managed server-side encryption algorithms exposed through the S3 API.
@@ -1193,15 +1238,15 @@ pub const SSE_S3_CHECKSUM_NONCE_LEN: usize = OBJECT_ENCRYPTION_CHECKSUM_NONCE_LE
 /// Stored per-object `SSE-C` state.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SseCustomerObjectState {
-    pub validator_key_id: u32,
-    pub validator_salt: [u8; SSE_C_VALIDATOR_SALT_LEN],
-    pub validator_hmac: [u8; SSE_C_VALIDATOR_HMAC_LEN],
-    pub wrap_salt: [u8; SSE_C_WRAP_SALT_LEN],
-    pub wrap_nonce: [u8; SSE_C_WRAP_NONCE_LEN],
-    pub wrapped_dek: [u8; SSE_C_WRAPPED_DEK_LEN],
-    pub segment_nonce_prefix: [u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
-    pub checksum_nonce: [u8; SSE_C_CHECKSUM_NONCE_LEN],
-    pub encrypted_checksum_metadata: Vec<u8>,
+    validator_key_id: u32,
+    validator_salt: [u8; SSE_C_VALIDATOR_SALT_LEN],
+    validator_hmac: [u8; SSE_C_VALIDATOR_HMAC_LEN],
+    wrap_salt: [u8; SSE_C_WRAP_SALT_LEN],
+    wrap_nonce: [u8; SSE_C_WRAP_NONCE_LEN],
+    wrapped_dek: [u8; SSE_C_WRAPPED_DEK_LEN],
+    segment_nonce_prefix: [u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+    checksum_nonce: [u8; SSE_C_CHECKSUM_NONCE_LEN],
+    encrypted_checksum_metadata: EncryptedChecksumMetadata,
 }
 
 impl std::fmt::Debug for SseCustomerObjectState {
@@ -1234,11 +1279,91 @@ impl SseCustomerObjectState {
         + 2;
 
     #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
-        let checksum_len = u16::try_from(self.encrypted_checksum_metadata.len())
-            .expect("encrypted checksum metadata length should fit in u16");
-        let mut out =
-            Vec::with_capacity(Self::FIXED_ENCODED_LEN + self.encrypted_checksum_metadata.len());
+    pub fn new(
+        validator_key_id: u32,
+        validator_salt: [u8; SSE_C_VALIDATOR_SALT_LEN],
+        validator_hmac: [u8; SSE_C_VALIDATOR_HMAC_LEN],
+        wrap_salt: [u8; SSE_C_WRAP_SALT_LEN],
+        wrap_nonce: [u8; SSE_C_WRAP_NONCE_LEN],
+        wrapped_dek: [u8; SSE_C_WRAPPED_DEK_LEN],
+        segment_nonce_prefix: [u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+    ) -> Self {
+        Self {
+            validator_key_id,
+            validator_salt,
+            validator_hmac,
+            wrap_salt,
+            wrap_nonce,
+            wrapped_dek,
+            segment_nonce_prefix,
+            checksum_nonce: [0; SSE_C_CHECKSUM_NONCE_LEN],
+            encrypted_checksum_metadata: EncryptedChecksumMetadata::empty(),
+        }
+    }
+
+    pub fn with_encrypted_checksum_metadata(
+        &self,
+        checksum_nonce: [u8; SSE_C_CHECKSUM_NONCE_LEN],
+        encrypted_checksum_metadata: Vec<u8>,
+    ) -> Result<Self, ObjectEncryptionStateError> {
+        Ok(Self {
+            checksum_nonce,
+            encrypted_checksum_metadata: EncryptedChecksumMetadata::try_new(
+                encrypted_checksum_metadata,
+            )?,
+            ..self.clone()
+        })
+    }
+
+    #[must_use]
+    pub const fn validator_key_id(&self) -> u32 {
+        self.validator_key_id
+    }
+
+    #[must_use]
+    pub const fn validator_salt(&self) -> &[u8; SSE_C_VALIDATOR_SALT_LEN] {
+        &self.validator_salt
+    }
+
+    #[must_use]
+    pub const fn validator_hmac(&self) -> &[u8; SSE_C_VALIDATOR_HMAC_LEN] {
+        &self.validator_hmac
+    }
+
+    #[must_use]
+    pub const fn wrap_salt(&self) -> &[u8; SSE_C_WRAP_SALT_LEN] {
+        &self.wrap_salt
+    }
+
+    #[must_use]
+    pub const fn wrap_nonce(&self) -> &[u8; SSE_C_WRAP_NONCE_LEN] {
+        &self.wrap_nonce
+    }
+
+    #[must_use]
+    pub const fn wrapped_dek(&self) -> &[u8; SSE_C_WRAPPED_DEK_LEN] {
+        &self.wrapped_dek
+    }
+
+    #[must_use]
+    pub const fn segment_nonce_prefix(&self) -> &[u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN] {
+        &self.segment_nonce_prefix
+    }
+
+    #[must_use]
+    pub const fn checksum_nonce(&self) -> &[u8; SSE_C_CHECKSUM_NONCE_LEN] {
+        &self.checksum_nonce
+    }
+
+    #[must_use]
+    pub fn encrypted_checksum_metadata(&self) -> &[u8] {
+        self.encrypted_checksum_metadata.as_slice()
+    }
+
+    #[must_use]
+    fn encode(&self) -> Vec<u8> {
+        let checksum_len = self.encrypted_checksum_metadata.encoded_len();
+        let mut out = Vec::with_capacity(Self::FIXED_ENCODED_LEN + usize::from(checksum_len));
         out.push(Self::VERSION);
         out.extend_from_slice(&self.validator_key_id.to_be_bytes());
         out.extend_from_slice(&self.validator_salt);
@@ -1249,11 +1374,11 @@ impl SseCustomerObjectState {
         out.extend_from_slice(&self.segment_nonce_prefix);
         out.extend_from_slice(&self.checksum_nonce);
         out.extend_from_slice(&checksum_len.to_be_bytes());
-        out.extend_from_slice(&self.encrypted_checksum_metadata);
+        out.extend_from_slice(self.encrypted_checksum_metadata.as_slice());
         out
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, ObjectEncryptionDecodeError> {
+    fn decode(bytes: &[u8]) -> Result<Self, ObjectEncryptionDecodeError> {
         if bytes.len() < Self::FIXED_ENCODED_LEN {
             return Err(ObjectEncryptionDecodeError::InvalidSseCustomerStateLength {
                 actual: bytes.len(),
@@ -1306,16 +1431,20 @@ impl SseCustomerObjectState {
             take(&mut cursor, 2)
                 .try_into()
                 .expect("slice length checked"),
-        ) as usize;
-        if cursor + checksum_len != bytes.len() {
+        );
+        let checksum_len_usize = usize::from(checksum_len);
+        if cursor + checksum_len_usize != bytes.len() {
             return Err(
                 ObjectEncryptionDecodeError::InvalidSseCustomerChecksumMetadataLength {
-                    declared: checksum_len,
+                    declared: checksum_len_usize,
                     remaining: bytes.len().saturating_sub(cursor),
                 },
             );
         }
-        let encrypted_checksum_metadata = take(&mut cursor, checksum_len).to_vec();
+        let encrypted_checksum_metadata = EncryptedChecksumMetadata::from_encoded(
+            checksum_len,
+            take(&mut cursor, checksum_len_usize).to_vec(),
+        );
 
         Ok(Self {
             validator_key_id,
@@ -1334,12 +1463,12 @@ impl SseCustomerObjectState {
 /// Stored per-object `SSE-S3` state.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SseS3ObjectState {
-    pub wrapping_key_id: u32,
-    pub wrap_nonce: [u8; SSE_S3_WRAP_NONCE_LEN],
-    pub wrapped_dek: [u8; SSE_S3_WRAPPED_DEK_LEN],
-    pub segment_nonce_prefix: [u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
-    pub checksum_nonce: [u8; SSE_S3_CHECKSUM_NONCE_LEN],
-    pub encrypted_checksum_metadata: Vec<u8>,
+    wrapping_key_id: u32,
+    wrap_nonce: [u8; SSE_S3_WRAP_NONCE_LEN],
+    wrapped_dek: [u8; SSE_S3_WRAPPED_DEK_LEN],
+    segment_nonce_prefix: [u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+    checksum_nonce: [u8; SSE_S3_CHECKSUM_NONCE_LEN],
+    encrypted_checksum_metadata: EncryptedChecksumMetadata,
 }
 
 impl std::fmt::Debug for SseS3ObjectState {
@@ -1366,11 +1495,70 @@ impl SseS3ObjectState {
         + 2;
 
     #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
-        let checksum_len = u16::try_from(self.encrypted_checksum_metadata.len())
-            .expect("encrypted checksum metadata length should fit in u16");
-        let mut out =
-            Vec::with_capacity(Self::FIXED_ENCODED_LEN + self.encrypted_checksum_metadata.len());
+    pub fn new(
+        wrapping_key_id: u32,
+        wrap_nonce: [u8; SSE_S3_WRAP_NONCE_LEN],
+        wrapped_dek: [u8; SSE_S3_WRAPPED_DEK_LEN],
+        segment_nonce_prefix: [u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+    ) -> Self {
+        Self {
+            wrapping_key_id,
+            wrap_nonce,
+            wrapped_dek,
+            segment_nonce_prefix,
+            checksum_nonce: [0; SSE_S3_CHECKSUM_NONCE_LEN],
+            encrypted_checksum_metadata: EncryptedChecksumMetadata::empty(),
+        }
+    }
+
+    pub fn with_encrypted_checksum_metadata(
+        &self,
+        checksum_nonce: [u8; SSE_S3_CHECKSUM_NONCE_LEN],
+        encrypted_checksum_metadata: Vec<u8>,
+    ) -> Result<Self, ObjectEncryptionStateError> {
+        Ok(Self {
+            checksum_nonce,
+            encrypted_checksum_metadata: EncryptedChecksumMetadata::try_new(
+                encrypted_checksum_metadata,
+            )?,
+            ..self.clone()
+        })
+    }
+
+    #[must_use]
+    pub const fn wrapping_key_id(&self) -> u32 {
+        self.wrapping_key_id
+    }
+
+    #[must_use]
+    pub const fn wrap_nonce(&self) -> &[u8; SSE_S3_WRAP_NONCE_LEN] {
+        &self.wrap_nonce
+    }
+
+    #[must_use]
+    pub const fn wrapped_dek(&self) -> &[u8; SSE_S3_WRAPPED_DEK_LEN] {
+        &self.wrapped_dek
+    }
+
+    #[must_use]
+    pub const fn segment_nonce_prefix(&self) -> &[u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN] {
+        &self.segment_nonce_prefix
+    }
+
+    #[must_use]
+    pub const fn checksum_nonce(&self) -> &[u8; SSE_S3_CHECKSUM_NONCE_LEN] {
+        &self.checksum_nonce
+    }
+
+    #[must_use]
+    pub fn encrypted_checksum_metadata(&self) -> &[u8] {
+        self.encrypted_checksum_metadata.as_slice()
+    }
+
+    #[must_use]
+    fn encode(&self) -> Vec<u8> {
+        let checksum_len = self.encrypted_checksum_metadata.encoded_len();
+        let mut out = Vec::with_capacity(Self::FIXED_ENCODED_LEN + usize::from(checksum_len));
         out.push(Self::VERSION);
         out.extend_from_slice(&self.wrapping_key_id.to_be_bytes());
         out.extend_from_slice(&self.wrap_nonce);
@@ -1378,11 +1566,11 @@ impl SseS3ObjectState {
         out.extend_from_slice(&self.segment_nonce_prefix);
         out.extend_from_slice(&self.checksum_nonce);
         out.extend_from_slice(&checksum_len.to_be_bytes());
-        out.extend_from_slice(&self.encrypted_checksum_metadata);
+        out.extend_from_slice(self.encrypted_checksum_metadata.as_slice());
         out
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, ObjectEncryptionDecodeError> {
+    fn decode(bytes: &[u8]) -> Result<Self, ObjectEncryptionDecodeError> {
         if bytes.len() < Self::FIXED_ENCODED_LEN {
             return Err(ObjectEncryptionDecodeError::InvalidSseS3StateLength {
                 actual: bytes.len(),
@@ -1424,16 +1612,20 @@ impl SseS3ObjectState {
             take(&mut cursor, 2)
                 .try_into()
                 .expect("slice length checked"),
-        ) as usize;
-        if cursor + checksum_len != bytes.len() {
+        );
+        let checksum_len_usize = usize::from(checksum_len);
+        if cursor + checksum_len_usize != bytes.len() {
             return Err(
                 ObjectEncryptionDecodeError::InvalidSseS3ChecksumMetadataLength {
-                    declared: checksum_len,
+                    declared: checksum_len_usize,
                     remaining: bytes.len().saturating_sub(cursor),
                 },
             );
         }
-        let encrypted_checksum_metadata = take(&mut cursor, checksum_len).to_vec();
+        let encrypted_checksum_metadata = EncryptedChecksumMetadata::from_encoded(
+            checksum_len,
+            take(&mut cursor, checksum_len_usize).to_vec(),
+        );
 
         Ok(Self {
             wrapping_key_id,
@@ -1467,7 +1659,7 @@ impl std::fmt::Debug for ObjectEncryption {
 
 impl ObjectEncryption {
     #[must_use]
-    pub fn encryption_type(&self) -> ObjectEncryptionType {
+    pub(crate) fn encryption_type(&self) -> ObjectEncryptionType {
         match self {
             Self::None => ObjectEncryptionType::None,
             Self::SseCustomer(_) => ObjectEncryptionType::SseCustomer,
@@ -1476,7 +1668,7 @@ impl ObjectEncryption {
     }
 
     #[must_use]
-    pub fn encode_state(&self) -> Option<Vec<u8>> {
+    pub(crate) fn encode_state(&self) -> Option<Vec<u8>> {
         match self {
             Self::None => None,
             Self::SseCustomer(state) => Some(state.encode()),
@@ -1511,7 +1703,7 @@ impl ObjectEncryption {
         }
     }
 
-    pub fn decode(
+    pub(crate) fn decode(
         encryption_type: ObjectEncryptionType,
         state: Option<Vec<u8>>,
     ) -> Result<Self, ObjectEncryptionDecodeError> {
@@ -4560,44 +4752,119 @@ mod tests {
     }
 
     #[test]
-    fn sse_s3_object_state_round_trip() {
-        let state = SseS3ObjectState {
-            wrapping_key_id: 7,
-            wrap_nonce: [1u8; SSE_S3_WRAP_NONCE_LEN],
-            wrapped_dek: [2u8; SSE_S3_WRAPPED_DEK_LEN],
-            segment_nonce_prefix: [3u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
-            checksum_nonce: [4u8; SSE_S3_CHECKSUM_NONCE_LEN],
-            encrypted_checksum_metadata: vec![5, 6, 7, 8],
-        };
-        let encoded = state.encode();
-        let decoded = SseS3ObjectState::decode(&encoded).unwrap();
-        assert_eq!(decoded, state);
+    fn object_encryption_encoding_matches_golden_baseline() {
+        let none = ObjectEncryption::None;
+        assert_eq!(none.encryption_type() as u8, 0);
+        assert_eq!(none.encode_state(), None);
+        assert_eq!(
+            ObjectEncryption::decode(ObjectEncryptionType::from_u8(0).unwrap(), None).unwrap(),
+            none
+        );
+
+        let customer_state =
+            SseCustomerObjectState::new(7, [1; 16], [2; 32], [3; 16], [4; 12], [5; 48], [6; 6])
+                .with_encrypted_checksum_metadata([7; 12], vec![8, 9, 10, 11])
+                .unwrap();
+        let customer = ObjectEncryption::SseCustomer(customer_state);
+        let mut customer_golden = vec![3, 0, 0, 0, 7];
+        customer_golden.extend_from_slice(&[1; 16]);
+        customer_golden.extend_from_slice(&[2; 32]);
+        customer_golden.extend_from_slice(&[3; 16]);
+        customer_golden.extend_from_slice(&[4; 12]);
+        customer_golden.extend_from_slice(&[5; 48]);
+        customer_golden.extend_from_slice(&[6; 6]);
+        customer_golden.extend_from_slice(&[7; 12]);
+        customer_golden.extend_from_slice(&[0, 4, 8, 9, 10, 11]);
+        assert_eq!(customer.encryption_type() as u8, 1);
+        assert_eq!(customer.encode_state().unwrap(), customer_golden);
+        assert_eq!(
+            ObjectEncryption::decode(
+                ObjectEncryptionType::from_u8(1).unwrap(),
+                Some(customer_golden),
+            )
+            .unwrap(),
+            customer
+        );
+
+        let managed_state = SseS3ObjectState::new(9, [10; 12], [11; 48], [12; 6])
+            .with_encrypted_checksum_metadata([13; 12], vec![14, 15, 16])
+            .unwrap();
+        let managed = ObjectEncryption::SseS3(managed_state);
+        let mut managed_golden = vec![1, 0, 0, 0, 9];
+        managed_golden.extend_from_slice(&[10; 12]);
+        managed_golden.extend_from_slice(&[11; 48]);
+        managed_golden.extend_from_slice(&[12; 6]);
+        managed_golden.extend_from_slice(&[13; 12]);
+        managed_golden.extend_from_slice(&[0, 3, 14, 15, 16]);
+        assert_eq!(managed.encryption_type() as u8, 2);
+        assert_eq!(managed.encode_state().unwrap(), managed_golden);
+        assert_eq!(
+            ObjectEncryption::decode(
+                ObjectEncryptionType::from_u8(2).unwrap(),
+                Some(managed_golden),
+            )
+            .unwrap(),
+            managed
+        );
     }
 
     #[test]
-    fn object_encryption_sse_s3_round_trip() {
-        let encryption = ObjectEncryption::SseS3(SseS3ObjectState {
-            wrapping_key_id: 9,
-            wrap_nonce: [10u8; SSE_S3_WRAP_NONCE_LEN],
-            wrapped_dek: [11u8; SSE_S3_WRAPPED_DEK_LEN],
-            segment_nonce_prefix: [12u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
-            checksum_nonce: [13u8; SSE_S3_CHECKSUM_NONCE_LEN],
-            encrypted_checksum_metadata: vec![14, 15, 16],
-        });
-        let decoded =
-            ObjectEncryption::decode(encryption.encryption_type(), encryption.encode_state())
-                .unwrap();
-        assert_eq!(decoded, encryption);
-        assert!(decoded.is_encrypted());
-        assert_eq!(
-            decoded.segment_ciphertext_extra_len(),
-            OBJECT_ENCRYPTION_SEGMENT_TAG_LEN
+    fn object_encryption_checksum_metadata_is_bounded_at_construction() {
+        let customer = SseCustomerObjectState::new(
+            7,
+            [1; SSE_C_VALIDATOR_SALT_LEN],
+            [2; SSE_C_VALIDATOR_HMAC_LEN],
+            [3; SSE_C_WRAP_SALT_LEN],
+            [4; SSE_C_WRAP_NONCE_LEN],
+            [5; SSE_C_WRAPPED_DEK_LEN],
+            [6; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
         );
-        assert!(!decoded.uses_sse_customer_headers());
+        let managed = SseS3ObjectState::new(
+            9,
+            [10; SSE_S3_WRAP_NONCE_LEN],
+            [11; SSE_S3_WRAPPED_DEK_LEN],
+            [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        );
+        let maximum = vec![0; usize::from(u16::MAX)];
+        assert!(customer
+            .with_encrypted_checksum_metadata([7; SSE_C_CHECKSUM_NONCE_LEN], maximum.clone())
+            .is_ok());
+        assert!(managed
+            .with_encrypted_checksum_metadata([13; SSE_S3_CHECKSUM_NONCE_LEN], maximum)
+            .is_ok());
+
+        let overlong = vec![0; usize::from(u16::MAX) + 1];
+        assert_eq!(
+            customer
+                .with_encrypted_checksum_metadata([7; SSE_C_CHECKSUM_NONCE_LEN], overlong.clone(),)
+                .unwrap_err(),
+            ObjectEncryptionStateError::EncryptedChecksumMetadataTooLong
+        );
+        assert_eq!(
+            managed
+                .with_encrypted_checksum_metadata([13; SSE_S3_CHECKSUM_NONCE_LEN], overlong)
+                .unwrap_err(),
+            ObjectEncryptionStateError::EncryptedChecksumMetadataTooLong
+        );
     }
 
     #[test]
     fn object_encryption_decode_reports_typed_errors() {
+        assert_eq!(
+            ObjectEncryptionType::from_u8(0),
+            Some(ObjectEncryptionType::None)
+        );
+        assert_eq!(
+            ObjectEncryptionType::from_u8(1),
+            Some(ObjectEncryptionType::SseCustomer)
+        );
+        assert_eq!(
+            ObjectEncryptionType::from_u8(2),
+            Some(ObjectEncryptionType::SseS3)
+        );
+        assert_eq!(ObjectEncryptionType::from_u8(3), None);
+        assert_eq!(ObjectEncryptionType::from_u8(u8::MAX), None);
+
         assert_eq!(
             ObjectEncryption::decode(ObjectEncryptionType::None, Some(vec![1])).unwrap_err(),
             ObjectEncryptionDecodeError::UnexpectedStateForUnencryptedObject
@@ -4619,14 +4886,12 @@ mod tests {
             }
         );
 
-        let state = SseS3ObjectState {
-            wrapping_key_id: 7,
-            wrap_nonce: [1u8; SSE_S3_WRAP_NONCE_LEN],
-            wrapped_dek: [2u8; SSE_S3_WRAPPED_DEK_LEN],
-            segment_nonce_prefix: [3u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
-            checksum_nonce: [4u8; SSE_S3_CHECKSUM_NONCE_LEN],
-            encrypted_checksum_metadata: Vec::new(),
-        };
+        let state = SseS3ObjectState::new(
+            7,
+            [1; SSE_S3_WRAP_NONCE_LEN],
+            [2; SSE_S3_WRAPPED_DEK_LEN],
+            [3; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        );
         let mut encoded = state.encode();
         encoded[0] = 99;
         assert_eq!(
@@ -4650,6 +4915,33 @@ mod tests {
             ObjectEncryptionDecodeError::InvalidSseCustomerStateLength {
                 actual: 0,
                 minimum: SseCustomerObjectState::FIXED_ENCODED_LEN,
+            }
+        );
+
+        let customer_state = SseCustomerObjectState::new(
+            17,
+            [1; SSE_C_VALIDATOR_SALT_LEN],
+            [2; SSE_C_VALIDATOR_HMAC_LEN],
+            [3; SSE_C_WRAP_SALT_LEN],
+            [4; SSE_C_WRAP_NONCE_LEN],
+            [5; SSE_C_WRAPPED_DEK_LEN],
+            [6; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+        );
+        let mut encoded = customer_state.encode();
+        encoded[0] = 99;
+        assert_eq!(
+            SseCustomerObjectState::decode(&encoded).unwrap_err(),
+            ObjectEncryptionDecodeError::UnsupportedSseCustomerStateVersion { version: 99 }
+        );
+
+        let mut encoded = customer_state.encode();
+        let checksum_len_offset = SseCustomerObjectState::FIXED_ENCODED_LEN - 2;
+        encoded[checksum_len_offset..checksum_len_offset + 2].copy_from_slice(&1u16.to_be_bytes());
+        assert_eq!(
+            SseCustomerObjectState::decode(&encoded).unwrap_err(),
+            ObjectEncryptionDecodeError::InvalidSseCustomerChecksumMetadataLength {
+                declared: 1,
+                remaining: 0,
             }
         );
     }
@@ -4706,17 +4998,19 @@ mod tests {
         assert!(!system_debug.contains("checksum-secret"));
         assert!(!tags_debug.contains("secret-tag"));
 
-        let encryption = ObjectEncryption::SseCustomer(SseCustomerObjectState {
-            validator_key_id: 42,
-            validator_salt: [1u8; SSE_C_VALIDATOR_SALT_LEN],
-            validator_hmac: [2u8; SSE_C_VALIDATOR_HMAC_LEN],
-            wrap_salt: [3u8; SSE_C_WRAP_SALT_LEN],
-            wrap_nonce: [4u8; SSE_C_WRAP_NONCE_LEN],
-            wrapped_dek: [5u8; SSE_C_WRAPPED_DEK_LEN],
-            segment_nonce_prefix: [6u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
-            checksum_nonce: [7u8; SSE_C_CHECKSUM_NONCE_LEN],
-            encrypted_checksum_metadata: vec![8, 9, 10],
-        });
+        let encryption = ObjectEncryption::SseCustomer(
+            SseCustomerObjectState::new(
+                42,
+                [1; SSE_C_VALIDATOR_SALT_LEN],
+                [2; SSE_C_VALIDATOR_HMAC_LEN],
+                [3; SSE_C_WRAP_SALT_LEN],
+                [4; SSE_C_WRAP_NONCE_LEN],
+                [5; SSE_C_WRAPPED_DEK_LEN],
+                [6; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+            )
+            .with_encrypted_checksum_metadata([7; SSE_C_CHECKSUM_NONCE_LEN], vec![8, 9, 10])
+            .unwrap(),
+        );
         let debug = format!("{encryption:?}");
         assert!(debug.contains("<redacted:sse_customer_state>"));
         assert!(!debug.contains("wrapped_dek"));

@@ -1,11 +1,14 @@
 use std::fmt;
 
 use ring::{aead, hmac, rand::SecureRandom};
+#[cfg(test)]
+use storage::SSE_S3_CHECKSUM_NONCE_LEN;
 use storage::{
-    ObjectEncryption, SseCustomerObjectState, SseS3ObjectState, SSE_C_CHECKSUM_NONCE_LEN,
-    SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN,
-    SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
-    SSE_S3_CHECKSUM_NONCE_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAP_NONCE_LEN,
+    ObjectEncryption, ObjectEncryptionStateError, SseCustomerObjectState, SseS3ObjectState,
+    SSE_C_CHECKSUM_NONCE_LEN, SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN,
+    SSE_C_VALIDATOR_HMAC_LEN, SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN,
+    SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN,
+    SSE_S3_WRAP_NONCE_LEN,
 };
 
 use crate::error::ServerError;
@@ -30,6 +33,16 @@ const MANAGED_ENCRYPTION_LABEL: &str = "managed encryption";
 struct AeadDescriptor<'a> {
     aad: &'a [u8],
     label: &'a str,
+}
+
+fn object_encryption_state_error(error: ObjectEncryptionStateError) -> ServerError {
+    match error {
+        ObjectEncryptionStateError::EncryptedChecksumMetadataTooLong => {
+            ServerError::InternalError {
+                reason: "encrypted checksum metadata exceeds the durable storage limit".to_string(),
+            }
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -293,17 +306,11 @@ impl SseCustomerWriteContext {
         };
         let (checksum_nonce, encrypted_checksum_metadata) =
             encrypt_checksum_with_dek(&self.dek, checksum, SSE_C_CHECKSUM_AAD, "SSE-C")?;
-        Ok(ObjectEncryption::SseCustomer(SseCustomerObjectState {
-            validator_key_id: state.validator_key_id,
-            validator_salt: state.validator_salt,
-            validator_hmac: state.validator_hmac,
-            wrap_salt: state.wrap_salt,
-            wrap_nonce: state.wrap_nonce,
-            wrapped_dek: state.wrapped_dek,
-            segment_nonce_prefix: state.segment_nonce_prefix,
-            checksum_nonce,
-            encrypted_checksum_metadata,
-        }))
+        Ok(ObjectEncryption::SseCustomer(
+            state
+                .with_encrypted_checksum_metadata(checksum_nonce, encrypted_checksum_metadata)
+                .map_err(object_encryption_state_error)?,
+        ))
     }
 }
 
@@ -341,7 +348,7 @@ impl ManagedEncryptionWriteContext {
         };
         encrypt_segment_with_dek_and_prefix(
             &self.dek,
-            &state.segment_nonce_prefix,
+            state.segment_nonce_prefix(),
             self.segment_scope,
             segment_index,
             plaintext,
@@ -367,14 +374,11 @@ impl ManagedEncryptionWriteContext {
             MANAGED_CHECKSUM_AAD,
             MANAGED_ENCRYPTION_LABEL,
         )?;
-        Ok(ObjectEncryption::SseS3(SseS3ObjectState {
-            wrapping_key_id: state.wrapping_key_id,
-            wrap_nonce: state.wrap_nonce,
-            wrapped_dek: state.wrapped_dek,
-            segment_nonce_prefix: state.segment_nonce_prefix,
-            checksum_nonce,
-            encrypted_checksum_metadata,
-        }))
+        Ok(ObjectEncryption::SseS3(
+            state
+                .with_encrypted_checksum_metadata(checksum_nonce, encrypted_checksum_metadata)
+                .map_err(object_encryption_state_error)?,
+        ))
     }
 }
 
@@ -456,17 +460,15 @@ pub fn prepare_sse_customer_write(
 
     Ok(SseCustomerWriteContext {
         request: request.clone(),
-        encryption: ObjectEncryption::SseCustomer(SseCustomerObjectState {
-            validator_key_id: validator.key_id,
+        encryption: ObjectEncryption::SseCustomer(SseCustomerObjectState::new(
+            validator.key_id,
             validator_salt,
             validator_hmac,
             wrap_salt,
             wrap_nonce,
             wrapped_dek,
             segment_nonce_prefix,
-            checksum_nonce: [0u8; SSE_C_CHECKSUM_NONCE_LEN],
-            encrypted_checksum_metadata: Vec::new(),
-        }),
+        )),
         dek,
         segment_scope: SseCustomerSegmentScope::object(),
     })
@@ -479,11 +481,11 @@ pub(crate) fn resume_sse_customer_write(
     segment_scope: SseCustomerSegmentScope,
 ) -> Result<SseCustomerWriteContext, ServerError> {
     validate_sse_customer_write(validator, state, request)?;
-    let kek = derive_wrap_key(request.customer_key(), &state.wrap_salt)?;
+    let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
     let dek = unwrap_managed_dek(
         &kek,
-        &state.wrap_nonce,
-        &state.wrapped_dek,
+        state.wrap_nonce(),
+        state.wrapped_dek(),
         SSE_C_WRAP_AAD,
         "SSE-C",
     )?;
@@ -500,11 +502,11 @@ pub fn validate_sse_customer_read(
     state: &SseCustomerObjectState,
     request: &SseCustomerRequest,
 ) -> Result<SseCustomerResponseHeaders, ServerError> {
-    if state.validator_key_id != validator.key_id {
+    if state.validator_key_id() != validator.key_id {
         return Err(sse_customer_validator_key_unavailable());
     }
-    let actual = compute_validator_hmac(validator, &state.validator_salt, request.customer_key());
-    if !auth::constant_time_eq(&state.validator_hmac, &actual) {
+    let actual = compute_validator_hmac(validator, state.validator_salt(), request.customer_key());
+    if !auth::constant_time_eq(state.validator_hmac(), &actual) {
         return Err(ServerError::AccessDenied);
     }
     Ok(request.response_headers())
@@ -542,14 +544,12 @@ pub fn prepare_managed_encryption_write(
         })?;
 
     Ok(ManagedEncryptionWriteContext {
-        encryption: ObjectEncryption::SseS3(SseS3ObjectState {
-            wrapping_key_id: wrapping_key.key_id,
+        encryption: ObjectEncryption::SseS3(SseS3ObjectState::new(
+            wrapping_key.key_id,
             wrap_nonce,
             wrapped_dek,
             segment_nonce_prefix,
-            checksum_nonce: [0u8; SSE_S3_CHECKSUM_NONCE_LEN],
-            encrypted_checksum_metadata: Vec::new(),
-        }),
+        )),
         dek,
         segment_scope: SseCustomerSegmentScope::object(),
     })
@@ -563,14 +563,14 @@ pub(crate) fn resume_managed_encryption_write(
 ) -> Result<ManagedEncryptionWriteContext, ServerError> {
     let wrapping_key =
         provider
-            .lookup_key(state.wrapping_key_id)
+            .lookup_key(state.wrapping_key_id())
             .ok_or(ServerError::InternalError {
                 reason: "managed wrapping key for object is not available".to_string(),
             })?;
     let dek = unwrap_managed_dek(
         wrapping_key.wrapping_key(),
-        &state.wrap_nonce,
-        &state.wrapped_dek,
+        state.wrap_nonce(),
+        state.wrapped_dek(),
         MANAGED_WRAP_AAD,
         MANAGED_ENCRYPTION_LABEL,
     )?;
@@ -591,20 +591,20 @@ pub(crate) fn decrypt_managed_encryption_segment(
 ) -> Result<Vec<u8>, ServerError> {
     let wrapping_key =
         provider
-            .lookup_key(state.wrapping_key_id)
+            .lookup_key(state.wrapping_key_id())
             .ok_or(ServerError::InternalError {
                 reason: "managed wrapping key for object is not available".to_string(),
             })?;
     let dek = unwrap_managed_dek(
         wrapping_key.wrapping_key(),
-        &state.wrap_nonce,
-        &state.wrapped_dek,
+        state.wrap_nonce(),
+        state.wrapped_dek(),
         MANAGED_WRAP_AAD,
         MANAGED_ENCRYPTION_LABEL,
     )?;
     decrypt_segment_with_dek_and_prefix(
         &dek,
-        &state.segment_nonce_prefix,
+        state.segment_nonce_prefix(),
         segment_scope,
         segment_index,
         ciphertext,
@@ -620,26 +620,26 @@ pub fn decrypt_managed_encryption_checksum(
     provider: &impl ManagedKeyProvider,
     state: &SseS3ObjectState,
 ) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
-    if state.encrypted_checksum_metadata.is_empty() {
+    if state.encrypted_checksum_metadata().is_empty() {
         return Ok(None);
     }
     let wrapping_key =
         provider
-            .lookup_key(state.wrapping_key_id)
+            .lookup_key(state.wrapping_key_id())
             .ok_or(ServerError::InternalError {
                 reason: "managed wrapping key for object is not available".to_string(),
             })?;
     let dek = unwrap_managed_dek(
         wrapping_key.wrapping_key(),
-        &state.wrap_nonce,
-        &state.wrapped_dek,
+        state.wrap_nonce(),
+        state.wrapped_dek(),
         MANAGED_WRAP_AAD,
         MANAGED_ENCRYPTION_LABEL,
     )?;
     decrypt_checksum_with_dek(
         &dek,
-        &state.checksum_nonce,
-        &state.encrypted_checksum_metadata,
+        state.checksum_nonce(),
+        state.encrypted_checksum_metadata(),
         MANAGED_CHECKSUM_AAD,
         MANAGED_ENCRYPTION_LABEL,
     )
@@ -650,11 +650,11 @@ fn validate_sse_customer_write(
     state: &SseCustomerObjectState,
     request: &SseCustomerRequest,
 ) -> Result<SseCustomerResponseHeaders, ServerError> {
-    if state.validator_key_id != validator.key_id {
+    if state.validator_key_id() != validator.key_id {
         return Err(sse_customer_validator_key_unavailable());
     }
-    let actual = compute_validator_hmac(validator, &state.validator_salt, request.customer_key());
-    if !auth::constant_time_eq(&state.validator_hmac, &actual) {
+    let actual = compute_validator_hmac(validator, state.validator_salt(), request.customer_key());
+    if !auth::constant_time_eq(state.validator_hmac(), &actual) {
         return Err(ServerError::InvalidRequest {
             reason: "The provided encryption parameters did not match the ones used originally."
                 .to_string(),
@@ -679,17 +679,17 @@ pub(crate) fn decrypt_sse_customer_segment(
     plaintext_len: usize,
 ) -> Result<Vec<u8>, ServerError> {
     validate_sse_customer_read(validator, state, request)?;
-    let kek = derive_wrap_key(request.customer_key(), &state.wrap_salt)?;
+    let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
     let dek = unwrap_managed_dek(
         &kek,
-        &state.wrap_nonce,
-        &state.wrapped_dek,
+        state.wrap_nonce(),
+        state.wrapped_dek(),
         SSE_C_WRAP_AAD,
         "SSE-C",
     )?;
     decrypt_segment_with_dek_and_prefix(
         &dek,
-        &state.segment_nonce_prefix,
+        state.segment_nonce_prefix(),
         segment_scope,
         segment_index,
         ciphertext,
@@ -706,22 +706,22 @@ pub fn decrypt_sse_customer_checksum(
     state: &SseCustomerObjectState,
     request: &SseCustomerRequest,
 ) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
-    if state.encrypted_checksum_metadata.is_empty() {
+    if state.encrypted_checksum_metadata().is_empty() {
         return Ok(None);
     }
     validate_sse_customer_read(validator, state, request)?;
-    let kek = derive_wrap_key(request.customer_key(), &state.wrap_salt)?;
+    let kek = derive_wrap_key(request.customer_key(), state.wrap_salt())?;
     let dek = unwrap_managed_dek(
         &kek,
-        &state.wrap_nonce,
-        &state.wrapped_dek,
+        state.wrap_nonce(),
+        state.wrapped_dek(),
         SSE_C_WRAP_AAD,
         "SSE-C",
     )?;
     decrypt_checksum_with_dek(
         &dek,
-        &state.checksum_nonce,
-        &state.encrypted_checksum_metadata,
+        state.checksum_nonce(),
+        state.encrypted_checksum_metadata(),
         SSE_C_CHECKSUM_AAD,
         "SSE-C",
     )
@@ -825,7 +825,7 @@ fn encrypt_segment_with_dek(
 ) -> Result<Vec<u8>, ServerError> {
     encrypt_segment_with_dek_and_prefix(
         dek,
-        &state.segment_nonce_prefix,
+        state.segment_nonce_prefix(),
         segment_scope,
         segment_index,
         plaintext,
@@ -1259,7 +1259,7 @@ mod tests {
         else {
             panic!("expected SSE-C object state");
         };
-        assert!(!state.encrypted_checksum_metadata.is_empty());
+        assert!(!state.encrypted_checksum_metadata().is_empty());
         let decrypted = decrypt_sse_customer_checksum(&validator, &state, &req)
             .unwrap()
             .expect("expected checksum metadata");
@@ -1325,7 +1325,7 @@ mod tests {
         else {
             panic!("expected SSE-S3 object state");
         };
-        assert!(!state.encrypted_checksum_metadata.is_empty());
+        assert!(!state.encrypted_checksum_metadata().is_empty());
         let decrypted = decrypt_managed_encryption_checksum(&provider, &state)
             .unwrap()
             .expect("expected checksum metadata");

@@ -5276,14 +5276,16 @@ mod tests {
         let multipart_checksum =
             MultipartChecksumConfig::new(ChecksumAlgorithm::Sha256, Some(ChecksumType::Composite))
                 .unwrap();
-        let sse_s3_encryption = ObjectEncryption::SseS3(SseS3ObjectState {
-            wrapping_key_id: 9,
-            wrap_nonce: [10; SSE_S3_WRAP_NONCE_LEN],
-            wrapped_dek: [11; SSE_S3_WRAPPED_DEK_LEN],
-            segment_nonce_prefix: [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
-            checksum_nonce: [13; SSE_S3_CHECKSUM_NONCE_LEN],
-            encrypted_checksum_metadata: vec![14, 15, 16],
-        });
+        let sse_s3_encryption = ObjectEncryption::SseS3(
+            SseS3ObjectState::new(
+                9,
+                [10; SSE_S3_WRAP_NONCE_LEN],
+                [11; SSE_S3_WRAPPED_DEK_LEN],
+                [12; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+            )
+            .with_encrypted_checksum_metadata([13; SSE_S3_CHECKSUM_NONCE_LEN], vec![14, 15, 16])
+            .unwrap(),
+        );
         let multipart_upload = MultipartUploadRecord {
             upload_id: upload_id.clone(),
             bucket: bucket.clone(),

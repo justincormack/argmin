@@ -206,7 +206,7 @@ impl Coordinator {
                 let Some(request) = sse_customer else {
                     return Ok(system_metadata);
                 };
-                if !state.encrypted_checksum_metadata.is_empty() {
+                if !state.encrypted_checksum_metadata().is_empty() {
                     let validator =
                         self.sse_c_validator
                             .as_ref()
@@ -225,7 +225,7 @@ impl Coordinator {
                 }
             }
             ObjectEncryption::SseS3(state) => {
-                if !state.encrypted_checksum_metadata.is_empty() {
+                if !state.encrypted_checksum_metadata().is_empty() {
                     let provider =
                         self.managed_key_provider
                             .as_ref()

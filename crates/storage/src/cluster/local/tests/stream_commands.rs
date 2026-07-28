@@ -3199,14 +3199,16 @@ fn stream_put_finalize_rejects_encrypted_payload_crc64_mismatch() {
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
-    let encryption = crate::ObjectEncryption::SseS3(crate::SseS3ObjectState {
-        wrapping_key_id: 9,
-        wrap_nonce: [10; crate::SSE_S3_WRAP_NONCE_LEN],
-        wrapped_dek: [11; crate::SSE_S3_WRAPPED_DEK_LEN],
-        segment_nonce_prefix: [12; crate::SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
-        checksum_nonce: [13; crate::SSE_S3_CHECKSUM_NONCE_LEN],
-        encrypted_checksum_metadata: vec![14, 15, 16],
-    });
+    let encryption = crate::ObjectEncryption::SseS3(
+        crate::SseS3ObjectState::new(
+            9,
+            [10; crate::SSE_S3_WRAP_NONCE_LEN],
+            [11; crate::SSE_S3_WRAPPED_DEK_LEN],
+            [12; crate::SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        )
+        .with_encrypted_checksum_metadata([13; crate::SSE_S3_CHECKSUM_NONCE_LEN], vec![14, 15, 16])
+        .unwrap(),
+    );
     let session_id = crate::SessionId::try_from("90".repeat(16)).unwrap();
     cluster
         .create_put_object_stream_session_record(&bucket, &key, &session_id, encryption.clone())

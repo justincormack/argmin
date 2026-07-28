@@ -2682,6 +2682,30 @@ fail_with_matches \
     "Raft restart artifacts, WAL representations, layout helpers, and explicit-WAL constructors are private to storage; use durable authority constructors or opaque semantic test inspection" \
     "$raft_durable_format_leaks"
 
+object_encryption_codec_leaks=$(
+    {
+        rg -n --color=never \
+            '\bObjectEncryption(Type|DecodeError)\b|\bSse(Customer|S3)ObjectState::(encode|decode)\b|\.encode_state\(\)' \
+            . \
+            -g 'crates/**/*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            '\bSse(Customer|S3)ObjectState[[:space:]]*\{' \
+            . \
+            -g 'crates/**/*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            'pub enum ObjectEncryption(Type|DecodeError)|pub fn encode_state\(' \
+            crates/storage/src/types.rs \
+            || true
+    }
+)
+fail_with_matches \
+    "Object-encryption discriminators, decode errors, byte codecs, and concrete state layout are storage-owned; use ObjectEncryption and typed state constructors/accessors" \
+    "$object_encryption_codec_leaks"
+
 if [[ "$failed" -ne 0 ]]; then
     echo
     echo "storage cluster boundary checks failed" >&2
