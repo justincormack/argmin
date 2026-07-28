@@ -658,7 +658,7 @@ Node-client role classification (2026-07-19):
 | `ShardReadHandleNodeClient` | data locations carried in the handle request | active/retained authority is inherited from each validated `ShardLocation`; the lease itself remains non-cloneable |
 | `ObjectPayloadLeaseNodeClient` | object subject rather than a caller-supplied PG | subject-bound payload lease/reclaim capability; placement is validated when shard locations are acquired |
 | `MetadataCommandNodeClient` | genuinely generic metadata PG | active publisher authority, retained recovery authority, or peering/transfer authority selected from the command/recovery operation class |
-| `StorageNodeClient` | transitional mixed aggregate | must not preserve raw role-specific duplicates; split/delegate to the typed interfaces before Phase 3 completes |
+| `StorageNodeClient` | removed transitional mixed aggregate | production and cross-boundary test callers use role-specific interfaces; deliberately process-local assertions use the sanctioned raw-node test facade; private local helpers implement the embedded adapter without exposing another trait surface |
 
 The generic classifications are intentional. A metadata command can target a
 bucket or object PG, and recovery/transfer operates on a PG before a request
@@ -3599,6 +3599,35 @@ Eighty-first Phase 3 slice:
 - two focused object mutation RPC regressions and all 2,362 storage tests pass,
   as do formatting, the storage boundary checker, and workspace-wide strict
   Clippy.
+
+Eighty-second Phase 3 slice:
+
+- the transitional mixed `StorageNodeClient` aggregate is removed. Its final
+  multipart/stream-session, payload-reclaim/lifecycle, and bucket-worker
+  duplicates no longer form a second compiler-visible node-client interface;
+  callers can name only the already role-specific traits.
+- the local adapter retains private same-module helpers for the shared embedded
+  implementations used by `ObjectMutationMetadataNodeClient` and
+  `BucketWriteReservationNodeClient`. These helpers cannot be reached by
+  cluster routing or other production modules, while the trait boundaries
+  remain the sole callable surface.
+- the two remaining test-only aggregate consumers now use their intended
+  boundaries directly: shard-scavenger observation reads use
+  `ShardScavengerNodeClient`, and process-local payload-lease inspection uses
+  the raw node test facade. `LocalNodeStore` and `LocalNodeClients` therefore
+  no longer retain a mixed client trait object.
+- capability requirements on the remaining role-specific node-client traits
+  remain open in Phase 3.
+- the two focused redirected-consumer regressions and all 2,366 storage tests
+  pass, as do formatting, the storage boundary checker, and workspace-wide
+  strict Clippy. The full 7,679-test workspace suite also passes.
+
+Eighty-second Phase 3 review correction:
+
+- guidance now distinguishes role-specific production and cross-boundary test
+  interfaces from the sanctioned raw-node facade used for deliberately
+  process-local assertions. The boundary checker reports the same replacement
+  instead of directing developers to the removed aggregate.
 
 ### Phase 4 — type metadata-command publication
 

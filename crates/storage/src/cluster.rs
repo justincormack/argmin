@@ -47,8 +47,6 @@ use crate::metadata_command::{
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
-#[cfg(any(test, feature = "test-hooks"))]
-use crate::node_client::StorageNodeClient;
 use crate::node_client::{
     BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
     CreateStreamUploadPrecondition, MetadataCommandNodeClient, ObjectListingMetadataNodeClient,
@@ -8976,17 +8974,6 @@ impl StorageCluster {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn metadata_pg_primary_client(
-        &self,
-        pg_id: PgId,
-    ) -> Result<&Arc<dyn StorageNodeClient>, StoreError> {
-        let node = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        Ok(node.storage_client())
-    }
-
     fn metadata_pg_primary_shard_ack_client(
         &self,
         pg_id: PgId,
@@ -16942,7 +16929,9 @@ impl StorageCluster {
         data_pg_id: u32,
     ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
         let pg_id = PgId::new(data_pg_id);
-        self.metadata_pg_primary_client(pg_id)?
+        self.local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .shard_scavenger_client()
             .list_shard_scavenger_observations(self.validated_data_pg(pg_id)?)
     }
 

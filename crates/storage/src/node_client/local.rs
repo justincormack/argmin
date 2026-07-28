@@ -1330,7 +1330,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         now: u64,
         limit: usize,
     ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::get_bucket_delete_finalize_roots(self, pg_id, now, limit)
+        Self::get_bucket_delete_finalize_roots(self, pg_id, now, limit)
     }
 
     fn get_bucket_delete_begin_roots(
@@ -1340,13 +1340,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         start_after_bucket: Option<&BucketName>,
         limit: usize,
     ) -> Result<Vec<BucketDeleteBeginRoot>, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::get_bucket_delete_begin_roots(
-            self,
-            pg_id,
-            now,
-            start_after_bucket,
-            limit,
-        )
+        Self::get_bucket_delete_begin_roots(self, pg_id, now, start_after_bucket, limit)
     }
 
     fn acquire_bucket_delete_finalize_claim(
@@ -1361,7 +1355,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         lease_deadline: Option<u64>,
         now: u64,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::acquire_bucket_delete_finalize_claim(
+        Self::acquire_bucket_delete_finalize_claim(
             self,
             pg_id,
             bucket,
@@ -1380,7 +1374,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         pg_id: BucketPgId,
         claim: &BucketDeleteFinalizeClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::release_bucket_delete_finalize_claim(self, pg_id, claim)
+        Self::release_bucket_delete_finalize_claim(self, pg_id, claim)
     }
 
     fn bucket_delete_finalize_claim(
@@ -1388,7 +1382,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::bucket_delete_finalize_claim(self, pg_id, bucket)
+        Self::bucket_delete_finalize_claim(self, pg_id, bucket)
     }
 
     fn get_lifecycle_sweep_roots(
@@ -1397,14 +1391,14 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         now: u64,
         limit: usize,
     ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::get_lifecycle_sweep_roots(self, pg_id, now, limit)
+        Self::get_lifecycle_sweep_roots(self, pg_id, now, limit)
     }
 
     fn list_lifecycle_sweep_buckets(
         &self,
         pg_id: BucketPgId,
     ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::list_lifecycle_sweep_buckets(self, pg_id)
+        Self::list_lifecycle_sweep_buckets(self, pg_id)
     }
 
     fn acquire_lifecycle_sweep_claim(
@@ -1419,7 +1413,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         lease_deadline: Option<u64>,
         now: u64,
     ) -> Result<Option<LifecycleSweepClaimRecord>, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::acquire_lifecycle_sweep_claim(
+        Self::acquire_lifecycle_sweep_claim(
             self,
             pg_id,
             bucket,
@@ -1440,13 +1434,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         heartbeat_at: u64,
         lease_deadline: Option<u64>,
     ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::heartbeat_lifecycle_sweep_claim(
-            self,
-            pg_id,
-            claim,
-            heartbeat_at,
-            lease_deadline,
-        )
+        Self::heartbeat_lifecycle_sweep_claim(self, pg_id, claim, heartbeat_at, lease_deadline)
     }
 
     fn record_lifecycle_sweep_claim_error(
@@ -1455,9 +1443,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         claim: &LifecycleSweepClaimRecord,
         last_error: &str,
     ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::record_lifecycle_sweep_claim_error(
-            self, pg_id, claim, last_error,
-        )
+        Self::record_lifecycle_sweep_claim_error(self, pg_id, claim, last_error)
     }
 
     fn release_lifecycle_sweep_claim(
@@ -1465,7 +1451,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::release_lifecycle_sweep_claim(self, pg_id, claim)
+        Self::release_lifecycle_sweep_claim(self, pg_id, claim)
     }
 }
 
@@ -1661,18 +1647,18 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
             };
         }
 
-        let stream_session = match <Self as StorageNodeClient>::load_stream_upload_session(
-            self, pg_id, bucket, key, session_id,
-        ) {
-            Ok(session) => session,
-            Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound { .. })) => {
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
-        let staged_segments = <Self as StorageNodeClient>::load_stream_upload_segments(
-            self, pg_id, bucket, key, session_id,
-        )?;
+        let stream_session =
+            match Self::load_stream_upload_session(self, pg_id, bucket, key, session_id) {
+                Ok(session) => session,
+                Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
+                    ..
+                })) => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+        let staged_segments =
+            Self::load_stream_upload_segments(self, pg_id, bucket, key, session_id)?;
         let command_id = <Self as MetadataCommandNodeClient>::next_metadata_command_id_at_least(
             self,
             raw_pg_id,
@@ -1949,12 +1935,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         create: &CreateStreamUploadReq,
         expected_command: Option<&CreateStreamUploadCommand>,
     ) -> Result<bool, ObjectPgActionError> {
-        <Self as StorageNodeClient>::matching_stream_upload_exists(
-            self,
-            pg_id,
-            create,
-            expected_command,
-        )
+        Self::matching_stream_upload_exists(self, pg_id, create, expected_command)
     }
 
     fn matching_multipart_upload_initiated_at(
@@ -1963,12 +1944,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         create: &CreateMultipartUploadReq,
         expected_command: Option<&CreateMultipartUploadCommand>,
     ) -> Result<Option<u64>, ObjectPgActionError> {
-        <Self as StorageNodeClient>::matching_multipart_upload_initiated_at(
-            self,
-            pg_id,
-            create,
-            expected_command,
-        )
+        Self::matching_multipart_upload_initiated_at(self, pg_id, create, expected_command)
     }
 
     fn load_stream_upload_session(
@@ -1978,9 +1954,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_stream_upload_session(
-            self, pg_id, bucket, key, session_id,
-        )
+        Self::load_stream_upload_session(self, pg_id, bucket, key, session_id)
     }
 
     fn load_multipart_upload(
@@ -1990,7 +1964,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::load_multipart_upload(self, pg_id, bucket, key, upload_id)
+        Self::load_multipart_upload(self, pg_id, bucket, key, upload_id)
     }
 
     fn load_in_progress_multipart_upload(
@@ -2000,9 +1974,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_in_progress_multipart_upload(
-            self, pg_id, bucket, key, upload_id,
-        )
+        Self::load_in_progress_multipart_upload(self, pg_id, bucket, key, upload_id)
     }
 
     fn load_in_progress_multipart_upload_for_listing(
@@ -2012,9 +1984,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_in_progress_multipart_upload_for_listing(
-            self, pg_id, bucket, key, upload_id,
-        )
+        Self::load_in_progress_multipart_upload_for_listing(self, pg_id, bucket, key, upload_id)
     }
 
     fn load_multipart_completion_snapshot(
@@ -2023,7 +1993,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         authorized_upload: &AuthorizedMultipartUploadRecord,
         requested_part_numbers: &[u32],
     ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_multipart_completion_snapshot(
+        Self::load_multipart_completion_snapshot(
             self,
             pg_id,
             authorized_upload,
@@ -2036,11 +2006,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
     ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_multipart_completion_preflight(
-            self,
-            pg_id,
-            authorized_upload,
-        )
+        Self::load_multipart_completion_preflight(self, pg_id, authorized_upload)
     }
 
     fn list_multipart_parts_for_authorized_upload(
@@ -2050,7 +2016,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         part_number_marker: Option<u32>,
         max_parts: u32,
     ) -> Result<ListedMultipartParts, ObjectPgActionError> {
-        <Self as StorageNodeClient>::list_multipart_parts_for_authorized_upload(
+        Self::list_multipart_parts_for_authorized_upload(
             self,
             pg_id,
             authorized_upload,
@@ -2066,23 +2032,21 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
-        <Self as StorageNodeClient>::lookup_multipart_upload_management(
-            self, pg_id, bucket, key, upload_id,
-        )
+        Self::lookup_multipart_upload_management(self, pg_id, bucket, key, upload_id)
     }
 
     fn build_create_stream_upload_command(
         &self,
         request: BuildCreateStreamUploadCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        <Self as StorageNodeClient>::build_create_stream_upload_command(self, request)
+        Self::build_create_stream_upload_command(self, request)
     }
 
     fn build_create_multipart_upload_command(
         &self,
         request: BuildCreateMultipartUploadCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        <Self as StorageNodeClient>::build_create_multipart_upload_command(self, request)
+        Self::build_create_multipart_upload_command(self, request)
     }
 
     fn load_stream_upload_segments(
@@ -2092,9 +2056,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_stream_upload_segments(
-            self, pg_id, bucket, key, session_id,
-        )
+        Self::load_stream_upload_segments(self, pg_id, bucket, key, session_id)
     }
 
     fn list_stream_uploads_for_bucket_page(
@@ -2104,13 +2066,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         session_id_marker: Option<&SessionId>,
         limit: u32,
     ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
-        <Self as StorageNodeClient>::list_stream_uploads_for_bucket_page(
-            self,
-            pg_id,
-            bucket,
-            session_id_marker,
-            limit,
-        )
+        Self::list_stream_uploads_for_bucket_page(self, pg_id, bucket, session_id_marker, limit)
     }
 
     fn list_all_stream_uploads_page(
@@ -2119,12 +2075,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         session_id_marker: Option<&SessionId>,
         limit: u32,
     ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
-        <Self as StorageNodeClient>::list_all_stream_uploads_page(
-            self,
-            pg_id,
-            session_id_marker,
-            limit,
-        )
+        Self::list_all_stream_uploads_page(self, pg_id, session_id_marker, limit)
     }
 
     fn payload_reclaim_exists(
@@ -2134,7 +2085,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
-        <Self as StorageNodeClient>::payload_reclaim_exists(self, pg_id, bucket, key, generation_id)
+        Self::payload_reclaim_exists(self, pg_id, bucket, key, generation_id)
     }
 
     fn get_bucket_payload_reclaim_root(
@@ -2142,14 +2093,14 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         pg_id: ObjectMetadataScanPgId,
         bucket: &BucketName,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::get_bucket_payload_reclaim_root(self, pg_id, bucket)
+        Self::get_bucket_payload_reclaim_root(self, pg_id, bucket)
     }
 
     fn get_payload_reclaim_root(
         &self,
         pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::get_payload_reclaim_root(self, pg_id)
+        Self::get_payload_reclaim_root(self, pg_id)
     }
 
     fn get_object_payload_reclaim(
@@ -2159,20 +2110,14 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::get_object_payload_reclaim(
-            self,
-            pg_id,
-            bucket,
-            key,
-            generation_id,
-        )
+        Self::get_object_payload_reclaim(self, pg_id, bucket, key, generation_id)
     }
 
     fn object_payload_reclaim_claim(
         &self,
         pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::object_payload_reclaim_claim(self, pg_id)
+        Self::object_payload_reclaim_claim(self, pg_id)
     }
 
     fn acquire_object_payload_reclaim_claim(
@@ -2190,7 +2135,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         lease_deadline: Option<u64>,
         now: u64,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::acquire_object_payload_reclaim_claim(
+        Self::acquire_object_payload_reclaim_claim(
             self,
             pg_id,
             bucket,
@@ -2212,7 +2157,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         pg_id: ObjectMetadataPgId,
         claim: &ObjectPayloadReclaimClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::release_object_payload_reclaim_claim(self, pg_id, claim)
+        Self::release_object_payload_reclaim_claim(self, pg_id, claim)
     }
 
     fn prepare_stream_segment_append(
@@ -2222,9 +2167,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        <Self as StorageNodeClient>::prepare_stream_segment_append(
-            self, pg_id, bucket, key, request,
-        )
+        Self::prepare_stream_segment_append(self, pg_id, bucket, key, request)
     }
 
     fn prepare_stream_segment_append_with_effect_fence(
@@ -2235,7 +2178,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         request: &PrepareStreamUploadSegmentAppendReq,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        <Self as StorageNodeClient>::prepare_stream_segment_append_with_effect_fence(
+        Self::prepare_stream_segment_append_with_effect_fence(
             self,
             pg_id,
             bucket,
@@ -2252,9 +2195,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_stream_put_finalize_snapshot(
-            self, pg_id, bucket, key, session_id,
-        )
+        Self::load_stream_put_finalize_snapshot(self, pg_id, bucket, key, session_id)
     }
 
     fn update_stream_upload_bucket_write_reservation(
@@ -2266,7 +2207,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         current: &BucketWriteReservationProof,
         renewed: &BucketWriteReservationProof,
     ) -> Result<(), ObjectPgActionError> {
-        <Self as StorageNodeClient>::update_stream_upload_bucket_write_reservation(
+        Self::update_stream_upload_bucket_write_reservation(
             self, pg_id, bucket, key, session_id, current, renewed,
         )
     }
@@ -2275,16 +2216,14 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         &self,
         request: UpdateStreamUploadBucketWriteReservationReq<'_>,
     ) -> Result<(), ObjectPgActionError> {
-        <Self as StorageNodeClient>::update_stream_upload_bucket_write_reservation_with_effect_fence(
-            self, request,
-        )
+        Self::update_stream_upload_bucket_write_reservation_with_effect_fence(self, request)
     }
 
     fn build_stream_put_commit_command(
         &self,
         request: BuildStreamPutCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        <Self as StorageNodeClient>::build_stream_put_commit_command(self, request)
+        Self::build_stream_put_commit_command(self, request)
     }
 
     fn load_stream_part_finalize_snapshot(
@@ -2296,7 +2235,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         session_id: &SessionId,
         part_number: u32,
     ) -> Result<StreamUploadPartStorageSnapshot, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_stream_part_finalize_snapshot(
+        Self::load_stream_part_finalize_snapshot(
             self,
             pg_id,
             bucket,
@@ -2311,7 +2250,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         &self,
         request: BuildStreamPartCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        <Self as StorageNodeClient>::build_stream_part_commit_command(self, request)
+        Self::build_stream_part_commit_command(self, request)
     }
 
     fn load_multipart_completion_stale_payload_source(
@@ -2330,7 +2269,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         &self,
         request: BuildCompleteMultipartObjectCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        <Self as StorageNodeClient>::build_complete_multipart_object_command(self, request)
+        Self::build_complete_multipart_object_command(self, request)
     }
 
     fn load_abort_multipart_upload_cleanup(
@@ -2340,23 +2279,21 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_abort_multipart_upload_cleanup(
-            self, pg_id, bucket, key, upload_id,
-        )
+        Self::load_abort_multipart_upload_cleanup(self, pg_id, bucket, key, upload_id)
     }
 
     fn build_abort_multipart_upload_command(
         &self,
         request: BuildAbortMultipartUploadCommandReq<'_>,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        <Self as StorageNodeClient>::build_abort_multipart_upload_command(self, request)
+        Self::build_abort_multipart_upload_command(self, request)
     }
 
     fn build_authorized_abort_multipart_upload_command(
         &self,
         request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        <Self as StorageNodeClient>::build_authorized_abort_multipart_upload_command(self, request)
+        Self::build_authorized_abort_multipart_upload_command(self, request)
     }
 }
 
@@ -2444,11 +2381,7 @@ impl ObjectListingMetadataNodeClient for LocalStorageNodeClient {
     }
 }
 
-impl StorageNodeClient for LocalStorageNodeClient {
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
-        self.storage_node.bucket_object_payload_lease_count(bucket)
-    }
+impl LocalStorageNodeClient {
     fn load_multipart_upload(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -2480,9 +2413,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_in_progress_multipart_upload(
-            self, pg_id, bucket, key, upload_id,
-        )
+        Self::load_in_progress_multipart_upload(self, pg_id, bucket, key, upload_id)
     }
 
     fn load_multipart_completion_snapshot(
@@ -3492,6 +3423,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         Ok(PgMetadataStore::object_payload_reclaim_claim(&*pg)?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn acquire_object_payload_reclaim_claim(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -3571,6 +3503,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         )?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn acquire_bucket_delete_finalize_claim(
         &self,
         pg_id: BucketPgId,
@@ -3645,6 +3578,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn acquire_lifecycle_sweep_claim(
         &self,
         pg_id: BucketPgId,

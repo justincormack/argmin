@@ -27,8 +27,6 @@ use crate::node::SharedStorageNode;
 use crate::node::{
     LocalNodeRuntime, ReclaimQueueInsert, OBJECT_PAYLOAD_RECLAIM_MAX_OUTSTANDING_PER_PG,
 };
-#[cfg(any(test, feature = "test-hooks"))]
-use crate::node_client::StorageNodeClient;
 use crate::node_client::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
     LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandNodeClient,
@@ -492,8 +490,6 @@ pub struct LocalNodeStore {
     node_id: NodeId,
     data_dir: PathBuf,
     runtime: LocalNodeRuntime,
-    #[cfg(any(test, feature = "test-hooks"))]
-    storage_client: Arc<dyn StorageNodeClient>,
     object_payload_lease_client: Arc<dyn ObjectPayloadLeaseNodeClient>,
     bucket_metadata_client: Arc<dyn BucketMetadataNodeClient>,
     bucket_metadata_unix_socket_path: Option<PathBuf>,
@@ -519,8 +515,6 @@ impl LocalNodeStore {
             node_id,
             data_dir,
             runtime,
-            #[cfg(any(test, feature = "test-hooks"))]
-            storage_client: clients.storage,
             object_payload_lease_client: clients.object_payload_lease,
             bucket_metadata_client: clients.bucket_metadata,
             bucket_metadata_unix_socket_path: None,
@@ -570,11 +564,6 @@ impl LocalNodeStore {
     #[cfg(test)]
     fn storage_node(&self) -> &Arc<SharedStorageNode> {
         self.test_node()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn storage_client(&self) -> &Arc<dyn StorageNodeClient> {
-        &self.storage_client
     }
 
     pub(crate) fn object_payload_lease_client(&self) -> &Arc<dyn ObjectPayloadLeaseNodeClient> {
@@ -3304,10 +3293,7 @@ impl LocalClusterMap {
     pub(crate) fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
         self.nodes
             .values()
-            .map(|node| {
-                node.storage_client()
-                    .bucket_object_payload_lease_count(bucket)
-            })
+            .map(|node| node.test_node().bucket_object_payload_lease_count(bucket))
             .max()
             .unwrap_or(0)
     }

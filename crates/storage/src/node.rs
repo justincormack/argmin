@@ -16,8 +16,6 @@ use s3_types::VersionId;
 #[cfg(test)]
 use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId};
 
-#[cfg(any(test, feature = "test-hooks"))]
-use super::clients::StorageNodeClient;
 use super::clients::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
     LocalStorageNodeClient, MetadataCommandNodeClient, ObjectGenerationMetadataNodeClient,
@@ -409,8 +407,6 @@ pub(crate) struct LocalNodeRuntime {
 }
 
 pub(crate) struct LocalNodeClients {
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) storage: Arc<dyn StorageNodeClient>,
     pub(crate) object_payload_lease: Arc<dyn ObjectPayloadLeaseNodeClient>,
     pub(crate) bucket_metadata: Arc<dyn BucketMetadataNodeClient>,
     pub(crate) bucket_write_reservation: Arc<dyn BucketWriteReservationNodeClient>,
@@ -467,8 +463,6 @@ impl LocalNodeRuntime {
 
     pub(crate) fn clients(&self) -> LocalNodeClients {
         LocalNodeClients {
-            #[cfg(any(test, feature = "test-hooks"))]
-            storage: self.client.clone(),
             object_payload_lease: self.client.clone(),
             bucket_metadata: self.client.clone(),
             bucket_write_reservation: self.client.clone(),

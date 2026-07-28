@@ -58,7 +58,7 @@ public_node_read_boundary_bypasses=$(
       crates/storage/src/node/stream_ops.rs
 )
 fail_with_matches \
-    "SharedStorageNode read convenience wrappers must stay cfg(test); production cluster code must use StorageNodeClient" \
+    "SharedStorageNode read convenience wrappers must stay cfg(test); production cluster code must use role-specific node-client interfaces, while process-local inspection uses the sanctioned raw-node test facade" \
     "$public_node_read_boundary_bypasses"
 
 unexpected_single_node=$(
