@@ -3542,6 +3542,24 @@ Seventy-eighth Phase 3 slice:
 - the focused Unix object-read boundary regression and all 2,361 storage tests
   pass.
 
+Seventy-ninth Phase 3 slice:
+
+- the transitional `StorageNodeClient` aggregate no longer exposes bucket
+  snapshot, paired-snapshot, raw/info lookup, command-construction, or
+  subresource-read operations. These operations are available only through
+  `BucketMetadataNodeClient`, whose local adapter now owns the sole embedded
+  implementation as the Unix adapter already did.
+- this preserves the role-typed bucket PG boundary for bucket creation,
+  multipart completion barriers, bucket versioning/ACL/property/subresource
+  mutations, and admitted bucket reads while preventing new mixed-client
+  callers from bypassing it through the aggregate interface.
+- bucket write-reservation, object mutation and multipart-state, and
+  payload-reclaim/lifecycle duplicates in the transitional aggregate,
+  together with capability requirements on the role-specific node-client
+  traits, remain open in Phase 3.
+- four focused bucket RPC regressions and all 2,361 storage tests pass, as do
+  formatting, the storage boundary checker, and workspace-wide strict Clippy.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

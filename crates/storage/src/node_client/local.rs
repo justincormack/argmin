@@ -687,7 +687,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::head_bucket_raw(self, pg_id, bucket)
+        self.head_bucket_raw(pg_id, bucket)
     }
 
     fn head_bucket_raw(
@@ -695,7 +695,8 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::head_bucket_raw(self, pg_id, bucket)
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::head_bucket_raw(&*pg, bucket)?)
     }
 
     fn head_bucket_info(
@@ -703,7 +704,8 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::head_bucket_info(self, pg_id, bucket)
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::head_bucket(&*pg, bucket)?)
     }
 
     fn load_bucket_snapshot(
@@ -712,7 +714,10 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::load_bucket_snapshot(self, pg_id, bucket, request)
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let snapshot = SharedStorageNode::load_bucket_snapshot_from_pg(&pg, bucket, request)?;
+        drop(pg);
+        Ok(snapshot)
     }
 
     fn load_bucket_snapshot_pair(
@@ -722,13 +727,21 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         destination_pg_id: BucketPgId,
         destination: (&BucketName, BucketSnapshotRequest),
     ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::load_bucket_snapshot_pair(
-            self,
-            source_pg_id,
-            source,
-            destination_pg_id,
-            destination,
-        )
+        if source.0 == destination.0 {
+            let merged_request = source.1.union(destination.1);
+            let bucket = self.load_bucket_snapshot(source_pg_id, source.0, merged_request)?;
+            return Ok(BucketSnapshotPair::Same {
+                bucket: Box::new(bucket),
+            });
+        }
+
+        let source_snapshot = self.load_bucket_snapshot(source_pg_id, source.0, source.1)?;
+        let destination_snapshot =
+            self.load_bucket_snapshot(destination_pg_id, destination.0, destination.1)?;
+        Ok(BucketSnapshotPair::Distinct {
+            source: Box::new(source_snapshot),
+            destination: Box::new(destination_snapshot),
+        })
     }
 
     fn build_create_bucket_command(
@@ -738,9 +751,22 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         command_id: MetadataCommandId,
         config: &CreateBucketConfig<'_>,
     ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::build_create_bucket_command(
-            self, pg_id, bucket, command_id, config,
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        match PgMetadataStore::head_bucket_raw(&*pg, bucket) {
+            Ok(info) => return Ok(CreateBucketCommandBuild::Exists(info)),
+            Err(MetadataError::BucketNotFound { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let bucket_execution_generation = pg.next_bucket_execution_generation_candidate()?;
+        let command = CreateBucketCommand::from_config(
+            config,
+            crate::clock::current_time_millis(),
+            bucket_execution_generation,
         )
+        .map_err(|reason| MetadataError::InvalidBucketName { reason })?;
+        Ok(CreateBucketCommandBuild::Command(Box::new(
+            MetadataCommandEnvelope::new(command_id, MetadataCommandPayload::CreateBucket(command)),
+        )))
     }
 
     fn build_advance_multipart_completion_barrier_command(
@@ -751,14 +777,52 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         completion_target_context: &str,
         bucket_write_reservation: &BucketWriteReservationProof,
     ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::build_advance_multipart_completion_barrier_command(
+        if &bucket_write_reservation.bucket != bucket {
+            return Err(MetadataError::BucketWriteReservationConflict {
+                reservation_id: bucket_write_reservation.reservation_id.clone(),
+            }
+            .into());
+        }
+        if bucket_write_reservation.operation_kind
+            != COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND
+            || bucket_write_reservation.target_context.as_deref() != Some(completion_target_context)
+        {
+            return Err(MetadataError::BucketWriteReservationConflict {
+                reservation_id: bucket_write_reservation.reservation_id.clone(),
+            }
+            .into());
+        }
+        <Self as StorageNodeClient>::validate_bucket_write_reservation_proof(
             self,
             pg_id,
-            bucket,
-            command_id,
-            completion_target_context,
             bucket_write_reservation,
-        )
+        )?;
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let current_sequence = pg.multipart_completion_barrier_sequence_for_bucket(bucket)?;
+        let barrier_sequence =
+            current_sequence
+                .checked_add(1)
+                .ok_or_else(|| MetadataError::InvariantViolation {
+                    context: "reserve multipart completion barrier overflow",
+                    reason: "multipart completion barrier sequence overflow".into(),
+                })?;
+        i64::try_from(barrier_sequence).map_err(|_| MetadataError::InvariantViolation {
+            context: "reserve multipart completion barrier overflow",
+            reason: "multipart completion barrier sequence exceeds the durable integer range"
+                .into(),
+        })?;
+        Ok((
+            barrier_sequence,
+            MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+                    AdvanceMultipartCompletionBarrierCommand {
+                        bucket: bucket.clone(),
+                        barrier_sequence,
+                    },
+                ),
+            ),
+        ))
     }
 
     fn pending_mark_bucket_deleting_command_matches_current(
@@ -806,9 +870,24 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         command: &PutBucketVersioningCommand,
         state: BucketVersioningState,
     ) -> Result<bool, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::pending_put_bucket_versioning_command_matches_current(
-            self, pg_id, bucket, command, state,
-        )
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
+        pending_bucket_command_matches_current(current, &command.bucket, |record| {
+            if state == BucketVersioningState::Disabled
+                && record.versioning != BucketVersioningState::Disabled
+            {
+                return Err(MetadataError::InvalidVersioningTransition {
+                    from: record.versioning,
+                    to: state,
+                }
+                .into());
+            }
+            Ok(PutBucketVersioningCommand::from_bucket(
+                record.with_execution_generation(command.bucket.bucket_execution_generation),
+                state,
+            )
+            .bucket)
+        })
     }
 
     fn build_put_bucket_versioning_command(
@@ -818,9 +897,25 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         command_id: MetadataCommandId,
         state: BucketVersioningState,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::build_put_bucket_versioning_command(
-            self, pg_id, bucket, command_id, state,
-        )
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
+        if state == BucketVersioningState::Disabled
+            && current.versioning != BucketVersioningState::Disabled
+        {
+            return Err(MetadataError::InvalidVersioningTransition {
+                from: current.versioning,
+                to: state,
+            }
+            .into());
+        }
+        let bucket_execution_generation = pg.next_bucket_execution_generation_candidate()?;
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::from_bucket(
+                current.with_execution_generation(bucket_execution_generation),
+                state,
+            )),
+        ))
     }
 
     fn pending_put_bucket_acl_command_matches_current(
@@ -831,9 +926,16 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         acl_grants: &AclGrants,
         summary: BucketAclSummary,
     ) -> Result<bool, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::pending_put_bucket_acl_command_matches_current(
-            self, pg_id, bucket, command, acl_grants, summary,
-        )
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
+        pending_bucket_command_matches_current(current, &command.bucket, |record| {
+            Ok(PutBucketAclCommand::from_bucket(
+                record.with_execution_generation(command.bucket.bucket_execution_generation),
+                acl_grants.clone(),
+                summary,
+            )
+            .bucket)
+        })
     }
 
     fn build_put_bucket_acl_command(
@@ -844,9 +946,17 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         acl_grants: &AclGrants,
         summary: BucketAclSummary,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::build_put_bucket_acl_command(
-            self, pg_id, bucket, command_id, acl_grants, summary,
-        )
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
+        let bucket_execution_generation = pg.next_bucket_execution_generation_candidate()?;
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
+                current.with_execution_generation(bucket_execution_generation),
+                acl_grants.clone(),
+                summary,
+            )),
+        ))
     }
 
     fn pending_put_bucket_property_command_matches_current(
@@ -856,9 +966,15 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         command: &PutBucketPropertyCommand,
         mutation: &BucketPropertyMutation,
     ) -> Result<bool, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::pending_put_bucket_property_command_matches_current(
-            self, pg_id, bucket, command, mutation,
-        )
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
+        pending_bucket_command_matches_current(current, &command.bucket, |record| {
+            Ok(PutBucketPropertyCommand::from_bucket_and_mutation(
+                record.with_execution_generation(command.bucket.bucket_execution_generation),
+                mutation.clone(),
+            )
+            .bucket)
+        })
     }
 
     fn build_put_bucket_property_command(
@@ -868,9 +984,18 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         command_id: MetadataCommandId,
         mutation: &BucketPropertyMutation,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::build_put_bucket_property_command(
-            self, pg_id, bucket, command_id, mutation,
-        )
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
+        let bucket_execution_generation = pg.next_bucket_execution_generation_candidate()?;
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::PutBucketProperty(
+                PutBucketPropertyCommand::from_bucket_and_mutation(
+                    current.with_execution_generation(bucket_execution_generation),
+                    mutation.clone(),
+                ),
+            ),
+        ))
     }
 
     fn build_put_bucket_subresource_command(
@@ -880,9 +1005,16 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         command_id: MetadataCommandId,
         mutation: &BucketSubresourceMutation,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::build_put_bucket_subresource_command(
-            self, pg_id, bucket, command_id, mutation,
-        )
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let bucket_execution_generation = pg.next_bucket_execution_generation_candidate()?;
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::PutBucketSubresource(PutBucketSubresourceCommand::new(
+                bucket.clone(),
+                mutation.clone(),
+                bucket_execution_generation,
+            )),
+        ))
     }
 
     fn get_bucket_subresource(
@@ -891,7 +1023,8 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::get_bucket_subresource(self, pg_id, bucket, kind)
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::get_bucket_subresource(&*pg, bucket, kind)?.map(|stored| stored.body))
     }
 
     fn list_buckets(
@@ -2286,319 +2419,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 now: crate::clock::current_time_millis(),
             },
         )?)
-    }
-
-    fn load_bucket_snapshot(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        request: BucketSnapshotRequest,
-    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let snapshot = SharedStorageNode::load_bucket_snapshot_from_pg(&pg, bucket, request)?;
-        drop(pg);
-        Ok(snapshot)
-    }
-
-    fn load_bucket_snapshot_pair(
-        &self,
-        source_pg_id: BucketPgId,
-        source: (&BucketName, BucketSnapshotRequest),
-        destination_pg_id: BucketPgId,
-        destination: (&BucketName, BucketSnapshotRequest),
-    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
-        if source.0 == destination.0 {
-            let merged_request = source.1.union(destination.1);
-            let bucket = <Self as StorageNodeClient>::load_bucket_snapshot(
-                self,
-                source_pg_id,
-                source.0,
-                merged_request,
-            )?;
-            return Ok(BucketSnapshotPair::Same {
-                bucket: Box::new(bucket),
-            });
-        }
-
-        let source_snapshot = <Self as StorageNodeClient>::load_bucket_snapshot(
-            self,
-            source_pg_id,
-            source.0,
-            source.1,
-        )?;
-        let destination_snapshot = <Self as StorageNodeClient>::load_bucket_snapshot(
-            self,
-            destination_pg_id,
-            destination.0,
-            destination.1,
-        )?;
-        Ok(BucketSnapshotPair::Distinct {
-            source: Box::new(source_snapshot),
-            destination: Box::new(destination_snapshot),
-        })
-    }
-
-    fn head_bucket_raw(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::head_bucket_raw(&*pg, bucket)?)
-    }
-
-    fn head_bucket_info(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::head_bucket(&*pg, bucket)?)
-    }
-
-    fn build_create_bucket_command(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        command_id: MetadataCommandId,
-        config: &CreateBucketConfig<'_>,
-    ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        match PgMetadataStore::head_bucket_raw(&*pg, bucket) {
-            Ok(info) => return Ok(CreateBucketCommandBuild::Exists(info)),
-            Err(MetadataError::BucketNotFound { .. }) => {}
-            Err(error) => return Err(error.into()),
-        }
-        let bucket_execution_generation = pg.next_bucket_execution_generation_candidate()?;
-        let command = CreateBucketCommand::from_config(
-            config,
-            crate::clock::current_time_millis(),
-            bucket_execution_generation,
-        )
-        .map_err(|reason| MetadataError::InvalidBucketName { reason })?;
-        Ok(CreateBucketCommandBuild::Command(Box::new(
-            MetadataCommandEnvelope::new(command_id, MetadataCommandPayload::CreateBucket(command)),
-        )))
-    }
-
-    fn build_advance_multipart_completion_barrier_command(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        command_id: MetadataCommandId,
-        completion_target_context: &str,
-        bucket_write_reservation: &BucketWriteReservationProof,
-    ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError> {
-        if &bucket_write_reservation.bucket != bucket {
-            return Err(MetadataError::BucketWriteReservationConflict {
-                reservation_id: bucket_write_reservation.reservation_id.clone(),
-            }
-            .into());
-        }
-        if bucket_write_reservation.operation_kind
-            != COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND
-            || bucket_write_reservation.target_context.as_deref() != Some(completion_target_context)
-        {
-            return Err(MetadataError::BucketWriteReservationConflict {
-                reservation_id: bucket_write_reservation.reservation_id.clone(),
-            }
-            .into());
-        }
-        <Self as StorageNodeClient>::validate_bucket_write_reservation_proof(
-            self,
-            pg_id,
-            bucket_write_reservation,
-        )?;
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let current_sequence = pg.multipart_completion_barrier_sequence_for_bucket(bucket)?;
-        let barrier_sequence =
-            current_sequence
-                .checked_add(1)
-                .ok_or_else(|| MetadataError::InvariantViolation {
-                    context: "reserve multipart completion barrier overflow",
-                    reason: "multipart completion barrier sequence overflow".into(),
-                })?;
-        i64::try_from(barrier_sequence).map_err(|_| MetadataError::InvariantViolation {
-            context: "reserve multipart completion barrier overflow",
-            reason: "multipart completion barrier sequence exceeds the durable integer range"
-                .into(),
-        })?;
-        Ok((
-            barrier_sequence,
-            MetadataCommandEnvelope::new(
-                command_id,
-                MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
-                    AdvanceMultipartCompletionBarrierCommand {
-                        bucket: bucket.clone(),
-                        barrier_sequence,
-                    },
-                ),
-            ),
-        ))
-    }
-
-    fn pending_put_bucket_versioning_command_matches_current(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        command: &PutBucketVersioningCommand,
-        state: BucketVersioningState,
-    ) -> Result<bool, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
-        pending_bucket_command_matches_current(current, &command.bucket, |record| {
-            if state == BucketVersioningState::Disabled
-                && record.versioning != BucketVersioningState::Disabled
-            {
-                return Err(MetadataError::InvalidVersioningTransition {
-                    from: record.versioning,
-                    to: state,
-                }
-                .into());
-            }
-            Ok(PutBucketVersioningCommand::from_bucket(
-                record.with_execution_generation(command.bucket.bucket_execution_generation),
-                state,
-            )
-            .bucket)
-        })
-    }
-
-    fn build_put_bucket_versioning_command(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        command_id: MetadataCommandId,
-        state: BucketVersioningState,
-    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
-        if state == BucketVersioningState::Disabled
-            && current.versioning != BucketVersioningState::Disabled
-        {
-            return Err(MetadataError::InvalidVersioningTransition {
-                from: current.versioning,
-                to: state,
-            }
-            .into());
-        }
-        let bucket_execution_generation = pg.next_bucket_execution_generation_candidate()?;
-        Ok(MetadataCommandEnvelope::new(
-            command_id,
-            MetadataCommandPayload::PutBucketVersioning(PutBucketVersioningCommand::from_bucket(
-                current.with_execution_generation(bucket_execution_generation),
-                state,
-            )),
-        ))
-    }
-
-    fn pending_put_bucket_acl_command_matches_current(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        command: &PutBucketAclCommand,
-        acl_grants: &AclGrants,
-        summary: BucketAclSummary,
-    ) -> Result<bool, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
-        pending_bucket_command_matches_current(current, &command.bucket, |record| {
-            Ok(PutBucketAclCommand::from_bucket(
-                record.with_execution_generation(command.bucket.bucket_execution_generation),
-                acl_grants.clone(),
-                summary,
-            )
-            .bucket)
-        })
-    }
-
-    fn build_put_bucket_acl_command(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        command_id: MetadataCommandId,
-        acl_grants: &AclGrants,
-        summary: BucketAclSummary,
-    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
-        let bucket_execution_generation = pg.next_bucket_execution_generation_candidate()?;
-        Ok(MetadataCommandEnvelope::new(
-            command_id,
-            MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
-                current.with_execution_generation(bucket_execution_generation),
-                acl_grants.clone(),
-                summary,
-            )),
-        ))
-    }
-
-    fn pending_put_bucket_property_command_matches_current(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        command: &PutBucketPropertyCommand,
-        mutation: &BucketPropertyMutation,
-    ) -> Result<bool, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
-        pending_bucket_command_matches_current(current, &command.bucket, |record| {
-            Ok(PutBucketPropertyCommand::from_bucket_and_mutation(
-                record.with_execution_generation(command.bucket.bucket_execution_generation),
-                mutation.clone(),
-            )
-            .bucket)
-        })
-    }
-
-    fn build_put_bucket_property_command(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        command_id: MetadataCommandId,
-        mutation: &BucketPropertyMutation,
-    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
-        let bucket_execution_generation = pg.next_bucket_execution_generation_candidate()?;
-        Ok(MetadataCommandEnvelope::new(
-            command_id,
-            MetadataCommandPayload::PutBucketProperty(
-                PutBucketPropertyCommand::from_bucket_and_mutation(
-                    current.with_execution_generation(bucket_execution_generation),
-                    mutation.clone(),
-                ),
-            ),
-        ))
-    }
-
-    fn build_put_bucket_subresource_command(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        command_id: MetadataCommandId,
-        mutation: &BucketSubresourceMutation,
-    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let bucket_execution_generation = pg.next_bucket_execution_generation_candidate()?;
-        Ok(MetadataCommandEnvelope::new(
-            command_id,
-            MetadataCommandPayload::PutBucketSubresource(PutBucketSubresourceCommand::new(
-                bucket.clone(),
-                mutation.clone(),
-                bucket_execution_generation,
-            )),
-        ))
-    }
-
-    fn get_bucket_subresource(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        kind: BucketSubresourceKind,
-    ) -> Result<Option<String>, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::get_bucket_subresource(&*pg, bucket, kind)?.map(|stored| stored.body))
     }
 
     fn load_put_object_metadata_snapshot(
