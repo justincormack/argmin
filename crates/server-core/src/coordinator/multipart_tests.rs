@@ -1264,7 +1264,7 @@ fn create_multipart_upload_preserves_metadata() {
     assert_eq!(record.tags.as_deref(), Some(tags_xml));
 
     // Deserialize and verify the metadata blob.
-    let (blob, _) = MetadataBlob::deserialize(record.metadata_blob.as_slice()).unwrap();
+    let blob = MetadataBlob::deserialize(record.metadata_blob.as_slice()).unwrap();
     assert_eq!(blob.get("x-amz-meta-author"), Some("test"));
     let stored_system =
         SystemMetadata::deserialize(record.system_metadata_blob.as_slice()).unwrap();

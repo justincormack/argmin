@@ -2706,6 +2706,32 @@ fail_with_matches \
     "Object-encryption discriminators, decode errors, byte codecs, and concrete state layout are storage-owned; use ObjectEncryption and typed state constructors/accessors" \
     "$object_encryption_codec_leaks"
 
+metadata_blob_codec_leaks=$(
+    {
+        rg -n --color=never \
+            '\b(MetadataBlob|SystemMetadata)::deserialize\b' \
+            . \
+            -g 'crates/**/*.rs' \
+            -g '!crates/server-core/**' \
+            || true
+        rg -n --color=never \
+            '\bSerialized(Metadata|SystemMetadata)Blob\b' \
+            . \
+            -g 'crates/**/*.rs' \
+            -g '!crates/server-core/**' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            'pub fn (serialize|deserialize)\(' \
+            crates/server-core/src/metadata_blob.rs \
+            crates/server-core/src/system_metadata.rs \
+            || true
+    }
+)
+fail_with_matches \
+    "User/system metadata byte codecs are private to server-core and storage carries only their opaque serialized values" \
+    "$metadata_blob_codec_leaks"
+
 if [[ "$failed" -ne 0 ]]; then
     echo
     echo "storage cluster boundary checks failed" >&2

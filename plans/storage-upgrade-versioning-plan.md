@@ -246,6 +246,49 @@ old owner's access in the same change. Until then, `storage` exclusively owns th
 control-plane and Raft formats, and `argmin-s3` exclusively owns the static manifest and
 process-identity formats.
 
+### Nested Durable Codec Inventory: Object Metadata (2026-07-28)
+
+`server-core` owns both object-metadata codecs. Its public logical surface is `MetadataBlob`,
+`MetadataEntry`, `SystemMetadata`, and `ObjectChecksumMetadata`; byte serialization and parsing
+are crate-private. `storage` carries `SerializedMetadataBlob` and
+`SerializedSystemMetadataBlob` as opaque values through persistence, commands, and RPCs, but
+does not interpret their inner versions, fields, or errors. No other crate may construct or
+inspect those serialized carriers directly.
+
+Both nested formats require their exact current version:
+
+- User metadata version 1 has a self-inclusive little-endian `u32` length, a little-endian
+  `u16` entry count, and ordered UTF-8 key/value pairs with little-endian `u16` lengths.
+- System metadata version 1 has a little-endian `u16` field bitmap, its optional typed header
+  values in fixed bit order with little-endian `u16` lengths, and an optional checksum record.
+
+The owner rejects unsupported versions, unknown system-field bits, incomplete input, declared
+length mismatches, bytes left inside a declared user-metadata frame, and bytes after either
+complete representation. Empty bytes are not a representation of empty system metadata; the
+current empty encoding is the explicit version-and-zero-flags frame. Exact-byte owner-local
+goldens pin both empty formats and representative full field order, enum tags, endianness, and
+length encoding. User-metadata construction and decode share one canonical-entry validator for
+the lowercase `x-amz-meta-` token-name and stored Latin-1/header-value domain, so corrupt entries
+cannot be silently hidden by response filtering. The system-metadata baseline separately pins all
+ten checksum-algorithm tags, both checksum-type tags, and the absent-type sentinel.
+
+The same nested bytes are embedded in these storage-owned containing formats:
+
+| Containing format | Current baseline | Metadata embedding |
+| --- | --- | --- |
+| PG SQLite schema | schema version 1 | `objects`, `multipart_uploads`, and `stream_uploads` store user and system metadata blob columns. |
+| Metadata command | encoding version 5 | Object, multipart-upload, and stream-session command values carry both opaque blobs. |
+| Storage-node RPC | frame encoding version 11 | Logical object, multipart, and stream request/response payloads carry both opaque blobs. |
+| Canonical PG state | encoding version 4 | The metadata columns participate in canonical row and state digests. |
+| Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry the metadata columns and bind them into row, table, state, and checkpoint digests. |
+
+Changing either metadata encoding requires a new inner version and coordinated advancement of
+every containing format that can persist, replay, hash, or transmit the changed bytes. There are
+no old-version or prefix-decoding fallbacks. The separately encrypted checksum projection used
+by SSE-C and SSE-S3 is a private `server-core` version-1 codec nested inside the storage-owned
+encryption state; changing it also requires advancing the corresponding encryption inner version
+and all of that format's containing versions.
+
 ### Nested Durable Codec Inventory: Object Encryption State (2026-07-28)
 
 `storage` owns the object-encryption discriminator and durable byte encoding. Its public logical
@@ -640,9 +683,9 @@ Raft peer client and server transports are storage-owned and boundary-checked.
    diagnostics, and cannot construct raw `Io`, `RpcProtocol`, or `RpcRemote` variants.
 4. **In progress:** inventory and restrict nested durable codecs for metadata, tags, ACLs, and
    encryption; record how containing formats advance when a nested format changes. Object
-   encryption is complete: its discriminator, decode errors, versioned byte codecs, and concrete
-   state layout are storage-owned and boundary-checked, and all five containing formats are
-   recorded above. Metadata, tags, and ACLs remain.
+   encryption and user/system metadata are complete: their private codecs are owner-local and
+   boundary-checked, their exact current representations are golden-tested, and all five
+   containing formats are recorded above. Tags and ACLs remain.
 5. Audit existing version/fallback code and remove unsupported legacy compatibility where it
    worsens current invariants.
 6. Add or tighten current-version rejection tests for existing versioned formats.

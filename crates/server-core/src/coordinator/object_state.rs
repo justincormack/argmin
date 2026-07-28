@@ -135,7 +135,7 @@ impl Coordinator {
         metadata_blob: Option<&SerializedMetadataBlob>,
     ) -> Result<MetadataBlob, ServerError> {
         metadata_blob
-            .map(|blob| MetadataBlob::deserialize(blob.as_slice()).map(|(m, _)| m))
+            .map(|blob| MetadataBlob::deserialize(blob.as_slice()))
             .transpose()?
             .map_or(Ok(MetadataBlob::new()), Ok)
     }

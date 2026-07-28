@@ -38,6 +38,36 @@ fn has_invalid_header_bytes(s: &str) -> bool {
     s.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
+fn is_header_name_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn metadata_entry_is_canonical(key: &str, value: &str) -> bool {
+    key.starts_with("x-amz-meta-")
+        && key
+            .bytes()
+            .all(|byte| is_header_name_token_byte(byte) && !byte.is_ascii_uppercase())
+        && !has_invalid_header_bytes(value)
+        && value.chars().all(|character| u32::from(character) <= 0xff)
+}
+
 impl MetadataBlob {
     /// Create an empty metadata blob.
     pub fn new() -> Self {
@@ -87,6 +117,11 @@ impl MetadataBlob {
                 } else {
                     value.to_string()
                 };
+                if !metadata_entry_is_canonical(&lower, &stored_value) {
+                    return Err(ServerError::InvalidRequest {
+                        reason: format!("metadata entry for '{lower}' is not canonical"),
+                    });
+                }
                 entries.push(MetadataEntry {
                     key: lower,
                     value: stored_value,
@@ -96,8 +131,8 @@ impl MetadataBlob {
         Ok(Self { entries })
     }
 
-    /// Serialize the blob to bytes.
-    pub fn serialize(&self) -> Result<Vec<u8>, ServerError> {
+    /// Serialize the storage-owned nested representation.
+    pub(crate) fn serialize(&self) -> Result<Vec<u8>, ServerError> {
         // Validate field widths before serializing
         if self.entries.len() > u16::MAX as usize {
             return Err(ServerError::MetadataBlobError {
@@ -109,6 +144,11 @@ impl MetadataBlob {
             });
         }
         for entry in &self.entries {
+            if !metadata_entry_is_canonical(&entry.key, &entry.value) {
+                return Err(ServerError::MetadataBlobError {
+                    reason: "metadata entry is not canonical".to_string(),
+                });
+            }
             if entry.key.len() > u16::MAX as usize {
                 return Err(ServerError::MetadataBlobError {
                     reason: format!(
@@ -166,9 +206,8 @@ impl MetadataBlob {
         Ok(buf)
     }
 
-    /// Deserialize a blob from the front of a data buffer.
-    /// Returns the parsed blob and the total number of bytes consumed.
-    pub fn deserialize(data: &[u8]) -> Result<(MetadataBlob, usize), ServerError> {
+    /// Deserialize one complete storage-owned nested representation.
+    pub(crate) fn deserialize(data: &[u8]) -> Result<MetadataBlob, ServerError> {
         if data.len() < MIN_BLOB_SIZE {
             return Err(ServerError::MetadataBlobError {
                 reason: "data too short for metadata blob".to_string(),
@@ -177,7 +216,7 @@ impl MetadataBlob {
 
         // Read total length
         let total_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        if total_len < MIN_BLOB_SIZE || total_len > data.len() {
+        if total_len < MIN_BLOB_SIZE || total_len != data.len() {
             return Err(ServerError::MetadataBlobError {
                 reason: format!(
                     "invalid metadata blob length: {} (data len: {})",
@@ -245,10 +284,22 @@ impl MetadataBlob {
                 .to_string();
             pos += val_len;
 
+            if !metadata_entry_is_canonical(&key, &value) {
+                return Err(ServerError::MetadataBlobError {
+                    reason: "stored metadata entry is not canonical".to_string(),
+                });
+            }
+
             entries.push(MetadataEntry { key, value });
         }
 
-        Ok((MetadataBlob { entries }, total_len))
+        if pos != total_len {
+            return Err(ServerError::MetadataBlobError {
+                reason: "trailing bytes in metadata blob".to_string(),
+            });
+        }
+
+        Ok(MetadataBlob { entries })
     }
 
     /// Get a metadata value by key.
@@ -285,14 +336,40 @@ impl Default for MetadataBlob {
 mod tests {
     use super::*;
 
+    fn raw_single_entry(key: &str, value: &str) -> Vec<u8> {
+        let total_len = 7 + 2 + key.len() + 2 + value.len();
+        let mut data = Vec::with_capacity(total_len);
+        data.extend_from_slice(&u32::try_from(total_len).unwrap().to_le_bytes());
+        data.push(1);
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&u16::try_from(key.len()).unwrap().to_le_bytes());
+        data.extend_from_slice(key.as_bytes());
+        data.extend_from_slice(&u16::try_from(value.len()).unwrap().to_le_bytes());
+        data.extend_from_slice(value.as_bytes());
+        data
+    }
+
     #[test]
-    fn round_trip_empty() {
+    fn encoding_matches_golden_baseline() {
         let blob = MetadataBlob::new();
         let data = blob.serialize().unwrap();
-        let (decoded, consumed) = MetadataBlob::deserialize(&data).unwrap();
-        assert_eq!(consumed, data.len());
+        assert_eq!(data, [7, 0, 0, 0, 1, 0, 0]);
+        let decoded = MetadataBlob::deserialize(&data).unwrap();
         assert_eq!(decoded, blob);
         assert!(decoded.entries.is_empty());
+
+        let blob = MetadataBlob {
+            entries: vec![MetadataEntry {
+                key: "x-amz-meta-k".to_string(),
+                value: "v".to_string(),
+            }],
+        };
+        let expected = [
+            24, 0, 0, 0, 1, 1, 0, 12, 0, b'x', b'-', b'a', b'm', b'z', b'-', b'm', b'e', b't',
+            b'a', b'-', b'k', 1, 0, b'v',
+        ];
+        assert_eq!(blob.serialize().unwrap(), expected);
+        assert_eq!(MetadataBlob::deserialize(&expected).unwrap(), blob);
     }
 
     #[test]
@@ -304,8 +381,7 @@ mod tests {
             }],
         };
         let data = blob.serialize().unwrap();
-        let (decoded, consumed) = MetadataBlob::deserialize(&data).unwrap();
-        assert_eq!(consumed, data.len());
+        let decoded = MetadataBlob::deserialize(&data).unwrap();
         assert_eq!(decoded, blob);
     }
 
@@ -328,24 +404,55 @@ mod tests {
             ],
         };
         let data = blob.serialize().unwrap();
-        let (decoded, consumed) = MetadataBlob::deserialize(&data).unwrap();
-        assert_eq!(consumed, data.len());
+        let decoded = MetadataBlob::deserialize(&data).unwrap();
         assert_eq!(decoded, blob);
     }
 
     #[test]
-    fn deserialize_with_trailing_data() {
+    fn deserialize_rejects_trailing_data_inside_or_after_declared_length() {
         let blob = MetadataBlob {
             entries: vec![MetadataEntry {
-                key: "k".to_string(),
+                key: "x-amz-meta-k".to_string(),
                 value: "v".to_string(),
             }],
         };
         let mut data = blob.serialize().unwrap();
-        data.extend_from_slice(b"trailing user data here");
-        let (decoded, consumed) = MetadataBlob::deserialize(&data).unwrap();
-        assert_eq!(decoded, blob);
-        assert!(consumed < data.len());
+        data.push(0);
+        assert!(MetadataBlob::deserialize(&data).is_err());
+
+        let declared_len = u32::try_from(data.len()).unwrap().to_le_bytes();
+        data[..4].copy_from_slice(&declared_len);
+        assert!(MetadataBlob::deserialize(&data).is_err());
+    }
+
+    #[test]
+    fn construction_and_decode_share_canonical_entry_validation() {
+        let canonical = MetadataBlob::from_headers(&[("X-Amz-Meta-K", "café")]).unwrap();
+        assert_eq!(canonical.get("x-amz-meta-k"), Some("cafÃ©"));
+        assert!(MetadataBlob::deserialize(&canonical.serialize().unwrap()).is_ok());
+
+        for (key, value) in [
+            ("X-Amz-Meta-K", "value"),
+            ("content-type", "value"),
+            ("x-amz-meta-bad key", "value"),
+            ("x-amz-meta-k", "bad\nvalue"),
+            ("x-amz-meta-k", "outside-latin1- "),
+        ] {
+            assert!(
+                MetadataBlob::deserialize(&raw_single_entry(key, value)).is_err(),
+                "unexpectedly accepted key={key:?} value={value:?}"
+            );
+        }
+
+        for (key, value) in [
+            ("x-amz-meta-bad key", "value"),
+            ("x-amz-meta-k", "bad\nvalue"),
+        ] {
+            assert!(
+                MetadataBlob::from_headers(&[(key, value)]).is_err(),
+                "construction unexpectedly accepted key={key:?} value={value:?}"
+            );
+        }
     }
 
     #[test]
@@ -403,34 +510,44 @@ mod tests {
     fn serialize_rejects_oversized_value() {
         let blob = MetadataBlob {
             entries: vec![MetadataEntry {
-                key: "k".to_string(),
+                key: "x-amz-meta-k".to_string(),
                 value: "x".repeat(u16::MAX as usize + 1),
             }],
         };
-        assert!(blob.serialize().is_err());
+        let err = blob.serialize().unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::MetadataBlobError { reason }
+                if reason.starts_with("metadata value too long")
+        ));
     }
 
     #[test]
     fn serialize_rejects_oversized_key() {
         let blob = MetadataBlob {
             entries: vec![MetadataEntry {
-                key: "k".repeat(u16::MAX as usize + 1),
+                key: format!("x-amz-meta-{}", "k".repeat(u16::MAX as usize + 1)),
                 value: "v".to_string(),
             }],
         };
-        assert!(blob.serialize().is_err());
+        let err = blob.serialize().unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::MetadataBlobError { reason }
+                if reason.starts_with("metadata key too long")
+        ));
     }
 
     #[test]
     fn serialize_accepts_max_u16_value() {
         let blob = MetadataBlob {
             entries: vec![MetadataEntry {
-                key: "k".to_string(),
+                key: "x-amz-meta-k".to_string(),
                 value: "x".repeat(u16::MAX as usize),
             }],
         };
         let data = blob.serialize().unwrap();
-        let (decoded, _) = MetadataBlob::deserialize(&data).unwrap();
+        let decoded = MetadataBlob::deserialize(&data).unwrap();
         assert_eq!(decoded.entries[0].value.len(), u16::MAX as usize);
     }
 

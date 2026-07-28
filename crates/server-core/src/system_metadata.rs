@@ -16,6 +16,14 @@ const CONTENT_LANGUAGE_BIT: u16 = 1 << 4;
 const EXPIRES_BIT: u16 = 1 << 5;
 const CHECKSUM_BIT: u16 = 1 << 6;
 const WEBSITE_REDIRECT_LOCATION_BIT: u16 = 1 << 7;
+const KNOWN_FLAGS: u16 = CONTENT_TYPE_BIT
+    | CONTENT_ENCODING_BIT
+    | CACHE_CONTROL_BIT
+    | CONTENT_DISPOSITION_BIT
+    | CONTENT_LANGUAGE_BIT
+    | EXPIRES_BIT
+    | CHECKSUM_BIT
+    | WEBSITE_REDIRECT_LOCATION_BIT;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectChecksumMetadata {
@@ -400,7 +408,7 @@ impl SystemMetadata {
         headers
     }
 
-    pub fn serialize(&self) -> Result<Vec<u8>, ServerError> {
+    pub(crate) fn serialize(&self) -> Result<Vec<u8>, ServerError> {
         let mut out = Vec::new();
         out.push(FORMAT_VERSION);
         let mut flags = 0u16;
@@ -468,10 +476,7 @@ impl SystemMetadata {
         Ok(out)
     }
 
-    pub fn deserialize(data: &[u8]) -> Result<Self, ServerError> {
-        if data.is_empty() {
-            return Ok(Self::new());
-        }
+    pub(crate) fn deserialize(data: &[u8]) -> Result<Self, ServerError> {
         if data.len() < 3 {
             return Err(ServerError::MetadataBlobError {
                 reason: "system metadata blob too short".to_string(),
@@ -483,6 +488,14 @@ impl SystemMetadata {
             });
         }
         let flags = u16::from_le_bytes([data[1], data[2]]);
+        if flags & !KNOWN_FLAGS != 0 {
+            return Err(ServerError::MetadataBlobError {
+                reason: format!(
+                    "unknown system metadata flags: {:#06x}",
+                    flags & !KNOWN_FLAGS
+                ),
+            });
+        }
         let mut pos = 3usize;
         fn read_system_string(
             data: &[u8],
@@ -773,20 +786,94 @@ mod tests {
     }
 
     #[test]
-    fn round_trip() {
-        let mut metadata = SystemMetadata::new();
-        metadata.content_type = Some(ContentType::new("text/plain").unwrap());
-        metadata.content_encoding = Some(ContentEncoding::new("gzip").unwrap());
-        metadata.website_redirect_location =
-            Some(WebsiteRedirectLocation::new("/docs/start.html").unwrap());
+    fn encoding_matches_golden_baseline() {
+        let empty = SystemMetadata::new();
+        assert_eq!(empty.serialize().unwrap(), [1, 0, 0]);
+        assert_eq!(SystemMetadata::deserialize(&[1, 0, 0]).unwrap(), empty);
+
+        let mut metadata = SystemMetadata {
+            content_type: Some(ContentType::new("a").unwrap()),
+            content_encoding: Some(ContentEncoding::new("b").unwrap()),
+            cache_control: Some(CacheControl::new("c").unwrap()),
+            content_disposition: Some(ContentDisposition::new("d").unwrap()),
+            content_language: Some(ContentLanguage::new("e").unwrap()),
+            expires: Some(Expires::new("f").unwrap()),
+            checksum: None,
+            website_redirect_location: Some(WebsiteRedirectLocation::new("/g").unwrap()),
+        };
         metadata.set_checksum(
             ChecksumAlgorithm::Crc32,
             Some(ChecksumType::FullObject),
-            "abcd",
+            "h",
         );
-        let bytes = metadata.serialize().unwrap();
-        let decoded = SystemMetadata::deserialize(&bytes).unwrap();
-        assert_eq!(decoded, metadata);
+        let expected = [
+            1, 0xff, 0, 1, 0, b'a', 1, 0, b'b', 1, 0, b'c', 1, 0, b'd', 1, 0, b'e', 1, 0, b'f', 2,
+            0, b'/', b'g', 0, 1, 1, 0, b'h',
+        ];
+        assert_eq!(metadata.serialize().unwrap(), expected);
+        assert_eq!(SystemMetadata::deserialize(&expected).unwrap(), metadata);
+    }
+
+    #[test]
+    fn checksum_discriminants_match_complete_golden_baseline() {
+        let algorithms = [
+            (ChecksumAlgorithm::Crc32, 0),
+            (ChecksumAlgorithm::Crc32c, 1),
+            (ChecksumAlgorithm::Sha1, 2),
+            (ChecksumAlgorithm::Sha256, 3),
+            (ChecksumAlgorithm::Crc64nvme, 4),
+            (ChecksumAlgorithm::Md5, 5),
+            (ChecksumAlgorithm::XxHash64, 6),
+            (ChecksumAlgorithm::XxHash3, 7),
+            (ChecksumAlgorithm::XxHash128, 8),
+            (ChecksumAlgorithm::Sha512, 9),
+        ];
+        assert_eq!(
+            algorithms.map(|(algorithm, _)| algorithm),
+            ChecksumAlgorithm::ALL
+        );
+        for (algorithm, tag) in algorithms {
+            let mut metadata = SystemMetadata::new();
+            metadata.set_checksum(algorithm, None, "v");
+            let expected = [1, CHECKSUM_BIT as u8, 0, tag, u8::MAX, 1, 0, b'v'];
+            assert_eq!(metadata.serialize().unwrap(), expected);
+            let decoded = SystemMetadata::deserialize(&expected).unwrap();
+            let checksum = decoded.checksum().unwrap();
+            assert_eq!(checksum.algorithm(), algorithm);
+            assert_eq!(checksum.checksum_type(), None);
+        }
+
+        for (checksum_type, tag) in [
+            (None, u8::MAX),
+            (Some(ChecksumType::Composite), 0),
+            (Some(ChecksumType::FullObject), 1),
+        ] {
+            let mut metadata = SystemMetadata::new();
+            metadata.set_checksum(ChecksumAlgorithm::Crc32, checksum_type, "v");
+            let expected = [1, CHECKSUM_BIT as u8, 0, 0, tag, 1, 0, b'v'];
+            assert_eq!(metadata.serialize().unwrap(), expected);
+            let decoded = SystemMetadata::deserialize(&expected).unwrap();
+            assert_eq!(decoded.checksum().unwrap().checksum_type(), checksum_type);
+        }
+    }
+
+    #[test]
+    fn deserialize_rejects_non_current_or_incomplete_representations() {
+        for malformed in [
+            &[][..],
+            &[1][..],
+            &[1, 0][..],
+            &[2, 0, 0][..],
+            &[1, 0, 1][..],
+            &[1, 0, 0, 0][..],
+            &[1, CHECKSUM_BIT as u8, 0, 10, u8::MAX, 0, 0][..],
+            &[1, CHECKSUM_BIT as u8, 0, 0, 2, 0, 0][..],
+        ] {
+            assert!(
+                SystemMetadata::deserialize(malformed).is_err(),
+                "unexpectedly accepted {malformed:?}"
+            );
+        }
     }
 
     #[test]
