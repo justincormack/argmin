@@ -1976,8 +1976,9 @@ impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         version_id: Option<VersionId>,
     ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_object_read_auth_subject(
-            self, pg_id, bucket, key, version_id,
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        SharedStorageNode::load_object_read_auth_subject_from_object_pg(
+            &pg, bucket, key, version_id,
         )
     }
 
@@ -1990,9 +1991,9 @@ impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
         expected_identity: &ObjectReadAuthSubjectIdentity,
         snapshot_mode: ObjectReadSnapshotMode,
     ) -> Result<ObjectReadSnapshot, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_object_read_snapshot_for_subject(
-            self,
-            pg_id,
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        SharedStorageNode::load_object_read_snapshot_for_subject_from_object_pg(
+            &pg,
             bucket,
             key,
             version_id,
@@ -2010,9 +2011,9 @@ impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
         expected_identity: &ObjectReadAuthSubjectIdentity,
         authorized_version_id: VersionId,
     ) -> Result<Option<String>, ObjectPgActionError> {
-        <Self as StorageNodeClient>::get_object_tags_for_subject(
-            self,
-            pg_id,
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        SharedStorageNode::get_object_tags_for_subject_from_object_pg(
+            &pg,
             bucket,
             key,
             version_id,
@@ -2841,59 +2842,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 stale_payload,
             }),
         ))
-    }
-
-    fn load_object_read_auth_subject(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<s3_types::VersionId>,
-    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        SharedStorageNode::load_object_read_auth_subject_from_object_pg(
-            &pg, bucket, key, version_id,
-        )
-    }
-
-    fn load_object_read_snapshot_for_subject(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<s3_types::VersionId>,
-        expected_identity: &ObjectReadAuthSubjectIdentity,
-        snapshot_mode: ObjectReadSnapshotMode,
-    ) -> Result<ObjectReadSnapshot, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        SharedStorageNode::load_object_read_snapshot_for_subject_from_object_pg(
-            &pg,
-            bucket,
-            key,
-            version_id,
-            expected_identity,
-            snapshot_mode,
-        )
-    }
-
-    fn get_object_tags_for_subject(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<s3_types::VersionId>,
-        expected_identity: &ObjectReadAuthSubjectIdentity,
-        authorized_version_id: s3_types::VersionId,
-    ) -> Result<Option<String>, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        SharedStorageNode::get_object_tags_for_subject_from_object_pg(
-            &pg,
-            bucket,
-            key,
-            version_id,
-            expected_identity,
-            authorized_version_id,
-        )
     }
 
     fn load_multipart_upload(

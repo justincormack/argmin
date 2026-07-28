@@ -1808,34 +1808,6 @@ pub(crate) trait StorageNodeClient:
         request: BuildInsertDeleteMarkerCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 
-    fn load_object_read_auth_subject(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<s3_types::VersionId>,
-    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError>;
-
-    fn load_object_read_snapshot_for_subject(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<s3_types::VersionId>,
-        expected_identity: &ObjectReadAuthSubjectIdentity,
-        snapshot_mode: ObjectReadSnapshotMode,
-    ) -> Result<ObjectReadSnapshot, ObjectPgActionError>;
-
-    fn get_object_tags_for_subject(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<s3_types::VersionId>,
-        expected_identity: &ObjectReadAuthSubjectIdentity,
-        authorized_version_id: s3_types::VersionId,
-    ) -> Result<Option<String>, ObjectPgActionError>;
-
     fn load_multipart_upload(
         &self,
         pg_id: ObjectMetadataPgId,
