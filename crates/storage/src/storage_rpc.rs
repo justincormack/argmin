@@ -76,7 +76,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU32;
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 10;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 11;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -287,7 +287,6 @@ const STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN: usize = STORAGE_RPC_MAX_BUCKET_NA
     + 4
     + STORAGE_RPC_MAX_BUCKET_WRITE_OPERATION_KIND_LEN
     + 8
-    + 1
     + 8
     + 1
     + 4
@@ -436,7 +435,9 @@ const STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 4 + SESSION_ID_LEN;
 const STORAGE_RPC_MAX_STREAM_UPLOAD_BUCKET_WRITE_RESERVATION_UPDATE_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN
-        + (2 * STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN);
+        + (2 * STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN)
+        + 1
+        + 16;
 const STORAGE_RPC_MAX_STREAM_UPLOAD_SEGMENTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_STREAM_SEGMENT_APPEND_PREPARE_REQUEST_PAYLOAD_LEN: usize =
@@ -476,7 +477,7 @@ const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ACQUIRE_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_HEARTBEAT_PAYLOAD_LEN: usize =
-    STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN + 8;
+    STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN + 8 + 1 + 16;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_RECORD_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN;
 const STORAGE_RPC_BUCKET_WRITE_DRAIN_RECORD_MAX_LEN: usize = STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN
@@ -2024,6 +2025,7 @@ pub(crate) struct StorageRpcStreamUploadBucketWriteReservationUpdateRequest {
     pub(crate) session_id: SessionId,
     pub(crate) current: BucketWriteReservationProof,
     pub(crate) renewed: BucketWriteReservationProof,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2847,6 +2849,20 @@ fn admitted_route_effect_deadline_is_conservative(
             .saturating_sub(crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS)
 }
 
+fn put_admitted_route_effect_deadline(
+    out: &mut Vec<u8>,
+    deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
+) {
+    match deadline {
+        None => put_u8(out, 0),
+        Some(deadline) => {
+            put_u8(out, 1);
+            put_u64(out, deadline.authority_valid_until_ms);
+            put_u64(out, deadline.portable_wall_valid_until_ms);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandPendingSlotReplaceRequest {
     pub(crate) node_id: NodeId,
@@ -3422,6 +3438,7 @@ pub(crate) struct StorageRpcBucketWriteReservationHeartbeatRequest {
     pub(crate) pg_id: PgId,
     pub(crate) proof: BucketWriteReservationProof,
     pub(crate) lease_deadline: u64,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5832,6 +5849,7 @@ pub(crate) fn encode_stream_upload_bucket_write_reservation_update_request(
     });
     put_bucket_write_reservation_proof(&mut out, &request.current);
     put_bucket_write_reservation_proof(&mut out, &request.renewed);
+    put_admitted_route_effect_deadline(&mut out, request.effect_deadline);
     out
 }
 
@@ -5843,12 +5861,15 @@ pub(crate) fn decode_stream_upload_bucket_write_reservation_update_request(
     let session_id = decoder.read_session_id()?;
     let current = decoder.read_bucket_write_reservation_proof()?;
     let renewed = decoder.read_bucket_write_reservation_proof()?;
+    let effect_deadline = decoder
+        .read_admitted_route_effect_deadline("stream upload bucket write reservation update")?;
     decoder.finish()?;
     Ok(StorageRpcStreamUploadBucketWriteReservationUpdateRequest {
         object,
         session_id,
         current,
         renewed,
+        effect_deadline,
     })
 }
 
@@ -11705,6 +11726,15 @@ pub(crate) fn decode_bucket_write_reservation_proof_request(
 pub(crate) fn encode_bucket_write_reservation_heartbeat_request(
     request: &StorageRpcBucketWriteReservationHeartbeatRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_bucket_write_reservation_proof(&request.proof)?;
+    if request
+        .effect_deadline
+        .is_some_and(|deadline| !admitted_route_effect_deadline_is_conservative(deadline))
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "effect deadline is not conservatively delegated",
+        ));
+    }
     let mut out = encode_bucket_write_reservation_proof_request(
         &StorageRpcBucketWriteReservationProofRequest {
             node_id: request.node_id,
@@ -11714,26 +11744,32 @@ pub(crate) fn encode_bucket_write_reservation_heartbeat_request(
         },
     )?;
     put_u64(&mut out, request.lease_deadline);
+    put_admitted_route_effect_deadline(&mut out, request.effect_deadline);
     Ok(out)
 }
 
 pub(crate) fn decode_bucket_write_reservation_heartbeat_request(
     bytes: &[u8],
 ) -> Result<StorageRpcBucketWriteReservationHeartbeatRequest, StorageRpcPayloadError> {
-    if bytes.len() < 8 {
+    if bytes.len() < 9 {
         return Err(StorageRpcPayloadError::Truncated);
     }
-    let proof_len = bytes.len() - 8;
-    let proof_request = decode_bucket_write_reservation_proof_request(&bytes[..proof_len])?;
-    let mut decoder = StorageRpcDecoder::new(&bytes[proof_len..]);
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let route_cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let proof = decoder.read_bucket_write_reservation_proof()?;
     let lease_deadline = decoder.read_u64()?;
+    let effect_deadline =
+        decoder.read_admitted_route_effect_deadline("bucket write reservation heartbeat")?;
     decoder.finish()?;
     Ok(StorageRpcBucketWriteReservationHeartbeatRequest {
-        node_id: proof_request.node_id,
-        route_cluster_epoch: proof_request.route_cluster_epoch,
-        pg_id: proof_request.pg_id,
-        proof: proof_request.proof,
+        node_id,
+        route_cluster_epoch,
+        pg_id,
+        proof,
         lease_deadline,
+        effect_deadline,
     })
 }
 
@@ -13176,6 +13212,32 @@ impl<'a> StorageRpcDecoder<'a> {
                 "invalid optional object key tag",
             )),
         }
+    }
+
+    fn read_admitted_route_effect_deadline(
+        &mut self,
+        operation: &'static str,
+    ) -> Result<Option<StorageRpcAdmittedRouteEffectDeadline>, StorageRpcPayloadError> {
+        let deadline = match self.read_u8()? {
+            0 => None,
+            1 => Some(StorageRpcAdmittedRouteEffectDeadline {
+                authority_valid_until_ms: self.read_u64()?,
+                portable_wall_valid_until_ms: self.read_u64()?,
+            }),
+            _ => {
+                return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "invalid admitted route effect deadline tag",
+                ))
+            }
+        };
+        if deadline
+            .is_some_and(|deadline| !admitted_route_effect_deadline_is_conservative(deadline))
+        {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                operation,
+            ));
+        }
+        Ok(deadline)
     }
 
     fn read_rpc_object_request(
@@ -17637,7 +17699,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&10u16.to_le_bytes());
+        expected.extend_from_slice(&11u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -17648,15 +17710,15 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_rejects_version_nine_fixture() {
+    fn storage_rpc_frame_rejects_version_ten_fixture() {
         let mut bytes =
             encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
         let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&9_u16.to_le_bytes());
+        bytes[version_offset..version_offset + 2].copy_from_slice(&10_u16.to_le_bytes());
 
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnsupportedVersion(9))
+            Err(StorageRpcFrameError::UnsupportedVersion(10))
         );
     }
 
@@ -20219,6 +20281,16 @@ mod tests {
                 STORAGE_RPC_MAX_OBJECT_GENERATION_RESERVATION_REQUEST_PAYLOAD_LEN,
             ),
             (
+                StorageRpcMessageKind::ObjectStreamUploadBucketWriteReservationUpdate,
+                STORAGE_RPC_MAX_STREAM_UPLOAD_BUCKET_WRITE_RESERVATION_UPDATE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_STREAM_UPLOAD_BUCKET_WRITE_RESERVATION_UPDATE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare,
+                STORAGE_RPC_MAX_STREAM_SEGMENT_APPEND_PREPARE_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_STREAM_SEGMENT_APPEND_PREPARE_REQUEST_PAYLOAD_LEN,
+            ),
+            (
                 StorageRpcMessageKind::ObjectVersionNext,
                 STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN,
@@ -20307,6 +20379,11 @@ mod tests {
                 StorageRpcMessageKind::BucketWriteReservationValidate,
                 STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::BucketWriteReservationHeartbeat,
+                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_HEARTBEAT_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_HEARTBEAT_PAYLOAD_LEN,
             ),
             (
                 StorageRpcMessageKind::BucketWriteReservationRelease,
@@ -21525,6 +21602,126 @@ mod tests {
         let bytes = encode_bucket_write_reservation_proof_request(&proof).unwrap();
         let decoded = decode_bucket_write_reservation_proof_request(&bytes).unwrap();
         assert_eq!(decoded, proof);
+
+        let heartbeat = StorageRpcBucketWriteReservationHeartbeatRequest {
+            node_id: NodeId::new(7),
+            route_cluster_epoch: ClusterEpoch::new(2).unwrap(),
+            pg_id: PgId::new(3),
+            proof: BucketWriteReservationProof::from(&record),
+            lease_deadline: 30,
+            effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                authority_valid_until_ms: 5_000,
+                portable_wall_valid_until_ms: 4_000,
+            }),
+        };
+        let bytes = encode_bucket_write_reservation_heartbeat_request(&heartbeat).unwrap();
+        assert!(bytes.len() <= STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_HEARTBEAT_PAYLOAD_LEN);
+        let decoded = decode_bucket_write_reservation_heartbeat_request(&bytes).unwrap();
+        assert_eq!(decoded, heartbeat);
+
+        let update = StorageRpcStreamUploadBucketWriteReservationUpdateRequest {
+            object: StorageRpcObjectRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(2).unwrap(),
+                pg_id: PgId::new(4),
+                bucket: record.bucket.clone(),
+                key: ObjectKey::try_from("key").unwrap(),
+            },
+            session_id: SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap(),
+            current: BucketWriteReservationProof::from(&record),
+            renewed: BucketWriteReservationProof {
+                lease_deadline: 30,
+                ..BucketWriteReservationProof::from(&record)
+            },
+            effect_deadline: heartbeat.effect_deadline,
+        };
+        let bytes = encode_stream_upload_bucket_write_reservation_update_request(&update);
+        let decoded = decode_stream_upload_bucket_write_reservation_update_request(&bytes).unwrap();
+        assert_eq!(decoded, update);
+    }
+
+    #[test]
+    fn stream_reservation_heartbeat_and_update_requests_fit_exact_kind_caps() {
+        let bucket = BucketName::try_from("b".repeat(STORAGE_RPC_MAX_BUCKET_NAME_LEN)).unwrap();
+        let key = ObjectKey::try_from("k".repeat(STORAGE_RPC_MAX_OBJECT_KEY_LEN)).unwrap();
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "r".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN),
+            owner_token: "w".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: u64::MAX,
+            bucket_incarnation_generation: u64::MAX,
+            operation_kind: "o".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_OPERATION_KIND_LEN),
+            created_at: u64::MAX,
+            lease_deadline: u64::MAX,
+            target_context: Some("k".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN)),
+        };
+        let effect_deadline = Some(StorageRpcAdmittedRouteEffectDeadline {
+            authority_valid_until_ms: u64::MAX,
+            portable_wall_valid_until_ms: u64::MAX
+                - crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+        });
+        let heartbeat = StorageRpcBucketWriteReservationHeartbeatRequest {
+            node_id: NodeId::new(u32::MAX),
+            route_cluster_epoch: ClusterEpoch::new(u64::MAX).unwrap(),
+            pg_id: PgId::new(u32::MAX),
+            proof: proof.clone(),
+            lease_deadline: u64::MAX,
+            effect_deadline,
+        };
+        let heartbeat_payload =
+            encode_bucket_write_reservation_heartbeat_request(&heartbeat).unwrap();
+        assert_eq!(
+            heartbeat_payload.len(),
+            STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_HEARTBEAT_PAYLOAD_LEN
+        );
+        let heartbeat_frame = encode_storage_rpc_frame(
+            18,
+            StorageRpcMessageKind::BucketWriteReservationHeartbeat,
+            &heartbeat_payload,
+        )
+        .unwrap();
+        let decoded_heartbeat_frame =
+            read_storage_rpc_request_frame_from(&mut Cursor::new(heartbeat_frame)).unwrap();
+        assert_eq!(
+            decode_bucket_write_reservation_heartbeat_request(&decoded_heartbeat_frame.payload)
+                .unwrap(),
+            heartbeat
+        );
+
+        let update = StorageRpcStreamUploadBucketWriteReservationUpdateRequest {
+            object: StorageRpcObjectRequest {
+                node_id: NodeId::new(u32::MAX),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                pg_id: PgId::new(u32::MAX),
+                bucket,
+                key,
+            },
+            session_id: SessionId::try_from("a".repeat(SESSION_ID_LEN)).unwrap(),
+            current: proof.clone(),
+            renewed: proof,
+            effect_deadline,
+        };
+        let update_payload = encode_stream_upload_bucket_write_reservation_update_request(&update);
+        assert_eq!(
+            update_payload.len(),
+            STORAGE_RPC_MAX_STREAM_UPLOAD_BUCKET_WRITE_RESERVATION_UPDATE_PAYLOAD_LEN
+        );
+        let update_frame = encode_storage_rpc_frame(
+            19,
+            StorageRpcMessageKind::ObjectStreamUploadBucketWriteReservationUpdate,
+            &update_payload,
+        )
+        .unwrap();
+        let decoded_update_frame =
+            read_storage_rpc_request_frame_from(&mut Cursor::new(update_frame)).unwrap();
+        assert_eq!(
+            decode_stream_upload_bucket_write_reservation_update_request(
+                &decoded_update_frame.payload
+            )
+            .unwrap(),
+            update
+        );
     }
 
     #[test]

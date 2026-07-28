@@ -121,8 +121,6 @@ impl Coordinator {
         req: &PutObjectRequest<'_>,
     ) -> Result<PutObjectResult, ServerError> {
         self.require_storage_route_admission(admission)?;
-        let storage_node = self.storage_node();
-        self.require_admitted_storage_effect(admission, &storage_node)?;
         let authorize_req = AuthorizePutObjectRequest {
             object: ObjectRequest::new(
                 req.object.bucket.name_typed().clone(),
@@ -137,9 +135,13 @@ impl Coordinator {
             encryption: req.encryption,
         };
         if req.data.len() > INTERNAL_SEGMENT_SIZE {
+            let cleanup = self.retained_stream_upload_cleanup(
+                admission,
+                req.object.bucket.name_typed(),
+                req.object.key_typed(),
+            )?;
             let prepared = self.begin_stream_put_with_storage_admission_and_cleanup_deadline(
                 admission,
-                &storage_node,
                 &authorize_req,
                 admission.authority_valid_until_ms(),
             )?;
@@ -162,10 +164,8 @@ impl Coordinator {
                     &prepared.session_id,
                 );
             if result.is_err() {
-                let _ = self.abort_stream_put_for_cleanup_with_storage_node(
-                    &storage_node,
-                    prepared.authorized_write.bucket_typed(),
-                    prepared.authorized_write.key_typed(),
+                let _ = self.abort_stream_upload_with_retained_cleanup_retrying(
+                    &cleanup,
                     &prepared.session_id,
                 );
             }
@@ -198,11 +198,10 @@ impl Coordinator {
     pub fn commit_put_object_write_with_storage_admission(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: &AuthorizedPutObjectCommitRequest<'_>,
         authorized: &AuthorizedPutObjectWrite,
     ) -> Result<PutObjectResult, ServerError> {
-        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.require_storage_route_admission(admission)?;
         self.put_object_from_authorized_write_on_admitted_route(admission, req, authorized)
     }
 
@@ -236,12 +235,14 @@ impl Coordinator {
         );
 
         if req.data.len() > INTERNAL_SEGMENT_SIZE {
-            let storage_node = self.storage_node();
-            self.require_admitted_storage_effect(admission, &storage_node)?;
+            let cleanup = self.retained_stream_upload_cleanup(
+                admission,
+                authorized.bucket_typed(),
+                authorized.key_typed(),
+            )?;
             let session_id = self
                 .begin_stream_put_session_with_storage_admission_and_cleanup_deadline(
                     admission,
-                    &storage_node,
                     authorized,
                     admission.authority_valid_until_ms(),
                 )?;
@@ -253,12 +254,8 @@ impl Coordinator {
                     &session_id,
                 );
             if result.is_err() {
-                let _ = self.abort_stream_put_for_cleanup_with_storage_node(
-                    &storage_node,
-                    authorized.bucket_typed(),
-                    authorized.key_typed(),
-                    &session_id,
-                );
+                let _ =
+                    self.abort_stream_upload_with_retained_cleanup_retrying(&cleanup, &session_id);
             }
             return result;
         }
@@ -558,7 +555,6 @@ impl Coordinator {
                         PreparedStreamPut {
                             authorized_write,
                             session_id: session_id.clone(),
-                            storage_node: std::sync::Arc::clone(storage_node),
                         },
                         create,
                     ))
@@ -570,11 +566,10 @@ impl Coordinator {
     pub fn begin_stream_put_with_storage_admission_and_cleanup_deadline(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: &AuthorizePutObjectRequest<'_>,
         cleanup_after: Option<u64>,
     ) -> Result<PreparedStreamPut, ServerError> {
-        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.require_storage_route_admission(admission)?;
         let route = admission
             .active_put_object_route(req.object.bucket_name_typed(), req.object.key_typed())
             .map_err(super::map_store_error)?;
@@ -614,7 +609,6 @@ impl Coordinator {
                         PreparedStreamPut {
                             authorized_write,
                             session_id: session_id.clone(),
-                            storage_node: std::sync::Arc::clone(storage_node),
                         },
                         create,
                     ))
@@ -658,11 +652,10 @@ impl Coordinator {
     pub fn begin_stream_put_session_with_storage_admission_and_cleanup_deadline(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
         authorized: &AuthorizedPutObjectWrite,
         cleanup_after: Option<u64>,
     ) -> Result<SessionId, ServerError> {
-        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.require_storage_route_admission(admission)?;
         let route = admission
             .active_put_object_route(authorized.bucket_typed(), authorized.key_typed())
             .map_err(super::map_store_error)?;
@@ -740,10 +733,9 @@ impl Coordinator {
     pub fn append_stream_put_data_with_storage_admission(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: &AppendStreamPutRequest<'_>,
     ) -> Result<(), ServerError> {
-        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.require_storage_route_admission(admission)?;
         let route = admission
             .active_put_object_route(req.bucket, req.key)
             .map_err(super::map_store_error)?;
@@ -855,12 +847,11 @@ impl Coordinator {
     pub fn finalize_authorized_stream_put_with_storage_admission(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: &AuthorizedFinalizeStreamPutRequest<'_>,
         authorized: &AuthorizedPutObjectWrite,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<PutObjectResult, ServerError> {
-        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.require_storage_route_admission(admission)?;
         let route = admission
             .active_put_object_route(authorized.bucket_typed(), authorized.key_typed())
             .map_err(super::map_store_error)?;
@@ -1169,6 +1160,7 @@ impl Coordinator {
         )
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn heartbeat_stream_put_session_with_storage_node(
         &self,
         storage_node: &std::sync::Arc<storage::StorageCluster>,
@@ -1184,12 +1176,15 @@ impl Coordinator {
     pub fn heartbeat_stream_put_session_with_storage_admission(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ServerError> {
-        self.require_admitted_storage_effect(admission, storage_node)?;
-        self.heartbeat_stream_put_session_with_storage_node(storage_node, bucket, key, session_id)
+        self.require_storage_route_admission(admission)?;
+        admission
+            .active_put_object_route(bucket, key)
+            .map_err(super::map_store_error)?
+            .heartbeat_stream_session(session_id)
+            .map_err(Self::map_object_pg_action_error)
     }
 }

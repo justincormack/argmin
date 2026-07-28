@@ -51,7 +51,7 @@ use crate::node_client::{
     MetadataCommandNodeClient, ObjectDeleteStorageSnapshot, ObjectGenerationMetadataNodeClient,
     ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, ShardAckNodeClient,
-    ShardScavengerNodeClient,
+    ShardScavengerNodeClient, UpdateStreamUploadBucketWriteReservationReq,
 };
 use crate::node_runtime::pg_store::{
     initialize_pg_durable_identity, inspect_pg_shard_inventory, sync_initialized_pg_store_layout,
@@ -4110,8 +4110,13 @@ impl StorageNodeActiveBucketRoute<'_> {
         &self,
         proof: &BucketWriteReservationProof,
         lease_deadline: u64,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteReservationRecord, StorageNodeBucketRouteError> {
         self.require_valid_now()?;
+        effect_fence
+            .require_valid_for(self.fence.cluster_epoch)
+            .map_err(BucketSnapshotLoadError::Store)
+            .map_err(StorageNodeBucketRouteError::Bucket)?;
         if proof.bucket != *self.bucket {
             return Err(StorageNodeBucketRouteError::Route(
                 StorageRpcErrorResponse {
@@ -4126,11 +4131,13 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation(
+        BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation_with_effect_fence(
             &local_client,
             self.pg_id,
+            self.fence.cluster_epoch,
             proof,
             lease_deadline,
+            effect_fence,
         )
         .map_err(StorageNodeBucketRouteError::Bucket)
     }
@@ -5005,13 +5012,18 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         session_id: &SessionId,
         current: &BucketWriteReservationProof,
         renewed: &BucketWriteReservationProof,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(), StorageNodeObjectRouteError> {
-        self.require_object_mutation_proof(
+        effect_fence
+            .require_valid_for(self.route.fence.cluster_epoch)
+            .map_err(ObjectPgActionError::Store)
+            .map_err(StorageNodeObjectRouteError::Object)?;
+        self.require_stream_reservation_proof_subject(
             current,
             PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
             "stream upload bucket write reservation update",
         )?;
-        self.require_object_mutation_proof(
+        self.require_stream_reservation_proof_subject(
             renewed,
             PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
             "stream upload bucket write reservation update",
@@ -5028,14 +5040,18 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::update_stream_upload_bucket_write_reservation(
+        ObjectMutationMetadataNodeClient::update_stream_upload_bucket_write_reservation_with_effect_fence(
             &local_client,
-            self.route.pg_id,
-            self.route.bucket,
-            self.route.key,
-            session_id,
-            current,
-            renewed,
+            UpdateStreamUploadBucketWriteReservationReq {
+                pg_id: self.route.pg_id,
+                route_cluster_epoch: self.route.fence.cluster_epoch,
+                bucket: self.route.bucket,
+                key: self.route.key,
+                session_id,
+                current,
+                renewed,
+                effect_fence,
+            },
         )
         .map_err(StorageNodeObjectRouteError::Object)
     }
@@ -5646,6 +5662,29 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
                     code: StorageRpcErrorCode::PayloadDecode,
                     message: format!(
                         "{operation} bucket write reservation proof does not match the active object route, epoch, or operation"
+                    ),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_stream_reservation_proof_subject(
+        &self,
+        bucket_write_reservation: &BucketWriteReservationProof,
+        expected_operation_kind: &'static str,
+        operation: &'static str,
+    ) -> Result<(), StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        if bucket_write_reservation.bucket != *self.route.bucket
+            || bucket_write_reservation.operation_kind != expected_operation_kind
+            || bucket_write_reservation.target_context.as_deref() != Some(self.route.key.as_str())
+        {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: format!(
+                        "{operation} bucket write reservation proof does not match the active object subject or operation"
                     ),
                 },
             ));
@@ -9226,7 +9265,13 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        match route.heartbeat_write_reservation(&request.proof, request.lease_deadline) {
+        let effect_fence =
+            admitted_route_effect_fence(request.route_cluster_epoch, request.effect_deadline);
+        match route.heartbeat_write_reservation(
+            &request.proof,
+            request.lease_deadline,
+            effect_fence,
+        ) {
             Ok(record) => {
                 let payload = encode_bucket_write_reservation_record_response(
                     &StorageRpcBucketWriteReservationRecordResponse {
@@ -10587,6 +10632,7 @@ impl StorageNodeConnectionHandler {
             &request.session_id,
             &request.current,
             &request.renewed,
+            admitted_route_effect_fence(request.object.cluster_epoch, request.effect_deadline),
         ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(StorageNodeObjectRouteError::Route(error)) => {
@@ -23979,6 +24025,7 @@ mod tests {
                     &reservation_id,
                     &stream_proof,
                     &renewed_stream_proof,
+                    AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                 )
                 .unwrap();
             assert_eq!(
@@ -23988,6 +24035,36 @@ mod tests {
                     .bucket_write_reservation
                     .as_ref(),
                 Some(&renewed_stream_proof)
+            );
+        });
+
+        let later_stream_proof = BucketWriteReservationProof {
+            lease_deadline: renewed_stream_proof.lease_deadline.saturating_add(1_000),
+            ..renewed_stream_proof.clone()
+        };
+        let expired_stream_update = crate::clock::with_time_override(3_500, || {
+            primary_route.update_stream_upload_bucket_write_reservation(
+                &reservation_id,
+                &renewed_stream_proof,
+                &later_stream_proof,
+                AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 3_000),
+            )
+        });
+        assert!(matches!(
+            expired_stream_update,
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
+            ))
+        ));
+        crate::clock::with_time_override(1_000, || {
+            assert_eq!(
+                primary_route
+                    .load_stream_upload_session(&reservation_id)
+                    .unwrap()
+                    .bucket_write_reservation
+                    .as_ref(),
+                Some(&renewed_stream_proof),
+                "expired request effect fence must reject before stream proof mutation"
             );
         });
 
@@ -24083,6 +24160,7 @@ mod tests {
                 &reservation_id,
                 &renewed_stream_proof,
                 &mismatched_renewed_stream_proof,
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
             )
         });
         match mismatched_stream_update {
@@ -25186,6 +25264,7 @@ mod tests {
                             &reservation_id,
                             &renewed_stream_proof,
                             &renewed_stream_proof,
+                            AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                         )
                         .map(|_| ()),
                 ),
@@ -25569,6 +25648,37 @@ mod tests {
                 .unwrap();
         });
 
+        crate::clock::with_time_override(3_500, || {
+            match route.heartbeat_write_reservation(
+                &BucketWriteReservationProof::from(&reservation),
+                9_000,
+                AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 3_000),
+            ) {
+                Err(StorageNodeBucketRouteError::Bucket(BucketSnapshotLoadError::Store(
+                    StoreError::RouteMapExpired { .. },
+                ))) => {}
+                Err(error) => panic!(
+                    "expired request effect fence returned an unexpected heartbeat error: {error:?}"
+                ),
+                Ok(record) => panic!(
+                    "expired request effect fence unexpectedly renewed reservation {record:?}"
+                ),
+            }
+            let pg = server._node.get_pg(0).unwrap();
+            assert_eq!(
+                PgMetadataStore::durable_bucket_write_reservation(
+                    &*pg,
+                    &bucket,
+                    &reservation.reservation_id,
+                )
+                .unwrap()
+                .unwrap()
+                .lease_deadline,
+                reservation.lease_deadline,
+                "expired request effect fence must reject before durable heartbeat mutation"
+            );
+        });
+
         crate::clock::with_time_override(6_000, || match route.head_bucket(true) {
             Err(StorageNodeBucketRouteError::Route(error)) => {
                 assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
@@ -25598,6 +25708,7 @@ mod tests {
             match route.heartbeat_write_reservation(
                 &BucketWriteReservationProof::from(&reservation),
                 9_000,
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
             ) {
                 Err(StorageNodeBucketRouteError::Route(error)) => {
                     assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);

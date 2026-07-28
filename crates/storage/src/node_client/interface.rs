@@ -302,11 +302,13 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         bucket: &BucketName,
     ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError>;
 
-    fn heartbeat_durable_bucket_write_reservation(
+    fn heartbeat_durable_bucket_write_reservation_with_effect_fence(
         &self,
         pg_id: BucketPgId,
+        route_cluster_epoch: ClusterEpoch,
         proof: &BucketWriteReservationProof,
         lease_deadline: u64,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
 
     fn get_bucket_delete_finalize_roots(
@@ -730,6 +732,11 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         renewed: &BucketWriteReservationProof,
     ) -> Result<(), ObjectPgActionError>;
 
+    fn update_stream_upload_bucket_write_reservation_with_effect_fence(
+        &self,
+        request: UpdateStreamUploadBucketWriteReservationReq<'_>,
+    ) -> Result<(), ObjectPgActionError>;
+
     fn build_stream_put_commit_command(
         &self,
         request: BuildStreamPutCommitCommandReq<'_>,
@@ -821,6 +828,17 @@ pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
     pub(crate) expected_snapshot: &'a StreamPutFinalizeStorageSnapshot,
     pub(crate) commit: &'a StreamPutCommitInput,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
+}
+
+pub(crate) struct UpdateStreamUploadBucketWriteReservationReq<'a> {
+    pub(crate) pg_id: ObjectMetadataPgId,
+    pub(crate) route_cluster_epoch: ClusterEpoch,
+    pub(crate) bucket: &'a BucketName,
+    pub(crate) key: &'a ObjectKey,
+    pub(crate) session_id: &'a SessionId,
+    pub(crate) current: &'a BucketWriteReservationProof,
+    pub(crate) renewed: &'a BucketWriteReservationProof,
+    pub(crate) effect_fence: AdmittedRouteEffectFence,
 }
 
 pub(crate) struct BuildDirectPutCommitCommandReq<'a> {
@@ -1625,11 +1643,13 @@ pub(crate) trait StorageNodeClient:
         bucket: &BucketName,
     ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError>;
 
-    fn heartbeat_durable_bucket_write_reservation(
+    fn heartbeat_durable_bucket_write_reservation_with_effect_fence(
         &self,
         pg_id: BucketPgId,
+        route_cluster_epoch: ClusterEpoch,
         proof: &crate::BucketWriteReservationProof,
         lease_deadline: u64,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
 
     fn load_bucket_snapshot(
@@ -2022,6 +2042,11 @@ pub(crate) trait StorageNodeClient:
         session_id: &SessionId,
         current: &crate::BucketWriteReservationProof,
         renewed: &crate::BucketWriteReservationProof,
+    ) -> Result<(), ObjectPgActionError>;
+
+    fn update_stream_upload_bucket_write_reservation_with_effect_fence(
+        &self,
+        request: UpdateStreamUploadBucketWriteReservationReq<'_>,
     ) -> Result<(), ObjectPgActionError>;
 
     fn build_stream_put_commit_command(

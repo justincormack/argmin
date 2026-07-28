@@ -3458,6 +3458,47 @@ Seventy-fifth Phase 3 slice:
 - other remaining buffered coordinator workflows and capability requirements
   on node-client traits remain open in Phase 3.
 
+Seventy-sixth Phase 3 slice:
+
+- admitted PutObject and POST Object stream contexts no longer carry a raw,
+  renewable `StorageCluster` alongside their request admission. Preparation,
+  session creation, append, heartbeat, direct commit, and finalization derive
+  the subject-bound `ActivePutObjectRoute` from the coordinator's own
+  publication domain. Promoted buffered PUT also derives retained cleanup
+  authority before its first durable stream mutation.
+- stream heartbeat now carries the immutable admitted effect fence to both
+  durable mutations: bucket-reservation lease renewal and the stream session's
+  persisted reservation-proof update. Embedded nodes validate immediately at
+  the metadata effect; Unix/TLS RPC sends a portable wall deadline which the
+  storage process conservatively binds to its own monotonic clock. The active
+  route epoch authorizes the new effect while an older durable reservation
+  proof remains valid across a route-epoch transition.
+- the production raw unbounded heartbeat adapters are test/test-hook-only.
+  Maximum-sized deadline-bearing heartbeat and proof-update requests are
+  admitted exactly at their per-kind caps, and storage RPC encoding advances
+  to version 11 with explicit version-10 rejection.
+- deterministic storage-node capability regressions expire the request fence
+  while the renewed active route remains valid and prove neither durable lease
+  nor stream proof changes. Unix tests cover the complete heartbeat/update
+  codecs, current-route renewal of an older proof, and wrong-PG rejection.
+- remaining buffered coordinator workflows and capability requirements on
+  node-client traits remain open in Phase 3.
+
+Seventy-sixth Phase 3 review correction:
+
+- the object-PG stream-proof update no longer requires the durable proof's
+  acquisition epoch to equal the separately authorized active route epoch. It
+  validates the bucket/key/operation subject, requires current and renewed
+  proofs to have the same complete stable identity, and relies on the PG-store
+  comparison with the persisted session proof before changing only the lease
+  deadline. The admitted effect fence still must match the current active
+  route epoch at the storage-node boundary.
+- an end-to-end Unix cluster regression seeds an epoch-N reservation and
+  stream session on distinct bucket and object PGs, serves them through an
+  epoch-N+1 route, runs the complete stream heartbeat, and proves both the
+  bucket reservation and persisted session proof advance to the same deadline
+  while retaining their epoch-N stable identity.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

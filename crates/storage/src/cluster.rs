@@ -2721,6 +2721,19 @@ impl ActivePutObjectRoute<'_> {
             .load_stream_upload_session_on_route(self.effect_route(), session_id)
     }
 
+    pub fn heartbeat_stream_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), ObjectPgActionError> {
+        self.admission
+            .cluster
+            .heartbeat_put_object_stream_session_with_route_validation(
+                self.effect_route(),
+                session_id,
+                || self.admission.require_valid_now(),
+            )
+    }
+
     pub fn prepare_stream_segment_append(
         &self,
         request: &PrepareStreamUploadSegmentAppendReq,

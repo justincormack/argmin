@@ -40,6 +40,7 @@ use crate::node_client::{
     BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
     BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
     InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
+    UpdateStreamUploadBucketWriteReservationReq,
 };
 use crate::storage_rpc::StorageRpcErrorCode;
 use crate::traits::DurableBucketWriteReservationAcquire;
@@ -3617,13 +3618,40 @@ impl super::StorageCluster {
         crate::clock::current_time_millis().saturating_add(BUCKET_WRITE_RESERVATION_LEASE_MILLIS)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn heartbeat_put_object_stream_session(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
-        let object_pg_id = self.object_metadata_pg(bucket, key);
+        self.heartbeat_put_object_stream_session_with_route_validation(
+            super::PutObjectMutationEffectRoute {
+                bucket_pg_id: self.bucket_metadata_pg(bucket),
+                object_pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            session_id,
+            || Ok(()),
+        )
+    }
+
+    pub(super) fn heartbeat_put_object_stream_session_with_route_validation(
+        &self,
+        route: super::PutObjectMutationEffectRoute<'_>,
+        session_id: &SessionId,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<(), ObjectPgActionError> {
+        let super::PutObjectMutationEffectRoute {
+            bucket_pg_id,
+            object_pg_id,
+            bucket,
+            key,
+            effect_fence,
+        } = route;
+        require_valid_route()?;
         let upload = self
             .object_mutation_metadata_primary_client(bucket, key)?
             .load_stream_upload_session(object_pg_id, bucket, key, session_id)?;
@@ -3638,17 +3666,20 @@ impl super::StorageCluster {
             });
         };
         let mut proof = stored_proof.clone();
-        let pg_id = PgId::new(self.bucket_metadata_pg_id(&proof.bucket));
+        require_valid_route()?;
+        let pg_id = bucket_pg_id.pg_id();
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)
             .map_err(ObjectPgActionError::from)?;
         let renewed = node
             .bucket_write_reservation_client()
-            .heartbeat_durable_bucket_write_reservation(
-                self.validated_bucket_metadata_pg(pg_id),
+            .heartbeat_durable_bucket_write_reservation_with_effect_fence(
+                bucket_pg_id,
+                effect_fence.cluster_epoch(),
                 &proof,
                 self.put_object_stream_create_lease_deadline(),
+                effect_fence,
             );
         let renewed = match renewed {
             Ok(record) => record,
@@ -3656,8 +3687,11 @@ impl super::StorageCluster {
                 MetadataError::BucketWriteReservationConflict { .. },
             )) => {
                 let Some(refreshed) = self
-                    .refresh_stream_upload_bucket_write_reservation_for_object_action(
-                        &upload, &proof,
+                    .refresh_stream_upload_bucket_write_reservation_for_object_action_with_route_validation(
+                        route,
+                        &upload,
+                        &proof,
+                        &mut require_valid_route,
                     )?
                 else {
                     return Err(ObjectPgActionError::Metadata(
@@ -3667,11 +3701,14 @@ impl super::StorageCluster {
                     ));
                 };
                 proof = refreshed;
+                require_valid_route()?;
                 node.bucket_write_reservation_client()
-                    .heartbeat_durable_bucket_write_reservation(
-                        self.validated_bucket_metadata_pg(pg_id),
+                    .heartbeat_durable_bucket_write_reservation_with_effect_fence(
+                        bucket_pg_id,
+                        effect_fence.cluster_epoch(),
                         &proof,
                         self.put_object_stream_create_lease_deadline(),
+                        effect_fence,
                     )
                     .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
             }
@@ -3682,14 +3719,19 @@ impl super::StorageCluster {
             }
         };
         let renewed_proof = BucketWriteReservationProof::from(&renewed);
+        require_valid_route()?;
         self.object_mutation_metadata_primary_client(bucket, key)?
-            .update_stream_upload_bucket_write_reservation(
-                object_pg_id,
-                bucket,
-                key,
-                session_id,
-                &proof,
-                &renewed_proof,
+            .update_stream_upload_bucket_write_reservation_with_effect_fence(
+                UpdateStreamUploadBucketWriteReservationReq {
+                    pg_id: object_pg_id,
+                    route_cluster_epoch: effect_fence.cluster_epoch(),
+                    bucket,
+                    key,
+                    session_id,
+                    current: &proof,
+                    renewed: &renewed_proof,
+                    effect_fence,
+                },
             )?;
         Ok(())
     }
@@ -4430,12 +4472,29 @@ impl super::StorageCluster {
         Ok(true)
     }
 
-    fn refresh_stream_upload_bucket_write_reservation_for_object_action(
+    fn refresh_stream_upload_bucket_write_reservation_for_object_action_with_route_validation(
         &self,
+        route: super::PutObjectMutationEffectRoute<'_>,
         upload: &StreamUploadRecord,
         proof: &BucketWriteReservationProof,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<Option<BucketWriteReservationProof>, ObjectPgActionError> {
-        let pg_id = PgId::new(self.bucket_metadata_pg_id(&proof.bucket));
+        let super::PutObjectMutationEffectRoute {
+            bucket_pg_id,
+            object_pg_id,
+            bucket,
+            key,
+            effect_fence,
+        } = route;
+        if upload.bucket != *bucket || upload.key != *key || proof.bucket != *bucket {
+            return Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "refresh put object stream reservation",
+                },
+            ));
+        }
+        require_valid_route()?;
+        let pg_id = bucket_pg_id.pg_id();
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)
@@ -4443,10 +4502,7 @@ impl super::StorageCluster {
         let now = crate::clock::current_time_millis();
         let reservations = node
             .bucket_write_reservation_client()
-            .durable_bucket_write_reservations(
-                self.validated_bucket_metadata_pg(pg_id),
-                &proof.bucket,
-            )
+            .durable_bucket_write_reservations(bucket_pg_id, bucket)
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
         let Some(current) = reservations
             .into_iter()
@@ -4455,14 +4511,19 @@ impl super::StorageCluster {
             return Ok(None);
         };
         let renewed = BucketWriteReservationProof::from(&current);
-        self.object_mutation_metadata_primary_client(&upload.bucket, &upload.key)?
-            .update_stream_upload_bucket_write_reservation(
-                self.object_metadata_pg(&upload.bucket, &upload.key),
-                &upload.bucket,
-                &upload.key,
-                &upload.session_id,
-                proof,
-                &renewed,
+        require_valid_route()?;
+        self.object_mutation_metadata_primary_client(bucket, key)?
+            .update_stream_upload_bucket_write_reservation_with_effect_fence(
+                UpdateStreamUploadBucketWriteReservationReq {
+                    pg_id: object_pg_id,
+                    route_cluster_epoch: effect_fence.cluster_epoch(),
+                    bucket,
+                    key,
+                    session_id: &upload.session_id,
+                    current: proof,
+                    renewed: &renewed,
+                    effect_fence,
+                },
             )?;
         Ok(Some(renewed))
     }

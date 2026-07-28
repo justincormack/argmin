@@ -1373,7 +1373,6 @@ fn stream_put_creation_expires_at_pending_install_effect_boundary() {
         }));
     let error = match coord.begin_stream_put_with_storage_admission_and_cleanup_deadline(
         &admission,
-        &storage_node,
         &AuthorizePutObjectRequest {
             object: object_request_with_expected_owner(
                 "bucket",
@@ -1409,7 +1408,6 @@ fn stream_put_creation_expires_at_pending_install_effect_boundary() {
     let prepared = coord
         .begin_stream_put_with_storage_admission_and_cleanup_deadline(
             &fresh_admission,
-            &storage_node,
             &AuthorizePutObjectRequest {
                 object: object_request_with_expected_owner(
                     "bucket",
@@ -1978,7 +1976,6 @@ fn stream_put_finalization_expires_inside_command_build() {
     let prepared = coord
         .begin_stream_put_with_storage_admission_and_cleanup_deadline(
             &admission,
-            &storage_node,
             &AuthorizePutObjectRequest {
                 object: object_request_with_expected_owner(
                     "bucket",
@@ -2004,7 +2001,6 @@ fn stream_put_finalization_expires_inside_command_build() {
     let error = coord
         .finalize_authorized_stream_put_with_storage_admission(
             &admission,
-            &storage_node,
             &AuthorizedFinalizeStreamPutRequest {
                 session_id: &prepared.session_id,
                 crc64: checksum::crc64::checksum(b""),

@@ -2018,25 +2018,34 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         })
     ));
 
-    ObjectMutationMetadataNodeClient::update_stream_upload_bucket_write_reservation(
+    let effect_fence = crate::types::AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL);
+    ObjectMutationMetadataNodeClient::update_stream_upload_bucket_write_reservation_with_effect_fence(
         &client,
-        correct_pg,
-        &bucket,
-        &key,
-        &session_id,
-        &current_proof,
-        &renewed_proof,
+        UpdateStreamUploadBucketWriteReservationReq {
+            pg_id: correct_pg,
+            route_cluster_epoch: ClusterEpoch::INITIAL,
+            bucket: &bucket,
+            key: &key,
+            session_id: &session_id,
+            current: &current_proof,
+            renewed: &renewed_proof,
+            effect_fence,
+        },
     )
     .unwrap();
     let wrong_update_error =
-        ObjectMutationMetadataNodeClient::update_stream_upload_bucket_write_reservation(
+        ObjectMutationMetadataNodeClient::update_stream_upload_bucket_write_reservation_with_effect_fence(
             &client,
-            wrong_pg,
-            &bucket,
-            &key,
-            &session_id,
-            &current_proof,
-            &renewed_proof,
+            UpdateStreamUploadBucketWriteReservationReq {
+                pg_id: wrong_pg,
+                route_cluster_epoch: ClusterEpoch::INITIAL,
+                bucket: &bucket,
+                key: &key,
+                session_id: &session_id,
+                current: &current_proof,
+                renewed: &renewed_proof,
+                effect_fence,
+            },
         )
         .unwrap_err();
     assert!(matches!(

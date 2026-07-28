@@ -188,10 +188,9 @@ impl Coordinator {
     pub fn prepare_put_object_write_with_storage_admission(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
-        storage_node: &Arc<StorageCluster>,
         req: &AuthorizePutObjectRequest<'_>,
     ) -> Result<AuthorizedPutObjectWrite, ServerError> {
-        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.require_storage_route_admission(admission)?;
         self.authorize_put_object_write_on_admitted_route(admission, req)
     }
 

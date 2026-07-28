@@ -540,23 +540,40 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         )
     }
 
-    fn heartbeat_durable_bucket_write_reservation(
+    fn heartbeat_durable_bucket_write_reservation_with_effect_fence(
         &self,
         pg_id: BucketPgId,
+        route_cluster_epoch: ClusterEpoch,
         proof: &BucketWriteReservationProof,
         lease_deadline: u64,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        effect_fence.require_valid_for(route_cluster_epoch)?;
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(BucketSnapshotLoadError::Store(
+                StoreError::RouteAdmissionClusterMismatch {
+                    admitted_epoch: route_cluster_epoch,
+                    operation_epoch: self.cluster_epoch,
+                },
+            ));
+        }
         let request = StorageRpcBucketWriteReservationHeartbeatRequest {
             node_id: self.node_id,
             route_cluster_epoch: self.cluster_epoch,
             pg_id: pg_id.pg_id(),
             proof: proof.clone(),
             lease_deadline,
+            effect_deadline: effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
         };
         let payload =
             encode_bucket_write_reservation_heartbeat_request(&request).map_err(|error| {
                 BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "encode bucket write reservation heartbeat request",
+                    "encode fenced bucket write reservation heartbeat request",
                     error.to_string(),
                 ))
             })?;
@@ -571,25 +588,22 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         let response =
             decode_bucket_write_reservation_record_response(&response).map_err(|error| {
                 BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "decode bucket write reservation heartbeat response",
+                    "decode fenced bucket write reservation heartbeat response",
                     error.to_string(),
                 ))
             })?;
-        let record = match response.outcome {
-            StorageRpcBucketWriteReservationAcquireOutcome::Acquired(record) => record,
-            StorageRpcBucketWriteReservationAcquireOutcome::Draining
-            | StorageRpcBucketWriteReservationAcquireOutcome::BucketNotFound { .. } => {
-                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "validate bucket write reservation heartbeat response",
-                    "heartbeat response returned non-record outcome".to_string(),
-                )));
-            }
+        let StorageRpcBucketWriteReservationAcquireOutcome::Acquired(record) = response.outcome
+        else {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate fenced bucket write reservation heartbeat response",
+                "unexpected non-acquired outcome".to_string(),
+            )));
         };
         let mut previous_identity = record.clone();
         previous_identity.lease_deadline = proof.lease_deadline;
         if !proof.matches_record(&previous_identity) || record.lease_deadline != lease_deadline {
             return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                "validate bucket write reservation heartbeat response",
+                "validate fenced bucket write reservation heartbeat response",
                 "heartbeat response identity does not match request".to_string(),
             )));
         }
@@ -2863,6 +2877,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             session_id: session_id.clone(),
             current: current.clone(),
             renewed: renewed.clone(),
+            effect_deadline: None,
         };
         let payload = encode_stream_upload_bucket_write_reservation_update_request(&request);
         let response = self
@@ -2873,6 +2888,50 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             .map_err(ObjectPgActionError::Store)?;
         self.validate_empty_bucket_write_reservation_response(
             "decode stream upload bucket write reservation update response",
+            &response,
+        )
+        .map_err(|error| match error {
+            BucketSnapshotLoadError::Store(error) => ObjectPgActionError::Store(error),
+            BucketSnapshotLoadError::Metadata(error) => ObjectPgActionError::Metadata(error),
+        })
+    }
+
+    fn update_stream_upload_bucket_write_reservation_with_effect_fence(
+        &self,
+        update: UpdateStreamUploadBucketWriteReservationReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        update
+            .effect_fence
+            .require_valid_for(update.route_cluster_epoch)?;
+        if update.route_cluster_epoch != self.cluster_epoch {
+            return Err(ObjectPgActionError::Store(
+                StoreError::RouteAdmissionClusterMismatch {
+                    admitted_epoch: update.route_cluster_epoch,
+                    operation_epoch: self.cluster_epoch,
+                },
+            ));
+        }
+        let request = StorageRpcStreamUploadBucketWriteReservationUpdateRequest {
+            object: self.object_request(update.pg_id.pg_id(), update.bucket, update.key),
+            session_id: update.session_id.clone(),
+            current: update.current.clone(),
+            renewed: update.renewed.clone(),
+            effect_deadline: update.effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
+        };
+        let payload = encode_stream_upload_bucket_write_reservation_update_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamUploadBucketWriteReservationUpdate,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        self.validate_empty_bucket_write_reservation_response(
+            "decode fenced stream upload bucket write reservation update response",
             &response,
         )
         .map_err(|error| match error {

@@ -180,17 +180,6 @@ impl StreamSegmentMutationRoute for storage::ActiveMultipartObjectRoute<'_> {
 }
 
 impl Coordinator {
-    pub(super) fn require_admitted_storage_effect(
-        &self,
-        admission: &storage::StorageClusterRouteAdmission,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-    ) -> Result<(), ServerError> {
-        self.require_storage_route_admission(admission)?;
-        admission
-            .require_valid_now_for(storage_node)
-            .map_err(super::map_store_error)
-    }
-
     pub fn retained_stream_upload_cleanup(
         &self,
         admission: &storage::StorageClusterRouteAdmission,

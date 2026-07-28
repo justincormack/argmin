@@ -3499,6 +3499,166 @@ fn frontend_unix_bucket_write_reservation_mode_uses_storage_node() {
 }
 
 #[test]
+fn frontend_unix_stream_heartbeat_renews_old_epoch_proof_and_session_row() {
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_id = NodeId::new(1);
+    let pg_ids = [0, 1];
+    let ec_shape = EcShape { k: 1, m: 0 };
+    let proof_epoch = ClusterEpoch::INITIAL;
+    let route_epoch = ClusterEpoch::new(proof_epoch.get() + 1).unwrap();
+    let remote_data_dir = tmp.path().join("remote-old-proof-stream-heartbeat");
+    let socket_path = tmp
+        .path()
+        .join("sockets")
+        .join("old-proof-stream-heartbeat.sock");
+    let remote =
+        SharedStorageNode::open_with_default_ec_shape(&remote_data_dir, &pg_ids, ec_shape).unwrap();
+    let topology = remote.pg_topology();
+    let bucket = bucket_for_pg(topology, 0, "old-proof-heartbeat-");
+    let key = key_for_object_pg(topology, &bucket, 1, "key-");
+    let session_id = crate::tests::stream_session_id("old-proof");
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let now = crate::clock::current_time_millis();
+    let initial_lease_deadline = now.saturating_add(1_000);
+    let initial_record = {
+        let bucket_pg = remote.get_pg(0).unwrap();
+        crate::PgMetadataStore::create_bucket(
+            &*bucket_pg,
+            &bucket,
+            "owner",
+            &owner,
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        let record = crate::PgMetadataStore::acquire_durable_bucket_write_reservation(
+            &*bucket_pg,
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "old-proof-stream-heartbeat",
+                owner_token: "old-proof-stream-heartbeat-owner",
+                cluster_epoch: proof_epoch,
+                operation_kind:
+                    crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+                created_at: now,
+                lease_deadline: initial_lease_deadline,
+                target_context: Some(key.as_str()),
+            },
+        )
+        .unwrap();
+        bucket_pg.refresh_metadata_command_state_digest().unwrap();
+        record
+    };
+    let initial_proof = crate::metadata_command::BucketWriteReservationProof::from(&initial_record);
+    {
+        let object_pg = remote.get_pg(1).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::reserve_object_generation(
+                &*object_pg,
+                &bucket,
+                &key,
+                &session_id,
+            )
+            .unwrap(),
+            GenerationId::MIN
+        );
+        let create = crate::CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        };
+        let command = crate::metadata_command::MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                proof_epoch,
+                PgId::new(1),
+                crate::metadata_command::MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            crate::metadata_command::MetadataCommandPayload::CreateStreamUpload(Box::new(
+                crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
+                    create,
+                    now,
+                    None,
+                    initial_proof.clone(),
+                ),
+            )),
+        );
+        object_pg.apply_metadata_command(&command).unwrap();
+        object_pg.refresh_metadata_command_state_digest().unwrap();
+    }
+    drop(remote);
+
+    private_socket_dir(socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(StorageNodeProcessConfig {
+        node_id,
+        cluster_epoch: route_epoch,
+        route_map_validity: RouteMapValidity::Forever,
+        data_dir: remote_data_dir.clone(),
+        default_ec_shape: ec_shape,
+        pg_ids: pg_ids.to_vec(),
+        socket_path: socket_path.clone(),
+        pg_routes: pg_ids
+            .iter()
+            .copied()
+            .map(|pg_id| StorageNodePgRoute {
+                pg_id,
+                cluster_epoch: route_epoch,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            })
+            .collect(),
+        pending_metadata_command_recoveries: Vec::new(),
+        historical_pg_routes: Vec::new(),
+    })
+    .unwrap();
+    let _server_guard = spawn_storage_node_server(server);
+
+    let mut map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+        node_id,
+        [LocalNodeStoreConfig::new(
+            node_id,
+            tmp.path().join("frontend-old-proof-stream-heartbeat"),
+        )],
+        &pg_ids,
+        ec_shape,
+        route_epoch,
+    )
+    .unwrap();
+    map.install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+        node_id,
+        socket_path,
+    )])
+    .unwrap();
+    let cluster = StorageCluster::from_local_map(Arc::new(map)).unwrap();
+
+    cluster
+        .heartbeat_put_object_stream_session(&bucket, &key, &session_id)
+        .unwrap();
+
+    let remote =
+        SharedStorageNode::open_with_default_ec_shape(&remote_data_dir, &pg_ids, ec_shape).unwrap();
+    let renewed_record = crate::PgMetadataStore::durable_bucket_write_reservation(
+        &*remote.get_pg(0).unwrap(),
+        &bucket,
+        &initial_record.reservation_id,
+    )
+    .unwrap()
+    .expect("heartbeat must preserve the durable reservation");
+    let renewed_proof =
+        crate::PgMetadataStore::get_stream_upload(&*remote.get_pg(1).unwrap(), &session_id)
+            .unwrap()
+            .bucket_write_reservation
+            .expect("heartbeat must preserve the stream reservation proof");
+    assert!(initial_proof.has_same_stable_identity(&renewed_proof));
+    assert_eq!(renewed_proof.cluster_epoch, proof_epoch);
+    assert!(renewed_record.lease_deadline > initial_lease_deadline);
+    assert_eq!(renewed_proof.lease_deadline, renewed_record.lease_deadline);
+}
+
+#[test]
 fn frontend_unix_bucket_snapshot_pair_mode_uses_storage_node() {
     let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);

@@ -1089,17 +1089,21 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         <Self as StorageNodeClient>::durable_bucket_write_reservations(self, pg_id, bucket)
     }
 
-    fn heartbeat_durable_bucket_write_reservation(
+    fn heartbeat_durable_bucket_write_reservation_with_effect_fence(
         &self,
         pg_id: BucketPgId,
+        route_cluster_epoch: ClusterEpoch,
         proof: &BucketWriteReservationProof,
         lease_deadline: u64,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::heartbeat_durable_bucket_write_reservation(
+        <Self as StorageNodeClient>::heartbeat_durable_bucket_write_reservation_with_effect_fence(
             self,
             pg_id,
+            route_cluster_epoch,
             proof,
             lease_deadline,
+            effect_fence,
         )
     }
 
@@ -1783,6 +1787,15 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn update_stream_upload_bucket_write_reservation_with_effect_fence(
+        &self,
+        request: UpdateStreamUploadBucketWriteReservationReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        <Self as StorageNodeClient>::update_stream_upload_bucket_write_reservation_with_effect_fence(
+            self, request,
+        )
+    }
+
     fn build_stream_put_commit_command(
         &self,
         request: BuildStreamPutCommitCommandReq<'_>,
@@ -2157,13 +2170,16 @@ impl StorageNodeClient for LocalStorageNodeClient {
         )?)
     }
 
-    fn heartbeat_durable_bucket_write_reservation(
+    fn heartbeat_durable_bucket_write_reservation_with_effect_fence(
         &self,
         pg_id: BucketPgId,
+        route_cluster_epoch: ClusterEpoch,
         proof: &crate::BucketWriteReservationProof,
         lease_deadline: u64,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
+        effect_fence.require_valid_for(route_cluster_epoch)?;
         Ok(PgMetadataStore::heartbeat_durable_bucket_write_reservation(
             &*pg,
             DurableBucketWriteReservationHeartbeat {
@@ -3496,6 +3512,31 @@ impl StorageNodeClient for LocalStorageNodeClient {
         Ok(
             PgMetadataStore::update_stream_upload_bucket_write_reservation(
                 &*pg, session_id, current, renewed,
+            )?,
+        )
+    }
+
+    fn update_stream_upload_bucket_write_reservation_with_effect_fence(
+        &self,
+        request: UpdateStreamUploadBucketWriteReservationReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let session = PgMetadataStore::get_stream_upload(&*pg, request.session_id)?;
+        if session.bucket != *request.bucket || session.key != *request.key {
+            return Err(MetadataError::StreamSessionNotFound {
+                session_id: request.session_id.as_str().to_string(),
+            }
+            .into());
+        }
+        request
+            .effect_fence
+            .require_valid_for(request.route_cluster_epoch)?;
+        Ok(
+            PgMetadataStore::update_stream_upload_bucket_write_reservation(
+                &*pg,
+                request.session_id,
+                request.current,
+                request.renewed,
             )?,
         )
     }

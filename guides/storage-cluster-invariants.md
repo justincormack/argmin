@@ -313,6 +313,15 @@ any pre-publication boundary releases transient reservations and removes only
 payload known to belong to the rejected attempt, including shards written
 earlier in a partially completed direct placement.
 
+Stream heartbeats use that same route rather than a renewable raw cluster
+handle. Both durable effects—the bucket reservation lease renewal and the
+stream session's persisted proof update—receive and revalidate the original
+effect fence immediately beside mutation. The route epoch binds the new
+effect; the reservation proof may retain its older acquisition epoch across a
+route transition. Unix and TLS/TCP carry only the portable wall deadline and
+rebind it to storage-local monotonic time. The raw unbounded heartbeat adapter
+is test/test-hook-only.
+
 `ActiveMultipartObjectRoute` is the corresponding non-cloneable authority for
 one multipart bucket/key/object-metadata-PG tuple. In addition to multipart
 control and completion, UploadPartCopy uses it for destination session
