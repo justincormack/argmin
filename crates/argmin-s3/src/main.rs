@@ -1642,20 +1642,10 @@ fn refresh_pg_metadata_transfer_import_route(
         })
 }
 
-fn control_plane_runtime_map_not_ready_for_serving(message: &str) -> bool {
-    message.contains("control-plane runtime map has no routed PGs")
-        || message.contains(" has no serving primary in cluster epoch ")
-        || (message.contains(" primary node ")
-            && message.contains(" has not reported active state in cluster epoch "))
-        || (message.contains(" reported unresolved pending metadata command for PG ")
-            && message.contains(" in cluster epoch "))
-}
-
 fn control_plane_metadata_transfer_observation_error_is_retryable(
     error: &ControlPlaneError,
 ) -> bool {
-    error.is_retryable_read_only_rpc_transport_error()
-        || control_plane_runtime_map_not_ready_for_serving(&error.to_string())
+    error.is_retryable_runtime_map_observation_error()
 }
 
 fn metadata_transfer_error_is_transient_route_refresh(error: &PgMetadataTransferError) -> bool {
@@ -2507,10 +2497,7 @@ impl ExperimentalRaftControlPlane {
                     .local_leader()
                     .then(|| status.current_term())
                     .flatten()
-                    .ok_or(ControlPlaneError::RpcRemote {
-                        message: "local OpenRaft test authority is not the serving leader"
-                            .to_string(),
-                    })?;
+                    .ok_or(ControlPlaneError::AuthorityNotServing)?;
                 return Ok((
                     supplied_now_ms,
                     LeaseHorizonAuthorityBinding::checked_new(1, Some(term)),
@@ -2532,12 +2519,7 @@ impl ExperimentalRaftControlPlane {
         }
         let status = self.block_on(self.authority.status())?;
         if !status.linearized_authority_serving() {
-            return Err(ControlPlaneError::RpcRemote {
-                message: format!(
-                    "local OpenRaft authority is not the serving leader: {:?}",
-                    status.linearized_authority_readiness()
-                ),
-            });
+            return Err(ControlPlaneError::AuthorityNotServing);
         }
         self.authority_time_and_lease_horizon_binding_for_status(status)
     }
@@ -4609,7 +4591,7 @@ fn wait_for_initial_experimental_raft_control_plane_with(
     loop {
         match bootstrap() {
             Ok(()) => return Ok(()),
-            Err(error) if error.is_retryable_openraft_leadership_error() => {
+            Err(error) if error.is_control_plane_leader_routing_rejection() => {
                 // Every voter keeps its peer endpoint available while waiting.
                 // A transient election or quorum gap between leadership
                 // observation and command admission must not terminate the
@@ -6105,13 +6087,8 @@ fn build_control_plane_storage_node_process_config(
             node_id,
             node_incarnation,
         )?;
-        match control_plane
-            .refresh_node_heartbeat(heartbeat, storage::clock::current_time_millis())
-            .map_err(|error| {
-                format!(
-                    "failed to refresh control-plane runtime map from {control_plane_socket_path}: {error}"
-                )
-            }) {
+        match control_plane.refresh_node_heartbeat(heartbeat, storage::clock::current_time_millis())
+        {
             Ok(refresh) => {
                 if attempts > 1 {
                     process_info!(
@@ -6122,7 +6099,7 @@ fn build_control_plane_storage_node_process_config(
                 break refresh;
             }
             Err(error)
-                if control_plane_startup_error_is_retryable(&error)
+                if error.is_retryable_heartbeat_startup_error()
                     && started_at.elapsed() < retry_deadline =>
             {
                 if attempts == 1 || attempts.is_multiple_of(10) {
@@ -6132,7 +6109,11 @@ fn build_control_plane_storage_node_process_config(
                 }
                 thread::sleep(retry_delay);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                return Err(format!(
+                    "failed to refresh control-plane runtime map from {control_plane_socket_path}: {error}"
+                ));
+            }
         }
     };
     let (_lease, runtime_map) = refresh.into_parts();
@@ -6287,10 +6268,7 @@ async fn build_remote_frontend_storage_cluster_retrying_startup(
                 }
                 return Ok(storage_clusters);
             }
-            Err(error)
-                if frontend_control_plane_startup_error_is_retryable(&error)
-                    && started_at.elapsed() < retry_deadline =>
-            {
+            Err(error) if error.is_retryable() && started_at.elapsed() < retry_deadline => {
                 if attempts == 1 || attempts.is_multiple_of(10) {
                     eprintln!(
                         "argmin-s3 frontend waiting for control-plane runtime map during startup: {error}"
@@ -6298,7 +6276,7 @@ async fn build_remote_frontend_storage_cluster_retrying_startup(
                 }
                 tokio::time::sleep(retry_delay).await;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.to_string()),
         }
     }
 }
@@ -6323,6 +6301,71 @@ impl FrontendStorageClusters {
         Self {
             foreground,
             distinct_maintenance: Some(maintenance),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum FrontendControlPlaneStartupError {
+    RuntimeMapFetch {
+        socket_path: String,
+        source: Box<ControlPlaneError>,
+    },
+    NoRoutedPgs,
+    NoRoutedNodes,
+    PgNotServing {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+    Permanent(String),
+}
+
+impl FrontendControlPlaneStartupError {
+    fn runtime_map_fetch(socket_path: &str, source: ControlPlaneError) -> Self {
+        Self::RuntimeMapFetch {
+            socket_path: socket_path.to_owned(),
+            source: Box::new(source),
+        }
+    }
+
+    fn permanent(error: impl ToString) -> Self {
+        Self::Permanent(error.to_string())
+    }
+
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::RuntimeMapFetch { source, .. } => {
+                source.is_retryable_runtime_map_observation_error()
+            }
+            Self::NoRoutedPgs | Self::NoRoutedNodes | Self::PgNotServing { .. } => true,
+            Self::Permanent(_) => false,
+        }
+    }
+}
+
+impl std::fmt::Display for FrontendControlPlaneStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RuntimeMapFetch {
+                socket_path,
+                source,
+            } => write!(
+                formatter,
+                "failed to fetch control-plane runtime map from {socket_path}: {source}"
+            ),
+            Self::NoRoutedPgs => formatter.write_str("control-plane runtime map has no routed PGs"),
+            Self::NoRoutedNodes => {
+                formatter.write_str("control-plane runtime map has no routed nodes")
+            }
+            Self::PgNotServing {
+                pg_id,
+                cluster_epoch,
+            } => write!(
+                formatter,
+                "PG {pg_id} has no serving primary in cluster epoch {}",
+                cluster_epoch.get()
+            ),
+            Self::Permanent(message) => formatter.write_str(message),
         }
     }
 }
@@ -6365,23 +6408,13 @@ fn storage_node_control_plane_startup_retry_delay(config: &ServerConfig) -> Dura
     .min(Duration::from_secs(1))
 }
 
-fn frontend_control_plane_startup_error_is_retryable(error: &str) -> bool {
-    control_plane_startup_error_is_retryable(error)
-}
-
-fn control_plane_startup_error_is_retryable(error: &str) -> bool {
-    error.starts_with("failed to fetch control-plane runtime map from ")
-        || error.starts_with("failed to refresh control-plane runtime map from ")
-        || control_plane_runtime_map_not_ready_for_serving(error)
-        || error == "control-plane runtime map has no routed nodes"
-}
-
 fn build_remote_frontend_storage_cluster(
     config: &ServerConfig,
     ec_config: &EcConfig,
 ) -> Result<Arc<StorageCluster>, String> {
     if let Some(socket_path) = config.control_plane_socket_path.as_deref() {
-        return build_control_plane_frontend_storage_cluster(config, ec_config, socket_path);
+        return build_control_plane_frontend_storage_cluster(config, ec_config, socket_path)
+            .map_err(|error| error.to_string());
     }
     let cluster_epoch = ClusterEpoch::new(config.storage_cluster_epoch)
         .ok_or_else(|| "ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0".to_string())?;
@@ -6427,37 +6460,42 @@ fn build_control_plane_frontend_storage_cluster(
     config: &ServerConfig,
     ec_config: &EcConfig,
     control_plane_socket_path: &str,
-) -> Result<Arc<StorageCluster>, String> {
-    let control_plane = build_frontend_control_plane_client(config, control_plane_socket_path)?;
+) -> Result<Arc<StorageCluster>, FrontendControlPlaneStartupError> {
+    let control_plane = build_frontend_control_plane_client(config, control_plane_socket_path)
+        .map_err(FrontendControlPlaneStartupError::permanent)?;
     let runtime_map = control_plane
         .runtime_map_snapshot(storage::clock::current_time_millis())
-        .map_err(|error| {
-            format!(
-                "failed to fetch control-plane runtime map from {control_plane_socket_path}: {error}"
-            )
+        .map_err(|source| {
+            FrontendControlPlaneStartupError::runtime_map_fetch(control_plane_socket_path, source)
         })?;
     ensure_frontend_startup_runtime_map_is_serving(&runtime_map)?;
     build_frontend_storage_cluster_from_runtime_map(config, ec_config, &runtime_map)
+        .map_err(FrontendControlPlaneStartupError::permanent)
 }
 
 fn build_control_plane_frontend_storage_clusters(
     config: &ServerConfig,
     ec_config: &EcConfig,
-) -> Result<FrontendStorageClusters, String> {
+) -> Result<FrontendStorageClusters, FrontendControlPlaneStartupError> {
     let socket_path = config.control_plane_socket_path.as_deref().ok_or_else(|| {
-        "control-plane frontend cluster requires a control-plane socket".to_string()
+        FrontendControlPlaneStartupError::permanent(
+            "control-plane frontend cluster requires a control-plane socket",
+        )
     })?;
-    let control_plane = build_frontend_control_plane_client(config, socket_path)?;
+    let control_plane = build_frontend_control_plane_client(config, socket_path)
+        .map_err(FrontendControlPlaneStartupError::permanent)?;
     let runtime_map = control_plane
         .runtime_map_snapshot(storage::clock::current_time_millis())
-        .map_err(|error| {
-            format!("failed to fetch control-plane runtime map from {socket_path}: {error}")
+        .map_err(|source| {
+            FrontendControlPlaneStartupError::runtime_map_fetch(socket_path, source)
         })?;
     ensure_frontend_startup_runtime_map_is_serving(&runtime_map)?;
     let foreground =
-        build_frontend_storage_cluster_from_runtime_map(config, ec_config, &runtime_map)?;
+        build_frontend_storage_cluster_from_runtime_map(config, ec_config, &runtime_map)
+            .map_err(FrontendControlPlaneStartupError::permanent)?;
     let Some(maintenance) =
-        build_maintenance_storage_cluster_from_runtime_map(config, ec_config, &runtime_map)?
+        build_maintenance_storage_cluster_from_runtime_map(config, ec_config, &runtime_map)
+            .map_err(FrontendControlPlaneStartupError::permanent)?
     else {
         return Ok(FrontendStorageClusters::shared(foreground));
     };
@@ -6469,17 +6507,19 @@ fn build_control_plane_frontend_storage_clusters(
 
 fn ensure_frontend_startup_runtime_map_is_serving(
     runtime_map: &ClusterRuntimeMapSnapshot,
-) -> Result<(), String> {
+) -> Result<(), FrontendControlPlaneStartupError> {
     if runtime_map.pg_routes().is_empty() {
-        return Err("control-plane runtime map has no routed PGs".to_string());
+        return Err(FrontendControlPlaneStartupError::NoRoutedPgs);
+    }
+    if runtime_map.nodes().is_empty() {
+        return Err(FrontendControlPlaneStartupError::NoRoutedNodes);
     }
     for route in runtime_map.pg_routes() {
         if route.state() != PgState::Active || route.primary_lease_deadline_ms().is_none() {
-            return Err(format!(
-                "PG {} has no serving primary in cluster epoch {}",
-                route.pg_id().get(),
-                runtime_map.cluster_epoch().get()
-            ));
+            return Err(FrontendControlPlaneStartupError::PgNotServing {
+                pg_id: route.pg_id().get(),
+                cluster_epoch: runtime_map.cluster_epoch(),
+            });
         }
     }
     Ok(())
@@ -8037,39 +8077,11 @@ mod tests {
     }
 
     #[test]
-    fn raft_non_leader_classifier_covers_status_submission_race() {
-        assert!(experimental_raft_error_is_non_local_leader(
-            &ControlPlaneError::RpcRemote {
-                message: "local OpenRaft authority is not the serving leader".to_string(),
-            }
-        ));
-        assert!(experimental_raft_error_is_non_local_leader(
-            &ControlPlaneError::RpcRemote {
-                message: "local OpenRaft authority is not the serving leader: NotLocalLeader"
-                    .to_string(),
-            }
-        ));
-        assert!(experimental_raft_error_is_non_local_leader(
-            &ControlPlaneError::RpcRemote {
-                message: "local OpenRaft authority is not the serving leader: command-authority read-index failed: not enough for a quorum"
-                    .to_string(),
-            }
-        ));
-        assert!(experimental_raft_error_is_non_local_leader(
-            &ControlPlaneError::RpcRemote {
-                message: "OpenRaft client-write failed: has to forward request to: Some(102)"
-                    .to_string(),
-            }
-        ));
+    fn raft_lease_expiry_classifier_covers_term_change() {
         assert!(experimental_raft_lease_expiry_error_is_transient(
             &ControlPlaneError::LeaseGrantHorizonAuthorityTermMismatch {
                 authority_term: Some(2),
                 committed_term: Some(3),
-            }
-        ));
-        assert!(!experimental_raft_error_is_non_local_leader(
-            &ControlPlaneError::RpcRemote {
-                message: "unrelated control-plane failure".to_string(),
             }
         ));
     }
@@ -12532,7 +12544,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcRemote { message } if message.contains("unknown node 99")
+            ControlPlaneError::UnknownNode { node_id: 99 }
         ));
         let after = harness
             .control_plane
@@ -12781,8 +12793,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            ControlPlaneError::RpcRemote { message }
-                if message.contains("PG 19 acting set references unknown node 99")
+            ControlPlaneError::UnknownActingSetNode {
+                pg_id: 19,
+                node_id: 99,
+            }
         ));
         let after = harness
             .control_plane
@@ -13724,55 +13738,6 @@ mod tests {
     }
 
     #[test]
-    fn metadata_transfer_active_check_treats_incomplete_runtime_map_as_retryable() {
-        assert!(
-            control_plane_metadata_transfer_observation_error_is_retryable(
-                &ControlPlaneError::RpcRemote {
-                    message: "PG 1 has no serving primary in cluster epoch 26".to_string(),
-                }
-            )
-        );
-        assert!(
-            control_plane_metadata_transfer_observation_error_is_retryable(
-                &ControlPlaneError::RpcRemote {
-                    message:
-                        "PG 0 primary node 2 has not reported active state in cluster epoch 31"
-                            .to_string(),
-                }
-            )
-        );
-        assert!(control_plane_metadata_transfer_observation_error_is_retryable(
-            &ControlPlaneError::RpcRemote {
-                message:
-                    "node 1 reported unresolved pending metadata command for PG 27 in cluster epoch 83"
-                        .to_string(),
-            }
-        ));
-        assert!(
-            control_plane_metadata_transfer_observation_error_is_retryable(
-                &ControlPlaneError::RpcRemote {
-                    message: "control-plane runtime map has no routed PGs".to_string(),
-                }
-            )
-        );
-        assert!(
-            control_plane_metadata_transfer_observation_error_is_retryable(
-                &ControlPlaneError::Io {
-                    context: "read control-plane RPC magic",
-                    source: io::Error::from(io::ErrorKind::WouldBlock),
-                }
-            )
-        );
-        assert!(
-            !control_plane_metadata_transfer_observation_error_is_retryable(
-                &ControlPlaneError::RpcRemote {
-                    message: "unknown PG 99".to_string(),
-                }
-            )
-        );
-    }
-
-    #[test]
     fn metadata_transfer_active_check_uses_pg_scoped_runtime_map() {
         let tmp = short_unix_socket_test_dir("mpg");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -13789,7 +13754,7 @@ mod tests {
 
         let full_map_error = control_plane.runtime_map_snapshot(2_000).unwrap_err();
         assert!(
-            control_plane_runtime_map_not_ready_for_serving(&full_map_error.to_string()),
+            full_map_error.is_retryable_runtime_map_observation_error(),
             "expected unrelated PG to make full runtime map fail, got {full_map_error}"
         );
         assert!(
@@ -13820,22 +13785,32 @@ mod tests {
     }
 
     #[test]
-    fn frontend_startup_retries_transient_control_plane_runtime_map_errors() {
-        assert!(frontend_control_plane_startup_error_is_retryable(
-            "failed to fetch control-plane runtime map from /tmp/control-plane.sock: control-plane RPC remote error: PG 1 has no serving primary in cluster epoch 35"
-        ));
-        assert!(frontend_control_plane_startup_error_is_retryable(
-            "failed to fetch control-plane runtime map from /tmp/control-plane.sock: No such file or directory"
-        ));
-        assert!(frontend_control_plane_startup_error_is_retryable(
-            "control-plane runtime map has no routed nodes"
-        ));
-        assert!(frontend_control_plane_startup_error_is_retryable(
-            "control-plane runtime map has no routed PGs"
-        ));
-        assert!(!frontend_control_plane_startup_error_is_retryable(
+    fn frontend_startup_retry_classification_is_typed() {
+        let cluster_epoch = ClusterEpoch::new(35).unwrap();
+        assert!(FrontendControlPlaneStartupError::runtime_map_fetch(
+            "/tmp/control-plane.sock",
+            ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: 1,
+                cluster_epoch,
+            },
+        )
+        .is_retryable());
+        assert!(FrontendControlPlaneStartupError::NoRoutedNodes.is_retryable());
+        assert!(FrontendControlPlaneStartupError::NoRoutedPgs.is_retryable());
+        assert!(FrontendControlPlaneStartupError::PgNotServing {
+            pg_id: 1,
+            cluster_epoch,
+        }
+        .is_retryable());
+        assert!(!FrontendControlPlaneStartupError::runtime_map_fetch(
+            "/tmp/control-plane.sock",
+            ControlPlaneError::UnknownPg { pg_id: 1 },
+        )
+        .is_retryable());
+        assert!(!FrontendControlPlaneStartupError::permanent(
             "ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0"
-        ));
+        )
+        .is_retryable());
     }
 
     #[test]

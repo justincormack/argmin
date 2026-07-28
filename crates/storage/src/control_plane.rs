@@ -16839,6 +16839,21 @@ fn encode_control_plane_rpc_response(
             write_u8(&mut payload, kind.wire_tag());
             write_string(&mut payload, &message)?;
         }
+        Err(ControlPlaneError::AuthorityNotServing) => {
+            write_u8(&mut payload, 10);
+        }
+        Err(ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority) => {
+            write_u8(&mut payload, 11);
+        }
+        Err(ControlPlaneError::UnknownNode { node_id }) => {
+            write_u8(&mut payload, 12);
+            write_u32(&mut payload, node_id);
+        }
+        Err(ControlPlaneError::UnknownActingSetNode { pg_id, node_id }) => {
+            write_u8(&mut payload, 13);
+            write_u32(&mut payload, pg_id);
+            write_u32(&mut payload, node_id);
+        }
         Err(error) => {
             write_u8(&mut payload, 1);
             write_string(&mut payload, &error.to_string())?;
@@ -16953,6 +16968,25 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
             let message = reader.read_string()?.to_owned();
             reader.finish()?;
             Err(ControlPlaneError::OpenRaftOperation { kind, message })
+        }
+        10 => {
+            reader.finish()?;
+            Err(ControlPlaneError::AuthorityNotServing)
+        }
+        11 => {
+            reader.finish()?;
+            Err(ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority)
+        }
+        12 => {
+            let node_id = reader.read_u32()?;
+            reader.finish()?;
+            Err(ControlPlaneError::UnknownNode { node_id })
+        }
+        13 => {
+            let pg_id = reader.read_u32()?;
+            let node_id = reader.read_u32()?;
+            reader.finish()?;
+            Err(ControlPlaneError::UnknownActingSetNode { pg_id, node_id })
         }
         _ => Err(ControlPlaneError::RpcProtocol {
             message: format!("invalid control-plane RPC response status {status}"),
@@ -19005,6 +19039,9 @@ pub enum ControlPlaneError {
     #[error("control-plane RPC remote error: {message}")]
     RpcRemote { message: String },
 
+    #[error("local control-plane authority is not serving")]
+    AuthorityNotServing,
+
     #[error("control-plane OpenRaft operation failed ({kind}): {message}")]
     OpenRaftOperation {
         kind: ControlPlaneRaftOperationErrorKind,
@@ -19566,15 +19603,7 @@ impl ControlPlaneError {
         }
         matches!(
             self,
-            Self::RpcRemote { message }
-                if message.contains("local OpenRaft authority is not the serving leader")
-                    || message.contains(
-                        "control-plane authority clock can only be re-established on the local serving Raft authority",
-                    )
-                    || (message.contains("OpenRaft client-write failed")
-                        && message.contains("has to forward request to"))
-                    || message.contains("OpenRaft runtime-map")
-                        && message.contains("not enough for a quorum")
+            Self::AuthorityNotServing | Self::AuthorityClockNotLocalServingRaftAuthority
         )
     }
 
@@ -19602,6 +19631,18 @@ impl ControlPlaneError {
                 | ErrorKind::ConnectionRefused
                 | ErrorKind::NotFound
         )
+    }
+
+    #[must_use]
+    pub fn is_retryable_runtime_map_observation_error(&self) -> bool {
+        self.is_retryable_read_only_rpc_transport_error()
+            || self.is_transient_runtime_map_serving_gap()
+    }
+
+    #[must_use]
+    pub fn is_retryable_heartbeat_startup_error(&self) -> bool {
+        self.is_retryable_runtime_map_observation_error()
+            || matches!(self, Self::RpcUnconfirmed { .. })
     }
 
     #[must_use]
@@ -23780,10 +23821,9 @@ mod tests {
         let follower = std::thread::spawn(move || {
             let (mut stream, _) = follower_listener.accept().unwrap();
             let (kind, _) = read_control_plane_rpc_frame(&mut stream).unwrap();
-            let response = encode_control_plane_rpc_response(Err(ControlPlaneError::RpcRemote {
-                message: "local OpenRaft authority is not the serving leader".to_owned(),
-            }))
-            .unwrap();
+            let response =
+                encode_control_plane_rpc_response(Err(ControlPlaneError::AuthorityNotServing))
+                    .unwrap();
             write_control_plane_rpc_frame(&mut stream, kind, &response).unwrap();
         });
         let leader = std::thread::spawn(move || {
@@ -27270,9 +27310,9 @@ mod tests {
             let request = read_control_plane_unix_request(&mut stream).unwrap();
             let response = ControlPlaneRpcResponse {
                 kind: request.kind,
-                payload: encode_control_plane_rpc_response(Err(ControlPlaneError::RpcRemote {
-                    message: "local OpenRaft authority is not the serving leader".to_owned(),
-                }))
+                payload: encode_control_plane_rpc_response(Err(
+                    ControlPlaneError::AuthorityNotServing,
+                ))
                 .unwrap(),
             };
             write_control_plane_unix_response(&mut stream, response).unwrap();
@@ -27326,10 +27366,8 @@ mod tests {
                 let (mut stream, _addr) = listener.accept().unwrap();
                 let (kind, _payload) = read_control_plane_rpc_frame(&mut stream).unwrap();
                 let response =
-                    encode_control_plane_rpc_response(Err(ControlPlaneError::RpcRemote {
-                        message: "local OpenRaft authority is not the serving leader".to_owned(),
-                    }))
-                    .unwrap();
+                    encode_control_plane_rpc_response(Err(ControlPlaneError::AuthorityNotServing))
+                        .unwrap();
                 let response = sign_control_plane_response_payload(
                     kind,
                     &signer
@@ -27394,10 +27432,9 @@ mod tests {
         let follower = std::thread::spawn(move || {
             let (mut stream, _addr) = follower_listener.accept().unwrap();
             let (kind, _payload) = read_control_plane_rpc_frame(&mut stream).unwrap();
-            let response = encode_control_plane_rpc_response(Err(ControlPlaneError::RpcRemote {
-                message: "local OpenRaft authority is not the serving leader".to_owned(),
-            }))
-            .unwrap();
+            let response =
+                encode_control_plane_rpc_response(Err(ControlPlaneError::AuthorityNotServing))
+                    .unwrap();
             write_control_plane_rpc_frame(&mut stream, kind, &response).unwrap();
         });
 
@@ -27506,6 +27543,86 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_rpc_preserves_authority_not_serving_identity() {
+        let encoded =
+            encode_control_plane_rpc_response(Err(ControlPlaneError::AuthorityNotServing)).unwrap();
+
+        let error = decode_control_plane_rpc_response(encoded).unwrap_err();
+        assert!(matches!(&error, ControlPlaneError::AuthorityNotServing));
+        assert!(error.is_control_plane_leader_routing_rejection());
+
+        let encoded = encode_control_plane_rpc_response(Err(
+            ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority,
+        ))
+        .unwrap();
+        let error = decode_control_plane_rpc_response(encoded).unwrap_err();
+        assert!(matches!(
+            &error,
+            ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority
+        ));
+        assert!(error.is_control_plane_leader_routing_rejection());
+    }
+
+    #[test]
+    fn runtime_map_observation_retry_classification_uses_semantic_errors() {
+        let cluster_epoch = ClusterEpoch::new(44).unwrap();
+        for error in [
+            ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: 7,
+                cluster_epoch,
+            },
+            ControlPlaneError::PgPrimaryMissingActiveObservation {
+                pg_id: 7,
+                node_id: 3,
+                cluster_epoch,
+            },
+            ControlPlaneError::PgPrimaryObservationNotActive {
+                pg_id: 7,
+                node_id: 3,
+                cluster_epoch,
+                state: PgState::Peering,
+            },
+            ControlPlaneError::PgPeeringPendingMetadataCommand {
+                pg_id: 7,
+                node_id: 3,
+                cluster_epoch,
+                pending: PendingMetadataCommandObservation::new(
+                    ClusterEpoch::new(41).unwrap(),
+                    NonZeroU64::new(17).unwrap(),
+                    0xfeed_beef,
+                ),
+            },
+            ControlPlaneError::AuthorityNotServing,
+            ControlPlaneError::Io {
+                context: "read control-plane RPC magic",
+                source: std::io::Error::from(ErrorKind::WouldBlock),
+            },
+        ] {
+            assert!(
+                error.is_retryable_runtime_map_observation_error(),
+                "expected semantic retry classification for {error:?}"
+            );
+        }
+
+        assert!(!ControlPlaneError::RpcRemote {
+            message: "PG 7 has no serving primary in cluster epoch 44".to_owned(),
+        }
+        .is_retryable_runtime_map_observation_error());
+        assert!(!ControlPlaneError::RpcProtocol {
+            message: "invalid runtime-map response".to_owned(),
+        }
+        .is_retryable_runtime_map_observation_error());
+        assert!(
+            !ControlPlaneError::UnknownPg { pg_id: 7 }.is_retryable_runtime_map_observation_error()
+        );
+        let unconfirmed = ControlPlaneError::RpcUnconfirmed {
+            message: "heartbeat retry budget expired".to_owned(),
+        };
+        assert!(unconfirmed.is_retryable_heartbeat_startup_error());
+        assert!(!unconfirmed.is_retryable_runtime_map_observation_error());
+    }
+
+    #[test]
     fn control_plane_rpc_preserves_metadata_migration_source_not_ready_identity() {
         let cluster_epoch = ClusterEpoch::new(44).unwrap();
         let encoded = encode_control_plane_rpc_response(Err(
@@ -27555,6 +27672,28 @@ mod tests {
         assert!(matches!(
             decode_control_plane_rpc_response(encoded),
             Err(ControlPlaneError::UnknownPg { pg_id: 7 })
+        ));
+
+        let encoded =
+            encode_control_plane_rpc_response(Err(ControlPlaneError::UnknownNode { node_id: 9 }))
+                .unwrap();
+        assert!(matches!(
+            decode_control_plane_rpc_response(encoded),
+            Err(ControlPlaneError::UnknownNode { node_id: 9 })
+        ));
+
+        let encoded =
+            encode_control_plane_rpc_response(Err(ControlPlaneError::UnknownActingSetNode {
+                pg_id: 7,
+                node_id: 9,
+            }))
+            .unwrap();
+        assert!(matches!(
+            decode_control_plane_rpc_response(encoded),
+            Err(ControlPlaneError::UnknownActingSetNode {
+                pg_id: 7,
+                node_id: 9,
+            })
         ));
     }
 
@@ -27936,10 +28075,7 @@ mod tests {
         let request = verify_control_plane_unix_request(request, Some(&verifier), 2_000).unwrap();
         let response = build_control_plane_unix_admission_error_response(
             request,
-            ControlPlaneError::RpcRemote {
-                message: "local OpenRaft authority is not the serving leader: NotLocalLeader"
-                    .to_owned(),
-            },
+            ControlPlaneError::AuthorityNotServing,
             2_000,
         )
         .unwrap();
@@ -27949,12 +28085,7 @@ mod tests {
         let error = decode_control_plane_rpc_response(payload).unwrap_err();
         let metrics = verifier.metrics_snapshot();
 
-        assert!(matches!(
-            error,
-            ControlPlaneError::RpcRemote { message }
-                if message.contains("local OpenRaft authority is not the serving leader")
-                    && message.contains("NotLocalLeader")
-        ));
+        assert!(matches!(error, ControlPlaneError::AuthorityNotServing));
         assert_eq!(metrics.accepted_total(), 1);
     }
 
@@ -29329,10 +29460,7 @@ mod tests {
                             request,
                             &verifier,
                             request_now_ms,
-                            Err(ControlPlaneError::RpcRemote {
-                                message: "local OpenRaft authority is not the serving leader: NotLocalLeader"
-                                    .to_owned(),
-                            }),
+                            Err(ControlPlaneError::AuthorityNotServing),
                         );
                         std::thread::sleep(Duration::from_millis(200));
                         let _ = write_control_plane_unix_response(&mut stream, response);
@@ -29465,9 +29593,7 @@ mod tests {
                             .unwrap();
                     build_control_plane_unix_admission_error_response(
                         request,
-                        ControlPlaneError::RpcRemote {
-                            message: "local OpenRaft authority is not the serving leader: command-authority read-index timed out after 1s".to_owned(),
-                        },
+                        ControlPlaneError::AuthorityNotServing,
                         now_ms,
                     )
                     .unwrap()
@@ -30894,8 +31020,13 @@ mod tests {
 
         server.join().unwrap();
         assert!(
-            matches!(error, ControlPlaneError::RpcRemote { ref message }
-            if message.contains("unknown node 99")),
+            matches!(
+                error,
+                ControlPlaneError::UnknownActingSetNode {
+                    pg_id: 7,
+                    node_id: 99,
+                }
+            ),
             "unexpected error: {error}"
         );
     }
@@ -33799,7 +33930,7 @@ mod tests {
         server.join().unwrap();
         assert!(matches!(
             error,
-            ControlPlaneError::RpcRemote { message } if message.contains("unknown node 99")
+            ControlPlaneError::UnknownNode { node_id: 99 }
         ));
     }
 

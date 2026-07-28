@@ -2610,6 +2610,36 @@ fail_with_matches \
     "Control-plane server framing, admission, TLS profile, and workers are private to storage; use ControlPlaneRpcServerListener and ControlPlaneRpcServerPolicy" \
     "$control_plane_server_wire_leaks"
 
+control_plane_error_representation_leaks=$(
+    {
+        rg -n --color=never \
+            '\bControlPlaneError::Io\b' \
+            . \
+            -g 'crates/**/*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n -U --color=never \
+            'ControlPlaneError::(RpcRemote|RpcProtocol)\s*\{[^}]*\}\s*(if|=>)' \
+            . \
+            -g 'crates/**/*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            '\b(control_plane_startup_error_is_retryable|control_plane_startup_message_indicates_runtime_map_not_ready|frontend_control_plane_startup_error_is_retryable)\b' \
+            crates/argmin-s3/src \
+            -g '*.rs' \
+            || true
+        rg -n -U --color=never \
+            '(error|message)\.(starts_with|contains)\(\s*"(failed to (fetch|refresh) control-plane runtime map|control-plane runtime map has no routed| has no serving primary in cluster epoch )' \
+            crates/argmin-s3/src \
+            -g '*.rs' \
+            || true
+    }
+)
+fail_with_matches \
+    "Control-plane transport errors and remote diagnostic text are storage-owned; preserve typed startup errors and use semantic ControlPlaneError classifications" \
+    "$control_plane_error_representation_leaks"
+
 raft_peer_client_wire_leaks=$(
     rg -n --color=never \
         '\bControlPlaneRaftPeerFrame(Transport|Exchange|ExchangeError)\b|\bControlPlaneRaftPeerNetwork(Factory)?\b|\bStaticRaftTcpPeer(FrameTransport)?\b|\bexchange_static_raft_tcp_peer_frame\b' \

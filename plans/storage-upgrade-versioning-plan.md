@@ -335,9 +335,16 @@ The public boundary and containment status for each surface are as follows.
 - `ControlPlaneError` currently mixes logical authority failures with public `Io`, `RpcProtocol`,
   and string-valued `RpcRemote` wire/transport failures. The storage clients own much of the
   retry logic, including read-only endpoint failover and operation-specific response-loss
-  confirmation, but `argmin-s3` still destructures I/O errors for metrics and parses rendered
-  control-plane and runtime-map messages to make retry decisions. These need owner-defined
-  semantic classifications and a stable server diagnostic surface.
+  confirmation. The first error-containment slice removes cross-crate I/O destructuring and
+  rendered-error parsing for leader routing, runtime-map observation, and frontend/storage-node
+  startup retries. Frontend startup retains a typed fetch-or-readiness error until retry policy is
+  applied; storage-node heartbeat startup likewise asks storage for semantic classification before
+  rendering its terminal diagnostic. Authority readiness, authority-clock routing, unknown-node,
+  and unknown acting-set-node failures retain typed identities across the RPC boundary; storage
+  owns the retry classification and a boundary check prevents raw transport matching or the former
+  startup format-then-parse helpers outside the crate. Remaining work is to replace `argmin-s3`
+  construction of `RpcRemote` and `RpcProtocol`, then place their diagnostic payloads behind an
+  opaque stable surface.
 - Storage contains the codec, version, authentication, retry, resource-admission, TLS/ALPN, and
   client/server protocol tests. Process-level lifecycle and durability tests remain in
   `argmin-s3`, but use logical clients and the opaque storage-owned server facade.
@@ -561,21 +568,24 @@ The storage-owned PG layout slice is complete:
 - Native-lock symlink and replacement tests are owned by `storage`; the boundary check rejects
   exposing the constant or literal filename to `argmin-s3`.
 
-Residual containment work includes closing the inventoried RPC/control-plane/Raft leaks,
-hiding WAL and restart-format constructors, and replacing any remaining higher-layer
-implementation-error matching. These remain explicit work below.
+Residual containment work now starts with replacing the remaining higher-layer matching and
+construction of control-plane transport/implementation errors. The RPC transports, raw Raft
+representations, and durable Raft restart/WAL formats are contained and boundary-checked.
 
 ## Immediate Next Steps
 
 Completed in the current containment pass: the control-plane client and server boundaries and the
 Raft peer client and server transports are storage-owned and boundary-checked.
 
-1. Privatize the remaining raw Raft frame, auth-envelope, OpenRaft-handle, and
+1. **Complete:** privatize the remaining raw Raft frame, auth-envelope, OpenRaft-handle, and
    transport-error APIs and relocate malformed-wire tests into `storage`.
-2. Hide public WAL/restart-format constructors and move direct WAL/impossible-state tests into
-   the owner.
-3. Replace other higher-layer matching on database/RPC implementation errors with owner-defined
-   semantic errors or classification methods.
+2. **Complete:** hide public WAL/restart-format constructors and move direct WAL/impossible-state
+   tests into the owner.
+3. **In progress:** replace other higher-layer matching and construction of database/RPC
+   implementation errors with owner-defined semantic errors or exhaustive classification methods.
+   Start with `ControlPlaneError`: storage must own transport, response-loss, leader-routing, and
+   runtime-map readiness classification; callers must not parse rendered messages or construct raw
+   `Io`, `RpcProtocol`, or `RpcRemote` variants to drive policy tests.
 4. Inventory and restrict nested durable codecs for metadata, tags, ACLs, and encryption;
    record how containing formats advance when a nested format changes.
 5. Audit existing version/fallback code and remove unsupported legacy compatibility where it

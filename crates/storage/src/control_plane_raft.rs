@@ -5355,22 +5355,7 @@ impl ControlPlaneRaftAuthority {
     ) -> Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError> {
         let status = self.status().await?;
         if !status.linearized_authority_serving() {
-            let readiness = status.linearized_authority_readiness();
-            let kind = match readiness {
-                ControlPlaneRaftLinearizedAuthorityReadiness::NotLocalLeader
-                | ControlPlaneRaftLinearizedAuthorityReadiness::NotEffectiveVoter => {
-                    ControlPlaneRaftOperationErrorKind::ForwardToLeader
-                }
-                ControlPlaneRaftLinearizedAuthorityReadiness::NotAppliedToCommitted
-                | ControlPlaneRaftLinearizedAuthorityReadiness::NotCommittedInCurrentTerm => {
-                    ControlPlaneRaftOperationErrorKind::QuorumNotEnough
-                }
-                ControlPlaneRaftLinearizedAuthorityReadiness::Serving => unreachable!(),
-            };
-            return Err(ControlPlaneError::OpenRaftOperation {
-                kind,
-                message: format!("local authority is not the serving leader: {readiness:?}"),
-            });
+            return Err(ControlPlaneError::AuthorityNotServing);
         }
         ControlPlaneRaftTypeConfig::timeout(
             Duration::from_secs(1),
@@ -6625,7 +6610,7 @@ async fn control_plane_runtime_map_status_via_openraft_read_index(
     let read_log_id = raft
         .ensure_linearizable(ReadPolicy::ReadIndex)
         .await
-        .map_err(|error| openraft_remote_error("runtime-map status read-index", error))?
+        .map_err(|error| openraft_linearizable_read_error("runtime-map status read-index", error))?
         .ok_or_else(|| ControlPlaneError::CommandDecode {
             message: "OpenRaft runtime-map status read-index returned no applied log id"
                 .to_string(),
@@ -6701,7 +6686,7 @@ async fn control_plane_snapshot_via_openraft_read_index(
     let read_log_id = raft
         .ensure_linearizable(ReadPolicy::ReadIndex)
         .await
-        .map_err(|error| openraft_remote_error("read-index", error))?
+        .map_err(|error| openraft_linearizable_read_error("read-index", error))?
         .ok_or_else(|| ControlPlaneError::CommandDecode {
             message: "OpenRaft read-index returned no applied log id".to_string(),
         })?;
@@ -19018,10 +19003,7 @@ mod tests {
         loop {
             match operation().await {
                 Ok(value) => return Ok(value),
-                Err(ControlPlaneError::RpcRemote { message })
-                    if message.contains("OpenRaft read-index failed")
-                        && message.contains("not enough for a quorum") =>
-                {
+                Err(error) if error.is_retryable_openraft_leadership_error() => {
                     ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
                 }
                 Err(error) => return Err(error),
@@ -23969,8 +23951,10 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(
                 err,
-                ControlPlaneError::RpcRemote { message }
-                    if message.contains("OpenRaft read-index failed")
+                ControlPlaneError::OpenRaftOperation {
+                    kind: ControlPlaneRaftOperationErrorKind::ForwardToLeader,
+                    ..
+                }
             ));
 
             let err = authority
@@ -23980,13 +23964,7 @@ mod tests {
                 })
                 .await
                 .unwrap_err();
-            assert!(matches!(
-                err,
-                ControlPlaneError::OpenRaftOperation {
-                    kind: ControlPlaneRaftOperationErrorKind::ForwardToLeader,
-                    ..
-                }
-            ));
+            assert!(matches!(err, ControlPlaneError::AuthorityNotServing));
 
             authority.shutdown().await.unwrap();
         });
@@ -24169,10 +24147,7 @@ mod tests {
             .unwrap_err();
             assert!(matches!(
                 follower_error,
-                ControlPlaneError::OpenRaftOperation {
-                    kind: ControlPlaneRaftOperationErrorKind::ForwardToLeader,
-                    message,
-                } if message.contains("NotLocalLeader")
+                ControlPlaneError::AuthorityNotServing
             ));
 
             let write = authority1
@@ -24620,8 +24595,10 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(
                 old_leader_read_err,
-                ControlPlaneError::RpcRemote { message }
-                    if message.contains("OpenRaft read-index failed")
+                ControlPlaneError::OpenRaftOperation {
+                    kind: ControlPlaneRaftOperationErrorKind::ForwardToLeader,
+                    ..
+                }
             ));
 
             let old_leader_err = authority1
@@ -24881,8 +24858,10 @@ mod tests {
             .await;
             assert!(matches!(
                 removed_read_err,
-                ControlPlaneError::RpcRemote { message }
-                    if message.contains("OpenRaft read-index failed")
+                ControlPlaneError::OpenRaftOperation {
+                    kind: ControlPlaneRaftOperationErrorKind::ForwardToLeader,
+                    ..
+                }
             ));
             let removed_write_err = expect_bounded_control_plane_raft_error(
                 authority2.submit_control_plane_command(
