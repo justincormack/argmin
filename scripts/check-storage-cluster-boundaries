@@ -2613,13 +2613,7 @@ fail_with_matches \
 control_plane_error_representation_leaks=$(
     {
         rg -n --color=never \
-            '\bControlPlaneError::Io\b' \
-            . \
-            -g 'crates/**/*.rs' \
-            -g '!crates/storage/**' \
-            || true
-        rg -n -U --color=never \
-            'ControlPlaneError::(RpcRemote|RpcProtocol)\s*\{[^}]*\}\s*(if|=>)' \
+            '\bControlPlaneError::(Io|RpcRemote|RpcProtocol)\b' \
             . \
             -g 'crates/**/*.rs' \
             -g '!crates/storage/**' \
@@ -2637,7 +2631,7 @@ control_plane_error_representation_leaks=$(
     }
 )
 fail_with_matches \
-    "Control-plane transport errors and remote diagnostic text are storage-owned; preserve typed startup errors and use semantic ControlPlaneError classifications" \
+    "Raw control-plane transport/protocol errors and remote diagnostic text are storage-owned; preserve typed errors and use semantic ControlPlaneError classifications" \
     "$control_plane_error_representation_leaks"
 
 raft_peer_client_wire_leaks=$(

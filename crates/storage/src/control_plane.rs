@@ -18956,6 +18956,33 @@ impl fmt::Display for ControlPlaneRaftOperationErrorKind {
     }
 }
 
+/// Opaque diagnostic retained for a semantically classified control-plane failure.
+///
+/// The classification is part of the public control-plane contract. The diagnostic text is
+/// deliberately not exposed through formatting or accessors, so callers cannot turn an
+/// implementation detail back into policy by parsing it.
+pub struct ControlPlaneFailureDiagnostic(Box<str>);
+
+impl ControlPlaneFailureDiagnostic {
+    fn new(detail: impl Into<Box<str>>) -> Self {
+        Self(detail.into())
+    }
+}
+
+impl fmt::Debug for ControlPlaneFailureDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(_retained_detail) = self;
+        formatter.write_str("ControlPlaneFailureDiagnostic(<redacted>)")
+    }
+}
+
+impl fmt::Display for ControlPlaneFailureDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self(_retained_detail) = self;
+        formatter.write_str("control-plane diagnostic redacted")
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ControlPlaneError {
     #[error("{context}: {source}")]
@@ -19041,6 +19068,26 @@ pub enum ControlPlaneError {
 
     #[error("local control-plane authority is not serving")]
     AuthorityNotServing,
+
+    #[error("control-plane durability is unavailable")]
+    DurabilityFailure {
+        diagnostic: ControlPlaneFailureDiagnostic,
+    },
+
+    #[error("control-plane invariant validation failed")]
+    InvariantFailure {
+        diagnostic: ControlPlaneFailureDiagnostic,
+    },
+
+    #[error("control-plane startup timed out")]
+    StartupTimeout {
+        diagnostic: ControlPlaneFailureDiagnostic,
+    },
+
+    #[error("control-plane static topology is invalid")]
+    StaticTopologyFailure {
+        diagnostic: ControlPlaneFailureDiagnostic,
+    },
 
     #[error("control-plane OpenRaft operation failed ({kind}): {message}")]
     OpenRaftOperation {
@@ -19584,6 +19631,34 @@ pub enum ControlPlaneError {
 }
 
 impl ControlPlaneError {
+    #[must_use]
+    pub fn durability_failure(diagnostic: impl Into<Box<str>>) -> Self {
+        Self::DurabilityFailure {
+            diagnostic: ControlPlaneFailureDiagnostic::new(diagnostic),
+        }
+    }
+
+    #[must_use]
+    pub fn invariant_failure(diagnostic: impl Into<Box<str>>) -> Self {
+        Self::InvariantFailure {
+            diagnostic: ControlPlaneFailureDiagnostic::new(diagnostic),
+        }
+    }
+
+    #[must_use]
+    pub fn startup_timeout(diagnostic: impl Into<Box<str>>) -> Self {
+        Self::StartupTimeout {
+            diagnostic: ControlPlaneFailureDiagnostic::new(diagnostic),
+        }
+    }
+
+    #[must_use]
+    pub fn static_topology_failure(diagnostic: impl Into<Box<str>>) -> Self {
+        Self::StaticTopologyFailure {
+            diagnostic: ControlPlaneFailureDiagnostic::new(diagnostic),
+        }
+    }
+
     #[must_use]
     pub fn is_retryable_openraft_leadership_error(&self) -> bool {
         matches!(
@@ -27620,6 +27695,21 @@ mod tests {
         };
         assert!(unconfirmed.is_retryable_heartbeat_startup_error());
         assert!(!unconfirmed.is_retryable_runtime_map_observation_error());
+    }
+
+    #[test]
+    fn higher_layer_failure_diagnostics_are_opaque() {
+        const SECRET_DIAGNOSTIC: &str = "implementation detail that must remain storage-owned";
+
+        for error in [
+            ControlPlaneError::durability_failure(SECRET_DIAGNOSTIC),
+            ControlPlaneError::invariant_failure(SECRET_DIAGNOSTIC),
+            ControlPlaneError::startup_timeout(SECRET_DIAGNOSTIC),
+            ControlPlaneError::static_topology_failure(SECRET_DIAGNOSTIC),
+        ] {
+            assert!(!error.to_string().contains(SECRET_DIAGNOSTIC));
+            assert!(!format!("{error:?}").contains(SECRET_DIAGNOSTIC));
+        }
     }
 
     #[test]

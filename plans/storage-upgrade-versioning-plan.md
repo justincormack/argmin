@@ -342,9 +342,17 @@ The public boundary and containment status for each surface are as follows.
   rendering its terminal diagnostic. Authority readiness, authority-clock routing, unknown-node,
   and unknown acting-set-node failures retain typed identities across the RPC boundary; storage
   owns the retry classification and a boundary check prevents raw transport matching or the former
-  startup format-then-parse helpers outside the crate. Remaining work is to replace `argmin-s3`
-  construction of `RpcRemote` and `RpcProtocol`, then place their diagnostic payloads behind an
-  opaque stable surface.
+  startup format-then-parse helpers outside the crate. The follow-on slice removes every
+  `argmin-s3` construction of `Io`, `RpcRemote`, and `RpcProtocol`: local configuration and missing
+  command capabilities remain local errors, while durability, invariant, startup-timeout, and
+  static-topology failures use explicit semantic variants whose retained diagnostics have redacted
+  `Debug` and `Display` implementations. Static identity establishment preserves a typed split
+  between identity/topology validation and durable inspection or publication failure, so filesystem
+  replacement and synchronization failures remain durability failures. The repository check now
+  rejects any use of the three raw variants outside `storage`, rather than only destructuring them
+  for policy. Remaining work is to make the diagnostic payloads of the storage-internal raw variants
+  structurally opaque in the public Rust API; the repository check provides containment for
+  in-repository callers until that representation refactor is complete.
 - Storage contains the codec, version, authentication, retry, resource-admission, TLS/ALPN, and
   client/server protocol tests. Process-level lifecycle and durability tests remain in
   `argmin-s3`, but use logical clients and the opaque storage-owned server facade.

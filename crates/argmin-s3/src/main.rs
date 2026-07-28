@@ -2355,10 +2355,9 @@ impl ExperimentalRaftDurabilityPublication {
             .lock()
             .expect("experimental OpenRaft response publication mutex poisoned");
         if state.poison_requested || self.poisoned.load(Ordering::Acquire) {
-            return Err(ControlPlaneError::RpcRemote {
-                message: "experimental OpenRaft durable authority was poisoned before response publication"
-                    .to_owned(),
-            });
+            return Err(ControlPlaneError::durability_failure(
+                "experimental OpenRaft durable authority was poisoned before response publication",
+            ));
         }
         state.active_responses = state
             .active_responses
@@ -2528,8 +2527,8 @@ impl ExperimentalRaftControlPlane {
         &self,
         status: ControlPlaneRaftAuthorityStatus,
     ) -> Result<(u64, Option<LeaseHorizonAuthorityBinding>), ControlPlaneError> {
-        let current_term = status.current_term().ok_or(ControlPlaneError::RpcRemote {
-            message: "local OpenRaft leader has no current term".to_string(),
+        let current_term = status.current_term().ok_or_else(|| {
+            ControlPlaneError::invariant_failure("local OpenRaft leader has no current term")
         })?;
         self.authority_time_and_lease_horizon_binding_for_term(current_term)
     }
@@ -2557,7 +2556,7 @@ impl ExperimentalRaftControlPlane {
             .lock()
             .expect("experimental OpenRaft durable poison mutex poisoned")
             .clone()
-            .map(|message| ControlPlaneError::RpcRemote { message })
+            .map(ControlPlaneError::durability_failure)
     }
 
     fn ensure_not_durably_poisoned(&self) -> Result<(), ControlPlaneError> {
@@ -2597,11 +2596,9 @@ impl ExperimentalRaftControlPlane {
         if self.authority.durability_metric_snapshots().wal.is_some() {
             let wal_status = self.authority.durable_wal_monitor_snapshot()?;
             if let Some(reason) = wal_status.poisoned() {
-                return Err(ControlPlaneError::RpcRemote {
-                    message: format!(
-                        "durable OpenRaft serving read observed poisoned WAL state: {reason}"
-                    ),
-                });
+                return Err(ControlPlaneError::durability_failure(format!(
+                    "durable OpenRaft serving read observed poisoned WAL state: {reason}"
+                )));
             }
             return Ok(());
         }
@@ -2693,8 +2690,10 @@ impl ExperimentalRaftControlPlane {
         if preflight_expired.is_empty() {
             return Ok((preflight_snapshot.cluster_epoch(), 0, 0));
         }
-        let preflight_authority = preflight_authority.ok_or(ControlPlaneError::RpcRemote {
-            message: "OpenRaft heartbeat expiry has no serving lease-horizon authority".to_string(),
+        let preflight_authority = preflight_authority.ok_or_else(|| {
+            ControlPlaneError::invariant_failure(
+                "OpenRaft heartbeat expiry has no serving lease-horizon authority",
+            )
         })?;
         preflight_snapshot
             .validate_lease_grant_horizon_rebinding(preflight_authority, preflight_now_ms)?;
@@ -2707,8 +2706,10 @@ impl ExperimentalRaftControlPlane {
         if expired.is_empty() {
             return Ok((snapshot.cluster_epoch(), 0, 0));
         }
-        let authority = lease_horizon_authority.ok_or(ControlPlaneError::RpcRemote {
-            message: "OpenRaft heartbeat expiry has no serving lease-horizon authority".to_string(),
+        let authority = lease_horizon_authority.ok_or_else(|| {
+            ControlPlaneError::invariant_failure(
+                "OpenRaft heartbeat expiry has no serving lease-horizon authority",
+            )
         })?;
         snapshot.validate_lease_grant_horizon_rebinding(authority, now_ms)?;
         let response =
@@ -3085,12 +3086,10 @@ where
         }
         let now = Instant::now();
         if now >= deadline {
-            return Err(ControlPlaneError::RpcRemote {
-                message: format!(
-                    "OpenRaft startup did not apply through committed state within {timeout:?}: \
-                     {message}"
-                ),
-            });
+            return Err(ControlPlaneError::startup_timeout(format!(
+                "OpenRaft startup did not apply through committed state within {timeout:?}: \
+                 {message}"
+            )));
         }
         source
             .wait_for_applied(committed, deadline.saturating_duration_since(now), message)
@@ -3439,11 +3438,9 @@ async fn wait_for_experimental_raft_local_authority_serving(
     if experimental_raft_local_authority_serving_within(authority, timeout).await? {
         return Ok(());
     }
-    Err(ControlPlaneError::RpcRemote {
-        message: format!(
-            "local OpenRaft authority did not become serving within {timeout:?}: {message}"
-        ),
-    })
+    Err(ControlPlaneError::startup_timeout(format!(
+        "local OpenRaft authority did not become serving within {timeout:?}: {message}"
+    )))
 }
 
 #[cfg(test)]
@@ -3549,10 +3546,10 @@ impl ControlPlaneRaftPeerServerDurability for ExperimentalRaftPeerServerDurabili
             .context
             .artifact_path
             .as_deref()
-            .ok_or_else(|| ControlPlaneError::RpcRemote {
-                message:
-                    "experimental OpenRaft snapshot peer RPC requires durable checkpoint path before response"
-                        .to_owned(),
+            .ok_or_else(|| {
+                ControlPlaneError::durability_failure(
+                    "experimental OpenRaft snapshot peer RPC requires durable checkpoint path before response",
+                )
             })?;
         let result = store_experimental_raft_durable_restart_artifact(
             &self.runtime,
@@ -3676,11 +3673,9 @@ fn checkpoint_experimental_raft_peer_wal_if_due(
 ) -> Result<bool, ControlPlaneError> {
     let wal_status = authority.durable_wal_monitor_snapshot()?;
     if let Some(reason) = wal_status.poisoned() {
-        return Err(ControlPlaneError::RpcRemote {
-            message: format!(
-                "durable OpenRaft peer checkpoint scheduler observed poisoned WAL state: {reason}"
-            ),
-        });
+        return Err(ControlPlaneError::durability_failure(format!(
+            "durable OpenRaft peer checkpoint scheduler observed poisoned WAL state: {reason}"
+        )));
     }
     let wal_metrics = wal_status.metrics();
     let successful_append_total = wal_metrics
@@ -3690,12 +3685,12 @@ fn checkpoint_experimental_raft_peer_wal_if_due(
     let wal_suffix_bytes = offsets
         .clean_len()
         .checked_sub(offsets.base_offset())
-        .ok_or(ControlPlaneError::RpcRemote {
-            message: format!(
+        .ok_or_else(|| {
+            ControlPlaneError::invariant_failure(format!(
                 "durable OpenRaft WAL clean offset {} precedes base offset {}",
                 offsets.clean_len(),
                 offsets.base_offset()
-            ),
+            ))
         })?;
     let observation = ExperimentalRaftPeerCheckpointObservation {
         wal_suffix_bytes,
@@ -3704,13 +3699,11 @@ fn checkpoint_experimental_raft_peer_wal_if_due(
     if tracker.observe(now, observation).is_none() {
         return Ok(false);
     }
-    let path = durability
-        .artifact_path
-        .as_deref()
-        .ok_or(ControlPlaneError::RpcRemote {
-            message: "durable OpenRaft peer checkpoint scheduler requires an artifact path"
-                .to_string(),
-        })?;
+    let path = durability.artifact_path.as_deref().ok_or_else(|| {
+        ControlPlaneError::durability_failure(
+            "durable OpenRaft peer checkpoint scheduler requires an artifact path",
+        )
+    })?;
     snapshot_purge_and_checkpoint_experimental_raft_peer_wal(
         runtime,
         authority,
@@ -3864,11 +3857,7 @@ fn establish_static_raft_control_plane_identity(
                 static_cluster_state::mark_static_control_plane_identity_established(
                     identity, node_id, path,
                 )
-                .map_err(|message| ControlPlaneError::RpcRemote {
-                    message: format!(
-                        "failed to establish static control-plane identity: {message}"
-                    ),
-                })?;
+                .map_err(classify_static_control_plane_identity_establishment_error)?;
             }
             Ok(convergence)
         },
@@ -3880,6 +3869,25 @@ fn establish_static_raft_control_plane_identity(
             )
         },
     )
+}
+
+fn classify_static_control_plane_identity_establishment_error(
+    error: static_cluster_state::StaticControlPlaneIdentityEstablishmentError,
+) -> ControlPlaneError {
+    use static_cluster_state::StaticControlPlaneIdentityEstablishmentError;
+
+    match error {
+        StaticControlPlaneIdentityEstablishmentError::Validation(message) => {
+            ControlPlaneError::static_topology_failure(format!(
+                "failed to establish static control-plane identity: {message}"
+            ))
+        }
+        StaticControlPlaneIdentityEstablishmentError::Persistence(message) => {
+            ControlPlaneError::durability_failure(format!(
+                "failed to persist established static control-plane identity: {message}"
+            ))
+        }
+    }
 }
 
 fn snapshot_purge_and_checkpoint_experimental_raft_peer_wal(
@@ -3951,25 +3959,32 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 eprintln!("{error}");
                 std::process::exit(1);
             });
+    let raft_peer_network = raft_peer_policy.as_ref().map(|_| {
+        if config.control_plane_raft_peer_client_endpoints.is_empty() {
+            Ok(ControlPlaneRaftPeerNetworkConfig::unix(
+                config.control_plane_raft_peer_io_timeout,
+            ))
+        } else {
+            ControlPlaneRaftPeerNetworkConfig::with_peer_endpoints(
+                config.control_plane_raft_peer_io_timeout,
+                config.control_plane_raft_peer_client_endpoints.clone(),
+            )
+            .map_err(|error| format!("invalid control-plane Raft peer endpoints: {error}"))
+        }
+    });
+    let raft_peer_network = raft_peer_network.transpose().unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
     let durable_checkpoint_lock = Arc::new(Mutex::new(()));
     let durable_artifact_path = Arc::new(PathBuf::from(state_path));
     let authority_clock_checkpoint_binding =
         ControlPlaneAuthorityClockCheckpointBinding::for_raft(&cluster_name, node_id);
     let authority = block_on_control_plane_raft(&runtime, async {
         let authority = if let Some(policy) = raft_peer_policy.clone() {
-            let network = if config.control_plane_raft_peer_client_endpoints.is_empty() {
-                ControlPlaneRaftPeerNetworkConfig::unix(
-                    config.control_plane_raft_peer_io_timeout,
-                )
-            } else {
-                ControlPlaneRaftPeerNetworkConfig::with_peer_endpoints(
-                    config.control_plane_raft_peer_io_timeout,
-                    config.control_plane_raft_peer_client_endpoints.clone(),
-                )
-                .map_err(|error| ControlPlaneError::RpcProtocol {
-                    message: error.to_string(),
-                })?
-            };
+            let network = raft_peer_network
+                .clone()
+                .expect("Raft peer policy has a validated peer network");
             if config.static_cluster_identity.is_some() && !static_cluster_identity_established {
                 ControlPlaneRaftAuthority::new_experimental_peer_durable_pending_static_initialization_network(
                         cluster_name.clone(),
@@ -4635,26 +4650,21 @@ fn establish_static_initial_control_plane_topology(
     policy: &ControlPlaneRaftPeerTransportPolicy,
     allow_bootstrap: bool,
 ) -> Result<(), ControlPlaneError> {
-    let expected =
-        config
-            .static_initial_cluster_map
-            .as_ref()
-            .ok_or_else(|| ControlPlaneError::RpcRemote {
-                message: "static initial cluster map is not configured".to_string(),
-            })?;
+    let expected = config.static_initial_cluster_map.as_ref().ok_or_else(|| {
+        ControlPlaneError::static_topology_failure("static initial cluster map is not configured")
+    })?;
     loop {
         let snapshot =
             block_on_control_plane_raft(runtime, authority.current_control_plane_snapshot())?;
         if snapshot.nodes().next().is_some() || snapshot.pgs().next().is_some() {
             validate_static_initial_topology_certificate(&snapshot, expected)
-                .map_err(|message| ControlPlaneError::RpcRemote { message })?;
+                .map_err(ControlPlaneError::static_topology_failure)?;
             return Ok(());
         }
         if !allow_bootstrap {
-            return Err(ControlPlaneError::RpcRemote {
-                message: "established static control-plane state is missing its certified initial topology"
-                    .to_string(),
-            });
+            return Err(ControlPlaneError::static_topology_failure(
+                "established static control-plane state is missing its certified initial topology",
+            ));
         }
         block_on_control_plane_raft(
             runtime,
@@ -4945,32 +4955,26 @@ impl FrontendControlPlaneClient {
 }
 
 impl AdminControlPlaneClient {
-    fn authority_clock_status(
-        &self,
-    ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+    fn authority_clock_status(&self) -> Result<ControlPlaneAuthorityClockStatus, String> {
         match self {
-            Self::Plain(_) => Err(ControlPlaneError::RpcProtocol {
-                message: "authority-clock status requires authenticated admin credentials"
-                    .to_owned(),
-            }),
-            Self::Authenticated(client) => {
-                client.authority_clock_status(storage::clock::current_time_millis())
+            Self::Plain(_) => {
+                Err("authority-clock status requires authenticated admin credentials".to_owned())
             }
+            Self::Authenticated(client) => client
+                .authority_clock_status(storage::clock::current_time_millis())
+                .map_err(|error| error.to_string()),
         }
     }
 
-    fn reestablish_authority_clock(
-        &self,
-    ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+    fn reestablish_authority_clock(&self) -> Result<ControlPlaneAuthorityClockStatus, String> {
         match self {
-            Self::Plain(_) => Err(ControlPlaneError::RpcProtocol {
-                message:
-                    "authority-clock re-establishment requires authenticated admin credentials"
-                        .to_owned(),
-            }),
-            Self::Authenticated(client) => {
-                client.reestablish_authority_clock(storage::clock::current_time_millis())
-            }
+            Self::Plain(_) => Err(
+                "authority-clock re-establishment requires authenticated admin credentials"
+                    .to_owned(),
+            ),
+            Self::Authenticated(client) => client
+                .reestablish_authority_clock(storage::clock::current_time_millis())
+                .map_err(|error| error.to_string()),
         }
     }
 
@@ -7587,6 +7591,31 @@ mod tests {
     }
 
     #[test]
+    fn static_identity_establishment_error_mapping_preserves_failure_class() {
+        use static_cluster_state::StaticControlPlaneIdentityEstablishmentError;
+
+        let validation = classify_static_control_plane_identity_establishment_error(
+            StaticControlPlaneIdentityEstablishmentError::Validation(
+                "synthetic identity mismatch".to_owned(),
+            ),
+        );
+        assert!(matches!(
+            validation,
+            ControlPlaneError::StaticTopologyFailure { .. }
+        ));
+
+        let persistence = classify_static_control_plane_identity_establishment_error(
+            StaticControlPlaneIdentityEstablishmentError::Persistence(
+                "synthetic directory sync failure".to_owned(),
+            ),
+        );
+        assert!(matches!(
+            persistence,
+            ControlPlaneError::DurabilityFailure { .. }
+        ));
+    }
+
+    #[test]
     fn static_raft_membership_establishment_requires_exact_applied_policy() {
         let tmp = test_util::tempdir();
         let state_path = tmp.path().join("control-plane.state");
@@ -8350,9 +8379,7 @@ mod tests {
         let error = publication
             .publish(|| Ok(()))
             .expect_err("a response arriving after poison was requested must be suppressed");
-        assert!(error
-            .to_string()
-            .contains("poisoned before response publication"));
+        assert!(matches!(error, ControlPlaneError::DurabilityFailure { .. }));
 
         release_first_tx
             .send(())
@@ -8406,9 +8433,7 @@ mod tests {
             .join()
             .expect("in-flight clone worker should exit")
             .expect_err("response publication after poison must fail closed");
-        assert!(error
-            .to_string()
-            .contains("poisoned before response publication"));
+        assert!(matches!(error, ControlPlaneError::DurabilityFailure { .. }));
         assert!(!published.load(Ordering::Acquire));
         assert!(harness.control_plane.ensure_not_durably_poisoned().is_err());
         harness.shutdown();
@@ -8818,14 +8843,18 @@ mod tests {
             storage::clock::current_time_millis(),
         )
         .expect_err("poisoned durable authority should reject runtime-map service");
-        assert!(runtime_map_err
-            .to_string()
-            .contains("durability checkpoint failed"));
+        assert!(matches!(
+            runtime_map_err,
+            ControlPlaneError::DurabilityFailure { .. }
+        ));
 
         let admin_err = control_plane
             .set_pg_acting_set(PgId::new(0), vec![NodeId::new(1)])
             .expect_err("poisoned durable authority should reject admin mutation");
-        assert!(admin_err.to_string().contains("refusing to serve"));
+        assert!(matches!(
+            admin_err,
+            ControlPlaneError::DurabilityFailure { .. }
+        ));
 
         runtime
             .block_on(authority.shutdown())
