@@ -22,9 +22,9 @@ use super::clients::{
     ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
     ObjectPayloadLeaseNodeClient, ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
     PlacedShardNodeClient, RetainedBucketWriteReservationNodeClient,
-    RetainedObjectMutationMetadataNodeClient, RetainedPlacedShardNodeClient,
-    RetainedShardAckNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient,
-    ShardScavengerNodeClient,
+    RetainedObjectMutationMetadataNodeClient, RetainedObjectPayloadReclaimNodeClient,
+    RetainedPlacedShardNodeClient, RetainedShardAckNodeClient, ShardAckNodeClient,
+    ShardReadHandleNodeClient, ShardScavengerNodeClient,
 };
 use super::{BucketPgId, DataPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 use crate::cluster::ProcessLocalRegistryKey;
@@ -411,6 +411,7 @@ pub(crate) struct LocalNodeRuntime {
 
 pub(crate) struct LocalNodeClients {
     pub(crate) object_payload_lease: Arc<dyn ObjectPayloadLeaseNodeClient>,
+    pub(crate) retained_object_payload_reclaim: Arc<dyn RetainedObjectPayloadReclaimNodeClient>,
     pub(crate) bucket_metadata: Arc<dyn BucketMetadataNodeClient>,
     pub(crate) bucket_write_reservation: Arc<dyn BucketWriteReservationNodeClient>,
     pub(crate) retained_bucket_write_reservation: Arc<dyn RetainedBucketWriteReservationNodeClient>,
@@ -471,6 +472,7 @@ impl LocalNodeRuntime {
     pub(crate) fn clients(&self) -> LocalNodeClients {
         LocalNodeClients {
             object_payload_lease: self.client.clone(),
+            retained_object_payload_reclaim: self.client.clone(),
             bucket_metadata: self.client.clone(),
             bucket_write_reservation: self.client.clone(),
             retained_bucket_write_reservation: self.client.clone(),

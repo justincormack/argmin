@@ -659,7 +659,8 @@ Node-client role classification (2026-07-19):
 | `RetainedPlacedShardNodeClient`, `RetainedShardAckNodeClient` | data | retained exact-placement inspection and cleanup for historical shard bytes and acknowledgement rows |
 | `ShardScavengerNodeClient` | data for shard rows/files, generic metadata PG for durable observation rows | active or retained authority according to the scanned location; observation publication is primary-only |
 | `ShardReadHandleNodeClient` | data locations carried in the handle request | active/retained authority is inherited from each validated `ShardLocation`; the lease itself remains non-cloneable |
-| `ObjectPayloadLeaseNodeClient` | object subject rather than a caller-supplied PG | subject-bound payload lease/reclaim capability; placement is validated when shard locations are acquired |
+| `ObjectPayloadLeaseNodeClient` | object subject rather than a caller-supplied PG | active subject-bound lease acquisition, reclaim-begin, and observation; placement is validated when shard locations are acquired |
+| `RetainedObjectPayloadReclaimNodeClient` | object subject rather than a caller-supplied PG | retained exact-claim reclaim completion and fence cleanup; opaque lease objects retain their own release authority |
 | `MetadataCommandNodeClient` | genuinely generic metadata PG | active publisher authority, retained recovery authority, or peering/transfer authority selected from the command/recovery operation class |
 | `StorageNodeClient` | removed transitional mixed aggregate | production and cross-boundary test callers use role-specific interfaces; deliberately process-local assertions use the sanctioned raw-node test facade; private local helpers implement the embedded adapter without exposing another trait surface |
 
@@ -3688,6 +3689,28 @@ Eighty-fifth Phase 3 slice:
   segment reads, and old-primary direct-PUT/CopyObject cleanup of both remote
   shard files and acknowledgement rows. Opaque capability arguments for the
   remaining role-specific node-client traits remain open in Phase 3.
+- all 2,366 storage tests pass, as do formatting, the storage boundary checker,
+  and workspace-wide strict Clippy. The full 7,679-test workspace suite also
+  passes.
+
+Eighty-sixth Phase 3 slice:
+
+- object-payload lease acquisition and reclaim cleanup are now separate node-
+  client roles, matching the existing storage-RPC admission split.
+  `ObjectPayloadLeaseNodeClient` retains active lease acquisition,
+  reclaim-begin, and count operations, while
+  `RetainedObjectPayloadReclaimNodeClient` owns exact-authority reclaim finish
+  and fence clearing. The opaque lease object continues to own its exact
+  release operation.
+- local and Unix adapters implement both roles, but `LocalNodeStore` and
+  `LocalNodeClients` retain distinct trait objects. Multi-node reclaim begin
+  now records only retained cleanup clients for rollback, so an active lease
+  client cannot finish or clear a reclaim fence.
+- focused embedded and Unix regressions cover runtime-map-surviving lease
+  release, reclaim begin/finish, crossed claim authority, active-lease
+  exclusion, and fence retention across cleanup failure. Opaque capability
+  arguments for the remaining role-specific node-client traits remain open in
+  Phase 3.
 - all 2,366 storage tests pass, as do formatting, the storage boundary checker,
   and workspace-wide strict Clippy. The full 7,679-test workspace suite also
   passes.

@@ -34,9 +34,9 @@ use crate::node_client::{
     ObjectMutationMetadataNodeClient, ObjectPayloadLeaseNodeClient, ObjectPayloadLeaseNodeLease,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
     RetainedBucketWriteReservationNodeClient, RetainedObjectMutationMetadataNodeClient,
-    RetainedPlacedShardNodeClient, RetainedShardAckNodeClient, ShardAckNodeClient,
-    ShardReadHandleNodeClient, ShardScavengerNodeClient, UnixStorageNodeClient,
-    UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
+    RetainedObjectPayloadReclaimNodeClient, RetainedPlacedShardNodeClient,
+    RetainedShardAckNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient,
+    ShardScavengerNodeClient, UnixStorageNodeClient, UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
     UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
@@ -493,6 +493,7 @@ pub struct LocalNodeStore {
     data_dir: PathBuf,
     runtime: LocalNodeRuntime,
     object_payload_lease_client: Arc<dyn ObjectPayloadLeaseNodeClient>,
+    retained_object_payload_reclaim_client: Arc<dyn RetainedObjectPayloadReclaimNodeClient>,
     bucket_metadata_client: Arc<dyn BucketMetadataNodeClient>,
     bucket_metadata_unix_socket_path: Option<PathBuf>,
     bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient>,
@@ -522,6 +523,7 @@ impl LocalNodeStore {
             data_dir,
             runtime,
             object_payload_lease_client: clients.object_payload_lease,
+            retained_object_payload_reclaim_client: clients.retained_object_payload_reclaim,
             bucket_metadata_client: clients.bucket_metadata,
             bucket_metadata_unix_socket_path: None,
             bucket_write_reservation_client: clients.bucket_write_reservation,
@@ -578,6 +580,12 @@ impl LocalNodeStore {
 
     pub(crate) fn object_payload_lease_client(&self) -> &Arc<dyn ObjectPayloadLeaseNodeClient> {
         &self.object_payload_lease_client
+    }
+
+    pub(crate) fn retained_object_payload_reclaim_client(
+        &self,
+    ) -> &Arc<dyn RetainedObjectPayloadReclaimNodeClient> {
+        &self.retained_object_payload_reclaim_client
     }
 
     pub(crate) fn bucket_metadata_client(&self) -> &Arc<dyn BucketMetadataNodeClient> {
@@ -2357,6 +2365,9 @@ impl LocalClusterMap {
             > = client.clone();
             let object_read_metadata_client: Arc<dyn ObjectReadMetadataNodeClient> = client.clone();
             let object_payload_lease_client: Arc<dyn ObjectPayloadLeaseNodeClient> = client.clone();
+            let retained_object_payload_reclaim_client: Arc<
+                dyn RetainedObjectPayloadReclaimNodeClient,
+            > = client.clone();
             let shard_client: Arc<dyn PlacedShardNodeClient> = client.clone();
             let retained_shard_client: Arc<dyn RetainedPlacedShardNodeClient> = client.clone();
             let shard_ack_client: Arc<dyn ShardAckNodeClient> = client.clone();
@@ -2380,6 +2391,7 @@ impl LocalClusterMap {
                 retained_object_mutation_metadata_client;
             node.object_read_metadata_client = object_read_metadata_client;
             node.object_payload_lease_client = object_payload_lease_client;
+            node.retained_object_payload_reclaim_client = retained_object_payload_reclaim_client;
             node.shard_client = shard_client;
             node.retained_shard_client = retained_shard_client;
             node.shard_ack_client = shard_ack_client;
@@ -3200,8 +3212,9 @@ impl LocalClusterMap {
     ) -> Result<bool, StoreError> {
         let mut acquired = Vec::with_capacity(self.nodes.len());
         for node in self.nodes.values() {
-            let client = Arc::clone(node.object_payload_lease_client());
-            match client.try_begin_object_payload_reclaim(
+            let active_client = node.object_payload_lease_client();
+            let retained_client = Arc::clone(node.retained_object_payload_reclaim_client());
+            match active_client.try_begin_object_payload_reclaim(
                 self.epoch,
                 bucket,
                 key,
@@ -3209,12 +3222,12 @@ impl LocalClusterMap {
                 authority,
             ) {
                 Ok(true) => {
-                    acquired.push(client);
+                    acquired.push(retained_client);
                     continue;
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    let _ = client.finish_object_payload_reclaim(
+                    let _ = retained_client.finish_object_payload_reclaim(
                         self.epoch,
                         bucket,
                         key,
@@ -3261,7 +3274,7 @@ impl LocalClusterMap {
         let mut first_error = None;
         for node in self.nodes.values() {
             if let Err(error) = node
-                .object_payload_lease_client()
+                .retained_object_payload_reclaim_client()
                 .finish_object_payload_reclaim(
                     self.epoch,
                     bucket,
@@ -3300,7 +3313,7 @@ impl LocalClusterMap {
         let mut first_error = None;
         for node in self.nodes.values() {
             if let Err(error) = node
-                .object_payload_lease_client()
+                .retained_object_payload_reclaim_client()
                 .clear_object_payload_reclaim_fence(
                     self.epoch,
                     bucket,

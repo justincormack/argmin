@@ -1898,6 +1898,34 @@ impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
         }
     }
 
+    fn object_payload_lease_count(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<usize, StoreError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::RouteAdmissionClusterMismatch {
+                admitted_epoch: route_cluster_epoch,
+                operation_epoch: self.cluster_epoch,
+            });
+        }
+        let count = self.object_payload_lease_control_request(
+            bucket,
+            key,
+            generation_id,
+            StorageRpcObjectPayloadLeaseControlOperation::Count,
+            None,
+        )?;
+        usize::try_from(count).map_err(|_| StoreError::Io {
+            context: "validate storage-node object-payload lease count response",
+            source: io::Error::new(io::ErrorKind::InvalidData, "lease count exceeds usize"),
+        })
+    }
+}
+
+impl RetainedObjectPayloadReclaimNodeClient for UnixStorageNodeClient {
     fn finish_object_payload_reclaim(
         &self,
         route_cluster_epoch: ClusterEpoch,
@@ -1968,32 +1996,6 @@ impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
             }
         }
         Err(last_error.expect("object-payload reclaim fence clear attempted at least once"))
-    }
-
-    fn object_payload_lease_count(
-        &self,
-        route_cluster_epoch: ClusterEpoch,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<usize, StoreError> {
-        if route_cluster_epoch != self.cluster_epoch {
-            return Err(StoreError::RouteAdmissionClusterMismatch {
-                admitted_epoch: route_cluster_epoch,
-                operation_epoch: self.cluster_epoch,
-            });
-        }
-        let count = self.object_payload_lease_control_request(
-            bucket,
-            key,
-            generation_id,
-            StorageRpcObjectPayloadLeaseControlOperation::Count,
-            None,
-        )?;
-        usize::try_from(count).map_err(|_| StoreError::Io {
-            context: "validate storage-node object-payload lease count response",
-            source: io::Error::new(io::ErrorKind::InvalidData, "lease count exceeds usize"),
-        })
     }
 }
 

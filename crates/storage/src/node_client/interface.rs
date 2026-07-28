@@ -1101,6 +1101,19 @@ pub(crate) trait ObjectPayloadLeaseNodeClient: Send + Sync {
         authority: &ObjectPayloadReclaimClaimProof,
     ) -> Result<bool, StoreError>;
 
+    fn object_payload_lease_count(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<usize, StoreError>;
+}
+
+/// Retained cleanup authority for an exact object-payload reclaim subject.
+/// Reclaim completion and fence release can outlive the active route which
+/// admitted the reclaim attempt.
+pub(crate) trait RetainedObjectPayloadReclaimNodeClient: Send + Sync {
     fn finish_object_payload_reclaim(
         &self,
         route_cluster_epoch: ClusterEpoch,
@@ -1119,14 +1132,6 @@ pub(crate) trait ObjectPayloadLeaseNodeClient: Send + Sync {
         generation_id: GenerationId,
         authority: &ObjectPayloadReclaimClaimProof,
     ) -> Result<(), StoreError>;
-
-    fn object_payload_lease_count(
-        &self,
-        route_cluster_epoch: ClusterEpoch,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<usize, StoreError>;
 }
 
 pub(crate) trait ShardAckNodeClient: Send + Sync {

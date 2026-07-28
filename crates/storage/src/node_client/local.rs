@@ -322,6 +322,20 @@ impl ObjectPayloadLeaseNodeClient for LocalStorageNodeClient {
         ))
     }
 
+    fn object_payload_lease_count(
+        &self,
+        _route_cluster_epoch: ClusterEpoch,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<usize, StoreError> {
+        Ok(self
+            .storage_node
+            .object_payload_lease_count(bucket, key, generation_id))
+    }
+}
+
+impl RetainedObjectPayloadReclaimNodeClient for LocalStorageNodeClient {
     fn finish_object_payload_reclaim(
         &self,
         _route_cluster_epoch: ClusterEpoch,
@@ -349,18 +363,6 @@ impl ObjectPayloadLeaseNodeClient for LocalStorageNodeClient {
             .clear_object_payload_reclaim_fence(bucket, key, generation_id, authority)
             .then_some(())
             .ok_or(StoreError::ObjectPayloadReclaimFenceAuthorityMismatch)
-    }
-
-    fn object_payload_lease_count(
-        &self,
-        _route_cluster_epoch: ClusterEpoch,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<usize, StoreError> {
-        Ok(self
-            .storage_node
-            .object_payload_lease_count(bucket, key, generation_id))
     }
 }
 
