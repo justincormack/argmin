@@ -27399,6 +27399,13 @@ mod tests {
                 .wait_for_current_leader(1, Duration::from_secs(1), "WAL-only command setup")
                 .await
                 .unwrap();
+            wait_for_authority_status_matching(
+                &authority,
+                Duration::from_secs(1),
+                "WAL-only command authority applies initialization",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
             let bootstrap = authority
                 .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
                     nodes: vec![(NodeId::new(1), "node-1".to_owned())],
