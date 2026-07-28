@@ -652,7 +652,8 @@ Node-client role classification (2026-07-19):
 | `RetainedBucketWriteReservationNodeClient` | bucket metadata | retained subject-bound cleanup for exact reservation proofs, drains, and worker claims |
 | `ObjectGenerationMetadataNodeClient`, `ObjectVersionMetadataNodeClient`, `DirectPutMetadataNodeClient` | object metadata | active object route, with completion-specific admission represented as a narrower operation class |
 | `ObjectListingMetadataNodeClient` | object metadata scan | active object-metadata route for the scanned PG; listing fan-out constructs one capability per routed PG |
-| `ObjectMutationMetadataNodeClient` | object metadata | active object route; stale-payload cleanup requires a separate retained cleanup authority |
+| `ObjectMutationMetadataNodeClient` | object metadata | active object route for object, multipart, stream-session, and payload-reclaim mutation |
+| `RetainedObjectMutationMetadataNodeClient` | object metadata | retained subject-bound stream abort preparation and exact payload-reclaim claim release |
 | `ObjectReadMetadataNodeClient` | object metadata | active object route plus the existing subject identity/read lease |
 | `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active data route; historical inspection/deletion requires retained data cleanup authority |
 | `ShardScavengerNodeClient` | data for shard rows/files, generic metadata PG for durable observation rows | active or retained authority according to the scanned location; observation publication is primary-only |
@@ -3649,6 +3650,26 @@ Eighty-third Phase 3 slice:
 - all 54 focused Unix bucket-role regressions and all 2,366 storage tests pass,
   as do formatting, the storage boundary checker, and workspace-wide strict
   Clippy. The full 7,679-test workspace suite also passes.
+
+Eighty-fourth Phase 3 slice:
+
+- active object mutation and retained object cleanup are now separate node-
+  client roles. `ObjectMutationMetadataNodeClient` retains active object,
+  multipart, stream-session, and payload-reclaim mutation, while
+  `RetainedObjectMutationMetadataNodeClient` owns exact retained stream-abort
+  preparation and payload-reclaim claim release.
+- local and Unix adapters implement both roles, but `LocalNodeStore` and
+  `LocalNodeClients` retain distinct trait objects. Retained stream cleanup
+  selects the recovery route's retained client, and the reclaim worker now
+  acquires its durable claim through the active role before releasing that
+  exact claim through the retained role.
+- five focused Unix regressions cover expired-route retained cleanup, abort-
+  command subject binding, active mutation parity, and equivalent wrong-PG
+  rejection. Opaque capability arguments for the remaining role-specific
+  node-client traits remain open in Phase 3.
+- all 2,366 storage tests pass, as do formatting, the storage boundary checker,
+  and workspace-wide strict Clippy. The full 7,679-test workspace suite also
+  passes.
 
 ### Phase 4 — type metadata-command publication
 

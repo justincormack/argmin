@@ -56,7 +56,7 @@ fn unix_object_payload_reclaim_claim_release_survives_expired_route() {
         config.socket_path.clone(),
     );
 
-    ObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
+    RetainedObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
         &client,
         ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &claim,
@@ -261,7 +261,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
     ));
 
     assert!(matches!(
-        ObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
+        RetainedObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
             &client,
             wrong_pg,
             config.cluster_epoch,
@@ -297,7 +297,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
         })
     ));
 
-    let command = ObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
+    let command = RetainedObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
         &client,
         correct_pg,
         config.cluster_epoch,
@@ -330,16 +330,17 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
         .unwrap()
     );
 
-    let part_command = ObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
-        &client,
-        correct_pg,
-        config.cluster_epoch,
-        &bucket,
-        &key,
-        &part_session_id,
-    )
-    .unwrap()
-    .expect("expired-route retained cleanup must prepare the UploadPart abort");
+    let part_command =
+        RetainedObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
+            &client,
+            correct_pg,
+            config.cluster_epoch,
+            &bucket,
+            &key,
+            &part_session_id,
+        )
+        .unwrap()
+        .expect("expired-route retained cleanup must prepare the UploadPart abort");
     assert!(matches!(
         part_command.payload(),
         MetadataCommandPayload::AbortStreamUpload(abort)
@@ -3106,7 +3107,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     .unwrap()
     .expect("seeded object reclaim claim should load");
     assert_eq!(loaded_claim, claim);
-    ObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
+    RetainedObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
         &client,
         ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &claim,
@@ -3958,7 +3959,7 @@ fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
     );
 
     assert_bucket_payload_decode!(
-        ObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
+        RetainedObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
             &client,
             wrong_pg,
             &wrong_claim,
@@ -3968,7 +3969,7 @@ fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
         ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(&client, wrong_scan_pg)
     );
 
-    ObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
+    RetainedObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
         &client,
         correct_pg,
         &correct_claim,

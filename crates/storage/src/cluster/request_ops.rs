@@ -11632,6 +11632,8 @@ impl super::StorageCluster {
         };
         emit_outcome("started");
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+        let retained_mutation_client =
+            self.retained_object_mutation_metadata_primary_client(bucket, key)?;
         if self
             .local_map
             .object_payload_lease_count(bucket, key, generation_id)?
@@ -11747,7 +11749,7 @@ impl super::StorageCluster {
 
         let release_reclaim_claim = || -> Result<(), ObjectPgActionError> {
             self.maybe_run_before_reclaim_claim_release_hook()?;
-            mutation_client
+            retained_mutation_client
                 .release_object_payload_reclaim_claim(object_pg_id, &claim)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
         };

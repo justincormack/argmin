@@ -479,18 +479,6 @@ pub(crate) trait ObjectListingMetadataNodeClient: Send + Sync {
 }
 
 pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
-    /// Prepare the exact state-reducing abort command used by a retained
-    /// stream-cleanup capability. Implementations must serialize session and
-    /// segment loading with pending-slot allocation.
-    fn prepare_retained_stream_upload_abort(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        cluster_epoch: ClusterEpoch,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
-
     fn load_put_object_metadata_snapshot(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -698,12 +686,6 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         now: u64,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
 
-    fn release_object_payload_reclaim_claim(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        claim: &ObjectPayloadReclaimClaimRecord,
-    ) -> Result<(), BucketSnapshotLoadError>;
-
     fn prepare_stream_segment_append(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -793,6 +775,28 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         &self,
         request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
+}
+
+/// Cleanup authority for exact object-metadata subjects which may need to
+/// outlive the active route that created them.
+pub(crate) trait RetainedObjectMutationMetadataNodeClient: Send + Sync {
+    /// Prepare the exact state-reducing abort command used by a retained
+    /// stream-cleanup capability. Implementations must serialize session and
+    /// segment loading with pending-slot allocation.
+    fn prepare_retained_stream_upload_abort(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        cluster_epoch: ClusterEpoch,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
+
+    fn release_object_payload_reclaim_claim(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        claim: &ObjectPayloadReclaimClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError>;
 }
 
 pub(crate) trait ObjectReadMetadataNodeClient: Send + Sync {

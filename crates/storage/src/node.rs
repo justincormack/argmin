@@ -21,8 +21,9 @@ use super::clients::{
     LocalStorageNodeClient, MetadataCommandNodeClient, ObjectGenerationMetadataNodeClient,
     ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
     ObjectPayloadLeaseNodeClient, ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
-    PlacedShardNodeClient, RetainedBucketWriteReservationNodeClient, ShardAckNodeClient,
-    ShardReadHandleNodeClient, ShardScavengerNodeClient,
+    PlacedShardNodeClient, RetainedBucketWriteReservationNodeClient,
+    RetainedObjectMutationMetadataNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient,
+    ShardScavengerNodeClient,
 };
 use super::{BucketPgId, DataPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 use crate::cluster::ProcessLocalRegistryKey;
@@ -417,6 +418,7 @@ pub(crate) struct LocalNodeClients {
     pub(crate) direct_put_metadata: Arc<dyn DirectPutMetadataNodeClient>,
     pub(crate) object_listing_metadata: Arc<dyn ObjectListingMetadataNodeClient>,
     pub(crate) object_mutation_metadata: Arc<dyn ObjectMutationMetadataNodeClient>,
+    pub(crate) retained_object_mutation_metadata: Arc<dyn RetainedObjectMutationMetadataNodeClient>,
     pub(crate) object_read_metadata: Arc<dyn ObjectReadMetadataNodeClient>,
     pub(crate) metadata_command: Arc<dyn MetadataCommandNodeClient>,
     pub(crate) shard: Arc<dyn PlacedShardNodeClient>,
@@ -474,6 +476,7 @@ impl LocalNodeRuntime {
             direct_put_metadata: self.client.clone(),
             object_listing_metadata: self.client.clone(),
             object_mutation_metadata: self.client.clone(),
+            retained_object_mutation_metadata: self.client.clone(),
             object_read_metadata: self.client.clone(),
             metadata_command: self.client.clone(),
             shard: self.client.clone(),

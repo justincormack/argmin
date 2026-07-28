@@ -1616,7 +1616,7 @@ impl DirectPutMetadataNodeClient for LocalStorageNodeClient {
     }
 }
 
-impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
+impl RetainedObjectMutationMetadataNodeClient for LocalStorageNodeClient {
     fn prepare_retained_stream_upload_abort(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -1688,6 +1688,16 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         Ok(Some(command))
     }
 
+    fn release_object_payload_reclaim_claim(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        claim: &ObjectPayloadReclaimClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        Self::release_object_payload_reclaim_claim(self, pg_id, claim)
+    }
+}
+
+impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
     fn load_put_object_metadata_snapshot(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -2152,14 +2162,6 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
             lease_deadline,
             now,
         )
-    }
-
-    fn release_object_payload_reclaim_claim(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        claim: &ObjectPayloadReclaimClaimRecord,
-    ) -> Result<(), BucketSnapshotLoadError> {
-        Self::release_object_payload_reclaim_claim(self, pg_id, claim)
     }
 
     fn prepare_stream_segment_append(

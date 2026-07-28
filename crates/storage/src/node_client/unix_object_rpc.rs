@@ -1690,7 +1690,7 @@ impl UnixStorageNodeClient {
     }
 }
 
-impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
+impl RetainedObjectMutationMetadataNodeClient for UnixStorageNodeClient {
     fn prepare_retained_stream_upload_abort(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -1760,6 +1760,37 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         }
     }
 
+    fn release_object_payload_reclaim_claim(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        claim: &ObjectPayloadReclaimClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let pg_id = pg_id.pg_id();
+        let request = StorageRpcObjectPayloadReclaimClaimRecordRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            record: claim.clone(),
+        };
+        let payload =
+            encode_object_payload_reclaim_claim_record_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode object payload reclaim claim release request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self.rpc_request_bucket_snapshot(
+            StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease,
+            payload,
+        )?;
+        self.validate_empty_bucket_write_reservation_response(
+            "decode object payload reclaim claim release response",
+            &response,
+        )
+    }
+}
+
+impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
     fn matching_stream_upload_exists(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -2771,35 +2802,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             }
         }
         Ok(response.record)
-    }
-
-    fn release_object_payload_reclaim_claim(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        claim: &ObjectPayloadReclaimClaimRecord,
-    ) -> Result<(), BucketSnapshotLoadError> {
-        let pg_id = pg_id.pg_id();
-        let request = StorageRpcObjectPayloadReclaimClaimRecordRequest {
-            node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
-            pg_id,
-            record: claim.clone(),
-        };
-        let payload =
-            encode_object_payload_reclaim_claim_record_request(&request).map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "encode object payload reclaim claim release request",
-                    error.to_string(),
-                ))
-            })?;
-        let response = self.rpc_request_bucket_snapshot(
-            StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease,
-            payload,
-        )?;
-        self.validate_empty_bucket_write_reservation_response(
-            "decode object payload reclaim claim release response",
-            &response,
-        )
     }
 
     fn prepare_stream_segment_append(

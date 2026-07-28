@@ -51,8 +51,8 @@ use crate::node_client::{
     MetadataCommandNodeClient, ObjectDeleteStorageSnapshot, ObjectGenerationMetadataNodeClient,
     ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
-    RetainedBucketWriteReservationNodeClient, ShardAckNodeClient, ShardScavengerNodeClient,
-    UpdateStreamUploadBucketWriteReservationReq,
+    RetainedBucketWriteReservationNodeClient, RetainedObjectMutationMetadataNodeClient,
+    ShardAckNodeClient, ShardScavengerNodeClient, UpdateStreamUploadBucketWriteReservationReq,
 };
 use crate::node_runtime::pg_store::{
     initialize_pg_durable_identity, inspect_pg_shard_inventory, sync_initialized_pg_store_layout,
@@ -6528,7 +6528,7 @@ impl StorageNodeRetainedObjectPayloadReclaimClaimRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        ObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
+        RetainedObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
             &local_client,
             self.pg_id,
             self.claim,
@@ -6882,7 +6882,7 @@ impl StorageNodeRetainedPrimaryStreamAbortSessionRoute<'_> {
             self.route.route.handler.config.node_id,
             Arc::clone(&self.route.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
+        RetainedObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
             &local_client,
             self.route.route.pg_id,
             self.route.route.route_cluster_epoch,

@@ -33,8 +33,9 @@ use crate::node_client::{
     ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
     ObjectMutationMetadataNodeClient, ObjectPayloadLeaseNodeClient, ObjectPayloadLeaseNodeLease,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
-    RetainedBucketWriteReservationNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient,
-    ShardScavengerNodeClient, UnixStorageNodeClient, UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
+    RetainedBucketWriteReservationNodeClient, RetainedObjectMutationMetadataNodeClient,
+    ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient, UnixStorageNodeClient,
+    UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
     UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
@@ -501,6 +502,7 @@ pub struct LocalNodeStore {
     direct_put_metadata_client: Arc<dyn DirectPutMetadataNodeClient>,
     object_listing_metadata_client: Arc<dyn ObjectListingMetadataNodeClient>,
     object_mutation_metadata_client: Arc<dyn ObjectMutationMetadataNodeClient>,
+    retained_object_mutation_metadata_client: Arc<dyn RetainedObjectMutationMetadataNodeClient>,
     object_read_metadata_client: Arc<dyn ObjectReadMetadataNodeClient>,
     metadata_command_client: Arc<dyn MetadataCommandNodeClient>,
     shard_client: Arc<dyn PlacedShardNodeClient>,
@@ -527,6 +529,7 @@ impl LocalNodeStore {
             direct_put_metadata_client: clients.direct_put_metadata,
             object_listing_metadata_client: clients.object_listing_metadata,
             object_mutation_metadata_client: clients.object_mutation_metadata,
+            retained_object_mutation_metadata_client: clients.retained_object_mutation_metadata,
             object_read_metadata_client: clients.object_read_metadata,
             metadata_command_client: clients.metadata_command,
             shard_client: clients.shard,
@@ -614,6 +617,12 @@ impl LocalNodeStore {
         &self,
     ) -> &Arc<dyn ObjectMutationMetadataNodeClient> {
         &self.object_mutation_metadata_client
+    }
+
+    pub(crate) fn retained_object_mutation_metadata_client(
+        &self,
+    ) -> &Arc<dyn RetainedObjectMutationMetadataNodeClient> {
+        &self.retained_object_mutation_metadata_client
     }
 
     pub(crate) fn object_read_metadata_client(&self) -> &Arc<dyn ObjectReadMetadataNodeClient> {
@@ -2326,6 +2335,9 @@ impl LocalClusterMap {
                 client.clone();
             let object_mutation_metadata_client: Arc<dyn ObjectMutationMetadataNodeClient> =
                 client.clone();
+            let retained_object_mutation_metadata_client: Arc<
+                dyn RetainedObjectMutationMetadataNodeClient,
+            > = client.clone();
             let object_read_metadata_client: Arc<dyn ObjectReadMetadataNodeClient> = client.clone();
             let object_payload_lease_client: Arc<dyn ObjectPayloadLeaseNodeClient> = client.clone();
             let shard_client: Arc<dyn PlacedShardNodeClient> = client.clone();
@@ -2345,6 +2357,8 @@ impl LocalClusterMap {
             node.direct_put_metadata_client = direct_put_metadata_client;
             node.object_listing_metadata_client = object_listing_metadata_client;
             node.object_mutation_metadata_client = object_mutation_metadata_client;
+            node.retained_object_mutation_metadata_client =
+                retained_object_mutation_metadata_client;
             node.object_read_metadata_client = object_read_metadata_client;
             node.object_payload_lease_client = object_payload_lease_client;
             node.shard_client = shard_client;
@@ -2812,8 +2826,14 @@ impl LocalClusterMap {
                 self.epoch,
                 config.socket_path,
             ));
-            let object_mutation_metadata_client: Arc<dyn ObjectMutationMetadataNodeClient> = client;
+            let object_mutation_metadata_client: Arc<dyn ObjectMutationMetadataNodeClient> =
+                client.clone();
+            let retained_object_mutation_metadata_client: Arc<
+                dyn RetainedObjectMutationMetadataNodeClient,
+            > = client;
             node.object_mutation_metadata_client = object_mutation_metadata_client;
+            node.retained_object_mutation_metadata_client =
+                retained_object_mutation_metadata_client;
         }
         Ok(())
     }

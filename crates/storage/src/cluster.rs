@@ -9452,6 +9452,20 @@ impl StorageCluster {
             .map(|node| node.object_mutation_metadata_client())
     }
 
+    fn retained_object_mutation_metadata_primary_client(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<&Arc<dyn crate::node_client::RetainedObjectMutationMetadataNodeClient>, StoreError>
+    {
+        self.local_map
+            .metadata_pg_primary_node(
+                self.operation_epoch(),
+                PgId::new(self.object_metadata_pg_id(bucket, key)),
+            )
+            .map(|node| node.retained_object_mutation_metadata_client())
+    }
+
     fn object_generation_metadata_primary_client(
         &self,
         bucket: &BucketName,
@@ -14283,7 +14297,7 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node_for_metadata_command_recovery(cluster_epoch, pg_id)?;
         let Some(command) = primary
-            .object_mutation_metadata_client()
+            .retained_object_mutation_metadata_client()
             .prepare_retained_stream_upload_abort(
                 object_pg_id,
                 cluster_epoch,
