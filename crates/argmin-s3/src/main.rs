@@ -60,12 +60,11 @@ use storage::control_plane_auth::{
 };
 use storage::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
 use storage::control_plane_raft::{
-    durable_artifact_wal_path, ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus,
-    ControlPlaneRaftCommandOutcome, ControlPlaneRaftEstablishedPeerPolicyConvergence,
-    ControlPlaneRaftLogId, ControlPlaneRaftNodeId, ControlPlaneRaftPeerAuthPolicy,
-    ControlPlaneRaftPeerNetworkConfig, ControlPlaneRaftPeerServerDurability,
-    ControlPlaneRaftPeerServerListener, ControlPlaneRaftPeerServerPolicy,
-    ControlPlaneRaftPeerTransportPolicy,
+    ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome,
+    ControlPlaneRaftEstablishedPeerPolicyConvergence, ControlPlaneRaftLogId,
+    ControlPlaneRaftNodeId, ControlPlaneRaftPeerAuthPolicy, ControlPlaneRaftPeerNetworkConfig,
+    ControlPlaneRaftPeerServerDurability, ControlPlaneRaftPeerServerListener,
+    ControlPlaneRaftPeerServerPolicy, ControlPlaneRaftPeerTransportPolicy,
 };
 use storage::storage_node_server::{
     PreparedStorageNodeServer, StorageNodeBootstrap, StorageNodeControlPlaneRefreshLoop,
@@ -3819,7 +3818,7 @@ fn store_experimental_raft_durable_restart_artifact_while_locked(
     let checkpoint =
         block_on_control_plane_raft(runtime, authority.capture_durable_restart_checkpoint())?;
     let committed_timestamp_high_water_ms =
-        authority.persist_durable_restart_checkpoint(checkpoint, path)?;
+        authority.persist_durable_restart_checkpoint(checkpoint)?;
     let binding = authority.authority_clock_checkpoint_binding();
     if !artifact_existed && load_authority_clock_restart_checkpoint(path, binding)?.is_none() {
         store_authority_clock_restart_checkpoint(
@@ -3872,7 +3871,7 @@ fn establish_static_raft_control_plane_identity(
             let convergence = checkpoint.established_peer_policy_convergence(policy)?;
             if convergence == ControlPlaneRaftEstablishedPeerPolicyConvergence::Converged {
                 let committed_timestamp_high_water_ms =
-                    authority.persist_durable_restart_checkpoint(checkpoint, path)?;
+                    authority.persist_durable_restart_checkpoint(checkpoint)?;
                 let binding = authority.authority_clock_checkpoint_binding();
                 store_authority_clock_restart_checkpoint(
                     path,
@@ -3974,7 +3973,6 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     let durable_artifact_path = Arc::new(PathBuf::from(state_path));
     let authority_clock_checkpoint_binding =
         ControlPlaneAuthorityClockCheckpointBinding::for_raft(&cluster_name, node_id);
-    let durable_wal_path = durable_artifact_wal_path(&durable_artifact_path);
     let authority = block_on_control_plane_raft(&runtime, async {
         let authority = if let Some(policy) = raft_peer_policy.clone() {
             let network = if config.control_plane_raft_peer_client_endpoints.is_empty() {
@@ -3991,33 +3989,30 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 })?
             };
             if config.static_cluster_identity.is_some() && !static_cluster_identity_established {
-                ControlPlaneRaftAuthority::new_experimental_peer_durable_with_wal_pending_static_initialization_network(
+                ControlPlaneRaftAuthority::new_experimental_peer_durable_pending_static_initialization_network(
                         cluster_name.clone(),
                         node_id,
                         Path::new(state_path),
-                        &durable_wal_path,
                         policy,
                         initial_control_plane_bootstrap_command(config),
                         network,
                     )
                     .await?
             } else {
-                ControlPlaneRaftAuthority::new_experimental_peer_durable_with_wal_network(
+                ControlPlaneRaftAuthority::new_experimental_peer_durable_network(
                         cluster_name.clone(),
                         node_id,
                         Path::new(state_path),
-                        &durable_wal_path,
                         policy,
                         network,
                     )
                     .await?
             }
         } else {
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+            ControlPlaneRaftAuthority::new_experimental_single_node_durable(
                 cluster_name.clone(),
                 node_id,
                 Path::new(state_path),
-                &durable_wal_path,
             )
             .await?
         };
@@ -7037,14 +7032,13 @@ mod tests {
         assert!(recovery.as_os_str().as_bytes().len() <= socket.as_os_str().as_bytes().len());
     }
 
-    fn durable_raft_artifact_vote(path: &Path) -> Option<Vote<ControlPlaneRaftLeaderId>> {
-        let artifact =
-            storage::control_plane_raft::ControlPlaneRaftRestartArtifact::load_durable_artifact(
-                path,
-            )
-            .ok()?;
-        let (log_store, _state_machine) = artifact.restore().ok()?;
-        log_store.persisted_vote().ok().flatten()
+    fn durable_raft_checkpoint_vote(path: &Path) -> Option<(u64, u64, bool)> {
+        let state =
+            storage::control_plane_raft::inspect_control_plane_raft_checkpoint_state_for_test(path)
+                .ok()?;
+        state
+            .persisted_vote()
+            .map(|vote| (vote.term(), vote.node_id(), vote.committed()))
     }
 
     #[test]
@@ -7554,7 +7548,29 @@ mod tests {
 
     #[test]
     fn static_raft_membership_establishment_requires_exact_applied_policy() {
-        let harness = experimental_raft_test_harness("static-membership-establishment");
+        let tmp = test_util::tempdir();
+        let state_path = tmp.path().join("control-plane.state");
+        let cluster_name = format!(
+            "argmin-s3-experimental-raft-static-membership-establishment-{}",
+            std::process::id()
+        );
+        let static_identity = ConfiguredStaticClusterIdentity {
+            cluster_id: cluster_name.clone(),
+            topology_generation: 1,
+            topology_digest: "a".repeat(64),
+            process_id: "control-1".to_string(),
+            process_identity_digest: "b".repeat(64),
+        };
+        static_cluster_state::initialize_static_control_plane_identity(
+            &static_identity,
+            1,
+            &state_path,
+        )
+        .expect("static identity should initialize before durable state exists");
+        let harness = experimental_raft_uncheckpointed_durable_test_harness(
+            "static-membership-establishment",
+            &state_path,
+        );
         let status = harness
             .runtime
             .block_on(harness.authority.status())
@@ -7565,10 +7581,6 @@ mod tests {
             node_id: 1,
             socket_path: "localhost".to_string(),
         }];
-        let cluster_name = format!(
-            "argmin-s3-experimental-raft-static-membership-establishment-{}",
-            std::process::id()
-        );
         let exact_policy = build_experimental_raft_peer_transport_policy(&config, &cluster_name, 1)
             .unwrap()
             .unwrap();
@@ -7583,21 +7595,6 @@ mod tests {
             ))
             .expect("exact applied membership should complete the convergence wait");
 
-        let tmp = test_util::tempdir();
-        let state_path = tmp.path().join("control-plane.state");
-        let static_identity = ConfiguredStaticClusterIdentity {
-            cluster_id: cluster_name.clone(),
-            topology_generation: 1,
-            topology_digest: "a".repeat(64),
-            process_id: "control-1".to_string(),
-            process_identity_digest: "b".repeat(64),
-        };
-        static_cluster_state::initialize_static_control_plane_identity(
-            &static_identity,
-            1,
-            &state_path,
-        )
-        .expect("static identity should initialize before durable state exists");
         let background_checkpoint = harness
             .runtime
             .block_on(harness.authority.capture_durable_restart_checkpoint())
@@ -7607,7 +7604,7 @@ mod tests {
             .expect("captured membership should match the exact static policy");
         harness
             .authority
-            .persist_durable_restart_checkpoint(background_checkpoint, &state_path)
+            .persist_durable_restart_checkpoint(background_checkpoint)
             .expect("background checkpoint should publish an artifact without a clock sidecar");
         let checkpoint_binding = harness.authority.authority_clock_checkpoint_binding();
         assert_eq!(
@@ -8199,17 +8196,44 @@ mod tests {
     }
 
     fn experimental_raft_test_harness(name: &str) -> ExperimentalRaftTestHarness {
+        experimental_raft_test_harness_inner(name, None)
+    }
+
+    fn experimental_raft_uncheckpointed_durable_test_harness(
+        name: &str,
+        artifact_path: &Path,
+    ) -> ExperimentalRaftTestHarness {
+        experimental_raft_test_harness_inner(name, Some(artifact_path))
+    }
+
+    fn experimental_raft_test_harness_inner(
+        name: &str,
+        artifact_path: Option<&Path>,
+    ) -> ExperimentalRaftTestHarness {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("test runtime should build");
         let handle = runtime.handle().clone();
         let authority = runtime.block_on(async {
-            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
-                format!("argmin-s3-experimental-raft-{name}-{}", std::process::id()),
-                1,
-            )
-            .await
+            let cluster_name = format!("argmin-s3-experimental-raft-{name}-{}", std::process::id());
+            let authority = match artifact_path {
+                Some(path) => {
+                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                        cluster_name,
+                        1,
+                        path,
+                    )
+                    .await
+                }
+                None => {
+                    ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                        cluster_name,
+                        1,
+                    )
+                    .await
+                }
+            }
             .expect("experimental raft authority should initialize");
             authority
                 .initialize_single_node_membership(1)
@@ -8232,11 +8256,12 @@ mod tests {
             .expect("single-node raft should apply committed membership and become serving");
             Arc::new(authority)
         });
+        let durable_artifact_path = artifact_path.map(|path| Arc::new(path.to_path_buf()));
         let control_plane = ExperimentalRaftControlPlane {
             runtime: handle,
             authority: Arc::clone(&authority),
-            durable_artifact_path: None,
-            durable_checkpoint_lock: None,
+            durable_artifact_path,
+            durable_checkpoint_lock: artifact_path.map(|_| Arc::new(Mutex::new(()))),
             durable_serving_checkpoint: Arc::new(Mutex::new(None)),
             checkpoint_serving_reads: false,
             resample_authority_time: false,
@@ -8430,21 +8455,19 @@ mod tests {
         name: &str,
         state_path: &Path,
     ) -> ExperimentalRaftTestHarness {
-        experimental_raft_durable_test_harness_inner(name, state_path, None)
+        experimental_raft_durable_test_harness_inner(name, state_path)
     }
 
     fn experimental_raft_durable_wal_test_harness(
         name: &str,
         state_path: &Path,
     ) -> ExperimentalRaftTestHarness {
-        let wal_path = durable_artifact_wal_path(state_path);
-        experimental_raft_durable_test_harness_inner(name, state_path, Some(&wal_path))
+        experimental_raft_durable_test_harness_inner(name, state_path)
     }
 
     fn experimental_raft_durable_test_harness_inner(
         name: &str,
         state_path: &Path,
-        wal_path: Option<&Path>,
     ) -> ExperimentalRaftTestHarness {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -8456,25 +8479,12 @@ mod tests {
                 "argmin-s3-experimental-durable-raft-{name}-{}",
                 std::process::id()
             );
-            let authority = match wal_path {
-                Some(wal_path) => {
-                    ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
-                        cluster_name,
-                        1,
-                        state_path,
-                        wal_path,
-                    )
-                    .await
-                }
-                None => {
-                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                        cluster_name,
-                        1,
-                        state_path,
-                    )
-                    .await
-                }
-            }
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                cluster_name,
+                1,
+                state_path,
+            )
+            .await
             .expect("durable experimental raft authority should initialize");
             if !authority
                 .is_initialized()
@@ -8486,7 +8496,7 @@ mod tests {
                     .await
                     .expect("single-node durable raft membership should initialize");
                 authority
-                    .store_durable_restart_artifact(state_path)
+                    .store_durable_restart_artifact()
                     .await
                     .expect("single-node durable raft membership should checkpoint");
             }
@@ -8506,7 +8516,7 @@ mod tests {
             .await
             .expect("single-node durable raft should apply committed prefix");
             authority
-                .store_durable_restart_artifact(state_path)
+                .store_durable_restart_artifact()
                 .await
                 .expect("single-node durable raft startup should checkpoint");
             Arc::new(authority)
@@ -8716,128 +8726,11 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_durable_restart_restores_bootstrap_state() {
-        let state_dir = short_unix_socket_test_dir("experimental-raft-durable-restart");
-        let _ = fs::remove_dir_all(&state_dir);
-        fs::create_dir_all(&state_dir).unwrap();
-        let state_path = state_dir.join("control-plane.state");
-        let storage_nodes = vec![(
-            NodeId::new(1),
-            "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
-        )];
-        let pg_ids = vec![PgId::new(0)];
-        let mut config = test_server_config();
-        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
-            node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
-        }];
-        config.storage_pg_ids = vec![0];
-        let cluster_name = format!(
-            "argmin-s3-experimental-raft-durable-restart-{}",
-            std::process::id()
-        );
-        let checkpoint_binding =
-            ControlPlaneAuthorityClockCheckpointBinding::for_raft(&cluster_name, 1);
-        let expected =
-            storage::control_plane_raft::ControlPlaneRaftRestartArtifact::store_single_node_committed_ahead_bootstrap_artifact_for_test(
-                &state_path,
-                cluster_name.clone(),
-                1,
-                storage_nodes,
-                pg_ids,
-            )
-            .expect("committed-ahead durable raft artifact should be stored");
-        store_authority_clock_restart_checkpoint(
-            &state_path,
-            checkpoint_binding,
-            1,
-            expected.max_committed_timestamp_ms(),
-        )
-        .expect("test restart artifact should have a paired authority-clock checkpoint");
-        assert!(state_path.exists());
-
-        let restarted_runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("restarted test runtime should build");
-        let handle = restarted_runtime.handle().clone();
-        let authority = restarted_runtime.block_on(async {
-            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                cluster_name,
-                1,
-                &state_path,
-            )
-            .await
-            .expect("durable experimental raft authority should restore");
-            assert!(authority
-                .is_initialized()
-                .await
-                .expect("restored durable raft initialization status should read"));
-            authority
-                .wait_for_current_leader(
-                    1,
-                    Duration::from_secs(1),
-                    "restarted durable experimental process test leadership",
-                )
-                .await
-                .expect("single-node raft should become leader");
-            wait_for_experimental_raft_local_authority_serving(
-                &authority,
-                Duration::from_secs(1),
-                "restarted durable experimental process test committed replay",
-            )
-            .await
-            .expect("restarted durable raft should apply committed suffix");
-            authority
-                .store_durable_restart_artifact(&state_path)
-                .await
-                .expect("restarted durable raft should checkpoint caught-up state");
-            Arc::new(authority)
-        });
-        store_experimental_raft_durable_restart_artifact(&handle, &authority, &state_path, None)
-            .expect("process checkpoint should pair Raft state with a clock checkpoint");
-        let restart_clock_checkpoint =
-            load_authority_clock_restart_checkpoint(&state_path, checkpoint_binding)
-                .expect("Raft clock checkpoint should load")
-                .expect("Raft clock checkpoint should exist");
-        let restored_snapshot = restarted_runtime
-            .block_on(authority.current_control_plane_snapshot())
-            .expect("restored snapshot should read for clock checkpoint validation");
-        assert_eq!(
-            restart_clock_checkpoint.committed_timestamp_high_water_ms(),
-            restored_snapshot.max_committed_timestamp_ms()
-        );
-        let mut control_plane = ExperimentalRaftControlPlane {
-            runtime: handle,
-            authority: Arc::clone(&authority),
-            durable_artifact_path: Some(Arc::new(state_path.clone())),
-            durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
-            durable_serving_checkpoint: Arc::new(Mutex::new(None)),
-            checkpoint_serving_reads: false,
-            resample_authority_time: false,
-            authority_clock: None,
-            durable_poison: Arc::new(Mutex::new(None)),
-            durable_publication: ExperimentalRaftDurabilityPublication::new(),
-            after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
-        };
-        bootstrap_empty_experimental_raft_control_plane(&mut control_plane, &config)
-            .expect("durable experimental raft control-plane bootstrap should succeed");
-        let restarted = control_plane
-            .current_snapshot()
-            .expect("durable experimental snapshot should read after bootstrap");
-        restarted_runtime
-            .block_on(authority.shutdown())
-            .expect("durable experimental raft authority should shut down");
-        assert_eq!(restarted, expected);
-    }
-
-    #[test]
     fn experimental_raft_control_plane_checkpoint_failure_poisons_durable_authority() {
         let state_dir = short_unix_socket_test_dir("experimental-raft-checkpoint-poison");
         let _ = fs::remove_dir_all(&state_dir);
         fs::create_dir_all(&state_dir).unwrap();
-        let startup_state_path = state_dir.join("startup.state");
-        let invalid_checkpoint_path = state_dir.to_path_buf();
+        let invalid_checkpoint_path = state_dir.join("checkpoint.state");
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -8851,7 +8744,7 @@ mod tests {
                     std::process::id()
                 ),
                 1,
-                &startup_state_path,
+                &invalid_checkpoint_path,
             )
             .await
             .expect("durable experimental raft authority should initialize");
@@ -8876,6 +8769,8 @@ mod tests {
             .expect("single-node raft should apply committed membership");
             Arc::new(authority)
         });
+        fs::create_dir(&invalid_checkpoint_path)
+            .expect("checkpoint artifact path should become an invalid directory target");
         let mut control_plane = ExperimentalRaftControlPlane {
             runtime: handle,
             authority: Arc::clone(&authority),
@@ -9318,7 +9213,6 @@ mod tests {
 
         let state_dir = short_unix_socket_test_dir("raft-write-amplification-gate");
         let state_path = state_dir.0.path().join("control-plane.state");
-        let wal_path = durable_artifact_wal_path(&state_path);
         let endpoints = (0..STORAGE_NODE_COUNT)
             .map(|node_id| {
                 state_dir
@@ -9471,9 +9365,11 @@ mod tests {
             expected_before_restart,
             "restart must recover the large retained WAL suffix before monitor checkpoint"
         );
-        let large_artifact_bytes = fs::metadata(&state_path)
-            .expect("large restart artifact metadata should read")
-            .len();
+        let large_artifact_bytes = harness
+            .authority
+            .durability_metric_snapshots()
+            .checkpoint
+            .bytes_last;
         assert!(
             large_artifact_bytes >= LARGE_RESTART_ARTIFACT_MIN_BYTES,
             "release workload restart artifact {large_artifact_bytes} bytes does not reproduce the production-sized checkpoint"
@@ -9574,9 +9470,11 @@ mod tests {
                 interval + 1,
                 "each sustained Peering interval should produce one coordinated snapshot/purge"
             );
-            let artifact_bytes = fs::metadata(&state_path)
-                .expect("post-purge artifact metadata should read")
-                .len();
+            let artifact_bytes = harness
+                .authority
+                .durability_metric_snapshots()
+                .checkpoint
+                .bytes_last;
             assert!(
                 artifact_bytes <= POST_PURGE_ARTIFACT_MAX_BYTES,
                 "coordinated interval {} retained a {}-byte artifact after purge",
@@ -9756,8 +9654,6 @@ mod tests {
         assert!(stable, "active heartbeat state should converge");
 
         let read_checkpoint_before = harness.authority.durability_metric_snapshots().checkpoint;
-        let read_artifact_before =
-            fs::read(&state_path).expect("pre-serving-read restart artifact should read");
         let pre_measurement_status = harness
             .control_plane
             .runtime_map_status(now_ms)
@@ -9774,11 +9670,6 @@ mod tests {
         assert_eq!(
             read_checkpoint_after.file_sync_total, read_checkpoint_before.file_sync_total,
             "a serving read must not synchronously sync a liveness checkpoint"
-        );
-        assert_eq!(
-            fs::read(&state_path).expect("post-serving-read restart artifact should read"),
-            read_artifact_before,
-            "a serving read must retain liveness changes solely in the synced WAL suffix"
         );
 
         let warm_status = harness
@@ -9807,8 +9698,6 @@ mod tests {
             .block_on(harness.authority.status())
             .expect("pre-measurement Raft status should read")
             .applied();
-        let artifact_before = fs::read(&state_path).expect("restart artifact should read");
-        let wal_before = fs::read(&wal_path).expect("Raft WAL should read");
         let wal_offsets_before = durable_wal_offsets(&harness);
         let durability_metrics_before = harness.authority.durability_metric_snapshots();
         assert_eq!(
@@ -9885,12 +9774,8 @@ mod tests {
             .block_on(harness.authority.status())
             .expect("post-measurement Raft status should read")
             .applied();
-        let artifact_after_steady = fs::read(&state_path).expect("restart artifact should reread");
-        let wal_after_steady = fs::read(&wal_path).expect("Raft WAL should reread");
         let durability_metrics_after_steady = harness.authority.durability_metric_snapshots();
         assert_eq!(applied_after_steady, applied_before);
-        assert_eq!(artifact_after_steady, artifact_before);
-        assert_eq!(wal_after_steady, wal_before);
         assert_eq!(durable_wal_offsets(&harness), wal_offsets_before);
         assert_eq!(
             durability_metrics_after_steady, durability_metrics_before,
@@ -11156,24 +11041,21 @@ mod tests {
         let _ = fs::remove_dir_all(&state_dir);
         fs::create_dir_all(&state_dir).expect("durable test directory should exist");
         let state_path = state_dir.join("control-plane.state");
-        let wal_path = durable_artifact_wal_path(&state_path);
         let peer_socket_path = state_dir.join("peer.sock");
         let cluster_name = format!(
             "argmin-s3-experimental-raft-peer-wal-ack-{}",
             std::process::id()
         );
         let authority = runtime.block_on(async {
-            let authority =
-                ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
-                    cluster_name.clone(),
-                    1,
-                    &state_path,
-                    &wal_path,
-                )
-                .await
-                .expect("WAL-backed durable authority should initialize");
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                cluster_name.clone(),
+                1,
+                &state_path,
+            )
+            .await
+            .expect("WAL-backed durable authority should initialize");
             authority
-                .store_durable_restart_artifact(&state_path)
+                .store_durable_restart_artifact()
                 .await
                 .expect("uninitialized WAL-backed raft should checkpoint initial artifact");
             Arc::new(authority)
@@ -11269,7 +11151,7 @@ mod tests {
             "peer RPC should acknowledge after its WAL mutation is durable"
         );
         assert_eq!(
-            durable_raft_artifact_vote(&state_path),
+            durable_raft_checkpoint_vote(&state_path),
             None,
             "ordinary peer acknowledgement must not rewrite the checkpoint artifact"
         );
@@ -11296,8 +11178,12 @@ mod tests {
             "WAL append count should reach the test checkpoint bound"
         );
         assert_eq!(
-            durable_raft_artifact_vote(&state_path),
-            Some(expected_vote),
+            durable_raft_checkpoint_vote(&state_path),
+            Some((
+                expected_vote.leader_id.term,
+                expected_vote.leader_id.node_id,
+                expected_vote.committed,
+            )),
             "bounded checkpoint should capture the acknowledged WAL vote"
         );
         let post_checkpoint_status = runtime
@@ -11362,21 +11248,18 @@ mod tests {
         let _ = fs::remove_dir_all(&state_dir);
         fs::create_dir_all(&state_dir).expect("durable test directory should exist");
         let state_path = state_dir.join("control-plane.state");
-        let wal_path = durable_artifact_wal_path(&state_path);
         let cluster_name = format!(
             "argmin-s3-experimental-raft-local-election-checkpoint-{}",
             std::process::id()
         );
         let (authority, initial_vote) = runtime.block_on(async {
-            let authority =
-                ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
-                    cluster_name,
-                    1,
-                    &state_path,
-                    &wal_path,
-                )
-                .await
-                .expect("WAL-backed durable authority should initialize");
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                cluster_name,
+                1,
+                &state_path,
+            )
+            .await
+            .expect("WAL-backed durable authority should initialize");
             authority
                 .initialize_single_node_membership(1)
                 .await
@@ -11397,7 +11280,7 @@ mod tests {
             .await
             .expect("single-node authority should apply committed membership");
             authority
-                .store_durable_restart_artifact(&state_path)
+                .store_durable_restart_artifact()
                 .await
                 .expect("leader baseline authority state should checkpoint");
             let vote_granted = authority
@@ -11465,11 +11348,9 @@ mod tests {
             let offsets = status
                 .durable_wal_offsets()
                 .expect("WAL-backed authority should report offsets");
-            let checkpointed_vote = durable_raft_artifact_vote(&state_path);
-            if checkpointed_vote.as_ref().is_some_and(|vote| {
-                vote.committed
-                    && vote.leader_id.node_id == 1
-                    && vote.leader_id.term >= elected_vote.leader_id.term
+            let checkpointed_vote = durable_raft_checkpoint_vote(&state_path);
+            if checkpointed_vote.is_some_and(|(term, node_id, committed)| {
+                committed && node_id == 1 && term >= elected_vote.leader_id.term
             }) && offsets.base_offset() == offsets.clean_len()
             {
                 break;
@@ -11717,8 +11598,7 @@ mod tests {
             experimental_raft_durable_wal_test_harness("wal-heartbeat-restart", &state_path);
         bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
             .expect("WAL-backed control-plane bootstrap should succeed");
-        let checkpoint_before =
-            fs::read(&state_path).expect("baseline restart artifact should read");
+        let checkpoint_before = harness.authority.durability_metric_snapshots().checkpoint;
         let wal_offsets_before = harness
             .authority
             .durable_wal_monitor_snapshot()
@@ -11755,7 +11635,7 @@ mod tests {
             .current_snapshot()
             .expect("acknowledged heartbeat snapshot should read");
         assert_eq!(
-            fs::read(&state_path).expect("restart artifact should remain readable"),
+            harness.authority.durability_metric_snapshots().checkpoint,
             checkpoint_before,
             "WAL-backed heartbeat acknowledgement must not synchronously rewrite the artifact"
         );
@@ -11820,8 +11700,7 @@ mod tests {
             .control_plane
             .store_durable_restart_artifact()
             .expect("snapshot payload must be durable before purge");
-        let artifact_before_purge =
-            fs::read(&state_path).expect("pre-purge snapshot artifact should read");
+        let checkpoint_before_purge = harness.authority.durability_metric_snapshots().checkpoint;
         harness
             .control_plane
             .block_on(
@@ -11831,8 +11710,8 @@ mod tests {
             )
             .expect("snapshot-covered log prefix should purge");
         assert_eq!(
-            fs::read(&state_path).expect("artifact should remain readable after purge"),
-            artifact_before_purge,
+            harness.authority.durability_metric_snapshots().checkpoint,
+            checkpoint_before_purge,
             "purge must be recoverable before its post-purge artifact checkpoint"
         );
         let purge_wal = harness

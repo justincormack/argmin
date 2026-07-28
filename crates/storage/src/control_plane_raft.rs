@@ -2567,6 +2567,7 @@ pub struct ControlPlaneRaftAuthority {
     >,
     checkpoint_instance: Arc<()>,
     checkpoint_publication: Arc<Mutex<Option<ControlPlaneRaftCheckpointPosition>>>,
+    durable_artifact_path: Option<Arc<PathBuf>>,
     checkpoint_metrics: Arc<ControlPlaneRaftCheckpointMetrics>,
     command_metrics: Arc<ControlPlaneRaftCommandMetrics>,
 }
@@ -4578,11 +4579,18 @@ impl ControlPlaneRaftAuthority {
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
     ) -> Result<Self, ControlPlaneError> {
-        Self::new_experimental_single_node_durable_inner(cluster_name, node_id, artifact_path, None)
-            .await
+        let wal_path = durable_artifact_wal_path(artifact_path);
+        Self::new_experimental_single_node_durable_inner(
+            cluster_name,
+            node_id,
+            artifact_path,
+            Some(&wal_path),
+        )
+        .await
     }
 
-    pub async fn new_experimental_single_node_durable_with_wal(
+    #[cfg(test)]
+    async fn new_experimental_single_node_durable_with_wal(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
@@ -4623,7 +4631,8 @@ impl ControlPlaneRaftAuthority {
         .map_err(|error| {
             openraft_remote_error("new experimental durable single-node authority", error)
         })?;
-        Ok(Self::new_with_log_store(raft, log_store, cluster_name))
+        Ok(Self::new_with_log_store(raft, log_store, cluster_name)
+            .with_durable_artifact_path(artifact_path))
     }
 
     pub async fn new_experimental_unix_peer_durable(
@@ -4633,11 +4642,12 @@ impl ControlPlaneRaftAuthority {
         peer_policy: ControlPlaneRaftPeerTransportPolicy,
         rpc_timeout: Duration,
     ) -> Result<Self, ControlPlaneError> {
+        let wal_path = durable_artifact_wal_path(artifact_path);
         Self::new_experimental_peer_durable_inner(
             cluster_name,
             node_id,
             artifact_path,
-            None,
+            Some(&wal_path),
             peer_policy,
             ControlPlaneRaftPeerNetworkConfig::unix(rpc_timeout),
             None,
@@ -4645,7 +4655,8 @@ impl ControlPlaneRaftAuthority {
         .await
     }
 
-    pub async fn new_experimental_unix_peer_durable_with_wal(
+    #[cfg(test)]
+    async fn new_experimental_unix_peer_durable_with_wal(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
@@ -4665,7 +4676,8 @@ impl ControlPlaneRaftAuthority {
         .await
     }
 
-    pub async fn new_experimental_unix_peer_durable_with_wal_pending_static_initialization(
+    #[cfg(test)]
+    async fn new_experimental_unix_peer_durable_with_wal_pending_static_initialization(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
@@ -4686,19 +4698,19 @@ impl ControlPlaneRaftAuthority {
         .await
     }
 
-    pub async fn new_experimental_peer_durable_with_wal_network(
+    pub async fn new_experimental_peer_durable_network(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
-        wal_path: &Path,
         peer_policy: ControlPlaneRaftPeerTransportPolicy,
         network: ControlPlaneRaftPeerNetworkConfig,
     ) -> Result<Self, ControlPlaneError> {
+        let wal_path = durable_artifact_wal_path(artifact_path);
         Self::new_experimental_peer_durable_inner(
             cluster_name,
             node_id,
             artifact_path,
-            Some(wal_path),
+            Some(&wal_path),
             peer_policy,
             network,
             None,
@@ -4706,20 +4718,20 @@ impl ControlPlaneRaftAuthority {
         .await
     }
 
-    pub async fn new_experimental_peer_durable_with_wal_pending_static_initialization_network(
+    pub async fn new_experimental_peer_durable_pending_static_initialization_network(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
-        wal_path: &Path,
         peer_policy: ControlPlaneRaftPeerTransportPolicy,
         expected_bootstrap: ControlPlaneCommand,
         network: ControlPlaneRaftPeerNetworkConfig,
     ) -> Result<Self, ControlPlaneError> {
+        let wal_path = durable_artifact_wal_path(artifact_path);
         Self::new_experimental_peer_durable_inner(
             cluster_name,
             node_id,
             artifact_path,
-            Some(wal_path),
+            Some(&wal_path),
             peer_policy,
             network,
             Some(expected_bootstrap),
@@ -4788,11 +4800,12 @@ impl ControlPlaneRaftAuthority {
             log_store,
             cluster_name,
             peer_policy,
-        ))
+        )
+        .with_durable_artifact_path(artifact_path))
     }
 
     #[must_use]
-    pub fn new_with_log_store(
+    fn new_with_log_store(
         raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
         log_store: ControlPlaneRaftLogStore,
         cluster_name: impl Into<String>,
@@ -4810,6 +4823,7 @@ impl ControlPlaneRaftAuthority {
             runtime_map_overlay_content_certificate: Mutex::new(None),
             checkpoint_instance: Arc::new(()),
             checkpoint_publication: Arc::new(Mutex::new(None)),
+            durable_artifact_path: None,
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
             command_metrics: Arc::new(ControlPlaneRaftCommandMetrics::default()),
         }
@@ -4835,6 +4849,7 @@ impl ControlPlaneRaftAuthority {
             runtime_map_overlay_content_certificate: Mutex::new(None),
             checkpoint_instance: Arc::new(()),
             checkpoint_publication: Arc::new(Mutex::new(None)),
+            durable_artifact_path: None,
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
             command_metrics: Arc::new(ControlPlaneRaftCommandMetrics::default()),
         }
@@ -4843,6 +4858,12 @@ impl ControlPlaneRaftAuthority {
     #[must_use]
     fn raft(&self) -> &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine> {
         &self.raft
+    }
+
+    #[must_use]
+    fn with_durable_artifact_path(mut self, artifact_path: &Path) -> Self {
+        self.durable_artifact_path = Some(Arc::new(artifact_path.to_path_buf()));
+        self
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -5765,12 +5786,9 @@ impl ControlPlaneRaftAuthority {
             })
     }
 
-    pub async fn store_durable_restart_artifact(
-        &self,
-        path: &Path,
-    ) -> Result<Option<u64>, ControlPlaneError> {
+    pub async fn store_durable_restart_artifact(&self) -> Result<Option<u64>, ControlPlaneError> {
         let checkpoint = self.capture_durable_restart_checkpoint().await?;
-        let path = path.to_path_buf();
+        let path = self.configured_durable_artifact_path()?;
         let checkpoint_instance = Arc::clone(&self.checkpoint_instance);
         let checkpoint_publication = Arc::clone(&self.checkpoint_publication);
         let checkpoint_metrics = Arc::clone(&self.checkpoint_metrics);
@@ -5782,7 +5800,7 @@ impl ControlPlaneRaftAuthority {
                 &checkpoint_metrics,
                 log_store.as_ref(),
                 checkpoint,
-                &path,
+                path.as_ref(),
             )
         })
         .await
@@ -5803,16 +5821,25 @@ impl ControlPlaneRaftAuthority {
     pub fn persist_durable_restart_checkpoint(
         &self,
         checkpoint: ControlPlaneRaftCapturedRestartCheckpoint,
-        path: &Path,
     ) -> Result<Option<u64>, ControlPlaneError> {
+        let path = self.configured_durable_artifact_path()?;
         Self::persist_durable_restart_checkpoint_inner(
             &self.checkpoint_instance,
             &self.checkpoint_publication,
             &self.checkpoint_metrics,
             self.log_store.as_ref(),
             checkpoint,
-            path,
+            path.as_ref(),
         )
+    }
+
+    fn configured_durable_artifact_path(&self) -> Result<Arc<PathBuf>, ControlPlaneError> {
+        self.durable_artifact_path
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| ControlPlaneError::RpcRemote {
+                message: "OpenRaft durable checkpoint requested for an authority without configured durable state".to_owned(),
+            })
     }
 
     fn persist_durable_restart_checkpoint_inner(
@@ -6806,7 +6833,7 @@ static CONTROL_PLANE_RAFT_WAL_DURABLE_PUBLICATION_GATES: Mutex<
 > = Mutex::new(BTreeMap::new());
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct ControlPlaneRaftLogStoreRestartArtifact {
+struct ControlPlaneRaftLogStoreRestartArtifact {
     vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
     committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     last_purged_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
@@ -6814,7 +6841,7 @@ pub struct ControlPlaneRaftLogStoreRestartArtifact {
 }
 
 #[derive(Debug, Clone)]
-pub struct ControlPlaneRaftRestartArtifact {
+struct ControlPlaneRaftRestartArtifact {
     cluster_name: String,
     local_node_id: ControlPlaneRaftNodeId,
     wal_replay_offset: u64,
@@ -7036,7 +7063,7 @@ impl ControlPlaneRaftCheckpointPosition {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ControlPlaneRaftWalRecord {
+enum ControlPlaneRaftWalRecord {
     SaveVote(VoteOf<ControlPlaneRaftTypeConfig>),
     Append(Vec<ControlPlaneRaftEntry>),
     SaveCommitted(Option<LogIdOf<ControlPlaneRaftTypeConfig>>),
@@ -7045,17 +7072,17 @@ pub enum ControlPlaneRaftWalRecord {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ControlPlaneRaftWalFrame {
+struct ControlPlaneRaftWalFrame {
     cluster_name: String,
     local_node_id: ControlPlaneRaftNodeId,
     record: ControlPlaneRaftWalRecord,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControlPlaneRaftWalFileConfig {
-    pub path: PathBuf,
-    pub cluster_name: String,
-    pub local_node_id: ControlPlaneRaftNodeId,
+struct ControlPlaneRaftWalFileConfig {
+    path: PathBuf,
+    cluster_name: String,
+    local_node_id: ControlPlaneRaftNodeId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7077,13 +7104,13 @@ impl ControlPlaneRaftWalOffsets {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct ControlPlaneRaftWalReplayConfig<'a> {
-    pub base: &'a ControlPlaneRaftLogStoreRestartArtifact,
-    pub replay_offset: u64,
+struct ControlPlaneRaftWalReplayConfig<'a> {
+    base: &'a ControlPlaneRaftLogStoreRestartArtifact,
+    replay_offset: u64,
 }
 
 #[derive(Debug, Clone)]
-pub struct ControlPlaneRaftWalFile {
+struct ControlPlaneRaftWalFile {
     cluster_name: String,
     local_node_id: ControlPlaneRaftNodeId,
     metrics: Arc<ControlPlaneRaftWalMetrics>,
@@ -7656,7 +7683,8 @@ impl ControlPlaneRaftLogStore {
         Self::default()
     }
 
-    pub fn export_restart_artifact(
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn export_restart_artifact(
         &self,
     ) -> Result<ControlPlaneRaftLogStoreRestartArtifact, io::Error> {
         let durable = self.lock_durable()?;
@@ -7765,13 +7793,14 @@ impl ControlPlaneRaftLogStore {
         })
     }
 
-    pub fn from_restart_artifact_in_memory(
+    fn from_restart_artifact_in_memory(
         artifact: ControlPlaneRaftLogStoreRestartArtifact,
     ) -> Result<Self, io::Error> {
         Self::from_restart_artifact_inner(artifact, None)
     }
 
-    pub fn from_restart_artifact_with_wal_file(
+    #[cfg(test)]
+    fn from_restart_artifact_with_wal_file(
         artifact: ControlPlaneRaftLogStoreRestartArtifact,
         wal: ControlPlaneRaftWalFile,
     ) -> Result<Self, ControlPlaneError> {
@@ -8236,7 +8265,7 @@ impl ControlPlaneRaftWalRecord {
 }
 
 impl ControlPlaneRaftWalFrame {
-    pub fn new(
+    fn new(
         cluster_name: impl Into<String>,
         local_node_id: ControlPlaneRaftNodeId,
         record: ControlPlaneRaftWalRecord,
@@ -8248,23 +8277,26 @@ impl ControlPlaneRaftWalFrame {
         }
     }
 
-    pub fn cluster_name(&self) -> &str {
+    #[cfg(test)]
+    fn cluster_name(&self) -> &str {
         &self.cluster_name
     }
 
-    pub fn local_node_id(&self) -> ControlPlaneRaftNodeId {
+    #[cfg(test)]
+    fn local_node_id(&self) -> ControlPlaneRaftNodeId {
         self.local_node_id
     }
 
-    pub fn record(&self) -> &ControlPlaneRaftWalRecord {
+    #[cfg(test)]
+    fn record(&self) -> &ControlPlaneRaftWalRecord {
         &self.record
     }
 
-    pub fn into_record(self) -> ControlPlaneRaftWalRecord {
+    fn into_record(self) -> ControlPlaneRaftWalRecord {
         self.record
     }
 
-    pub fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
+    fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
         let mut out = Vec::new();
         out.extend_from_slice(CONTROL_PLANE_RAFT_WAL_MAGIC);
         write_raft_u16(&mut out, CONTROL_PLANE_RAFT_WAL_VERSION);
@@ -8275,7 +8307,7 @@ impl ControlPlaneRaftWalFrame {
         Ok(out)
     }
 
-    pub fn decode_frame(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+    fn decode_frame(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
         let min_len = CONTROL_PLANE_RAFT_WAL_MAGIC.len() + 2 + CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN;
         if bytes.len() < min_len {
             return Err(raft_artifact_protocol_error(
@@ -8318,7 +8350,7 @@ impl ControlPlaneRaftWalFrame {
         Ok(frame)
     }
 
-    pub fn validate_identity(
+    fn validate_identity(
         &self,
         cluster_name: &str,
         local_node_id: ControlPlaneRaftNodeId,
@@ -8347,7 +8379,7 @@ struct ControlPlaneRaftWalFileRecords {
 }
 
 impl ControlPlaneRaftWalFile {
-    pub fn new(config: ControlPlaneRaftWalFileConfig) -> Self {
+    fn new(config: ControlPlaneRaftWalFileConfig) -> Self {
         let metrics = Arc::new(ControlPlaneRaftWalMetrics::default());
         let observer = Arc::new(ControlPlaneRaftWalObserver {
             metrics: Arc::clone(&metrics),
@@ -8366,14 +8398,12 @@ impl ControlPlaneRaftWalFile {
         }
     }
 
-    pub fn path(&self) -> &Path {
+    fn path(&self) -> &Path {
         self.journal.path()
     }
 
-    pub fn append_record(
-        &self,
-        record: &ControlPlaneRaftWalRecord,
-    ) -> Result<(), ControlPlaneError> {
+    #[cfg(test)]
+    fn append_record(&self, record: &ControlPlaneRaftWalRecord) -> Result<(), ControlPlaneError> {
         self.append_record_for_log_store(record)
             .map_err(DurableJournalAppendError::into_control_plane_error)
     }
@@ -8392,7 +8422,7 @@ impl ControlPlaneRaftWalFile {
         self.journal.append_frame(&frame)
     }
 
-    pub fn replay_log_store_artifact(
+    fn replay_log_store_artifact(
         &self,
         config: ControlPlaneRaftWalReplayConfig<'_>,
     ) -> Result<ControlPlaneRaftLogStoreRestartArtifact, ControlPlaneError> {
@@ -8410,7 +8440,8 @@ impl ControlPlaneRaftWalFile {
         Ok(artifact)
     }
 
-    pub fn clean_len(&self) -> Result<u64, ControlPlaneError> {
+    #[cfg(test)]
+    fn clean_len(&self) -> Result<u64, ControlPlaneError> {
         self.journal.clean_len()
     }
 
@@ -8520,15 +8551,8 @@ fn write_control_plane_raft_wal_bytes(
 }
 
 impl ControlPlaneRaftRestartArtifact {
-    pub fn cluster_name(&self) -> &str {
-        &self.cluster_name
-    }
-
-    pub fn local_node_id(&self) -> ControlPlaneRaftNodeId {
-        self.local_node_id
-    }
-
-    pub fn capture(
+    #[cfg(test)]
+    fn capture(
         cluster_name: impl Into<String>,
         local_node_id: ControlPlaneRaftNodeId,
         log_store: &ControlPlaneRaftLogStore,
@@ -8555,7 +8579,7 @@ impl ControlPlaneRaftRestartArtifact {
         Ok(artifact)
     }
 
-    pub fn encode_durable_artifact(&self) -> Result<Vec<u8>, ControlPlaneError> {
+    fn encode_durable_artifact(&self) -> Result<Vec<u8>, ControlPlaneError> {
         let mut out = Vec::new();
         out.extend_from_slice(CONTROL_PLANE_RAFT_RESTART_MAGIC);
         write_raft_u16(&mut out, CONTROL_PLANE_RAFT_RESTART_VERSION);
@@ -8568,7 +8592,8 @@ impl ControlPlaneRaftRestartArtifact {
         Ok(out)
     }
 
-    pub fn decode_durable_artifact(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn decode_durable_artifact(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
         let artifact = Self::decode_durable_artifact_before_restore_validation(bytes)?;
         artifact
             .clone()
@@ -8625,7 +8650,8 @@ impl ControlPlaneRaftRestartArtifact {
         Ok(artifact)
     }
 
-    pub fn load_durable_artifact(path: &Path) -> Result<Self, ControlPlaneError> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn load_durable_artifact(path: &Path) -> Result<Self, ControlPlaneError> {
         let bytes = Self::read_durable_artifact(path)?;
         Self::decode_durable_artifact(&bytes)
     }
@@ -8649,7 +8675,8 @@ impl ControlPlaneRaftRestartArtifact {
         Ok(bytes)
     }
 
-    pub fn store_durable_artifact(&self, path: &Path) -> Result<(), ControlPlaneError> {
+    #[cfg(test)]
+    fn store_durable_artifact(&self, path: &Path) -> Result<(), ControlPlaneError> {
         self.store_durable_artifact_with_metrics(path, None)
     }
 
@@ -8746,9 +8773,8 @@ impl ControlPlaneRaftRestartArtifact {
         Self::validate_log_store_state_machine_pair(&self.log_store, &self.state_machine)
     }
 
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn store_single_node_committed_ahead_bootstrap_artifact_for_test(
+    #[cfg(test)]
+    fn store_single_node_committed_ahead_bootstrap_artifact_for_test(
         path: &Path,
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
@@ -8799,7 +8825,7 @@ impl ControlPlaneRaftRestartArtifact {
         Ok(expected_state_machine.inner().snapshot().clone())
     }
 
-    pub fn restore(
+    fn restore(
         self,
     ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), io::Error> {
         let log_store =
@@ -8817,7 +8843,8 @@ impl ControlPlaneRaftRestartArtifact {
         Ok((log_store, state_machine))
     }
 
-    pub fn restore_with_wal_file(
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn restore_with_wal_file(
         self,
         wal: ControlPlaneRaftWalFile,
     ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), ControlPlaneError> {
@@ -10176,6 +10203,178 @@ pub struct ControlPlaneRaftPendingTestResponse {
     max_frame_bytes: usize,
 }
 
+/// Semantic view of persisted Raft state for cross-crate process tests.
+///
+/// Restart-artifact and WAL representations remain private to storage. This
+/// view exposes only the state that a restarted authority would recover.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneRaftPersistedVoteForTest {
+    term: u64,
+    node_id: ControlPlaneRaftNodeId,
+    committed: bool,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl ControlPlaneRaftPersistedVoteForTest {
+    #[must_use]
+    pub fn term(&self) -> u64 {
+        self.term
+    }
+
+    #[must_use]
+    pub fn node_id(&self) -> ControlPlaneRaftNodeId {
+        self.node_id
+    }
+
+    #[must_use]
+    pub fn committed(&self) -> bool {
+        self.committed
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneRaftDurableStateForTest {
+    snapshot: ClusterControlSnapshot,
+    persisted_vote: Option<ControlPlaneRaftPersistedVoteForTest>,
+    last_log_id: Option<ControlPlaneRaftLogId>,
+    committed: Option<ControlPlaneRaftLogId>,
+    cached_snapshot_log_id: Option<ControlPlaneRaftLogId>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl ControlPlaneRaftDurableStateForTest {
+    #[must_use]
+    pub fn snapshot(&self) -> &ClusterControlSnapshot {
+        &self.snapshot
+    }
+
+    #[must_use]
+    pub fn persisted_vote(&self) -> Option<&ControlPlaneRaftPersistedVoteForTest> {
+        self.persisted_vote.as_ref()
+    }
+
+    #[must_use]
+    pub fn last_log_id(&self) -> Option<ControlPlaneRaftLogId> {
+        self.last_log_id
+    }
+
+    #[must_use]
+    pub fn committed(&self) -> Option<ControlPlaneRaftLogId> {
+        self.committed
+    }
+
+    #[must_use]
+    pub fn cached_snapshot_log_id(&self) -> Option<ControlPlaneRaftLogId> {
+        self.cached_snapshot_log_id
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn inspect_control_plane_raft_recovery_state_for_test(
+    artifact_path: &Path,
+) -> Result<ControlPlaneRaftDurableStateForTest, ControlPlaneError> {
+    inspect_control_plane_raft_durable_state_for_test(artifact_path, true)
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn inspect_control_plane_raft_checkpoint_state_for_test(
+    artifact_path: &Path,
+) -> Result<ControlPlaneRaftDurableStateForTest, ControlPlaneError> {
+    inspect_control_plane_raft_durable_state_for_test(artifact_path, false)
+}
+
+/// Opaque filesystem fault used by process tests to block one checkpoint
+/// publication without exposing storage's temporary-file naming convention.
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct ControlPlaneRaftCheckpointWriteBlockerForTest {
+    path: PathBuf,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl ControlPlaneRaftCheckpointWriteBlockerForTest {
+    pub fn install(
+        artifact_path: &Path,
+        writer_process_id: u32,
+    ) -> Result<Self, ControlPlaneError> {
+        let path = durable_artifact_tmp_path_for_process(artifact_path, writer_process_id);
+        fs::create_dir(&path).map_err(|source| ControlPlaneError::Io {
+            context: "install control-plane OpenRaft checkpoint write blocker",
+            source,
+        })?;
+        Ok(Self { path })
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for ControlPlaneRaftCheckpointWriteBlockerForTest {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn inspect_control_plane_raft_durable_state_for_test(
+    artifact_path: &Path,
+    replay_wal: bool,
+) -> Result<ControlPlaneRaftDurableStateForTest, ControlPlaneError> {
+    let artifact = ControlPlaneRaftRestartArtifact::load_durable_artifact(artifact_path)?;
+    let (log_store, mut state_machine) = if replay_wal {
+        let wal = ControlPlaneRaftWalFile::new(ControlPlaneRaftWalFileConfig {
+            path: durable_artifact_wal_path(artifact_path),
+            cluster_name: artifact.cluster_name.clone(),
+            local_node_id: artifact.local_node_id,
+        });
+        artifact.restore_with_wal_file(wal)?
+    } else {
+        artifact.restore().map_err(|source| ControlPlaneError::Io {
+            context: "inspect control-plane OpenRaft checkpoint state",
+            source,
+        })?
+    };
+    let log_store_artifact =
+        log_store
+            .export_restart_artifact()
+            .map_err(|source| ControlPlaneError::Io {
+                context: "inspect control-plane OpenRaft recovered log state",
+                source,
+            })?;
+    if let Some(committed) = log_store_artifact.committed {
+        let start = state_machine
+            .last_applied()
+            .map_or(0, |log_id| log_id.index().saturating_add(1));
+        for entry in log_store_artifact.entries.iter().filter(|entry| {
+            let index = entry.log_id.index();
+            index >= start && index <= committed.index()
+        }) {
+            state_machine.apply_entry(entry.clone())?;
+        }
+    }
+    let last_log_id = log_store_artifact
+        .entries
+        .last()
+        .map(|entry| entry.log_id)
+        .or(log_store_artifact.last_purged_log_id);
+    let persisted_vote = log_store_artifact
+        .vote
+        .map(|vote| ControlPlaneRaftPersistedVoteForTest {
+            term: vote.leader_id.term,
+            node_id: vote.leader_id.node_id,
+            committed: vote.committed,
+        });
+    let cached_snapshot_log_id = state_machine
+        .current_snapshot()
+        .and_then(|snapshot| snapshot.meta.last_log_id);
+    Ok(ControlPlaneRaftDurableStateForTest {
+        snapshot: state_machine.inner().snapshot().clone(),
+        persisted_vote,
+        last_log_id,
+        committed: log_store_artifact.committed,
+        cached_snapshot_log_id,
+    })
+}
+
 #[cfg(any(test, feature = "test-hooks"))]
 impl ControlPlaneRaftPendingTestResponse {
     pub fn wait(self) -> Result<(), ControlPlaneError> {
@@ -11082,28 +11281,26 @@ fn reverse_raft_peer_frame_identity(
 }
 
 fn durable_artifact_tmp_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|file_name| file_name.to_str())
-        .unwrap_or("control-plane-raft.state");
-    path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()))
+    durable_artifact_tmp_path_for_process(path, std::process::id())
+}
+
+fn durable_artifact_tmp_path_for_process(path: &Path, process_id: u32) -> PathBuf {
+    durable_artifact_companion_path(path, &format!(".tmp.{process_id}"))
 }
 
 fn durable_artifact_sentinel_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|file_name| file_name.to_str())
-        .unwrap_or("control-plane-raft.state");
-    path.with_file_name(format!("{file_name}.sentinel"))
+    durable_artifact_companion_path(path, ".sentinel")
 }
 
 #[must_use]
-pub fn durable_artifact_wal_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|file_name| file_name.to_str())
-        .unwrap_or("control-plane-raft.state");
-    path.with_file_name(format!("{file_name}.wal"))
+fn durable_artifact_wal_path(path: &Path) -> PathBuf {
+    durable_artifact_companion_path(path, ".wal")
+}
+
+fn durable_artifact_companion_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut companion = path.as_os_str().to_os_string();
+    companion.push(suffix);
+    PathBuf::from(companion)
 }
 
 fn sync_durable_artifact_parent(
@@ -12517,7 +12714,7 @@ impl Clone for ControlPlaneRaftStateMachine {
 }
 
 #[derive(Debug, Clone)]
-pub struct ControlPlaneRaftStateMachineRestartArtifact {
+struct ControlPlaneRaftStateMachineRestartArtifact {
     inner: ReplicatedControlPlaneStateMachine,
     last_applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     last_membership: StoredMembershipOf<ControlPlaneRaftTypeConfig>,
@@ -12580,7 +12777,7 @@ impl ControlPlaneRaftStateMachine {
     }
 
     #[must_use]
-    pub fn export_restart_artifact(&self) -> ControlPlaneRaftStateMachineRestartArtifact {
+    fn export_restart_artifact(&self) -> ControlPlaneRaftStateMachineRestartArtifact {
         let current_snapshot = lock_control_plane_raft_snapshot_cache(&self.current_snapshot)
             .as_ref()
             .filter(|snapshot| {
@@ -12595,7 +12792,7 @@ impl ControlPlaneRaftStateMachine {
         }
     }
 
-    pub fn from_restart_artifact(
+    fn from_restart_artifact(
         artifact: ControlPlaneRaftStateMachineRestartArtifact,
     ) -> Result<Self, ControlPlaneError> {
         let state_machine = Self::new(
@@ -13359,8 +13556,10 @@ impl RaftStateMachine<ControlPlaneRaftTypeConfig> for ControlPlaneRaftStateMachi
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::ffi::OsString;
     use std::future::Future;
     use std::net::TcpListener;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::{
@@ -13391,6 +13590,36 @@ mod tests {
     use crate::control_plane_auth::ControlPlaneScopedCredentialInput;
     use crate::control_plane_command::LeaseHorizonAuthorityBinding;
     use crate::types::PgId;
+
+    #[test]
+    fn control_plane_raft_companion_paths_preserve_non_utf8_artifact_names() {
+        let directory = test_util::tempdir();
+        let first = directory
+            .path()
+            .join(OsString::from_vec(vec![b'r', b'a', b'f', b't', 0xfe]));
+        let second = directory
+            .path()
+            .join(OsString::from_vec(vec![b'r', b'a', b'f', b't', 0xff]));
+
+        for derive in [
+            durable_artifact_wal_path as fn(&Path) -> PathBuf,
+            durable_artifact_sentinel_path,
+        ] {
+            assert_ne!(derive(&first), derive(&second));
+            assert!(derive(&first)
+                .as_os_str()
+                .as_bytes()
+                .starts_with(first.as_os_str().as_bytes()));
+            assert!(derive(&second)
+                .as_os_str()
+                .as_bytes()
+                .starts_with(second.as_os_str().as_bytes()));
+        }
+        assert_ne!(
+            durable_artifact_tmp_path_for_process(&first, 17),
+            durable_artifact_tmp_path_for_process(&second, 17)
+        );
+    }
 
     type ControlPlaneOpenRaftLogSuite = OpenRaftLogSuite<
         ControlPlaneRaftTypeConfig,
@@ -19383,7 +19612,7 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let artifact_path = tmp.path().join("raft.state");
-            let wal_path = tmp.path().join("raft.wal");
+            let wal_path = durable_artifact_wal_path(&artifact_path);
             let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
             let log_store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
                 ControlPlaneRaftLogStoreRestartArtifact::default(),
@@ -19400,7 +19629,8 @@ mod tests {
             .await
             .unwrap();
             let authority =
-                ControlPlaneRaftAuthority::new_with_log_store(raft, log_store, "test-cluster");
+                ControlPlaneRaftAuthority::new_with_log_store(raft, log_store, "test-cluster")
+                    .with_durable_artifact_path(&artifact_path);
             authority
                 .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
                 .await
@@ -19414,7 +19644,7 @@ mod tests {
             );
             let metrics_before = observability::control_plane_raft_checkpoint_metrics_snapshot();
             authority
-                .store_durable_restart_artifact(&artifact_path)
+                .store_durable_restart_artifact()
                 .await
                 .expect("durable checkpoint should store and compact WAL");
             let metrics_after = observability::control_plane_raft_checkpoint_metrics_snapshot();
@@ -19478,7 +19708,7 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let artifact_path = tmp.path().join("raft.state");
-            let wal_path = tmp.path().join("raft.wal");
+            let wal_path = durable_artifact_wal_path(&artifact_path);
             let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
             let log_store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
                 ControlPlaneRaftLogStoreRestartArtifact::default(),
@@ -19498,7 +19728,8 @@ mod tests {
                 raft,
                 log_store.clone(),
                 "test-cluster",
-            );
+            )
+            .with_durable_artifact_path(&artifact_path);
             authority
                 .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
                 .await
@@ -19521,7 +19752,7 @@ mod tests {
             assert!(suffix_end > replay_offset);
 
             authority
-                .persist_durable_restart_checkpoint(checkpoint, &artifact_path)
+                .persist_durable_restart_checkpoint(checkpoint)
                 .expect("captured checkpoint should persist and compact its WAL prefix");
             assert_eq!(
                 authority
@@ -19779,7 +20010,7 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let directory = test_util::tempdir();
             let artifact_path = directory.path().join("raft.state");
-            let wal_path = directory.path().join("raft.wal");
+            let wal_path = durable_artifact_wal_path(&artifact_path);
             let authority = Arc::new(
                 ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
                     "wal-monitor-state-machine-isolation",
@@ -19829,7 +20060,7 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let directory = test_util::tempdir();
             let artifact_path = directory.path().join("raft.state");
-            let wal_path = directory.path().join("raft.wal");
+            let wal_path = durable_artifact_wal_path(&artifact_path);
             let authority = Arc::new(
                 ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
                     "captured-checkpoint-state-machine-isolation",
@@ -19859,11 +20090,10 @@ mod tests {
             });
             entered_rx.await.unwrap();
             let persist_authority = Arc::clone(&authority);
-            let persist_path = artifact_path.clone();
             tokio::time::timeout(
                 Duration::from_secs(1),
                 tokio::task::spawn_blocking(move || {
-                    persist_authority.persist_durable_restart_checkpoint(checkpoint, &persist_path)
+                    persist_authority.persist_durable_restart_checkpoint(checkpoint)
                 }),
             )
             .await
@@ -19882,7 +20112,7 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let artifact_path = tmp.path().join("raft.state");
-            let wal_path = tmp.path().join("raft.wal");
+            let wal_path = durable_artifact_wal_path(&artifact_path);
             let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
             let log_store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
                 ControlPlaneRaftLogStoreRestartArtifact::default(),
@@ -19899,7 +20129,8 @@ mod tests {
             .await
             .unwrap();
             let authority =
-                ControlPlaneRaftAuthority::new_with_log_store(raft, log_store, "test-cluster");
+                ControlPlaneRaftAuthority::new_with_log_store(raft, log_store, "test-cluster")
+                    .with_durable_artifact_path(&artifact_path);
             authority
                 .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
                 .await
@@ -19935,13 +20166,13 @@ mod tests {
                 .await
                 .expect("newer restart checkpoint should capture");
             authority
-                .persist_durable_restart_checkpoint(current, &artifact_path)
+                .persist_durable_restart_checkpoint(current)
                 .expect("newer restart checkpoint should publish");
             let artifact_before_stale = fs::read(&artifact_path).unwrap();
             let offsets_before_stale = authority.durable_wal_monitor_snapshot().unwrap().offsets();
 
             let error = authority
-                .persist_durable_restart_checkpoint(stale, &artifact_path)
+                .persist_durable_restart_checkpoint(stale)
                 .expect_err("older captured checkpoint must not replace a newer publication");
             assert!(
                 error.to_string().contains("precedes the last publication"),
@@ -19974,7 +20205,8 @@ mod tests {
             .await
             .unwrap();
             let authority =
-                ControlPlaneRaftAuthority::new_with_log_store(raft, log_store, "test-cluster");
+                ControlPlaneRaftAuthority::new_with_log_store(raft, log_store, "test-cluster")
+                    .with_durable_artifact_path(&artifact_path);
             let checkpoint = authority
                 .capture_durable_restart_checkpoint()
                 .await
@@ -19987,10 +20219,11 @@ mod tests {
                     .expect("test authority should retain its log store")
                     .clone(),
                 "test-cluster",
-            );
+            )
+            .with_durable_artifact_path(&artifact_path);
 
             let error = foreign_authority
-                .persist_durable_restart_checkpoint(checkpoint, &artifact_path)
+                .persist_durable_restart_checkpoint(checkpoint)
                 .expect_err("another authority instance must reject the captured checkpoint");
             assert!(
                 error.to_string().contains("another authority instance"),
@@ -27123,6 +27356,162 @@ mod tests {
                 restored_state_machine.last_applied(),
                 Some(raft_log_id(3, 1, 2))
             );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_durable_authority_applies_committed_restart_suffix() {
+        let tmp = test_util::tempdir();
+        let artifact_path = tmp.path().join("raft.state");
+        let cluster_name = "control-plane-raft-committed-restart-suffix";
+        let expected = ControlPlaneRaftRestartArtifact::
+            store_single_node_committed_ahead_bootstrap_artifact_for_test(
+                &artifact_path,
+                cluster_name,
+                1,
+                vec![(NodeId::new(1), "node-1".to_owned())],
+                vec![PgId::new(0)],
+            )
+            .expect("committed-ahead restart artifact should store");
+
+        ControlPlaneRaftTypeConfig::run(async {
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                cluster_name,
+                1,
+                &artifact_path,
+            )
+            .await
+            .expect("durable authority should restore committed-ahead state");
+            authority
+                .wait_for_applied_index_at_least(
+                    2,
+                    Duration::from_secs(1),
+                    "restored authority applies committed restart suffix",
+                )
+                .await
+                .expect("restored authority should apply committed restart suffix");
+            assert_eq!(
+                authority.current_control_plane_snapshot().await.unwrap(),
+                expected
+            );
+            authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_public_durable_authority_applies_wal_only_committed_command() {
+        let tmp = test_util::tempdir();
+        let artifact_path = tmp.path().join("raft.state");
+        let cluster_name = "control-plane-raft-wal-only-committed-command";
+
+        ControlPlaneRaftTypeConfig::run(async {
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                cluster_name,
+                1,
+                &artifact_path,
+            )
+            .await
+            .unwrap();
+            authority
+                .initialize_single_node_membership(1)
+                .await
+                .unwrap();
+            authority
+                .wait_for_current_leader(1, Duration::from_secs(1), "WAL-only command setup")
+                .await
+                .unwrap();
+            let bootstrap = authority
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(1), "node-1".to_owned())],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            authority.store_durable_restart_artifact().await.unwrap();
+            authority.shutdown().await.unwrap();
+
+            let artifact =
+                ControlPlaneRaftRestartArtifact::load_durable_artifact(&artifact_path).unwrap();
+            let checkpoint_last_log_id = artifact
+                .log_store
+                .entries
+                .last()
+                .map(|entry| entry.log_id)
+                .expect("checkpoint should retain its bootstrap log tip");
+            assert_eq!(checkpoint_last_log_id, bootstrap.log_id());
+            assert_ne!(
+                artifact
+                    .state_machine
+                    .inner
+                    .snapshot()
+                    .node(NodeId::new(1))
+                    .map(|node| node.availability()),
+                Some(NodeAvailabilityState::Unavailable)
+            );
+
+            let command_term = artifact
+                .log_store
+                .vote
+                .expect("checkpoint should retain a vote")
+                .leader_id
+                .term
+                .checked_add(1_000)
+                .unwrap();
+            let command_log_id = LogId::new(
+                LeaderId {
+                    term: command_term,
+                    node_id: 1,
+                },
+                checkpoint_last_log_id.index().checked_add(1).unwrap(),
+            );
+            let wal =
+                test_raft_wal_file(durable_artifact_wal_path(&artifact_path), cluster_name, 1);
+            wal.append_record(&ControlPlaneRaftWalRecord::SaveVote(Vote::<
+                ControlPlaneRaftLeaderId,
+            >::new_committed(
+                command_term, 1
+            )))
+            .unwrap();
+            wal.append_record(&ControlPlaneRaftWalRecord::Append(vec![
+                ControlPlaneRaftEntry {
+                    log_id: command_log_id,
+                    payload: EntryPayload::Normal(ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(1),
+                        availability: NodeAvailabilityState::Unavailable,
+                    }),
+                },
+            ]))
+            .unwrap();
+            wal.append_record(&ControlPlaneRaftWalRecord::SaveCommitted(Some(
+                command_log_id,
+            )))
+            .unwrap();
+
+            let restarted = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                cluster_name,
+                1,
+                &artifact_path,
+            )
+            .await
+            .expect("public durable authority should restore the derived WAL");
+            restarted
+                .wait_for_applied_log_id(
+                    command_log_id,
+                    Duration::from_secs(1),
+                    "public durable authority applies WAL-only committed command",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                restarted
+                    .current_control_plane_snapshot()
+                    .await
+                    .unwrap()
+                    .node(NodeId::new(1))
+                    .map(|node| node.availability()),
+                Some(NodeAvailabilityState::Unavailable)
+            );
+            restarted.shutdown().await.unwrap();
         });
     }
 

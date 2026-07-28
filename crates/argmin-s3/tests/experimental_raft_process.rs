@@ -13,10 +13,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use openraft::impls::leader_id_adv::LeaderId;
-use openraft::impls::Entry;
-use openraft::storage::{RaftLogReader, RaftLogStorage};
-use openraft::{EntryPayload, LogId, Vote};
 use storage::control_plane::{
     AuthenticatedUnixControlPlaneClient, ControlPlaneHeartbeatRuntimeMapSource, NodeHeartbeat,
     UnixControlPlaneClient,
@@ -27,10 +23,11 @@ use storage::control_plane_auth::{
 };
 use storage::control_plane_command::ControlPlaneCommand;
 use storage::control_plane_raft::{
-    durable_artifact_wal_path, ControlPlaneRaftEntry, ControlPlaneRaftLeaderId,
-    ControlPlaneRaftLogId, ControlPlaneRaftPeerAuthPolicy, ControlPlaneRaftPeerTestClient,
-    ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftRestartArtifact, ControlPlaneRaftWalFile,
-    ControlPlaneRaftWalFileConfig, ControlPlaneRaftWalRecord,
+    inspect_control_plane_raft_checkpoint_state_for_test,
+    inspect_control_plane_raft_recovery_state_for_test,
+    ControlPlaneRaftCheckpointWriteBlockerForTest, ControlPlaneRaftLogId,
+    ControlPlaneRaftPeerAuthPolicy, ControlPlaneRaftPeerTestClient,
+    ControlPlaneRaftPeerTransportLimits,
 };
 use storage::{ClusterEpoch, NodeId, PgId};
 
@@ -578,15 +575,6 @@ fn wait_for_trigger_raft_election(
     }
 }
 
-fn wait_for_runtime_map_ready(
-    bin: &Path,
-    test_dir: &Path,
-    children: &mut [&mut ChildGuard],
-    raft_node_ids: &[u64],
-) -> (PathBuf, Output) {
-    wait_for_runtime_map_ready_with_extra_env(bin, test_dir, children, raft_node_ids, &[])
-}
-
 fn wait_for_runtime_map_ready_with_extra_env(
     bin: &Path,
     test_dir: &Path,
@@ -770,58 +758,13 @@ fn format_admin_failure(status: ExitStatus, output: &Output) -> String {
 }
 
 fn follower_artifact_has_bootstrapped_state(path: &Path) -> Result<bool, String> {
-    let state_machine = follower_artifact_state_machine_with_wal_replay(path)?;
-    let snapshot = state_machine.inner().snapshot();
+    let state = inspect_control_plane_raft_recovery_state_for_test(path)
+        .map_err(|error| error.to_string())?;
+    let snapshot = state.snapshot();
     let node_ids: BTreeSet<_> = snapshot.nodes().map(|node| node.node_id()).collect();
     let pg_ids: BTreeSet<_> = snapshot.pgs().map(|pg| pg.pg_id()).collect();
     Ok(node_ids == BTreeSet::from([NodeId::new(0), NodeId::new(1)])
         && pg_ids == BTreeSet::from([PgId::new(0)]))
-}
-
-fn follower_artifact_state_machine_with_wal_replay(
-    path: &Path,
-) -> Result<storage::control_plane_raft::ControlPlaneRaftStateMachine, String> {
-    let artifact = match ControlPlaneRaftRestartArtifact::load_durable_artifact(path) {
-        Ok(artifact) => artifact,
-        Err(error) => return Err(error.to_string()),
-    };
-    let wal = raft_wal_file(
-        durable_artifact_wal_path(path),
-        artifact.cluster_name(),
-        artifact.local_node_id(),
-    );
-    let (mut log_store, mut state_machine) = artifact
-        .restore_with_wal_file(wal)
-        .map_err(|error| error.to_string())?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
-    let committed = runtime
-        .block_on(RaftLogStorage::read_committed(&mut log_store))
-        .map_err(|error| error.to_string())?;
-    let Some(committed) = committed else {
-        return Ok(state_machine);
-    };
-    let start = state_machine
-        .last_applied()
-        .map_or(0, |log_id| log_id.index().saturating_add(1));
-    if start > committed.index() {
-        return Ok(state_machine);
-    }
-
-    let entries = runtime
-        .block_on(RaftLogReader::try_get_log_entries(
-            &mut log_store,
-            start..committed.index().saturating_add(1),
-        ))
-        .map_err(|error| error.to_string())?;
-    for entry in entries {
-        state_machine
-            .apply_entry(entry)
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(state_machine)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -831,124 +774,43 @@ struct PersistedVoteSummary {
     committed: bool,
 }
 
-fn persisted_vote_summary(vote: Vote<ControlPlaneRaftLeaderId>) -> PersistedVoteSummary {
+fn persisted_vote_summary(
+    vote: &storage::control_plane_raft::ControlPlaneRaftPersistedVoteForTest,
+) -> PersistedVoteSummary {
     PersistedVoteSummary {
-        term: vote.leader_id.term,
-        node_id: vote.leader_id.node_id,
-        committed: vote.committed,
+        term: vote.term(),
+        node_id: vote.node_id(),
+        committed: vote.committed(),
     }
 }
 
 fn artifact_persisted_vote(path: &Path) -> Result<Option<PersistedVoteSummary>, String> {
-    let artifact = match ControlPlaneRaftRestartArtifact::load_durable_artifact(path) {
-        Ok(artifact) => artifact,
-        Err(error) => return Err(error.to_string()),
-    };
-    let wal = raft_wal_file(
-        durable_artifact_wal_path(path),
-        artifact.cluster_name(),
-        artifact.local_node_id(),
-    );
-    let (log_store, _state_machine) = artifact
-        .restore_with_wal_file(wal)
+    let state = inspect_control_plane_raft_recovery_state_for_test(path)
         .map_err(|error| error.to_string())?;
-    let vote = log_store
-        .persisted_vote()
-        .map_err(|error| error.to_string())?;
-    Ok(vote.map(persisted_vote_summary))
-}
-
-fn artifact_only_persisted_vote(path: &Path) -> Result<Option<PersistedVoteSummary>, String> {
-    let artifact = match ControlPlaneRaftRestartArtifact::load_durable_artifact(path) {
-        Ok(artifact) => artifact,
-        Err(error) => return Err(error.to_string()),
-    };
-    let (log_store, _state_machine) = artifact.restore().map_err(|error| error.to_string())?;
-    let vote = log_store
-        .persisted_vote()
-        .map_err(|error| error.to_string())?;
-    Ok(vote.map(persisted_vote_summary))
-}
-
-fn artifact_persisted_vote_with_wal(
-    path: &Path,
-    cluster_name: &str,
-    node_id: u64,
-) -> Result<Option<PersistedVoteSummary>, String> {
-    let artifact = match ControlPlaneRaftRestartArtifact::load_durable_artifact(path) {
-        Ok(artifact) => artifact,
-        Err(error) => return Err(error.to_string()),
-    };
-    let (log_store, _state_machine) = artifact
-        .restore_with_wal_file(raft_wal_file(
-            durable_artifact_wal_path(path),
-            cluster_name,
-            node_id,
-        ))
-        .map_err(|error| error.to_string())?;
-    let vote = log_store
-        .persisted_vote()
-        .map_err(|error| error.to_string())?;
-    Ok(vote.map(persisted_vote_summary))
+    Ok(state.persisted_vote().map(persisted_vote_summary))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PersistedLogStateSummary {
-    last_log_id: Option<LogId<ControlPlaneRaftLeaderId>>,
-    committed: Option<LogId<ControlPlaneRaftLeaderId>>,
+    last_log_id: Option<ControlPlaneRaftLogId>,
+    committed: Option<ControlPlaneRaftLogId>,
 }
 
-fn artifact_log_state_with_wal(
-    path: &Path,
-    cluster_name: &str,
-    node_id: u64,
-) -> Result<PersistedLogStateSummary, String> {
-    let artifact = match ControlPlaneRaftRestartArtifact::load_durable_artifact(path) {
-        Ok(artifact) => artifact,
-        Err(error) => return Err(error.to_string()),
-    };
-    let (mut log_store, _state_machine) = artifact
-        .restore_with_wal_file(raft_wal_file(
-            durable_artifact_wal_path(path),
-            cluster_name,
-            node_id,
-        ))
-        .map_err(|error| error.to_string())?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
-    let log_state = runtime
-        .block_on(RaftLogStorage::get_log_state(&mut log_store))
-        .map_err(|error| error.to_string())?;
-    let committed = runtime
-        .block_on(RaftLogStorage::read_committed(&mut log_store))
+fn artifact_log_state(path: &Path) -> Result<PersistedLogStateSummary, String> {
+    let state = inspect_control_plane_raft_recovery_state_for_test(path)
         .map_err(|error| error.to_string())?;
     Ok(PersistedLogStateSummary {
-        last_log_id: log_state.last_log_id,
-        committed,
+        last_log_id: state.last_log_id(),
+        committed: state.committed(),
     })
 }
 
 fn artifact_only_log_state(path: &Path) -> Result<PersistedLogStateSummary, String> {
-    let artifact = match ControlPlaneRaftRestartArtifact::load_durable_artifact(path) {
-        Ok(artifact) => artifact,
-        Err(error) => return Err(error.to_string()),
-    };
-    let (mut log_store, _state_machine) = artifact.restore().map_err(|error| error.to_string())?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
-    let log_state = runtime
-        .block_on(RaftLogStorage::get_log_state(&mut log_store))
-        .map_err(|error| error.to_string())?;
-    let committed = runtime
-        .block_on(RaftLogStorage::read_committed(&mut log_store))
+    let state = inspect_control_plane_raft_checkpoint_state_for_test(path)
         .map_err(|error| error.to_string())?;
     Ok(PersistedLogStateSummary {
-        last_log_id: log_state.last_log_id,
-        committed,
+        last_log_id: state.last_log_id(),
+        committed: state.committed(),
     })
 }
 
@@ -957,25 +819,9 @@ fn follower_artifact_pg_has_acting_set(
     pg_id: PgId,
     acting_set: &[NodeId],
 ) -> Result<bool, String> {
-    let state_machine = follower_artifact_state_machine_with_wal_replay(path)?;
-    let snapshot = state_machine.inner().snapshot();
-    let Some(pg) = snapshot.pg(pg_id) else {
-        return Ok(false);
-    };
-    Ok(pg.acting_set() == acting_set)
-}
-
-fn artifact_only_pg_has_acting_set(
-    path: &Path,
-    pg_id: PgId,
-    acting_set: &[NodeId],
-) -> Result<bool, String> {
-    let artifact = match ControlPlaneRaftRestartArtifact::load_durable_artifact(path) {
-        Ok(artifact) => artifact,
-        Err(error) => return Err(error.to_string()),
-    };
-    let (_log_store, state_machine) = artifact.restore().map_err(|error| error.to_string())?;
-    let snapshot = state_machine.inner().snapshot();
+    let state = inspect_control_plane_raft_recovery_state_for_test(path)
+        .map_err(|error| error.to_string())?;
+    let snapshot = state.snapshot();
     let Some(pg) = snapshot.pg(pg_id) else {
         return Ok(false);
     };
@@ -988,18 +834,16 @@ fn follower_artifact_pg_has_acting_set_and_snapshot_index_at_least(
     acting_set: &[NodeId],
     min_snapshot_index: u64,
 ) -> Result<bool, String> {
-    let state_machine = follower_artifact_state_machine_with_wal_replay(path)?;
-    let snapshot_index = state_machine
-        .current_snapshot()
-        .and_then(|snapshot| snapshot.meta.last_log_id)
-        .map(|log_id| log_id.index());
+    let state = inspect_control_plane_raft_recovery_state_for_test(path)
+        .map_err(|error| error.to_string())?;
+    let snapshot_index = state.cached_snapshot_log_id().map(|log_id| log_id.index());
     let Some(snapshot_index) = snapshot_index else {
         return Ok(false);
     };
     if snapshot_index < min_snapshot_index {
         return Ok(false);
     }
-    let snapshot = state_machine.inner().snapshot();
+    let snapshot = state.snapshot();
     let Some(pg) = snapshot.pg(pg_id) else {
         return Ok(false);
     };
@@ -1229,39 +1073,6 @@ fn peer_socket(test_dir: &Path, node_id: u64) -> PathBuf {
 
 fn state_path(test_dir: &Path, node_id: u64) -> PathBuf {
     state_dir(test_dir, node_id).join("control.state")
-}
-
-fn state_tmp_path_for_process(state_path: &Path, process_id: u32) -> PathBuf {
-    let file_name = state_path
-        .file_name()
-        .and_then(|file_name| file_name.to_str())
-        .expect("test state path should have a UTF-8 file name");
-    state_path.with_file_name(format!("{file_name}.tmp.{process_id}"))
-}
-
-fn wal_path(test_dir: &Path, node_id: u64) -> PathBuf {
-    durable_artifact_wal_path(&state_path(test_dir, node_id))
-}
-
-fn raft_wal_file(
-    path: PathBuf,
-    cluster_name: impl Into<String>,
-    node_id: u64,
-) -> ControlPlaneRaftWalFile {
-    ControlPlaneRaftWalFile::new(ControlPlaneRaftWalFileConfig {
-        path,
-        cluster_name: cluster_name.into(),
-        local_node_id: node_id,
-    })
-}
-
-fn state_sentinel_path(test_dir: &Path, node_id: u64) -> PathBuf {
-    let state_path = state_path(test_dir, node_id);
-    let file_name = state_path
-        .file_name()
-        .and_then(|file_name| file_name.to_str())
-        .expect("state path should have UTF-8 file name");
-    state_path.with_file_name(format!("{file_name}.sentinel"))
 }
 
 fn wait_for_process_exit(child: &mut ChildGuard, timeout: Duration) -> ExitStatus {
@@ -2141,127 +1952,6 @@ fn experimental_raft_full_auth_composition_smoke() {
 }
 
 #[test]
-fn experimental_raft_process_rejects_missing_artifact_after_state_existed() {
-    let bin = argmin_s3_bin();
-    let test_dir = TestDir::new("experimental-raft-process-missing-artifact");
-    let cluster_name = format!(
-        "process-missing-artifact-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after Unix epoch")
-            .as_nanos()
-    );
-    let raft_node_ids = [101, 102];
-    let mut node102 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 102, &raft_node_ids);
-    wait_for_socket_file(&peer_socket(test_dir.path(), 102), &mut node102);
-    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
-
-    let (_leader_socket, _output) = wait_for_runtime_map_ready(
-        &bin,
-        test_dir.path(),
-        &mut [&mut node101, &mut node102],
-        &raft_node_ids,
-    );
-    wait_for_follower_artifact(
-        &state_path(test_dir.path(), 102),
-        &mut [&mut node101, &mut node102],
-    );
-    assert!(
-        state_sentinel_path(test_dir.path(), 102).exists(),
-        "node 102 should persist a state-existed sentinel"
-    );
-
-    node102.stop();
-    fs::remove_file(state_path(test_dir.path(), 102))
-        .expect("test should delete only the durable artifact, not the sentinel");
-
-    let mut restarted102 =
-        ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 102, &raft_node_ids);
-    let status = wait_for_process_exit(&mut restarted102, Duration::from_secs(5));
-    assert!(
-        !status.success(),
-        "restart without artifact should fail closed, got {status}"
-    );
-    let logs = process_logs(test_dir.path());
-    assert!(
-        logs.contains("is missing but sentinel"),
-        "restart failure should mention sentinel guard:\n{logs}"
-    );
-}
-
-#[test]
-fn experimental_raft_process_restart_replays_post_checkpoint_wal_suffix() {
-    let bin = argmin_s3_bin();
-    let test_dir = TestDir::new("experimental-raft-process-wal-suffix");
-    let cluster_name = format!(
-        "process-wal-suffix-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after Unix epoch")
-            .as_nanos()
-    );
-    let raft_node_ids = [101];
-    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
-    wait_for_socket_file(&peer_socket(test_dir.path(), 101), &mut node101);
-
-    let control_socket = control_socket(test_dir.path(), 101);
-    wait_for_runtime_map_ready_on(&bin, &control_socket, test_dir.path(), &mut [&mut node101]);
-    let state_path = state_path(test_dir.path(), 101);
-    let vote_before_restart = artifact_persisted_vote_with_wal(&state_path, &cluster_name, 101)
-        .expect("artifact plus WAL should restore before WAL suffix injection")
-        .expect("bootstrapped process should persist a vote");
-
-    node101.stop();
-
-    let artifact_only_vote = artifact_only_persisted_vote(&state_path)
-        .expect("artifact should restore before WAL suffix injection")
-        .expect("artifact should contain the checkpointed vote");
-    let injected_term = vote_before_restart.term + 1_000;
-    let wal = raft_wal_file(wal_path(test_dir.path(), 101), &cluster_name, 101);
-    wal.append_record(&ControlPlaneRaftWalRecord::SaveVote(Vote::<
-        ControlPlaneRaftLeaderId,
-    >::new_committed(
-        injected_term, 101
-    )))
-    .expect("test should append a post-checkpoint WAL vote record");
-
-    assert_eq!(
-        artifact_only_persisted_vote(&state_path)
-            .expect("artifact should still restore after WAL suffix injection"),
-        Some(artifact_only_vote),
-        "WAL suffix injection must not rewrite the checkpoint artifact"
-    );
-    assert_eq!(
-        artifact_persisted_vote_with_wal(&state_path, &cluster_name, 101)
-            .expect("artifact plus WAL should restore after suffix injection"),
-        Some(PersistedVoteSummary {
-            term: injected_term,
-            node_id: 101,
-            committed: true,
-        }),
-        "artifact plus WAL restore should observe the injected post-checkpoint suffix"
-    );
-
-    let mut restarted101 =
-        ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
-    wait_for_socket_file(&peer_socket(test_dir.path(), 101), &mut restarted101);
-    wait_for_runtime_map_ready_on(
-        &bin,
-        &control_socket,
-        test_dir.path(),
-        &mut [&mut restarted101],
-    );
-    wait_for_artifact_committed_vote_at_least(
-        &state_path,
-        101,
-        injected_term,
-        &mut [&mut restarted101],
-    );
-}
-
-#[test]
 fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_state() {
     let bin = argmin_s3_bin();
     let test_dir = TestDir::new("experimental-raft-process-peer-append-wal-crash");
@@ -2302,18 +1992,16 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
         &mut restarted103,
         "argmin-s3 experimental durable OpenRaft control-plane manager using state",
     );
-    let follower_log_before_crash =
-        artifact_log_state_with_wal(&follower_state_path, &cluster_name, 103)
-            .expect("follower artifact plus WAL should expose log state before crash");
+    let follower_log_before_crash = artifact_log_state(&follower_state_path)
+        .expect("follower artifact plus WAL should expose log state before crash");
     assert!(
         follower_log_before_crash.last_log_id.is_some()
             || follower_log_before_crash.committed.is_some(),
         "bootstrapped follower should expose retained log state before crash: {follower_log_before_crash:?}"
     );
-    let follower_vote_before_crash =
-        artifact_persisted_vote_with_wal(&follower_state_path, &cluster_name, 103)
-            .expect("follower artifact plus WAL should expose vote before crash")
-            .expect("bootstrapped follower should persist a vote before crash");
+    let follower_vote_before_crash = artifact_persisted_vote(&follower_state_path)
+        .expect("follower artifact plus WAL should expose vote before crash")
+        .expect("bootstrapped follower should persist a vote before crash");
     assert!(
         follower_vote_before_crash.committed,
         "bootstrapped follower should persist a committed vote before direct append: {follower_vote_before_crash:?}"
@@ -2343,9 +2031,8 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
         )
         .expect("synthetic leader preparation should be acknowledged");
 
-    let follower_log_before_crash =
-        artifact_log_state_with_wal(&follower_state_path, &cluster_name, 103)
-            .expect("prepared follower artifact plus WAL should expose current log state");
+    let follower_log_before_crash = artifact_log_state(&follower_state_path)
+        .expect("prepared follower artifact plus WAL should expose current log state");
     let mut prev_log_id = follower_log_before_crash
         .last_log_id
         .expect("prepared follower should have a log tip before append");
@@ -2394,12 +2081,11 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
         prev_log_id = appended_log_id;
     }
     let acknowledged_log_id = prev_log_id;
-    let follower_checkpoint_tmp_path =
-        state_tmp_path_for_process(&follower_state_path, restarted103.process_id());
-    let _ = fs::remove_file(&follower_checkpoint_tmp_path);
-    let _ = fs::remove_dir_all(&follower_checkpoint_tmp_path);
-    fs::create_dir(&follower_checkpoint_tmp_path)
-        .expect("follower checkpoint temp path should be blocked by a directory");
+    let checkpoint_write_blocker = ControlPlaneRaftCheckpointWriteBlockerForTest::install(
+        &follower_state_path,
+        restarted103.process_id(),
+    )
+    .expect("follower checkpoint publication should be blocked");
 
     // Keep the threshold-crossing connection alive, but do not require its
     // response to race the independently scheduled checkpoint failure. The
@@ -2414,8 +2100,7 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
         });
 
     let status = wait_for_process_exit(&mut restarted103, Duration::from_secs(5));
-    fs::remove_dir(&follower_checkpoint_tmp_path)
-        .expect("follower checkpoint temp-path blocker should be removed after crash");
+    drop(checkpoint_write_blocker);
     assert!(
         !status.success(),
         "follower should exit after the acknowledged WAL suffix cannot be checkpointed"
@@ -2427,12 +2112,10 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
         Some(appended_log_id),
         "failed checkpoint must leave the synthetic peer append out of the checkpoint artifact: {follower_artifact_after_crash:?}"
     );
-    let follower_log_after_crash =
-        artifact_log_state_with_wal(&follower_state_path, &cluster_name, 103)
-            .expect("artifact plus WAL should restore after peer append crash");
-    let follower_vote_after_crash =
-        artifact_persisted_vote_with_wal(&follower_state_path, &cluster_name, 103)
-            .expect("artifact plus WAL should restore vote after peer append crash");
+    let follower_log_after_crash = artifact_log_state(&follower_state_path)
+        .expect("artifact plus WAL should restore after peer append crash");
+    let follower_vote_after_crash = artifact_persisted_vote(&follower_state_path)
+        .expect("artifact plus WAL should restore vote after peer append crash");
     assert_eq!(
         follower_log_after_crash.last_log_id,
         Some(appended_log_id),
@@ -2451,106 +2134,11 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
     // cannot combine an old artifact read with a newly compacted WAL.
     recovered103.stop();
     assert_eq!(
-        artifact_log_state_with_wal(&follower_state_path, &cluster_name, 103)
+        artifact_log_state(&follower_state_path)
             .expect("recovered follower artifact plus WAL should expose log state")
             .last_log_id,
         Some(appended_log_id),
         "recovered follower should retain the WAL-restored acknowledged append"
-    );
-}
-
-#[test]
-fn experimental_raft_process_restart_replays_post_checkpoint_wal_command_suffix() {
-    let bin = argmin_s3_bin();
-    let test_dir = TestDir::new("experimental-raft-process-wal-command-suffix");
-    let cluster_name = format!(
-        "process-wal-command-suffix-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after Unix epoch")
-            .as_nanos()
-    );
-    let raft_node_ids = [101];
-    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
-    wait_for_socket_file(&peer_socket(test_dir.path(), 101), &mut node101);
-
-    let control_socket = control_socket(test_dir.path(), 101);
-    wait_for_runtime_map_ready_on(&bin, &control_socket, test_dir.path(), &mut [&mut node101]);
-    let state_path = state_path(test_dir.path(), 101);
-    let vote_before_restart = artifact_persisted_vote_with_wal(&state_path, &cluster_name, 101)
-        .expect("artifact plus WAL should restore before WAL command suffix injection")
-        .expect("bootstrapped process should persist a vote");
-    let log_state_before_restart = artifact_log_state_with_wal(&state_path, &cluster_name, 101)
-        .expect("artifact plus WAL should expose log state before suffix injection");
-    let last_log_id = log_state_before_restart
-        .last_log_id
-        .expect("bootstrapped process should have a retained log tip");
-
-    node101.stop();
-
-    assert!(
-        !follower_artifact_pg_has_acting_set(&state_path, PgId::new(0), &[NodeId::new(1)])
-            .expect("artifact should restore before WAL command suffix injection"),
-        "checkpoint artifact should not already contain the injected acting-set change"
-    );
-
-    let command_term = vote_before_restart.term + 1_000;
-    let command_log_id = LogId::new(
-        LeaderId {
-            term: command_term,
-            node_id: 101,
-        },
-        last_log_id.index() + 1,
-    );
-    let command_entry: ControlPlaneRaftEntry = Entry {
-        log_id: command_log_id,
-        payload: EntryPayload::Normal(ControlPlaneCommand::SetPgActingSet {
-            pg_id: PgId::new(0),
-            acting_set: vec![NodeId::new(1)],
-        }),
-    };
-    let wal = raft_wal_file(wal_path(test_dir.path(), 101), &cluster_name, 101);
-    wal.append_record(&ControlPlaneRaftWalRecord::SaveVote(Vote::<
-        ControlPlaneRaftLeaderId,
-    >::new_committed(
-        command_term, 101
-    )))
-    .expect("test should append a post-checkpoint WAL vote record");
-    wal.append_record(&ControlPlaneRaftWalRecord::Append(vec![command_entry]))
-        .expect("test should append a post-checkpoint WAL command entry");
-    wal.append_record(&ControlPlaneRaftWalRecord::SaveCommitted(Some(
-        command_log_id,
-    )))
-    .expect("test should append a post-checkpoint WAL committed watermark");
-
-    assert!(
-        !artifact_only_pg_has_acting_set(&state_path, PgId::new(0), &[NodeId::new(1)])
-            .expect("artifact should still restore after WAL command suffix injection"),
-        "WAL suffix injection must not rewrite the checkpoint artifact"
-    );
-    assert_eq!(
-        artifact_log_state_with_wal(&state_path, &cluster_name, 101)
-            .expect("artifact plus WAL should restore log state after command suffix injection")
-            .committed,
-        Some(command_log_id),
-        "artifact plus WAL restore should observe the injected committed command suffix"
-    );
-
-    let mut restarted101 =
-        ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
-    wait_for_socket_file(&peer_socket(test_dir.path(), 101), &mut restarted101);
-    wait_for_runtime_map_ready_on(
-        &bin,
-        &control_socket,
-        test_dir.path(),
-        &mut [&mut restarted101],
-    );
-    wait_for_follower_artifact_pg_acting_set(
-        &state_path,
-        PgId::new(0),
-        &[NodeId::new(1)],
-        &mut [&mut restarted101],
     );
 }
 

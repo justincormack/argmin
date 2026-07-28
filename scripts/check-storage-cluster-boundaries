@@ -2647,6 +2647,18 @@ fail_with_matches \
     "Raft frames, shared auth envelopes, raw handlers, and the OpenRaft handle are private to storage; use logical authority APIs or opaque test hooks" \
     "$raft_peer_representation_leaks"
 
+raft_durable_format_leaks=$(
+    rg -n --color=never \
+        '\bControlPlaneRaft(RestartArtifact|LogStoreRestartArtifact|StateMachineRestartArtifact|Wal(File|FileConfig|Frame|Record|ReplayConfig))\b|\bdurable_artifact_wal_path\b|\bnew_experimental_[a-z_]*with_wal\b' \
+        . \
+        -g 'crates/**/*.rs' \
+        -g '!crates/storage/**' \
+        || true
+)
+fail_with_matches \
+    "Raft restart artifacts, WAL representations, layout helpers, and explicit-WAL constructors are private to storage; use durable authority constructors or opaque semantic test inspection" \
+    "$raft_durable_format_leaks"
+
 if [[ "$failed" -ne 0 ]]; then
     echo
     echo "storage cluster boundary checks failed" >&2

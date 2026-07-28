@@ -231,7 +231,7 @@ Initial ownership assessment:
 | Metadata command log, checkpoints, and canonical metadata digests | `storage` | Codecs are largely crate-private; inventory every embedded nested format and keep recovery/corruption tests local. |
 | Storage-node RPC | `storage` | The main codec and wire error codes are private; `StorageNodeServer`, `StoreError`, and `StorageNodeFailureClass` form the logical facade. Remaining work is ALPN/TLS profile containment. |
 | Control-plane durable state, RPC, and auth envelope | `storage` | Client and server transport are contained behind typed Unix/TLS endpoints and opaque storage-owned facades. |
-| Raft peer protocol, restart artifact, and WAL | `storage` | Hide raw frame decoders, framing helpers, WAL records/files, and layout helpers; move direct WAL construction tests into storage. |
+| Raft peer protocol, restart artifact, and WAL | `storage` | Peer wire and durable representations are contained: raw frames, restart artifacts, WAL records/files, and layout helpers are private; process tests use logical clients and opaque semantic recovery inspection. |
 | Object user/system metadata blobs | `server-core` | Keep storage's carriers opaque; make serialization entry points crate-private unless another owner has a demonstrated need to interpret them. |
 | Tag and ACL canonical value formats | `s3-types` | Keep validation and canonical value codecs central; treat their embeddings in storage rows/RPCs as separately versioned containing formats. |
 | Object encryption state | `storage` | Keep the durable codec private to storage while exposing only typed encryption state to callers. |
@@ -370,6 +370,17 @@ The public boundary and containment status for each surface are as follows.
   client for votes and command appends, including an opaque pending response for crash races;
   binary durability tests use owner-provided snapshot, step-down, and election hooks rather than
   OpenRaft types.
+- **Completed durable-format containment slice:** restart artifacts, state-machine/log-store
+  restart values, WAL frames/records/files, replay configuration, and WAL path derivation are
+  private to `storage`. Public durable authority constructors accept only the configured restart
+  path and derive the owned WAL path internally. Checkpoint publication is likewise bound to that
+  authority path, so a caller cannot publish an artifact independently of the WAL that will be
+  compacted. Companion paths append their suffixes through `OsString`, preserving non-UTF-8
+  artifact names without fallback-name collisions. Cross-crate crash tests inspect an opaque
+  semantic recovered/checkpoint state; tests that manufacture committed-ahead artifacts or append
+  synthetic WAL suffixes are colocated with the storage implementation. An owner-local restart
+  test places a committed command only in the derived WAL and proves that the public durable
+  authority applies it to the live state machine.
 - Client retry classification is storage-owned and permanently tests that reachability failures
   map to OpenRaft `Unreachable` while protocol failures map to `Network`. The inbound server
   returns only an opaque terminal listener failure to the process; request and transport
@@ -399,9 +410,12 @@ implementation order is:
    allocation bound and durability-before-ack invariant. TLS/ALPN, worker admission, authenticated
    dispatch, response signing and finalization are storage-owned and boundary-checked.
 5. **Complete:** make the remaining raw Raft frame, auth-envelope, ALPN, OpenRaft-handle, and
-   transport-error APIs private; relocate impossible-state tests into `storage`; retain process
-   coverage through logical or opaque semantic test facilities; and enforce the boundary with a
-   repository check. The equivalent control-plane client and server cleanup is also complete.
+   transport-error APIs private; retain process coverage through logical or opaque semantic test
+   facilities; and enforce the wire boundary with a repository check. The equivalent
+   control-plane client and server cleanup is also complete.
+6. **Complete:** make restart-artifact and WAL representations, replay/layout helpers, and
+   explicit-WAL constructors private; derive the WAL location inside storage; relocate direct
+   durable-format and impossible-state tests into `storage`; and boundary-check these symbols.
 
 Phase 1 exit criteria:
 

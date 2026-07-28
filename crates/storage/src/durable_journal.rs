@@ -224,6 +224,7 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn clean_len(&self) -> Result<u64, ControlPlaneError> {
         let _guard = self.lock()?;
         let replay_offset = match self.read_file_base_offset_unlocked() {
