@@ -1172,7 +1172,7 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
     )
     .unwrap();
     assert_eq!(renewed.lease_deadline, renewed_deadline);
-    BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
+    RetainedBucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
         &client,
         bucket_pg_id_for_test(0),
         &renewed,
@@ -1275,7 +1275,7 @@ fn unix_bucket_write_reservation_identity_uses_current_route_after_epoch_change(
         ),
     )
     .unwrap();
-    BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
+    RetainedBucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
         &client,
         bucket_pg_id_for_test(0),
         &renewed,
@@ -1516,7 +1516,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         .map(|record| record.drain_id.as_str()),
         Some("drain-rpc-1")
     );
-    BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
+    RetainedBucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
         &client,
         bucket_pg_id_for_test(0),
         &drain,
@@ -1581,7 +1581,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     )
     .unwrap();
     assert!(begin_roots.is_empty());
-    BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
+    RetainedBucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
         &client,
         bucket_pg_id_for_test(0),
         &live_begin_drain,
@@ -1609,7 +1609,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     .unwrap();
     assert_eq!(begin_roots.len(), 1);
     assert_eq!(begin_roots[0].bucket, bucket);
-    BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
+    RetainedBucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
         &client,
         bucket_pg_id_for_test(0),
         &expired_begin_drain,
@@ -1659,17 +1659,18 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         observed_claim.bucket_incarnation_generation,
         finalize_bucket_incarnation_generation
     );
-    let stale_release = BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
-        &client,
-        bucket_pg_id_for_test(0),
-        &claim,
-    )
-    .unwrap_err();
+    let stale_release =
+        RetainedBucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
+            &client,
+            bucket_pg_id_for_test(0),
+            &claim,
+        )
+        .unwrap_err();
     assert!(matches!(
         stale_release,
         BucketSnapshotLoadError::Metadata(MetadataError::ReclaimClaimConflict { .. })
     ));
-    BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
+    RetainedBucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
         &client,
         bucket_pg_id_for_test(0),
         &replacement_claim,
@@ -1819,7 +1820,7 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
         Some("transient lifecycle error")
     );
 
-    BucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
+    RetainedBucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
         &client,
         bucket_pg_id_for_test(0),
         &error_record,
@@ -2366,7 +2367,7 @@ fn unix_bucket_write_reservation_client_clears_exact_drain_after_route_expiry() 
         config.socket_path.clone(),
     );
 
-    BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
+    RetainedBucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
         &client,
         bucket_pg_id_for_test(0),
         &drain,
@@ -2443,7 +2444,7 @@ fn unix_bucket_write_reservation_client_releases_finalizer_claim_after_route_exp
         config.socket_path.clone(),
     );
 
-    BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
+    RetainedBucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
         &client,
         bucket_pg_id_for_test(0),
         &claim,
@@ -2529,7 +2530,7 @@ fn unix_bucket_write_reservation_client_releases_lifecycle_claim_after_route_exp
         config.socket_path.clone(),
     );
 
-    BucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
+    RetainedBucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
         &client,
         bucket_pg_id_for_test(0),
         &claim,
@@ -2862,12 +2863,13 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
         "unexpected wrong-PG reservation error: {reservation_error:?}"
     );
 
-    let release_error = BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
-        &client,
-        wrong_bucket_pg,
-        &wrong_pg_release_record,
-    )
-    .unwrap_err();
+    let release_error =
+        RetainedBucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
+            &client,
+            wrong_bucket_pg,
+            &wrong_pg_release_record,
+        )
+        .unwrap_err();
     assert!(
         matches!(
             release_error,
@@ -3190,7 +3192,7 @@ fn unix_bucket_write_drain_operations_reject_wrong_bucket_pg_before_access() {
     assert_payload_decode(error, "expired drain clear");
     assert_drains_unchanged();
 
-    let error = BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
+    let error = RetainedBucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
         &client, wrong_pg, &drain,
     )
     .unwrap_err();
@@ -3355,7 +3357,7 @@ fn unix_bucket_delete_finalize_claim_operations_reject_wrong_bucket_pg_before_ac
     assert_payload_decode(error, "finalizer claim get");
     assert_claims_unchanged();
 
-    let error = BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
+    let error = RetainedBucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
         &client,
         wrong_pg,
         &wrong_claim,
@@ -3557,7 +3559,7 @@ fn unix_lifecycle_sweep_claim_operations_reject_wrong_bucket_pg_before_access() 
     assert_payload_decode(error, "lifecycle claim error");
     assert_claims_unchanged();
 
-    let error = BucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
+    let error = RetainedBucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
         &client,
         wrong_pg,
         &wrong_claim,

@@ -610,56 +610,6 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         Ok(record)
     }
 
-    fn release_durable_bucket_write_reservation(
-        &self,
-        pg_id: BucketPgId,
-        record: &BucketWriteReservationRecord,
-    ) -> Result<(), BucketSnapshotLoadError> {
-        let request = StorageRpcBucketWriteReservationRecordRequest {
-            node_id: self.node_id,
-            route_cluster_epoch: self.cluster_epoch,
-            pg_id: pg_id.pg_id(),
-            record: record.clone(),
-        };
-        let payload =
-            encode_bucket_write_reservation_record_request(&request).map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "encode bucket write reservation release request",
-                    error.to_string(),
-                ))
-            })?;
-        let response = self.rpc_request_bucket_snapshot(
-            StorageRpcMessageKind::BucketWriteReservationRelease,
-            payload,
-        )?;
-        self.validate_empty_bucket_write_reservation_response(
-            "decode bucket write reservation release response",
-            &response,
-        )
-    }
-
-    fn release_metadata_command_bucket_write_reservation(
-        &self,
-        pg_id: BucketPgId,
-        proof: &BucketWriteReservationProof,
-    ) -> Result<(), BucketSnapshotLoadError> {
-        let request = StorageRpcProofReleaseRequest {
-            node_id: self.node_id,
-            route_cluster_epoch: proof.cluster_epoch,
-            pg_id: pg_id.pg_id(),
-            proof: proof.clone(),
-        };
-        let payload = encode_proof_release_request(&request).map_err(|error| {
-            BucketSnapshotLoadError::Store(
-                self.rpc_payload_error("encode proof release request", error.to_string()),
-            )
-        })?;
-        let response =
-            self.rpc_request_bucket_snapshot(StorageRpcMessageKind::ProofRelease, payload)?;
-        self.validate_proof_release_response(&response)?;
-        Ok(())
-    }
-
     fn begin_durable_bucket_write_drain_with_effect_fence(
         &self,
         pg_id: BucketPgId,
@@ -729,33 +679,6 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             )));
         }
         Ok(record)
-    }
-
-    fn clear_durable_bucket_write_drain(
-        &self,
-        pg_id: BucketPgId,
-        record: &BucketWriteDrainRecord,
-    ) -> Result<(), BucketSnapshotLoadError> {
-        let request = StorageRpcBucketWriteDrainRecordRequest {
-            node_id: self.node_id,
-            route_cluster_epoch: self.cluster_epoch,
-            pg_id: pg_id.pg_id(),
-            record: record.clone(),
-        };
-        let payload =
-            encode_bucket_write_drain_record_request(&request).map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "encode bucket write drain clear request",
-                    error.to_string(),
-                ))
-            })?;
-        let response = self
-            .rpc_request(StorageRpcMessageKind::BucketWriteDrainClear, payload)
-            .map_err(BucketSnapshotLoadError::Store)?;
-        self.validate_empty_bucket_write_reservation_response(
-            "decode bucket write drain clear response",
-            &response,
-        )
     }
 
     fn clear_expired_durable_bucket_write_drain(
@@ -1055,32 +978,6 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         Ok(response.record)
     }
 
-    fn release_bucket_delete_finalize_claim(
-        &self,
-        pg_id: BucketPgId,
-        claim: &BucketDeleteFinalizeClaimRecord,
-    ) -> Result<(), BucketSnapshotLoadError> {
-        let request = StorageRpcBucketDeleteFinalizeClaimRecordRequest {
-            node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
-            pg_id: pg_id.pg_id(),
-            record: claim.clone(),
-        };
-        let payload =
-            encode_bucket_delete_finalize_claim_record_request(&request).map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "encode bucket delete finalize claim release request",
-                    error.to_string(),
-                ))
-            })?;
-        let kind = StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease;
-        let response = self.rpc_request_bucket_snapshot(kind, payload)?;
-        self.validate_empty_bucket_write_reservation_response(
-            "decode bucket delete finalize claim release response",
-            &response,
-        )
-    }
-
     fn bucket_delete_finalize_claim(
         &self,
         pg_id: BucketPgId,
@@ -1318,6 +1215,111 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             )));
         }
         Ok(response.record)
+    }
+}
+
+impl RetainedBucketWriteReservationNodeClient for UnixStorageNodeClient {
+    fn release_durable_bucket_write_reservation(
+        &self,
+        pg_id: BucketPgId,
+        record: &BucketWriteReservationRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let request = StorageRpcBucketWriteReservationRecordRequest {
+            node_id: self.node_id,
+            route_cluster_epoch: self.cluster_epoch,
+            pg_id: pg_id.pg_id(),
+            record: record.clone(),
+        };
+        let payload =
+            encode_bucket_write_reservation_record_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket write reservation release request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self.rpc_request_bucket_snapshot(
+            StorageRpcMessageKind::BucketWriteReservationRelease,
+            payload,
+        )?;
+        self.validate_empty_bucket_write_reservation_response(
+            "decode bucket write reservation release response",
+            &response,
+        )
+    }
+
+    fn release_metadata_command_bucket_write_reservation(
+        &self,
+        pg_id: BucketPgId,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let request = StorageRpcProofReleaseRequest {
+            node_id: self.node_id,
+            route_cluster_epoch: proof.cluster_epoch,
+            pg_id: pg_id.pg_id(),
+            proof: proof.clone(),
+        };
+        let payload = encode_proof_release_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.rpc_payload_error("encode proof release request", error.to_string()),
+            )
+        })?;
+        let response =
+            self.rpc_request_bucket_snapshot(StorageRpcMessageKind::ProofRelease, payload)?;
+        self.validate_proof_release_response(&response)?;
+        Ok(())
+    }
+
+    fn clear_durable_bucket_write_drain(
+        &self,
+        pg_id: BucketPgId,
+        record: &BucketWriteDrainRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let request = StorageRpcBucketWriteDrainRecordRequest {
+            node_id: self.node_id,
+            route_cluster_epoch: self.cluster_epoch,
+            pg_id: pg_id.pg_id(),
+            record: record.clone(),
+        };
+        let payload =
+            encode_bucket_write_drain_record_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket write drain clear request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketWriteDrainClear, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        self.validate_empty_bucket_write_reservation_response(
+            "decode bucket write drain clear response",
+            &response,
+        )
+    }
+
+    fn release_bucket_delete_finalize_claim(
+        &self,
+        pg_id: BucketPgId,
+        claim: &BucketDeleteFinalizeClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let request = StorageRpcBucketDeleteFinalizeClaimRecordRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id: pg_id.pg_id(),
+            record: claim.clone(),
+        };
+        let payload =
+            encode_bucket_delete_finalize_claim_record_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket delete finalize claim release request",
+                    error.to_string(),
+                ))
+            })?;
+        let kind = StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease;
+        let response = self.rpc_request_bucket_snapshot(kind, payload)?;
+        self.validate_empty_bucket_write_reservation_response(
+            "decode bucket delete finalize claim release response",
+            &response,
+        )
     }
 
     fn release_lifecycle_sweep_claim(

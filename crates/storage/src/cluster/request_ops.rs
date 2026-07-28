@@ -3740,7 +3740,7 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(reservation.pg_id))?;
-        node.bucket_write_reservation_client()
+        node.retained_bucket_write_reservation_client()
             .release_durable_bucket_write_reservation(
                 self.validated_bucket_metadata_pg(PgId::new(reservation.pg_id)),
                 &reservation.record,
@@ -3984,7 +3984,7 @@ impl super::StorageCluster {
                                         current.bucket_execution_generation
                                     ),
                                 );
-                                node.bucket_write_reservation_client()
+                                node.retained_bucket_write_reservation_client()
                                     .clear_durable_bucket_write_drain(
                                         self.validated_bucket_metadata_pg(PgId::new(pg_id)),
                                         &existing,
@@ -4055,7 +4055,7 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(drain.pg_id))?;
-        node.bucket_write_reservation_client()
+        node.retained_bucket_write_reservation_client()
             .clear_durable_bucket_write_drain(
                 self.validated_bucket_metadata_pg(PgId::new(drain.pg_id)),
                 &drain.record,
@@ -4272,7 +4272,7 @@ impl super::StorageCluster {
             if !expired.is_empty() {
                 for reservation in expired {
                     match node
-                        .bucket_write_reservation_client()
+                        .retained_bucket_write_reservation_client()
                         .release_durable_bucket_write_reservation(
                             self.validated_bucket_metadata_pg(PgId::new(pg_id)),
                             &reservation,
@@ -5352,7 +5352,7 @@ impl super::StorageCluster {
                             format!("live stream blocker before drain adoption: {source:?}"),
                         );
                         match node_store
-                            .bucket_write_reservation_client()
+                            .retained_bucket_write_reservation_client()
                             .clear_durable_bucket_write_drain(
                                 self.validated_bucket_metadata_pg(pg_id),
                                 &existing,
@@ -6922,6 +6922,8 @@ impl super::StorageCluster {
         let claimed_at = crate::clock::current_time_millis();
         let bucket_write_reservation_client =
             Arc::clone(bucket_store.bucket_write_reservation_client());
+        let retained_bucket_write_reservation_client =
+            Arc::clone(bucket_store.retained_bucket_write_reservation_client());
         let claim = bucket_write_reservation_client
             .acquire_bucket_delete_finalize_claim(
                 self.validated_bucket_metadata_pg(PgId::new(bucket_pg_id)),
@@ -6946,7 +6948,7 @@ impl super::StorageCluster {
         crate::node::maybe_run_after_bucket_delete_finalize_claim_hook(bucket);
 
         let release_finalizer_claim = || -> Result<(), BucketWriteDrainError> {
-            bucket_write_reservation_client
+            retained_bucket_write_reservation_client
                 .as_ref()
                 .release_bucket_delete_finalize_claim(
                     self.validated_bucket_metadata_pg(PgId::new(bucket_pg_id)),
@@ -8292,7 +8294,7 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        node.bucket_write_reservation_client()
+        node.retained_bucket_write_reservation_client()
             .release_lifecycle_sweep_claim(
                 self.validated_bucket_metadata_pg(PgId::new(pg_id)),
                 claim,

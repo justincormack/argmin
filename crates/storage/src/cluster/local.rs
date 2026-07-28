@@ -33,8 +33,8 @@ use crate::node_client::{
     ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
     ObjectMutationMetadataNodeClient, ObjectPayloadLeaseNodeClient, ObjectPayloadLeaseNodeLease,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
-    ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient, UnixStorageNodeClient,
-    UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
+    RetainedBucketWriteReservationNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient,
+    ShardScavengerNodeClient, UnixStorageNodeClient, UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
     UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
@@ -494,6 +494,7 @@ pub struct LocalNodeStore {
     bucket_metadata_client: Arc<dyn BucketMetadataNodeClient>,
     bucket_metadata_unix_socket_path: Option<PathBuf>,
     bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient>,
+    retained_bucket_write_reservation_client: Arc<dyn RetainedBucketWriteReservationNodeClient>,
     bucket_write_reservation_unix_socket_path: Option<PathBuf>,
     object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient>,
     object_version_metadata_client: Arc<dyn ObjectVersionMetadataNodeClient>,
@@ -519,6 +520,7 @@ impl LocalNodeStore {
             bucket_metadata_client: clients.bucket_metadata,
             bucket_metadata_unix_socket_path: None,
             bucket_write_reservation_client: clients.bucket_write_reservation,
+            retained_bucket_write_reservation_client: clients.retained_bucket_write_reservation,
             bucket_write_reservation_unix_socket_path: None,
             object_generation_metadata_client: clients.object_generation_metadata,
             object_version_metadata_client: clients.object_version_metadata,
@@ -578,6 +580,12 @@ impl LocalNodeStore {
         &self,
     ) -> &Arc<dyn BucketWriteReservationNodeClient> {
         &self.bucket_write_reservation_client
+    }
+
+    pub(crate) fn retained_bucket_write_reservation_client(
+        &self,
+    ) -> &Arc<dyn RetainedBucketWriteReservationNodeClient> {
+        &self.retained_bucket_write_reservation_client
     }
 
     pub(crate) fn object_generation_metadata_client(
@@ -2305,6 +2313,9 @@ impl LocalClusterMap {
             let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = client.clone();
             let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> =
                 client.clone();
+            let retained_bucket_write_reservation_client: Arc<
+                dyn RetainedBucketWriteReservationNodeClient,
+            > = client.clone();
             let metadata_command_client: Arc<dyn MetadataCommandNodeClient> = client.clone();
             let object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient> =
                 client.clone();
@@ -2325,6 +2336,8 @@ impl LocalClusterMap {
             node.bucket_metadata_client = bucket_metadata_client;
             node.bucket_metadata_unix_socket_path = unix_socket_path.clone();
             node.bucket_write_reservation_client = bucket_write_reservation_client;
+            node.retained_bucket_write_reservation_client =
+                retained_bucket_write_reservation_client;
             node.bucket_write_reservation_unix_socket_path = unix_socket_path;
             node.metadata_command_client = metadata_command_client;
             node.object_generation_metadata_client = object_generation_metadata_client;
@@ -2561,8 +2574,14 @@ impl LocalClusterMap {
                 self.epoch,
                 config.socket_path.clone(),
             ));
-            let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> = client;
+            let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> =
+                client.clone();
+            let retained_bucket_write_reservation_client: Arc<
+                dyn RetainedBucketWriteReservationNodeClient,
+            > = client;
             node.bucket_write_reservation_client = bucket_write_reservation_client;
+            node.retained_bucket_write_reservation_client =
+                retained_bucket_write_reservation_client;
             node.bucket_write_reservation_unix_socket_path = Some(config.socket_path);
         }
         Ok(())
@@ -4452,7 +4471,7 @@ fn release_open_metadata_command_bucket_write_reservation(
         .get(&primary_node_id)
         .expect("validated route primary must be in local node set");
     let bucket_pg = node.runtime().bucket_metadata_pg_for(&proof.bucket);
-    node.bucket_write_reservation_client()
+    node.retained_bucket_write_reservation_client()
         .release_metadata_command_bucket_write_reservation(bucket_pg, proof)
         .map_err(|source| ClusterBuildError::OpenLocalNode {
             node_id: primary_node_id.as_u32(),

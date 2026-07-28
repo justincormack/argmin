@@ -648,7 +648,8 @@ Node-client role classification (2026-07-19):
 | Interface | PG role | Capability direction |
 | --- | --- | --- |
 | `BucketMetadataNodeClient` | bucket metadata | active bucket route; reads may later receive a read-only projection |
-| `BucketWriteReservationNodeClient` | bucket metadata | active bucket route for acquire/heartbeat; retained subject-bound cleanup for release/drain recovery |
+| `BucketWriteReservationNodeClient` | bucket metadata | active bucket route for acquisition, heartbeat, worker scans, and claim creation |
+| `RetainedBucketWriteReservationNodeClient` | bucket metadata | retained subject-bound cleanup for exact reservation proofs, drains, and worker claims |
 | `ObjectGenerationMetadataNodeClient`, `ObjectVersionMetadataNodeClient`, `DirectPutMetadataNodeClient` | object metadata | active object route, with completion-specific admission represented as a narrower operation class |
 | `ObjectListingMetadataNodeClient` | object metadata scan | active object-metadata route for the scanned PG; listing fan-out constructs one capability per routed PG |
 | `ObjectMutationMetadataNodeClient` | object metadata | active object route; stale-payload cleanup requires a separate retained cleanup authority |
@@ -3628,6 +3629,26 @@ Eighty-second Phase 3 review correction:
   interfaces from the sanctioned raw-node facade used for deliberately
   process-local assertions. The boundary checker reports the same replacement
   instead of directing developers to the removed aggregate.
+
+Eighty-third Phase 3 slice:
+
+- bucket-write acquisition and retained cleanup are now separate compiler-
+  visible node-client roles. `BucketWriteReservationNodeClient` retains active-
+  route acquisition, heartbeat, worker scans, and claim creation, while
+  `RetainedBucketWriteReservationNodeClient` owns exact reservation/proof
+  release, drain clearing, and delete-finalizer/lifecycle-claim release.
+- local and Unix adapters implement both roles, but `LocalNodeStore` and
+  `LocalNodeClients` preserve separate trait objects. Cluster call sites must
+  therefore choose the active or retained interface explicitly; an active
+  reservation client can no longer invoke a retained cleanup operation.
+- existing retained-route Unix regressions now invoke the retained role
+  directly, including stale-route and wrong-PG rejection for reservation,
+  drain, delete-finalizer claim, and lifecycle claim cleanup. Opaque capability
+  arguments for the remaining role-specific node-client traits remain open in
+  Phase 3.
+- all 54 focused Unix bucket-role regressions and all 2,366 storage tests pass,
+  as do formatting, the storage boundary checker, and workspace-wide strict
+  Clippy. The full 7,679-test workspace suite also passes.
 
 ### Phase 4 — type metadata-command publication
 

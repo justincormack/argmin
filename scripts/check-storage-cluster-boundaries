@@ -1473,8 +1473,8 @@ lifecycle_sweep_coordination_broad_client_bypasses=$(
         next
     }
     {
-        if ($0 ~ /\.bucket_write_reservation_client\(\)/ \
-            || $0 ~ /bucket_write_reservation_client[[:space:]]*$/) {
+        if ($0 ~ /\.(retained_)?bucket_write_reservation_client\(\)/ \
+            || $0 ~ /(retained_)?bucket_write_reservation_client[[:space:]]*$/) {
             pending_bucket_write_client = 1
         }
         if ($0 ~ /\.(durable_bucket_write_drain_exists|list_lifecycle_sweep_buckets|get_lifecycle_sweep_roots|acquire_lifecycle_sweep_claim|heartbeat_lifecycle_sweep_claim|record_lifecycle_sweep_claim_error|release_lifecycle_sweep_claim)\(/) {
@@ -1482,8 +1482,8 @@ lifecycle_sweep_coordination_broad_client_bypasses=$(
                 next
             }
             if (pending_bucket_write_client \
-                || $0 ~ /\.bucket_write_reservation_client\(\)/ \
-                || $0 ~ /bucket_write_reservation_client\./) {
+                || $0 ~ /\.(retained_)?bucket_write_reservation_client\(\)/ \
+                || $0 ~ /(retained_)?bucket_write_reservation_client\./) {
                 pending_bucket_write_client = 0
                 next
             }
@@ -1499,7 +1499,7 @@ lifecycle_sweep_coordination_broad_client_bypasses=$(
       crates/storage/src/cluster/local.rs
 )
 fail_with_matches \
-    "Production lifecycle sweep coordination must use bucket_write_reservation_client" \
+    "Production lifecycle sweep coordination must use its active or retained reservation role" \
     "$lifecycle_sweep_coordination_broad_client_bypasses"
 
 # Temporary migration prohibition: physical deletion stays behind the

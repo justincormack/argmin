@@ -1162,38 +1162,6 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         }
     }
 
-    fn release_durable_bucket_write_reservation(
-        &self,
-        pg_id: BucketPgId,
-        record: &BucketWriteReservationRecord,
-    ) -> Result<(), BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::release_durable_bucket_write_reservation(
-            &*pg, record,
-        )?)
-    }
-
-    fn release_metadata_command_bucket_write_reservation(
-        &self,
-        pg_id: BucketPgId,
-        proof: &BucketWriteReservationProof,
-    ) -> Result<(), BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        if let Some(record) = PgMetadataStore::durable_bucket_write_reservation(
-            &*pg,
-            &proof.bucket,
-            &proof.reservation_id,
-        )? {
-            if !proof.matches_record(&record) {
-                return Err(MetadataError::BucketWriteReservationConflict {
-                    reservation_id: proof.reservation_id.clone(),
-                }
-                .into());
-            }
-        }
-        Ok(PgMetadataStore::release_metadata_command_bucket_write_reservation(&*pg, proof)?)
-    }
-
     fn begin_durable_bucket_write_drain(
         &self,
         pg_id: BucketPgId,
@@ -1238,23 +1206,6 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
             created_at,
             lease_deadline,
         )
-    }
-
-    fn clear_durable_bucket_write_drain(
-        &self,
-        pg_id: BucketPgId,
-        record: &BucketWriteDrainRecord,
-    ) -> Result<(), BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::clear_durable_bucket_write_drain(
-            &*pg,
-            &record.bucket,
-            &record.drain_id,
-            &record.owner_token,
-            record.cluster_epoch,
-            record.bucket_execution_generation,
-            record.lease_deadline,
-        )?)
     }
 
     fn clear_expired_durable_bucket_write_drain(
@@ -1369,14 +1320,6 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         )
     }
 
-    fn release_bucket_delete_finalize_claim(
-        &self,
-        pg_id: BucketPgId,
-        claim: &BucketDeleteFinalizeClaimRecord,
-    ) -> Result<(), BucketSnapshotLoadError> {
-        Self::release_bucket_delete_finalize_claim(self, pg_id, claim)
-    }
-
     fn bucket_delete_finalize_claim(
         &self,
         pg_id: BucketPgId,
@@ -1444,6 +1387,65 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         last_error: &str,
     ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError> {
         Self::record_lifecycle_sweep_claim_error(self, pg_id, claim, last_error)
+    }
+}
+
+impl RetainedBucketWriteReservationNodeClient for LocalStorageNodeClient {
+    fn release_durable_bucket_write_reservation(
+        &self,
+        pg_id: BucketPgId,
+        record: &BucketWriteReservationRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::release_durable_bucket_write_reservation(
+            &*pg, record,
+        )?)
+    }
+
+    fn release_metadata_command_bucket_write_reservation(
+        &self,
+        pg_id: BucketPgId,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        if let Some(record) = PgMetadataStore::durable_bucket_write_reservation(
+            &*pg,
+            &proof.bucket,
+            &proof.reservation_id,
+        )? {
+            if !proof.matches_record(&record) {
+                return Err(MetadataError::BucketWriteReservationConflict {
+                    reservation_id: proof.reservation_id.clone(),
+                }
+                .into());
+            }
+        }
+        Ok(PgMetadataStore::release_metadata_command_bucket_write_reservation(&*pg, proof)?)
+    }
+
+    fn clear_durable_bucket_write_drain(
+        &self,
+        pg_id: BucketPgId,
+        record: &BucketWriteDrainRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::clear_durable_bucket_write_drain(
+            &*pg,
+            &record.bucket,
+            &record.drain_id,
+            &record.owner_token,
+            record.cluster_epoch,
+            record.bucket_execution_generation,
+            record.lease_deadline,
+        )?)
+    }
+
+    fn release_bucket_delete_finalize_claim(
+        &self,
+        pg_id: BucketPgId,
+        claim: &BucketDeleteFinalizeClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        Self::release_bucket_delete_finalize_claim(self, pg_id, claim)
     }
 
     fn release_lifecycle_sweep_claim(

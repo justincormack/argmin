@@ -50,8 +50,9 @@ use crate::node_client::{
     DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
     MetadataCommandNodeClient, ObjectDeleteStorageSnapshot, ObjectGenerationMetadataNodeClient,
     ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
-    ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, ShardAckNodeClient,
-    ShardScavengerNodeClient, UpdateStreamUploadBucketWriteReservationReq,
+    ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
+    RetainedBucketWriteReservationNodeClient, ShardAckNodeClient, ShardScavengerNodeClient,
+    UpdateStreamUploadBucketWriteReservationReq,
 };
 use crate::node_runtime::pg_store::{
     initialize_pg_durable_identity, inspect_pg_shard_inventory, sync_initialized_pg_store_layout,
@@ -6343,7 +6344,7 @@ impl StorageNodeRetainedBucketWriteReservationRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
+        RetainedBucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
             &local_client,
             self.pg_id,
             self.record,
@@ -6385,7 +6386,7 @@ impl StorageNodeRetainedMetadataCommandProofRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::release_metadata_command_bucket_write_reservation(
+        RetainedBucketWriteReservationNodeClient::release_metadata_command_bucket_write_reservation(
             &local_client,
             self.pg_id,
             self.proof,
@@ -6415,7 +6416,7 @@ impl StorageNodeRetainedBucketWriteDrainRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
+        RetainedBucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
             &local_client,
             self.pg_id,
             self.record,
@@ -6456,7 +6457,7 @@ impl StorageNodeRetainedBucketDeleteFinalizeClaimRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
+        RetainedBucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
             &local_client,
             self.pg_id,
             self.claim,
@@ -6497,7 +6498,7 @@ impl StorageNodeRetainedLifecycleSweepClaimRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
+        RetainedBucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
             &local_client,
             self.pg_id,
             self.claim,

@@ -9370,7 +9370,7 @@ impl StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node_for_retained_cleanup(proof.cluster_epoch, PgId::new(pg_id))?;
-        node.bucket_write_reservation_client()
+        node.retained_bucket_write_reservation_client()
             .release_metadata_command_bucket_write_reservation(
                 self.validated_bucket_metadata_pg(PgId::new(pg_id)),
                 proof,

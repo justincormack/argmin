@@ -228,18 +228,6 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         proof: &BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError>;
 
-    fn release_durable_bucket_write_reservation(
-        &self,
-        pg_id: BucketPgId,
-        record: &BucketWriteReservationRecord,
-    ) -> Result<(), BucketSnapshotLoadError>;
-
-    fn release_metadata_command_bucket_write_reservation(
-        &self,
-        pg_id: BucketPgId,
-        proof: &BucketWriteReservationProof,
-    ) -> Result<(), BucketSnapshotLoadError>;
-
     #[allow(clippy::too_many_arguments)]
     fn begin_durable_bucket_write_drain(
         &self,
@@ -275,12 +263,6 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         lease_deadline: u64,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError>;
-
-    fn clear_durable_bucket_write_drain(
-        &self,
-        pg_id: BucketPgId,
-        record: &BucketWriteDrainRecord,
-    ) -> Result<(), BucketSnapshotLoadError>;
 
     fn clear_expired_durable_bucket_write_drain(
         &self,
@@ -339,12 +321,6 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         now: u64,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
 
-    fn release_bucket_delete_finalize_claim(
-        &self,
-        pg_id: BucketPgId,
-        claim: &BucketDeleteFinalizeClaimRecord,
-    ) -> Result<(), BucketSnapshotLoadError>;
-
     fn bucket_delete_finalize_claim(
         &self,
         pg_id: BucketPgId,
@@ -391,6 +367,38 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         claim: &LifecycleSweepClaimRecord,
         last_error: &str,
     ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError>;
+}
+
+/// Cleanup authority for exact durable bucket-write subjects which may need
+/// to outlive the active route that created them.
+///
+/// Keeping these operations separate prevents an active acquisition client
+/// from being used implicitly for retained proof, drain, or worker-claim
+/// cleanup.
+pub(crate) trait RetainedBucketWriteReservationNodeClient: Send + Sync {
+    fn release_durable_bucket_write_reservation(
+        &self,
+        pg_id: BucketPgId,
+        record: &BucketWriteReservationRecord,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
+    fn release_metadata_command_bucket_write_reservation(
+        &self,
+        pg_id: BucketPgId,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
+    fn clear_durable_bucket_write_drain(
+        &self,
+        pg_id: BucketPgId,
+        record: &BucketWriteDrainRecord,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
+    fn release_bucket_delete_finalize_claim(
+        &self,
+        pg_id: BucketPgId,
+        claim: &BucketDeleteFinalizeClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError>;
 
     fn release_lifecycle_sweep_claim(
         &self,
