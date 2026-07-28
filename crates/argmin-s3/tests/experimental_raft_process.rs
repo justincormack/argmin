@@ -2352,33 +2352,45 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
     node101.stop();
     node102.stop();
 
-    let padded_endpoint = "x".repeat(120 * 1024);
-    let send_padded_append_batch = |prev_log_id: ControlPlaneRaftLogId| {
-        let commands = (0..64)
-            .map(|_| ControlPlaneCommand::BootstrapInitialClusterMap {
-                nodes: vec![(NodeId::new(1), padded_endpoint.clone())],
-                pg_ids: vec![PgId::new(0)],
-            })
-            .collect();
-        peer_client
-            .begin_append_commands(
+    let send_padded_append_batch =
+        |prev_log_id: ControlPlaneRaftLogId, padded_endpoint_bytes: usize| {
+            let padded_endpoint = "x".repeat(padded_endpoint_bytes);
+            let commands = (0..64)
+                .map(|_| ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(1), padded_endpoint.clone())],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .collect();
+            peer_client.begin_append_commands(
                 append_term,
                 prev_log_id,
                 follower_log_before_crash.committed,
                 commands,
             )
-            .expect("padded append should be written to follower peer socket")
-    };
+        };
 
-    // Keep the suffix just below the 64 MiB checkpoint threshold while the
-    // artifact path is writable, then cross it only after checkpoint writes
-    // are blocked. This exercises the resource bound without waiting for the
-    // one-minute age bound.
-    for _ in 0..8 {
-        let (appended_log_id, response) = send_padded_append_batch(prev_log_id);
-        response
-            .wait()
-            .expect("sub-threshold fsynced padded peer WAL append should be acknowledged");
+    // Build a 60 MiB payload prefix using requests small enough to complete
+    // within the peer's one-second end-to-end deadline on slower filesystems.
+    // This leaves ample framing headroom below the 64 MiB checkpoint boundary.
+    const PREFIX_ENDPOINT_BYTES: usize = 32 * 1024;
+    const PREFIX_BATCHES: usize = 30;
+    for batch in 0..PREFIX_BATCHES {
+        let (appended_log_id, response) = send_padded_append_batch(
+            prev_log_id,
+            PREFIX_ENDPOINT_BYTES,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "sub-threshold padded peer WAL append batch {batch} request should be sent: {error:?}\n{}",
+                process_logs(test_dir.path())
+            )
+        });
+        response.wait().unwrap_or_else(|error| {
+            panic!(
+                "sub-threshold fsynced padded peer WAL append batch {batch} should be acknowledged: {error:?}\n{}",
+                process_logs(test_dir.path())
+            )
+        });
         prev_log_id = appended_log_id;
     }
     let acknowledged_log_id = prev_log_id;
@@ -2391,9 +2403,15 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
 
     // Keep the threshold-crossing connection alive, but do not require its
     // response to race the independently scheduled checkpoint failure. The
-    // eight preceding batches establish the acknowledged recovery prefix.
+    // preceding batches establish the acknowledged recovery prefix. A 4 MiB
+    // payload batch then carries the WAL suffix beyond the 64 MiB threshold.
     let (appended_log_id, _threshold_crossing_response) =
-        send_padded_append_batch(acknowledged_log_id);
+        send_padded_append_batch(acknowledged_log_id, 64 * 1024).unwrap_or_else(|error| {
+            panic!(
+                "threshold-crossing padded peer WAL append request should be sent: {error:?}\n{}",
+                process_logs(test_dir.path())
+            )
+        });
 
     let status = wait_for_process_exit(&mut restarted103, Duration::from_secs(5));
     fs::remove_dir(&follower_checkpoint_tmp_path)
