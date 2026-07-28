@@ -305,7 +305,6 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
     fn heartbeat_durable_bucket_write_reservation_with_effect_fence(
         &self,
         pg_id: BucketPgId,
-        route_cluster_epoch: ClusterEpoch,
         proof: &BucketWriteReservationProof,
         lease_deadline: u64,
         effect_fence: AdmittedRouteEffectFence,
@@ -832,7 +831,6 @@ pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
 
 pub(crate) struct UpdateStreamUploadBucketWriteReservationReq<'a> {
     pub(crate) pg_id: ObjectMetadataPgId,
-    pub(crate) route_cluster_epoch: ClusterEpoch,
     pub(crate) bucket: &'a BucketName,
     pub(crate) key: &'a ObjectKey,
     pub(crate) session_id: &'a SessionId,
@@ -1646,7 +1644,6 @@ pub(crate) trait StorageNodeClient:
     fn heartbeat_durable_bucket_write_reservation_with_effect_fence(
         &self,
         pg_id: BucketPgId,
-        route_cluster_epoch: ClusterEpoch,
         proof: &crate::BucketWriteReservationProof,
         lease_deadline: u64,
         effect_fence: AdmittedRouteEffectFence,
@@ -1918,28 +1915,6 @@ pub(crate) trait StorageNodeClient:
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError>;
 
-    fn next_object_version_id(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<s3_types::VersionId, ObjectPgActionError>;
-
-    fn next_object_generation_id(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<GenerationId, ObjectPgActionError>;
-
-    fn object_generation_reservation(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        reservation_id: &SessionId,
-    ) -> Result<GenerationId, ObjectPgActionError>;
-
     fn load_stream_upload_session(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -2011,20 +1986,6 @@ pub(crate) trait StorageNodeClient:
         request: &PrepareStreamUploadSegmentAppendReq,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError>;
-
-    fn load_direct_put_commit_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        reservation_id: &SessionId,
-        generation_id: GenerationId,
-    ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError>;
-
-    fn build_direct_put_commit_command(
-        &self,
-        request: BuildDirectPutCommitCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 
     fn load_stream_put_finalize_snapshot(
         &self,

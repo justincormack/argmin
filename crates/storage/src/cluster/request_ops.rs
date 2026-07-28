@@ -3676,7 +3676,6 @@ impl super::StorageCluster {
             .bucket_write_reservation_client()
             .heartbeat_durable_bucket_write_reservation_with_effect_fence(
                 bucket_pg_id,
-                effect_fence.cluster_epoch(),
                 &proof,
                 self.put_object_stream_create_lease_deadline(),
                 effect_fence,
@@ -3705,7 +3704,6 @@ impl super::StorageCluster {
                 node.bucket_write_reservation_client()
                     .heartbeat_durable_bucket_write_reservation_with_effect_fence(
                         bucket_pg_id,
-                        effect_fence.cluster_epoch(),
                         &proof,
                         self.put_object_stream_create_lease_deadline(),
                         effect_fence,
@@ -3724,7 +3722,6 @@ impl super::StorageCluster {
             .update_stream_upload_bucket_write_reservation_with_effect_fence(
                 UpdateStreamUploadBucketWriteReservationReq {
                     pg_id: object_pg_id,
-                    route_cluster_epoch: effect_fence.cluster_epoch(),
                     bucket,
                     key,
                     session_id,
@@ -4516,7 +4513,6 @@ impl super::StorageCluster {
             .update_stream_upload_bucket_write_reservation_with_effect_fence(
                 UpdateStreamUploadBucketWriteReservationReq {
                     pg_id: object_pg_id,
-                    route_cluster_epoch: effect_fence.cluster_epoch(),
                     bucket,
                     key,
                     session_id: &upload.session_id,

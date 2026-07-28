@@ -2023,7 +2023,6 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         &client,
         UpdateStreamUploadBucketWriteReservationReq {
             pg_id: correct_pg,
-            route_cluster_epoch: ClusterEpoch::INITIAL,
             bucket: &bucket,
             key: &key,
             session_id: &session_id,
@@ -2038,7 +2037,6 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             &client,
             UpdateStreamUploadBucketWriteReservationReq {
                 pg_id: wrong_pg,
-                route_cluster_epoch: ClusterEpoch::INITIAL,
                 bucket: &bucket,
                 key: &key,
                 session_id: &session_id,

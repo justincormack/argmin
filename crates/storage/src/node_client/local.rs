@@ -1092,7 +1092,6 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
     fn heartbeat_durable_bucket_write_reservation_with_effect_fence(
         &self,
         pg_id: BucketPgId,
-        route_cluster_epoch: ClusterEpoch,
         proof: &BucketWriteReservationProof,
         lease_deadline: u64,
         effect_fence: AdmittedRouteEffectFence,
@@ -1100,7 +1099,6 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         <Self as StorageNodeClient>::heartbeat_durable_bucket_write_reservation_with_effect_fence(
             self,
             pg_id,
-            route_cluster_epoch,
             proof,
             lease_deadline,
             effect_fence,
@@ -1260,13 +1258,13 @@ impl ObjectGenerationMetadataNodeClient for LocalStorageNodeClient {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
-        <Self as StorageNodeClient>::object_generation_reservation(
-            self,
-            pg_id,
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::get_object_generation_reservation(
+            &*pg,
             bucket,
             key,
             reservation_id,
-        )
+        )?)
     }
 
     fn next_object_generation_id(
@@ -1275,7 +1273,8 @@ impl ObjectGenerationMetadataNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<GenerationId, ObjectPgActionError> {
-        <Self as StorageNodeClient>::next_object_generation_id(self, pg_id, bucket, key)
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::next_generation_id(&*pg, bucket, key)?)
     }
 }
 
@@ -1286,7 +1285,8 @@ impl ObjectVersionMetadataNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<VersionId, ObjectPgActionError> {
-        <Self as StorageNodeClient>::next_object_version_id(self, pg_id, bucket, key)
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::next_version_id(&*pg, bucket, key)?)
     }
 }
 
@@ -1299,9 +1299,10 @@ impl DirectPutMetadataNodeClient for LocalStorageNodeClient {
         reservation_id: &SessionId,
         generation_id: GenerationId,
     ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError> {
-        <Self as StorageNodeClient>::load_direct_put_commit_snapshot(
-            self,
-            pg_id,
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        load_direct_put_commit_snapshot_from_pg(
+            &pg,
+            self.node_id,
             bucket,
             key,
             reservation_id,
@@ -1313,7 +1314,98 @@ impl DirectPutMetadataNodeClient for LocalStorageNodeClient {
         &self,
         request: BuildDirectPutCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        <Self as StorageNodeClient>::build_direct_put_commit_command(self, request)
+        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let current = load_direct_put_commit_snapshot_from_pg(
+            &pg,
+            self.node_id,
+            &request.request.bucket,
+            &request.request.key,
+            &request.request.generation_reservation_id,
+            request.request.generation_id,
+        )?;
+        if &current != request.expected_snapshot {
+            return Err(ObjectPgActionError::StaleDirectPutCommitSnapshot);
+        }
+        if request.request.versioning == BucketVersioningState::Enabled
+            && request.version_id.is_null()
+        {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "versioned direct PUT commit requires reserved version id".to_string(),
+            });
+        }
+        if request.request.versioning != BucketVersioningState::Enabled
+            && !request.version_id.is_null()
+        {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "unversioned direct PUT commit must use null version id".to_string(),
+            });
+        }
+
+        let last_modified_millis = crate::clock::current_time_millis();
+        let write_sequence = pg.next_object_write_sequence(
+            request.request.bucket.as_str(),
+            request.request.key.as_str(),
+        )?;
+        let stale_payload = if request.version_id.is_null() {
+            snapshot_direct_put_stale_payload_command(
+                &pg,
+                &request.request.bucket,
+                &request.request.key,
+                last_modified_millis,
+            )?
+        } else {
+            None
+        };
+
+        let segment_record = ObjectSegmentRecord {
+            bucket: request.request.bucket.clone(),
+            key: request.request.key.clone(),
+            version_id: request.version_id,
+            segment_index: request.request.segment_index,
+            size: request.request.size,
+            segment_crc64: request.request.segment_crc64,
+            segment_okh: request.request.segment_okh,
+            segment_vid: request.request.segment_vid,
+            data_pg_id: request.request.data_pg_id,
+            placement_cluster_epoch: request.cluster_epoch,
+            ec_k: request.request.ec.k,
+            ec_m: request.request.ec.m,
+        };
+        let object = PutLiveObjectReq {
+            bucket: request.request.bucket.clone(),
+            key: request.request.key.clone(),
+            version_id: request.version_id,
+            owner: request.request.owner.clone(),
+            acl_grants: request.request.acl_grants.clone(),
+            public_read: request.request.public_read,
+            generation_id: request.request.generation_id,
+            size: request.request.size,
+            etag: ObjectEtag::single_part(request.request.etag_crc64),
+            ec: request.request.ec,
+            layout: ObjectLayout::Standard,
+            tags: request.request.tags.clone(),
+            metadata_blob: Some(request.request.metadata_blob.clone()),
+            system_metadata_blob: Some(request.request.system_metadata_blob.clone()),
+            object_lock: request.request.object_lock,
+            encryption: request.request.encryption.clone(),
+        };
+        let command_id = self.next_metadata_command_id_from_locked_pg(
+            request.pg_id.pg_id(),
+            request.cluster_epoch,
+            &pg,
+        )?;
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+                object,
+                segments: vec![segment_record],
+                generation_reservation_id: request.request.generation_reservation_id.clone(),
+                write_sequence,
+                last_modified_millis,
+                stale_payload,
+                bucket_write_reservation: request.bucket_write_reservation.clone(),
+            })),
+        ))
     }
 }
 
@@ -2173,13 +2265,12 @@ impl StorageNodeClient for LocalStorageNodeClient {
     fn heartbeat_durable_bucket_write_reservation_with_effect_fence(
         &self,
         pg_id: BucketPgId,
-        route_cluster_epoch: ClusterEpoch,
         proof: &crate::BucketWriteReservationProof,
         lease_deadline: u64,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        effect_fence.require_valid_for(route_cluster_epoch)?;
+        effect_fence.require_valid_for(effect_fence.cluster_epoch())?;
         Ok(PgMetadataStore::heartbeat_durable_bucket_write_reservation(
             &*pg,
             DurableBucketWriteReservationHeartbeat {
@@ -3061,42 +3152,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
         )?)
     }
 
-    fn next_object_version_id(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<s3_types::VersionId, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::next_version_id(&*pg, bucket, key)?)
-    }
-
-    fn next_object_generation_id(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<GenerationId, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::next_generation_id(&*pg, bucket, key)?)
-    }
-
-    fn object_generation_reservation(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        reservation_id: &SessionId,
-    ) -> Result<GenerationId, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::get_object_generation_reservation(
-            &*pg,
-            bucket,
-            key,
-            reservation_id,
-        )?)
-    }
-
     fn load_stream_upload_session(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -3364,123 +3419,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
         self.prepare_stream_segment_append_inner(pg_id, bucket, key, request, Some(effect_fence))
     }
 
-    fn load_direct_put_commit_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        reservation_id: &SessionId,
-        generation_id: GenerationId,
-    ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        load_direct_put_commit_snapshot_from_pg(
-            &pg,
-            self.node_id,
-            bucket,
-            key,
-            reservation_id,
-            generation_id,
-        )
-    }
-
-    fn build_direct_put_commit_command(
-        &self,
-        request: BuildDirectPutCommitCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(request.pg_id.get())?;
-        let current = load_direct_put_commit_snapshot_from_pg(
-            &pg,
-            self.node_id,
-            &request.request.bucket,
-            &request.request.key,
-            &request.request.generation_reservation_id,
-            request.request.generation_id,
-        )?;
-        if &current != request.expected_snapshot {
-            return Err(ObjectPgActionError::StaleDirectPutCommitSnapshot);
-        }
-        if request.request.versioning == BucketVersioningState::Enabled
-            && request.version_id.is_null()
-        {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "versioned direct PUT commit requires reserved version id".to_string(),
-            });
-        }
-        if request.request.versioning != BucketVersioningState::Enabled
-            && !request.version_id.is_null()
-        {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "unversioned direct PUT commit must use null version id".to_string(),
-            });
-        }
-
-        let last_modified_millis = crate::clock::current_time_millis();
-        let write_sequence = pg.next_object_write_sequence(
-            request.request.bucket.as_str(),
-            request.request.key.as_str(),
-        )?;
-        let stale_payload = if request.version_id.is_null() {
-            snapshot_direct_put_stale_payload_command(
-                &pg,
-                &request.request.bucket,
-                &request.request.key,
-                last_modified_millis,
-            )?
-        } else {
-            None
-        };
-
-        let segment_record = ObjectSegmentRecord {
-            bucket: request.request.bucket.clone(),
-            key: request.request.key.clone(),
-            version_id: request.version_id,
-            segment_index: request.request.segment_index,
-            size: request.request.size,
-            segment_crc64: request.request.segment_crc64,
-            segment_okh: request.request.segment_okh,
-            segment_vid: request.request.segment_vid,
-            data_pg_id: request.request.data_pg_id,
-            placement_cluster_epoch: request.cluster_epoch,
-            ec_k: request.request.ec.k,
-            ec_m: request.request.ec.m,
-        };
-        let object = PutLiveObjectReq {
-            bucket: request.request.bucket.clone(),
-            key: request.request.key.clone(),
-            version_id: request.version_id,
-            owner: request.request.owner.clone(),
-            acl_grants: request.request.acl_grants.clone(),
-            public_read: request.request.public_read,
-            generation_id: request.request.generation_id,
-            size: request.request.size,
-            etag: ObjectEtag::single_part(request.request.etag_crc64),
-            ec: request.request.ec,
-            layout: ObjectLayout::Standard,
-            tags: request.request.tags.clone(),
-            metadata_blob: Some(request.request.metadata_blob.clone()),
-            system_metadata_blob: Some(request.request.system_metadata_blob.clone()),
-            object_lock: request.request.object_lock,
-            encryption: request.request.encryption.clone(),
-        };
-        let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
-            &pg,
-        )?;
-        Ok(MetadataCommandEnvelope::new(
-            command_id,
-            MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
-                object,
-                segments: vec![segment_record],
-                generation_reservation_id: request.request.generation_reservation_id.clone(),
-                write_sequence,
-                last_modified_millis,
-                stale_payload,
-                bucket_write_reservation: request.bucket_write_reservation.clone(),
-            })),
-        ))
-    }
-
     fn load_stream_put_finalize_snapshot(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -3530,7 +3468,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         }
         request
             .effect_fence
-            .require_valid_for(request.route_cluster_epoch)?;
+            .require_valid_for(request.effect_fence.cluster_epoch())?;
         Ok(
             PgMetadataStore::update_stream_upload_bucket_write_reservation(
                 &*pg,

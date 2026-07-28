@@ -3499,6 +3499,31 @@ Seventy-sixth Phase 3 review correction:
   bucket reservation and persisted session proof advance to the same deadline
   while retaining their epoch-N stable identity.
 
+Seventy-seventh Phase 3 slice:
+
+- the transitional `StorageNodeClient` aggregate no longer exposes object
+  generation allocation, object version allocation, or direct-PUT snapshot
+  and command construction. Those operations are available only through the
+  role-specific `ObjectGenerationMetadataNodeClient`,
+  `ObjectVersionMetadataNodeClient`, and `DirectPutMetadataNodeClient`
+  interfaces. Their duplicate raw method set and duplicate local
+  implementation are removed, so adding or changing one of these operations
+  has one compiler-visible interface and implementation.
+- the two admitted stream-heartbeat mutation boundaries no longer accept a
+  separately caller-supplied route epoch alongside their
+  `AdmittedRouteEffectFence`. Bucket-reservation renewal and persisted stream
+  proof update derive the authorizing current route epoch from the fence;
+  the durable reservation proof deliberately retains its independent stable
+  acquisition epoch. This removes a contradictory state without conflating
+  route authority with proof identity.
+- the remaining bucket metadata/write-reservation, object mutation/read, and
+  payload-reclaim duplicates in the transitional aggregate, together with
+  capability requirements on the role-specific node-client traits, remain
+  open in Phase 3.
+- the seven focused embedded/Unix generation, version, direct-PUT, and
+  heartbeat regressions pass, as do all 2,359 storage tests, formatting, the
+  storage boundary checker, and workspace-wide strict Clippy.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

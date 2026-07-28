@@ -543,11 +543,11 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
     fn heartbeat_durable_bucket_write_reservation_with_effect_fence(
         &self,
         pg_id: BucketPgId,
-        route_cluster_epoch: ClusterEpoch,
         proof: &BucketWriteReservationProof,
         lease_deadline: u64,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        let route_cluster_epoch = effect_fence.cluster_epoch();
         effect_fence.require_valid_for(route_cluster_epoch)?;
         if route_cluster_epoch != self.cluster_epoch {
             return Err(BucketSnapshotLoadError::Store(
@@ -2900,13 +2900,12 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         &self,
         update: UpdateStreamUploadBucketWriteReservationReq<'_>,
     ) -> Result<(), ObjectPgActionError> {
-        update
-            .effect_fence
-            .require_valid_for(update.route_cluster_epoch)?;
-        if update.route_cluster_epoch != self.cluster_epoch {
+        let route_cluster_epoch = update.effect_fence.cluster_epoch();
+        update.effect_fence.require_valid_for(route_cluster_epoch)?;
+        if route_cluster_epoch != self.cluster_epoch {
             return Err(ObjectPgActionError::Store(
                 StoreError::RouteAdmissionClusterMismatch {
-                    admitted_epoch: update.route_cluster_epoch,
+                    admitted_epoch: route_cluster_epoch,
                     operation_epoch: self.cluster_epoch,
                 },
             ));

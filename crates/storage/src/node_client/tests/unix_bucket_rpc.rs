@@ -1162,7 +1162,6 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
     let renewed = BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation_with_effect_fence(
         &client,
         bucket_pg_id_for_test(0),
-        ClusterEpoch::new(1).unwrap(),
         &BucketWriteReservationProof::from(&record),
         renewed_deadline,
         crate::types::AdmittedRouteEffectFence::bounded(
@@ -1267,7 +1266,6 @@ fn unix_bucket_write_reservation_identity_uses_current_route_after_epoch_change(
     let renewed = BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation_with_effect_fence(
         &client,
         bucket_pg_id_for_test(0),
-        route_epoch,
         &proof,
         lease_deadline.saturating_add(60_000),
         crate::types::AdmittedRouteEffectFence::bounded(

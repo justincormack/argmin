@@ -4134,7 +4134,6 @@ impl StorageNodeActiveBucketRoute<'_> {
         BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation_with_effect_fence(
             &local_client,
             self.pg_id,
-            self.fence.cluster_epoch,
             proof,
             lease_deadline,
             effect_fence,
@@ -5044,7 +5043,6 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             &local_client,
             UpdateStreamUploadBucketWriteReservationReq {
                 pg_id: self.route.pg_id,
-                route_cluster_epoch: self.route.fence.cluster_epoch,
                 bucket: self.route.bucket,
                 key: self.route.key,
                 session_id,

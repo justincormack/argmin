@@ -318,9 +318,11 @@ handle. Both durable effects—the bucket reservation lease renewal and the
 stream session's persisted proof update—receive and revalidate the original
 effect fence immediately beside mutation. The route epoch binds the new
 effect; the reservation proof may retain its older acquisition epoch across a
-route transition. Unix and TLS/TCP carry only the portable wall deadline and
-rebind it to storage-local monotonic time. The raw unbounded heartbeat adapter
-is test/test-hook-only.
+route transition. The node-client heartbeat interfaces derive that authorizing
+route epoch from the effect fence itself; callers cannot provide a second epoch
+which disagrees with the fence. Unix and TLS/TCP carry only the portable wall
+deadline and rebind it to storage-local monotonic time. The raw unbounded
+heartbeat adapter is test/test-hook-only.
 
 `ActiveMultipartObjectRoute` is the corresponding non-cloneable authority for
 one multipart bucket/key/object-metadata-PG tuple. In addition to multipart
