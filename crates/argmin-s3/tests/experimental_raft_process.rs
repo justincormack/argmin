@@ -2429,12 +2429,7 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
             .expect("follower peer socket should connect");
         write_control_plane_raft_peer_transport_frame(&mut peer_stream, &append_frame)
             .expect("padded append frame should be written to follower peer socket");
-        read_control_plane_raft_peer_transport_frame(
-            &mut peer_stream,
-            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
-        )
-        .expect("fsynced padded peer WAL append should be acknowledged");
-        appended_log_id
+        (appended_log_id, peer_stream)
     };
 
     // Keep the suffix just below the 64 MiB checkpoint threshold while the
@@ -2442,8 +2437,15 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
     // are blocked. This exercises the resource bound without waiting for the
     // one-minute age bound.
     for _ in 0..8 {
-        prev_log_id = send_padded_append_batch(prev_log_id);
+        let (appended_log_id, mut peer_stream) = send_padded_append_batch(prev_log_id);
+        read_control_plane_raft_peer_transport_frame(
+            &mut peer_stream,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        )
+        .expect("sub-threshold fsynced padded peer WAL append should be acknowledged");
+        prev_log_id = appended_log_id;
     }
+    let acknowledged_log_id = prev_log_id;
     let follower_checkpoint_tmp_path =
         state_tmp_path_for_process(&follower_state_path, restarted103.process_id());
     let _ = fs::remove_file(&follower_checkpoint_tmp_path);
@@ -2451,7 +2453,11 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
     fs::create_dir(&follower_checkpoint_tmp_path)
         .expect("follower checkpoint temp path should be blocked by a directory");
 
-    let appended_log_id = send_padded_append_batch(prev_log_id);
+    // Keep the threshold-crossing connection alive, but do not require its
+    // response to race the independently scheduled checkpoint failure. The
+    // eight preceding batches establish the acknowledged recovery prefix.
+    let (appended_log_id, _threshold_crossing_stream) =
+        send_padded_append_batch(acknowledged_log_id);
 
     let status = wait_for_process_exit(&mut restarted103, Duration::from_secs(5));
     fs::remove_dir(&follower_checkpoint_tmp_path)
@@ -2476,7 +2482,7 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
     assert_eq!(
         follower_log_after_crash.last_log_id,
         Some(appended_log_id),
-        "artifact plus WAL must recover the acknowledged and fsynced follower append; before={follower_log_before_crash:?} after={follower_log_after_crash:?} vote_after={follower_vote_after_crash:?}"
+        "artifact plus WAL must recover the acknowledged prefix through {acknowledged_log_id:?} and the fsynced threshold-crossing append; before={follower_log_before_crash:?} after={follower_log_after_crash:?} vote_after={follower_vote_after_crash:?}"
     );
 
     let mut recovered103 =
