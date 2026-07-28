@@ -179,6 +179,7 @@ impl Coordinator {
     /// Supports conditional headers on both source and destination,
     /// and metadata directive (COPY preserves source metadata, REPLACE
     /// uses new headers).
+    #[cfg(test)]
     pub fn copy_object(&self, req: &CopyObjectRequest) -> Result<CopyObjectResult, ServerError> {
         let admission = self.admit_storage_route_for_request()?;
         self.copy_object_on_admitted_route(&admission, req)
@@ -208,7 +209,6 @@ impl Coordinator {
         let directive = &req.directive;
         let source_sse_customer = req.source_sse_customer;
         self.require_storage_route_admission(admission)?;
-        let storage_node = self.storage_node();
         let dst_explicit_sse_customer = self.prepare_sse_customer_write_context(
             req.destination_encryption.sse_customer_request(),
         )?;
@@ -218,7 +218,7 @@ impl Coordinator {
         let AuthorizedCopyObject {
             source: source_snapshot,
             destination: dst_authorized,
-        } = self.authorize_copy_object_on_admitted_route(admission, &storage_node, req)?;
+        } = self.authorize_copy_object_on_admitted_route(admission, req)?;
 
         let AuthorizedCopySourceRead {
             snapshot: source_snapshot,
@@ -284,7 +284,15 @@ impl Coordinator {
                 });
             }
 
-            let retained = storage_node
+            let source_route = admission
+                .active_object_read_route(
+                    &req.source.bucket,
+                    &req.source.key,
+                    src_version_id,
+                    storage::ObjectReadSnapshotMode::FullPayloadLayout,
+                )
+                .map_err(super::map_store_error)?;
+            let retained = source_route
                 .retain_object_payload_read(source_payload_handoff)
                 .map_err(super::map_store_error)?
                 .ok_or_else(|| ServerError::InternalError {
@@ -350,10 +358,25 @@ impl Coordinator {
             } => Some(StreamingChecksumAccumulator::new(*algo)),
             _ => None,
         };
-        let session_id = self.create_stream_put_session_for_authorized_write_with_storage_node(
-            &storage_node,
-            &dst_authorized,
+        let destination_route = admission
+            .active_put_object_route(
+                req.destination.bucket.name_typed(),
+                req.destination.key_typed(),
+            )
+            .map_err(super::map_store_error)?;
+        let stream_cleanup = self.retained_stream_upload_cleanup(
+            admission,
+            req.destination.bucket.name_typed(),
+            req.destination.key_typed(),
         )?;
+        let session_id = Self::random_session_id("failed to generate copy stream session ID")?;
+        destination_route
+            .create_stream_session_record(
+                &session_id,
+                dst_authorized.write_encryption.object_encryption(),
+                admission.authority_valid_until_ms(),
+            )
+            .map_err(Self::map_object_pg_action_error)?;
         let dst_write_encryption = &dst_authorized.write_encryption;
         let copy_result = (|| {
             let mut crc64 = checksum::crc64::Hasher::new();
@@ -372,8 +395,8 @@ impl Coordinator {
                 }
                 let chunk_crc64 = checksum::crc64::checksum(&chunk);
                 let storage_chunk = dst_write_encryption.encrypt_segment(segment_index, &chunk)?;
-                self.append_stream_segment_for_storage_node(
-                    &storage_node,
+                self.append_stream_segment_on_admitted_put_route(
+                    &destination_route,
                     req.destination.bucket.name_typed(),
                     req.destination.key_typed(),
                     &session_id,
@@ -405,8 +428,8 @@ impl Coordinator {
             }
 
             let put_result = self
-                .finalize_stream_put_with_authorized_write_tags_with_storage_node(
-                    &storage_node,
+                .finalize_stream_put_with_authorized_write_tags_on_admitted_route(
+                    &destination_route,
                     &AuthorizedFinalizeStreamPutRequest {
                         session_id: &session_id,
                         crc64: crc64.finalize(),
@@ -433,12 +456,8 @@ impl Coordinator {
             })
         })();
         if copy_result.is_err() {
-            let _ = self.abort_stream_put_for_cleanup_with_storage_node(
-                &storage_node,
-                req.destination.bucket.name_typed(),
-                req.destination.key_typed(),
-                &session_id,
-            );
+            let _ = self
+                .abort_stream_upload_with_retained_cleanup_retrying(&stream_cleanup, &session_id);
         }
         copy_result
     }

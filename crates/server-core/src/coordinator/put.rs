@@ -939,7 +939,7 @@ impl Coordinator {
         )
     }
 
-    fn finalize_stream_put_with_authorized_write_tags_on_admitted_route(
+    pub(super) fn finalize_stream_put_with_authorized_write_tags_on_admitted_route(
         &self,
         route: &storage::ActivePutObjectRoute<'_>,
         req: &AuthorizedFinalizeStreamPutRequest<'_>,

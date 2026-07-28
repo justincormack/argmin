@@ -175,6 +175,66 @@ impl Coordinator {
             .map_err(Self::map_object_pg_action_error)
     }
 
+    pub(super) fn abort_stream_upload_with_retained_cleanup_retrying(
+        &self,
+        cleanup: &storage::RetainedStreamUploadCleanup,
+        session_id: &SessionId,
+    ) -> Result<(), ServerError> {
+        self.abort_stream_upload_with_retained_cleanup_until(
+            cleanup,
+            session_id,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(5),
+        )
+    }
+
+    fn abort_stream_upload_with_retained_cleanup_until(
+        &self,
+        cleanup: &storage::RetainedStreamUploadCleanup,
+        session_id: &SessionId,
+        deadline: Instant,
+        retry_delay: Duration,
+    ) -> Result<(), ServerError> {
+        loop {
+            match cleanup
+                .abort(session_id)
+                .map_err(Self::map_object_pg_action_error)
+            {
+                Ok(()) => return Ok(()),
+                Err(error @ (ServerError::OperationAborted | ServerError::SlowDown)) => {
+                    let now = Instant::now();
+                    let Some(remaining) = deadline.checked_duration_since(now) else {
+                        return Err(error);
+                    };
+                    if remaining.is_zero() {
+                        return Err(error);
+                    }
+                    std::thread::sleep(retry_delay.min(remaining));
+                    if Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn abort_stream_upload_with_retained_cleanup_for_test(
+        &self,
+        cleanup: &storage::RetainedStreamUploadCleanup,
+        session_id: &SessionId,
+        retry_timeout: Duration,
+        retry_delay: Duration,
+    ) -> Result<(), ServerError> {
+        self.abort_stream_upload_with_retained_cleanup_until(
+            cleanup,
+            session_id,
+            Instant::now() + retry_timeout,
+            retry_delay,
+        )
+    }
+
     pub fn prepare_sse_customer_write_context(
         &self,
         sse_customer: Option<&SseCustomerRequest>,

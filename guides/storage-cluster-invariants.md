@@ -296,7 +296,8 @@ and may complete while a successor map waits to publish. Raw cluster
 metadata-mutation entry points are available only to storage unit tests.
 
 `ActivePutObjectRoute` is the non-cloneable authority for one complete direct
-or promoted-stream PutObject workflow. It fixes the bucket, key,
+or promoted-stream PutObject workflow, including the destination side of
+CopyObject. It fixes the bucket, key,
 bucket-metadata PG, object-metadata PG, publication domain, and immutable
 request deadline before
 authorization. The same route then owns current-object loading, the durable
@@ -316,15 +317,16 @@ earlier in a partially completed direct placement.
 Its private fields bind the exact object snapshot, requested version, metadata
 route, originating cluster, and broad generation lease; callers may inspect the
 snapshot but cannot pair another snapshot with that lease. An
-`ActiveObjectReadRoute` can consume it only when all provenance matches, while
-the pinned cluster retained by an admitted CopyObject or UploadPartCopy request
-consumes the same source token. Both forms derive every shard owner from the
-token's recorded placement epochs, acquire the narrow storage-node leases, and
-only then release the broad lease. Copy-source snapshot loading itself uses the
-request admission, so its retained repair fence captures the publication
-generation and immutable request deadline. The authorization result and token
-share one immutable snapshot allocation, so large multipart part and segment
-vectors are not cloned during handoff.
+`ActiveObjectReadRoute` can consume it only when all provenance matches.
+CopyObject reconstructs that exact admitted source route before consuming the
+handoff; UploadPartCopy remains on the transitional pinned-cluster path. Both
+forms derive every shard owner from the token's recorded placement epochs,
+acquire the narrow storage-node leases, and only then release the broad lease.
+Copy-source snapshot loading itself uses the request admission, so its retained
+repair fence captures the publication generation and immutable request
+deadline. The authorization result and token share one immutable snapshot
+allocation, so large multipart part and segment vectors are not cloned during
+handoff.
 
 `RetainedObjectPayloadRead` is the resulting response-body or copy-source
 authority. It carries no long-lived publication admission and cannot perform

@@ -1535,6 +1535,126 @@ fn promoted_put_expires_inside_stream_append_and_cleans_staged_payload() {
 }
 
 #[test]
+fn copy_object_expires_inside_destination_append_and_cleans_stream_state() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    initial_coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    test_helpers::put_object(
+        &initial_coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                "copy-source",
+                test_requester(),
+                None,
+            ),
+            data: b"copy payload must not be published after route expiry",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
+    drop(initial_coord);
+    drop(initial);
+    let cluster = open_same_store_cluster_with_route_map_validity(
+        same_store_inputs,
+        RouteMapValidity::until_ms(5_000).unwrap(),
+    );
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&cluster),
+    );
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+
+    let attempted_shards = Arc::new(Mutex::new(Vec::new()));
+    let hook_attempted_shards = Arc::clone(&attempted_shards);
+    let shard_hook = cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(
+        move |location, key| {
+            hook_attempted_shards
+                .lock()
+                .unwrap()
+                .push((*location, key.clone()));
+            Ok(())
+        },
+    ));
+    let hook_clock = Arc::clone(&clock);
+    let append_hook = cluster
+        .test_install_before_stream_append_command_id_hook(Arc::new(move || hook_clock.set(4_500)));
+    let error = coord
+        .copy_object_on_admitted_route(
+            &admission,
+            &CopyObjectRequest {
+                source: copy_source("bucket", "copy-source", None),
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "late-copy-destination",
+                    test_requester(),
+                    None,
+                ),
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                website_redirect_location: None,
+                tagging: TaggingDirective::Copy,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                source_sse_customer: None,
+                destination_encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    drop(append_hook);
+    drop(shard_hook);
+    drop(admission);
+
+    let attempted = attempted_shards.lock().unwrap().clone();
+    assert!(
+        !attempted.is_empty(),
+        "CopyObject must stage destination shards before append publication"
+    );
+    for (location, key) in attempted {
+        assert!(
+            !cluster
+                .test_placed_payload_shard_file_exists(location, &key)
+                .unwrap(),
+            "expired CopyObject must remove every staged destination shard"
+        );
+    }
+    assert!(cluster
+        .load_existing_live_object(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-copy-destination"),
+        )
+        .unwrap()
+        .is_none());
+    assert!(
+        cluster
+            .list_stream_upload_sessions_best_effort()
+            .into_iter()
+            .all(|session| session.bucket.as_str() != "bucket"
+                || session.key.as_str() != "late-copy-destination"),
+        "failed CopyObject must abort its destination stream session through retained cleanup"
+    );
+}
+
+#[test]
 fn stream_put_finalization_expires_inside_command_build() {
     let tmp = test_util::tempdir();
     let initial = open_test_storage_cluster(tmp.path(), &[0]);
@@ -4264,6 +4384,29 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
     foreign
         .get_object_legal_hold_on_admitted_route(&foreign_admission, &metadata_request)
         .unwrap();
+    foreign
+        .copy_object_on_admitted_route(
+            &foreign_admission,
+            &CopyObjectRequest {
+                source: copy_source("bucket", "key", None),
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "copy-domain-canary",
+                    test_requester(),
+                    None,
+                ),
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                website_redirect_location: None,
+                tagging: TaggingDirective::Copy,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                source_sse_customer: None,
+                destination_encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+            },
+        )
+        .unwrap();
 
     let rejected_tags = PutObjectTagsRequest {
         object: object_version_request_with_expected_owner(
@@ -4328,12 +4471,36 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
         cond: NO_WRITE,
         acl: NO_PUT_OBJECT_ACL.into(),
     };
+    let rejected_copy = CopyObjectRequest {
+        source: copy_source("bucket", "key", None),
+        destination: object_request_with_expected_owner(
+            "bucket",
+            "foreign-domain-copy",
+            test_requester(),
+            None,
+        ),
+        dst_condition: NO_WRITE,
+        directive: MetadataDirective::Copy,
+        website_redirect_location: None,
+        tagging: TaggingDirective::Copy,
+        acl: NO_PUT_OBJECT_ACL.into(),
+        policy_context: PutObjectPolicyContext::default(),
+        source_sse_customer: None,
+        destination_encryption: WriteEncryptionRequest::none(),
+        object_lock: ObjectLockState::default(),
+    };
 
     for (operation, result) in [
         (
             "PutObject",
             local
                 .put_object_on_admitted_route(&foreign_admission, &rejected_put)
+                .map(|_| ()),
+        ),
+        (
+            "CopyObject",
+            local
+                .copy_object_on_admitted_route(&foreign_admission, &rejected_copy)
                 .map(|_| ()),
         ),
         (
@@ -4456,6 +4623,32 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
         )
         .unwrap()
         .is_none());
+    assert!(cluster
+        .load_existing_live_object(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("foreign-domain-copy"),
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        foreign
+            .get_object(&GetObjectRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "copy-domain-canary",
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+                sse_customer: None,
+            })
+            .unwrap()
+            .body
+            .read_all()
+            .unwrap(),
+        b"data"
+    );
 }
 
 #[test]
@@ -4504,6 +4697,62 @@ fn retained_stream_cleanup_rejects_admission_from_an_unrelated_coordinator() {
         .retained_stream_upload_cleanup(&local_admission, &bucket, &key)
         .unwrap();
     local
+        .abort_stream_upload_with_retained_cleanup(&cleanup, &session_id)
+        .unwrap();
+    assert!(matches!(
+        cluster.load_stream_upload_session(&bucket, &key, &session_id),
+        Err(storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::StreamSessionNotFound { .. }
+        ))
+    ));
+}
+
+#[test]
+fn retained_stream_cleanup_does_not_retry_after_its_deadline() {
+    let tmp = test_util::tempdir();
+    let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let admission = coord.admit_storage_route_for_request().unwrap();
+    let cleanup = coord
+        .retained_stream_upload_cleanup(&admission, &bucket, &key)
+        .unwrap();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let hook_attempts = Arc::clone(&attempts);
+    let hook = cluster.test_install_before_retained_stream_abort_hook(Arc::new(move || {
+        hook_attempts.fetch_add(1, Ordering::SeqCst);
+        Err(storage::ObjectPgActionError::Store(
+            storage::StoreError::MetadataCommandContention {
+                context: "injected retained cleanup exhaustion",
+            },
+        ))
+    }));
+    let error = coord
+        .abort_stream_upload_with_retained_cleanup_for_test(
+            &cleanup,
+            &session_id,
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "the retry delay crosses the deadline, so no second RPC may begin"
+    );
+    cluster
+        .load_stream_upload_session(&bucket, &key, &session_id)
+        .expect("exhausted cleanup must leave the durable session for recovery");
+
+    drop(hook);
+    coord
         .abort_stream_upload_with_retained_cleanup(&cleanup, &session_id)
         .unwrap();
     assert!(matches!(
@@ -12569,7 +12818,6 @@ fn copy_object_failure_retries_destination_stream_abort_cleanup() {
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
     let hook_append_failures = Arc::clone(&append_failures);
-    let hook_abort_failures = Arc::clone(&abort_failures);
     let hook_guard = storage_cluster.test_install_before_metadata_command_apply_context_hook(
         Arc::new(move |context| {
             if context.bucket.as_ref() != Some(&hook_bucket)
@@ -12592,23 +12840,26 @@ fn copy_object_failure_retries_destination_stream_abort_cleanup() {
                     log_index: 1,
                 });
             }
-            if context.kind == MetadataCommandApplyTestKind::AbortStreamUpload
-                && hook_abort_failures
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                        remaining.checked_sub(1)
-                    })
-                    .is_ok()
-            {
-                return Err(storage::StoreError::MetadataCommandLogConflict {
-                    node_id: primary_node.as_u32(),
-                    pg_id: object_pg,
-                    cluster_epoch: storage::ClusterEpoch::INITIAL,
-                    log_index: 1,
-                });
-            }
             Ok(())
         }),
     );
+    let hook_abort_failures = Arc::clone(&abort_failures);
+    let retained_abort_guard =
+        storage_cluster.test_install_before_retained_stream_abort_hook(Arc::new(move || {
+            if hook_abort_failures
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(storage::ObjectPgActionError::Store(
+                    storage::StoreError::MetadataCommandContention {
+                        context: "injected retained CopyObject cleanup contention",
+                    },
+                ));
+            }
+            Ok(())
+        }));
 
     let err = coord
         .copy_object(&CopyObjectRequest {
@@ -12635,6 +12886,7 @@ fn copy_object_failure_retries_destination_stream_abort_cleanup() {
         "expected CopyObject append conflict to map to OperationAborted, got {err:?}"
     );
     drop(hook_guard);
+    drop(retained_abort_guard);
     assert_eq!(
         append_failures.load(Ordering::SeqCst),
         0,

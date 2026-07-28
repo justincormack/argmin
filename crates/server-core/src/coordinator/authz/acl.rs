@@ -453,26 +453,15 @@ impl Coordinator {
         req: &CopyObjectRequest<'_>,
     ) -> Result<AuthorizedCopyObject, ServerError> {
         let admission = self.admit_storage_route_for_request()?;
-        let storage_node = self.storage_node();
-        self.authorize_copy_object_on_admitted_route(&admission, &storage_node, req)
+        self.authorize_copy_object_on_admitted_route(&admission, req)
     }
 
     pub(in crate::coordinator) fn authorize_copy_object_on_admitted_route(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
-        storage_node: &Arc<storage::StorageCluster>,
         req: &CopyObjectRequest<'_>,
     ) -> Result<AuthorizedCopyObject, ServerError> {
         self.require_storage_route_admission(admission)?;
-        self.authorize_copy_object_with_storage_node_and_admission(storage_node, admission, req)
-    }
-
-    fn authorize_copy_object_with_storage_node_and_admission(
-        &self,
-        storage_node: &Arc<storage::StorageCluster>,
-        admission: &storage::StorageClusterRouteAdmission,
-        req: &CopyObjectRequest<'_>,
-    ) -> Result<AuthorizedCopyObject, ServerError> {
         let src_version_id = req.source.version_id;
         let requester = &req.destination.bucket.requester;
         let acl = req.acl.clone();
@@ -505,8 +494,8 @@ impl Coordinator {
         let dst_policy_context = req
             .destination_encryption
             .with_policy_context(copy_policy_context);
-        let destination = self.authorize_put_object_write_with_storage_node(
-            storage_node,
+        let destination = self.authorize_put_object_write_on_admitted_route(
+            admission,
             &AuthorizePutObjectRequest {
                 object: ObjectRequest::new(
                     req.destination.bucket.name_typed().clone(),

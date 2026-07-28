@@ -3308,6 +3308,53 @@ Seventy-second Phase 3 slice:
 - remaining buffered coordinator workflows and capability requirements on
   node-client traits remain open in Phase 3.
 
+Seventy-third Phase 3 slice:
+
+- CopyObject now consumes the buffered request's existing admission for both
+  sides of the operation. Destination PutObject authorization no longer loads
+  the bucket/current-object state through a renewable raw cluster, and source
+  payload retention must consume the leased snapshot through the exact
+  `ActiveObjectReadRoute` that matches its bucket, key, requested version,
+  object-metadata PG, publication domain, and immutable deadline.
+- one `ActivePutObjectRoute` owns destination stream-session creation,
+  encrypted shard placement, segment-append publication, lifecycle snapshot,
+  final object publication, and displaced-generation reclaim. Stream cleanup
+  authority is derived before the first durable destination mutation, so an
+  expired or failed copy can abort staged state without retaining request
+  admission or resampling the current runtime map. CopyObject's synchronous
+  retained cleanup retries only `OperationAborted`/`SlowDown` for a bounded
+  interval; the retry sleep is capped to the remaining budget and the deadline
+  is rechecked immediately before every later RPC. Frontend PUT, POST Object,
+  and UploadPart cleanup remains deliberately one-shot so it releases route
+  publication immediately to the durable cleanup handoff. The session's
+  durable cleanup deadline remains the recovery handoff after either
+  capability is dropped. The production raw `Coordinator::copy_object` entry
+  point is test-only.
+- a deterministic same-epoch-renewal regression expires the original
+  admission after destination shards are written but before append command
+  allocation. It requires `OperationAborted`, no destination object, no staged
+  shard files, and no stream session. The same-cluster/different-runtime-map
+  matrix now rejects CopyObject through foreign admission while an owning
+  coordinator canary copies and reads the expected bytes.
+- all 50 focused server-core CopyObject/retained-cleanup tests, the 30-test
+  endpoint-neutral CopyObject suite, HTTP response coverage, formatting, diff
+  validation, the storage boundary checker, and workspace-wide strict Clippy
+  pass. The final parallel workspace run passes all 7,641 selected tests; the
+  known, separately owned experimental Raft heartbeat write-amplification gate
+  is explicitly excluded from that run.
+- UploadPartCopy, other remaining buffered coordinator workflows, and
+  capability requirements on node-client traits remain open in Phase 3.
+
+Seventy-third Phase 3 review correction:
+
+- CopyObject's bounded retained-cleanup loop no longer starts one final RPC
+  after its retry deadline. A short-budget exhaustion regression uses a retry
+  delay longer than the remaining budget, requires exactly one attempted RPC,
+  preserves the durable stream session for recovery, and then proves cleanup
+  succeeds once the injected contention is removed. The pre-existing promoted
+  POST Object and UploadPart handoff regressions continue to pin that frontend
+  cleanup makes only one prompt attempt and cannot delay route publication.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
