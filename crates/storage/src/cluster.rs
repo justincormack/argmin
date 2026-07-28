@@ -8775,12 +8775,9 @@ impl StorageCluster {
     ) -> Result<PgRouteSnapshot, StoreError> {
         self.local_map
             .reconstructed_pg_route_at_epoch(pg_id, cluster_epoch)
-            .ok_or_else(|| StoreError::PayloadShardSetMismatch {
-                reason: format!(
-                    "PG {} route for cluster epoch {} is not retained",
-                    pg_id.get(),
-                    cluster_epoch.get()
-                ),
+            .ok_or(StoreError::HistoricalPgRouteNotRetained {
+                pg_id: pg_id.get(),
+                cluster_epoch,
             })
     }
 
@@ -14805,6 +14802,38 @@ impl StorageCluster {
             )),
             ShardScavengerPayloadReference::ReclaimOnly(_) => None,
         }
+    }
+
+    pub fn placed_segment_shard_backfill_source_is_referenced(
+        &self,
+        work_item: &PlacedSegmentShardBackfillWorkItem,
+    ) -> Result<bool, StoreError> {
+        for route in self.local_pg_routes() {
+            let node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())?;
+            let references = node
+                .shard_scavenger_client()
+                .list_shard_scavenger_payload_references(
+                    self.object_metadata_scan_pg(route.pg_id()),
+                )?;
+            if references.iter().any(|reference| {
+                let ShardScavengerPayloadReference::Placed(reference) = reference else {
+                    return false;
+                };
+                let request = work_item.request;
+                reference.data_pg_id == request.data_pg_id
+                    && reference.okh == request.segment_okh
+                    && reference.generation_id == request.segment_vid
+                    && reference.placement_cluster_epoch == work_item.source_cluster_epoch
+                    && reference.stored_size == request.stored_size as u64
+                    && reference.crc64 == request.segment_crc64
+                    && reference.ec == request.ec
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn acquire_placed_segment_shard_backfill_claim(

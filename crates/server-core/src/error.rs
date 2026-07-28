@@ -861,6 +861,7 @@ fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
         StoreError::IntegrityError { .. } => "store_integrity_error",
         StoreError::ShardAckMismatch { .. } => "shard_ack_mismatch",
         StoreError::PayloadShardSetMismatch { .. } => "payload_shard_set_mismatch",
+        StoreError::HistoricalPgRouteNotRetained { .. } => "historical_pg_route_not_retained",
         StoreError::ObjectPayloadReclaimFenceAuthorityMismatch => {
             "object_payload_reclaim_fence_authority_mismatch"
         }

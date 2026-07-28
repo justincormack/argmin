@@ -3032,7 +3032,7 @@ impl ClusterControlSnapshot {
             match validate_pg_peering_observations(self, record.pg_id, record.acting_set(), now_ms)
             {
                 Ok(active_metadata_proof)
-                    if validate_peering_metadata_proof_floor(
+                    if validate_converged_peering_metadata_proof_floor(
                         self.cluster_epoch,
                         record.pg_id,
                         primary,
@@ -21753,7 +21753,7 @@ fn validate_pg_peering_completion(
     } else {
         observed_metadata_proof
     };
-    validate_peering_metadata_proof_floor(
+    validate_converged_peering_metadata_proof_floor(
         snapshot.cluster_epoch,
         pg_id,
         primary,
@@ -21765,6 +21765,43 @@ fn validate_pg_peering_completion(
         active_metadata_proof,
         active_metadata_proof_epoch: snapshot.cluster_epoch,
     })
+}
+
+fn validate_converged_peering_metadata_proof_floor(
+    cluster_epoch: ClusterEpoch,
+    pg_id: PgId,
+    node_id: NodeId,
+    floor: Option<PeeringMetadataProofFloor>,
+    transfer: Option<PgMetadataTransferProof>,
+    actual: PgMetadataProof,
+) -> Result<(), ControlPlaneError> {
+    if converged_peering_proof_preserves_local_state(cluster_epoch, floor, transfer, actual) {
+        return Ok(());
+    }
+    validate_peering_metadata_proof_floor(cluster_epoch, pg_id, node_id, floor, transfer, actual)
+}
+
+fn converged_peering_proof_preserves_local_state(
+    cluster_epoch: ClusterEpoch,
+    floor: Option<PeeringMetadataProofFloor>,
+    transfer: Option<PgMetadataTransferProof>,
+    actual: PgMetadataProof,
+) -> bool {
+    let Some(floor) = floor else {
+        return false;
+    };
+    // Peering observation validation has already established exact agreement
+    // across every healthy replica. A later local epoch may restart its log and
+    // execute commands whose net metadata effect is zero; the unchanged state
+    // digest is then the durable floor, while the new nonzero hash proves this
+    // is an epoch-local log rather than a replay of the old proof.
+    transfer.is_none()
+        && !floor.imported
+        && floor.epoch.is_some_and(|epoch| epoch < cluster_epoch)
+        && actual != floor.proof
+        && actual.applied_log_hash != 0
+        && actual.applied_log_hash != floor.proof.applied_log_hash
+        && actual.state_digest == floor.proof.state_digest
 }
 
 fn validate_pg_peering_observations(
@@ -44919,6 +44956,88 @@ mod tests {
         let persisted_pg = persisted.pg(PgId::new(19)).unwrap();
         assert_eq!(persisted_pg.active_primary(), Some(NodeId::new(1)));
         assert_eq!(persisted_pg.active_metadata_proof(), Some(matching_proof));
+    }
+
+    #[test]
+    fn complete_pg_peering_accepts_converged_later_epoch_log_with_unchanged_state() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2, 3] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let pg_id = PgId::new(35);
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+
+        let active_floor = PgMetadataProof {
+            applied_log_index: 90,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        for node_id in [1, 2] {
+            heartbeat_with_pg_proof(
+                &mut authority,
+                node_id,
+                pg_id.get(),
+                PgState::Peering,
+                active_floor,
+                false,
+                2_000 + u64::from(node_id),
+            );
+        }
+        authority
+            .complete_pg_peering(
+                pg_id,
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            )
+            .unwrap();
+        for node_id in [1, 2] {
+            heartbeat_with_pg_proof(
+                &mut authority,
+                node_id,
+                pg_id.get(),
+                PgState::Active,
+                active_floor,
+                false,
+                2_012 + u64::from(node_id),
+            );
+        }
+
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)])
+            .unwrap();
+        let later_epoch_proof = PgMetadataProof {
+            applied_log_index: 2,
+            applied_log_hash: 0x123,
+            state_digest: active_floor.state_digest,
+        };
+        for node_id in [1, 2, 3] {
+            heartbeat_with_pg_proof(
+                &mut authority,
+                node_id,
+                pg_id.get(),
+                PgState::Peering,
+                later_epoch_proof,
+                false,
+                2_020 + u64::from(node_id),
+            );
+        }
+        assert_eq!(
+            authority.complete_ready_pg_peerings(2_030).unwrap(),
+            vec![pg_id],
+            "the converged reset proof must be discovered and completed automatically"
+        );
+
+        let active = authority.snapshot().pg(pg_id).unwrap();
+        assert_eq!(active.state(), PgState::Active);
+        assert_eq!(active.active_metadata_proof(), Some(later_epoch_proof));
     }
 
     #[test]

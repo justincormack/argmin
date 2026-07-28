@@ -109,6 +109,12 @@ pub enum StoreError {
     #[error("payload shard set mismatch: {reason}")]
     PayloadShardSetMismatch { reason: String },
 
+    #[error("PG {pg_id} route for cluster epoch {cluster_epoch} is not retained")]
+    HistoricalPgRouteNotRetained {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
     #[error("object payload reclaim fence authority does not match the active reclaim")]
     ObjectPayloadReclaimFenceAuthorityMismatch,
 
@@ -598,6 +604,7 @@ impl StoreError {
             Self::IntegrityError { .. } => "integrity_error",
             Self::ShardAckMismatch { .. } => "shard_ack_mismatch",
             Self::PayloadShardSetMismatch { .. } => "payload_shard_set_mismatch",
+            Self::HistoricalPgRouteNotRetained { .. } => "historical_pg_route_not_retained",
             Self::ObjectPayloadReclaimFenceAuthorityMismatch => {
                 "object_payload_reclaim_fence_authority_mismatch"
             }

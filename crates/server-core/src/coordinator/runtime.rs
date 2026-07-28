@@ -2194,6 +2194,24 @@ fn run_one_placed_segment_shard_backfill(
             }
         }
         Err(error) => {
+            if matches!(error, StoreError::HistoricalPgRouteNotRetained { .. }) {
+                match storage_cluster
+                    .placed_segment_shard_backfill_source_is_referenced(&claim.work_item)
+                {
+                    Ok(false) => {
+                        complete_obsolete_placed_segment_shard_backfill(storage_cluster, &claim);
+                        return;
+                    }
+                    Ok(true) => {}
+                    Err(reference_error) => {
+                        let _ = observability::event(
+                            TRACE_TARGET,
+                            "shard_backfill_source_reference_check_error",
+                            Some(format_args!("error={reference_error}")),
+                        );
+                    }
+                }
+            }
             let event = if shard_backfill_error_is_stale_retry(&error) {
                 "stale_retry"
             } else {
@@ -2244,6 +2262,44 @@ fn run_one_placed_segment_shard_backfill(
                     )),
                 );
             }
+        }
+    }
+}
+
+fn complete_obsolete_placed_segment_shard_backfill(
+    storage_cluster: &StorageCluster,
+    claim: &storage::PlacedSegmentShardBackfillClaimRecord,
+) {
+    match storage_cluster.complete_placed_segment_shard_backfill_claim(claim) {
+        Ok(true) => emit_shard_backfill_event(
+            Some(claim.work_item.request.data_pg_id),
+            "obsolete_source_complete_succeeded",
+            shard_backfill_queue_depth(storage_cluster),
+            None,
+        ),
+        Ok(false) => emit_shard_backfill_event(
+            Some(claim.work_item.request.data_pg_id),
+            "obsolete_source_complete_stale",
+            shard_backfill_queue_depth(storage_cluster),
+            None,
+        ),
+        Err(error) => {
+            observability::record_shard_backfill_error(
+                Some(claim.work_item.request.data_pg_id),
+                "obsolete_source_complete_failed",
+                error.diagnostic_kind(),
+            );
+            emit_shard_backfill_event(
+                Some(claim.work_item.request.data_pg_id),
+                "obsolete_source_complete_failed",
+                shard_backfill_queue_depth(storage_cluster),
+                None,
+            );
+            let _ = observability::event(
+                TRACE_TARGET,
+                "shard_backfill_obsolete_source_complete_error",
+                Some(format_args!("error={error}")),
+            );
         }
     }
 }

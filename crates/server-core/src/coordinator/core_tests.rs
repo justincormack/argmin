@@ -5015,6 +5015,60 @@ fn shard_backfill_worker_uses_refreshed_runtime_map_handle() {
 }
 
 #[test]
+fn shard_backfill_worker_resolves_missing_history_after_source_metadata_is_gone() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let source_epoch = initial.cluster_epoch();
+    let desired_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
+    let initial_route = initial.local_pg_route(PgId::new(0)).unwrap();
+    let current_route = storage::control_plane::PgRouteSnapshot::reconstructed(
+        desired_epoch,
+        initial_route.pg_id(),
+        initial_route.primary_node_id(),
+        initial_route.acting_set().to_vec(),
+        PgState::Active,
+    );
+    let current = initial
+        .test_clone_with_pg_routes(desired_epoch, [current_route], [])
+        .unwrap();
+    let work_item = PlacedSegmentShardBackfillWorkItem {
+        request: SegmentStoredBytesRequest {
+            data_pg_id: 0,
+            segment_okh: [0xA5; 16],
+            segment_vid: GenerationId::MIN,
+            stored_size: 32,
+            segment_crc64: 0x1234,
+            ec: current.default_payload_ec_shape(),
+        },
+        source_cluster_epoch: source_epoch,
+        desired_cluster_epoch: desired_epoch,
+    };
+    assert!(matches!(
+        current.backfill_placed_segment_payload_shards_for_work_item(&work_item),
+        Err(storage::StoreError::HistoricalPgRouteNotRetained {
+            pg_id: 0,
+            cluster_epoch,
+        }) if cluster_epoch == source_epoch
+    ));
+    assert!(!current
+        .placed_segment_shard_backfill_source_is_referenced(&work_item)
+        .unwrap());
+    current
+        .record_placed_segment_shard_backfill(&work_item, None)
+        .unwrap();
+
+    super::runtime::run_one_placed_segment_shard_backfill_for_test(
+        &current,
+        "obsolete-source-test",
+    );
+
+    assert!(current
+        .list_placed_segment_shard_backfills(0)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn shard_backfill_candidate_scanner_retains_cursor_across_runtime_map_replacement() {
     let tmp = test_util::tempdir();
     let ec_shape = EcShape { k: 4, m: 2 };

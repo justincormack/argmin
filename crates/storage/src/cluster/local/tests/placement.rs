@@ -2902,6 +2902,10 @@ fn placed_segment_payload_backfill_plan_record_derives_durable_priority() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].work_item.request, fixture.req);
+    assert!(fixture
+        .desired_cluster
+        .placed_segment_shard_backfill_source_is_referenced(&rows[0].work_item)
+        .unwrap());
     assert_eq!(
         rows[0].work_item.source_cluster_epoch,
         fixture.source_route.cluster_epoch()
