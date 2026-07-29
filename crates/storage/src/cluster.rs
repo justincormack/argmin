@@ -50,9 +50,8 @@ use crate::node::SharedStorageNode;
 use crate::node_client::{
     BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
     CreateStreamUploadPrecondition, MetadataCommandInspectionNodeClient, MetadataCommandNodeClient,
-    MetadataCommandPeeringNodeClient, MetadataCommandRecoveryNodeClient,
-    ObjectListingMetadataNodeClient, ObjectPayloadLeaseNodeLease, RetainedShardAckNodeClient,
-    ShardAckNodeClient,
+    MetadataCommandPeeringNodeClient, ObjectListingMetadataNodeClient, ObjectPayloadLeaseNodeLease,
+    RetainedShardAckNodeClient, ShardAckNodeClient,
 };
 pub use crate::peering::PgMetadataTransferArtifact;
 use crate::peering::{
@@ -6165,7 +6164,7 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         primary_node_id: NodeId,
-        primary_metadata_client: &dyn MetadataCommandRecoveryNodeClient,
+        primary_metadata_client: &dyn MetadataCommandInspectionNodeClient,
         primary_max_log_index: u64,
         acting_set_max_log_index: u64,
         stale_command: &MetadataCommandEnvelope,
@@ -6188,7 +6187,7 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         primary_node_id: NodeId,
-        primary_metadata_client: &dyn MetadataCommandRecoveryNodeClient,
+        primary_metadata_client: &dyn MetadataCommandInspectionNodeClient,
         primary_max_log_index: u64,
         acting_set_max_log_index: u64,
         expected_payload: &MetadataCommandPayload,
@@ -6341,7 +6340,7 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         primary_node_id: NodeId,
-        primary_metadata_client: &dyn MetadataCommandRecoveryNodeClient,
+        primary_metadata_client: &dyn MetadataCommandInspectionNodeClient,
         acting_set_max_log_index: u64,
         primary_state: &MetadataCommandReplicaState,
         current: MetadataCommandEnvelope,
@@ -6510,9 +6509,8 @@ impl StorageCluster {
             let primary_critical_section = primary_metadata_client
                 .open_metadata_command_recovery_critical_section(pg_id, route_epoch)?;
             let primary_max_log_index =
-                primary_critical_section.max_metadata_command_log_index(pg_id, route_epoch)?;
-            let Some(current) =
-                primary_critical_section.pending_metadata_command_envelope(pg_id, route_epoch)?
+                primary_critical_section.max_metadata_command_log_index()?;
+            let Some(current) = primary_critical_section.pending_metadata_command_envelope()?
             else {
                 return Ok(None);
             };
@@ -6539,14 +6537,12 @@ impl StorageCluster {
                 let replaced = match recovery_authorized_source {
                     None => primary_critical_section
                         .replace_pending_metadata_command_slot_for_reissue(
-                            pg_id,
                             command,
                             &replacement,
                             Some(&bucket),
                         ),
                     Some(authorized_source) => primary_critical_section
                         .replace_pending_metadata_command_slot_for_recovery(
-                            pg_id,
                             authorized_source,
                             recovery_abandoned_source,
                             command,
@@ -6557,10 +6553,9 @@ impl StorageCluster {
                 if replaced {
                     ReissueReplaceOutcome::Replaced(replacement)
                 } else {
-                    let current = primary_critical_section
-                        .pending_metadata_command_envelope(pg_id, route_epoch)?;
-                    let primary_max_log_index = primary_critical_section
-                        .max_metadata_command_log_index(pg_id, route_epoch)?;
+                    let current = primary_critical_section.pending_metadata_command_envelope()?;
+                    let primary_max_log_index =
+                        primary_critical_section.max_metadata_command_log_index()?;
                     match current {
                         Some(current) => ReissueReplaceOutcome::Reload {
                             current,
@@ -6587,7 +6582,7 @@ impl StorageCluster {
                 self.matching_reissued_pending_command_if_safe_with_route_mode(
                     pg_id,
                     primary.node_id(),
-                    primary_metadata_client.as_ref(),
+                    primary.metadata_command_inspection_client().as_ref(),
                     primary_max_log_index,
                     acting_set_max_log_index,
                     replacement_payload,

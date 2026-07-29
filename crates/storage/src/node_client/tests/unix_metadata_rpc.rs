@@ -1021,9 +1021,8 @@ fn unix_storage_node_client_inserts_pending_metadata_command_slot_idempotently()
         )
         .unwrap();
     assert!(
-        MetadataCommandRecoveryNodeClient::replace_pending_metadata_command_slot_for_reissue(
+        MetadataCommandRecoveryCriticalSection::replace_pending_metadata_command_slot_for_reissue(
             recovery_session.as_ref(),
-            PgId::new(0),
             &command,
             &replacement,
             Some(&bucket),
@@ -1031,9 +1030,8 @@ fn unix_storage_node_client_inserts_pending_metadata_command_slot_idempotently()
         .unwrap()
     );
     assert!(
-        MetadataCommandRecoveryNodeClient::replace_pending_metadata_command_slot_for_reissue(
+        MetadataCommandRecoveryCriticalSection::replace_pending_metadata_command_slot_for_reissue(
             recovery_session.as_ref(),
-            PgId::new(0),
             &command,
             &replacement,
             Some(&bucket),
@@ -1073,6 +1071,55 @@ fn unix_storage_node_client_inserts_pending_metadata_command_slot_idempotently()
         .unwrap()
         .unwrap();
     assert_eq!(pending.command_bytes(), replacement.command_bytes());
+}
+
+#[test]
+fn unix_recovery_critical_section_rejects_command_for_another_pg_without_mutation() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let recovery =
+        MetadataCommandRecoveryNodeClient::open_metadata_command_recovery_critical_section(
+            &client,
+            PgId::new(0),
+            config.cluster_epoch,
+        )
+        .unwrap();
+
+    let error = recovery
+        .record_metadata_command_abandoned(&test_metadata_command(1, 1))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode,
+            ..
+        }
+    ));
+    drop(recovery);
+    server_thread.join().unwrap();
+
+    let reopened = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    assert_eq!(
+        reopened
+            .get_pg(0)
+            .unwrap()
+            .max_metadata_command_log_index(config.cluster_epoch)
+            .unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -1157,11 +1204,13 @@ fn unix_storage_node_client_removes_pending_metadata_command_slot_idempotently()
         Some(&bucket),
     )
     .unwrap();
-    MetadataCommandRecoveryNodeClient::record_metadata_command_abandoned(
+    MetadataCommandRecoveryNodeClient::open_metadata_command_recovery_critical_section(
         &client,
         PgId::new(0),
-        &command,
+        config.cluster_epoch,
     )
+    .unwrap()
+    .record_metadata_command_abandoned(&command)
     .unwrap();
     assert!(
         MetadataCommandNodeClient::remove_pending_metadata_command_slot(
@@ -1201,11 +1250,7 @@ fn unix_storage_node_client_records_abandoned_metadata_command_idempotently() {
     let config = test_config(&tmp);
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = StorageNodeServer::bind(config.clone()).unwrap();
-    let server_thread = thread::spawn(move || {
-        for _ in 0..2 {
-            server.accept_one().unwrap();
-        }
-    });
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
     let client = UnixStorageNodeClient::new(
         config.node_id,
         config.cluster_epoch,
@@ -1213,18 +1258,20 @@ fn unix_storage_node_client_records_abandoned_metadata_command_idempotently() {
     );
     let command = test_metadata_command(0, 1);
 
-    let first = MetadataCommandRecoveryNodeClient::record_metadata_command_abandoned(
-        &client,
-        PgId::new(0),
-        &command,
-    )
-    .unwrap();
-    let second = MetadataCommandRecoveryNodeClient::record_metadata_command_abandoned(
-        &client,
-        PgId::new(0),
-        &command,
-    )
-    .unwrap();
+    let recovery =
+        MetadataCommandRecoveryNodeClient::open_metadata_command_recovery_critical_section(
+            &client,
+            PgId::new(0),
+            config.cluster_epoch,
+        )
+        .unwrap();
+    let first = recovery
+        .record_metadata_command_abandoned(&command)
+        .unwrap();
+    let second = recovery
+        .record_metadata_command_abandoned(&command)
+        .unwrap();
+    drop(recovery);
     server_thread.join().unwrap();
 
     assert_eq!(first, second);
@@ -1447,7 +1494,7 @@ fn metadata_command_session_result_from_fake_response<R>(
 
 fn metadata_command_recovery_session_result_from_fake_response<R>(
     target_payload: Vec<u8>,
-    call: impl FnOnce(Box<dyn MetadataCommandRecoveryNodeClient>) -> R,
+    call: impl FnOnce(Box<dyn MetadataCommandRecoveryCriticalSection>) -> R,
 ) -> R {
     let tmp = test_util::tempdir();
     let socket_path = tmp.path().join("sock").join("storage.sock");
@@ -1639,7 +1686,7 @@ fn unix_storage_node_session_rejects_malformed_log_conflicts() {
     let abandoned_error =
         metadata_command_recovery_session_result_from_fake_response(abandoned_payload, |session| {
             session
-                .record_metadata_command_abandoned(PgId::new(0), &command)
+                .record_metadata_command_abandoned(&command)
                 .unwrap_err()
         });
     assert!(matches!(
@@ -1742,35 +1789,14 @@ fn unix_storage_node_client_preserves_record_abandoned_log_conflict() {
     fn record_abandoned_error_from_fake_response(
         outcome: StorageRpcMetadataCommandStateOutcome,
     ) -> StoreError {
-        let tmp = test_util::tempdir();
-        let socket_path = tmp.path().join("sock").join("storage.sock");
-        private_socket_dir(socket_path.parent().unwrap());
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let join = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_storage_rpc_frame_from(&mut stream).unwrap();
-            let payload = encode_metadata_command_state_outcome_response(
-                &StorageRpcMetadataCommandStateOutcomeResponse { outcome },
-            );
-            let response = StorageRpcFrame {
-                request_id: request.request_id,
-                kind: request.kind,
-                payload: encode_storage_rpc_success_response(&payload),
-            };
-            write_storage_rpc_frame_to(&mut stream, &response).unwrap();
-        });
-        let client =
-            UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
-
-        let err = MetadataCommandRecoveryNodeClient::record_metadata_command_abandoned(
-            &client,
-            PgId::new(0),
-            &test_metadata_command(0, 1),
-        )
-        .unwrap_err();
-
-        join.join().unwrap();
-        err
+        let payload = encode_metadata_command_state_outcome_response(
+            &StorageRpcMetadataCommandStateOutcomeResponse { outcome },
+        );
+        metadata_command_recovery_session_result_from_fake_response(payload, |session| {
+            session
+                .record_metadata_command_abandoned(&test_metadata_command(0, 1))
+                .unwrap_err()
+        })
     }
 
     let conflict = record_abandoned_error_from_fake_response(

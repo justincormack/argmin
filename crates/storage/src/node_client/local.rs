@@ -3954,98 +3954,109 @@ impl MetadataCommandPeeringNodeClient for LocalStorageNodeClient {
     }
 }
 
+struct LocalMetadataCommandRecoveryCriticalSection {
+    client: LocalStorageNodeClient,
+    pg_id: PgId,
+    cluster_epoch: ClusterEpoch,
+}
+
+impl LocalMetadataCommandRecoveryCriticalSection {
+    fn validate_command_route(&self, command: &MetadataCommandEnvelope) -> Result<(), StoreError> {
+        if command.id().pg_id() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id: self.client.node_id.as_u32(),
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id.get(),
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        if command.id().cluster_epoch() != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: self.pg_id.get(),
+                operation_epoch: command.id().cluster_epoch(),
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_optional_command_route(
+        &self,
+        command: Option<&MetadataCommandEnvelope>,
+    ) -> Result<(), StoreError> {
+        command.map_or(Ok(()), |command| self.validate_command_route(command))
+    }
+}
+
 impl MetadataCommandRecoveryNodeClient for LocalStorageNodeClient {
     fn open_metadata_command_recovery_critical_section(
         &self,
-        _pg_id: PgId,
-        _cluster_epoch: ClusterEpoch,
-    ) -> Result<Box<dyn MetadataCommandRecoveryNodeClient>, StoreError> {
-        Ok(Box::new(self.clone()))
-    }
-
-    fn max_metadata_command_log_index(
-        &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-    ) -> Result<u64, StoreError> {
-        MetadataCommandInspectionNodeClient::max_metadata_command_log_index(
-            self,
+    ) -> Result<Box<dyn MetadataCommandRecoveryCriticalSection>, StoreError> {
+        drop(self.storage_node.get_pg(pg_id.get())?);
+        Ok(Box::new(LocalMetadataCommandRecoveryCriticalSection {
+            client: self.clone(),
             pg_id,
             cluster_epoch,
+        }))
+    }
+}
+
+impl MetadataCommandRecoveryCriticalSection for LocalMetadataCommandRecoveryCriticalSection {
+    fn max_metadata_command_log_index(&self) -> Result<u64, StoreError> {
+        MetadataCommandInspectionNodeClient::max_metadata_command_log_index(
+            &self.client,
+            self.pg_id,
+            self.cluster_epoch,
         )
     }
 
     fn pending_metadata_command_envelope(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
         MetadataCommandInspectionNodeClient::pending_metadata_command_envelope(
-            self,
-            pg_id,
-            cluster_epoch,
+            &self.client,
+            self.pg_id,
+            self.cluster_epoch,
         )
-    }
-
-    fn metadata_command_replica_state(
-        &self,
-        pg_id: PgId,
-    ) -> Result<MetadataCommandReplicaState, StoreError> {
-        MetadataCommandInspectionNodeClient::metadata_command_replica_state(self, pg_id)
     }
 
     fn metadata_command_acceptance(
         &self,
-        pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandAcceptance, StoreError> {
-        MetadataCommandInspectionNodeClient::metadata_command_acceptance(self, pg_id, command)
+        self.validate_command_route(command)?;
+        MetadataCommandInspectionNodeClient::metadata_command_acceptance(
+            &self.client,
+            self.pg_id,
+            command,
+        )
     }
 
     fn metadata_command_abandon_acceptance(
         &self,
-        pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.validate_command_route(command)?;
         MetadataCommandInspectionNodeClient::metadata_command_abandon_acceptance(
-            self, pg_id, command,
-        )
-    }
-
-    fn applied_metadata_command_log_entry_hashes(
-        &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<Option<(u64, u64)>, StoreError> {
-        MetadataCommandInspectionNodeClient::applied_metadata_command_log_entry_hashes(
-            self, pg_id, command,
-        )
-    }
-
-    fn has_matching_applied_metadata_command_log_entry(
-        &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
-        expected_previous_log_hash: u64,
-    ) -> Result<bool, StoreError> {
-        MetadataCommandInspectionNodeClient::has_matching_applied_metadata_command_log_entry(
-            self,
-            pg_id,
+            &self.client,
+            self.pg_id,
             command,
-            expected_previous_log_hash,
         )
     }
 
     fn replace_pending_metadata_command_slot_for_reissue(
         &self,
-        pg_id: PgId,
         previous: &MetadataCommandEnvelope,
         replacement: &MetadataCommandEnvelope,
         bucket: Option<&BucketName>,
     ) -> Result<bool, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        self.validate_command_route(previous)?;
+        self.validate_command_route(replacement)?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         pg.replace_pending_metadata_command_slot_for_reissue(
-            self.node_id.as_u32(),
+            self.client.node_id.as_u32(),
             previous,
             replacement,
             bucket,
@@ -4054,16 +4065,16 @@ impl MetadataCommandRecoveryNodeClient for LocalStorageNodeClient {
 
     fn replace_pending_metadata_command_slot_for_recovery(
         &self,
-        pg_id: PgId,
-        _authorized_source: &MetadataCommandEnvelope,
-        _abandoned_source: Option<&MetadataCommandEnvelope>,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
         previous: &MetadataCommandEnvelope,
         replacement: &MetadataCommandEnvelope,
         bucket: Option<&BucketName>,
     ) -> Result<bool, StoreError> {
-        MetadataCommandRecoveryNodeClient::replace_pending_metadata_command_slot_for_reissue(
+        self.validate_command_route(authorized_source)?;
+        self.validate_optional_command_route(abandoned_source)?;
+        MetadataCommandRecoveryCriticalSection::replace_pending_metadata_command_slot_for_reissue(
             self,
-            pg_id,
             previous,
             replacement,
             bucket,
@@ -4072,21 +4083,27 @@ impl MetadataCommandRecoveryNodeClient for LocalStorageNodeClient {
 
     fn apply_metadata_command_and_record_for_recovery(
         &self,
-        pg_id: PgId,
-        _authorized_source: &MetadataCommandEnvelope,
-        _abandoned_source: Option<&MetadataCommandEnvelope>,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        self.apply_metadata_command_and_record_inner(pg_id, command)
+        self.validate_command_route(authorized_source)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        self.validate_optional_command_route(abandoned_source)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        self.validate_command_route(command)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        self.client
+            .apply_metadata_command_and_record_inner(self.pg_id, command)
     }
 
     fn record_metadata_command_abandoned(
         &self,
-        pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.record_metadata_command_abandoned(self.node_id.as_u32(), command)
+        self.validate_command_route(command)?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        pg.record_metadata_command_abandoned(self.client.node_id.as_u32(), command)
     }
 }
 

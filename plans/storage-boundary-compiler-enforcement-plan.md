@@ -665,7 +665,7 @@ Node-client role classification (2026-07-19):
 | `MetadataCommandInspectionNodeClient` | genuinely generic metadata PG | read-only command state, checkpoints, retained-log ranges, acceptance, and abandonment inspection |
 | `MetadataCommandNodeClient` | genuinely generic metadata PG | ordinary active publisher and convergence authority; cannot replace pending slots, apply authorized recovery, or record abandonment |
 | `MetadataCommandPeeringNodeClient` | genuinely generic metadata PG | quiesced-PG replay validation, retained-log catch-up, and metadata-transfer initialization/adoption; no command-ID allocation or pending-slot publication |
-| `MetadataCommandRecoveryNodeClient` | genuinely generic metadata PG | pending-slot reissue, explicitly authorized recovery apply, and durable abandonment; exposes only the inspection needed while holding its recovery critical section |
+| `MetadataCommandRecoveryNodeClient` | genuinely generic metadata PG | opens a non-nestable recovery critical section bound to one PG and epoch; the returned interface owns pending-slot reissue, explicitly authorized recovery apply, and durable abandonment without accepting replacement route arguments |
 | `RetainedMetadataCommandNodeClient` | genuinely generic metadata PG | exact retained-route authority for applying and finishing a previously prepared stream-upload abort |
 | `StorageNodeClient` | removed transitional mixed aggregate | production and cross-boundary test callers use role-specific interfaces; deliberately process-local assertions use the sanctioned raw-node test facade; private local helpers implement the embedded adapter without exposing another trait surface |
 
@@ -3815,6 +3815,41 @@ Ninetieth Phase 3 slice:
   39-test Unix metadata-RPC groups. Formatting, the storage boundary checker,
   and workspace-wide strict Clippy pass, as does the full 7,689-test workspace
   suite.
+
+Ninety-first Phase 3 slice:
+
+- metadata-command recovery locking now returns a distinct
+  `MetadataCommandRecoveryCriticalSection` bound to the PG and epoch selected
+  when it is opened. Its read, reissue, recovery-apply, and abandonment methods
+  no longer accept caller-supplied PG or epoch values, so authority acquired
+  for one recovery subject cannot be redirected to another.
+- every recovery mutation, including replica application and abandonment, now
+  opens this scoped interface. The base `MetadataCommandRecoveryNodeClient`
+  exposes only critical-section construction. Read-only reissue reconciliation
+  continues through `MetadataCommandInspectionNodeClient`, avoiding both
+  recovery mutation authority and ordinary publisher authority.
+- local and Unix regressions pass a command for another PG through a critical
+  section bound to PG 0, require fail-closed rejection, and verify the bound PG
+  remains unmodified. Replacing the remaining active and retained stateful
+  method families with opaque operation capabilities remains open in Phase 3.
+- all 2,372 storage tests pass, including the focused 104-test recovery and
+  40-test Unix metadata-RPC groups. Formatting, the storage boundary checker,
+  and workspace-wide strict Clippy pass, as does the full 7,691-test workspace
+  suite.
+
+Ninety-first Phase 3 review correction:
+
+- the embedded recovery critical section now validates every command envelope
+  against both its captured PG and captured epoch before any PgStore access.
+  This includes acceptance reads, both reissue forms, recovery application,
+  and abandonment; authorized and abandoned source envelopes are checked as
+  well as the mutation target.
+- an epoch-1 embedded section presented with an epoch-2 command now fails with
+  `StaleMetadataOperation` and leaves both epoch log tips unchanged, matching
+  the fail-closed route binding already enforced by the Unix RPC boundary.
+- all 2,373 storage tests pass, including the focused 104-test recovery group.
+  Formatting, the storage boundary checker, and workspace-wide strict Clippy
+  pass, as does the full 7,692-test workspace suite.
 
 ### Phase 4 — type metadata-command publication
 

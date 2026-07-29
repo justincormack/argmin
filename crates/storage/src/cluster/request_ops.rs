@@ -1820,7 +1820,7 @@ impl super::StorageCluster {
                         })?;
                     let metadata_client = primary_critical_section.as_ref();
                     let acceptance = metadata_client
-                        .metadata_command_acceptance(pg_id, command)
+                        .metadata_command_acceptance(command)
                         .map_err(|source| MetadataCommandApplyFailure {
                             applied_nodes,
                             source: BucketSnapshotLoadError::Store(source),
@@ -1828,7 +1828,6 @@ impl super::StorageCluster {
                     if acceptance == MetadataCommandAcceptance::AlreadyApplied {
                         metadata_client
                             .apply_metadata_command_and_record_for_recovery(
-                                pg_id,
                                 source,
                                 abandoned_source,
                                 command,
@@ -1857,7 +1856,6 @@ impl super::StorageCluster {
                     })?;
                     metadata_client
                         .apply_metadata_command_and_record_for_recovery(
-                            pg_id,
                             source,
                             abandoned_source,
                             command,
@@ -1945,14 +1943,23 @@ impl super::StorageCluster {
             })?;
             if acceptance == MetadataCommandAcceptance::AlreadyApplied {
                 let apply = match authorized_source {
-                    Some(source) => node
-                        .metadata_command_recovery_client()
-                        .apply_metadata_command_and_record_for_recovery(
-                            pg_id,
+                    Some(source) => {
+                        let recovery_critical_section = node
+                            .metadata_command_recovery_client()
+                            .open_metadata_command_recovery_critical_section(
+                                pg_id,
+                                command.id().cluster_epoch(),
+                            )
+                            .map_err(|source| MetadataCommandApplyFailure {
+                                applied_nodes,
+                                source: BucketSnapshotLoadError::Store(source),
+                            })?;
+                        recovery_critical_section.apply_metadata_command_and_record_for_recovery(
                             source,
                             abandoned_source,
                             command,
-                        ),
+                        )
+                    }
                     None => node
                         .metadata_command_client()
                         .apply_metadata_command_and_record(pg_id, command),
@@ -1973,14 +1980,23 @@ impl super::StorageCluster {
                 source: source.into(),
             })?;
             let apply = match authorized_source {
-                Some(source) => node
-                    .metadata_command_recovery_client()
-                    .apply_metadata_command_and_record_for_recovery(
-                        pg_id,
+                Some(source) => {
+                    let recovery_critical_section = node
+                        .metadata_command_recovery_client()
+                        .open_metadata_command_recovery_critical_section(
+                            pg_id,
+                            command.id().cluster_epoch(),
+                        )
+                        .map_err(|source| MetadataCommandApplyFailure {
+                            applied_nodes,
+                            source: BucketSnapshotLoadError::Store(source),
+                        })?;
+                    recovery_critical_section.apply_metadata_command_and_record_for_recovery(
                         source,
                         abandoned_source,
                         command,
-                    ),
+                    )
+                }
                 None => node
                     .metadata_command_client()
                     .apply_metadata_command_and_record(pg_id, command),
@@ -2057,7 +2073,7 @@ impl super::StorageCluster {
         })?;
         nodes.sort_by_key(|node| node.node_id() != primary_node_id);
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
-            let metadata_client = if node.node_id() == primary_node_id {
+            if node.node_id() == primary_node_id {
                 let primary_critical_section = node
                     .metadata_command_recovery_client()
                     .open_metadata_command_recovery_critical_section(
@@ -2070,23 +2086,21 @@ impl super::StorageCluster {
                     })?;
                 let metadata_client = primary_critical_section.as_ref();
                 let acceptance = metadata_client
-                    .metadata_command_abandon_acceptance(pg_id, command)
+                    .metadata_command_abandon_acceptance(command)
                     .map_err(|source| MetadataCommandApplyFailure {
                         applied_nodes,
                         source: BucketSnapshotLoadError::Store(source),
                     })?;
                 if acceptance != MetadataCommandAcceptance::AlreadyApplied {
                     metadata_client
-                        .record_metadata_command_abandoned(pg_id, command)
+                        .record_metadata_command_abandoned(command)
                         .map_err(|source| MetadataCommandApplyFailure {
                             applied_nodes,
                             source: source.into(),
                         })?;
                 }
                 continue;
-            } else {
-                node.metadata_command_recovery_client().as_ref()
-            };
+            }
             let acceptance = self
                 .local_map
                 .validate_metadata_command_abandon_for_replica(
@@ -2102,8 +2116,16 @@ impl super::StorageCluster {
             if acceptance == MetadataCommandAcceptance::AlreadyApplied {
                 continue;
             }
-            metadata_client
-                .record_metadata_command_abandoned(pg_id, command)
+            node.metadata_command_recovery_client()
+                .open_metadata_command_recovery_critical_section(
+                    pg_id,
+                    command.id().cluster_epoch(),
+                )
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: BucketSnapshotLoadError::Store(source),
+                })?
+                .record_metadata_command_abandoned(command)
                 .map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,
                     source: source.into(),
