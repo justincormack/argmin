@@ -6348,12 +6348,16 @@ impl StorageNodeRetainedBucketWriteReservationRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        RetainedBucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
-            &local_client,
-            self.pg_id,
-            self.record,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route =
+            RetainedBucketWriteReservationNodeClient::open_retained_bucket_write_reservation_route(
+                &local_client,
+                self.pg_id,
+                &self.record.bucket,
+            )
+            .map_err(StorageNodeBucketRouteError::Bucket)?;
+        route
+            .release_durable_bucket_write_reservation(self.record)
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 }
 
@@ -6390,12 +6394,16 @@ impl StorageNodeRetainedMetadataCommandProofRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        RetainedBucketWriteReservationNodeClient::release_metadata_command_bucket_write_reservation(
-            &local_client,
-            self.pg_id,
-            self.proof,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route =
+            RetainedBucketWriteReservationNodeClient::open_retained_bucket_write_reservation_route(
+                &local_client,
+                self.pg_id,
+                &self.proof.bucket,
+            )
+            .map_err(StorageNodeBucketRouteError::Bucket)?;
+        route
+            .release_metadata_command_bucket_write_reservation(self.proof)
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 }
 
@@ -6420,12 +6428,16 @@ impl StorageNodeRetainedBucketWriteDrainRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        RetainedBucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
-            &local_client,
-            self.pg_id,
-            self.record,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route =
+            RetainedBucketWriteReservationNodeClient::open_retained_bucket_write_reservation_route(
+                &local_client,
+                self.pg_id,
+                &self.record.bucket,
+            )
+            .map_err(StorageNodeBucketRouteError::Bucket)?;
+        route
+            .clear_durable_bucket_write_drain(self.record)
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 }
 
@@ -6461,12 +6473,16 @@ impl StorageNodeRetainedBucketDeleteFinalizeClaimRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        RetainedBucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
-            &local_client,
-            self.pg_id,
-            self.claim,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route =
+            RetainedBucketWriteReservationNodeClient::open_retained_bucket_write_reservation_route(
+                &local_client,
+                self.pg_id,
+                &self.claim.bucket,
+            )
+            .map_err(StorageNodeBucketRouteError::Bucket)?;
+        route
+            .release_bucket_delete_finalize_claim(self.claim)
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 }
 
@@ -6502,12 +6518,16 @@ impl StorageNodeRetainedLifecycleSweepClaimRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        RetainedBucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
-            &local_client,
-            self.pg_id,
-            self.claim,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route =
+            RetainedBucketWriteReservationNodeClient::open_retained_bucket_write_reservation_route(
+                &local_client,
+                self.pg_id,
+                &self.claim.bucket,
+            )
+            .map_err(StorageNodeBucketRouteError::Bucket)?;
+        route
+            .release_lifecycle_sweep_claim(self.claim)
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 }
 

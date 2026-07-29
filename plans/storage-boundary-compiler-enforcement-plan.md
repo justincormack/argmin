@@ -649,7 +649,7 @@ Node-client role classification (2026-07-19):
 | --- | --- | --- |
 | `BucketMetadataNodeClient` | bucket metadata | active bucket route; reads may later receive a read-only projection |
 | `BucketWriteReservationNodeClient` | bucket metadata | active bucket route for acquisition, heartbeat, worker scans, and claim creation |
-| `RetainedBucketWriteReservationNodeClient` | bucket metadata | retained subject-bound cleanup for exact reservation proofs, drains, and worker claims |
+| `RetainedBucketWriteReservationNodeClient` | bucket metadata | opens a retained cleanup route bound to one bucket metadata PG and exact bucket; the returned interface releases exact reservation proofs, drains, and worker claims without accepting a replacement PG or bucket |
 | `ObjectGenerationMetadataNodeClient`, `ObjectVersionMetadataNodeClient`, `DirectPutMetadataNodeClient` | object metadata | active object route, with completion-specific admission represented as a narrower operation class |
 | `ObjectListingMetadataNodeClient` | object metadata scan | active object-metadata route for the scanned PG; listing fan-out constructs one capability per routed PG |
 | `ObjectMutationMetadataNodeClient` | object metadata | active object route for object, multipart, stream-session, and payload-reclaim mutation |
@@ -3947,6 +3947,30 @@ Ninety-fifth Phase 3 slice:
   and full Unix dispatch regressions. Formatting, the storage boundary checker,
   workspace-wide strict Clippy, and the full 7,729-test workspace suite also
   pass.
+
+Ninety-sixth Phase 3 slice:
+
+- retained bucket-write cleanup now opens a scoped
+  `RetainedBucketWriteReservationRoute` bound to the bucket metadata PG and
+  exact bucket selected by the retained cluster route. Reservation-record and
+  metadata-command-proof release, drain clearing, and delete-finalizer and
+  lifecycle-claim release no longer accept a replacement PG after the route is
+  opened.
+- embedded and Unix routes validate every cleanup subject against the captured
+  bucket before PgStore or transport access. Claim cleanup additionally binds
+  the PG embedded in each durable claim to the captured bucket PG. Storage-node
+  RPC dispatch retains its independent retained-route, primary, and wire-
+  subject validation before constructing the embedded route.
+- embedded and Unix regressions redirect all five cleanup subject forms to a
+  foreign bucket and redirect both claim types to a foreign embedded PG. Every
+  attempt must return the exact route-subject mismatch; the Unix regression
+  runs without a listening server, proving rejection before RPC. Replacing the
+  remaining stateful method families with scoped or opaque operation
+  capabilities remains open in Phase 3.
+- all 2,406 storage tests pass, including the focused scoped-route regressions
+  and the full 47-test Unix bucket-RPC module. Formatting, the storage boundary
+  checker, workspace-wide strict Clippy, and the full 7,731-test workspace
+  suite also pass.
 
 ### Phase 4 — type metadata-command publication
 

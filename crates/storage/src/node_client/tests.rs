@@ -71,6 +71,155 @@ fn test_shard_scavenger_observation(data_pg_id: u32, seed: u8) -> ShardScavenger
     }
 }
 
+struct TestRetainedBucketWriteSubjects {
+    reservation: BucketWriteReservationRecord,
+    proof: BucketWriteReservationProof,
+    drain: BucketWriteDrainRecord,
+    delete_claim: BucketDeleteFinalizeClaimRecord,
+    lifecycle_claim: LifecycleSweepClaimRecord,
+}
+
+fn test_retained_bucket_write_subjects(
+    bucket: BucketName,
+    pg_id: u32,
+) -> TestRetainedBucketWriteSubjects {
+    let reservation = BucketWriteReservationRecord {
+        bucket: bucket.clone(),
+        reservation_id: "retained-route-reservation".to_string(),
+        owner_token: "retained-route-reservation-owner".to_string(),
+        cluster_epoch: ClusterEpoch::INITIAL,
+        bucket_execution_generation: 2,
+        bucket_incarnation_generation: 3,
+        operation_kind: "retained-route-test".to_string(),
+        created_at: 10,
+        lease_deadline: 20,
+        target_context: None,
+    };
+    TestRetainedBucketWriteSubjects {
+        proof: BucketWriteReservationProof::from(&reservation),
+        reservation,
+        drain: BucketWriteDrainRecord {
+            bucket: bucket.clone(),
+            drain_id: "retained-route-drain".to_string(),
+            owner_token: "retained-route-drain-owner".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 2,
+            state: crate::types::BucketWriteDrainState::Draining,
+            created_at: 10,
+            lease_deadline: 20,
+        },
+        delete_claim: BucketDeleteFinalizeClaimRecord {
+            bucket: bucket.clone(),
+            bucket_incarnation_generation: 3,
+            claim_id: "retained-route-delete-claim".to_string(),
+            owner_token: "retained-route-delete-owner".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id,
+            claimed_at: 10,
+            lease_deadline: Some(20),
+            attempt_count: 1,
+            last_error: None,
+        },
+        lifecycle_claim: LifecycleSweepClaimRecord {
+            bucket,
+            bucket_incarnation_generation: 3,
+            claim_id: "retained-route-lifecycle-claim".to_string(),
+            owner_token: "retained-route-lifecycle-owner".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id,
+            claimed_at: 10,
+            heartbeat_at: 10,
+            lease_deadline: Some(20),
+            attempt_count: 1,
+            last_error: None,
+        },
+    }
+}
+
+fn assert_retained_bucket_write_subject_mismatch(
+    error: BucketSnapshotLoadError,
+    expected_operation: &'static str,
+) {
+    assert!(matches!(
+        error,
+        BucketSnapshotLoadError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation,
+        }) if operation == expected_operation
+    ));
+}
+
+#[test]
+fn local_retained_bucket_write_route_rejects_foreign_subject_before_storage() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), storage_node);
+    let bound_bucket = crate::tests::bucket_name("retained-route-bound-bucket");
+    let foreign_bucket = crate::tests::bucket_name("retained-route-foreign-bucket");
+    let pg_id = client.storage_node.bucket_metadata_pg_for(&bound_bucket);
+    let route = client
+        .open_retained_bucket_write_reservation_route(pg_id, &bound_bucket)
+        .unwrap();
+    let foreign = test_retained_bucket_write_subjects(foreign_bucket, pg_id.get());
+
+    for (error, operation) in [
+        (
+            route
+                .release_durable_bucket_write_reservation(&foreign.reservation)
+                .unwrap_err(),
+            "release durable bucket write reservation",
+        ),
+        (
+            route
+                .release_metadata_command_bucket_write_reservation(&foreign.proof)
+                .unwrap_err(),
+            "release metadata command bucket write reservation",
+        ),
+        (
+            route
+                .clear_durable_bucket_write_drain(&foreign.drain)
+                .unwrap_err(),
+            "clear durable bucket write drain",
+        ),
+        (
+            route
+                .release_bucket_delete_finalize_claim(&foreign.delete_claim)
+                .unwrap_err(),
+            "release bucket delete finalize claim",
+        ),
+        (
+            route
+                .release_lifecycle_sweep_claim(&foreign.lifecycle_claim)
+                .unwrap_err(),
+            "release lifecycle sweep claim",
+        ),
+    ] {
+        assert_retained_bucket_write_subject_mismatch(error, operation);
+    }
+
+    let mut wrong_pg = test_retained_bucket_write_subjects(bound_bucket, pg_id.get());
+    wrong_pg.delete_claim.pg_id = pg_id.get().saturating_add(1);
+    wrong_pg.lifecycle_claim.pg_id = pg_id.get().saturating_add(1);
+    assert_retained_bucket_write_subject_mismatch(
+        route
+            .release_bucket_delete_finalize_claim(&wrong_pg.delete_claim)
+            .unwrap_err(),
+        "release bucket delete finalize claim",
+    );
+    assert_retained_bucket_write_subject_mismatch(
+        route
+            .release_lifecycle_sweep_claim(&wrong_pg.lifecycle_claim)
+            .unwrap_err(),
+        "release lifecycle sweep claim",
+    );
+}
+
 #[test]
 fn local_shard_scavenger_observation_route_rejects_foreign_subject_without_mutation() {
     let tmp = test_util::tempdir();

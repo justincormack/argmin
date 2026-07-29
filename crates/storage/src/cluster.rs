@@ -9402,10 +9402,11 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node_for_retained_cleanup(proof.cluster_epoch, PgId::new(pg_id))?;
         node.retained_bucket_write_reservation_client()
-            .release_metadata_command_bucket_write_reservation(
+            .open_retained_bucket_write_reservation_route(
                 self.validated_bucket_metadata_pg(PgId::new(pg_id)),
-                proof,
-            )?;
+                &proof.bucket,
+            )?
+            .release_metadata_command_bucket_write_reservation(proof)?;
         Ok(())
     }
 

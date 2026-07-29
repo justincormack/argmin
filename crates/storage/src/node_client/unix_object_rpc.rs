@@ -1218,7 +1218,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
     }
 }
 
-impl RetainedBucketWriteReservationNodeClient for UnixStorageNodeClient {
+impl UnixStorageNodeClient {
     fn release_durable_bucket_write_reservation(
         &self,
         pg_id: BucketPgId,
@@ -1347,6 +1347,105 @@ impl RetainedBucketWriteReservationNodeClient for UnixStorageNodeClient {
             "decode lifecycle sweep claim release response",
             &response,
         )
+    }
+}
+
+struct UnixRetainedBucketWriteReservationRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    pg_id: BucketPgId,
+    bucket: BucketName,
+}
+
+impl UnixRetainedBucketWriteReservationRoute<'_> {
+    fn require_subject(
+        &self,
+        bucket: &BucketName,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if bucket != &self.bucket {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
+    }
+
+    fn require_claim_subject(
+        &self,
+        bucket: &BucketName,
+        pg_id: u32,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_subject(bucket, operation)?;
+        if pg_id != self.pg_id.get() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
+    }
+}
+
+impl RetainedBucketWriteReservationNodeClient for UnixStorageNodeClient {
+    fn open_retained_bucket_write_reservation_route(
+        &self,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+    ) -> Result<Box<dyn RetainedBucketWriteReservationRoute + '_>, BucketSnapshotLoadError> {
+        Ok(Box::new(UnixRetainedBucketWriteReservationRoute {
+            client: self,
+            pg_id,
+            bucket: bucket.clone(),
+        }))
+    }
+}
+
+impl RetainedBucketWriteReservationRoute for UnixRetainedBucketWriteReservationRoute<'_> {
+    fn release_durable_bucket_write_reservation(
+        &self,
+        record: &BucketWriteReservationRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_subject(&record.bucket, "release durable bucket write reservation")?;
+        self.client
+            .release_durable_bucket_write_reservation(self.pg_id, record)
+    }
+
+    fn release_metadata_command_bucket_write_reservation(
+        &self,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_subject(
+            &proof.bucket,
+            "release metadata command bucket write reservation",
+        )?;
+        self.client
+            .release_metadata_command_bucket_write_reservation(self.pg_id, proof)
+    }
+
+    fn clear_durable_bucket_write_drain(
+        &self,
+        record: &BucketWriteDrainRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_subject(&record.bucket, "clear durable bucket write drain")?;
+        self.client
+            .clear_durable_bucket_write_drain(self.pg_id, record)
+    }
+
+    fn release_bucket_delete_finalize_claim(
+        &self,
+        claim: &BucketDeleteFinalizeClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_claim_subject(
+            &claim.bucket,
+            claim.pg_id,
+            "release bucket delete finalize claim",
+        )?;
+        self.client
+            .release_bucket_delete_finalize_claim(self.pg_id, claim)
+    }
+
+    fn release_lifecycle_sweep_claim(
+        &self,
+        claim: &LifecycleSweepClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_claim_subject(&claim.bucket, claim.pg_id, "release lifecycle sweep claim")?;
+        self.client.release_lifecycle_sweep_claim(self.pg_id, claim)
     }
 }
 

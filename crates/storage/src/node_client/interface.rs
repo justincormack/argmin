@@ -394,33 +394,38 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
 /// from being used implicitly for retained proof, drain, or worker-claim
 /// cleanup.
 pub(crate) trait RetainedBucketWriteReservationNodeClient: Send + Sync {
-    fn release_durable_bucket_write_reservation(
+    /// Bind retained bucket-write cleanup to one bucket metadata PG and exact
+    /// bucket subject selected by the retained cluster route.
+    fn open_retained_bucket_write_reservation_route(
         &self,
         pg_id: BucketPgId,
+        bucket: &BucketName,
+    ) -> Result<Box<dyn RetainedBucketWriteReservationRoute + '_>, BucketSnapshotLoadError>;
+}
+
+pub(crate) trait RetainedBucketWriteReservationRoute: Send {
+    fn release_durable_bucket_write_reservation(
+        &self,
         record: &BucketWriteReservationRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     fn release_metadata_command_bucket_write_reservation(
         &self,
-        pg_id: BucketPgId,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     fn clear_durable_bucket_write_drain(
         &self,
-        pg_id: BucketPgId,
         record: &BucketWriteDrainRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     fn release_bucket_delete_finalize_claim(
         &self,
-        pg_id: BucketPgId,
         claim: &BucketDeleteFinalizeClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     fn release_lifecycle_sweep_claim(
         &self,
-        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 }

@@ -4600,7 +4600,8 @@ fn release_open_metadata_command_bucket_write_reservation(
         .expect("validated route primary must be in local node set");
     let bucket_pg = node.runtime().bucket_metadata_pg_for(&proof.bucket);
     node.retained_bucket_write_reservation_client()
-        .release_metadata_command_bucket_write_reservation(bucket_pg, proof)
+        .open_retained_bucket_write_reservation_route(bucket_pg, &proof.bucket)
+        .and_then(|route| route.release_metadata_command_bucket_write_reservation(proof))
         .map_err(|source| ClusterBuildError::OpenLocalNode {
             node_id: primary_node_id.as_u32(),
             source: StoreError::Io {
