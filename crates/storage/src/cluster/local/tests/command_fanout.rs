@@ -589,6 +589,79 @@ fn unapplied_object_command_is_abandoned_after_bucket_reservation_expires() {
 }
 
 #[test]
+fn applied_pending_command_converges_after_reservation_was_already_released() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "applied-released-pending-");
+    let key = key_for_object_pg(topology, &bucket, 1, "key-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
+    let pg_id = PgId::new(1);
+    let version_id = cluster
+        .reserve_next_object_version(pg_id, &bucket, &key)
+        .unwrap();
+    let proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        "applied-released-pending",
+        Some(key.as_str()),
+    );
+    let write_sequence = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .next_object_write_sequence(bucket.as_str(), key.as_str())
+        .unwrap();
+    let command = MetadataCommandEnvelope::new(
+        cluster.next_object_metadata_command_id(pg_id).unwrap(),
+        MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+            bucket_write_reservation: proof.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id,
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            write_sequence,
+            last_modified_millis: crate::clock::current_time_millis(),
+            stale_payload: None,
+        }),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+        .unwrap();
+    cluster
+        .release_bucket_write_reservation_proof(&proof)
+        .unwrap();
+    assert_bucket_write_reservations_released(&map, &bucket);
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_some());
+
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .unwrap();
+
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_version(&*pg, &bucket, &key, version_id),
+            Ok(crate::StoredObject::DeleteMarker(_))
+        ));
+    }
+}
+
+#[test]
 fn stream_put_create_keeps_reservation_until_pending_converges() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

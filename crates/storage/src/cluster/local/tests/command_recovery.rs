@@ -42,6 +42,15 @@ impl<S: crate::control_plane::ControlPlaneStore> ControlPlaneRuntimeMapSource
         self.authority
             .pg_runtime_map_snapshot(pg_id, authority_now_ms)
     }
+
+    fn serving_pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.authority
+            .serving_pg_runtime_map_snapshot(pg_id, authority_now_ms)
+    }
 }
 
 #[test]

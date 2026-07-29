@@ -13724,21 +13724,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route_validation = if request.cluster_epoch < self.config.cluster_epoch {
-            self.validate_metadata_command_recovery_read(
-                request.node_id,
-                request.cluster_epoch,
-                request.pg_id,
-                true,
-            )
-        } else {
-            self.validate_pg_route_for_metadata_log_read(
-                request.node_id,
-                request.cluster_epoch,
-                request.pg_id,
-            )
-        };
-        if let Err(error) = route_validation {
+        if let Err(error) = self.validate_pg_route_for_metadata_log_read(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
@@ -30789,12 +30779,15 @@ mod tests {
         });
         private_socket_dir(config.socket_path.parent().unwrap());
         let command = test_metadata_command(0, 1);
+        let pending_command = test_metadata_command(0, 2);
         let expected_state_digest;
         let expected_entries;
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         {
             let pg = server._node.get_pg(0).unwrap();
             pg.apply_metadata_command_and_record(7, &command).unwrap();
+            pg.try_insert_pending_metadata_command_slot(7, &pending_command, None)
+                .unwrap();
             expected_state_digest = pg.metadata_command_replica_state().unwrap().state_digest;
             expected_entries = pg
                 .retained_metadata_command_log_entries(
@@ -30860,9 +30853,19 @@ mod tests {
                 },
             ),
         );
-        let validate_response = send_frame(
+        let pending_response = send_frame(
             &mut client,
             4,
+            StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: command.id().cluster_epoch(),
+                pg_id: PgId::new(0),
+            }),
+        );
+        let validate_response = send_frame(
+            &mut client,
+            5,
             StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending,
             encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
                 node_id: NodeId::new(7),
@@ -30891,6 +30894,12 @@ mod tests {
             crate::storage_rpc::decode_metadata_command_log_entry_range_response(&entries_payload)
                 .unwrap();
         assert_eq!(entries.entries, expected_entries);
+
+        let pending_payload = decode_storage_rpc_response_payload(&pending_response.payload)
+            .unwrap()
+            .unwrap();
+        let pending = decode_metadata_command_pending_envelope_response(&pending_payload).unwrap();
+        assert_eq!(pending.command, Some(pending_command));
 
         let validate_payload = decode_storage_rpc_response_payload(&validate_response.payload)
             .unwrap()

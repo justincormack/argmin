@@ -4453,6 +4453,19 @@ mod runtime_map_refresh_invalidation_tests {
         ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
             Ok(self.0.clone())
         }
+
+        fn serving_pg_runtime_map_snapshot(
+            &self,
+            pg_id: PgId,
+            _authority_now_ms: u64,
+        ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+            self.0
+                .pg_routes()
+                .iter()
+                .any(|route| route.pg_id() == pg_id)
+                .then(|| self.0.clone())
+                .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })
+        }
     }
 
     fn frontend_storage_rpc_auth() -> crate::StorageRpcClientAuthConfig {
@@ -9361,7 +9374,16 @@ impl StorageCluster {
                 if create.session.target == StreamUploadTarget::PutObject
         );
         if !preserve_command_reservation {
-            self.release_metadata_command_bucket_write_reservation(command)?;
+            let expected_reservation_id =
+                Self::metadata_command_bucket_write_reservation_proof(command)
+                    .map(|proof| proof.reservation_id.as_str());
+            match self.release_metadata_command_bucket_write_reservation(command) {
+                Ok(()) => {}
+                Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::BucketWriteReservationNotFound { reservation_id },
+                )) if expected_reservation_id == Some(reservation_id.as_str()) => {}
+                Err(error) => return Err(error),
+            }
         }
         if let MetadataCommandPayload::AbortStreamUpload(abort) = command.payload() {
             if let Some(proof) = &abort.stream_create_bucket_write_reservation {

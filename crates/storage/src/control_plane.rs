@@ -1878,6 +1878,22 @@ impl ClusterControlSnapshot {
         )
     }
 
+    pub(crate) fn serving_runtime_map_for_pg_with_freshness_proof(
+        &self,
+        pg_id: PgId,
+        now_ms: u64,
+        freshness_proof: RuntimeMapFreshnessProof,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let route = self.pg_route(pg_id, now_ms)?;
+        self.runtime_map_from_pg_routes_with_history(
+            vec![route],
+            self.historical_pg_routes_for_runtime_map_pg(pg_id)?,
+            self.historical_cluster_epochs(),
+            freshness_proof,
+            non_serving_runtime_map_validity(now_ms),
+        )
+    }
+
     pub fn runtime_map_for_storage_node_refresh(
         &self,
         now_ms: u64,
@@ -5154,6 +5170,146 @@ impl ClusterRuntimeMapSnapshot {
             historical_cluster_epochs: self.historical_cluster_epochs.clone(),
         })
     }
+
+    /// Builds the one-PG route used to inspect a fenced metadata-transfer source.
+    ///
+    /// Historical maps are normally non-serving. This operation preserves the
+    /// freshness proof from the current authority read only when the current
+    /// Peering route still exactly matches the previously fenced route and,
+    /// for a transfer in progress, names the exact historical source route.
+    /// The resulting map cannot authorize an unrelated PG or source node.
+    pub fn metadata_transfer_source_runtime_map(
+        &self,
+        expected_current_route: &PgRouteSnapshot,
+        source_epoch: ClusterEpoch,
+        source_node_id: NodeId,
+    ) -> Result<Self, ControlPlaneError> {
+        if !self.freshness_proof.is_serving_authority_read() {
+            return Err(ControlPlaneError::rpc_protocol(
+                "metadata-transfer source map requires a serving authority read".to_owned(),
+            ));
+        }
+        let pg_id = expected_current_route.pg_id();
+        let current_route = self
+            .pg_routes
+            .iter()
+            .find(|route| route.pg_id == pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        if current_route
+            != &expected_current_route.with_cluster_epoch(current_route.cluster_epoch())
+        {
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "metadata-transfer source PG {} changed after its fence",
+                pg_id.get()
+            )));
+        }
+        if current_route.state != PgState::Peering {
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "metadata-transfer source PG {} is {:?}, not Peering",
+                pg_id.get(),
+                current_route.state
+            )));
+        }
+
+        let source_route = if current_route.peering_metadata_transfer.is_none() {
+            if current_route
+                .peering_metadata_transfer_source_route_epoch
+                .is_some()
+                || current_route
+                    .peering_metadata_transfer_source_node_id
+                    .is_some()
+                || expected_current_route.cluster_epoch() != source_epoch
+            {
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "metadata-transfer source PG {} has an incomplete or mismatched current-route authorization",
+                    pg_id.get()
+                )));
+            }
+            current_route.with_cluster_epoch(source_epoch)
+        } else {
+            if current_route.peering_metadata_transfer_source_route_epoch != Some(source_epoch)
+                || current_route.peering_metadata_transfer_source_node_id != Some(source_node_id)
+            {
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "metadata-transfer source PG {} does not authorize node {} at epoch {}",
+                    pg_id.get(),
+                    source_node_id.as_u32(),
+                    source_epoch.get()
+                )));
+            }
+            self.reconstructed_pg_route_at_epoch(pg_id, source_epoch)?
+        };
+        if source_route.state != PgState::Peering || source_route.primary_node_id != source_node_id
+        {
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "metadata-transfer source PG {} route at epoch {} is not Peering on primary {}",
+                pg_id.get(),
+                source_epoch.get(),
+                source_node_id.as_u32()
+            )));
+        }
+
+        Ok(Self {
+            cluster_epoch: source_epoch,
+            validity: self.validity,
+            freshness_proof: self.freshness_proof,
+            nodes: self.nodes.clone(),
+            pg_routes: vec![source_route],
+            historical_pg_routes: self
+                .historical_pg_routes
+                .iter()
+                .filter(|route| route.pg_id == pg_id)
+                .cloned()
+                .collect(),
+            historical_cluster_epochs: self.historical_cluster_epochs.clone(),
+        })
+    }
+
+    /// Builds the one-PG current route used to install a metadata transfer.
+    ///
+    /// The route must be observed through a serving authority read and must
+    /// still carry the exact transfer authorization expected by the importer.
+    pub fn metadata_transfer_destination_runtime_map(
+        &self,
+        pg_id: PgId,
+        acting_set: &[NodeId],
+        expected_transfer: PgMetadataTransferProof,
+    ) -> Result<Self, ControlPlaneError> {
+        if !self.freshness_proof.is_serving_authority_read() {
+            return Err(ControlPlaneError::rpc_protocol(
+                "metadata-transfer destination map requires a serving authority read".to_owned(),
+            ));
+        }
+        let route = self
+            .pg_routes
+            .iter()
+            .find(|route| route.pg_id == pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        if route.cluster_epoch != self.cluster_epoch
+            || route.state != PgState::Peering
+            || route.acting_set != acting_set
+            || route.peering_metadata_transfer != Some(expected_transfer)
+        {
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "metadata-transfer destination PG {} does not match its exact transfer authorization",
+                pg_id.get()
+            )));
+        }
+        Ok(Self {
+            cluster_epoch: self.cluster_epoch,
+            validity: self.validity,
+            freshness_proof: self.freshness_proof,
+            nodes: self.nodes.clone(),
+            pg_routes: vec![route.clone()],
+            historical_pg_routes: self
+                .historical_pg_routes
+                .iter()
+                .filter(|route| route.pg_id == pg_id)
+                .cloned()
+                .collect(),
+            historical_cluster_epochs: self.historical_cluster_epochs.clone(),
+        })
+    }
 }
 
 fn runtime_map_content_digest(snapshot: &ClusterRuntimeMapSnapshot) -> RuntimeMapContentDigest {
@@ -6356,6 +6512,12 @@ pub trait ControlPlaneRuntimeMapSource {
         }
         Err(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })
     }
+
+    fn serving_pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9717,6 +9879,23 @@ impl<S: ControlPlaneStore> ControlPlaneRuntimeMapSource for SingleAuthorityContr
                 non_serving_runtime_map_validity(authority_now_ms),
             )
     }
+
+    fn serving_pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.store.ensure_healthy()?;
+        self.snapshot
+            .serving_runtime_map_for_pg_with_freshness_proof(
+                pg_id,
+                authority_now_ms,
+                RuntimeMapFreshnessProof::SingleAuthority {
+                    authority_incarnation: self.snapshot.authority_incarnation(),
+                    issued_at_ms: authority_now_ms,
+                },
+            )
+    }
 }
 
 impl<S: ControlPlaneStore> ControlPlaneLinearizedCommandSink for SingleAuthorityControlPlane<S> {
@@ -11588,6 +11767,7 @@ impl UnixControlPlaneClient {
             ControlPlaneRpcKind::RuntimeMapSnapshot
                 | ControlPlaneRpcKind::RuntimeMapDiagnostics
                 | ControlPlaneRpcKind::PgRuntimeMapSnapshot
+                | ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot
                 | ControlPlaneRpcKind::RuntimeMapStatus
                 | ControlPlaneRpcKind::PendingMetadataCommandRecoveries
         ));
@@ -12121,6 +12301,24 @@ impl UnixControlPlaneClient {
         _authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         self.pg_runtime_map_snapshot_with_read_timeout(pg_id, 0, CONTROL_PLANE_RPC_IO_TIMEOUT)
+    }
+
+    pub fn serving_pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        _authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_pg_id_request(&mut payload, pg_id);
+        let payload = self.send_read_only_request_with_read_timeout(
+            ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot,
+            &payload,
+            CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        reader.finish()?;
+        Ok(runtime_map)
     }
 
     pub fn pending_metadata_command_recoveries(
@@ -14462,6 +14660,14 @@ impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         UnixControlPlaneClient::pg_runtime_map_snapshot(self, pg_id, authority_now_ms)
     }
+
+    fn serving_pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        UnixControlPlaneClient::serving_pg_runtime_map_snapshot(self, pg_id, authority_now_ms)
+    }
 }
 
 impl ControlPlaneRuntimeMapSource for AuthenticatedUnixControlPlaneClient {
@@ -14516,6 +14722,25 @@ impl ControlPlaneRuntimeMapSource for AuthenticatedUnixControlPlaneClient {
             authority_now_ms,
             payload,
             CONTROL_PLANE_RPC_IO_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        reader.finish()?;
+        Ok(runtime_map)
+    }
+
+    fn serving_pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_pg_id_request(&mut payload, pg_id);
+        let payload = self.send_signed_read_only_request_with_read_timeout(
+            ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot,
+            authority_now_ms,
+            payload,
+            CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
         )?;
         let mut reader = PayloadReader::new(&payload);
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
@@ -15252,6 +15477,27 @@ where
                 response_authority_now_ms,
             );
         }
+        ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot => {
+            let mut reader = PayloadReader::new(&payload);
+            let pg_id = read_pg_id_request(&mut reader)?;
+            reader.finish()?;
+            let response =
+                match control_plane.serving_pg_runtime_map_snapshot(pg_id, authority_now_ms) {
+                    Ok(snapshot) => {
+                        let mut response = Vec::new();
+                        write_runtime_map_snapshot(&mut response, &snapshot)?;
+                        Ok(response)
+                    }
+                    Err(error) => Err(error),
+                };
+            let response_authority_now_ms = response_authority_now_ms()?;
+            return build_control_plane_verified_response(
+                kind,
+                response,
+                response_auth,
+                response_authority_now_ms,
+            );
+        }
         ControlPlaneRpcKind::RefreshNodeHeartbeat => {
             debug_assert_eq!(
                 kind.auth_operation(),
@@ -15602,9 +15848,30 @@ enum ControlPlaneRpcKind {
     AuthorityClockStatus = 14,
     ReestablishAuthorityClock = 15,
     RuntimeMapDiagnostics = 16,
+    ServingPgRuntimeMapSnapshot = 17,
 }
 
 impl ControlPlaneRpcKind {
+    #[cfg(test)]
+    const ALL: [Self; 16] = [
+        Self::RuntimeMapSnapshot,
+        Self::RefreshNodeHeartbeat,
+        Self::SetPgActingSet,
+        Self::SetPgActingSetWithMetadataTransfer,
+        Self::SetPgActingSetWithMetadataTransferRuntimeMap,
+        Self::FencePgForMetadataTransferRuntimeMap,
+        Self::TransferRaftLeadership,
+        Self::PgRuntimeMapSnapshot,
+        Self::TriggerRaftSnapshotAndPurge,
+        Self::TriggerRaftElection,
+        Self::RuntimeMapStatus,
+        Self::PendingMetadataCommandRecoveries,
+        Self::AuthorityClockStatus,
+        Self::ReestablishAuthorityClock,
+        Self::RuntimeMapDiagnostics,
+        Self::ServingPgRuntimeMapSnapshot,
+    ];
+
     fn as_u16(self) -> u16 {
         self as u16
     }
@@ -15626,6 +15893,7 @@ impl ControlPlaneRpcKind {
             14 => Ok(Self::AuthorityClockStatus),
             15 => Ok(Self::ReestablishAuthorityClock),
             16 => Ok(Self::RuntimeMapDiagnostics),
+            17 => Ok(Self::ServingPgRuntimeMapSnapshot),
             _ => Err(ControlPlaneError::rpc_protocol(format!(
                 "unknown control-plane RPC kind {value}"
             ))),
@@ -15636,6 +15904,7 @@ impl ControlPlaneRpcKind {
         match self {
             Self::RuntimeMapSnapshot
             | Self::PgRuntimeMapSnapshot
+            | Self::ServingPgRuntimeMapSnapshot
             | Self::RuntimeMapStatus
             | Self::RuntimeMapDiagnostics
             | Self::PendingMetadataCommandRecoveries => {
@@ -15674,6 +15943,7 @@ impl ControlPlaneRpcKind {
             }
             Self::TransferRaftLeadership => MetricKind::TransferRaftLeadership,
             Self::PgRuntimeMapSnapshot => MetricKind::PgRuntimeMapSnapshot,
+            Self::ServingPgRuntimeMapSnapshot => MetricKind::ServingPgRuntimeMapSnapshot,
             Self::TriggerRaftSnapshotAndPurge => MetricKind::TriggerRaftSnapshotAndPurge,
             Self::TriggerRaftElection => MetricKind::TriggerRaftElection,
             Self::RuntimeMapStatus => MetricKind::RuntimeMapStatus,
@@ -17417,9 +17687,10 @@ fn read_control_plane_runtime_map_diagnostics(
 ) -> Result<ControlPlaneRuntimeMapDiagnostics, ControlPlaneError> {
     let runtime_map = read_runtime_map_snapshot(reader)?;
     let metric_count = reader.read_collection_len("control-plane RPC metrics", 97)?;
-    if metric_count > 16 {
+    if metric_count > observability::ControlPlaneRpcMetricKind::COUNT {
         return Err(ControlPlaneError::rpc_protocol(format!(
-            "control-plane RPC metric count {metric_count} exceeds 16"
+            "control-plane RPC metric count {metric_count} exceeds {}",
+            observability::ControlPlaneRpcMetricKind::COUNT
         )));
     }
     let mut rpc_metrics = Vec::with_capacity(metric_count);
@@ -17692,6 +17963,7 @@ fn control_plane_rpc_metric_kind_code(kind: observability::ControlPlaneRpcMetric
         Kind::ReestablishAuthorityClock => 14,
         Kind::RuntimeMapDiagnostics => 15,
         Kind::Unknown => 16,
+        Kind::ServingPgRuntimeMapSnapshot => 17,
     }
 }
 
@@ -17716,6 +17988,7 @@ fn read_control_plane_rpc_metric_kind(
         14 => Ok(Kind::ReestablishAuthorityClock),
         15 => Ok(Kind::RuntimeMapDiagnostics),
         16 => Ok(Kind::Unknown),
+        17 => Ok(Kind::ServingPgRuntimeMapSnapshot),
         _ => Err(ControlPlaneError::rpc_protocol(format!(
             "invalid control-plane RPC metric kind {code}"
         ))),
@@ -31352,6 +31625,17 @@ mod tests {
                 0,
             ))
         }
+
+        fn serving_pg_runtime_map_snapshot(
+            &self,
+            _pg_id: PgId,
+            _authority_now_ms: u64,
+        ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+            Err(ControlPlaneError::rpc_remote(
+                "recording Raft admin authority does not support serving PG runtime maps"
+                    .to_owned(),
+            ))
+        }
     }
 
     fn assert_raft_admin_trigger_unconfirmed(error: ControlPlaneError, expected_operation: &str) {
@@ -34162,6 +34446,7 @@ mod tests {
             ControlPlaneRpcKind::RuntimeMapSnapshot,
             ControlPlaneRpcKind::RuntimeMapDiagnostics,
             ControlPlaneRpcKind::PgRuntimeMapSnapshot,
+            ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot,
             ControlPlaneRpcKind::RuntimeMapStatus,
             ControlPlaneRpcKind::PendingMetadataCommandRecoveries,
         ];
@@ -34196,6 +34481,16 @@ mod tests {
                 "{kind:?}"
             );
         }
+
+        let mut classified_kinds = frontend_read_kinds
+            .into_iter()
+            .chain([ControlPlaneRpcKind::RefreshNodeHeartbeat])
+            .chain(admin_kinds)
+            .collect::<Vec<_>>();
+        classified_kinds.sort_by_key(|kind| kind.as_u16());
+        let mut all_kinds = ControlPlaneRpcKind::ALL.to_vec();
+        all_kinds.sort_by_key(|kind| kind.as_u16());
+        assert_eq!(classified_kinds, all_kinds);
     }
 
     #[test]
@@ -34324,6 +34619,94 @@ mod tests {
         assert_eq!(status.cluster_epoch(), expected_epoch);
         assert_eq!(status.pg_routes(), 1);
         assert_eq!(status.active_serving_pg_routes(), 1);
+    }
+
+    #[test]
+    fn unix_serving_pg_runtime_map_uses_check_applied_timeout_for_slow_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let expected_epoch = authority.snapshot().cluster_epoch();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(
+                request.kind,
+                ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot
+            );
+            std::thread::sleep(CONTROL_PLANE_RPC_IO_TIMEOUT + Duration::from_millis(250));
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_000)
+                .unwrap();
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let runtime_map = ControlPlaneRuntimeMapSource::serving_pg_runtime_map_snapshot(
+            &client,
+            PgId::new(7),
+            2_000,
+        )
+        .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(runtime_map.cluster_epoch(), expected_epoch);
+        assert_eq!(runtime_map.pg_routes().len(), 1);
+        assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(7));
+        assert!(runtime_map.freshness_proof().is_serving_authority_read());
+    }
+
+    #[test]
+    fn authenticated_unix_serving_pg_runtime_map_uses_check_applied_timeout_for_slow_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let expected_epoch = authority.snapshot().cluster_epoch();
+        let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            std::thread::sleep(CONTROL_PLANE_RPC_IO_TIMEOUT + Duration::from_millis(250));
+            handle_control_plane_unix_stream_with_auth(
+                &mut authority,
+                &mut stream,
+                2_000,
+                &verifier,
+            )
+            .unwrap();
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            frontend_auth_credential("auth-cluster", "frontend-1"),
+        );
+        let runtime_map = ControlPlaneRuntimeMapSource::serving_pg_runtime_map_snapshot(
+            &client,
+            PgId::new(7),
+            2_000,
+        )
+        .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(runtime_map.cluster_epoch(), expected_epoch);
+        assert_eq!(runtime_map.pg_routes().len(), 1);
+        assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(7));
+        assert!(runtime_map.freshness_proof().is_serving_authority_read());
     }
 
     #[test]
@@ -34650,7 +35033,10 @@ mod tests {
         let diagnostics = read_control_plane_runtime_map_diagnostics(&mut reader).unwrap();
         reader.finish().unwrap();
         assert!(diagnostics.runtime_map().cluster_epoch() > ClusterEpoch::INITIAL);
-        assert_eq!(diagnostics.rpc_metrics().len(), 16);
+        assert_eq!(
+            diagnostics.rpc_metrics().len(),
+            observability::ControlPlaneRpcMetricKind::COUNT
+        );
         assert!(
             diagnostics.snapshot_metrics().save_total >= 1,
             "the preceding durable mutation should be measured"
@@ -35581,6 +35967,20 @@ mod tests {
                 &self.status_map,
             ))
         }
+
+        fn serving_pg_runtime_map_snapshot(
+            &self,
+            pg_id: PgId,
+            authority_now_ms: u64,
+        ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+            let runtime_map = self.runtime_map_snapshot(authority_now_ms)?;
+            runtime_map
+                .pg_routes()
+                .iter()
+                .any(|route| route.pg_id() == pg_id)
+                .then_some(runtime_map)
+                .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })
+        }
     }
 
     fn current_runtime_map_test_snapshot() -> ClusterRuntimeMapSnapshot {
@@ -35755,6 +36155,107 @@ mod tests {
             snapshot.historical_cluster_epochs.push(source_epoch);
         }
         snapshot
+    }
+
+    #[test]
+    fn metadata_transfer_source_runtime_map_preserves_only_exact_fresh_authorization() {
+        let mut snapshot = runtime_map_test_snapshot_with_transfer_route(true);
+        let source_epoch = snapshot.historical_pg_routes[0].cluster_epoch();
+        snapshot.historical_pg_routes[0].state = PgState::Peering;
+        let expected_current_route = snapshot.pg_routes[0].clone();
+        let now_ms = crate::clock::current_time_millis();
+        snapshot.validity = RouteMapValidity::until_ms(now_ms + 10_000).unwrap();
+        snapshot.freshness_proof = RuntimeMapFreshnessProof::SingleAuthority {
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+            issued_at_ms: now_ms,
+        };
+        let expected_proof = *snapshot.freshness_proof();
+
+        let source = snapshot
+            .metadata_transfer_source_runtime_map(
+                &expected_current_route,
+                source_epoch,
+                NodeId::new(1),
+            )
+            .unwrap();
+
+        assert_eq!(source.cluster_epoch(), source_epoch);
+        assert_eq!(source.pg_routes().len(), 1);
+        assert_eq!(source.pg_routes()[0].state(), PgState::Peering);
+        assert_eq!(source.pg_routes()[0].primary_node_id(), NodeId::new(1));
+        assert_eq!(*source.freshness_proof(), expected_proof);
+        assert!(source
+            .bind_process_local_lease_at(now_ms, 50_000)
+            .unwrap()
+            .is_some_and(|lease| lease.is_valid_at_monotonic(50_001)));
+
+        assert!(snapshot
+            .metadata_transfer_source_runtime_map(
+                &expected_current_route,
+                source_epoch,
+                NodeId::new(2),
+            )
+            .is_err());
+        snapshot.freshness_proof = RuntimeMapFreshnessProof::Reconstructed {
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+        };
+        assert!(snapshot
+            .metadata_transfer_source_runtime_map(
+                &expected_current_route,
+                source_epoch,
+                NodeId::new(1),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn metadata_transfer_source_runtime_map_accepts_fresh_current_fence() {
+        let mut snapshot = runtime_map_test_snapshot_with_active_route();
+        snapshot.pg_routes[0].state = PgState::Peering;
+        snapshot.pg_routes[0].primary_lease_deadline_ms = None;
+        let expected_current_route = snapshot.pg_routes[0].clone();
+
+        let source = snapshot
+            .metadata_transfer_source_runtime_map(
+                &expected_current_route,
+                ClusterEpoch::INITIAL,
+                NodeId::new(1),
+            )
+            .unwrap();
+
+        assert_eq!(source.pg_routes(), snapshot.pg_routes());
+        assert_eq!(source.freshness_proof(), snapshot.freshness_proof());
+    }
+
+    #[test]
+    fn metadata_transfer_destination_runtime_map_preserves_fresh_exact_authorization() {
+        let mut snapshot = runtime_map_test_snapshot_with_transfer_route(true);
+        let transfer = snapshot.pg_routes[0].peering_metadata_transfer().unwrap();
+        let acting_set = snapshot.pg_routes[0].acting_set().to_vec();
+        let now_ms = crate::clock::current_time_millis();
+        snapshot.validity = RouteMapValidity::until_ms(now_ms + 10_000).unwrap();
+        snapshot.freshness_proof = RuntimeMapFreshnessProof::SingleAuthority {
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+            issued_at_ms: now_ms,
+        };
+
+        let destination = snapshot
+            .metadata_transfer_destination_runtime_map(PgId::new(7), &acting_set, transfer)
+            .unwrap();
+
+        assert_eq!(destination.pg_routes().len(), 1);
+        assert_eq!(destination.pg_routes()[0], snapshot.pg_routes()[0]);
+        assert!(destination
+            .bind_process_local_lease_at(now_ms, 60_000)
+            .unwrap()
+            .is_some_and(|lease| lease.is_valid_at_monotonic(60_001)));
+
+        snapshot.freshness_proof = RuntimeMapFreshnessProof::Reconstructed {
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+        };
+        assert!(snapshot
+            .metadata_transfer_destination_runtime_map(PgId::new(7), &acting_set, transfer)
+            .is_err());
     }
 
     #[test]
@@ -42335,6 +42836,66 @@ mod tests {
     }
 
     #[test]
+    fn serving_pg_runtime_map_ignores_unrelated_unserved_pg() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(25), vec![NodeId::new(1)])
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(26), vec![NodeId::new(2)])
+            .unwrap();
+        authority
+            .submit_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(2),
+                    node_incarnation: node_incarnation(&authority, 2),
+                    endpoint: "node-2.sock".to_owned(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(26),
+                        state: PgState::Peering,
+                        metadata_proof: PgMetadataProof::empty(),
+                        pending_metadata_command: None,
+                    }],
+                },
+                1_030,
+            )
+            .unwrap();
+        authority
+            .complete_pg_peering(
+                PgId::new(26),
+                NodeId::new(2),
+                node_incarnation(&authority, 2),
+                1_050,
+            )
+            .unwrap();
+
+        assert!(authority.runtime_map_snapshot(1_051).is_err());
+        let scoped = authority
+            .serving_pg_runtime_map_snapshot(PgId::new(25), 1_051)
+            .unwrap();
+
+        assert_eq!(scoped.pg_routes().len(), 1);
+        assert_eq!(scoped.pg_routes()[0].pg_id(), PgId::new(25));
+        assert_eq!(scoped.pg_routes()[0].state(), PgState::Peering);
+        assert!(scoped.freshness_proof().is_serving_authority_read());
+        assert_eq!(
+            scoped.valid_until_ms(),
+            Some(1_051 + MAX_HEARTBEAT_LEASE_MS)
+        );
+    }
+
+    #[test]
     fn runtime_map_exports_retained_historical_pg_routes() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -44010,6 +44571,22 @@ mod tests {
                     .push(authority_now_ms);
                 Err(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })
             }
+
+            fn serving_pg_runtime_map_snapshot(
+                &self,
+                pg_id: PgId,
+                authority_now_ms: u64,
+            ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+                self.snapshot
+                    .serving_runtime_map_for_pg_with_freshness_proof(
+                        pg_id,
+                        authority_now_ms,
+                        RuntimeMapFreshnessProof::SingleAuthority {
+                            authority_incarnation: self.snapshot.authority_incarnation(),
+                            issued_at_ms: authority_now_ms,
+                        },
+                    )
+            }
         }
 
         let tmp = test_util::tempdir();
@@ -44107,6 +44684,22 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                 ))
+            }
+
+            fn serving_pg_runtime_map_snapshot(
+                &self,
+                pg_id: PgId,
+                authority_now_ms: u64,
+            ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+                self.snapshot
+                    .serving_runtime_map_for_pg_with_freshness_proof(
+                        pg_id,
+                        authority_now_ms,
+                        RuntimeMapFreshnessProof::SingleAuthority {
+                            authority_incarnation: self.snapshot.authority_incarnation(),
+                            issued_at_ms: authority_now_ms,
+                        },
+                    )
             }
         }
 

@@ -80,6 +80,7 @@ use crate::durable_journal::{
     DurableJournalAppendError, DurableJournalFile, DurableJournalFormat, DurableJournalIoContexts,
     DurableJournalObserver,
 };
+use crate::PgId;
 use crate::{ClusterEpoch, PgState};
 
 pub type ControlPlaneRaftNodeId = u64;
@@ -5533,6 +5534,23 @@ impl ControlPlaneRaftAuthority {
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let (snapshot, read_index) = self.linearized_control_plane_snapshot().await?;
         snapshot.runtime_map_with_freshness_proof(
+            issued_at_ms,
+            RuntimeMapFreshnessProof::ReadIndex {
+                authority_incarnation: snapshot.authority_incarnation(),
+                read_index,
+                issued_at_ms,
+            },
+        )
+    }
+
+    pub async fn linearized_serving_pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        issued_at_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let (snapshot, read_index) = self.linearized_control_plane_snapshot().await?;
+        snapshot.serving_runtime_map_for_pg_with_freshness_proof(
+            pg_id,
             issued_at_ms,
             RuntimeMapFreshnessProof::ReadIndex {
                 authority_incarnation: snapshot.authority_incarnation(),
@@ -13556,7 +13574,8 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::control_plane::{
-        ClusterControlSnapshot, NodeAvailabilityState, NodeHeartbeat, RuntimeMapFreshnessProof,
+        ClusterControlSnapshot, NodeAvailabilityState, NodeHeartbeat, NodePgHeartbeatObservation,
+        PgMetadataProof, RuntimeMapFreshnessProof,
     };
     use crate::control_plane_auth::ControlPlaneScopedCredentialInput;
     use crate::control_plane_command::LeaseHorizonAuthorityBinding;
@@ -23108,7 +23127,7 @@ mod tests {
             let write = authority
                 .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
                     nodes: vec![(NodeId::new(1), "node-1".to_string())],
-                    pg_ids: vec![PgId::new(0)],
+                    pg_ids: vec![PgId::new(0), PgId::new(1)],
                 })
                 .await
                 .unwrap();
@@ -23176,6 +23195,105 @@ mod tests {
                     .content_digest(),
                 runtime_map.content_digest()
             );
+
+            let current_epoch = runtime_map.cluster_epoch();
+            let heartbeat = authority
+                .submit_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                    heartbeat: NodeHeartbeat {
+                        node_id: NodeId::new(1),
+                        node_incarnation: 1,
+                        endpoint: "node-1".to_string(),
+                        observed_epoch: current_epoch,
+                        requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: vec![NodePgHeartbeatObservation {
+                            pg_id: PgId::new(1),
+                            state: PgState::Peering,
+                            metadata_proof: PgMetadataProof::empty(),
+                            pending_metadata_command: None,
+                        }],
+                    },
+                    heartbeat_at_ms: 44_100,
+                    lease_deadline_ms: 45_100,
+                    lease_horizon_authority: Some(LeaseHorizonAuthorityBinding::new(1, Some(1))),
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    heartbeat.outcome(),
+                    ControlPlaneRaftCommandOutcome::Applied(
+                        ControlPlaneCommandResponse::RecordNodeHeartbeat
+                    )
+                ),
+                "unexpected scoped-read heartbeat outcome: {:?}",
+                heartbeat.outcome()
+            );
+            let current_epoch = authority
+                .current_control_plane_snapshot()
+                .await
+                .unwrap()
+                .cluster_epoch();
+            let heartbeat = authority
+                .submit_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                    heartbeat: NodeHeartbeat {
+                        node_id: NodeId::new(1),
+                        node_incarnation: 1,
+                        endpoint: "node-1".to_string(),
+                        observed_epoch: current_epoch,
+                        requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: vec![NodePgHeartbeatObservation {
+                            pg_id: PgId::new(1),
+                            state: PgState::Peering,
+                            metadata_proof: PgMetadataProof::empty(),
+                            pending_metadata_command: None,
+                        }],
+                    },
+                    heartbeat_at_ms: 44_101,
+                    lease_deadline_ms: 45_101,
+                    lease_horizon_authority: Some(LeaseHorizonAuthorityBinding::new(1, Some(1))),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                heartbeat.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::RecordNodeHeartbeat
+                )
+            ));
+            let completion = authority
+                .submit_control_plane_command(ControlPlaneCommand::CompletePgPeering {
+                    pg_id: PgId::new(1),
+                    primary: NodeId::new(1),
+                    node_incarnation: 1,
+                    complete_at_ms: 44_102,
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    completion.outcome(),
+                    ControlPlaneRaftCommandOutcome::Applied(
+                        ControlPlaneCommandResponse::CompletePgPeering
+                    )
+                ),
+                "unexpected scoped-read completion outcome: {:?}",
+                completion.outcome()
+            );
+            assert!(authority
+                .linearized_runtime_map_snapshot(44_103)
+                .await
+                .is_err());
+
+            let scoped = authority
+                .linearized_serving_pg_runtime_map_snapshot(PgId::new(0), 44_103)
+                .await
+                .unwrap();
+            assert_eq!(scoped.pg_routes().len(), 1);
+            assert_eq!(scoped.pg_routes()[0].pg_id(), PgId::new(0));
+            assert_eq!(scoped.pg_routes()[0].state(), PgState::Peering);
+            assert!(scoped.freshness_proof().is_serving_authority_read());
 
             authority.shutdown().await.unwrap();
         });

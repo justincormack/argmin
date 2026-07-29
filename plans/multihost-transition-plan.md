@@ -8366,6 +8366,21 @@ Metadata PG migration and backfill design notes:
   checkpoint-compatible failure. The selector now uses durable checkpoint-plus-
   suffix artifacts when available and keeps the full-checkpoint fallback for
   sources with no usable catalogue entry.
+- Hardened live metadata-transfer export route renewal. Generic reconstructed
+  historical maps remain non-serving; after a transient route expiry, export
+  now obtains an authority-issued serving PG-scoped map and derives a one-PG
+  source map only when the current Peering route still exactly matches the route
+  observed at the fence. The scoped authority read and its validity depend only
+  on the named PG, so an unrelated unserved PG cannot block transfer recovery or
+  shorten its lease. Unrelated global epoch advances are permitted, while any
+  source PG primary, acting-set, lifecycle, pending-recovery, or transfer-marker
+  change fails closed. Destination import renewal similarly requires the exact
+  current acting set and installed transfer proof. Both derived maps retain only
+  the named PG; an export with an installed transfer marker follows only its
+  exact historical source epoch and node. Read-only pending-envelope inspection
+  uses the same bounded retained-Peering-route authorization as retained
+  metadata-log inspection; command adoption and recovery mutation remain bound
+  to the exact pending-recovery authorization.
 - Added the first routine metadata-checkpoint scheduler. The shard scavenger's
   quiet-window pass now has a low-priority `routine_metadata_checkpoint`
   admission class that backs off under foreground pressure or durable

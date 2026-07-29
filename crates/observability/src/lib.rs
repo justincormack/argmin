@@ -241,7 +241,9 @@ static STREAM_UPLOAD_FINALIZE_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FLIGHT_RECORDER: OnceLock<Mutex<FlightRecorder>> = OnceLock::new();
 static PANIC_FLIGHT_RECORDER_HOOK: Once = Once::new();
 static FLIGHT_RECORD_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static CONTROL_PLANE_RPC_METRICS: OnceLock<[ControlPlaneRpcMetricCounters; 16]> = OnceLock::new();
+static CONTROL_PLANE_RPC_METRICS: OnceLock<
+    [ControlPlaneRpcMetricCounters; ControlPlaneRpcMetricKind::ALL.len()],
+> = OnceLock::new();
 static CONTROL_PLANE_SNAPSHOT_SERIALIZE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_SNAPSHOT_SERIALIZE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_SNAPSHOT_SERIALIZE_US_MAX: AtomicU64 = AtomicU64::new(0);
@@ -364,12 +366,13 @@ pub enum ControlPlaneRpcMetricKind {
     AuthorityClockStatus,
     ReestablishAuthorityClock,
     RuntimeMapDiagnostics,
+    ServingPgRuntimeMapSnapshot,
     #[default]
     Unknown,
 }
 
 impl ControlPlaneRpcMetricKind {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 17] = [
         Self::RuntimeMapSnapshot,
         Self::RefreshNodeHeartbeat,
         Self::SetPgActingSet,
@@ -385,8 +388,11 @@ impl ControlPlaneRpcMetricKind {
         Self::AuthorityClockStatus,
         Self::ReestablishAuthorityClock,
         Self::RuntimeMapDiagnostics,
+        Self::ServingPgRuntimeMapSnapshot,
         Self::Unknown,
     ];
+
+    pub const COUNT: usize = Self::ALL.len();
 
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -410,6 +416,7 @@ impl ControlPlaneRpcMetricKind {
             Self::AuthorityClockStatus => "authority_clock_status",
             Self::ReestablishAuthorityClock => "reestablish_authority_clock",
             Self::RuntimeMapDiagnostics => "runtime_map_diagnostics",
+            Self::ServingPgRuntimeMapSnapshot => "serving_pg_runtime_map_snapshot",
             Self::Unknown => "unknown",
         }
     }
@@ -442,7 +449,8 @@ pub enum ControlPlaneRpcResponseWriteErrorKind {
     Other,
 }
 
-fn control_plane_rpc_metrics() -> &'static [ControlPlaneRpcMetricCounters; 16] {
+fn control_plane_rpc_metrics(
+) -> &'static [ControlPlaneRpcMetricCounters; ControlPlaneRpcMetricKind::ALL.len()] {
     CONTROL_PLANE_RPC_METRICS
         .get_or_init(|| std::array::from_fn(|_| ControlPlaneRpcMetricCounters::new()))
 }
@@ -5433,6 +5441,9 @@ mod tests {
     #[test]
     fn control_plane_rpc_metrics_classify_response_write_errors() {
         let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        for (index, kind) in ControlPlaneRpcMetricKind::ALL.into_iter().enumerate() {
+            assert_eq!(kind.index(), index);
+        }
         let kind = ControlPlaneRpcMetricKind::Unknown;
         let before = control_plane_rpc_metrics_snapshot()[kind.index()];
 
