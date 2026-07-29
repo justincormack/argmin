@@ -1637,6 +1637,7 @@ payload_shard_read_callers=$(
     }
     ' $(find crates/storage/src crates/server-core/src -type f -name '*.rs' \
         ! -path '*/tests/*' \
+        ! -name 'tests.rs' \
         ! -name '*_tests.rs' \
         | sort) \
         | sort \
@@ -1786,6 +1787,7 @@ coarse_payload_lease_callers=$(
     }
     ' $(find crates/storage/src crates/server-core/src -type f -name '*.rs' \
         ! -path '*/tests/*' \
+        ! -name 'tests.rs' \
         ! -name '*_tests.rs' \
         | sort) \
         | sort \

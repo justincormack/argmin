@@ -41,6 +41,13 @@ struct UnixObjectPayloadLease {
     released: bool,
 }
 
+struct UnixObjectPayloadLeaseRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    bucket: BucketName,
+    key: ObjectKey,
+    generation_id: GenerationId,
+}
+
 struct UnixRetainedObjectPayloadReclaimRoute<'a> {
     client: &'a UnixStorageNodeClient,
     bucket: BucketName,
@@ -1613,25 +1620,38 @@ impl ShardReadHandleNodeClient for UnixStorageNodeClient {
 }
 
 impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
-    fn acquire_object_payload_lease(
+    fn open_object_payload_lease_route(
         &self,
         route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-        kind: ObjectPayloadLeaseKind,
-    ) -> Result<Option<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError> {
+    ) -> Result<Box<dyn ObjectPayloadLeaseRoute + '_>, StoreError> {
         if route_cluster_epoch != self.cluster_epoch {
             return Err(StoreError::RouteAdmissionClusterMismatch {
                 admitted_epoch: route_cluster_epoch,
                 operation_epoch: self.cluster_epoch,
             });
         }
-        let mut session = self.open_object_payload_lease_session(kind)?;
-        let acquired = session.object_payload_lease_control(
-            bucket,
-            key,
+        Ok(Box::new(UnixObjectPayloadLeaseRoute {
+            client: self,
+            bucket: bucket.clone(),
+            key: key.clone(),
             generation_id,
+        }))
+    }
+}
+
+impl ObjectPayloadLeaseRoute for UnixObjectPayloadLeaseRoute<'_> {
+    fn acquire_object_payload_lease(
+        &self,
+        kind: ObjectPayloadLeaseKind,
+    ) -> Result<Option<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError> {
+        let mut session = self.client.open_object_payload_lease_session(kind)?;
+        let acquired = session.object_payload_lease_control(
+            &self.bucket,
+            &self.key,
+            self.generation_id,
             StorageRpcObjectPayloadLeaseControlOperation::Acquire,
             None,
         )?;
@@ -1639,9 +1659,9 @@ impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
             0 => Ok(None),
             1 => Ok(Some(Box::new(UnixObjectPayloadLease {
                 session,
-                bucket: bucket.clone(),
-                key: key.clone(),
-                generation_id,
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+                generation_id: self.generation_id,
                 released: false,
             }))),
             _ => Err(StoreError::Io {
@@ -1653,22 +1673,17 @@ impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
 
     fn try_begin_object_payload_reclaim(
         &self,
-        route_cluster_epoch: ClusterEpoch,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
         authority: &ObjectPayloadReclaimClaimProof,
     ) -> Result<bool, StoreError> {
-        if route_cluster_epoch != self.cluster_epoch {
-            return Err(StoreError::RouteAdmissionClusterMismatch {
-                admitted_epoch: route_cluster_epoch,
-                operation_epoch: self.cluster_epoch,
+        if authority.cluster_epoch != self.client.cluster_epoch {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "begin object payload reclaim",
             });
         }
-        match self.object_payload_lease_control_request(
-            bucket,
-            key,
-            generation_id,
+        match self.client.object_payload_lease_control_request(
+            &self.bucket,
+            &self.key,
+            self.generation_id,
             StorageRpcObjectPayloadLeaseControlOperation::ReclaimBegin,
             Some(authority),
         )? {
@@ -1681,23 +1696,11 @@ impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
         }
     }
 
-    fn object_payload_lease_count(
-        &self,
-        route_cluster_epoch: ClusterEpoch,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<usize, StoreError> {
-        if route_cluster_epoch != self.cluster_epoch {
-            return Err(StoreError::RouteAdmissionClusterMismatch {
-                admitted_epoch: route_cluster_epoch,
-                operation_epoch: self.cluster_epoch,
-            });
-        }
-        let count = self.object_payload_lease_control_request(
-            bucket,
-            key,
-            generation_id,
+    fn object_payload_lease_count(&self) -> Result<usize, StoreError> {
+        let count = self.client.object_payload_lease_control_request(
+            &self.bucket,
+            &self.key,
+            self.generation_id,
             StorageRpcObjectPayloadLeaseControlOperation::Count,
             None,
         )?;

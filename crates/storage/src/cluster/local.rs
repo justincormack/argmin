@@ -3487,11 +3487,8 @@ impl LocalClusterMap {
         for node in self.nodes.values() {
             match node
                 .object_payload_lease_client()
+                .open_object_payload_lease_route(self.epoch, bucket, key, generation_id)?
                 .acquire_object_payload_lease(
-                    self.epoch,
-                    bucket,
-                    key,
-                    generation_id,
                     crate::node_client::ObjectPayloadLeaseKind::BroadSnapshot,
                 )? {
                 Some(lease) => acquired.push(lease),
@@ -3550,13 +3547,11 @@ impl LocalClusterMap {
 
         let mut acquired = Vec::with_capacity(lease_clients.len());
         for lease_client in lease_clients {
-            match lease_client.acquire_object_payload_lease(
-                self.epoch,
-                bucket,
-                key,
-                generation_id,
-                crate::node_client::ObjectPayloadLeaseKind::ShardLocations,
-            )? {
+            match lease_client
+                .open_object_payload_lease_route(self.epoch, bucket, key, generation_id)?
+                .acquire_object_payload_lease(
+                    crate::node_client::ObjectPayloadLeaseKind::ShardLocations,
+                )? {
                 Some(lease) => acquired.push(lease),
                 None => return Ok(Vec::new()),
             }
@@ -3574,7 +3569,18 @@ impl LocalClusterMap {
         let mut acquired: Vec<Box<dyn RetainedObjectPayloadReclaimRoute + '_>> =
             Vec::with_capacity(self.nodes.len());
         for node in self.nodes.values() {
-            let active_client = node.object_payload_lease_client();
+            let active_route = match node
+                .object_payload_lease_client()
+                .open_object_payload_lease_route(self.epoch, bucket, key, generation_id)
+            {
+                Ok(route) => route,
+                Err(error) => {
+                    for route in acquired {
+                        let _ = route.finish_object_payload_reclaim(false);
+                    }
+                    return Err(error);
+                }
+            };
             let retained_route = match node
                 .retained_object_payload_reclaim_client()
                 .open_retained_object_payload_reclaim_route(
@@ -3592,13 +3598,7 @@ impl LocalClusterMap {
                     return Err(error);
                 }
             };
-            match active_client.try_begin_object_payload_reclaim(
-                self.epoch,
-                bucket,
-                key,
-                generation_id,
-                authority,
-            ) {
+            match active_route.try_begin_object_payload_reclaim(authority) {
                 Ok(true) => {
                     acquired.push(retained_route);
                     continue;
@@ -3696,7 +3696,8 @@ impl LocalClusterMap {
         for node in self.nodes.values() {
             max_count = max_count.max(
                 node.object_payload_lease_client()
-                    .object_payload_lease_count(self.epoch, bucket, key, generation_id)?,
+                    .open_object_payload_lease_route(self.epoch, bucket, key, generation_id)?
+                    .object_payload_lease_count()?,
             );
         }
         Ok(max_count)
@@ -3713,7 +3714,8 @@ impl LocalClusterMap {
             .values()
             .filter(|node| {
                 node.object_payload_lease_client()
-                    .object_payload_lease_count(self.epoch, bucket, key, generation_id)
+                    .open_object_payload_lease_route(self.epoch, bucket, key, generation_id)
+                    .and_then(|route| route.object_payload_lease_count())
                     .unwrap_or(0)
                     != 0
             })

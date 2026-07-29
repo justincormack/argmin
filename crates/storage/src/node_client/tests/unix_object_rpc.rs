@@ -30,6 +30,39 @@ fn raw_retained_stream_abort_request_error(
 }
 
 #[test]
+fn unix_object_payload_lease_route_rejects_foreign_epoch_before_rpc() {
+    let client = test_unix_storage_node_client();
+    let bucket = crate::tests::bucket_name("unix-payload-lease-route-bucket");
+    let key = crate::tests::object_key("unix-payload-lease-route-key");
+    let generation_id = GenerationId::new(4).unwrap();
+    let route_epoch = ClusterEpoch::new(client.cluster_epoch.get().saturating_add(1)).unwrap();
+
+    assert!(matches!(
+        client
+            .open_object_payload_lease_route(route_epoch, &bucket, &key, generation_id)
+            .err()
+            .expect("foreign active route epoch must be rejected before RPC"),
+        StoreError::RouteAdmissionClusterMismatch {
+            admitted_epoch,
+            operation_epoch,
+        } if admitted_epoch == route_epoch && operation_epoch == client.cluster_epoch
+    ));
+
+    let route = client
+        .open_object_payload_lease_route(client.cluster_epoch, &bucket, &key, generation_id)
+        .unwrap();
+    let authority = test_object_payload_reclaim_proof(route_epoch);
+    assert!(matches!(
+        route
+            .try_begin_object_payload_reclaim(&authority)
+            .unwrap_err(),
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "begin object payload reclaim",
+        }
+    ));
+}
+
+#[test]
 fn unix_retained_object_payload_reclaim_route_rejects_foreign_epoch_before_rpc() {
     let client = test_unix_storage_node_client();
     let bucket = crate::tests::bucket_name("unix-retained-payload-route-bucket");

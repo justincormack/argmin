@@ -10,6 +10,14 @@ struct LocalObjectPayloadLease {
     released: bool,
 }
 
+struct LocalObjectPayloadLeaseRoute {
+    storage_node: Arc<SharedStorageNode>,
+    route_cluster_epoch: ClusterEpoch,
+    bucket: BucketName,
+    key: ObjectKey,
+    generation_id: GenerationId,
+}
+
 struct LocalRetainedObjectPayloadReclaimRoute {
     storage_node: Arc<SharedStorageNode>,
     bucket: BucketName,
@@ -291,55 +299,67 @@ impl ShardReadHandleNodeClient for LocalStorageNodeClient {
 }
 
 impl ObjectPayloadLeaseNodeClient for LocalStorageNodeClient {
-    fn acquire_object_payload_lease(
+    fn open_object_payload_lease_route(
         &self,
-        _route_cluster_epoch: ClusterEpoch,
+        route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+    ) -> Result<Box<dyn ObjectPayloadLeaseRoute + '_>, StoreError> {
+        Ok(Box::new(LocalObjectPayloadLeaseRoute {
+            storage_node: Arc::clone(&self.storage_node),
+            route_cluster_epoch,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+        }))
+    }
+}
+
+impl ObjectPayloadLeaseRoute for LocalObjectPayloadLeaseRoute {
+    fn acquire_object_payload_lease(
+        &self,
         _kind: ObjectPayloadLeaseKind,
     ) -> Result<Option<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError> {
-        if !self
-            .storage_node
-            .try_acquire_object_payload_lease(bucket, key, generation_id)
-        {
+        if !self.storage_node.try_acquire_object_payload_lease(
+            &self.bucket,
+            &self.key,
+            self.generation_id,
+        ) {
             return Ok(None);
         }
         Ok(Some(Box::new(LocalObjectPayloadLease {
             storage_node: Arc::clone(&self.storage_node),
-            bucket: bucket.clone(),
-            key: key.clone(),
-            generation_id,
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            generation_id: self.generation_id,
             released: false,
         })))
     }
 
     fn try_begin_object_payload_reclaim(
         &self,
-        _route_cluster_epoch: ClusterEpoch,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
         authority: &ObjectPayloadReclaimClaimProof,
     ) -> Result<bool, StoreError> {
+        if authority.cluster_epoch != self.route_cluster_epoch {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "begin object payload reclaim",
+            });
+        }
         Ok(self.storage_node.try_begin_object_payload_reclaim(
-            bucket,
-            key,
-            generation_id,
+            &self.bucket,
+            &self.key,
+            self.generation_id,
             authority,
         ))
     }
 
-    fn object_payload_lease_count(
-        &self,
-        _route_cluster_epoch: ClusterEpoch,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<usize, StoreError> {
-        Ok(self
-            .storage_node
-            .object_payload_lease_count(bucket, key, generation_id))
+    fn object_payload_lease_count(&self) -> Result<usize, StoreError> {
+        Ok(self.storage_node.object_payload_lease_count(
+            &self.bucket,
+            &self.key,
+            self.generation_id,
+        ))
     }
 }
 

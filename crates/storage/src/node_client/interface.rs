@@ -1113,31 +1113,27 @@ pub(crate) enum ObjectPayloadLeaseKind {
 }
 
 pub(crate) trait ObjectPayloadLeaseNodeClient: Send + Sync {
-    fn acquire_object_payload_lease(
+    fn open_object_payload_lease_route(
         &self,
         route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
+    ) -> Result<Box<dyn ObjectPayloadLeaseRoute + '_>, StoreError>;
+}
+
+pub(crate) trait ObjectPayloadLeaseRoute: Send {
+    fn acquire_object_payload_lease(
+        &self,
         kind: ObjectPayloadLeaseKind,
     ) -> Result<Option<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError>;
 
     fn try_begin_object_payload_reclaim(
         &self,
-        route_cluster_epoch: ClusterEpoch,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
         authority: &ObjectPayloadReclaimClaimProof,
     ) -> Result<bool, StoreError>;
 
-    fn object_payload_lease_count(
-        &self,
-        route_cluster_epoch: ClusterEpoch,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<usize, StoreError>;
+    fn object_payload_lease_count(&self) -> Result<usize, StoreError>;
 }
 
 /// Retained cleanup authority for an exact object-payload reclaim subject.

@@ -180,6 +180,69 @@ fn test_object_payload_reclaim_proof(
 }
 
 #[test]
+fn local_object_payload_lease_route_is_bound_to_exact_subject() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let bucket = crate::tests::bucket_name("payload-lease-route-bucket");
+    let bound_key = crate::tests::object_key("payload-lease-route-bound-key");
+    let foreign_key = crate::tests::object_key("payload-lease-route-foreign-key");
+    let generation_id = GenerationId::new(4).unwrap();
+    let authority = test_object_payload_reclaim_proof(ClusterEpoch::INITIAL);
+    let route = client
+        .open_object_payload_lease_route(ClusterEpoch::INITIAL, &bucket, &bound_key, generation_id)
+        .unwrap();
+
+    let mut lease = route
+        .acquire_object_payload_lease(ObjectPayloadLeaseKind::BroadSnapshot)
+        .unwrap()
+        .expect("bound route must acquire its exact payload lease");
+    assert_eq!(route.object_payload_lease_count().unwrap(), 1);
+    assert_eq!(
+        storage_node.object_payload_lease_count(&bucket, &foreign_key, generation_id),
+        0
+    );
+    assert!(!route.try_begin_object_payload_reclaim(&authority).unwrap());
+    assert_eq!(lease.release().unwrap(), 0);
+
+    let mut wrong_epoch = authority.clone();
+    wrong_epoch.cluster_epoch = ClusterEpoch::new(2).unwrap();
+    assert!(matches!(
+        route
+            .try_begin_object_payload_reclaim(&wrong_epoch)
+            .unwrap_err(),
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "begin object payload reclaim",
+        }
+    ));
+    assert!(route.try_begin_object_payload_reclaim(&authority).unwrap());
+    assert!(storage_node.test_object_payload_reclaim_is_active(&bucket, &bound_key, generation_id,));
+    assert!(!storage_node.test_object_payload_reclaim_is_active(
+        &bucket,
+        &foreign_key,
+        generation_id,
+    ));
+    client
+        .open_retained_object_payload_reclaim_route(
+            ClusterEpoch::INITIAL,
+            &bucket,
+            &bound_key,
+            generation_id,
+            &authority,
+        )
+        .unwrap()
+        .finish_object_payload_reclaim(false)
+        .unwrap();
+}
+
+#[test]
 fn local_retained_object_payload_reclaim_route_is_bound_to_exact_subject() {
     let tmp = test_util::tempdir();
     let storage_node = Arc::new(

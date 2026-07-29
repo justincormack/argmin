@@ -4025,6 +4025,34 @@ Ninety-eighth Phase 3 slice:
   boundary checker, workspace-wide strict Clippy, and the full 7,755-test
   workspace suite also pass.
 
+Ninety-ninth Phase 3 slice:
+
+- active object-payload lease access now opens an `ObjectPayloadLeaseRoute`
+  bound to one admitted cluster epoch and exact bucket/key/generation root.
+  Broad and shard-location lease acquisition, lease counting, and reclaim-
+  fence acquisition no longer accept replacement route subjects after the
+  route is opened.
+- embedded and Unix routes keep the same node-local lease semantics and Unix
+  admission classes, while reclaim begin additionally requires its claim proof
+  to match the route epoch before storage or transport access. The Unix
+  factory rejects an epoch that differs from its installed active client, and
+  storage-node RPC dispatch keeps its independent active-route, node, epoch,
+  operation, and authority validation.
+- an embedded regression proves one route acquires, counts, and fences only
+  its bound object generation and rejects foreign-epoch authority. A no-
+  listener Unix regression proves foreign route and authority epochs fail
+  before RPC. Existing Unix saturation and crossed-authority regressions cover
+  broad/narrow admission handoff, successful dispatch, and server-side proof
+  rejection through the scoped route. The coarse-payload-lease boundary scan
+  now excludes separately compiled `tests.rs` modules, matching its existing
+  `tests/` and `*_tests.rs` exclusions instead of treating test-only calls as
+  production readers. Replacing the remaining stateful method families with
+  scoped or opaque operation capabilities remains open in Phase 3.
+- all 2,431 storage tests pass as part of the full workspace run, including the
+  four focused active payload-lease route regressions. Formatting, the storage
+  boundary checker, workspace-wide strict Clippy, and the full 7,757-test
+  workspace suite also pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
