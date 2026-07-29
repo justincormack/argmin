@@ -6695,7 +6695,7 @@ Status: complete.
   bucket/key names, payload context, or SSE-C material in the HTTP response.
 - Continued the permanent diagnostics slice by having `argmin-s3` install a
   process-wide panic hook after configuration succeeds. Any frontend,
-  storage-node, or legacy-local panic now dumps the same bounded, redacted
+  storage-node, or all-in-one panic now dumps the same bounded, redacted
   flight-recorder ring to stderr before delegating to the normal Rust panic
   hook. The UAT wrapper also enables the local-only debug endpoint on loopback
   frontends and requests a flight-recorder dump before teardown on failed runs,
@@ -12119,10 +12119,9 @@ Supported deployment modes, replicated topologies, and gating:
   root/storage identity, and an explicit `EC 1+0` shape so the configuration
   does not imply redundancy that does not exist. It may use an embedded or
   separately persisted `SingleAuthorityControlPlane`; it does not need Raft.
-  Select these guarantees through `deployment.mode=standalone`. Replace the
-  current `LegacyLocal` process-role name with a topology name such as
-  `all-in-one` or `embedded`; do not rename the role to `Standalone`, because
-  deployment guarantees and process topology are separate dimensions.
+  Select these guarantees through `deployment.mode=standalone`. The former
+  `LegacyLocal` process-role name is now `AllInOne`; it is deliberately not
+  `Standalone`, because deployment guarantees and process topology are separate dimensions.
 - **Replicated** is one architecture with one set of authority, EC, durability,
   identity, and release requirements. Configuration declares the failure-domain
   level whose loss the deployment tolerates, initially `disk` for a single-host

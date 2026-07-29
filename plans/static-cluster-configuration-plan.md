@@ -995,8 +995,8 @@ Progress as of 2026-07-21:
   standalone/test path. A validated standalone `all-in-one` process maps to the
   existing local runtime while preserving the manifest's explicit storage-node
   id and exact data directory. Authority state and internal endpoint fields are
-  deliberately not activated in this compatibility profile because
-  `LegacyLocal` does not host those listeners; their runtime mapping remains
+  deliberately not activated in this compatibility profile because the
+  standalone `all-in-one` process does not host those listeners; their runtime mapping remains
   part of the replicated/embedded-service slices. Local listener and
   user-facing S3 settings remain schema-external as specified above. Mapping
   and runtime regressions cover mixed-mode rejection, unchanged env-only

@@ -1621,6 +1621,42 @@ enum StorageClusterRouteAuthority {
     Dynamic(DynamicRouteAuthorityProof),
 }
 
+/// Storage-owned preparation for one exact embedded standalone topology.
+///
+/// The logical configuration is consumed once, so callers bind and open the
+/// same topology rather than reconstructing it on opposite sides of the
+/// durable identity boundary.
+pub struct PreparedStandaloneEmbeddedTopology {
+    metadata_primary_node_id: NodeId,
+    configs: Vec<LocalNodeStoreConfig>,
+    pg_ids: Box<[u32]>,
+    default_ec_shape: EcShape,
+    cluster_epoch: ClusterEpoch,
+    route_identity: crate::StandaloneRouteIdentity,
+}
+
+impl PreparedStandaloneEmbeddedTopology {
+    #[must_use]
+    pub fn route_identity(&self) -> crate::StandaloneRouteIdentity {
+        self.route_identity
+    }
+
+    pub fn open(self) -> Result<Arc<StorageCluster>, ClusterBuildError> {
+        let local_map = LocalClusterMap::open_with_configs_and_epoch(
+            self.metadata_primary_node_id,
+            self.configs,
+            &self.pg_ids,
+            self.default_ec_shape,
+            self.cluster_epoch,
+        )?;
+        let cluster = StorageCluster::from_static_local_map(Arc::new(local_map))?;
+        if cluster.route_authority.require_static()?.content_digest.0 != self.route_identity.0 {
+            return Err(ClusterBuildError::StandaloneEmbeddedRouteIdentityChanged);
+        }
+        Ok(cluster)
+    }
+}
+
 impl StorageClusterRouteAuthority {
     fn static_for(local_map: &LocalClusterMap) -> Result<Self, ClusterBuildError> {
         if local_map.route_map_validity() != RouteMapValidity::Forever {
@@ -4838,6 +4874,34 @@ mod runtime_map_refresh_invalidation_tests {
     }
 
     #[test]
+    fn preflight_embedded_route_identity_matches_opened_static_authority() {
+        let dir = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_ids = [3, 9];
+        let ec_shape = EcShape { k: 1, m: 0 };
+        let epoch = ClusterEpoch::new(12).unwrap();
+        let config = LocalNodeStoreConfig::new(node_id, dir.path().join("node"));
+
+        let prepared = StorageCluster::prepare_standalone_embedded_topology(
+            node_id,
+            [config.clone()],
+            &pg_ids,
+            ec_shape,
+            epoch,
+        )
+        .unwrap();
+        let preflight = prepared.route_identity();
+        assert!(
+            !config.data_dir().join("pg-0003").exists(),
+            "preflight must not open placement-group storage"
+        );
+
+        let cluster = prepared.open().unwrap();
+
+        assert_eq!(preflight, cluster.standalone_route_identity().unwrap());
+    }
+
+    #[test]
     fn static_route_authority_rejects_bounded_validity() {
         let route = PgRouteSnapshot::reconstructed(
             ClusterEpoch::INITIAL,
@@ -4878,8 +4942,12 @@ mod runtime_map_refresh_invalidation_tests {
         let cluster = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
 
         assert!(matches!(
-            StorageClusterRouteHandle::from_static_cluster(cluster),
+            StorageClusterRouteHandle::from_static_cluster(Arc::clone(&cluster)),
             Err(ClusterBuildError::DynamicRouteAuthorityRequiresRuntimeMapHandle)
+        ));
+        assert!(matches!(
+            cluster.standalone_route_identity(),
+            Err(crate::StandaloneRouteIdentityError::DynamicAuthority)
         ));
     }
 
@@ -8687,6 +8755,55 @@ impl StorageCluster {
         _operation: &'static str,
         _error: &StoreError,
     ) {
+    }
+
+    /// Return the opaque durable identity for this static route authority.
+    ///
+    /// The representation remains storage-owned; callers can only pass it to
+    /// the standalone durable-binding API.
+    pub fn standalone_route_identity(
+        &self,
+    ) -> Result<crate::StandaloneRouteIdentity, crate::StandaloneRouteIdentityError> {
+        match self.route_authority {
+            StorageClusterRouteAuthority::Static(proof) => {
+                Ok(crate::StandaloneRouteIdentity(proof.content_digest.0))
+            }
+            StorageClusterRouteAuthority::Dynamic(_) => {
+                Err(crate::StandaloneRouteIdentityError::DynamicAuthority)
+            }
+        }
+    }
+
+    /// Derive the opaque durable identity for an embedded static topology
+    /// before opening any placement-group store.
+    ///
+    /// Directory preparation and canonicalization are included because their
+    /// resulting paths are routing inputs. No database is opened and no
+    /// recovery is performed by this operation.
+    pub fn prepare_standalone_embedded_topology(
+        metadata_primary_node_id: NodeId,
+        configs: impl IntoIterator<Item = LocalNodeStoreConfig>,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<PreparedStandaloneEmbeddedTopology, ClusterBuildError> {
+        let configs = configs.into_iter().collect::<Vec<_>>();
+        let route_identity = LocalClusterMap::preflight_static_embedded_route_digest(
+            metadata_primary_node_id,
+            configs.clone(),
+            pg_ids,
+            default_ec_shape,
+            cluster_epoch,
+        )
+        .map(crate::StandaloneRouteIdentity)?;
+        Ok(PreparedStandaloneEmbeddedTopology {
+            metadata_primary_node_id,
+            configs,
+            pg_ids: pg_ids.into(),
+            default_ec_shape,
+            cluster_epoch,
+            route_identity,
+        })
     }
 
     pub fn open_static_local_nodes(

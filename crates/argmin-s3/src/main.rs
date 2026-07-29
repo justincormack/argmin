@@ -332,6 +332,12 @@ async fn async_main() {
         }
     };
 
+    let _standalone_remote_route_identity_lock =
+        bind_no_control_plane_remote_route_identity(&config, &ec_config).unwrap_or_else(|error| {
+            eprintln!("failed to bind standalone storage route identity: {error}");
+            std::process::exit(1);
+        });
+
     match config.process_role {
         ProcessRole::ControlPlane => run_control_plane_process(&config),
         ProcessRole::StorageNode => run_storage_node_process(&config, &ec_config),
@@ -342,10 +348,44 @@ async fn async_main() {
         ProcessRole::Frontend => {
             run_remote_frontend(config, host_id, ec_config).await;
         }
-        ProcessRole::LegacyLocal => {
-            run_legacy_local_frontend(config, host_id, ec_config).await;
+        ProcessRole::AllInOne => {
+            run_all_in_one_frontend(config, host_id, ec_config).await;
         }
     }
+}
+
+fn bind_no_control_plane_remote_route_identity(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+) -> Result<Option<storage::StandaloneRouteIdentityLock>, String> {
+    if config.control_plane_socket_path.is_some() {
+        return Ok(None);
+    }
+    let route_identity = match config.process_role {
+        ProcessRole::Frontend => build_remote_frontend_storage_cluster(config, ec_config)?
+            .standalone_route_identity()
+            .map_err(|error| error.to_string())?,
+        ProcessRole::Combined => {
+            let frontend = build_remote_frontend_storage_cluster(config, ec_config)?
+                .standalone_route_identity()
+                .map_err(|error| error.to_string())?;
+            let storage_node = standalone_storage_node_process_config(config, ec_config)?
+                .standalone_route_identity()
+                .map_err(|error| error.to_string())?;
+            frontend.combined_with(storage_node)
+        }
+        ProcessRole::StorageNode => standalone_storage_node_process_config(config, ec_config)?
+            .standalone_route_identity()
+            .map_err(|error| error.to_string())?,
+        ProcessRole::AllInOne | ProcessRole::ControlPlane => return Ok(None),
+    };
+    let preparation =
+        storage::StandaloneRouteIdentityPreparation::acquire(Path::new(&config.data_dir))
+            .map_err(|error| error.to_string())?;
+    preparation
+        .bind(route_identity)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn maybe_run_control_plane_admin_command() -> Option<i32> {
@@ -6297,6 +6337,37 @@ fn build_storage_node_process_config(
     if let Some(socket_path) = config.control_plane_socket_path.as_deref() {
         return build_control_plane_storage_node_process_config(config, ec_config, socket_path);
     }
+    let storage_node_config = standalone_storage_node_process_config(config, ec_config)?;
+    let static_storage_runtime_lock = config
+        .static_cluster_identity
+        .as_ref()
+        .map(|identity| {
+            static_cluster_state::lock_and_verify_standalone_storage_startup(
+                identity,
+                storage_node_config.node_id().as_u32(),
+                storage_node_config.data_dir(),
+                storage_node_config.pg_ids(),
+            )
+        })
+        .transpose()?;
+    let mut prepared = PreparedStorageNodeServer::new(storage_node_config);
+    if let Some(rpc_auth) = config.storage_rpc_server_auth.clone() {
+        prepared = prepared.with_rpc_auth(rpc_auth);
+    }
+    if !config.storage_rpc_listeners.is_empty() {
+        prepared = prepared.with_rpc_listeners(config.storage_rpc_listeners.clone());
+    }
+    Ok(BuiltStorageNodeProcessConfig {
+        prepared_server: prepared,
+        control_plane_node_incarnation: None,
+        static_storage_runtime_lock,
+    })
+}
+
+fn standalone_storage_node_process_config(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+) -> Result<StorageNodeProcessConfig, String> {
     let cluster_epoch = ClusterEpoch::new(config.storage_cluster_epoch)
         .ok_or_else(|| "ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0".to_string())?;
     let pg_ids = config.storage_pg_ids.clone();
@@ -6309,18 +6380,6 @@ fn build_storage_node_process_config(
         .storage_node_data_dir
         .clone()
         .unwrap_or_else(|| format!("{}/node-{:04}", config.data_dir, node_id.as_u32()));
-    let static_storage_runtime_lock = config
-        .static_cluster_identity
-        .as_ref()
-        .map(|identity| {
-            static_cluster_state::lock_and_verify_standalone_storage_startup(
-                identity,
-                node_id.as_u32(),
-                Path::new(&node_data_dir),
-                &pg_ids,
-            )
-        })
-        .transpose()?;
     let socket_path = config.storage_node_socket_path.clone().ok_or_else(|| {
         "ARGMIN_STORAGE_NODE_SOCKET_PATH is required for storage roles".to_string()
     })?;
@@ -6345,36 +6404,22 @@ fn build_storage_node_process_config(
             acting_set: acting_set.clone(),
         })
         .collect();
-    let mut prepared = PreparedStorageNodeServer::new(
-        StorageNodeProcessConfig::new(StorageNodeProcessConfigParts {
-            node_id,
-            cluster_epoch,
-            route_map_validity: RouteMapValidity::Forever,
-            data_dir: Path::new(&node_data_dir).to_path_buf(),
-            default_ec_shape: EcShape {
-                k: ec_config.data_shards(),
-                m: ec_config.parity_shards(),
-            },
-            pg_ids,
-            socket_path: Path::new(&socket_path).to_path_buf(),
-            pg_routes,
-
-            historical_pg_routes: Vec::new(),
-            pending_metadata_command_recoveries: Vec::new(),
-        })
-        .map_err(|error| error.to_string())?,
-    );
-    if let Some(rpc_auth) = config.storage_rpc_server_auth.clone() {
-        prepared = prepared.with_rpc_auth(rpc_auth);
-    }
-    if !config.storage_rpc_listeners.is_empty() {
-        prepared = prepared.with_rpc_listeners(config.storage_rpc_listeners.clone());
-    }
-    Ok(BuiltStorageNodeProcessConfig {
-        prepared_server: prepared,
-        control_plane_node_incarnation: None,
-        static_storage_runtime_lock,
+    StorageNodeProcessConfig::new(StorageNodeProcessConfigParts {
+        node_id,
+        cluster_epoch,
+        route_map_validity: RouteMapValidity::Forever,
+        data_dir: Path::new(&node_data_dir).to_path_buf(),
+        default_ec_shape: EcShape {
+            k: ec_config.data_shards(),
+            m: ec_config.parity_shards(),
+        },
+        pg_ids,
+        socket_path: Path::new(&socket_path).to_path_buf(),
+        pg_routes,
+        historical_pg_routes: Vec::new(),
+        pending_metadata_command_recoveries: Vec::new(),
     })
+    .map_err(|error| error.to_string())
 }
 
 fn build_control_plane_storage_node_process_config(
@@ -6491,8 +6536,8 @@ fn build_control_plane_storage_node_process_config(
     })
 }
 
-async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
-    let opened_storage_cluster = build_legacy_local_storage_cluster(&config, &ec_config)
+async fn run_all_in_one_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
+    let opened_storage_cluster = build_standalone_storage_cluster(&config, &ec_config)
         .unwrap_or_else(|e| {
             eprintln!("failed to open local storage cluster: {e}");
             std::process::exit(1);
@@ -6509,18 +6554,19 @@ async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_con
     drop(opened_storage_cluster);
 }
 
-struct OpenedLegacyLocalStorageCluster {
+struct OpenedStandaloneStorageCluster {
     cluster: Arc<StorageCluster>,
     _static_storage_runtime_lock: Option<static_cluster_state::StaticStorageRuntimeLock>,
+    _standalone_route_identity_lock: storage::StandaloneRouteIdentityLock,
 }
 
-impl OpenedLegacyLocalStorageCluster {
+impl OpenedStandaloneStorageCluster {
     fn cluster(&self) -> Arc<StorageCluster> {
         Arc::clone(&self.cluster)
     }
 }
 
-impl std::ops::Deref for OpenedLegacyLocalStorageCluster {
+impl std::ops::Deref for OpenedStandaloneStorageCluster {
     type Target = StorageCluster;
 
     fn deref(&self) -> &Self::Target {
@@ -6528,12 +6574,15 @@ impl std::ops::Deref for OpenedLegacyLocalStorageCluster {
     }
 }
 
-fn build_legacy_local_storage_cluster(
+fn build_standalone_storage_cluster(
     config: &ServerConfig,
     ec_config: &EcConfig,
-) -> Result<OpenedLegacyLocalStorageCluster, String> {
+) -> Result<OpenedStandaloneStorageCluster, String> {
     let pg_ids: Vec<u32> = (0..config.pg_count).collect();
     let data_dir = Path::new(&config.data_dir);
+    let standalone_route_preparation =
+        storage::StandaloneRouteIdentityPreparation::acquire(data_dir)
+            .map_err(|error| error.to_string())?;
     let ec_shape = storage::EcShape {
         k: ec_config.data_shards(),
         m: ec_config.parity_shards(),
@@ -6545,43 +6594,65 @@ fn build_legacy_local_storage_cluster(
         .copied()
         .map(NodeId::new)
         .collect();
-    let mut static_storage_runtime_lock = None;
-    let storage_cluster = if node_ids.len() == 1 {
-        let node_id = node_ids[0];
+    let metadata_primary_node_id = if node_ids.len() == 1 {
+        node_ids[0]
+    } else {
+        NodeId::new(0)
+    };
+    let node_configs = if node_ids.len() == 1 {
+        let node_id = metadata_primary_node_id;
         let node_data_dir = config
             .storage_node_data_dir
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| data_dir.join(format!("node-{:04}", node_id.as_u32())));
+        vec![storage::LocalNodeStoreConfig::new(node_id, node_data_dir)]
+    } else {
+        node_ids
+            .iter()
+            .map(|node_id| {
+                storage::LocalNodeStoreConfig::new(
+                    *node_id,
+                    data_dir.join(format!("node-{:04}", node_id.as_u32())),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let cluster_epoch = ClusterEpoch::new(config.storage_cluster_epoch)
+        .ok_or_else(|| "configured storage cluster epoch must be > 0".to_string())?;
+    let mut static_storage_runtime_lock = None;
+    if node_configs.len() == 1 {
+        let node_id = metadata_primary_node_id;
         if let Some(identity) = &config.static_cluster_identity {
             static_storage_runtime_lock = Some(
                 static_cluster_state::lock_and_verify_standalone_storage_startup(
                     identity,
                     node_id.as_u32(),
-                    &node_data_dir,
+                    node_configs[0].data_dir(),
                     &pg_ids,
                 )?,
             );
         }
-        let cluster_epoch = ClusterEpoch::new(config.storage_cluster_epoch)
-            .ok_or_else(|| "configured storage cluster epoch must be > 0".to_string())?;
-        let local_map = LocalClusterMap::open_with_configs_and_epoch(
-            node_id,
-            [storage::LocalNodeStoreConfig::new(node_id, node_data_dir)],
-            &pg_ids,
-            ec_shape,
-            cluster_epoch,
-        )
+    }
+    let prepared_topology = StorageCluster::prepare_standalone_embedded_topology(
+        metadata_primary_node_id,
+        node_configs,
+        &pg_ids,
+        ec_shape,
+        cluster_epoch,
+    )
+    .map_err(|error| error.to_string())?;
+    let expected_route_identity = prepared_topology.route_identity();
+    let standalone_route_identity_lock = standalone_route_preparation
+        .bind(expected_route_identity)
         .map_err(|error| error.to_string())?;
-        StorageCluster::from_static_local_map(Arc::new(local_map))
-            .map_err(|error| error.to_string())?
-    } else {
-        StorageCluster::open_static_local_nodes(data_dir, &node_ids, &pg_ids, ec_shape)
-            .map_err(|error| error.to_string())?
-    };
-    Ok(OpenedLegacyLocalStorageCluster {
+    let storage_cluster = prepared_topology
+        .open()
+        .map_err(|error| error.to_string())?;
+    Ok(OpenedStandaloneStorageCluster {
         cluster: storage_cluster,
         _static_storage_runtime_lock: static_storage_runtime_lock,
+        _standalone_route_identity_lock: standalone_route_identity_lock,
     })
 }
 
@@ -14842,7 +14913,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_local_storage_cluster_preserves_explicit_node_id_and_data_dir() {
+    fn standalone_storage_cluster_preserves_explicit_node_id_and_data_dir() {
         let tmp = test_util::tempdir();
         let node_data_dir = tmp.path().join("manifest-node-data");
         let ec_config = EcConfig::new(1, 0).unwrap();
@@ -14853,7 +14924,7 @@ mod tests {
         config.storage_node_id = Some(17);
         config.storage_node_data_dir = Some(node_data_dir.display().to_string());
 
-        let cluster = build_legacy_local_storage_cluster(&config, &ec_config).unwrap();
+        let cluster = build_standalone_storage_cluster(&config, &ec_config).unwrap();
 
         assert_eq!(
             cluster.local_node_ids().collect::<Vec<_>>(),
@@ -14866,7 +14937,138 @@ mod tests {
             assert_eq!(route.acting_set(), &[NodeId::new(17)]);
         }
         assert!(node_data_dir.exists());
-        assert!(!Path::new(&config.data_dir).exists());
+        assert!(
+            Path::new(&config.data_dir).is_dir(),
+            "standalone startup must durably bind its storage-owned route identity"
+        );
+    }
+
+    #[test]
+    fn standalone_multi_node_cluster_uses_configured_epoch() {
+        let tmp = test_util::tempdir();
+        let ec_config = EcConfig::new(1, 1).unwrap();
+        let mut config = test_server_config();
+        config.data_dir = tmp.path().join("standalone").display().to_string();
+        config.pg_count = 2;
+        config.storage_node_ids = vec![0, 4];
+        config.storage_cluster_epoch = 17;
+
+        let cluster = build_standalone_storage_cluster(&config, &ec_config).unwrap();
+
+        assert_eq!(cluster.cluster_epoch(), ClusterEpoch::new(17).unwrap());
+        for pg_id in [0, 1] {
+            assert_eq!(
+                cluster
+                    .local_pg_route(PgId::new(pg_id))
+                    .unwrap()
+                    .cluster_epoch(),
+                ClusterEpoch::new(17).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_storage_cluster_rejects_topology_change_on_restart() {
+        let tmp = test_util::tempdir();
+        let ec_config = EcConfig::new(1, 0).unwrap();
+        let mut config = test_server_config();
+        config.process_role = ProcessRole::AllInOne;
+        config.data_dir = tmp.path().join("standalone").display().to_string();
+        config.pg_count = 1;
+        config.storage_node_ids = vec![17];
+        config.storage_node_id = Some(17);
+        config.storage_node_data_dir = Some(tmp.path().join("node-a").display().to_string());
+        drop(build_standalone_storage_cluster(&config, &ec_config).unwrap());
+
+        config.storage_node_data_dir = Some(tmp.path().join("node-b").display().to_string());
+        let error = match build_standalone_storage_cluster(&config, &ec_config) {
+            Ok(_) => panic!("changed standalone route topology must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("does not match the configured static topology"),
+            "{error}"
+        );
+        assert!(
+            !tmp.path().join("node-b/pg-0000").exists(),
+            "route mismatch must be rejected before opening PG storage"
+        );
+    }
+
+    #[test]
+    fn no_control_plane_process_roles_share_durable_static_route_binding() {
+        let temp = test_util::tempdir();
+        let ec_config = EcConfig::new(1, 0).unwrap();
+        for (index, role) in [
+            ProcessRole::Frontend,
+            ProcessRole::StorageNode,
+            ProcessRole::Combined,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let process_dir = temp.path().join(format!("process-{index}"));
+            let mut config = test_server_config();
+            config.process_role = role;
+            config.data_dir = process_dir.display().to_string();
+            config.storage_node_ids = vec![4];
+            config.storage_node_id = Some(4);
+            config.storage_node_data_dir = Some(process_dir.join("node").display().to_string());
+            config.storage_pg_ids = vec![0];
+            let first_socket_path = temp
+                .path()
+                .join(format!("node-{index}-a.sock"))
+                .display()
+                .to_string();
+            config.storage_node_socket_path = Some(first_socket_path.clone());
+            config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+                node_id: 4,
+                socket_path: first_socket_path,
+            }];
+
+            drop(
+                bind_no_control_plane_remote_route_identity(&config, &ec_config)
+                    .unwrap()
+                    .expect("no-control-plane process must retain a route binding"),
+            );
+            drop(
+                bind_no_control_plane_remote_route_identity(&config, &ec_config)
+                    .unwrap()
+                    .expect("unchanged route topology must reopen"),
+            );
+
+            let changed_socket_path = temp
+                .path()
+                .join(format!("node-{index}-b.sock"))
+                .display()
+                .to_string();
+            config.storage_node_socket_path = Some(changed_socket_path.clone());
+            config.storage_node_sockets[0].socket_path = changed_socket_path;
+            let error =
+                bind_no_control_plane_remote_route_identity(&config, &ec_config).unwrap_err();
+            assert!(
+                error.contains("does not match the configured static topology"),
+                "role {role:?}: {error}"
+            );
+
+            if matches!(role, ProcessRole::StorageNode | ProcessRole::Combined) {
+                let original_socket_path = temp
+                    .path()
+                    .join(format!("node-{index}-a.sock"))
+                    .display()
+                    .to_string();
+                config.storage_node_socket_path = Some(original_socket_path.clone());
+                config.storage_node_sockets[0].socket_path = original_socket_path;
+                config.storage_node_data_dir =
+                    Some(process_dir.join("other-node").display().to_string());
+                let error =
+                    bind_no_control_plane_remote_route_identity(&config, &ec_config).unwrap_err();
+                assert!(
+                    error.contains("does not match the configured static topology"),
+                    "role {role:?} did not bind its storage path: {error}"
+                );
+            }
+        }
     }
 
     #[test]

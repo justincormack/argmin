@@ -75,7 +75,7 @@ const INITIAL_PG_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin-initial-pg-placement-v1"
 const TOPOLOGY_IDENTITY_DOMAIN: &str = "argmin-static-cluster-topology-v1";
 const PROCESS_IDENTITY_DOMAIN: &str = "argmin-static-cluster-process-identity-v1";
 const FULL_CONFIG_FINGERPRINT_DOMAIN: &str = "argmin-static-cluster-full-config-v1";
-const LEGACY_CLUSTER_ENV_KEYS: &[&str] = &[
+const ENV_ONLY_CLUSTER_ENV_KEYS: &[&str] = &[
     "ARGMIN_PROCESS_ROLE",
     "ARGMIN_HOST_ID",
     "ARGMIN_DATA_DIR",
@@ -980,18 +980,60 @@ impl ValidatedStaticClusterManifest {
             .find(|storage_node| storage_node.process_id == selected.id)
             .ok_or_else(|| "selected storage process has no storage node".to_string())?;
         let pg_ids: Vec<u32> = (0..self.manifest.storage.pg_count).collect();
+        let standalone_route_preparation =
+            if self.manifest.deployment.mode == DeploymentMode::Standalone {
+                let disk = self
+                    .manifest
+                    .disks
+                    .iter()
+                    .find(|disk| disk.id == storage_node.disk_id)
+                    .ok_or_else(|| "storage node disk disappeared after validation".to_string())?;
+                Some(
+                    storage::StandaloneRouteIdentityPreparation::acquire(&disk.mount_path)
+                        .map_err(|error| error.to_string())?,
+                )
+            } else {
+                None
+            };
+        let ec_shape = storage::EcShape {
+            k: self.manifest.storage.ec_data_shards,
+            m: self.manifest.storage.ec_parity_shards,
+        };
+        let cluster_epoch = storage::ClusterEpoch::new(self.manifest.storage.initial_cluster_epoch)
+            .expect("validated static initial cluster epoch is nonzero");
+        let standalone_route_binding = if let Some(preparation) = standalone_route_preparation {
+            let node_id = storage::NodeId::new(storage_node.node_id);
+            let prepared = storage::StorageCluster::prepare_standalone_embedded_topology(
+                node_id,
+                [storage::LocalNodeStoreConfig::new(
+                    node_id,
+                    storage_node.data_dir.clone(),
+                )],
+                &pg_ids,
+                ec_shape,
+                cluster_epoch,
+            )
+            .map_err(|error| error.to_string())?;
+            let expected = prepared.route_identity();
+            let runtime_lock = preparation
+                .bind(expected)
+                .map_err(|error| error.to_string())?;
+            Some((runtime_lock, prepared))
+        } else {
+            None
+        };
         crate::static_cluster_state::initialize_static_storage(
             &self.configured_static_identity(),
             storage_node.node_id,
             &storage_node.data_dir,
             &pg_ids,
-            storage::EcShape {
-                k: self.manifest.storage.ec_data_shards,
-                m: self.manifest.storage.ec_parity_shards,
-            },
-            storage::ClusterEpoch::new(self.manifest.storage.initial_cluster_epoch)
-                .expect("validated static initial cluster epoch is nonzero"),
-        )
+            ec_shape,
+            cluster_epoch,
+        )?;
+        if let Some((_runtime_lock, prepared)) = standalone_route_binding {
+            prepared.open().map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     pub(crate) fn initialize_selected_process_state(&self) -> Result<(), String> {
@@ -2403,7 +2445,7 @@ impl ValidatedStaticClusterManifest {
         Ok(config)
     }
 
-    fn standalone_legacy_server_config<F>(&self, get: F) -> Result<ServerConfig, String>
+    fn standalone_server_config<F>(&self, get: F) -> Result<ServerConfig, String>
     where
         F: Fn(&str) -> Option<String>,
     {
@@ -2448,7 +2490,7 @@ impl ValidatedStaticClusterManifest {
             .find(|disk| disk.id == storage_node.disk_id)
             .ok_or_else(|| "storage node disk disappeared after validation".to_string())?;
         let mut manifest_values = BTreeMap::<&'static str, String>::new();
-        manifest_values.insert("ARGMIN_PROCESS_ROLE", "legacy-local".to_string());
+        manifest_values.insert("ARGMIN_PROCESS_ROLE", "all-in-one".to_string());
         manifest_values.insert(
             "ARGMIN_DATA_DIR",
             disk.mount_path.to_string_lossy().into_owned(),
@@ -2573,7 +2615,7 @@ where
             Err("ARGMIN_CLUSTER_CONFIG_PATH is required with ARGMIN_PROCESS_ID".to_string())
         }
         (Some(config_path), Some(process_id)) => {
-            for key in LEGACY_CLUSTER_ENV_KEYS {
+            for key in ENV_ONLY_CLUSTER_ENV_KEYS {
                 if get(key).is_some() {
                     return Err(format!(
                         "{key} cannot be set when ARGMIN_CLUSTER_CONFIG_PATH is active"
@@ -2583,7 +2625,7 @@ where
             let manifest = load_static_cluster_manifest_structural(config_path, process_id)?;
             validate_filesystem(&manifest)?;
             match manifest.manifest.deployment.mode {
-                DeploymentMode::Standalone => manifest.standalone_legacy_server_config(get),
+                DeploymentMode::Standalone => manifest.standalone_server_config(get),
                 DeploymentMode::Replicated => {
                     let material = manifest.resolve_selected_process_material()?;
                     match manifest.manifest.processes[manifest.selected_process_index].kind {
@@ -6729,17 +6771,17 @@ secret_ref = "file:/run/argmin-secrets/frontend-1-maintenance.key"
     }
 
     #[test]
-    fn static_cluster_manifest_maps_standalone_process_to_legacy_runtime_config() {
+    fn static_cluster_manifest_maps_standalone_deployment_to_all_in_one_process() {
         let manifest = parse_static_cluster_manifest(&standalone_manifest(), "all-1").unwrap();
         let mut environment = standalone_runtime_environment();
         environment.insert("ARGMIN_LISTEN_ADDR", "127.0.0.1:19000".to_string());
         environment.insert("ARGMIN_WORKERS", "7".to_string());
 
         let config = manifest
-            .standalone_legacy_server_config(|key| environment.get(key).cloned())
+            .standalone_server_config(|key| environment.get(key).cloned())
             .unwrap();
 
-        assert_eq!(config.process_role, ProcessRole::LegacyLocal);
+        assert_eq!(config.process_role, ProcessRole::AllInOne);
         assert_eq!(config.listen_addr, "127.0.0.1:19000");
         assert_eq!(config.workers, 7);
         assert_eq!(config.host_id.as_deref(), Some("host-1"));
@@ -7619,12 +7661,12 @@ transport_profile_id = "internal"
         let manifest = parse_static_cluster_manifest(&source, "all-1").unwrap();
         let environment = standalone_runtime_environment();
         let config = manifest
-            .standalone_legacy_server_config(|key| environment.get(key).cloned())
+            .standalone_server_config(|key| environment.get(key).cloned())
             .unwrap();
         let ec_config = EcConfig::new(config.ec_k, config.ec_m).unwrap();
         manifest.initialize_selected_storage().unwrap();
 
-        let cluster = crate::build_legacy_local_storage_cluster(&config, &ec_config).unwrap();
+        let cluster = crate::build_standalone_storage_cluster(&config, &ec_config).unwrap();
         let handle =
             storage::StorageClusterRouteHandle::from_static_cluster(cluster.cluster()).unwrap();
 
@@ -7648,30 +7690,26 @@ transport_profile_id = "internal"
         let manifest = parse_static_cluster_manifest(&source, "all-1").unwrap();
         let environment = standalone_runtime_environment();
         let config = manifest
-            .standalone_legacy_server_config(|key| environment.get(key).cloned())
+            .standalone_server_config(|key| environment.get(key).cloned())
             .unwrap();
         let ec_config = EcConfig::new(config.ec_k, config.ec_m).unwrap();
         manifest.initialize_selected_storage().unwrap();
-        let first = crate::build_legacy_local_storage_cluster(&config, &ec_config).unwrap();
-        let data_dir = Path::new(config.storage_node_data_dir.as_deref().unwrap());
-        let identity_path = data_dir.join(".argmin-static-storage.identity");
-        let held_identity_path = data_dir.join(".argmin-static-storage.identity.held");
-        std::fs::rename(&identity_path, &held_identity_path).unwrap();
+        let first = crate::build_standalone_storage_cluster(&config, &ec_config).unwrap();
 
-        let error = match crate::build_legacy_local_storage_cluster(&config, &ec_config) {
+        let error = match crate::build_standalone_storage_cluster(&config, &ec_config) {
             Ok(_) => panic!("second static runtime must not open the same storage directory"),
             Err(error) => error,
         };
 
-        assert!(error.contains("initialization or runtime is already active"));
+        assert!(error.contains("standalone route identity directory"));
+        assert!(error.contains("already in use"));
         assert!(
-            !error.contains("identity is missing"),
-            "runtime lock must be acquired before identity and PG verification"
+            !error.contains("static storage identity"),
+            "process route lock must be acquired before node identity and PG verification"
         );
-        std::fs::rename(&held_identity_path, &identity_path).unwrap();
         assert_eq!(first.local_node_count(), 1);
         drop(first);
-        crate::build_legacy_local_storage_cluster(&config, &ec_config)
+        crate::build_standalone_storage_cluster(&config, &ec_config)
             .expect("storage directory lock must be released with runtime");
     }
 
@@ -7687,11 +7725,11 @@ transport_profile_id = "internal"
         let manifest = parse_static_cluster_manifest(&source, "all-1").unwrap();
         let environment = standalone_runtime_environment();
         let config = manifest
-            .standalone_legacy_server_config(|key| environment.get(key).cloned())
+            .standalone_server_config(|key| environment.get(key).cloned())
             .unwrap();
         let ec_config = EcConfig::new(config.ec_k, config.ec_m).unwrap();
 
-        let error = match crate::build_legacy_local_storage_cluster(&config, &ec_config) {
+        let error = match crate::build_standalone_storage_cluster(&config, &ec_config) {
             Ok(_) => panic!("uninitialized static storage must fail closed"),
             Err(error) => error,
         };
@@ -7748,7 +7786,7 @@ transport_profile_id = "internal"
             load_server_config_from_inputs(None, None, |key| environment.get(key).cloned())
                 .unwrap();
 
-        assert_eq!(config.process_role, ProcessRole::LegacyLocal);
+        assert_eq!(config.process_role, ProcessRole::AllInOne);
         assert_eq!(config.pg_count, 3);
         assert_eq!(config.storage_node_ids, vec![0]);
         assert_eq!(config.static_cluster_identity, None);
@@ -7926,7 +7964,7 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
         );
         let credentialed = parse_static_cluster_manifest(&credentialed, "all-1").unwrap();
         let error = credentialed
-            .standalone_legacy_server_config(|key| environment.get(key).cloned())
+            .standalone_server_config(|key| environment.get(key).cloned())
             .unwrap_err();
         assert!(error.contains("no unresolved secret references"));
     }

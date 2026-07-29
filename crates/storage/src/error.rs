@@ -808,6 +808,9 @@ pub enum ClusterBuildError {
     #[error("static route authority must have unbounded validity")]
     StaticRouteAuthorityBoundedValidity,
 
+    #[error("embedded standalone route topology changed after durable identity preparation")]
+    StandaloneEmbeddedRouteIdentityChanged,
+
     #[error("dynamic route authority requires a runtime-map publication capability")]
     DynamicRouteAuthorityRequiresRuntimeMapHandle,
 

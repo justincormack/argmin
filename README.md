@@ -53,7 +53,7 @@ The server is configured via environment variables:
 | `ARGMIN_TLS_KEY_PATH` | *(unset)* | PEM private key path for direct HTTPS |
 | `ARGMIN_DATA_DIR` | `./data` | Data directory |
 | `ARGMIN_PG_COUNT` | `16` | Number of placement groups |
-| `ARGMIN_PROCESS_ROLE` | `legacy-local` | Process role: `legacy-local` or Phase 10.3 `storage-node`; `frontend` and `combined` are parsed but intentionally unsupported until remote storage routing is wired |
+| `ARGMIN_PROCESS_ROLE` | `all-in-one` | Process topology: `all-in-one`, `frontend`, `storage-node`, `combined`, or `control-plane`; standalone versus replicated deployment is configured separately |
 | `ARGMIN_STORAGE_NODE_ID` | *(required for `storage-node`)* | Storage-node identity to serve |
 | `ARGMIN_STORAGE_NODE_DATA_DIR` | `ARGMIN_DATA_DIR/node-NNNN` | Data directory for the storage-node identity |
 | `ARGMIN_STORAGE_NODE_SOCKET_PATH` | *(required for `storage-node`)* | Absolute Unix socket path for the storage-node process |

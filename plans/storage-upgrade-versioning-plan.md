@@ -175,11 +175,11 @@ The audit found these residual changes rather than another old-format reader:
   `ControlPlaneAuthorityClock::new_from_process_clock` constructor was removed. The equivalent
   sample-driven constructors are now restricted to tests and the `test-hooks` feature, while
   production construction requires restart-checkpoint continuity.
-- Standalone and environment-only startup still use the active `legacy-local` storage path. That
-  path gives the shared `StorageCluster` an optional runtime-map content digest and unbounded
-  route-map validity, with an explicit `None`-digest/`None`-validity transition during a later
-  authoritative refresh. This is a current deployment architecture, not dead compatibility code.
-  The selected replacement is the explicit static-authority design recorded below.
+- **Completed 2026-07-29:** the active `legacy-local` path was replaced by the explicit
+  static-authority design below. Every `StorageCluster` now has a mandatory static or dynamic
+  route proof, every no-control-plane process durably binds the storage-owned canonical static
+  route identity before serving, and the process topology is named `all-in-one` rather than being
+  conflated with the separately configured `standalone` deployment mode.
 - **Completed 2026-07-29:** session-token version selection is contained in `auth`.
   `IdentityProvider::seal_session_credential` is the semantic issuance API; the v1 prefix and
   representation-size constants are crate-private. The boundary check rejects versioned sealing
@@ -213,16 +213,15 @@ These current-format recovery paths were reviewed and are not migration compatib
 - Metadata-transfer checkpoint fallback is a current reconstruction strategy selected when a
   retained command prefix cannot reconstruct the state; it does not decode an older format.
 
-The `legacy-local` path above is the only audited compatibility-labelled behavior that remains in
-the shared production invariants. Environment/configuration fallback endpoints and AWS policy
-fallback rules are current availability or service-semantics behavior, not storage-format
-compatibility.
+No compatibility-labelled behavior remains in the shared production storage invariants.
+Environment/configuration fallback endpoints and AWS policy fallback rules are current
+availability or service-semantics behavior, not storage-format compatibility.
 
 ### Standalone Route Authority Decision (2026-07-29)
 
 Standalone topology is an explicit immutable authority, not an incomplete dynamic runtime-map
-generation. The term `legacy-local` describes the current active deployment path and will be
-replaced by `standalone` once this design is implemented.
+generation. `Standalone` remains the deployment mode; the former `legacy-local` process topology
+is now named `all-in-one`, keeping deployment guarantees distinct from process composition.
 
 The authority model has two closed variants:
 
@@ -247,10 +246,10 @@ process must restart and construct the new authority mode before serving. Conseq
 same-epoch `None`-digest/unbounded-validity to bounded/digested transition is removed rather than
 generalised.
 
-The implementation scope includes every no-control-plane construction path, not only the function
-named `build_legacy_local_storage_cluster`:
+The implementation scope includes every no-control-plane construction path, not only the embedded
+all-in-one builder:
 
-- standalone manifests and environment-only legacy-local startup;
+- standalone manifests and environment-only all-in-one startup;
 - no-control-plane remote frontend construction through
   `StorageCluster::from_static_local_map`;
 - standalone storage-node configuration using `RouteMapValidity::Forever`.
@@ -271,7 +270,8 @@ Implementation order:
 4. Move coordinator/frontend wiring to a common opaque route handle without duplicating storage
    operations or spreading authority-mode branches through request handling.
 5. Bind standalone topology durably, migrate all three no-control-plane paths above, remove the
-   `None` digest and special transition, and rename the deployment role to `standalone`.
+   `None` digest and special transition, and rename the process topology to `all-in-one` while
+   retaining `standalone` as the deployment mode.
 
 Implementation status (2026-07-29):
 
@@ -304,9 +304,29 @@ Implementation status (2026-07-29):
   coordinator constructors that accept an `Arc<StorageCluster>` are likewise static-only, while
   dynamic wiring must pass the route handle derived from its retained runtime-map capability. The
   repository boundary check locks these constructor and capability surfaces.
-- Remaining work starts at item 5: bind the storage-owned canonical static route digest into the
-  durable standalone identity for every no-control-plane startup path, fail closed on mismatch,
-  and finish the `legacy-local` to `standalone` deployment-role rename.
+- Item 5 is complete. Storage owns an opaque, exact-versioned standalone route identity and its
+  crash-recoverable durable preparation, atomic publication, checksum validation, and exclusive
+  runtime lock. The preparation retains and locks the exact directory descriptor and lock inode,
+  validates both named entries before and after binding, and performs identity publication relative
+  to the held directory descriptor. Immediately before publication it revalidates the exact marker,
+  published or pending identity inode and contents, and unpublished directory scaffolding. Artifact
+  inspection is nonblocking, so special files fail closed rather than stalling startup. A crash
+  marker admits only bounded empty private directory scaffolding or a separately validated pending
+  identity publication; arbitrary state without a published identity fails closed. Embedded
+  topology is consumed into a non-forgeable
+  storage-owned preparation;
+  callers can bind its opaque canonical identity and then open only that same prepared topology.
+  The durable identity is checked and locked before any PG database is opened or recovery runs,
+  and storage requires the prepared and opened identities to agree. Manifest
+  initialization, environment-only all-in-one startup, no-control-plane
+  remote frontends, and no-control-plane storage-node/combined processes all bind the canonical
+  static route identity before serving. Combined processes use a storage-owned composition of
+  their frontend route map and local storage-node route configuration, so both RPC topology and
+  the local durable path are bound. Missing identity beside existing state, corrupted or
+  unsupported identity formats, topology/endpoint/path changes, concurrent process ownership, and
+  attempts to bind dynamic authority fail closed. The old `legacy-local` process role and parser
+  value are removed; `all-in-one` now names process composition and `standalone` remains the
+  deployment mode.
 
 Exit criteria:
 
@@ -943,13 +963,14 @@ Raft peer client and server transports are storage-owned and boundary-checked.
    encryption, user/system metadata, object tags, bucket tags, and ACL grants have owner-local
    codecs, boundary checks, exact current-representation goldens, and containing-format
    inventories above.
-5. **In progress:** the unused legacy authority-clock constructor is removed and sample-driven
+5. **Complete:** the unused legacy authority-clock constructor is removed and sample-driven
    construction is test-only. The optional digest and live static-to-dynamic transition are now
    replaced by mandatory static/dynamic authority proofs, with bounded validity required at
    dynamic construction. Explicit static constructors, the opaque common route handle, the
    dynamic-only publication/refresh capability, frontend/coordinator migration, and boundary
-   checks are complete. Remaining work is to bind every no-control-plane topology to durable
-   standalone identity and finish the deployment-role rename.
+   checks are complete. Every no-control-plane topology now binds its storage-owned canonical
+   route identity durably before serving, and the former `legacy-local` process role is now the
+   topology-specific `all-in-one` role without conflating it with standalone deployment mode.
 6. **Complete:** owner-local exact-current rejection fixtures cover every boundary listed in the
    2026-07-29 audit, including resealed enclosing checksums, digests, and authenticators.
 7. **Complete:** session-token version selection is contained inside `auth`, with semantic APIs

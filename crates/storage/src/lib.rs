@@ -41,6 +41,7 @@ mod node_runtime;
 pub(crate) mod peering;
 pub mod pg_topology;
 pub mod shard_key_hash;
+mod standalone;
 #[allow(dead_code)]
 pub(crate) mod storage_rpc;
 pub(crate) mod storage_rpc_auth;
@@ -80,13 +81,13 @@ pub use cluster::{
     PlacedSegmentShardBackfillCandidateEnqueueSummary,
     PlacedSegmentShardBackfillCandidateScanCursor, PlacedSegmentShardBackfillCopyTarget,
     PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth, PlacedSegmentShardSetHealth,
-    PlacedSegmentShardSetRisk, PlacedSegmentShardValidation, ProcessLocalRegistryKey,
-    ReleasedObjectPayloadLease, RetainedObjectPayloadRead, RetainedStreamUploadCleanup,
-    ShardLocation, StorageCluster, StorageClusterRouteAdmission, StorageClusterRouteHandle,
-    StorageClusterRuntimeMapHandle, StorageClusterRuntimeMapRefreshError,
-    StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopFailure,
-    StorageClusterRuntimeMapRefreshLoopStatus, StorageClusterRuntimeMapRefreshLoopStatusHandle,
-    StorageClusterRuntimeMapRefreshLoopSuccess,
+    PlacedSegmentShardSetRisk, PlacedSegmentShardValidation, PreparedStandaloneEmbeddedTopology,
+    ProcessLocalRegistryKey, ReleasedObjectPayloadLease, RetainedObjectPayloadRead,
+    RetainedStreamUploadCleanup, ShardLocation, StorageCluster, StorageClusterRouteAdmission,
+    StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
+    StorageClusterRuntimeMapRefreshError, StorageClusterRuntimeMapRefreshLoop,
+    StorageClusterRuntimeMapRefreshLoopFailure, StorageClusterRuntimeMapRefreshLoopStatus,
+    StorageClusterRuntimeMapRefreshLoopStatusHandle, StorageClusterRuntimeMapRefreshLoopSuccess,
 };
 #[cfg(feature = "test-hooks")]
 pub use cluster::{
@@ -125,6 +126,10 @@ pub use placement::NodeId;
 pub use shard_key_hash::{
     direct_put_segment_key_hash, multipart_part_segment_key_hash, object_key_hash,
     segment_key_hash, stream_segment_key_hash,
+};
+pub use standalone::{
+    StandaloneRouteIdentity, StandaloneRouteIdentityError, StandaloneRouteIdentityLock,
+    StandaloneRouteIdentityPreparation,
 };
 pub use storage_rpc::StorageNodeFailure;
 pub(crate) use storage_rpc_auth::StorageRpcClientAuthConfig;

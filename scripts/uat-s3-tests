@@ -2384,7 +2384,7 @@ if [[ "$topology" == "local" ]]; then
         -u ARGMIN_STORAGE_NODE_DATA_DIR \
         -u ARGMIN_STORAGE_NODE_SOCKET_PATH \
         -u ARGMIN_STORAGE_NODE_SOCKETS \
-        ARGMIN_PROCESS_ROLE=legacy-local \
+        ARGMIN_PROCESS_ROLE=all-in-one \
         ARGMIN_BUCKET_DELETE_VISIBLE_DATA_DIAGNOSTICS=1 \
         ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS=1 \
         ARGMIN_LOCAL_DEBUG_ENDPOINT="$uat_local_debug_endpoint" \

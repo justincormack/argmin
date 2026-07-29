@@ -2010,44 +2010,16 @@ impl LocalClusterMap {
         pg_routes: Option<Vec<LocalPgRoute>>,
         validate_local_metadata_command_replay: bool,
     ) -> Result<Self, ClusterBuildError> {
-        let configs: Vec<LocalNodeStoreConfig> = configs.into_iter().collect();
-        if configs.is_empty() {
-            return Err(ClusterBuildError::EmptyCluster);
-        }
-
-        let mut node_ids = BTreeSet::<NodeId>::new();
-        for config in &configs {
-            if !node_ids.insert(config.node_id) {
-                return Err(ClusterBuildError::DuplicateNodeId {
-                    id: config.node_id.as_u32(),
-                });
-            }
-        }
-        if !node_ids.contains(&metadata_primary_node_id) {
-            return Err(ClusterBuildError::MetadataPrimaryNotFound {
-                id: metadata_primary_node_id.as_u32(),
-            });
-        }
-        let pg_ids = validate_local_pg_ids(pg_ids)?;
-        let placement_map = build_local_placement_map(node_ids.iter().copied())?;
-        validate_local_payload_placement(&placement_map, default_ec_shape)?;
-
-        let mut data_dirs = BTreeMap::<PathBuf, NodeId>::new();
-        let mut validated_configs = Vec::with_capacity(configs.len());
-
-        for config in configs {
-            let canonical_data_dir = prepare_local_node_data_dir(config.node_id, &config.data_dir)?;
-            if let Some(first_node_id) =
-                data_dirs.insert(canonical_data_dir.clone(), config.node_id)
-            {
-                return Err(ClusterBuildError::DuplicateDataDir {
-                    first_node_id: first_node_id.as_u32(),
-                    duplicate_node_id: config.node_id.as_u32(),
-                    data_dir: canonical_data_dir,
-                });
-            }
-            validated_configs.push((config.node_id, canonical_data_dir));
-        }
+        let ValidatedEmbeddedLocalTopology {
+            node_ids,
+            pg_ids,
+            configs: validated_configs,
+        } = validate_embedded_local_topology(
+            metadata_primary_node_id,
+            configs,
+            pg_ids,
+            default_ec_shape,
+        )?;
 
         let acting_set = Arc::<[NodeId]>::from(node_ids.iter().copied().collect::<Vec<_>>());
         let storage_pg_ids: Vec<u32> = pg_ids.iter().map(|pg_id| pg_id.get()).collect();
@@ -2150,39 +2122,11 @@ impl LocalClusterMap {
     }
 
     pub(super) fn static_route_map_content_digest(&self) -> [u8; 32] {
-        let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
-        static_route_digest_bytes(&mut hasher, STATIC_ROUTE_MAP_CONTENT_DIGEST_DOMAIN);
-        static_route_digest_u64(&mut hasher, self.epoch.get());
-        static_route_digest_u32(&mut hasher, self.metadata_primary_node_id.as_u32());
-        static_route_digest_u8(&mut hasher, self.default_ec_shape.k);
-        static_route_digest_u8(&mut hasher, self.default_ec_shape.m);
-
-        static_route_digest_len(&mut hasher, self.nodes.len());
-        for (node_id, node) in &self.nodes {
-            static_route_digest_u32(&mut hasher, node_id.as_u32());
-            match &node.route_execution_endpoint {
-                LocalRouteExecutionEndpoint::Embedded(data_dir) => {
-                    static_route_digest_u8(&mut hasher, 1);
-                    static_route_digest_bytes(&mut hasher, data_dir.as_os_str().as_bytes());
-                }
-                LocalRouteExecutionEndpoint::TopologyOnly => {
-                    static_route_digest_u8(&mut hasher, 2);
-                }
-                LocalRouteExecutionEndpoint::RpcUnix(socket_path) => {
-                    static_route_digest_u8(&mut hasher, 3);
-                    static_route_digest_bytes(&mut hasher, socket_path.as_os_str().as_bytes());
-                }
-                LocalRouteExecutionEndpoint::RpcTcp(endpoint) => {
-                    static_route_digest_u8(&mut hasher, 4);
-                    static_route_digest_bytes(&mut hasher, endpoint.as_bytes());
-                }
-            }
-        }
-
-        static_route_digest_len(&mut hasher, self.pg_ids.len());
-        for pg_id in &self.pg_ids {
-            static_route_digest_u32(&mut hasher, *pg_id);
-        }
+        let endpoints = self
+            .nodes
+            .iter()
+            .map(|(node_id, node)| (*node_id, node.route_execution_endpoint.clone()))
+            .collect::<BTreeMap<_, _>>();
         let current_routes = self
             .pg_routes
             .values()
@@ -2196,23 +2140,69 @@ impl LocalClusterMap {
                 )
             })
             .collect::<Vec<_>>();
-        digest_pg_routes(&mut hasher, &current_routes);
         let historical_routes = self
             .historical_pg_routes
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        digest_pg_routes(&mut hasher, &historical_routes);
-        static_route_digest_len(&mut hasher, self.historical_cluster_epochs.len());
-        for epoch in &self.historical_cluster_epochs {
-            static_route_digest_u64(&mut hasher, epoch.get());
-        }
+        static_route_map_content_digest(StaticRouteMapDigestInput {
+            cluster_epoch: self.epoch,
+            metadata_primary_node_id: self.metadata_primary_node_id,
+            default_ec_shape: self.default_ec_shape,
+            endpoints: &endpoints,
+            pg_ids: &self.pg_ids,
+            current_routes: &current_routes,
+            historical_routes: &historical_routes,
+            historical_cluster_epochs: &self.historical_cluster_epochs,
+        })
+    }
 
-        hasher
-            .finalize()
-            .bytes()
-            .try_into()
-            .expect("SHA-256 static route-map digest must contain 32 bytes")
+    pub(super) fn preflight_static_embedded_route_digest(
+        metadata_primary_node_id: NodeId,
+        configs: impl IntoIterator<Item = LocalNodeStoreConfig>,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<[u8; 32], ClusterBuildError> {
+        let ValidatedEmbeddedLocalTopology {
+            node_ids,
+            pg_ids,
+            configs,
+        } = validate_embedded_local_topology(
+            metadata_primary_node_id,
+            configs,
+            pg_ids,
+            default_ec_shape,
+        )?;
+        let acting_set = Arc::<[NodeId]>::from(node_ids.iter().copied().collect::<Vec<_>>());
+        let current_routes =
+            build_static_pg_routes(cluster_epoch, metadata_primary_node_id, acting_set, &pg_ids)
+                .into_values()
+                .map(|route| {
+                    PgRouteSnapshot::reconstructed(
+                        route.cluster_epoch(),
+                        route.pg_id(),
+                        route.primary_node_id(),
+                        route.acting_set().to_vec(),
+                        route.state(),
+                    )
+                })
+                .collect::<Vec<_>>();
+        let endpoints = configs
+            .into_iter()
+            .map(|(node_id, data_dir)| (node_id, LocalRouteExecutionEndpoint::Embedded(data_dir)))
+            .collect::<BTreeMap<_, _>>();
+        let raw_pg_ids = pg_ids.iter().map(|pg_id| pg_id.get()).collect::<Vec<_>>();
+        Ok(static_route_map_content_digest(StaticRouteMapDigestInput {
+            cluster_epoch,
+            metadata_primary_node_id,
+            default_ec_shape,
+            endpoints: &endpoints,
+            pg_ids: &raw_pg_ids,
+            current_routes: &current_routes,
+            historical_routes: &[],
+            historical_cluster_epochs: &BTreeSet::new(),
+        }))
     }
 
     pub(super) fn validate_dynamic_route_map_content(
@@ -4673,6 +4663,65 @@ impl LocalClusterMap {
     }
 }
 
+struct StaticRouteMapDigestInput<'a> {
+    cluster_epoch: ClusterEpoch,
+    metadata_primary_node_id: NodeId,
+    default_ec_shape: EcShape,
+    endpoints: &'a BTreeMap<NodeId, LocalRouteExecutionEndpoint>,
+    pg_ids: &'a [u32],
+    current_routes: &'a [PgRouteSnapshot],
+    historical_routes: &'a [PgRouteSnapshot],
+    historical_cluster_epochs: &'a BTreeSet<ClusterEpoch>,
+}
+
+fn static_route_map_content_digest(input: StaticRouteMapDigestInput<'_>) -> [u8; 32] {
+    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+    static_route_digest_bytes(&mut hasher, STATIC_ROUTE_MAP_CONTENT_DIGEST_DOMAIN);
+    static_route_digest_u64(&mut hasher, input.cluster_epoch.get());
+    static_route_digest_u32(&mut hasher, input.metadata_primary_node_id.as_u32());
+    static_route_digest_u8(&mut hasher, input.default_ec_shape.k);
+    static_route_digest_u8(&mut hasher, input.default_ec_shape.m);
+
+    static_route_digest_len(&mut hasher, input.endpoints.len());
+    for (node_id, endpoint) in input.endpoints {
+        static_route_digest_u32(&mut hasher, node_id.as_u32());
+        match endpoint {
+            LocalRouteExecutionEndpoint::Embedded(data_dir) => {
+                static_route_digest_u8(&mut hasher, 1);
+                static_route_digest_bytes(&mut hasher, data_dir.as_os_str().as_bytes());
+            }
+            LocalRouteExecutionEndpoint::TopologyOnly => {
+                static_route_digest_u8(&mut hasher, 2);
+            }
+            LocalRouteExecutionEndpoint::RpcUnix(socket_path) => {
+                static_route_digest_u8(&mut hasher, 3);
+                static_route_digest_bytes(&mut hasher, socket_path.as_os_str().as_bytes());
+            }
+            LocalRouteExecutionEndpoint::RpcTcp(endpoint) => {
+                static_route_digest_u8(&mut hasher, 4);
+                static_route_digest_bytes(&mut hasher, endpoint.as_bytes());
+            }
+        }
+    }
+
+    static_route_digest_len(&mut hasher, input.pg_ids.len());
+    for pg_id in input.pg_ids {
+        static_route_digest_u32(&mut hasher, *pg_id);
+    }
+    digest_pg_routes(&mut hasher, input.current_routes);
+    digest_pg_routes(&mut hasher, input.historical_routes);
+    static_route_digest_len(&mut hasher, input.historical_cluster_epochs.len());
+    for epoch in input.historical_cluster_epochs {
+        static_route_digest_u64(&mut hasher, epoch.get());
+    }
+
+    hasher
+        .finalize()
+        .bytes()
+        .try_into()
+        .expect("SHA-256 static route-map digest must contain 32 bytes")
+}
+
 fn build_static_pg_routes(
     cluster_epoch: ClusterEpoch,
     primary_node_id: NodeId,
@@ -5318,6 +5367,61 @@ fn validate_local_pg_ids(pg_ids: &[u32]) -> Result<Vec<PgId>, ClusterBuildError>
         validated.push(pg_id);
     }
     Ok(validated)
+}
+
+struct ValidatedEmbeddedLocalTopology {
+    node_ids: BTreeSet<NodeId>,
+    pg_ids: Vec<PgId>,
+    configs: Vec<(NodeId, PathBuf)>,
+}
+
+fn validate_embedded_local_topology(
+    metadata_primary_node_id: NodeId,
+    configs: impl IntoIterator<Item = LocalNodeStoreConfig>,
+    pg_ids: &[u32],
+    default_ec_shape: EcShape,
+) -> Result<ValidatedEmbeddedLocalTopology, ClusterBuildError> {
+    let configs = configs.into_iter().collect::<Vec<_>>();
+    if configs.is_empty() {
+        return Err(ClusterBuildError::EmptyCluster);
+    }
+
+    let mut node_ids = BTreeSet::new();
+    for config in &configs {
+        if !node_ids.insert(config.node_id) {
+            return Err(ClusterBuildError::DuplicateNodeId {
+                id: config.node_id.as_u32(),
+            });
+        }
+    }
+    if !node_ids.contains(&metadata_primary_node_id) {
+        return Err(ClusterBuildError::MetadataPrimaryNotFound {
+            id: metadata_primary_node_id.as_u32(),
+        });
+    }
+    let pg_ids = validate_local_pg_ids(pg_ids)?;
+    let placement_map = build_local_placement_map(node_ids.iter().copied())?;
+    validate_local_payload_placement(&placement_map, default_ec_shape)?;
+
+    let mut data_dirs = BTreeMap::<PathBuf, NodeId>::new();
+    let mut validated_configs = Vec::with_capacity(configs.len());
+    for config in configs {
+        let canonical_data_dir = prepare_local_node_data_dir(config.node_id, &config.data_dir)?;
+        if let Some(first_node_id) = data_dirs.insert(canonical_data_dir.clone(), config.node_id) {
+            return Err(ClusterBuildError::DuplicateDataDir {
+                first_node_id: first_node_id.as_u32(),
+                duplicate_node_id: config.node_id.as_u32(),
+                data_dir: canonical_data_dir,
+            });
+        }
+        validated_configs.push((config.node_id, canonical_data_dir));
+    }
+
+    Ok(ValidatedEmbeddedLocalTopology {
+        node_ids,
+        pg_ids,
+        configs: validated_configs,
+    })
 }
 
 fn validate_local_payload_placement(

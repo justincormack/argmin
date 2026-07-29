@@ -2847,10 +2847,42 @@ route_authority_capability_leaks=$(
             crates \
             -g '*.rs' \
             || true
+        rg -n --color=never \
+            '\.argmin-standalone-route\.(identity|identity\.next|initializing|lock)' \
+            crates \
+            -g '*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            '\b(StandaloneRouteIdentity|PreparedStandaloneEmbeddedTopology)\b' \
+            crates \
+            -g '*.rs' \
+            -g '!crates/storage/**' \
+            -g '!crates/argmin-s3/src/main.rs' \
+            -g '!crates/argmin-s3/src/static_cluster_config.rs' \
+            || true
+        rg -n --color=never \
+            'pub struct StandaloneRouteIdentity\(pub[[:space:]]' \
+            crates/storage/src/standalone.rs \
+            || true
+        awk '
+            /^#\[cfg\(test\)\]/ { exit }
+            /fs::(rename|remove_file|write)\(/ {
+                print FILENAME ":" FNR ":" $0
+            }
+        ' crates/storage/src/standalone.rs
+        awk '
+            /^mod tests \{/ { exit }
+            /legacy-local|ProcessRole::Standalone/ {
+                print FILENAME ":" FNR ":" $0
+            }
+        ' crates/argmin-s3/src/config.rs \
+          crates/argmin-s3/src/main.rs \
+          crates/argmin-s3/src/static_cluster_config.rs
     }
 )
 fail_with_matches \
-    "Static construction must be explicit, generic route-handle construction cannot be public, request consumers receive only StorageClusterRouteHandle, and no request handle can be upgraded to dynamic publication authority" \
+    "Static construction and standalone durable binding must remain storage-owned and explicit; generic route-handle construction cannot be public, request consumers receive only StorageClusterRouteHandle, no request handle can be upgraded to dynamic publication authority, and the obsolete legacy-local role cannot return" \
     "$route_authority_capability_leaks"
 
 session_token_format_leaks=$(

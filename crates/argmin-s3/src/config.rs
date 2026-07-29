@@ -27,7 +27,7 @@ const MAX_LOCAL_NODE_COUNT: u32 = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcessRole {
-    LegacyLocal,
+    AllInOne,
     Frontend,
     StorageNode,
     Combined,
@@ -40,7 +40,7 @@ impl ProcessRole {
     }
 
     fn has_frontend(self) -> bool {
-        matches!(self, Self::LegacyLocal | Self::Frontend | Self::Combined)
+        matches!(self, Self::AllInOne | Self::Frontend | Self::Combined)
     }
 
     fn has_control_plane(self) -> bool {
@@ -573,7 +573,7 @@ impl ServerConfig {
     pub(crate) fn from_lookup<F: Fn(&str) -> Option<String>>(get: F) -> Result<Self, String> {
         let process_role = match get("ARGMIN_PROCESS_ROLE") {
             Some(value) => parse_process_role(&value)?,
-            None => ProcessRole::LegacyLocal,
+            None => ProcessRole::AllInOne,
         };
         let (
             account_id,
@@ -1214,9 +1214,9 @@ fn parse_process_role(value: &str) -> Result<ProcessRole, String> {
         "storage-node" => Ok(ProcessRole::StorageNode),
         "combined" => Ok(ProcessRole::Combined),
         "control-plane" => Ok(ProcessRole::ControlPlane),
-        "legacy-local" => Ok(ProcessRole::LegacyLocal),
+        "all-in-one" => Ok(ProcessRole::AllInOne),
         _ => Err(
-            "ARGMIN_PROCESS_ROLE must be one of frontend, storage-node, combined, control-plane, legacy-local"
+            "ARGMIN_PROCESS_ROLE must be one of all-in-one, frontend, storage-node, combined, control-plane"
                 .to_string(),
         ),
     }
@@ -2103,7 +2103,7 @@ mod tests {
     fn defaults_applied() {
         let m = required_only();
         let cfg = ServerConfig::from_lookup(lookup(&m)).unwrap();
-        assert_eq!(cfg.process_role, ProcessRole::LegacyLocal);
+        assert_eq!(cfg.process_role, ProcessRole::AllInOne);
         assert_eq!(cfg.listen_addr, "127.0.0.1:9000");
         assert_eq!(cfg.tls_cert_path, None);
         assert_eq!(cfg.tls_key_path, None);
@@ -2175,6 +2175,19 @@ mod tests {
             cfg.sse_s3_wrapping_key_b64.as_str(),
             "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
         );
+    }
+
+    #[test]
+    fn obsolete_or_deployment_mode_process_roles_are_not_accepted() {
+        for value in ["legacy-local", "standalone"] {
+            let error =
+                ServerConfig::from_lookup(make_required_env(&[("ARGMIN_PROCESS_ROLE", value)]))
+                    .unwrap_err();
+            assert_eq!(
+                error,
+                "ARGMIN_PROCESS_ROLE must be one of all-in-one, frontend, storage-node, combined, control-plane"
+            );
+        }
     }
 
     #[test]

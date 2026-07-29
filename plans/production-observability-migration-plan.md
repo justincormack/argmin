@@ -79,7 +79,7 @@ Completed:
   and requests the dump before teardown on failed runs so intermittent
   full-suite races retain request-error and metadata-command conflict context.
 - `argmin-s3` installs a process-wide panic hook after configuration loads, so
-  frontend, storage-node, and legacy-local panics dump the same bounded,
+  frontend, storage-node, and all-in-one panics dump the same bounded,
   redacted flight-recorder ring before the normal panic output.
 
 Remaining:

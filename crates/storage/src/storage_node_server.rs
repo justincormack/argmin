@@ -348,6 +348,7 @@ use crate::{
     ShardLocation, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadTarget, UploadId,
 };
 use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
+use checksum::{ChecksumAlgorithm, ChecksumHasher};
 
 #[cfg(test)]
 type MetadataCommandBeforeWaitHook = Arc<dyn Fn(PgId) + Send + Sync>;
@@ -496,6 +497,46 @@ impl StorageNodeProcessConfig {
     #[must_use]
     pub fn historical_pg_routes(&self) -> &[StorageNodePgRoute] {
         &self.historical_pg_routes
+    }
+
+    /// Return the opaque durable identity for this standalone storage-node
+    /// route configuration.
+    pub fn standalone_route_identity(
+        &self,
+    ) -> Result<crate::StandaloneRouteIdentity, crate::StandaloneRouteIdentityError> {
+        if self.route_map_validity != RouteMapValidity::Forever {
+            return Err(crate::StandaloneRouteIdentityError::DynamicAuthority);
+        }
+        if !self.pending_metadata_command_recoveries.is_empty() {
+            return Err(crate::StandaloneRouteIdentityError::InvalidIdentity {
+                reason: "standalone storage-node route contains dynamic recovery state",
+            });
+        }
+
+        let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+        standalone_storage_node_digest_bytes(
+            &mut hasher,
+            b"argmin/standalone-storage-node-route/v1",
+        );
+        standalone_storage_node_digest_u32(&mut hasher, self.node_id.as_u32());
+        standalone_storage_node_digest_u64(&mut hasher, self.cluster_epoch.get());
+        standalone_storage_node_digest_bytes(&mut hasher, self.data_dir.as_os_str().as_bytes());
+        standalone_storage_node_digest_u8(&mut hasher, self.default_ec_shape.k);
+        standalone_storage_node_digest_u8(&mut hasher, self.default_ec_shape.m);
+        standalone_storage_node_digest_bytes(&mut hasher, self.socket_path.as_os_str().as_bytes());
+        standalone_storage_node_digest_len(&mut hasher, self.pg_ids.len());
+        for pg_id in &self.pg_ids {
+            standalone_storage_node_digest_u32(&mut hasher, *pg_id);
+        }
+        standalone_storage_node_digest_routes(&mut hasher, &self.pg_routes);
+        standalone_storage_node_digest_routes(&mut hasher, &self.historical_pg_routes);
+        Ok(crate::StandaloneRouteIdentity(
+            hasher
+                .finalize()
+                .bytes()
+                .try_into()
+                .expect("SHA-256 standalone storage-node route identity contains 32 bytes"),
+        ))
     }
 
     pub(crate) fn from_runtime_map(
@@ -793,6 +834,58 @@ impl StorageNodeProcessConfig {
                 .map(|route| (PgId::new(route.pg_id), route.state)),
         )
         .map_err(StorageNodeServerError::from)
+    }
+}
+
+fn standalone_storage_node_digest_len(hasher: &mut ChecksumHasher, len: usize) {
+    standalone_storage_node_digest_u64(
+        hasher,
+        u64::try_from(len).expect("standalone route collection length fits u64"),
+    );
+}
+
+fn standalone_storage_node_digest_bytes(hasher: &mut ChecksumHasher, bytes: &[u8]) {
+    standalone_storage_node_digest_len(hasher, bytes.len());
+    hasher.update(bytes);
+}
+
+fn standalone_storage_node_digest_u64(hasher: &mut ChecksumHasher, value: u64) {
+    hasher.update(&value.to_be_bytes());
+}
+
+fn standalone_storage_node_digest_u32(hasher: &mut ChecksumHasher, value: u32) {
+    hasher.update(&value.to_be_bytes());
+}
+
+fn standalone_storage_node_digest_u8(hasher: &mut ChecksumHasher, value: u8) {
+    hasher.update(&[value]);
+}
+
+fn standalone_storage_node_digest_routes(
+    hasher: &mut ChecksumHasher,
+    routes: &[StorageNodePgRoute],
+) {
+    let mut routes = routes.iter().collect::<Vec<_>>();
+    routes.sort_by_key(|route| (route.cluster_epoch, route.pg_id));
+    standalone_storage_node_digest_len(hasher, routes.len());
+    for route in routes {
+        standalone_storage_node_digest_u32(hasher, route.pg_id);
+        standalone_storage_node_digest_u64(hasher, route.cluster_epoch.get());
+        standalone_storage_node_digest_u8(
+            hasher,
+            match route.state {
+                PgState::Active => 1,
+                PgState::Peering => 2,
+                PgState::Degraded => 3,
+                PgState::Backfilling => 4,
+                PgState::Inconsistent => 5,
+            },
+        );
+        standalone_storage_node_digest_u32(hasher, route.primary_node_id.as_u32());
+        standalone_storage_node_digest_len(hasher, route.acting_set.len());
+        for node_id in &route.acting_set {
+            standalone_storage_node_digest_u32(hasher, node_id.as_u32());
+        }
     }
 }
 
@@ -19108,6 +19201,63 @@ mod tests {
             historical_pg_routes: Vec::new(),
             pending_metadata_command_recoveries: Vec::new(),
         }
+    }
+
+    #[test]
+    fn standalone_storage_node_route_identity_has_exact_baseline_and_binds_inputs() {
+        let baseline = StorageNodeProcessConfig {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            route_map_validity: RouteMapValidity::Forever,
+            data_dir: PathBuf::from("/data/node"),
+            default_ec_shape: EcShape { k: 4, m: 2 },
+            pg_ids: vec![0],
+            socket_path: PathBuf::from("/run/node.sock"),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                state: PgState::Active,
+                primary_node_id: NodeId::new(7),
+                acting_set: vec![NodeId::new(7)],
+            }],
+            historical_pg_routes: Vec::new(),
+            pending_metadata_command_recoveries: Vec::new(),
+        };
+        let identity = baseline.standalone_route_identity().unwrap();
+        assert_eq!(
+            identity.0,
+            [
+                54, 173, 168, 164, 79, 238, 241, 136, 186, 45, 203, 51, 18, 114, 94, 181, 178, 238,
+                22, 143, 165, 48, 13, 231, 250, 91, 2, 14, 82, 194, 201, 57,
+            ]
+        );
+
+        let mut changed = Vec::new();
+        let mut config = baseline.clone();
+        config.data_dir = PathBuf::from("/data/other");
+        changed.push(config);
+        let mut config = baseline.clone();
+        config.socket_path = PathBuf::from("/run/other.sock");
+        changed.push(config);
+        let mut config = baseline.clone();
+        config.default_ec_shape = EcShape { k: 3, m: 2 };
+        changed.push(config);
+        let mut config = baseline.clone();
+        config.pg_routes[0].state = PgState::Degraded;
+        changed.push(config);
+        let mut config = baseline.clone();
+        config.pg_routes[0].acting_set.push(NodeId::new(8));
+        changed.push(config);
+        for config in changed {
+            assert_ne!(config.standalone_route_identity().unwrap(), identity);
+        }
+
+        let mut dynamic = baseline;
+        dynamic.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        assert!(matches!(
+            dynamic.standalone_route_identity(),
+            Err(crate::StandaloneRouteIdentityError::DynamicAuthority)
+        ));
     }
 
     const STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST: &str =
