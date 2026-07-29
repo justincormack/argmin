@@ -1,15 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use checksum::{ChecksumAlgorithm, ChecksumHasher};
 use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
 use super::{ProcessLocalRegistryKey, ShardLocation};
 use crate::control_plane::{
-    reconstruct_sparse_pg_route_at_epoch, ClusterRuntimeMapSnapshot, NodeRouteSnapshot,
-    PgRouteSnapshot,
+    digest_pg_routes, reconstruct_sparse_pg_route_at_epoch, ClusterRuntimeMapSnapshot,
+    NodeRouteSnapshot, PgRouteSnapshot,
 };
 use crate::control_plane_lease::{
     validate_process_lease_clock, BoundRouteMapLease, CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
@@ -44,7 +46,7 @@ use crate::node_client::{
 };
 use crate::pg_store::PgClusterMapHistoryReferenceSummary;
 use crate::pg_topology::PgTopology;
-use crate::storage_rpc_transport::StorageRpcClientEndpoint;
+use crate::storage_rpc_transport::{StorageRpcClientEndpoint, StorageRpcEndpointAuthorityIdentity};
 use crate::types::AdmittedRouteEffectFence;
 use crate::{
     BucketDeleteFinalizeRoot, BucketName, BucketPgId, ClusterEpoch, DataPgId, EcShape,
@@ -54,10 +56,36 @@ use crate::{
 };
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
+const STATIC_ROUTE_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/static-route-map-content/v1";
 const LOCAL_RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const METADATA_COMMAND_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT: usize = 4096;
+
+fn static_route_digest_len(hasher: &mut ChecksumHasher, len: usize) {
+    static_route_digest_u64(
+        hasher,
+        u64::try_from(len).expect("static route-map collection length must fit u64"),
+    );
+}
+
+fn static_route_digest_bytes(hasher: &mut ChecksumHasher, bytes: &[u8]) {
+    static_route_digest_len(hasher, bytes.len());
+    hasher.update(bytes);
+}
+
+fn static_route_digest_u64(hasher: &mut ChecksumHasher, value: u64) {
+    hasher.update(&value.to_be_bytes());
+}
+
+fn static_route_digest_u32(hasher: &mut ChecksumHasher, value: u32) {
+    hasher.update(&value.to_be_bytes());
+}
+
+fn static_route_digest_u8(hasher: &mut ChecksumHasher, value: u8) {
+    hasher.update(&[value]);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LocalRouteMapLeaseSnapshot {
     pub(crate) validity: RouteMapValidity,
@@ -489,10 +517,45 @@ impl LocalUnixObjectListingMetadataNodeClientConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalRouteExecutionEndpoint {
+    Embedded(PathBuf),
+    TopologyOnly,
+    RpcUnix(PathBuf),
+    RpcTcp(String),
+}
+
+impl LocalRouteExecutionEndpoint {
+    fn for_local_store(data_dir: &Path) -> Self {
+        if data_dir.as_os_str().is_empty() {
+            Self::TopologyOnly
+        } else {
+            Self::Embedded(data_dir.to_path_buf())
+        }
+    }
+
+    fn for_rpc(endpoint: &StorageRpcClientEndpoint) -> Self {
+        match endpoint.authority_identity() {
+            StorageRpcEndpointAuthorityIdentity::Unix(path) => Self::RpcUnix(path.to_path_buf()),
+            StorageRpcEndpointAuthorityIdentity::Tcp(endpoint) => Self::RpcTcp(endpoint.to_owned()),
+        }
+    }
+
+    fn matches_advertised_endpoint(&self, advertised_endpoint: &str) -> bool {
+        match self {
+            Self::RpcUnix(path) => path.as_os_str().as_bytes() == advertised_endpoint.as_bytes(),
+            Self::RpcTcp(endpoint) => endpoint == advertised_endpoint,
+            Self::Embedded(_) | Self::TopologyOnly => false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct LocalNodeStore {
     node_id: NodeId,
     data_dir: PathBuf,
+    route_execution_endpoint: LocalRouteExecutionEndpoint,
+    route_authority_advertised_endpoint: Option<String>,
     runtime: LocalNodeRuntime,
     object_payload_lease_client: Arc<dyn ObjectPayloadLeaseNodeClient>,
     retained_object_payload_reclaim_client: Arc<dyn RetainedObjectPayloadReclaimNodeClient>,
@@ -525,9 +588,12 @@ pub struct LocalNodeStore {
 impl LocalNodeStore {
     fn new(node_id: NodeId, data_dir: PathBuf, runtime: LocalNodeRuntime) -> Self {
         let clients = runtime.clients();
+        let route_execution_endpoint = LocalRouteExecutionEndpoint::for_local_store(&data_dir);
         Self {
             node_id,
             data_dir,
+            route_execution_endpoint,
+            route_authority_advertised_endpoint: None,
             runtime,
             object_payload_lease_client: clients.object_payload_lease,
             retained_object_payload_reclaim_client: clients.retained_object_payload_reclaim,
@@ -1804,6 +1870,7 @@ impl LocalClusterMap {
             pg_routes,
             runtime_map.validity(),
         )?;
+        local_map.bind_runtime_map_advertised_endpoints(runtime_map);
         local_map.historical_pg_routes = runtime_map
             .historical_pg_routes()
             .iter()
@@ -1846,8 +1913,18 @@ impl LocalClusterMap {
             });
         }
         local_map.nodes.clone_from(&current.nodes);
+        local_map.bind_runtime_map_advertised_endpoints(runtime_map);
         local_map.inherit_process_local_state_from(current);
         Ok(local_map)
+    }
+
+    fn bind_runtime_map_advertised_endpoints(&mut self, runtime_map: &ClusterRuntimeMapSnapshot) {
+        for route in runtime_map.nodes() {
+            self.nodes
+                .get_mut(&route.node_id())
+                .expect("runtime-map node set was used to construct the local route map")
+                .route_authority_advertised_endpoint = Some(route.endpoint().to_owned());
+        }
     }
 
     pub(crate) fn inherit_process_local_state_from(&mut self, previous: &Self) {
@@ -1900,6 +1977,27 @@ impl LocalClusterMap {
             runtime_state: Arc::clone(&self.runtime_state),
             process_local_registry_key: self.process_local_registry_key,
         })
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_clone_with_route_map_validity(&self, validity: RouteMapValidity) -> Self {
+        Self {
+            epoch: self.epoch,
+            route_map_lease: RwLock::new(LocalRouteMapLeaseSnapshot {
+                validity,
+                local_valid_until_monotonic_ms: test_process_local_route_map_deadline(validity),
+            }),
+            metadata_primary_node_id: self.metadata_primary_node_id,
+            nodes: self.nodes.clone(),
+            pg_ids: self.pg_ids.clone(),
+            pg_topology: self.pg_topology.clone(),
+            default_ec_shape: self.default_ec_shape,
+            pg_routes: self.pg_routes.clone(),
+            historical_pg_routes: self.historical_pg_routes.clone(),
+            historical_cluster_epochs: self.historical_cluster_epochs.clone(),
+            runtime_state: Arc::clone(&self.runtime_state),
+            process_local_registry_key: self.process_local_registry_key,
+        }
     }
 
     fn open_with_configs_inner(
@@ -2048,6 +2146,171 @@ impl LocalClusterMap {
 
     pub fn epoch(&self) -> ClusterEpoch {
         self.epoch
+    }
+
+    pub(super) fn static_route_map_content_digest(&self) -> [u8; 32] {
+        let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+        static_route_digest_bytes(&mut hasher, STATIC_ROUTE_MAP_CONTENT_DIGEST_DOMAIN);
+        static_route_digest_u64(&mut hasher, self.epoch.get());
+        static_route_digest_u32(&mut hasher, self.metadata_primary_node_id.as_u32());
+        static_route_digest_u8(&mut hasher, self.default_ec_shape.k);
+        static_route_digest_u8(&mut hasher, self.default_ec_shape.m);
+
+        static_route_digest_len(&mut hasher, self.nodes.len());
+        for (node_id, node) in &self.nodes {
+            static_route_digest_u32(&mut hasher, node_id.as_u32());
+            match &node.route_execution_endpoint {
+                LocalRouteExecutionEndpoint::Embedded(data_dir) => {
+                    static_route_digest_u8(&mut hasher, 1);
+                    static_route_digest_bytes(&mut hasher, data_dir.as_os_str().as_bytes());
+                }
+                LocalRouteExecutionEndpoint::TopologyOnly => {
+                    static_route_digest_u8(&mut hasher, 2);
+                }
+                LocalRouteExecutionEndpoint::RpcUnix(socket_path) => {
+                    static_route_digest_u8(&mut hasher, 3);
+                    static_route_digest_bytes(&mut hasher, socket_path.as_os_str().as_bytes());
+                }
+                LocalRouteExecutionEndpoint::RpcTcp(endpoint) => {
+                    static_route_digest_u8(&mut hasher, 4);
+                    static_route_digest_bytes(&mut hasher, endpoint.as_bytes());
+                }
+            }
+        }
+
+        static_route_digest_len(&mut hasher, self.pg_ids.len());
+        for pg_id in &self.pg_ids {
+            static_route_digest_u32(&mut hasher, *pg_id);
+        }
+        let current_routes = self
+            .pg_routes
+            .values()
+            .map(|route| {
+                PgRouteSnapshot::reconstructed(
+                    route.cluster_epoch(),
+                    route.pg_id(),
+                    route.primary_node_id(),
+                    route.acting_set().to_vec(),
+                    route.state(),
+                )
+            })
+            .collect::<Vec<_>>();
+        digest_pg_routes(&mut hasher, &current_routes);
+        let historical_routes = self
+            .historical_pg_routes
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        digest_pg_routes(&mut hasher, &historical_routes);
+        static_route_digest_len(&mut hasher, self.historical_cluster_epochs.len());
+        for epoch in &self.historical_cluster_epochs {
+            static_route_digest_u64(&mut hasher, epoch.get());
+        }
+
+        hasher
+            .finalize()
+            .bytes()
+            .try_into()
+            .expect("SHA-256 static route-map digest must contain 32 bytes")
+    }
+
+    pub(super) fn validate_dynamic_route_map_content(
+        &self,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+    ) -> Result<(), ClusterBuildError> {
+        let local_node_ids = self.nodes.keys().copied().collect::<Vec<_>>();
+        let authority_node_ids = runtime_map
+            .nodes()
+            .iter()
+            .map(NodeRouteSnapshot::node_id)
+            .collect::<Vec<_>>();
+        if local_node_ids != authority_node_ids {
+            return Err(ClusterBuildError::DynamicRouteAuthorityNodeSetMismatch);
+        }
+        for authority_node in runtime_map.nodes() {
+            let local_node = self
+                .nodes
+                .get(&authority_node.node_id())
+                .expect("equal node sets must contain the authority node");
+            if local_node.route_authority_advertised_endpoint.as_deref()
+                != Some(authority_node.endpoint())
+            {
+                return Err(
+                    ClusterBuildError::DynamicRouteAuthorityNodeEndpointMismatch {
+                        id: authority_node.node_id().as_u32(),
+                    },
+                );
+            }
+        }
+
+        if self.pg_routes.len() != runtime_map.pg_routes().len()
+            || runtime_map.pg_routes().iter().any(|authority_route| {
+                self.pg_routes
+                    .get(&authority_route.pg_id())
+                    .is_none_or(|local_route| {
+                        local_route.cluster_epoch() != authority_route.cluster_epoch()
+                            || local_route.primary_node_id() != authority_route.primary_node_id()
+                            || local_route.acting_set() != authority_route.acting_set()
+                            || local_route.state() != authority_route.state()
+                    })
+            })
+        {
+            return Err(ClusterBuildError::DynamicRouteAuthorityPgRoutesMismatch);
+        }
+
+        if self.historical_pg_routes.len() != runtime_map.historical_pg_routes().len()
+            || runtime_map
+                .historical_pg_routes()
+                .iter()
+                .any(|authority_route| {
+                    self.historical_pg_routes
+                        .get(&(authority_route.pg_id(), authority_route.cluster_epoch()))
+                        != Some(authority_route)
+                })
+        {
+            return Err(ClusterBuildError::DynamicRouteAuthorityHistoricalPgRoutesMismatch);
+        }
+        if !self
+            .historical_cluster_epochs
+            .iter()
+            .copied()
+            .eq(runtime_map.historical_cluster_epochs().iter().copied())
+        {
+            return Err(ClusterBuildError::DynamicRouteAuthorityHistoricalEpochsMismatch);
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_installed_storage_rpc_clients(
+        &self,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+    ) -> Result<(), ClusterBuildError> {
+        for authority_node in runtime_map.nodes() {
+            let local_node = self
+                .nodes
+                .get(&authority_node.node_id())
+                .ok_or(ClusterBuildError::DynamicRouteAuthorityNodeSetMismatch)?;
+            if matches!(
+                local_node.route_execution_endpoint,
+                LocalRouteExecutionEndpoint::Embedded(_)
+                    | LocalRouteExecutionEndpoint::TopologyOnly
+            ) {
+                return Err(ClusterBuildError::RuntimeMapStorageNodeClientMissing {
+                    id: authority_node.node_id().as_u32(),
+                });
+            }
+            if !local_node
+                .route_execution_endpoint
+                .matches_advertised_endpoint(authority_node.endpoint())
+            {
+                return Err(
+                    ClusterBuildError::RemoteStorageNodeClientEndpointAuthorityMismatch {
+                        id: authority_node.node_id().as_u32(),
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn route_map_valid_until_ms(&self) -> Option<u64> {
@@ -2374,6 +2637,7 @@ impl LocalClusterMap {
                 .nodes
                 .get_mut(&config.node_id)
                 .expect("validated remote storage-node client node must exist");
+            let route_execution_endpoint = LocalRouteExecutionEndpoint::for_rpc(&config.endpoint);
             let unix_socket_path = config.endpoint.unix_socket_path().map(Path::to_path_buf);
             let client = Arc::new(
                 UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
@@ -2431,6 +2695,7 @@ impl LocalClusterMap {
                 client;
 
             node.bucket_metadata_client = bucket_metadata_client;
+            node.route_execution_endpoint = route_execution_endpoint;
             node.bucket_metadata_unix_socket_path = unix_socket_path.clone();
             node.bucket_write_reservation_client = bucket_write_reservation_client;
             node.retained_bucket_write_reservation_client =
@@ -2482,10 +2747,24 @@ impl LocalClusterMap {
                     );
                 }
             }
-            if !self.nodes.contains_key(&config.node_id) {
-                return Err(ClusterBuildError::RemoteStorageNodeClientNodeNotFound {
+            let node = self.nodes.get(&config.node_id).ok_or(
+                ClusterBuildError::RemoteStorageNodeClientNodeNotFound {
                     id: config.node_id.as_u32(),
-                });
+                },
+            )?;
+            if node
+                .route_authority_advertised_endpoint
+                .as_deref()
+                .is_some_and(|advertised_endpoint| {
+                    !LocalRouteExecutionEndpoint::for_rpc(&config.endpoint)
+                        .matches_advertised_endpoint(advertised_endpoint)
+                })
+            {
+                return Err(
+                    ClusterBuildError::RemoteStorageNodeClientEndpointAuthorityMismatch {
+                        id: config.node_id.as_u32(),
+                    },
+                );
             }
             if config.rpc_admission_limit == 0 {
                 return Err(
@@ -3076,6 +3355,14 @@ impl LocalClusterMap {
             .values()
             .map(PgRouteSnapshot::cluster_epoch)
             .collect();
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_remove_historical_cluster_epoch(&mut self, epoch: ClusterEpoch) {
+        assert!(
+            self.historical_cluster_epochs.remove(&epoch),
+            "test historical epoch must exist before it is removed"
+        );
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

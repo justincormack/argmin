@@ -50,8 +50,16 @@ fn long_lived_test_route_map_validity() -> RouteMapValidity {
 }
 
 fn make_dynamic_runtime_map_candidate(candidate: Arc<StorageCluster>) -> Arc<StorageCluster> {
-    candidate.test_store_route_map_validity(long_lived_test_route_map_validity());
     candidate
+        .test_clone_with_dynamic_route_map_validity(long_lived_test_route_map_validity())
+        .unwrap()
+}
+
+fn open_dynamic_test_storage_cluster(
+    data_dir: &std::path::Path,
+    pg_ids: &[u32],
+) -> Arc<StorageCluster> {
+    make_dynamic_runtime_map_candidate(open_test_storage_cluster(data_dir, pg_ids))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -204,7 +212,7 @@ fn stop_storage_node_server_loops(
 #[test]
 fn coordinator_storage_node_tracks_runtime_map_handle_install() {
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -2575,7 +2583,7 @@ fn multipart_upload_target_preflights_reject_an_expired_admission_after_same_epo
 fn list_parts_pins_runtime_map_after_authorization() {
     let bucket = "list-parts-pinned-bucket";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
         handle.clone(),
@@ -5207,7 +5215,7 @@ fn retained_stream_cleanup_does_not_retry_after_its_deadline() {
 #[test]
 fn bucket_exists_rejects_stale_admission_from_an_unrelated_coordinator() {
     let initial_tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(initial_tmp.path(), &[0]);
+    let initial = open_dynamic_test_storage_cluster(initial_tmp.path(), &[0]);
     let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let foreign_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -5258,7 +5266,7 @@ fn bucket_exists_rejects_stale_admission_from_an_unrelated_coordinator() {
 #[test]
 fn bucket_cors_read_rejects_stale_admission_from_an_unrelated_coordinator() {
     let initial_tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(initial_tmp.path(), &[0]);
+    let initial = open_dynamic_test_storage_cluster(initial_tmp.path(), &[0]);
     let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let foreign_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -5327,7 +5335,7 @@ fn bucket_cors_read_rejects_stale_admission_from_an_unrelated_coordinator() {
 #[test]
 fn maintenance_worker_operations_sample_epoch_refreshed_runtime_map() {
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -5355,7 +5363,7 @@ fn maintenance_worker_operations_sample_epoch_refreshed_runtime_map() {
 #[test]
 fn shard_backfill_worker_uses_refreshed_runtime_map_handle() {
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let _coord =
         setup_coordinator_with_only_shard_backfill_worker(handle.clone(), Arc::clone(&initial));
@@ -5414,7 +5422,9 @@ fn shard_backfill_worker_uses_refreshed_runtime_map_handle() {
     .unwrap();
     refreshed_map.test_install_historical_pg_routes([historical_route]);
     refreshed_map.test_set_route_map_validity(long_lived_test_route_map_validity());
-    let refreshed = StorageCluster::from_local_map(Arc::new(refreshed_map)).unwrap();
+    let refreshed =
+        StorageCluster::test_from_local_map_with_epoch(Arc::new(refreshed_map), desired_epoch)
+            .unwrap();
     handle.install(Arc::clone(&refreshed)).unwrap();
 
     let work_item = PlacedSegmentShardBackfillWorkItem {
@@ -5725,7 +5735,9 @@ fn shard_backfill_candidate_scanner_retains_cursor_across_runtime_map_replacemen
     .unwrap();
     desired_map.test_install_historical_pg_routes([source_route.clone()]);
     desired_map.test_set_route_map_validity(long_lived_test_route_map_validity());
-    let desired_cluster = StorageCluster::from_local_map(Arc::new(desired_map)).unwrap();
+    let desired_cluster =
+        StorageCluster::test_from_local_map_with_epoch(Arc::new(desired_map), desired_epoch)
+            .unwrap();
     let complete_source_health = desired_cluster
         .placed_segment_payload_shard_health_for_pg_route_snapshot(&source_route, complete_request)
         .unwrap();
@@ -5772,7 +5784,11 @@ fn shard_backfill_candidate_scanner_retains_cursor_across_runtime_map_replacemen
     .unwrap();
     replacement_map.test_install_historical_pg_routes([source_route]);
     replacement_map.test_set_route_map_validity(long_lived_test_route_map_validity());
-    let replacement = StorageCluster::from_local_map(Arc::new(replacement_map)).unwrap();
+    let replacement = StorageCluster::test_from_local_map_with_epoch(
+        Arc::new(replacement_map),
+        replacement_epoch,
+    )
+    .unwrap();
     handle.install(Arc::clone(&replacement)).unwrap();
     assert!(Arc::ptr_eq(&handle.current(), &replacement));
 
@@ -6038,7 +6054,7 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
 #[test]
 fn get_object_pins_runtime_map_for_snapshot_and_body() {
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -6125,7 +6141,7 @@ fn get_object_pins_runtime_map_for_snapshot_and_body() {
 #[test]
 fn copy_object_pins_runtime_map_for_source_and_destination() {
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -6236,7 +6252,7 @@ fn copy_object_pins_runtime_map_for_source_and_destination() {
 #[test]
 fn object_metadata_pins_runtime_map_after_policy_context_load() {
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -6337,7 +6353,7 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
 #[test]
 fn delete_object_pins_runtime_map_after_authorization() {
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -6421,7 +6437,7 @@ fn delete_object_pins_runtime_map_after_authorization() {
 #[test]
 fn delete_bucket_pins_runtime_map_after_authorization() {
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -6487,7 +6503,7 @@ fn delete_bucket_pins_runtime_map_after_authorization() {
 #[test]
 fn reclaim_worker_follows_runtime_map_refresh_for_bucket_finalize() {
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&initial));
     coord
@@ -6532,7 +6548,7 @@ fn reclaim_worker_resamples_runtime_map_after_dequeue() {
         .lock()
         .unwrap();
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let root = storage::BucketDeleteFinalizeRoot {
         bucket: trusted_bucket_name("reclaim-refresh-after-dequeue"),
@@ -6583,7 +6599,7 @@ fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
         .unwrap();
     let tmp = test_util::tempdir();
     let pg_ids = (0..32).collect::<Vec<_>>();
-    let initial = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &pg_ids);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let bucket = trusted_bucket_name("deferred-finalize-runtime-refresh");
     let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
@@ -6595,8 +6611,7 @@ fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
     initial
         .test_begin_bucket_delete_if_current(&bucket)
         .unwrap();
-    let replacement = open_test_storage_cluster(tmp.path(), &pg_ids);
-    replacement.test_store_route_map_validity(long_lived_test_route_map_validity());
+    let replacement = open_dynamic_test_storage_cluster(tmp.path(), &pg_ids);
     let root = storage::BucketDeleteFinalizeRoot {
         bucket,
         bucket_incarnation_generation: bucket_info.bucket_incarnation_generation,
@@ -6656,7 +6671,7 @@ fn deferred_object_reclaim_clears_original_and_duplicate_runtime_map_queue_owner
         .lock()
         .unwrap();
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -6725,8 +6740,7 @@ fn deferred_object_reclaim_clears_original_and_duplicate_runtime_map_queue_owner
     .unwrap();
     drop(coord);
 
-    let replacement = open_test_storage_cluster(tmp.path(), &[0, 1]);
-    replacement.test_store_route_map_validity(long_lived_test_route_map_validity());
+    let replacement = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     assert_ne!(
         initial.process_local_registry_key(),
         replacement.process_local_registry_key(),
@@ -6785,7 +6799,7 @@ fn deferred_object_reclaim_clears_original_and_duplicate_runtime_map_queue_owner
 #[test]
 fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
     initial.test_store_route_map_validity(long_lived_test_route_map_validity());
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
@@ -6839,7 +6853,7 @@ fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
 fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-retry-after-route-refresh");
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
@@ -6905,7 +6919,7 @@ fn bucket_delete_begin_marks_deleting_on_retained_route_after_runtime_map_primar
         .unwrap();
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-retained-route");
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1, 2]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
     direct_coord
@@ -6982,7 +6996,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..32).collect();
     let bucket = trusted_bucket_name("bucket-delete-begin-worker-frontier");
-    let initial = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &pg_ids);
     let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
@@ -7058,7 +7072,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
 fn reclaim_worker_adopts_bucket_delete_begin_from_stream_cleanup_phase() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-worker-stream-cleanup");
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1, 2]);
     let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
@@ -7147,7 +7161,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_stream_cleanup_phase() {
 fn reclaim_worker_adopts_bucket_delete_begin_from_reservation_wait_phase() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-worker-reservation-wait");
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1, 2]);
     let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
@@ -7237,7 +7251,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_reservation_wait_phase() {
 fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_phase() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-worker-final-visibility");
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1, 2]);
     let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
@@ -7312,7 +7326,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_phase() {
 fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_proven_phase() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-worker-final-visibility-proven");
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1, 2]);
     let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
@@ -7386,7 +7400,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_proven_phase(
 fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-stale-recreate");
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
     direct_coord
         .create_bucket_for_owner("old-owner", bucket.as_str(), false)
@@ -7446,7 +7460,7 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
 #[test]
 fn bucket_subresource_write_pins_runtime_map_after_authorization() {
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -7514,7 +7528,7 @@ fn bucket_subresource_write_pins_runtime_map_after_authorization() {
 #[test]
 fn bucket_subresource_write_pins_runtime_map_before_authorization() {
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -7582,7 +7596,7 @@ fn bucket_subresource_write_pins_runtime_map_before_authorization() {
 #[test]
 fn upload_part_copy_pins_runtime_map_after_stream_session_create() {
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -7684,7 +7698,7 @@ fn upload_part_copy_pins_runtime_map_after_stream_session_create() {
 fn put_object_pins_runtime_map_after_bucket_write_reservation() {
     let bucket = "direct-put-pinned-bucket";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -7826,7 +7840,9 @@ fn install_next_epoch_runtime_map_with_historical_routes(
     .unwrap();
     candidate_map.test_install_historical_pg_routes(historical_routes);
     candidate_map.test_set_route_map_validity(long_lived_test_route_map_validity());
-    let candidate = StorageCluster::from_local_map(Arc::new(candidate_map)).unwrap();
+    let candidate =
+        StorageCluster::test_from_local_map_with_epoch(Arc::new(candidate_map), next_epoch)
+            .unwrap();
     handle.install(candidate).unwrap();
 }
 
@@ -8027,7 +8043,8 @@ fn open_same_store_cluster_with_route_map_validity(
     )
     .unwrap();
     local_map.test_set_route_map_validity(route_map_validity);
-    StorageCluster::from_local_map(Arc::new(local_map)).unwrap()
+    StorageCluster::test_from_local_map_with_epoch(Arc::new(local_map), inputs.cluster_epoch)
+        .unwrap()
 }
 
 fn same_epoch_cluster_with_stale_current_pg_routes(
@@ -8158,7 +8175,9 @@ fn install_same_store_next_epoch_runtime_map_with_peering_pg(
     .unwrap();
     candidate_map.test_install_historical_pg_routes(historical_routes);
     candidate_map.test_set_route_map_validity(long_lived_test_route_map_validity());
-    let candidate = StorageCluster::from_local_map(Arc::new(candidate_map)).unwrap();
+    let candidate =
+        StorageCluster::test_from_local_map_with_epoch(Arc::new(candidate_map), next_epoch)
+            .unwrap();
     handle.install(candidate).unwrap();
     next_epoch
 }
@@ -8215,7 +8234,7 @@ fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() 
     let bucket = "direct-put-epoch-change-bucket";
     let key = "key";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord = Arc::new(
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -8335,7 +8354,7 @@ fn overwrite_object_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
     let bucket = "overwrite-epoch-change-bucket";
     let key = "key";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord = Arc::new(
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -8471,7 +8490,7 @@ fn copy_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route()
     let src_key = "src";
     let dst_key = "dst";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord = Arc::new(
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -8633,7 +8652,7 @@ fn delete_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route
     let bucket = "delete-epoch-change-bucket";
     let key = "key";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord = Arc::new(
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -8758,7 +8777,7 @@ fn complete_multipart_epoch_change_before_metadata_apply_commits_once_on_pinned_
     let bucket = "complete-multipart-epoch-change-bucket";
     let key = "key";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord = Arc::new(
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -8875,7 +8894,7 @@ fn upload_part_finalize_epoch_change_before_metadata_apply_commits_once_on_pinne
     let bucket = "upload-part-finalize-epoch-change-bucket";
     let key = "key";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord = Arc::new(
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -9026,7 +9045,7 @@ fn upload_part_copy_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
     let src_key = "src";
     let dst_key = "dst";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord = Arc::new(
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -9215,7 +9234,7 @@ fn put_object_tags_epoch_change_before_metadata_apply_commits_once_on_pinned_rou
     let bucket = "put-tags-epoch-change-bucket";
     let key = "key";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord = Arc::new(
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -9338,7 +9357,7 @@ fn put_object_legal_hold_epoch_change_before_metadata_apply_commits_once_on_pinn
     let bucket = "put-legal-hold-epoch-change-bucket";
     let key = "key";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord = Arc::new(
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -9465,7 +9484,7 @@ fn put_object_retention_epoch_change_before_metadata_apply_commits_once_on_pinne
     let bucket = "put-retention-epoch-change-bucket";
     let key = "key";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord = Arc::new(
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -9597,7 +9616,7 @@ fn put_object_acl_epoch_change_before_metadata_apply_commits_once_on_pinned_rout
     let bucket = "put-acl-epoch-change-bucket";
     let key = "key";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord = Arc::new(
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -9732,7 +9751,7 @@ fn get_object_epoch_change_after_read_snapshot_uses_pinned_route() {
     let bucket = "get-epoch-change-bucket";
     let key = "key";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -9821,7 +9840,7 @@ fn head_object_epoch_change_after_read_snapshot_uses_pinned_route() {
     let bucket = "head-epoch-change-bucket";
     let key = "key";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -9940,7 +9959,7 @@ fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read()
             )
         })
         .collect::<Vec<_>>();
-    let current_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+    let mut current_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
         NodeId::new(0),
         configs.clone(),
         &pg_ids,
@@ -9949,7 +9968,10 @@ fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read()
         current_routes.iter().map(LocalPgRoute::from),
     )
     .unwrap();
-    let current_cluster = StorageCluster::from_local_map(Arc::new(current_map)).unwrap();
+    current_map.test_set_route_map_validity(long_lived_test_route_map_validity());
+    let current_cluster =
+        StorageCluster::test_from_local_map_with_epoch(Arc::new(current_map), current_epoch)
+            .unwrap();
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&current_cluster));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -10067,7 +10089,9 @@ fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read()
         .install_unix_storage_node_clients(client_configs.clone())
         .unwrap();
     current_unix_map.test_set_route_map_validity(long_lived_test_route_map_validity());
-    let current_unix_cluster = StorageCluster::from_local_map(Arc::new(current_unix_map)).unwrap();
+    let current_unix_cluster =
+        StorageCluster::test_from_local_map_with_epoch(Arc::new(current_unix_map), current_epoch)
+            .unwrap();
     handle.install(current_unix_cluster).unwrap();
 
     let read = coord
@@ -10139,7 +10163,8 @@ fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read()
         .install_unix_storage_node_clients(client_configs)
         .unwrap();
     next_map.test_set_route_map_validity(long_lived_test_route_map_validity());
-    let next_cluster = StorageCluster::from_local_map(Arc::new(next_map)).unwrap();
+    let next_cluster =
+        StorageCluster::test_from_local_map_with_epoch(Arc::new(next_map), next_epoch).unwrap();
     handle.install(next_cluster).unwrap();
 
     assert_eq!(read.body.read_all().unwrap(), payload);
@@ -10200,7 +10225,7 @@ fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read()
 fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
     let bucket = "list-epoch-change-bucket";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -10306,7 +10331,7 @@ fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
 fn list_objects_continuation_survives_epoch_change_between_pages() {
     let bucket = "list-continuation-epoch-change-bucket";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -10537,7 +10562,7 @@ fn list_multipart_uploads_paginates_global_order_when_smallest_keys_are_on_last_
 fn list_objects_delimiter_continuation_survives_epoch_change_between_pages() {
     let bucket = "list-delimiter-continuation-epoch-change-bucket";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -10624,7 +10649,7 @@ fn list_objects_delimiter_continuation_survives_epoch_change_between_pages() {
 fn read_and_list_fail_closed_while_object_metadata_pg_is_peering() {
     let bucket = "object-peering-read-bucket";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -10745,7 +10770,7 @@ fn read_and_list_fail_closed_while_object_metadata_pg_is_peering() {
 fn large_put_object_pins_runtime_map_after_stream_session_create() {
     let bucket = "large-put-pinned-bucket";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -10835,7 +10860,7 @@ fn large_put_object_pins_runtime_map_after_stream_session_create() {
 fn streaming_upload_part_pins_runtime_map_after_session_create() {
     let bucket = "stream-part-pinned-bucket";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -10985,7 +11010,7 @@ fn streaming_upload_part_pins_runtime_map_after_session_create() {
 fn complete_multipart_upload_pins_runtime_map_between_snapshot_and_commit() {
     let bucket = "complete-multipart-pinned-bucket";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -11082,7 +11107,7 @@ fn complete_multipart_upload_pins_runtime_map_between_snapshot_and_commit() {
 fn abort_multipart_upload_pins_runtime_map_after_auth_lookup() {
     let bucket = "abort-multipart-pinned-bucket";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -11181,7 +11206,7 @@ fn abort_multipart_upload_pins_runtime_map_after_auth_lookup() {
 fn abort_multipart_upload_pins_runtime_map_after_bucket_summary() {
     let bucket = "abort-multipart-bucket-summary-pinned";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -15759,7 +15784,7 @@ fn list_object_versions_paginates_across_pgs() {
 fn list_object_versions_continuation_survives_epoch_change_between_pages() {
     let bucket = "version-continuation-epoch-change-bucket";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
@@ -16020,7 +16045,7 @@ fn list_object_versions_delimiter_paginates_common_prefixes() {
 fn list_object_versions_delimiter_continuation_survives_epoch_change_between_pages() {
     let bucket = "version-delimiter-continuation-epoch-change-bucket";
     let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(

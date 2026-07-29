@@ -4971,7 +4971,7 @@ const RUNTIME_MAP_CURRENT_STATE_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-curr
 pub struct RuntimeMapContentDigest([u8; RUNTIME_MAP_CONTENT_DIGEST_LEN]);
 
 impl RuntimeMapContentDigest {
-    fn from_bytes(bytes: [u8; RUNTIME_MAP_CONTENT_DIGEST_LEN]) -> Self {
+    pub(crate) fn from_bytes(bytes: [u8; RUNTIME_MAP_CONTENT_DIGEST_LEN]) -> Self {
         Self(bytes)
     }
 
@@ -5370,7 +5370,7 @@ fn runtime_map_current_state_digest(
     )
 }
 
-fn digest_pg_routes(hasher: &mut ChecksumHasher, routes: &[PgRouteSnapshot]) {
+pub(crate) fn digest_pg_routes(hasher: &mut ChecksumHasher, routes: &[PgRouteSnapshot]) {
     digest_len(hasher, routes.len());
     for route in routes {
         digest_u64(hasher, route.cluster_epoch().get());
@@ -6877,6 +6877,25 @@ impl ControlPlaneRuntimeMapStatus {
             pg_routes,
             active_serving_pg_routes,
             lease_renewal: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_lease_renewal(
+        cluster_epoch: ClusterEpoch,
+        content_digest: RuntimeMapContentDigest,
+        validity: RouteMapValidity,
+        freshness_proof: RuntimeMapFreshnessProof,
+    ) -> Self {
+        Self {
+            cluster_epoch,
+            pg_routes: 0,
+            active_serving_pg_routes: 0,
+            lease_renewal: Some(ControlPlaneRuntimeMapLeaseRenewal {
+                content_digest,
+                validity,
+                freshness_proof,
+            }),
         }
     }
 
@@ -43297,14 +43316,12 @@ mod tests {
             .unwrap();
 
         let runtime_map = authority.snapshot().runtime_map(2_001).unwrap();
-        let local_map =
-            crate::cluster::LocalClusterMap::open_frontend_topology_only_with_runtime_map(
-                NodeId::new(1),
-                &runtime_map,
-                crate::EcShape { k: 1, m: 1 },
-            )
-            .unwrap();
-        let cluster = crate::StorageCluster::from_local_map(Arc::new(local_map)).unwrap();
+        let cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &runtime_map,
+            crate::EcShape { k: 1, m: 1 },
+        )
+        .unwrap();
 
         let historical = cluster
             .reconstructed_pg_route_at_epoch(PgId::new(30), source_epoch)
@@ -44071,7 +44088,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_cluster_runtime_map_handle_rejects_same_epoch_unbounded_validity() {
+    fn storage_cluster_constructor_rejects_same_epoch_unbounded_dynamic_authority() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -44100,43 +44117,23 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
         )
         .unwrap();
-        let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&current_cluster));
-        let current_valid_until = current_cluster.route_map_valid_until_ms().unwrap();
-
         let mut unbounded_map = current_map.clone();
         unbounded_map.validity = RouteMapValidity::Forever;
-        let unbounded_cluster = crate::StorageCluster::from_runtime_map(
-            NodeId::new(1),
-            &unbounded_map,
-            crate::EcShape { k: 1, m: 0 },
-        )
-        .unwrap();
         assert!(matches!(
-            handle.install(unbounded_cluster),
-            Err(
-                crate::cluster::StorageClusterRuntimeMapRefreshError::UnboundedRouteMapValidity {
-                    candidate,
-                }
-            ) if candidate == current_map.cluster_epoch()
+            crate::StorageCluster::from_runtime_map(
+                NodeId::new(1),
+                &unbounded_map,
+                crate::EcShape { k: 1, m: 0 },
+            ),
+            Err(crate::ClusterBuildError::DynamicRouteAuthorityUnboundedValidity { epoch })
+                if epoch == current_map.cluster_epoch()
         ));
-        assert_eq!(
-            handle.current().route_map_valid_until_ms(),
-            Some(current_valid_until)
-        );
+        assert!(current_cluster.route_map_valid_until_ms().is_some());
     }
 
     #[test]
-    fn storage_cluster_runtime_map_handle_rejects_later_epoch_unbounded_validity() {
+    fn storage_cluster_constructor_rejects_later_epoch_unbounded_dynamic_authority() {
         let current_map = runtime_map_test_snapshot_with_active_route();
-        let current_cluster = crate::StorageCluster::from_runtime_map(
-            NodeId::new(1),
-            &current_map,
-            crate::EcShape { k: 1, m: 0 },
-        )
-        .unwrap();
-        let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&current_cluster));
-        let current_valid_until = current_cluster.route_map_valid_until_ms().unwrap();
-
         let mut unbounded_map = current_map.clone();
         unbounded_map.cluster_epoch = ClusterEpoch::new(current_map.cluster_epoch().get() + 1)
             .expect("test epoch should not overflow");
@@ -44144,29 +44141,16 @@ mod tests {
         for route in &mut unbounded_map.pg_routes {
             route.cluster_epoch = unbounded_map.cluster_epoch;
         }
-        let unbounded_cluster = crate::StorageCluster::from_runtime_map(
-            NodeId::new(1),
-            &unbounded_map,
-            crate::EcShape { k: 1, m: 0 },
-        )
-        .unwrap();
-
+        let expected_epoch = ClusterEpoch::new(current_map.cluster_epoch().get() + 1).unwrap();
         assert!(matches!(
-            handle.install(unbounded_cluster),
-            Err(
-                crate::cluster::StorageClusterRuntimeMapRefreshError::UnboundedRouteMapValidity {
-                    candidate,
-                }
-            ) if candidate == ClusterEpoch::new(current_map.cluster_epoch().get() + 1).unwrap()
+            crate::StorageCluster::from_runtime_map(
+                NodeId::new(1),
+                &unbounded_map,
+                crate::EcShape { k: 1, m: 0 },
+            ),
+            Err(crate::ClusterBuildError::DynamicRouteAuthorityUnboundedValidity { epoch })
+                if epoch == expected_epoch
         ));
-        assert_eq!(
-            handle.current().cluster_epoch(),
-            current_map.cluster_epoch()
-        );
-        assert_eq!(
-            handle.current().route_map_valid_until_ms(),
-            Some(current_valid_until)
-        );
     }
 
     #[test]
@@ -44339,7 +44323,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_cluster_runtime_map_handle_accepts_unbounded_to_bounded_same_epoch() {
+    fn storage_cluster_runtime_map_handle_rejects_static_to_dynamic_same_epoch() {
         let _clock = crate::clock::test_time_override_guard(1_050);
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -44395,15 +44379,12 @@ mod tests {
         assert_eq!(unbounded_cluster.route_map_valid_until_ms(), None);
         assert!(active_cluster.route_map_valid_until_ms().is_some());
 
-        handle.install(active_cluster).unwrap();
-        assert_eq!(
-            handle.current().route_map_valid_until_ms(),
-            active_map.valid_until_ms()
-        );
-        assert_eq!(
-            unbounded_cluster.route_map_valid_until_ms(),
-            active_map.valid_until_ms()
-        );
+        assert!(matches!(
+            handle.install(active_cluster),
+            Err(crate::cluster::StorageClusterRuntimeMapRefreshError::StaticRouteAuthorityRefresh)
+        ));
+        assert!(Arc::ptr_eq(&handle.current(), &unbounded_cluster));
+        assert_eq!(unbounded_cluster.route_map_valid_until_ms(), None);
     }
 
     #[test]

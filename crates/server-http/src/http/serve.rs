@@ -5359,6 +5359,22 @@ mod tests {
             .expect("open local storage cluster")
     }
 
+    fn long_lived_test_route_map_validity() -> storage::RouteMapValidity {
+        storage::RouteMapValidity::until_ms(
+            storage::clock::current_time_millis().saturating_add(3_600_000),
+        )
+        .unwrap()
+    }
+
+    fn open_dynamic_test_storage_cluster(
+        dir: &std::path::Path,
+        pg_ids: &[u32],
+    ) -> Arc<StorageCluster> {
+        open_test_storage_cluster(dir, pg_ids)
+            .test_clone_with_dynamic_route_map_validity(long_lived_test_route_map_validity())
+            .expect("build dynamic test storage cluster")
+    }
+
     struct ServerGuard(tokio::task::JoinHandle<()>);
 
     impl Drop for ServerGuard {
@@ -5429,7 +5445,7 @@ mod tests {
     #[test]
     fn streaming_body_frame_timeout_uses_captured_route_deadline() {
         let tmp = test_util::tempdir();
-        let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+        let cluster = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
         let handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
         let admission = storage::clock::with_time_override(1_000, || {
             cluster
@@ -5470,6 +5486,13 @@ mod tests {
     fn setup_frontend(dir: &std::path::Path) -> Arc<HttpFrontend> {
         let pg_ids: Vec<u32> = (0..1).collect();
         let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+        let storage_handle =
+            storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
+        setup_frontend_with_storage_handle(storage_handle)
+    }
+
+    fn setup_dynamic_frontend(dir: &std::path::Path) -> Arc<HttpFrontend> {
+        let storage_cluster = open_dynamic_test_storage_cluster(dir, &[0]);
         let storage_handle =
             storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
         setup_frontend_with_storage_handle(storage_handle)
@@ -5770,7 +5793,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn buffered_invalid_signature_precedes_expired_route_admission() {
         let tmp = test_util::tempdir();
-        let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+        let storage_cluster = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
         let storage_handle =
             storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
         let frontend = setup_frontend_with_storage_handle(storage_handle);
@@ -5841,7 +5864,7 @@ Connection: close\r\n\r\n",
         use tokio::io::AsyncWriteExt;
 
         let tmp = test_util::tempdir();
-        let initial = open_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
         let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
         create_test_bucket(&frontend, "route-admission-bucket");
@@ -5888,13 +5911,7 @@ Connection: close\r\n\r\n",
         .await
         .unwrap();
 
-        let candidate = open_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
-        candidate.test_store_route_map_validity(
-            storage::RouteMapValidity::until_ms(
-                storage::clock::current_time_millis().saturating_add(3_600_000),
-            )
-            .unwrap(),
-        );
+        let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
         let install_handle = storage_handle.clone();
         let installed_candidate = Arc::clone(&candidate);
         let installer = std::thread::spawn(move || {
@@ -5925,7 +5942,7 @@ Connection: close\r\n\r\n",
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let tmp = test_util::tempdir();
-        let initial = open_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
         let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
         create_test_bucket(&frontend, "route-expiry-bucket");
@@ -6009,13 +6026,7 @@ Content-Length: {}\r\n\
             )
             .is_ok());
 
-        let candidate = open_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
-        candidate.test_store_route_map_validity(
-            storage::RouteMapValidity::until_ms(
-                storage::clock::current_time_millis().saturating_add(3_600_000),
-            )
-            .unwrap(),
-        );
+        let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
         let install_handle = storage_handle.clone();
         let installed_candidate = Arc::clone(&candidate);
         let installer = std::thread::spawn(move || {
@@ -6045,6 +6056,7 @@ Content-Length: {}\r\n\
         .expect("route expiry should release publication while the client remains connected")
         .unwrap();
         assert!(Arc::ptr_eq(&storage_handle.current(), &candidate));
+        initial.test_store_route_map_validity(long_lived_test_route_map_validity());
         assert!(initial
             .list_stream_upload_sessions_best_effort()
             .into_iter()
@@ -6175,7 +6187,7 @@ Connection: close\r\n\r\n",
     #[tokio::test(flavor = "multi_thread")]
     async fn post_and_upload_part_acquire_cleanup_authority_before_creating_sessions() {
         let tmp = test_util::tempdir();
-        let initial = open_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
         let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle);
         create_test_bucket(&frontend, "post-cleanup-authority-bucket");
@@ -6260,7 +6272,7 @@ Connection: close\r\n\r\n",
     fn captured_admission_guards_put_post_and_upload_part_initial_mutations() {
         let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
         let tmp = test_util::tempdir();
-        let frontend = setup_frontend(tmp.path());
+        let frontend = setup_dynamic_frontend(tmp.path());
         let storage_cluster = frontend.coordinator.storage_node_for_request();
 
         create_test_bucket(&frontend, "initial-mutation-post-bucket");
@@ -6404,7 +6416,7 @@ Connection: close\r\n\r\n",
     #[tokio::test(flavor = "multi_thread")]
     async fn expired_promoted_post_cleanup_handoff_does_not_block_route_publication() {
         let tmp = test_util::tempdir();
-        let initial = open_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
         let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
         create_test_bucket(&frontend, "post-route-expiry-bucket");
@@ -6458,8 +6470,11 @@ Connection: close\r\n\r\n",
         });
         let abort_guard = StreamingAbortGuard::new(&state);
         abort_guard.arm_post(&ctx);
+        let retained_abort_attempts = Arc::new(AtomicUsize::new(0));
+        let hook_attempts = Arc::clone(&retained_abort_attempts);
         let retained_abort_failure =
-            initial.test_install_before_retained_stream_abort_hook(Arc::new(|| {
+            initial.test_install_before_retained_stream_abort_hook(Arc::new(move || {
+                hook_attempts.fetch_add(1, Ordering::SeqCst);
                 Err(storage::ObjectPgActionError::Store(
                     storage::StoreError::MetadataCommandContention {
                         context: "test retained cleanup handoff",
@@ -6467,13 +6482,7 @@ Connection: close\r\n\r\n",
                 ))
             }));
 
-        let candidate = open_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
-        candidate.test_store_route_map_validity(
-            storage::RouteMapValidity::until_ms(
-                storage::clock::current_time_millis().saturating_add(3_600_000),
-            )
-            .unwrap(),
-        );
+        let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
         let install_handle = storage_handle.clone();
         let installed_candidate = Arc::clone(&candidate);
         let installer = std::thread::spawn(move || {
@@ -6499,6 +6508,14 @@ Connection: close\r\n\r\n",
         .expect("durable POST cleanup handoff and sleeping heartbeat must release publication")
         .unwrap();
         assert!(Arc::ptr_eq(&storage_handle.current(), &candidate));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while retained_abort_attempts.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("retained POST cleanup must be attempted before the durable handoff");
+        initial.test_store_route_map_validity(long_lived_test_route_map_validity());
         assert!(initial
             .list_stream_upload_sessions_best_effort()
             .into_iter()
@@ -6530,7 +6547,7 @@ Connection: close\r\n\r\n",
     #[tokio::test(flavor = "multi_thread")]
     async fn expired_promoted_upload_part_cleanup_handoff_does_not_block_publication() {
         let tmp = test_util::tempdir();
-        let initial = open_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
         let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
         let upload_id = create_test_bucket_and_upload(&frontend, "part-route-expiry-bucket", "key");
@@ -6591,8 +6608,11 @@ Connection: close\r\n\r\n",
         });
         let abort_guard = StreamingAbortGuard::new(&state);
         abort_guard.arm_part(&ctx);
+        let retained_abort_attempts = Arc::new(AtomicUsize::new(0));
+        let hook_attempts = Arc::clone(&retained_abort_attempts);
         let retained_abort_failure =
-            initial.test_install_before_retained_stream_abort_hook(Arc::new(|| {
+            initial.test_install_before_retained_stream_abort_hook(Arc::new(move || {
+                hook_attempts.fetch_add(1, Ordering::SeqCst);
                 Err(storage::ObjectPgActionError::Store(
                     storage::StoreError::MetadataCommandContention {
                         context: "test retained UploadPart cleanup handoff",
@@ -6600,13 +6620,7 @@ Connection: close\r\n\r\n",
                 ))
             }));
 
-        let candidate = open_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
-        candidate.test_store_route_map_validity(
-            storage::RouteMapValidity::until_ms(
-                storage::clock::current_time_millis().saturating_add(3_600_000),
-            )
-            .unwrap(),
-        );
+        let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
         let install_handle = storage_handle.clone();
         let installed_candidate = Arc::clone(&candidate);
         let installer = std::thread::spawn(move || {
@@ -6632,6 +6646,14 @@ Connection: close\r\n\r\n",
         .expect("durable UploadPart cleanup handoff must release route publication")
         .unwrap();
         assert!(Arc::ptr_eq(&storage_handle.current(), &candidate));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while retained_abort_attempts.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("retained UploadPart cleanup must be attempted before the durable handoff");
+        initial.test_store_route_map_validity(long_lived_test_route_map_validity());
         assert!(initial
             .list_stream_upload_sessions_best_effort()
             .into_iter()
@@ -9478,7 +9500,7 @@ Connection: close\r\n\r\n",
     fn same_epoch_renewal_does_not_extend_streaming_put_effect_authority() {
         let clock = storage::clock::test_time_override_guard(1_000);
         let tmp = test_util::tempdir();
-        let frontend = setup_frontend(tmp.path());
+        let frontend = setup_dynamic_frontend(tmp.path());
         create_test_bucket(&frontend, "captured-stream-effect-deadline");
         let storage_cluster = frontend.coordinator.storage_node_for_request();
         storage_cluster
@@ -9558,7 +9580,7 @@ Connection: close\r\n\r\n",
     fn same_epoch_renewal_does_not_extend_post_or_upload_part_effect_authority() {
         let clock = storage::clock::test_time_override_guard(1_000);
         let tmp = test_util::tempdir();
-        let frontend = setup_frontend(tmp.path());
+        let frontend = setup_dynamic_frontend(tmp.path());
         create_test_bucket(&frontend, "captured-post-effect-deadline");
         let storage_cluster = frontend.coordinator.storage_node_for_request();
         storage_cluster

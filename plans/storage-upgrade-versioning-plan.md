@@ -178,11 +178,8 @@ The audit found these residual changes rather than another old-format reader:
 - Standalone and environment-only startup still use the active `legacy-local` storage path. That
   path gives the shared `StorageCluster` an optional runtime-map content digest and unbounded
   route-map validity, with an explicit `None`-digest/`None`-validity transition during a later
-  authoritative refresh. This is a current deployment architecture, not dead compatibility code,
-  so it must not simply be deleted. Replace the shared invariant exception by either constructing
-  an authoritative current standalone map/proof or separating standalone storage from the
-  dynamically refreshable cluster type; then make clustered generations require their digest and
-  validity proof.
+  authoritative refresh. This is a current deployment architecture, not dead compatibility code.
+  The selected replacement is the explicit static-authority design recorded below.
 - **Completed 2026-07-29:** session-token version selection is contained in `auth`.
   `IdentityProvider::seal_session_credential` is the semantic issuance API; the v1 prefix and
   representation-size constants are crate-private. The boundary check rejects versioned sealing
@@ -220,6 +217,101 @@ The `legacy-local` path above is the only audited compatibility-labelled behavio
 the shared production invariants. Environment/configuration fallback endpoints and AWS policy
 fallback rules are current availability or service-semantics behavior, not storage-format
 compatibility.
+
+### Standalone Route Authority Decision (2026-07-29)
+
+Standalone topology is an explicit immutable authority, not an incomplete dynamic runtime-map
+generation. The term `legacy-local` describes the current active deployment path and will be
+replaced by `standalone` once this design is implemented.
+
+The authority model has two closed variants:
+
+- **Static authority:** carries a mandatory canonical route-map content digest and an explicit
+  immutable authority proof. Its validity is unbounded because its topology cannot be published or
+  refreshed while the process is running; this is a positive static invariant, not absence of a
+  lease.
+- **Dynamic authority:** carries a mandatory canonical route-map content digest, freshness proof,
+  and bounded route-map lease. It is the only variant that supports same-epoch renewal, generation
+  publication, control-plane refresh, and refresh-loop construction.
+
+Storage owns both authority types, canonical route-digest construction, route admission, and the
+durable binding of standalone storage topology. `argmin-s3` supplies validated logical
+configuration and retains ownership of manifest/process identity parsing; it must not construct or
+interpret route digests. The shared storage-operation implementation remains internal and common to
+both modes, while distinct static and dynamic handles expose only their valid capabilities. A
+server-core-facing opaque route handle may dispatch between those handles, but must not recreate
+optional digest or validity states.
+
+Changing a running process from static to dynamic authority, or the reverse, is unsupported. The
+process must restart and construct the new authority mode before serving. Consequently, the current
+same-epoch `None`-digest/unbounded-validity to bounded/digested transition is removed rather than
+generalised.
+
+The implementation scope includes every no-control-plane construction path, not only the function
+named `build_legacy_local_storage_cluster`:
+
+- standalone manifests and environment-only legacy-local startup;
+- no-control-plane remote frontend construction through `StorageCluster::from_local_map`;
+- standalone storage-node configuration using `RouteMapValidity::Forever`.
+
+Manifest-based standalone startup must bind the storage-owned canonical route digest into its
+durable standalone identity before serving. Environment-only startup must establish an equivalent
+explicit durable binding; it must not remain a weaker unbound production path. A topology change
+without the corresponding deliberate identity/epoch change fails closed on restart.
+
+Implementation order:
+
+1. Define storage-owned static and dynamic route-authority proofs and a canonical digest over every
+   routing input used by local and remote static topology.
+2. Replace public production `from_local_map` construction with explicit static-authority
+   construction; keep impossible unbound construction only on the test surface where needed.
+3. Restrict runtime-map installation, renewal, and refresh loops to the dynamic handle, whose
+   constructor requires a bounded lease and digest.
+4. Move coordinator/frontend wiring to a common opaque route handle without duplicating storage
+   operations or spreading authority-mode branches through request handling.
+5. Bind standalone topology durably, migrate all three no-control-plane paths above, remove the
+   `None` digest and special transition, and rename the deployment role to `standalone`.
+
+Implementation status (2026-07-29):
+
+- The first invariant-bearing slice is complete in the working tree. `StorageCluster` now carries
+  a closed static/dynamic authority proof instead of an optional runtime-map digest. Static proof
+  construction requires unbounded validity and hashes the cluster epoch, metadata primary,
+  erasure-coding shape, node identities and embedded directories or RPC endpoints, current and
+  historical PG routes, and retained historical epochs. Unix paths are hashed as raw platform
+  bytes, so distinct non-UTF-8 endpoints cannot collide through lossy conversion.
+- Dynamic proof construction requires bounded validity and carries the runtime-map content digest
+  and freshness proof. Before attaching that proof, storage checks epoch and validity plus the
+  complete node/advertised-endpoint map, current PG routes, historical PG routes, and retained
+  historical epochs against the runtime snapshot. RPC-backed constructors additionally require one
+  installed client per runtime node with the exact authoritative advertised endpoint. Unbounded or
+  mismatched dynamic maps fail at construction rather than surviving until a later publication
+  attempt. Same-epoch renewal and pinned-generation lease extension additionally remain bound to
+  the authority incarnation that issued the installed generation.
+- The old unbounded/undigested to bounded/digested same-epoch transition is removed. The existing
+  common runtime-map handle now fails closed if publication or refresh is attempted for a static
+  authority.
+- Remaining work starts at item 2: replace the public generic `from_local_map` surface with an
+  explicit static constructor, split static admission from dynamic publication capabilities, move
+  the coordinator to the opaque common handle, and then add durable standalone identity binding
+  for every no-control-plane startup path.
+
+Exit criteria:
+
+- No production `StorageCluster` generation can lack a canonical content digest.
+- Dynamic generations cannot be constructed with unbounded validity, and static generations
+  cannot call publication, renewal, or refresh APIs.
+- Static and dynamic authority cannot transition in-process.
+- Environment-only and manifest-based standalone topology changes without the required durable
+  identity/epoch change fail closed before serving.
+- The boundary check rejects unbound production constructors and use of dynamic refresh APIs from
+  static startup paths.
+- Tests pin static construction/admission, dynamic bounded construction/renewal, digest mismatch,
+  durable standalone identity mismatch, and restart-only mode changes.
+
+Generating an arbitrary digest, assigning a far-future deadline, or self-renewing a lease without
+an independent authority is explicitly not an acceptable implementation: those approaches change
+field shapes without establishing the authority semantics the fields represent.
 
 ## Phase 1: Version Boundary Inventory And Containment
 
@@ -838,10 +930,12 @@ Raft peer client and server transports are storage-owned and boundary-checked.
    encryption, user/system metadata, object tags, bucket tags, and ACL grants have owner-local
    codecs, boundary checks, exact current-representation goldens, and containing-format
    inventories above.
-5. **Partially complete:** the unused legacy authority-clock constructor is removed and
-   sample-driven construction is test-only. Remediation of the active `legacy-local`
-   digest/validity exception remains a separate design decision: establish a current standalone
-   authority proof or a separate standalone type before making clustered invariants mandatory.
+5. **In progress:** the unused legacy authority-clock constructor is removed and sample-driven
+   construction is test-only. The optional digest and live static-to-dynamic transition are now
+   replaced by mandatory static/dynamic authority proofs, with bounded validity required at
+   dynamic construction. Remaining work is to replace the public generic `from_local_map`
+   surface, split refresh capability from static admission, migrate every no-control-plane startup
+   path, and bind standalone topology durably.
 6. **Complete:** owner-local exact-current rejection fixtures cover every boundary listed in the
    2026-07-29 audit, including resealed enclosing checksums, digests, and authenticators.
 7. **Complete:** session-token version selection is contained inside `auth`, with semantic APIs

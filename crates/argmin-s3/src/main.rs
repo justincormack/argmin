@@ -14747,27 +14747,20 @@ mod tests {
             frontend_runtime_map_handles(storage_clusters);
         assert!(foreground_handle.shares_route_admission_with(&maintenance_handle));
 
-        let next_epoch = foreground_handle
-            .current()
-            .cluster_epoch()
-            .get()
-            .checked_add(1)
-            .unwrap();
         let mut replacement_config = config.clone();
-        replacement_config.control_plane_socket_path = None;
-        replacement_config.storage_cluster_epoch = next_epoch;
-        replacement_config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
-            node_id: 0,
-            socket_path: endpoint.display().to_string(),
-        }];
-        let replacement =
-            build_remote_frontend_storage_cluster(&replacement_config, &ec_config).unwrap();
-        replacement.test_store_route_map_validity(
-            RouteMapValidity::until_ms(
-                storage::clock::current_time_millis().saturating_add(60_000),
-            )
-            .unwrap(),
+        let replacement_socket_path = tmp.join("replacement-cp.sock");
+        replacement_config.control_plane_socket_path =
+            Some(replacement_socket_path.display().to_string());
+        let replacement_server = serve_one_active_control_plane_runtime_map(
+            replacement_socket_path,
+            NodeId::new(0),
+            endpoint.display().to_string(),
         );
+        let replacement_clusters =
+            build_control_plane_frontend_storage_clusters(&replacement_config, &ec_config).unwrap();
+        assert!(replacement_clusters.distinct_maintenance.is_none());
+        let replacement = replacement_clusters.foreground;
+        replacement_server.join().unwrap();
         foreground_handle.install(Arc::clone(&replacement)).unwrap();
 
         assert!(Arc::ptr_eq(&foreground_handle.current(), &replacement));
@@ -14817,6 +14810,7 @@ mod tests {
         authority
             .set_pg_acting_set(PgId::new(0), vec![node_id])
             .unwrap();
+        let heartbeat_started_at_ms = storage::clock::current_time_millis();
         let pg_observations = if serving_pg_routes {
             vec![NodePgHeartbeatObservation {
                 pg_id: PgId::new(0),
@@ -14827,7 +14821,8 @@ mod tests {
         } else {
             Vec::new()
         };
-        for now_ms in 1_000..1_004 {
+        for heartbeat_offset_ms in 0..4 {
+            let now_ms = heartbeat_started_at_ms.saturating_add(heartbeat_offset_ms);
             let observed_epoch = authority.snapshot().cluster_epoch();
             let lease = authority
                 .submit_node_heartbeat(
@@ -14846,11 +14841,19 @@ mod tests {
             if lease.serving() {
                 break;
             }
-            assert!(now_ms < 1_003, "authority did not grant serving lease");
+            assert!(
+                heartbeat_offset_ms < 3,
+                "authority did not grant serving lease"
+            );
         }
         if serving_pg_routes {
             authority
-                .complete_pg_peering(PgId::new(0), node_id, 1, 1_004)
+                .complete_pg_peering(
+                    PgId::new(0),
+                    node_id,
+                    1,
+                    heartbeat_started_at_ms.saturating_add(4),
+                )
                 .unwrap();
             authority
                 .submit_node_heartbeat(
@@ -14868,14 +14871,14 @@ mod tests {
                             pending_metadata_command: None,
                         }],
                     },
-                    1_005,
+                    heartbeat_started_at_ms.saturating_add(5),
                 )
                 .unwrap();
         }
         spawn_control_plane_test_rpc_server(
             listener,
             Arc::new(Mutex::new(authority)),
-            [1_006],
+            [heartbeat_started_at_ms.saturating_add(6)],
             None,
         )
     }

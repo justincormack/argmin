@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[cfg(test)]
 use crate::storage_rpc::StorageRpcErrorCode;
 use crate::storage_rpc::{StorageNodeFailure, StorageRpcWireErrorCode};
-use crate::types::{ClusterEpoch, PgState};
+use crate::types::{ClusterEpoch, PgState, RouteMapValidity};
 
 /// Opaque diagnostic for a failure inside the metadata database implementation.
 ///
@@ -805,6 +805,43 @@ pub enum ClusterBuildError {
     #[error("runtime route-map lease could not bind to the process clock: {message}")]
     RouteMapLeaseBinding { message: String },
 
+    #[error("static route authority must have unbounded validity")]
+    StaticRouteAuthorityBoundedValidity,
+
+    #[error("dynamic route authority for epoch {epoch} must have bounded validity")]
+    DynamicRouteAuthorityUnboundedValidity { epoch: ClusterEpoch },
+
+    #[error(
+        "dynamic route authority epoch {authority} does not match local route-map epoch {local}"
+    )]
+    DynamicRouteAuthorityEpochMismatch {
+        local: ClusterEpoch,
+        authority: ClusterEpoch,
+    },
+
+    #[error(
+        "dynamic route authority validity {authority:?} does not match local route-map validity {local:?}"
+    )]
+    DynamicRouteAuthorityValidityMismatch {
+        local: RouteMapValidity,
+        authority: RouteMapValidity,
+    },
+
+    #[error("dynamic route authority node set does not match the local route map")]
+    DynamicRouteAuthorityNodeSetMismatch,
+
+    #[error("dynamic route authority endpoint for node {id} does not match the local route map")]
+    DynamicRouteAuthorityNodeEndpointMismatch { id: u32 },
+
+    #[error("dynamic route authority current PG routes do not match the local route map")]
+    DynamicRouteAuthorityPgRoutesMismatch,
+
+    #[error("dynamic route authority historical PG routes do not match the local route map")]
+    DynamicRouteAuthorityHistoricalPgRoutesMismatch,
+
+    #[error("dynamic route authority historical epochs do not match the local route map")]
+    DynamicRouteAuthorityHistoricalEpochsMismatch,
+
     #[error(
         "historical recovery runtime map node set {candidate:?} does not match current local node set {current:?}"
     )]
@@ -821,6 +858,14 @@ pub enum ClusterBuildError {
 
     #[error("remote storage-node client node {id} is not present in the local cluster map")]
     RemoteStorageNodeClientNodeNotFound { id: u32 },
+
+    #[error(
+        "remote storage-node client node {id} endpoint does not match its authoritative runtime-map endpoint"
+    )]
+    RemoteStorageNodeClientEndpointAuthorityMismatch { id: u32 },
+
+    #[error("runtime-map node {id} has no installed remote storage-node client")]
+    RuntimeMapStorageNodeClientMissing { id: u32 },
 
     #[error("remote storage-node client socket path {path:?} must be absolute")]
     RemoteStorageNodeClientSocketPathNotAbsolute { path: PathBuf },

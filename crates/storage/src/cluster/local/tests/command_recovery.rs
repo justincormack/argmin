@@ -325,7 +325,9 @@ fn refresh_recovery_applies_direct_put_from_historical_active_route() {
         LocalClusterMap::open_runtime_map_with_existing_local_nodes(&base_map, &runtime_map)
             .unwrap(),
     );
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&active_map)).unwrap();
+    let cluster =
+        crate::StorageCluster::from_runtime_local_map(Arc::clone(&active_map), &runtime_map)
+            .unwrap();
     let handle = StorageClusterRuntimeMapHandle::new(cluster.clone());
     cluster.require_route_map_valid_now().unwrap();
 
@@ -517,7 +519,9 @@ impl HistoricalRouteRecoveryFixture {
             LocalClusterMap::open_runtime_map_with_existing_local_nodes(&base_map, &runtime_map)
                 .unwrap(),
         );
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&active_map)).unwrap();
+        let cluster =
+            crate::StorageCluster::from_runtime_local_map(Arc::clone(&active_map), &runtime_map)
+                .unwrap();
         let handle = StorageClusterRuntimeMapHandle::new(cluster.clone());
         cluster.require_route_map_valid_now().unwrap();
         Self {

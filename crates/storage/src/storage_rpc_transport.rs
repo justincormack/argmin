@@ -32,6 +32,11 @@ pub enum StorageRpcClientEndpoint {
     },
 }
 
+pub(crate) enum StorageRpcEndpointAuthorityIdentity<'a> {
+    Unix(&'a Path),
+    Tcp(&'a str),
+}
+
 impl StorageRpcClientEndpoint {
     #[must_use]
     pub fn unix(socket_path: impl Into<PathBuf>) -> Self {
@@ -88,6 +93,18 @@ impl StorageRpcClientEndpoint {
                 advertised_endpoint,
                 ..
             } => advertised_endpoint.clone(),
+        }
+    }
+
+    pub(crate) fn authority_identity(&self) -> StorageRpcEndpointAuthorityIdentity<'_> {
+        match self {
+            Self::Unix { socket_path } => {
+                StorageRpcEndpointAuthorityIdentity::Unix(socket_path.as_path())
+            }
+            Self::Tcp {
+                advertised_endpoint,
+                ..
+            } => StorageRpcEndpointAuthorityIdentity::Tcp(advertised_endpoint),
         }
     }
 

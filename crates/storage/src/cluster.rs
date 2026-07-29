@@ -30,7 +30,7 @@ pub use request_ops::{
 use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneRuntimeMapSource,
     ControlPlaneRuntimeMapStatus, PendingMetadataCommandObservation, PgMetadataProof,
-    PgRouteSnapshot, RuntimeMapContentDigest,
+    PgRouteSnapshot, RuntimeMapContentDigest, RuntimeMapFreshnessProof,
 };
 use crate::control_plane_lease::BoundRouteMapLease;
 use crate::error::{ClusterBuildError, PgMetadataTransferError, ShardIoError, StoreError};
@@ -1458,6 +1458,8 @@ pub enum StorageClusterRuntimeMapRefreshError {
     },
     #[error("refreshed runtime map for epoch {candidate} has unbounded route-map validity")]
     UnboundedRouteMapValidity { candidate: ClusterEpoch },
+    #[error("static route authority cannot publish or refresh a runtime map")]
+    StaticRouteAuthorityRefresh,
     #[error(
         "refreshed runtime map for epoch {candidate} expired before publication (valid until {valid_until_ms}, now {now_ms})"
     )]
@@ -1482,6 +1484,7 @@ impl StorageClusterRuntimeMapRefreshError {
             Self::Build(_) => "cluster_build",
             Self::EpochDowngrade { .. } => "epoch_downgrade",
             Self::UnboundedRouteMapValidity { .. } => "unbounded_route_map_validity",
+            Self::StaticRouteAuthorityRefresh => "static_route_authority_refresh",
             Self::ExpiredRouteMapValidity { .. } => "expired_route_map_validity",
             Self::RefreshLoopZeroInterval => "refresh_loop_zero_interval",
             Self::RefreshLoopSpawn { .. } => "refresh_loop_spawn",
@@ -1598,10 +1601,100 @@ impl PendingMetadataCommandRefreshRecoveryError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaticRouteMapContentDigest([u8; 32]);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StaticRouteAuthorityProof {
+    content_digest: StaticRouteMapContentDigest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DynamicRouteAuthorityProof {
+    content_digest: RuntimeMapContentDigest,
+    freshness_proof: RuntimeMapFreshnessProof,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageClusterRouteAuthority {
+    Static(StaticRouteAuthorityProof),
+    Dynamic(DynamicRouteAuthorityProof),
+}
+
+impl StorageClusterRouteAuthority {
+    fn static_for(local_map: &LocalClusterMap) -> Result<Self, ClusterBuildError> {
+        if local_map.route_map_validity() != RouteMapValidity::Forever {
+            return Err(ClusterBuildError::StaticRouteAuthorityBoundedValidity);
+        }
+        Ok(Self::Static(StaticRouteAuthorityProof {
+            content_digest: StaticRouteMapContentDigest(
+                local_map.static_route_map_content_digest(),
+            ),
+        }))
+    }
+
+    fn dynamic_for(
+        local_map: &LocalClusterMap,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+    ) -> Result<Self, ClusterBuildError> {
+        if runtime_map.valid_until_ms().is_none() || local_map.route_map_valid_until_ms().is_none()
+        {
+            return Err(ClusterBuildError::DynamicRouteAuthorityUnboundedValidity {
+                epoch: runtime_map.cluster_epoch(),
+            });
+        }
+        if local_map.epoch() != runtime_map.cluster_epoch() {
+            return Err(ClusterBuildError::DynamicRouteAuthorityEpochMismatch {
+                local: local_map.epoch(),
+                authority: runtime_map.cluster_epoch(),
+            });
+        }
+        if local_map.route_map_validity() != runtime_map.validity() {
+            return Err(ClusterBuildError::DynamicRouteAuthorityValidityMismatch {
+                local: local_map.route_map_validity(),
+                authority: runtime_map.validity(),
+            });
+        }
+        local_map.validate_dynamic_route_map_content(runtime_map)?;
+        Ok(Self::Dynamic(DynamicRouteAuthorityProof {
+            content_digest: runtime_map.content_digest(),
+            freshness_proof: *runtime_map.freshness_proof(),
+        }))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn test_dynamic_for(local_map: &LocalClusterMap) -> Result<Self, ClusterBuildError> {
+        if local_map.route_map_valid_until_ms().is_none() {
+            return Err(ClusterBuildError::DynamicRouteAuthorityUnboundedValidity {
+                epoch: local_map.epoch(),
+            });
+        }
+        Ok(Self::Dynamic(DynamicRouteAuthorityProof {
+            content_digest: RuntimeMapContentDigest::from_bytes(
+                local_map.static_route_map_content_digest(),
+            ),
+            freshness_proof: RuntimeMapFreshnessProof::Reconstructed {
+                authority_incarnation: crate::control_plane::AuthorityIncarnation::INITIAL,
+            },
+        }))
+    }
+
+    fn dynamic_proof(
+        self,
+    ) -> Result<DynamicRouteAuthorityProof, StorageClusterRuntimeMapRefreshError> {
+        match self {
+            Self::Static(_) => {
+                Err(StorageClusterRuntimeMapRefreshError::StaticRouteAuthorityRefresh)
+            }
+            Self::Dynamic(proof) => Ok(proof),
+        }
+    }
+}
+
 pub struct StorageCluster {
     local_map: Arc<LocalClusterMap>,
     operation_epoch: ClusterEpoch,
-    runtime_map_content_digest: Option<RuntimeMapContentDigest>,
+    route_authority: StorageClusterRouteAuthority,
     bucket_write_owner_token: Arc<str>,
     rpc_auth: Option<crate::StorageRpcClientAuthConfig>,
     rpc_endpoints:
@@ -3804,19 +3897,14 @@ impl StorageClusterRuntimeMapHandle {
         candidate: Arc<StorageCluster>,
         after_drain: impl FnOnce(),
     ) -> Result<(), StorageClusterRuntimeMapRefreshError> {
-        if candidate.route_map_valid_until_ms().is_none() {
-            return Err(
-                StorageClusterRuntimeMapRefreshError::UnboundedRouteMapValidity {
-                    candidate: candidate.cluster_epoch(),
-                },
-            );
-        }
+        let candidate_authority = candidate.route_authority.dynamic_proof()?;
         let _publication = self.route_admission.begin_publication();
         after_drain();
         let mut current = self
             .cluster
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        current.route_authority.dynamic_proof()?;
         if candidate.cluster_epoch() < current.cluster_epoch() {
             return Err(StorageClusterRuntimeMapRefreshError::EpochDowngrade {
                 current: current.cluster_epoch(),
@@ -3848,23 +3936,23 @@ impl StorageClusterRuntimeMapHandle {
             );
         }
         if candidate.cluster_epoch() == current.cluster_epoch() {
-            let candidate_digest = candidate.runtime_map_content_digest;
+            let candidate_digest = candidate_authority.content_digest;
+            let candidate_authority_incarnation =
+                candidate_authority.freshness_proof.authority_incarnation();
             // Same-epoch authoritative refreshes update matching pinned
-            // generations. A legacy/local unbounded generation has no digest;
-            // it may only make the one-way transition to bounded validity.
+            // dynamic generations only.
             generations.retain(|generation| {
                 let Some(generation) = generation.upgrade() else {
                     return false;
                 };
                 if generation.cluster_epoch() == candidate.cluster_epoch() {
-                    if generation.runtime_map_content_digest != candidate_digest {
-                        if generation.runtime_map_content_digest.is_none()
-                            && generation.route_map_valid_until_ms().is_none()
-                        {
-                            generation
-                                .local_map
-                                .replace_route_map_lease_from(&candidate.local_map);
-                        }
+                    if !matches!(
+                        generation.route_authority,
+                        StorageClusterRouteAuthority::Dynamic(proof)
+                            if proof.content_digest == candidate_digest
+                                && proof.freshness_proof.authority_incarnation()
+                                    == candidate_authority_incarnation
+                    ) {
                         return true;
                     }
                     generation
@@ -3894,11 +3982,14 @@ impl StorageClusterRuntimeMapHandle {
             .cluster
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current_authority = current.route_authority.dynamic_proof()?;
         let Some(renewal) = status.lease_renewal() else {
             return Ok(None);
         };
         if status.cluster_epoch() != current.cluster_epoch()
-            || current.runtime_map_content_digest != Some(renewal.content_digest())
+            || current_authority.content_digest != renewal.content_digest()
+            || current_authority.freshness_proof.authority_incarnation()
+                != renewal.freshness_proof().authority_incarnation()
         {
             return Ok(None);
         }
@@ -3916,6 +4007,7 @@ impl StorageClusterRuntimeMapHandle {
             })?;
         let validity = renewal.validity();
         let digest = renewal.content_digest();
+        let authority_incarnation = renewal.freshness_proof().authority_incarnation();
         let mut generations = self
             .same_epoch_generations
             .lock()
@@ -3925,7 +4017,13 @@ impl StorageClusterRuntimeMapHandle {
                 return false;
             };
             if generation.cluster_epoch() != status.cluster_epoch()
-                || generation.runtime_map_content_digest != Some(digest)
+                || !matches!(
+                    generation.route_authority,
+                    StorageClusterRouteAuthority::Dynamic(proof)
+                        if proof.content_digest == digest
+                            && proof.freshness_proof.authority_incarnation()
+                                == authority_incarnation
+                )
             {
                 return true;
             }
@@ -4346,7 +4444,10 @@ impl StorageClusterRuntimeMapHandle {
                     &current.local_map,
                     &historical_runtime_map,
                 )?;
-                StorageCluster::from_local_map(Arc::new(local_map))?
+                StorageCluster::from_runtime_local_map(
+                    Arc::new(local_map),
+                    &historical_runtime_map,
+                )?
             }
         };
         let primary = recovery_cluster
@@ -4484,6 +4585,393 @@ mod runtime_map_refresh_invalidation_tests {
         crate::FrontendStorageRpcClientCapability::new(credential, 7, "a".repeat(64))
             .unwrap()
             .into()
+    }
+
+    fn static_route_authority_digest(cluster: &StorageCluster) -> [u8; 32] {
+        match cluster.route_authority {
+            StorageClusterRouteAuthority::Static(proof) => proof.content_digest.0,
+            StorageClusterRouteAuthority::Dynamic(_) => {
+                panic!("expected a static route-authority proof")
+            }
+        }
+    }
+
+    fn static_topology_cluster(socket_suffix: &str, ec: EcShape) -> Arc<StorageCluster> {
+        let mut local_map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+            NodeId::new(1),
+            [NodeId::new(1), NodeId::new(2)],
+            &[31, 32],
+            ec,
+            ClusterEpoch::INITIAL,
+        )
+        .unwrap();
+        local_map
+            .install_unix_storage_node_clients([
+                LocalUnixStorageNodeClientConfig::new(
+                    NodeId::new(1),
+                    format!("/tmp/static-route-node-1-{socket_suffix}.sock"),
+                ),
+                LocalUnixStorageNodeClientConfig::new(
+                    NodeId::new(2),
+                    format!("/tmp/static-route-node-2-{socket_suffix}.sock"),
+                ),
+            ])
+            .unwrap();
+        StorageCluster::from_local_map(Arc::new(local_map)).unwrap()
+    }
+
+    #[test]
+    fn static_route_authority_digest_is_exact_and_binds_rpc_endpoints() {
+        let cluster = static_topology_cluster("a", EcShape { k: 1, m: 1 });
+        assert_eq!(
+            static_route_authority_digest(&cluster),
+            [
+                66, 83, 165, 3, 69, 249, 220, 125, 67, 159, 169, 196, 224, 90, 7, 197, 145, 174,
+                53, 74, 51, 120, 173, 127, 86, 133, 89, 7, 31, 122, 193, 166,
+            ]
+        );
+
+        let changed_endpoint_cluster = static_topology_cluster("b", EcShape { k: 1, m: 1 });
+        assert_ne!(
+            static_route_authority_digest(&cluster),
+            static_route_authority_digest(&changed_endpoint_cluster)
+        );
+
+        let changed_placement_cluster = static_topology_cluster("a", EcShape { k: 1, m: 0 });
+        assert_ne!(
+            static_route_authority_digest(&cluster),
+            static_route_authority_digest(&changed_placement_cluster)
+        );
+    }
+
+    #[test]
+    fn static_route_authority_digest_distinguishes_non_utf8_unix_endpoints() {
+        use std::os::unix::ffi::OsStringExt;
+
+        fn cluster_for_endpoint(endpoint: Vec<u8>) -> Arc<StorageCluster> {
+            let mut local_map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+                NodeId::new(1),
+                [NodeId::new(1)],
+                &[31],
+                EcShape { k: 1, m: 0 },
+                ClusterEpoch::INITIAL,
+            )
+            .unwrap();
+            local_map
+                .install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+                    NodeId::new(1),
+                    std::ffi::OsString::from_vec(endpoint),
+                )])
+                .unwrap();
+            StorageCluster::from_local_map(Arc::new(local_map)).unwrap()
+        }
+
+        let first = cluster_for_endpoint(b"/tmp/static-route-\xff.sock".to_vec());
+        let second = cluster_for_endpoint(b"/tmp/static-route-\xfe.sock".to_vec());
+        assert_ne!(
+            static_route_authority_digest(&first),
+            static_route_authority_digest(&second)
+        );
+    }
+
+    #[test]
+    fn static_route_authority_digest_binds_embedded_node_directories() {
+        let first_dir = test_util::tempdir();
+        let second_dir = test_util::tempdir();
+        let first = StorageCluster::open_local_nodes(
+            first_dir.path(),
+            &[NodeId::new(0)],
+            &[31],
+            EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        let second = StorageCluster::open_local_nodes(
+            second_dir.path(),
+            &[NodeId::new(0)],
+            &[31],
+            EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+
+        assert_ne!(
+            static_route_authority_digest(&first),
+            static_route_authority_digest(&second)
+        );
+    }
+
+    #[test]
+    fn static_route_authority_rejects_bounded_validity() {
+        let route = PgRouteSnapshot::reconstructed(
+            ClusterEpoch::INITIAL,
+            PgId::new(31),
+            NodeId::new(1),
+            vec![NodeId::new(1)],
+            PgState::Active,
+        );
+        let local_map = LocalClusterMap::open_frontend_topology_only_with_pg_routes_and_validity(
+            NodeId::new(1),
+            [NodeId::new(1)],
+            &[31],
+            EcShape { k: 1, m: 0 },
+            ClusterEpoch::INITIAL,
+            [LocalPgRoute::from(&route)],
+            RouteMapValidity::until_ms(10_000).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            StorageCluster::from_local_map(Arc::new(local_map)),
+            Err(ClusterBuildError::StaticRouteAuthorityBoundedValidity)
+        ));
+    }
+
+    fn two_node_runtime_map_with_endpoints(
+        first_endpoint: &str,
+        second_endpoint: &str,
+    ) -> ClusterRuntimeMapSnapshot {
+        let tmp = test_util::tempdir();
+        let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+            crate::control_plane::FileControlPlaneStore::new(
+                tmp.path().join("control-plane.state"),
+            ),
+        )
+        .unwrap();
+        authority
+            .bootstrap_initial_cluster_map(
+                vec![
+                    (NodeId::new(1), first_endpoint.to_owned()),
+                    (NodeId::new(2), second_endpoint.to_owned()),
+                ],
+                vec![PgId::new(31)],
+            )
+            .unwrap();
+        authority.snapshot().runtime_map(1_000).unwrap()
+    }
+
+    fn two_node_runtime_map() -> ClusterRuntimeMapSnapshot {
+        two_node_runtime_map_with_endpoints("/tmp/runtime-node-1.sock", "/tmp/runtime-node-2.sock")
+    }
+
+    fn one_node_runtime_map() -> ClusterRuntimeMapSnapshot {
+        let tmp = test_util::tempdir();
+        let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+            crate::control_plane::FileControlPlaneStore::new(
+                tmp.path().join("control-plane.state"),
+            ),
+        )
+        .unwrap();
+        authority
+            .bootstrap_initial_cluster_map(
+                vec![(NodeId::new(1), "/tmp/runtime-node-1.sock".to_owned())],
+                vec![PgId::new(31)],
+            )
+            .unwrap();
+        authority.snapshot().runtime_map(1_000).unwrap()
+    }
+
+    fn runtime_map_with_historical_route() -> ClusterRuntimeMapSnapshot {
+        let tmp = test_util::tempdir();
+        let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+            crate::control_plane::FileControlPlaneStore::new(
+                tmp.path().join("control-plane.state"),
+            ),
+        )
+        .unwrap();
+        authority
+            .bootstrap_initial_cluster_map(
+                vec![
+                    (NodeId::new(1), "/tmp/runtime-node-1.sock".to_owned()),
+                    (NodeId::new(2), "/tmp/runtime-node-2.sock".to_owned()),
+                ],
+                vec![PgId::new(31)],
+            )
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(2)])
+            .unwrap();
+        let runtime_map = authority.snapshot().runtime_map(1_000).unwrap();
+        assert!(!runtime_map.historical_pg_routes().is_empty());
+        assert!(!runtime_map.historical_cluster_epochs().is_empty());
+        runtime_map
+    }
+
+    #[test]
+    fn dynamic_proof_rejects_local_node_set_from_another_runtime_map() {
+        let local_runtime_map = two_node_runtime_map();
+        let proof_runtime_map = one_node_runtime_map();
+        let local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
+            NodeId::new(1),
+            &local_runtime_map,
+            EcShape { k: 1, m: 1 },
+        )
+        .unwrap();
+        local_map.test_store_route_map_validity(proof_runtime_map.validity());
+
+        assert!(matches!(
+            StorageCluster::from_runtime_local_map(Arc::new(local_map), &proof_runtime_map),
+            Err(ClusterBuildError::DynamicRouteAuthorityNodeSetMismatch)
+        ));
+    }
+
+    #[test]
+    fn dynamic_proof_rejects_local_advertised_endpoint_from_another_runtime_map() {
+        let local_runtime_map = two_node_runtime_map();
+        let proof_runtime_map = two_node_runtime_map_with_endpoints(
+            "/tmp/other-runtime-node-1.sock",
+            "/tmp/runtime-node-2.sock",
+        );
+        let local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
+            NodeId::new(1),
+            &local_runtime_map,
+            EcShape { k: 1, m: 1 },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            StorageCluster::from_runtime_local_map(Arc::new(local_map), &proof_runtime_map),
+            Err(ClusterBuildError::DynamicRouteAuthorityNodeEndpointMismatch { id: 1 })
+        ));
+    }
+
+    #[test]
+    fn dynamic_proof_rejects_local_pg_routes_from_another_map() {
+        let runtime_map = two_node_runtime_map();
+        let local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
+            NodeId::new(1),
+            &runtime_map,
+            EcShape { k: 1, m: 1 },
+        )
+        .unwrap();
+        let authority_route = &runtime_map.pg_routes()[0];
+        let mismatched_route = PgRouteSnapshot::reconstructed(
+            authority_route.cluster_epoch(),
+            authority_route.pg_id(),
+            NodeId::new(2),
+            vec![NodeId::new(2), NodeId::new(1)],
+            PgState::Active,
+        );
+        let mismatched_local_map = local_map
+            .test_clone_with_pg_routes(
+                runtime_map.cluster_epoch(),
+                [mismatched_route],
+                runtime_map.historical_pg_routes().iter().cloned(),
+            )
+            .unwrap();
+        mismatched_local_map.test_store_route_map_validity(runtime_map.validity());
+
+        assert!(matches!(
+            StorageCluster::from_runtime_local_map(Arc::new(mismatched_local_map), &runtime_map,),
+            Err(ClusterBuildError::DynamicRouteAuthorityPgRoutesMismatch)
+        ));
+    }
+
+    #[test]
+    fn dynamic_proof_rejects_mismatched_historical_recovery_route() {
+        let runtime_map = runtime_map_with_historical_route();
+        let local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
+            NodeId::new(1),
+            &runtime_map,
+            EcShape { k: 1, m: 1 },
+        )
+        .unwrap();
+        let mut mismatched_routes = runtime_map.historical_pg_routes().to_vec();
+        let authority_route = &mismatched_routes[0];
+        let mismatched_primary = if authority_route.primary_node_id() == NodeId::new(1) {
+            NodeId::new(2)
+        } else {
+            NodeId::new(1)
+        };
+        mismatched_routes[0] = PgRouteSnapshot::reconstructed(
+            authority_route.cluster_epoch(),
+            authority_route.pg_id(),
+            mismatched_primary,
+            vec![mismatched_primary],
+            authority_route.state(),
+        );
+        let mismatched_local_map = local_map
+            .test_clone_with_pg_routes(
+                runtime_map.cluster_epoch(),
+                runtime_map.pg_routes().iter().cloned(),
+                mismatched_routes,
+            )
+            .unwrap();
+        mismatched_local_map.test_store_route_map_validity(runtime_map.validity());
+
+        assert!(matches!(
+            StorageCluster::from_runtime_local_map(Arc::new(mismatched_local_map), &runtime_map),
+            Err(ClusterBuildError::DynamicRouteAuthorityHistoricalPgRoutesMismatch)
+        ));
+    }
+
+    #[test]
+    fn dynamic_proof_rejects_mismatched_historical_recovery_epochs() {
+        let runtime_map = runtime_map_with_historical_route();
+        let mut local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
+            NodeId::new(1),
+            &runtime_map,
+            EcShape { k: 1, m: 1 },
+        )
+        .unwrap();
+        local_map.test_remove_historical_cluster_epoch(runtime_map.historical_cluster_epochs()[0]);
+
+        assert!(matches!(
+            StorageCluster::from_runtime_local_map(Arc::new(local_map), &runtime_map),
+            Err(ClusterBuildError::DynamicRouteAuthorityHistoricalEpochsMismatch)
+        ));
+    }
+
+    #[test]
+    fn dynamic_rpc_constructor_rejects_mismatched_advertised_endpoint() {
+        let runtime_map = two_node_runtime_map();
+        let result = StorageCluster::from_runtime_map_with_storage_rpc_endpoints_and_auth(
+            NodeId::new(1),
+            &runtime_map,
+            EcShape { k: 1, m: 1 },
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            [
+                (
+                    NodeId::new(1),
+                    crate::storage_rpc_transport::StorageRpcClientEndpoint::unix(
+                        "/tmp/wrong-node-1.sock",
+                    ),
+                ),
+                (
+                    NodeId::new(2),
+                    crate::storage_rpc_transport::StorageRpcClientEndpoint::unix(
+                        "/tmp/runtime-node-2.sock",
+                    ),
+                ),
+            ],
+            frontend_storage_rpc_auth(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ClusterBuildError::RemoteStorageNodeClientEndpointAuthorityMismatch { id: 1 })
+        ));
+    }
+
+    #[test]
+    fn dynamic_rpc_constructor_rejects_incomplete_endpoint_set() {
+        let runtime_map = two_node_runtime_map();
+        let result = StorageCluster::from_runtime_map_with_storage_rpc_endpoints_and_auth(
+            NodeId::new(1),
+            &runtime_map,
+            EcShape { k: 1, m: 1 },
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            [(
+                NodeId::new(1),
+                crate::storage_rpc_transport::StorageRpcClientEndpoint::unix(
+                    "/tmp/runtime-node-1.sock",
+                ),
+            )],
+            frontend_storage_rpc_auth(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ClusterBuildError::RuntimeMapStorageNodeClientMissing { id: 2 })
+        ));
     }
 
     fn active_test_cluster(validity: RouteMapValidity) -> Arc<StorageCluster> {
@@ -4700,6 +5188,61 @@ mod runtime_map_refresh_invalidation_tests {
                 now_ms: 4_000,
             }) if cluster_epoch == ClusterEpoch::INITIAL
         ));
+    }
+
+    #[test]
+    fn same_epoch_new_authority_incarnation_does_not_extend_pinned_generation() {
+        let (pinned, handle, mut candidate) = crate::clock::with_time_override(1_000, || {
+            let pinned = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
+            pinned.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+            let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned));
+            let candidate = active_test_cluster(RouteMapValidity::until_ms(9_000).unwrap());
+            candidate.test_store_route_map_validity(RouteMapValidity::until_ms(9_000).unwrap());
+            (pinned, handle, candidate)
+        });
+        let candidate_authority = match candidate.route_authority {
+            StorageClusterRouteAuthority::Static(_) => {
+                panic!("bounded test cluster must have dynamic authority")
+            }
+            StorageClusterRouteAuthority::Dynamic(proof) => proof,
+        };
+        Arc::get_mut(&mut candidate)
+            .expect("new candidate has one owner")
+            .route_authority = StorageClusterRouteAuthority::Dynamic(DynamicRouteAuthorityProof {
+            content_digest: candidate_authority.content_digest,
+            freshness_proof: RuntimeMapFreshnessProof::SingleAuthority {
+                authority_incarnation: crate::control_plane::AuthorityIncarnation::new(2).unwrap(),
+                issued_at_ms: 1_000,
+            },
+        });
+
+        crate::clock::with_time_override(1_000, || {
+            handle.install(Arc::clone(&candidate)).unwrap();
+        });
+
+        assert_eq!(pinned.route_map_valid_until_ms(), Some(5_000));
+        assert_eq!(handle.current().route_map_valid_until_ms(), Some(9_000));
+        assert!(Arc::ptr_eq(&handle.current(), &candidate));
+
+        let renewal = ControlPlaneRuntimeMapStatus::test_with_lease_renewal(
+            ClusterEpoch::INITIAL,
+            candidate_authority.content_digest,
+            RouteMapValidity::until_ms(12_000).unwrap(),
+            RuntimeMapFreshnessProof::SingleAuthority {
+                authority_incarnation: crate::control_plane::AuthorityIncarnation::new(2).unwrap(),
+                issued_at_ms: 1_000,
+            },
+        );
+        crate::clock::with_time_override(1_000, || {
+            handle
+                .renew_from_runtime_map_status(renewal, 1_000, 1_000)
+                .unwrap()
+                .expect("matching new-authority renewal must extend the current generation");
+        });
+
+        assert_eq!(pinned.route_map_valid_until_ms(), Some(5_000));
+        assert_eq!(candidate.route_map_valid_until_ms(), Some(12_000));
+        assert_eq!(handle.current().route_map_valid_until_ms(), Some(12_000));
     }
 
     #[test]
@@ -5050,7 +5593,7 @@ mod runtime_map_refresh_invalidation_tests {
     }
 
     #[test]
-    fn invalid_unbounded_candidate_is_rejected_without_draining_admitted_requests() {
+    fn static_candidate_is_rejected_without_draining_admitted_requests() {
         let (handle, _admission) = crate::clock::with_time_override(1_000, || {
             let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
             cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
@@ -5062,11 +5605,7 @@ mod runtime_map_refresh_invalidation_tests {
 
         assert!(matches!(
             handle.install(candidate),
-            Err(
-                StorageClusterRuntimeMapRefreshError::UnboundedRouteMapValidity {
-                    candidate: ClusterEpoch::INITIAL,
-                }
-            )
+            Err(StorageClusterRuntimeMapRefreshError::StaticRouteAuthorityRefresh)
         ));
     }
 
@@ -8001,7 +8540,9 @@ impl StorageCluster {
     }
 
     pub fn from_local_map(local_map: Arc<LocalClusterMap>) -> Result<Arc<Self>, ClusterBuildError> {
-        Self::from_local_map_with_epoch(Arc::clone(&local_map), local_map.epoch())
+        let operation_epoch = local_map.epoch();
+        let route_authority = StorageClusterRouteAuthority::static_for(&local_map)?;
+        Self::from_local_map_with_epoch_and_authority(local_map, operation_epoch, route_authority)
     }
 
     pub fn from_runtime_map(
@@ -8016,10 +8557,23 @@ impl StorageCluster {
                 default_ec_shape,
             )?,
         );
-        Self::from_local_map_with_epoch_and_digest(
+        let route_authority = StorageClusterRouteAuthority::dynamic_for(&local_map, runtime_map)?;
+        Self::from_local_map_with_epoch_and_authority(
             local_map,
             runtime_map.cluster_epoch(),
-            Some(runtime_map.content_digest()),
+            route_authority,
+        )
+    }
+
+    fn from_runtime_local_map(
+        local_map: Arc<LocalClusterMap>,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        let route_authority = StorageClusterRouteAuthority::dynamic_for(&local_map, runtime_map)?;
+        Self::from_local_map_with_epoch_and_authority(
+            local_map,
+            runtime_map.cluster_epoch(),
+            route_authority,
         )
     }
 
@@ -8086,10 +8640,13 @@ impl StorageCluster {
         .into_iter()
         .map(|config| config.with_optional_rpc_auth(rpc_auth.clone()));
         local_map.install_unix_storage_node_clients(storage_node_configs)?;
-        Self::from_local_map_with_epoch_and_digest_and_auth(
-            Arc::new(local_map),
+        local_map.validate_installed_storage_rpc_clients(runtime_map)?;
+        let local_map = Arc::new(local_map);
+        let route_authority = StorageClusterRouteAuthority::dynamic_for(&local_map, runtime_map)?;
+        Self::from_local_map_with_epoch_authority_and_auth(
+            local_map,
             runtime_map.cluster_epoch(),
-            Some(runtime_map.content_digest()),
+            route_authority,
             rpc_auth,
         )
     }
@@ -8176,10 +8733,13 @@ impl StorageCluster {
             .with_optional_rpc_auth(Some(rpc_auth.clone()))
         });
         local_map.install_unix_storage_node_clients(configs)?;
-        let mut cluster = Self::from_local_map_with_epoch_and_digest_and_auth(
-            Arc::new(local_map),
+        local_map.validate_installed_storage_rpc_clients(runtime_map)?;
+        let local_map = Arc::new(local_map);
+        let route_authority = StorageClusterRouteAuthority::dynamic_for(&local_map, runtime_map)?;
+        let mut cluster = Self::from_local_map_with_epoch_authority_and_auth(
+            local_map,
             runtime_map.cluster_epoch(),
-            Some(runtime_map.content_digest()),
+            route_authority,
             Some(rpc_auth),
         )?;
         Arc::get_mut(&mut cluster)
@@ -8241,16 +8801,19 @@ impl StorageCluster {
         control_plane: &impl ControlPlaneRuntimeMapSource,
         authority_now_ms: u64,
     ) -> Result<Arc<Self>, StorageClusterRuntimeMapRefreshError> {
+        self.require_dynamic_route_authority()?;
         let runtime_map = control_plane.runtime_map_snapshot(authority_now_ms)?;
         let local_map = LocalClusterMap::open_runtime_map_with_existing_local_nodes(
             &self.local_map,
             &runtime_map,
         )?;
+        let local_map = Arc::new(local_map);
+        let route_authority = StorageClusterRouteAuthority::dynamic_for(&local_map, &runtime_map)?;
         Ok(
-            Self::from_local_map_with_epoch_and_digest_auth_and_owner_token(
-                Arc::new(local_map),
+            Self::from_local_map_with_epoch_authority_auth_and_owner_token(
+                local_map,
                 runtime_map.cluster_epoch(),
-                Some(runtime_map.content_digest()),
+                route_authority,
                 self.rpc_auth.clone(),
                 Some(Arc::clone(&self.bucket_write_owner_token)),
             )?,
@@ -8263,6 +8826,7 @@ impl StorageCluster {
         authority_now_ms: u64,
         admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
     ) -> Result<Arc<Self>, StorageClusterRuntimeMapRefreshError> {
+        self.require_dynamic_route_authority()?;
         let runtime_map = control_plane.runtime_map_snapshot(authority_now_ms)?;
         let mut local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
             self.metadata_node_id(),
@@ -8291,10 +8855,13 @@ impl StorageCluster {
             .collect(),
         };
         local_map.install_unix_storage_node_clients(storage_node_configs)?;
-        let mut cluster = Self::from_local_map_with_epoch_and_digest_auth_and_owner_token(
-            Arc::new(local_map),
+        local_map.validate_installed_storage_rpc_clients(&runtime_map)?;
+        let local_map = Arc::new(local_map);
+        let route_authority = StorageClusterRouteAuthority::dynamic_for(&local_map, &runtime_map)?;
+        let mut cluster = Self::from_local_map_with_epoch_authority_auth_and_owner_token(
+            local_map,
             runtime_map.cluster_epoch(),
-            Some(runtime_map.content_digest()),
+            route_authority,
             self.rpc_auth.clone(),
             Some(Arc::clone(&self.bucket_write_owner_token)),
         )?;
@@ -8309,48 +8876,66 @@ impl StorageCluster {
         local_map: Arc<LocalClusterMap>,
         operation_epoch: ClusterEpoch,
     ) -> Result<Arc<Self>, ClusterBuildError> {
-        Self::from_local_map_with_epoch(local_map, operation_epoch)
+        let route_authority = if local_map.route_map_validity() == RouteMapValidity::Forever {
+            StorageClusterRouteAuthority::static_for(&local_map)?
+        } else {
+            StorageClusterRouteAuthority::test_dynamic_for(&local_map)?
+        };
+        Self::from_local_map_with_epoch_and_authority(local_map, operation_epoch, route_authority)
     }
 
-    fn from_local_map_with_epoch(
-        local_map: Arc<LocalClusterMap>,
-        operation_epoch: ClusterEpoch,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_clone_with_dynamic_route_map_validity(
+        &self,
+        validity: RouteMapValidity,
     ) -> Result<Arc<Self>, ClusterBuildError> {
-        Self::from_local_map_with_epoch_and_digest(local_map, operation_epoch, None)
+        let local_map = Arc::new(self.local_map.test_clone_with_route_map_validity(validity));
+        let route_authority = StorageClusterRouteAuthority::test_dynamic_for(&local_map)?;
+        let mut cluster = Self::from_local_map_with_epoch_authority_auth_and_owner_token(
+            local_map,
+            self.operation_epoch,
+            route_authority,
+            self.rpc_auth.clone(),
+            Some(Arc::clone(&self.bucket_write_owner_token)),
+        )?;
+        Arc::get_mut(&mut cluster)
+            .expect("new test storage cluster has one owner")
+            .rpc_endpoints = self.rpc_endpoints.clone();
+        Ok(cluster)
     }
 
-    fn from_local_map_with_epoch_and_digest(
+    fn from_local_map_with_epoch_and_authority(
         local_map: Arc<LocalClusterMap>,
         operation_epoch: ClusterEpoch,
-        runtime_map_content_digest: Option<RuntimeMapContentDigest>,
+        route_authority: StorageClusterRouteAuthority,
     ) -> Result<Arc<Self>, ClusterBuildError> {
-        Self::from_local_map_with_epoch_and_digest_and_auth(
+        Self::from_local_map_with_epoch_authority_and_auth(
             local_map,
             operation_epoch,
-            runtime_map_content_digest,
+            route_authority,
             None,
         )
     }
 
-    fn from_local_map_with_epoch_and_digest_and_auth(
+    fn from_local_map_with_epoch_authority_and_auth(
         local_map: Arc<LocalClusterMap>,
         operation_epoch: ClusterEpoch,
-        runtime_map_content_digest: Option<RuntimeMapContentDigest>,
+        route_authority: StorageClusterRouteAuthority,
         rpc_auth: Option<crate::StorageRpcClientAuthConfig>,
     ) -> Result<Arc<Self>, ClusterBuildError> {
-        Self::from_local_map_with_epoch_and_digest_auth_and_owner_token(
+        Self::from_local_map_with_epoch_authority_auth_and_owner_token(
             local_map,
             operation_epoch,
-            runtime_map_content_digest,
+            route_authority,
             rpc_auth,
             None,
         )
     }
 
-    fn from_local_map_with_epoch_and_digest_auth_and_owner_token(
+    fn from_local_map_with_epoch_authority_auth_and_owner_token(
         local_map: Arc<LocalClusterMap>,
         operation_epoch: ClusterEpoch,
-        runtime_map_content_digest: Option<RuntimeMapContentDigest>,
+        route_authority: StorageClusterRouteAuthority,
         rpc_auth: Option<crate::StorageRpcClientAuthConfig>,
         bucket_write_owner_token: Option<Arc<str>>,
     ) -> Result<Arc<Self>, ClusterBuildError> {
@@ -8363,7 +8948,7 @@ impl StorageCluster {
         Ok(Arc::new(Self {
             local_map,
             operation_epoch,
-            runtime_map_content_digest,
+            route_authority,
             bucket_write_owner_token,
             rpc_auth,
             rpc_endpoints: None,
@@ -8386,6 +8971,10 @@ impl StorageCluster {
 
     pub fn route_map_validity(&self) -> RouteMapValidity {
         self.local_map.route_map_validity()
+    }
+
+    fn require_dynamic_route_authority(&self) -> Result<(), StorageClusterRuntimeMapRefreshError> {
+        self.route_authority.dynamic_proof().map(|_| ())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -8915,7 +9504,26 @@ impl StorageCluster {
             pg_routes,
             historical_pg_routes,
         )?;
-        Self::from_local_map(Arc::new(local_map))
+        let route_authority = match self.route_authority {
+            StorageClusterRouteAuthority::Static(_) => {
+                StorageClusterRouteAuthority::static_for(&local_map)?
+            }
+            StorageClusterRouteAuthority::Dynamic(_) => {
+                local_map.test_store_route_map_validity(self.route_map_validity());
+                StorageClusterRouteAuthority::test_dynamic_for(&local_map)?
+            }
+        };
+        let mut cluster = Self::from_local_map_with_epoch_authority_auth_and_owner_token(
+            Arc::new(local_map),
+            cluster_epoch,
+            route_authority,
+            self.rpc_auth.clone(),
+            Some(Arc::clone(&self.bucket_write_owner_token)),
+        )?;
+        Arc::get_mut(&mut cluster)
+            .expect("new test storage cluster has one owner")
+            .rpc_endpoints = self.rpc_endpoints.clone();
+        Ok(cluster)
     }
 
     pub fn reconstructed_pg_route_at_epoch(
