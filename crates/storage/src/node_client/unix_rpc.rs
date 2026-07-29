@@ -2174,7 +2174,7 @@ impl UnixStorageNodeClient {
         )
     }
 
-    pub(crate) fn validate_metadata_command_replay_state(
+    fn validate_metadata_command_replay_state(
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
@@ -2221,7 +2221,7 @@ impl UnixStorageNodeClient {
             })
     }
 
-    pub(crate) fn initialize_metadata_transfer_empty_state(
+    fn initialize_metadata_transfer_empty_state(
         &self,
         pg_id: PgId,
         expected_state_digest: u64,
@@ -2247,7 +2247,7 @@ impl UnixStorageNodeClient {
             })
     }
 
-    pub(crate) fn initialize_metadata_transfer_matching_state(
+    fn initialize_metadata_transfer_matching_state(
         &self,
         pg_id: PgId,
         applied_log_index: u64,
@@ -2277,7 +2277,7 @@ impl UnixStorageNodeClient {
             })
     }
 
-    pub(crate) fn adopt_metadata_transfer_state_from_rebased_commands(
+    fn adopt_metadata_transfer_state_from_rebased_commands(
         &self,
         pg_id: PgId,
         commands: &[MetadataTransferCommand],
@@ -2312,7 +2312,7 @@ impl UnixStorageNodeClient {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn install_metadata_transfer_checkpoint_base(
+    fn install_metadata_transfer_checkpoint_base(
         &self,
         pg_id: PgId,
         checkpoint: &MetadataCommandCheckpoint,
@@ -2488,7 +2488,7 @@ impl UnixStorageNodeClient {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn replay_metadata_command_for_peering(
+    fn replay_metadata_command_for_peering(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
@@ -3034,12 +3034,78 @@ impl MetadataCommandInspectionNodeClient for UnixStorageNodeClient {
     }
 }
 
+struct UnixMetadataCommandPeeringRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    pg_id: PgId,
+    cluster_epoch: ClusterEpoch,
+}
+
+impl UnixMetadataCommandPeeringRoute<'_> {
+    fn require_current_epoch(&self) -> Result<(), StoreError> {
+        if self.cluster_epoch != self.client.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: self.pg_id.get(),
+                operation_epoch: self.cluster_epoch,
+                current_epoch: self.client.cluster_epoch,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_command_route(&self, command: &MetadataCommandEnvelope) -> Result<(), StoreError> {
+        if command.id().pg_id() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id: self.client.node_id.as_u32(),
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id.get(),
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        if command.id().cluster_epoch() != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: self.pg_id.get(),
+                operation_epoch: command.id().cluster_epoch(),
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_transfer_commands(
+        &self,
+        commands: &[MetadataTransferCommand],
+    ) -> Result<(), StoreError> {
+        commands
+            .iter()
+            .try_for_each(|command| self.validate_command_route(&command.command))
+    }
+
+    fn validate_checkpoint_pg(
+        &self,
+        checkpoint: &MetadataCommandCheckpoint,
+    ) -> Result<(), StoreError> {
+        if checkpoint.pg_id != self.pg_id {
+            return Err(StoreError::MetadataCheckpointInvalid {
+                node_id: self.client.node_id.as_u32(),
+                pg_id: self.pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+                reason: format!(
+                    "checkpoint PG {} does not match captured peering PG {}",
+                    checkpoint.pg_id.get(),
+                    self.pg_id.get()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 impl MetadataCommandPeeringNodeClient for UnixStorageNodeClient {
-    fn validate_metadata_command_replay_state(
+    fn open_metadata_command_peering_route(
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-    ) -> Result<MetadataCommandReplicaState, StoreError> {
+    ) -> Result<Box<dyn MetadataCommandPeeringRoute + '_>, StoreError> {
         if cluster_epoch > self.cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
                 pg_id: pg_id.get(),
@@ -3047,72 +3113,59 @@ impl MetadataCommandPeeringNodeClient for UnixStorageNodeClient {
                 current_epoch: self.cluster_epoch,
             });
         }
-        UnixStorageNodeClient::validate_metadata_command_replay_state(
-            self,
+        Ok(Box::new(UnixMetadataCommandPeeringRoute {
+            client: self,
             pg_id,
             cluster_epoch,
+        }))
+    }
+}
+
+impl MetadataCommandPeeringRoute for UnixMetadataCommandPeeringRoute<'_> {
+    fn validate_metadata_command_replay_state(
+        &self,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        UnixStorageNodeClient::validate_metadata_command_replay_state(
+            self.client,
+            self.pg_id,
+            self.cluster_epoch,
             false,
         )
     }
 
     fn validate_metadata_command_replay_state_preserving_pending_slot(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        if cluster_epoch > self.cluster_epoch {
-            return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
-                operation_epoch: cluster_epoch,
-                current_epoch: self.cluster_epoch,
-            });
-        }
         UnixStorageNodeClient::validate_metadata_command_replay_state(
-            self,
-            pg_id,
-            cluster_epoch,
+            self.client,
+            self.pg_id,
+            self.cluster_epoch,
             true,
         )
     }
 
     fn initialize_metadata_transfer_empty_state(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
         expected_state_digest: u64,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        if cluster_epoch != self.cluster_epoch {
-            return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
-                operation_epoch: cluster_epoch,
-                current_epoch: self.cluster_epoch,
-            });
-        }
+        self.require_current_epoch()?;
         UnixStorageNodeClient::initialize_metadata_transfer_empty_state(
-            self,
-            pg_id,
+            self.client,
+            self.pg_id,
             expected_state_digest,
         )
     }
 
     fn initialize_metadata_transfer_matching_state(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
         applied_log_index: u64,
         applied_log_hash: u64,
         expected_state_digest: u64,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        if cluster_epoch != self.cluster_epoch {
-            return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
-                operation_epoch: cluster_epoch,
-                current_epoch: self.cluster_epoch,
-            });
-        }
+        self.require_current_epoch()?;
         UnixStorageNodeClient::initialize_metadata_transfer_matching_state(
-            self,
-            pg_id,
+            self.client,
+            self.pg_id,
             applied_log_index,
             applied_log_hash,
             expected_state_digest,
@@ -3121,21 +3174,14 @@ impl MetadataCommandPeeringNodeClient for UnixStorageNodeClient {
 
     fn adopt_metadata_transfer_state_from_rebased_commands(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
         commands: &[MetadataTransferCommand],
         expected_state_digest: u64,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        if cluster_epoch != self.cluster_epoch {
-            return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
-                operation_epoch: cluster_epoch,
-                current_epoch: self.cluster_epoch,
-            });
-        }
+        self.require_current_epoch()?;
+        self.validate_transfer_commands(commands)?;
         UnixStorageNodeClient::adopt_metadata_transfer_state_from_rebased_commands(
-            self,
-            pg_id,
+            self.client,
+            self.pg_id,
             commands,
             expected_state_digest,
         )
@@ -3143,26 +3189,25 @@ impl MetadataCommandPeeringNodeClient for UnixStorageNodeClient {
 
     fn install_metadata_transfer_checkpoint_base(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
         checkpoint: &MetadataCommandCheckpoint,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        if cluster_epoch != self.cluster_epoch {
-            return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
-                operation_epoch: cluster_epoch,
-                current_epoch: self.cluster_epoch,
-            });
-        }
-        UnixStorageNodeClient::install_metadata_transfer_checkpoint_base(self, pg_id, checkpoint)
+        self.require_current_epoch()?;
+        self.validate_checkpoint_pg(checkpoint)?;
+        UnixStorageNodeClient::install_metadata_transfer_checkpoint_base(
+            self.client,
+            self.pg_id,
+            checkpoint,
+        )
     }
 
     fn replay_metadata_command_for_peering(
         &self,
-        pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        UnixStorageNodeClient::replay_metadata_command_for_peering(self, pg_id, command)
+        self.require_current_epoch()
+            .and_then(|()| self.validate_command_route(command))
+            .map_err(BucketSnapshotLoadError::Store)?;
+        UnixStorageNodeClient::replay_metadata_command_for_peering(self.client, self.pg_id, command)
     }
 }
 

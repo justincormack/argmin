@@ -361,12 +361,14 @@ fn unix_storage_node_client_reads_metadata_command_state_and_acceptance() {
     )
     .unwrap()
     .unwrap();
-    let replay_state =
-        MetadataCommandPeeringNodeClient::validate_metadata_command_replay_state_preserving_pending_slot(
-            &client,
-            PgId::new(0),
-            ClusterEpoch::new(1).unwrap(),
-        )
+    let peering = MetadataCommandPeeringNodeClient::open_metadata_command_peering_route(
+        &client,
+        PgId::new(0),
+        ClusterEpoch::new(1).unwrap(),
+    )
+    .unwrap();
+    let replay_state = peering
+        .validate_metadata_command_replay_state_preserving_pending_slot()
         .unwrap();
     let remote_hashes =
         MetadataCommandInspectionNodeClient::applied_metadata_command_log_entry_hashes(
@@ -471,11 +473,14 @@ fn unix_storage_node_client_adopts_metadata_transfer_state() {
         config.socket_path.clone(),
     );
 
-    let state =
-        MetadataCommandPeeringNodeClient::adopt_metadata_transfer_state_from_rebased_commands(
-            &client,
-            PgId::new(0),
-            destination_epoch,
+    let peering = MetadataCommandPeeringNodeClient::open_metadata_command_peering_route(
+        &client,
+        PgId::new(0),
+        destination_epoch,
+    )
+    .unwrap();
+    let state = peering
+        .adopt_metadata_transfer_state_from_rebased_commands(
             &[MetadataTransferCommand {
                 command: rebased,
                 pre_state_digest: 0,
@@ -802,13 +807,15 @@ fn unix_storage_node_client_installs_metadata_transfer_checkpoint_base() {
         config.socket_path.clone(),
     );
 
-    let state = MetadataCommandPeeringNodeClient::install_metadata_transfer_checkpoint_base(
+    let peering = MetadataCommandPeeringNodeClient::open_metadata_command_peering_route(
         &client,
         PgId::new(0),
         destination_epoch,
-        &checkpoint,
     )
     .unwrap();
+    let state = peering
+        .install_metadata_transfer_checkpoint_base(&checkpoint)
+        .unwrap();
     server_thread.join().unwrap();
 
     assert_eq!(state.cluster_epoch, destination_epoch);
@@ -848,13 +855,15 @@ fn unix_storage_node_client_rejects_active_metadata_transfer_checkpoint_base_ins
         config.socket_path.clone(),
     );
 
-    let err = MetadataCommandPeeringNodeClient::install_metadata_transfer_checkpoint_base(
+    let peering = MetadataCommandPeeringNodeClient::open_metadata_command_peering_route(
         &client,
         PgId::new(0),
         config.cluster_epoch,
-        &checkpoint,
     )
-    .unwrap_err();
+    .unwrap();
+    let err = peering
+        .install_metadata_transfer_checkpoint_base(&checkpoint)
+        .unwrap_err();
     server_thread.join().unwrap();
 
     assert!(matches!(
@@ -899,14 +908,14 @@ fn unix_storage_node_client_rejects_empty_metadata_transfer_adoption() {
         config.socket_path.clone(),
     );
 
-    let err =
-        MetadataCommandPeeringNodeClient::adopt_metadata_transfer_state_from_rebased_commands(
-            &client,
-            PgId::new(0),
-            destination_epoch,
-            &[],
-            before.state_digest,
-        )
+    let peering = MetadataCommandPeeringNodeClient::open_metadata_command_peering_route(
+        &client,
+        PgId::new(0),
+        destination_epoch,
+    )
+    .unwrap();
+    let err = peering
+        .adopt_metadata_transfer_state_from_rebased_commands(&[], before.state_digest)
         .unwrap_err();
     server_thread.join().unwrap();
 
@@ -1176,6 +1185,77 @@ fn unix_active_critical_section_rejects_command_for_another_pg_without_mutation(
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn unix_peering_route_rejects_redirected_commands_before_rpc() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.pg_routes[0].state = crate::PgState::Peering;
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let peering = MetadataCommandPeeringNodeClient::open_metadata_command_peering_route(
+        &client,
+        PgId::new(0),
+        config.cluster_epoch,
+    )
+    .unwrap();
+
+    let wrong_pg_command = test_metadata_command(1, 1);
+    let error = peering
+        .replay_metadata_command_for_peering(&wrong_pg_command)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        BucketSnapshotLoadError::Store(StoreError::MetadataCommandWrongPg {
+            command_pg_id: 1,
+            target_pg_id: 0,
+            ..
+        })
+    ));
+
+    let command = test_metadata_command(0, 1);
+    let future_epoch = ClusterEpoch::new(config.cluster_epoch.get() + 1).unwrap();
+    let future_command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(future_epoch, PgId::new(0), command.id().log_index()),
+        command.payload().clone(),
+    );
+    let error = peering
+        .adopt_metadata_transfer_state_from_rebased_commands(
+            &[MetadataTransferCommand {
+                command: future_command,
+                pre_state_digest: 0,
+                post_state_digest: 1,
+            }],
+            1,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::StaleMetadataOperation {
+            pg_id: 0,
+            operation_epoch,
+            current_epoch,
+        } if operation_epoch == future_epoch && current_epoch == config.cluster_epoch
+    ));
+
+    let (_, checkpoint) = test_metadata_checkpoint_with_bucket("unix-peering-route-checkpoint");
+    let mut wrong_pg_checkpoint = checkpoint.clone();
+    wrong_pg_checkpoint.pg_id = PgId::new(1);
+    let error = peering
+        .install_metadata_transfer_checkpoint_base(&wrong_pg_checkpoint)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::MetadataCheckpointInvalid {
+            pg_id: 0,
+            cluster_epoch,
+            ..
+        } if cluster_epoch == config.cluster_epoch
+    ));
 }
 
 #[test]

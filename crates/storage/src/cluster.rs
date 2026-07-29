@@ -5449,8 +5449,10 @@ fn classify_metadata_transfer_import_destination(
         state_digest: state.state_digest,
     };
     if state.cluster_epoch == cluster_epoch && proof == expected_import_proof {
-        let validated = metadata_client
-            .validate_metadata_command_replay_state_preserving_pending_slot(pg_id, cluster_epoch)?;
+        let peering_route =
+            metadata_client.open_metadata_command_peering_route(pg_id, cluster_epoch)?;
+        let validated =
+            peering_route.validate_metadata_command_replay_state_preserving_pending_slot()?;
         let validated_proof = PgMetadataProof {
             applied_log_index: validated.applied_log_index,
             applied_log_hash: validated.applied_log_hash,
@@ -5501,11 +5503,10 @@ fn classify_metadata_transfer_import_destination(
                     && base_import_proof.applied_log_hash == 0
                     && base_import_proof.state_digest == first_command.pre_state_digest
                 {
-                    let validated = metadata_client
-                        .validate_metadata_command_replay_state_preserving_pending_slot(
-                            pg_id,
-                            state.cluster_epoch,
-                        )?;
+                    let peering_route = metadata_client
+                        .open_metadata_command_peering_route(pg_id, state.cluster_epoch)?;
+                    let validated = peering_route
+                        .validate_metadata_command_replay_state_preserving_pending_slot()?;
                     let validated_proof = PgMetadataProof {
                         applied_log_index: validated.applied_log_index,
                         applied_log_hash: validated.applied_log_hash,
@@ -5515,11 +5516,10 @@ fn classify_metadata_transfer_import_destination(
                         return Ok(MetadataTransferImportDestination::AdoptBase);
                     }
                 } else if actual_proof == base_import_proof {
-                    let validated = metadata_client
-                        .validate_metadata_command_replay_state_preserving_pending_slot(
-                            pg_id,
-                            state.cluster_epoch,
-                        )?;
+                    let peering_route = metadata_client
+                        .open_metadata_command_peering_route(pg_id, state.cluster_epoch)?;
+                    let validated = peering_route
+                        .validate_metadata_command_replay_state_preserving_pending_slot()?;
                     let validated_proof = PgMetadataProof {
                         applied_log_index: validated.applied_log_index,
                         applied_log_hash: validated.applied_log_hash,
@@ -5584,11 +5584,10 @@ fn classify_metadata_transfer_import_destination(
                 state.cluster_epoch,
             );
             if actual_proof == historical_prefix_proof {
-                let validated = metadata_client
-                    .validate_metadata_command_replay_state_preserving_pending_slot(
-                        pg_id,
-                        state.cluster_epoch,
-                    )?;
+                let peering_route = metadata_client
+                    .open_metadata_command_peering_route(pg_id, state.cluster_epoch)?;
+                let validated = peering_route
+                    .validate_metadata_command_replay_state_preserving_pending_slot()?;
                 let validated_proof = PgMetadataProof {
                     applied_log_index: validated.applied_log_index,
                     applied_log_hash: validated.applied_log_hash,
@@ -6761,8 +6760,10 @@ impl StorageCluster {
                     node_id: replay_plan.node_id,
                 })?;
             let metadata_client = target_node.metadata_command_peering_client();
+            let peering_route = metadata_client
+                .open_metadata_command_peering_route(pg_id, self.operation_epoch())?;
             for command in replay_plan.commands {
-                metadata_client.replay_metadata_command_for_peering(pg_id, &command)?;
+                peering_route.replay_metadata_command_for_peering(&command)?;
             }
         }
 
@@ -7373,6 +7374,8 @@ impl StorageCluster {
         let mut reference: Option<(NodeId, PgMetadataProof)> = None;
         for node in nodes {
             let metadata_client = node.metadata_command_peering_client();
+            let peering_route = metadata_client
+                .open_metadata_command_peering_route(pg_id, self.operation_epoch())?;
             let state = if let Some(checkpoint) = checkpoint_base {
                 let checkpoint_destination_base_proof = PgMetadataProof {
                     applied_log_index: 0,
@@ -7413,11 +7416,8 @@ impl StorageCluster {
                         &commands,
                         self.operation_epoch(),
                     ) {
-                        let validated = metadata_client
-                            .validate_metadata_command_replay_state_preserving_pending_slot(
-                                pg_id,
-                                self.operation_epoch(),
-                            )?;
+                        let validated = peering_route
+                            .validate_metadata_command_replay_state_preserving_pending_slot()?;
                         let validated_proof = PgMetadataProof {
                             applied_log_index: validated.applied_log_index,
                             applied_log_hash: validated.applied_log_hash,
@@ -7450,22 +7450,19 @@ impl StorageCluster {
                         }
                         let mut state = validated;
                         for command in &commands[prefix_len..] {
-                            state = metadata_client
-                                .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                            state = peering_route
+                                .replay_metadata_command_for_peering(&command.command)?;
                         }
                         state
                     } else if metadata_client.metadata_command_replica_state_can_initialize(
                         pg_id,
                         self.operation_epoch(),
                     )? {
-                        let mut state = metadata_client.install_metadata_transfer_checkpoint_base(
-                            pg_id,
-                            self.operation_epoch(),
-                            checkpoint,
-                        )?;
+                        let mut state =
+                            peering_route.install_metadata_transfer_checkpoint_base(checkpoint)?;
                         for command in &commands {
-                            state = metadata_client
-                                .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                            state = peering_route
+                                .replay_metadata_command_for_peering(&command.command)?;
                         }
                         state
                     } else {
@@ -7483,14 +7480,11 @@ impl StorageCluster {
                         );
                     }
                 } else {
-                    let mut state = metadata_client.install_metadata_transfer_checkpoint_base(
-                        pg_id,
-                        self.operation_epoch(),
-                        checkpoint,
-                    )?;
+                    let mut state =
+                        peering_route.install_metadata_transfer_checkpoint_base(checkpoint)?;
                     for command in &commands {
-                        state = metadata_client
-                            .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                        state =
+                            peering_route.replay_metadata_command_for_peering(&command.command)?;
                     }
                     state
                 }
@@ -7507,49 +7501,41 @@ impl StorageCluster {
                     MetadataTransferImportDestination::AlreadyImported(state) => state,
                     MetadataTransferImportDestination::Empty => {
                         if commands.is_empty() {
-                            metadata_client.initialize_metadata_transfer_empty_state(
-                                pg_id,
-                                self.operation_epoch(),
+                            peering_route.initialize_metadata_transfer_empty_state(
                                 artifact.proof.state_digest,
                             )?
                         } else {
                             let mut state =
                                 metadata_client.metadata_command_replica_state(pg_id)?;
                             for command in &commands {
-                                state = metadata_client
-                                    .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                                state = peering_route
+                                    .replay_metadata_command_for_peering(&command.command)?;
                             }
                             state
                         }
                     }
                     MetadataTransferImportDestination::AdoptBase => {
-                        metadata_client.initialize_metadata_transfer_matching_state(
-                            pg_id,
-                            self.operation_epoch(),
+                        peering_route.initialize_metadata_transfer_matching_state(
                             0,
                             0,
                             base_import_proof.state_digest,
                         )?;
                         let mut state = metadata_client.metadata_command_replica_state(pg_id)?;
                         for command in &commands {
-                            state = metadata_client
-                                .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                            state = peering_route
+                                .replay_metadata_command_for_peering(&command.command)?;
                         }
                         state
                     }
                     MetadataTransferImportDestination::AdoptExisting => {
                         if commands.is_empty() {
-                            metadata_client.initialize_metadata_transfer_matching_state(
-                                pg_id,
-                                self.operation_epoch(),
+                            peering_route.initialize_metadata_transfer_matching_state(
                                 expected_import_proof.applied_log_index,
                                 expected_import_proof.applied_log_hash,
                                 expected_import_proof.state_digest,
                             )?
                         } else {
-                            metadata_client.adopt_metadata_transfer_state_from_rebased_commands(
-                                pg_id,
-                                self.operation_epoch(),
+                            peering_route.adopt_metadata_transfer_state_from_rebased_commands(
                                 &commands,
                                 artifact.proof.state_digest,
                             )?
@@ -7557,17 +7543,15 @@ impl StorageCluster {
                     }
                     MetadataTransferImportDestination::AdoptPrefix { prefix_len } => {
                         if prefix_len > 0 {
-                            metadata_client.adopt_metadata_transfer_state_from_rebased_commands(
-                                pg_id,
-                                self.operation_epoch(),
+                            peering_route.adopt_metadata_transfer_state_from_rebased_commands(
                                 &commands[..prefix_len],
                                 commands[prefix_len - 1].post_state_digest,
                             )?;
                         }
                         let mut state = metadata_client.metadata_command_replica_state(pg_id)?;
                         for command in &commands[prefix_len..] {
-                            state = metadata_client
-                                .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                            state = peering_route
+                                .replay_metadata_command_for_peering(&command.command)?;
                         }
                         state
                     }

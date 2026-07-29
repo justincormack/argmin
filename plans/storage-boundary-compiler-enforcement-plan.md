@@ -664,7 +664,7 @@ Node-client role classification (2026-07-19):
 | `RetainedObjectPayloadReclaimNodeClient` | object subject rather than a caller-supplied PG | retained exact-claim reclaim completion and fence cleanup; opaque lease objects retain their own release authority |
 | `MetadataCommandInspectionNodeClient` | genuinely generic metadata PG | read-only command state, checkpoints, retained-log ranges, acceptance, and abandonment inspection |
 | `MetadataCommandNodeClient` | genuinely generic metadata PG | ordinary active publisher and convergence authority; serialized primary acceptance/application opens a non-nestable critical section bound to one PG and epoch, while recovery-only operations remain unavailable |
-| `MetadataCommandPeeringNodeClient` | genuinely generic metadata PG | quiesced-PG replay validation, retained-log catch-up, and metadata-transfer initialization/adoption; no command-ID allocation or pending-slot publication |
+| `MetadataCommandPeeringNodeClient` | genuinely generic metadata PG | opens a scoped peering route bound to one destination PG and epoch; the returned interface owns quiesced-PG replay validation, retained-log catch-up, and metadata-transfer initialization/adoption without accepting replacement destination route arguments, command-ID allocation, or pending-slot publication |
 | `MetadataCommandRecoveryNodeClient` | genuinely generic metadata PG | opens a non-nestable recovery critical section bound to one PG and epoch; the returned interface owns pending-slot reissue, explicitly authorized recovery apply, and durable abandonment without accepting replacement route arguments |
 | `RetainedMetadataCommandNodeClient` | genuinely generic metadata PG | exact retained-route authority for applying and finishing an opaque stream-upload abort prepared from validated node state; callers cannot supply or redirect its PG or command |
 | `StorageNodeClient` | removed transitional mixed aggregate | production and cross-boundary test callers use role-specific interfaces; deliberately process-local assertions use the sanctioned raw-node test facade; private local helpers implement the embedded adapter without exposing another trait surface |
@@ -3895,6 +3895,31 @@ Ninety-third Phase 3 slice:
   opaque-provenance regressions. Formatting, the storage boundary checker,
   workspace-wide strict Clippy, and the full 7,715-test workspace suite also
   pass.
+
+Ninety-fourth Phase 3 slice:
+
+- quiesced metadata-command peering and transfer mutation now opens a scoped
+  `MetadataCommandPeeringRoute` bound to the destination PG and epoch selected
+  by the cluster workflow. Replay, transfer initialization/adoption, and
+  checkpoint-base installation no longer accept a replacement destination PG
+  or epoch at the individual effect call.
+- embedded and Unix implementations validate replay envelopes and every
+  command in a rebased transfer batch against the captured destination route
+  before storage access or RPC. Checkpoint installation separately binds the
+  checkpoint PG while preserving its source epoch as transfer provenance, so
+  a checkpoint from an older epoch can still initialize the current
+  destination epoch.
+- startup recovery, retained-log catch-up, checkpoint import, and metadata
+  transfer callers now retain the scoped route across their mutation sequence.
+  Embedded regressions require wrong-PG and future-epoch command redirection to
+  fail without advancing either log; the Unix regression requires the same
+  failures, plus wrong-PG checkpoint rejection, before any RPC can be sent.
+  Replacing the remaining stateful method families with opaque operation
+  capabilities remains open in Phase 3.
+- all 2,401 storage tests pass, including the focused peering-route and
+  cross-epoch checkpoint-import regressions. Formatting, the storage boundary
+  checker, workspace-wide strict Clippy, and the full 7,726-test workspace
+  suite also pass.
 
 ### Phase 4 — type metadata-command publication
 

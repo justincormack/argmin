@@ -4471,15 +4471,17 @@ fn validate_metadata_command_replay_state(
         let mut primary_pending_command = None;
         for node in nodes.values() {
             let node_id = node.node_id();
+            let peering_route = node
+                .metadata_command_peering_client()
+                .open_metadata_command_peering_route(pg_id, cluster_epoch)
+                .map_err(|source| ClusterBuildError::OpenLocalNode {
+                    node_id: node_id.as_u32(),
+                    source,
+                })?;
             let state = if node_id == primary_node_id {
-                node.metadata_command_peering_client()
-                    .validate_metadata_command_replay_state_preserving_pending_slot(
-                        pg_id,
-                        cluster_epoch,
-                    )
+                peering_route.validate_metadata_command_replay_state_preserving_pending_slot()
             } else {
-                node.metadata_command_peering_client()
-                    .validate_metadata_command_replay_state(pg_id, cluster_epoch)
+                peering_route.validate_metadata_command_replay_state()
             }
             .map_err(|source| ClusterBuildError::OpenLocalNode {
                 node_id: node_id.as_u32(),
@@ -4634,9 +4636,15 @@ fn converge_in_flight_metadata_command_on_open(
     let mut converged_states = Vec::new();
     for node in nodes.values() {
         let node_id = node.node_id();
-        let state = node
+        let peering_route = node
             .metadata_command_peering_client()
-            .validate_metadata_command_replay_state(pg_id, cluster_epoch)
+            .open_metadata_command_peering_route(pg_id, cluster_epoch)
+            .map_err(|source| ClusterBuildError::OpenLocalNode {
+                node_id: node_id.as_u32(),
+                source,
+            })?;
+        let state = peering_route
+            .validate_metadata_command_replay_state()
             .map_err(|source| ClusterBuildError::OpenLocalNode {
                 node_id: node_id.as_u32(),
                 source,

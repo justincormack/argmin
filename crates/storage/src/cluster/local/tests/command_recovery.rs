@@ -4146,11 +4146,14 @@ fn metadata_transfer_import_replays_retained_suffix_over_checkpoint_base() {
         .unwrap()
         .metadata_command_peering_client()
         .clone();
-    partial_client
-        .install_metadata_transfer_checkpoint_base(pg_id, destination_epoch, &checkpoint)
+    let partial_route = partial_client
+        .open_metadata_command_peering_route(pg_id, destination_epoch)
         .unwrap();
-    partial_client
-        .replay_metadata_command_for_peering(pg_id, &rebased_commands[0].command)
+    partial_route
+        .install_metadata_transfer_checkpoint_base(&checkpoint)
+        .unwrap();
+    partial_route
+        .replay_metadata_command_for_peering(&rebased_commands[0].command)
         .unwrap();
 
     let proof = cluster
@@ -4270,12 +4273,15 @@ proptest! {
             .unwrap()
             .metadata_command_peering_client()
             .clone();
-        partial_client
-            .install_metadata_transfer_checkpoint_base(pg_id, destination_epoch, &checkpoint)
+        let partial_route = partial_client
+            .open_metadata_command_peering_route(pg_id, destination_epoch)
+            .unwrap();
+        partial_route
+            .install_metadata_transfer_checkpoint_base(&checkpoint)
             .unwrap();
         for command in &rebased_commands[..partial_prefix_len] {
-            partial_client
-                .replay_metadata_command_for_peering(pg_id, &command.command)
+            partial_route
+                .replay_metadata_command_for_peering(&command.command)
                 .unwrap();
         }
 

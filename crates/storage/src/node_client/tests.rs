@@ -236,6 +236,151 @@ fn local_active_critical_section_rejects_future_epoch_command_without_mutation()
 }
 
 #[test]
+fn local_peering_route_rejects_command_for_another_pg_without_mutation() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0, 1],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let peering = MetadataCommandPeeringNodeClient::open_metadata_command_peering_route(
+        &client,
+        PgId::new(0),
+        ClusterEpoch::new(1).unwrap(),
+    )
+    .unwrap();
+
+    let wrong_command = test_metadata_command(1, 1);
+    let error = peering
+        .replay_metadata_command_for_peering(&wrong_command)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        BucketSnapshotLoadError::Store(StoreError::MetadataCommandWrongPg {
+            command_pg_id: 1,
+            target_pg_id: 0,
+            ..
+        })
+    ));
+    let error = peering
+        .adopt_metadata_transfer_state_from_rebased_commands(
+            &[MetadataTransferCommand {
+                command: wrong_command,
+                pre_state_digest: 0,
+                post_state_digest: 1,
+            }],
+            1,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::MetadataCommandWrongPg {
+            command_pg_id: 1,
+            target_pg_id: 0,
+            ..
+        }
+    ));
+    let wrong_checkpoint = {
+        let pg = storage_node.get_pg(1).unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        pg.metadata_command_checkpoint(7, ClusterEpoch::new(1).unwrap())
+            .unwrap()
+    };
+    let error = peering
+        .install_metadata_transfer_checkpoint_base(&wrong_checkpoint)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::MetadataCheckpointInvalid {
+            pg_id: 0,
+            cluster_epoch,
+            ..
+        } if cluster_epoch == ClusterEpoch::new(1).unwrap()
+    ));
+    drop(peering);
+
+    for pg_id in [0, 1] {
+        assert_eq!(
+            storage_node
+                .get_pg(pg_id)
+                .unwrap()
+                .max_metadata_command_log_index(ClusterEpoch::new(1).unwrap())
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn local_peering_route_rejects_future_epoch_command_without_mutation() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let captured_epoch = ClusterEpoch::new(1).unwrap();
+    let future_epoch = ClusterEpoch::new(2).unwrap();
+    let peering = MetadataCommandPeeringNodeClient::open_metadata_command_peering_route(
+        &client,
+        PgId::new(0),
+        captured_epoch,
+    )
+    .unwrap();
+    let command = test_metadata_command(0, 1);
+    let future_command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(future_epoch, PgId::new(0), command.id().log_index()),
+        command.payload().clone(),
+    );
+
+    let error = peering
+        .replay_metadata_command_for_peering(&future_command)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        BucketSnapshotLoadError::Store(StoreError::StaleMetadataOperation {
+            pg_id: 0,
+            operation_epoch,
+            current_epoch,
+        }) if operation_epoch == future_epoch && current_epoch == captured_epoch
+    ));
+    let error = peering
+        .adopt_metadata_transfer_state_from_rebased_commands(
+            &[MetadataTransferCommand {
+                command: future_command,
+                pre_state_digest: 0,
+                post_state_digest: 1,
+            }],
+            1,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::StaleMetadataOperation {
+            pg_id: 0,
+            operation_epoch,
+            current_epoch,
+        } if operation_epoch == future_epoch && current_epoch == captured_epoch
+    ));
+    drop(peering);
+
+    let pg = storage_node.get_pg(0).unwrap();
+    assert_eq!(
+        pg.max_metadata_command_log_index(captured_epoch).unwrap(),
+        0
+    );
+    assert_eq!(pg.max_metadata_command_log_index(future_epoch).unwrap(), 0);
+}
+
+#[test]
 fn multipart_completion_barrier_rejects_non_completion_bucket_write_reservation() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);

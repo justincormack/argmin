@@ -3873,54 +3873,116 @@ impl MetadataCommandInspectionNodeClient for LocalStorageNodeClient {
     }
 }
 
+struct LocalMetadataCommandPeeringRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    pg_id: PgId,
+    cluster_epoch: ClusterEpoch,
+}
+
+impl LocalMetadataCommandPeeringRoute<'_> {
+    fn validate_command_route(&self, command: &MetadataCommandEnvelope) -> Result<(), StoreError> {
+        if command.id().pg_id() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id: self.client.node_id.as_u32(),
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id.get(),
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        if command.id().cluster_epoch() != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: self.pg_id.get(),
+                operation_epoch: command.id().cluster_epoch(),
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_transfer_commands(
+        &self,
+        commands: &[MetadataTransferCommand],
+    ) -> Result<(), StoreError> {
+        commands
+            .iter()
+            .try_for_each(|command| self.validate_command_route(&command.command))
+    }
+
+    fn validate_checkpoint_pg(
+        &self,
+        checkpoint: &MetadataCommandCheckpoint,
+    ) -> Result<(), StoreError> {
+        if checkpoint.pg_id != self.pg_id {
+            return Err(StoreError::MetadataCheckpointInvalid {
+                node_id: self.client.node_id.as_u32(),
+                pg_id: self.pg_id.get(),
+                cluster_epoch: self.cluster_epoch,
+                reason: format!(
+                    "checkpoint PG {} does not match captured peering PG {}",
+                    checkpoint.pg_id.get(),
+                    self.pg_id.get()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 impl MetadataCommandPeeringNodeClient for LocalStorageNodeClient {
-    fn validate_metadata_command_replay_state(
+    fn open_metadata_command_peering_route(
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
+    ) -> Result<Box<dyn MetadataCommandPeeringRoute + '_>, StoreError> {
+        drop(self.storage_node.get_pg(pg_id.get())?);
+        Ok(Box::new(LocalMetadataCommandPeeringRoute {
+            client: self,
+            pg_id,
+            cluster_epoch,
+        }))
+    }
+}
+
+impl MetadataCommandPeeringRoute for LocalMetadataCommandPeeringRoute<'_> {
+    fn validate_metadata_command_replay_state(
+        &self,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.validate_metadata_command_replay_state(self.node_id.as_u32(), cluster_epoch)
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        pg.validate_metadata_command_replay_state(self.client.node_id.as_u32(), self.cluster_epoch)
     }
 
     fn validate_metadata_command_replay_state_preserving_pending_slot(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         pg.validate_metadata_command_replay_state_preserving_pending_slot(
-            self.node_id.as_u32(),
-            cluster_epoch,
+            self.client.node_id.as_u32(),
+            self.cluster_epoch,
         )
     }
 
     fn initialize_metadata_transfer_empty_state(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
         expected_state_digest: u64,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         pg.initialize_metadata_transfer_empty_state(
-            self.node_id.as_u32(),
-            cluster_epoch,
+            self.client.node_id.as_u32(),
+            self.cluster_epoch,
             expected_state_digest,
         )
     }
 
     fn initialize_metadata_transfer_matching_state(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
         applied_log_index: u64,
         applied_log_hash: u64,
         expected_state_digest: u64,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         pg.initialize_metadata_transfer_matching_state(
-            self.node_id.as_u32(),
-            cluster_epoch,
+            self.client.node_id.as_u32(),
+            self.cluster_epoch,
             applied_log_index,
             applied_log_hash,
             expected_state_digest,
@@ -3929,15 +3991,14 @@ impl MetadataCommandPeeringNodeClient for LocalStorageNodeClient {
 
     fn adopt_metadata_transfer_state_from_rebased_commands(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
         commands: &[MetadataTransferCommand],
         expected_state_digest: u64,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        self.validate_transfer_commands(commands)?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         pg.adopt_metadata_transfer_state_from_rebased_commands(
-            self.node_id.as_u32(),
-            cluster_epoch,
+            self.client.node_id.as_u32(),
+            self.cluster_epoch,
             commands,
             expected_state_digest,
         )
@@ -3945,25 +4006,25 @@ impl MetadataCommandPeeringNodeClient for LocalStorageNodeClient {
 
     fn install_metadata_transfer_checkpoint_base(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
         checkpoint: &MetadataCommandCheckpoint,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        self.validate_checkpoint_pg(checkpoint)?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         pg.install_metadata_transfer_checkpoint_base(
-            self.node_id.as_u32(),
-            cluster_epoch,
+            self.client.node_id.as_u32(),
+            self.cluster_epoch,
             checkpoint,
         )
     }
 
     fn replay_metadata_command_for_peering(
         &self,
-        pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.apply_metadata_command_and_record(self.node_id.as_u32(), command)
+        self.validate_command_route(command)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        pg.apply_metadata_command_and_record(self.client.node_id.as_u32(), command)
     }
 }
 

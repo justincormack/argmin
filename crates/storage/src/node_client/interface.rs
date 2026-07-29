@@ -1442,29 +1442,35 @@ pub(crate) trait MetadataCommandInspectionNodeClient: Send + Sync {
 pub(crate) trait MetadataCommandPeeringNodeClient:
     MetadataCommandInspectionNodeClient + Send + Sync
 {
-    fn validate_metadata_command_replay_state(
+    /// Bind peering mutation to one metadata PG and epoch selected by an
+    /// already-quiesced cluster workflow.
+    ///
+    /// The returned interface deliberately omits PG and epoch parameters so a
+    /// caller cannot redirect authority selected for one peering route to a
+    /// different metadata command subject.
+    fn open_metadata_command_peering_route(
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
+    ) -> Result<Box<dyn MetadataCommandPeeringRoute + '_>, StoreError>;
+}
+
+pub(crate) trait MetadataCommandPeeringRoute: Send {
+    fn validate_metadata_command_replay_state(
+        &self,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
 
     fn validate_metadata_command_replay_state_preserving_pending_slot(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
 
     fn initialize_metadata_transfer_empty_state(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
         expected_state_digest: u64,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
 
     fn initialize_metadata_transfer_matching_state(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
         applied_log_index: u64,
         applied_log_hash: u64,
         expected_state_digest: u64,
@@ -1472,8 +1478,6 @@ pub(crate) trait MetadataCommandPeeringNodeClient:
 
     fn adopt_metadata_transfer_state_from_rebased_commands(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
         commands: &[MetadataTransferCommand],
         expected_state_digest: u64,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
@@ -1481,14 +1485,11 @@ pub(crate) trait MetadataCommandPeeringNodeClient:
     #[allow(dead_code)]
     fn install_metadata_transfer_checkpoint_base(
         &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
         checkpoint: &MetadataCommandCheckpoint,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
 
     fn replay_metadata_command_for_peering(
         &self,
-        pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
 }
