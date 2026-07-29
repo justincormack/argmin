@@ -12,7 +12,8 @@ use crate::storage_rpc::{
     encode_metadata_command_bool_outcome_response, encode_metadata_command_next_id_response,
     encode_metadata_command_pending_slot_insert_response,
     encode_metadata_command_state_outcome_response, encode_read_handle_acquire_response,
-    encode_storage_rpc_success_response, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+    encode_scavenger_observations_response, encode_storage_rpc_success_response,
+    read_storage_rpc_frame_from, write_storage_rpc_frame_to,
     StorageRpcMetadataCommandAcceptanceResponse, StorageRpcMetadataCommandAppliedHashesResponse,
     StorageRpcMetadataCommandBoolOutcomeResponse, StorageRpcMetadataCommandNextIdResponse,
     StorageRpcMetadataCommandPendingSlotInsertResponse,
@@ -24,6 +25,7 @@ use crate::types::{
     SerializedSystemMetadataBlob, SerializedTagSet, StorageClass, StreamUploadPartSnapshot,
 };
 use crate::RouteMapValidity;
+use crate::ShardScavengerObservationReason;
 
 fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
     StorageNodeProcessConfig {
@@ -49,6 +51,95 @@ fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
 fn private_socket_dir(path: &std::path::Path) {
     fs::create_dir_all(path).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn test_shard_scavenger_observation(data_pg_id: u32, seed: u8) -> ShardScavengerObservationRecord {
+    let shard_key = ShardKey::new(&[seed; 16], u64::from(seed), 0);
+    ShardScavengerObservationRecord {
+        key: ShardScavengerObservationKey {
+            node_id: 7,
+            data_pg_id,
+            shard_index: shard_key.shard_index(),
+            shard_key,
+        },
+        data_size: None,
+        crc64: None,
+        file_exists: false,
+        shard_row_exists: false,
+        reason: ShardScavengerObservationReason::ScanIncomplete,
+        last_error: Some(format!("PG {data_pg_id} canary")),
+    }
+}
+
+#[test]
+fn local_shard_scavenger_observation_route_rejects_foreign_subject_without_mutation() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0, 1],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let pg0_observation = test_shard_scavenger_observation(0, 0x41);
+    let pg1_observation = test_shard_scavenger_observation(1, 0x42);
+    storage_node
+        .get_pg(0)
+        .unwrap()
+        .record_shard_scavenger_observation(&pg0_observation)
+        .unwrap();
+    storage_node
+        .get_pg(1)
+        .unwrap()
+        .record_shard_scavenger_observation(&pg1_observation)
+        .unwrap();
+    let before = [0, 1].map(|pg_id| {
+        storage_node
+            .get_pg(pg_id)
+            .unwrap()
+            .list_shard_scavenger_observations()
+            .unwrap()
+    });
+
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let route = client
+        .open_shard_scavenger_observation_route(DataPgId::new_for_test(PgId::new(0)))
+        .unwrap();
+    assert_eq!(
+        route.list_shard_scavenger_observations().unwrap(),
+        before[0]
+    );
+    let mut redirected = pg1_observation;
+    redirected.last_error = Some("must not persist".to_string());
+    for error in [
+        route
+            .record_shard_scavenger_observation(&redirected)
+            .unwrap_err(),
+        route
+            .resolve_shard_scavenger_observation(&redirected.key)
+            .unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            StoreError::ShardScavengerObservationWrongPg {
+                store_pg_id: 0,
+                observation_pg_id: 1,
+            }
+        ));
+    }
+    drop(route);
+
+    for (pg_id, expected) in [0, 1].into_iter().zip(before) {
+        assert_eq!(
+            storage_node
+                .get_pg(pg_id)
+                .unwrap()
+                .list_shard_scavenger_observations()
+                .unwrap(),
+            expected
+        );
+    }
 }
 
 #[test]

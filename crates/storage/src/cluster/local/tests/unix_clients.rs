@@ -1581,27 +1581,25 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
         shard_index: key.shard_index(),
         shard_key: key.clone(),
     };
-    map.node(NodeId::new(1))
-        .unwrap()
-        .shard_scavenger_observation_client()
-        .record_shard_scavenger_observation(
-            data_pg_id,
-            &crate::ShardScavengerObservationRecord {
-                key: observation_key.clone(),
-                data_size: Some(payload.len() as u64),
-                crc64: Some(ack.crc64),
-                file_exists: true,
-                shard_row_exists: true,
-                reason: crate::ShardScavengerObservationReason::UnreferencedShardRowAndFile,
-                last_error: None,
-            },
-        )
-        .unwrap();
-    let observations = map
+    let observation_route = map
         .node(NodeId::new(1))
         .unwrap()
         .shard_scavenger_observation_client()
-        .list_shard_scavenger_observations(data_pg_id)
+        .open_shard_scavenger_observation_route(data_pg_id)
+        .unwrap();
+    observation_route
+        .record_shard_scavenger_observation(&crate::ShardScavengerObservationRecord {
+            key: observation_key.clone(),
+            data_size: Some(payload.len() as u64),
+            crc64: Some(ack.crc64),
+            file_exists: true,
+            shard_row_exists: true,
+            reason: crate::ShardScavengerObservationReason::UnreferencedShardRowAndFile,
+            last_error: None,
+        })
+        .unwrap();
+    let observations = observation_route
+        .list_shard_scavenger_observations()
         .unwrap();
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0].key, observation_key);
@@ -1614,10 +1612,8 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
         .list_shard_scavenger_observations()
         .unwrap()
         .is_empty());
-    map.node(NodeId::new(1))
-        .unwrap()
-        .shard_scavenger_observation_client()
-        .resolve_shard_scavenger_observation(data_pg_id, &observation_key)
+    observation_route
+        .resolve_shard_scavenger_observation(&observation_key)
         .unwrap();
     let missing_key = ShardKey::new(&[0x62; 16], 100, 0);
     let err = map

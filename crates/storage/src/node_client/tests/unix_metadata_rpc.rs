@@ -1259,6 +1259,98 @@ fn unix_peering_route_rejects_redirected_commands_before_rpc() {
 }
 
 #[test]
+fn unix_shard_scavenger_observation_route_rejects_foreign_subject_before_rpc() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let route = client
+        .open_shard_scavenger_observation_route(DataPgId::new_for_test(PgId::new(0)))
+        .unwrap();
+    let observation = test_shard_scavenger_observation(1, 0x43);
+
+    for error in [
+        route
+            .record_shard_scavenger_observation(&observation)
+            .unwrap_err(),
+        route
+            .resolve_shard_scavenger_observation(&observation.key)
+            .unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            StoreError::ShardScavengerObservationWrongPg {
+                store_pg_id: 0,
+                observation_pg_id: 1,
+            }
+        ));
+    }
+}
+
+#[test]
+fn unix_shard_scavenger_observation_route_rejects_foreign_list_response() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&config.socket_path).unwrap();
+    let observation = test_shard_scavenger_observation(1, 0x44);
+    let response_observation = ShardScavengerObservation {
+        key: observation.key,
+        first_seen_at: 10,
+        last_seen_at: 11,
+        observation_count: 1,
+        data_size: observation.data_size,
+        crc64: observation.crc64,
+        file_exists: observation.file_exists,
+        shard_row_exists: observation.shard_row_exists,
+        reason: observation.reason,
+        last_error: observation.last_error,
+        resolved_at: None,
+    };
+    let server_thread = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+        assert_eq!(
+            request.kind,
+            StorageRpcMessageKind::ShardScavengerObservations
+        );
+        let payload = encode_scavenger_observations_response(&[response_observation]);
+        write_storage_rpc_frame_to(
+            &mut stream,
+            &StorageRpcFrame {
+                request_id: request.request_id,
+                kind: request.kind,
+                payload: encode_storage_rpc_success_response(&payload),
+            },
+        )
+        .unwrap();
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let route = client
+        .open_shard_scavenger_observation_route(DataPgId::new_for_test(PgId::new(0)))
+        .unwrap();
+
+    let error = route.list_shard_scavenger_observations().unwrap_err();
+    server_thread.join().unwrap();
+
+    assert!(matches!(
+        error,
+        StoreError::StorageRpc {
+            operation: "validate shard scavenger observations response",
+            failure: StorageRpcErrorCode::PayloadDecode,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn unix_storage_node_client_inserts_bucket_control_pending_slot_idempotently() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);

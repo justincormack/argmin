@@ -658,7 +658,7 @@ Node-client role classification (2026-07-19):
 | `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active data route for serving I/O, current placement cleanup, and repair/backfill work |
 | `RetainedPlacedShardNodeClient`, `RetainedShardAckNodeClient` | data | retained exact-placement inspection and cleanup for historical shard bytes and acknowledgement rows |
 | `ShardScavengerNodeClient` | data for shard rows/files and object-metadata reference scans | read-only inventory authority for the validated active or retained scan location |
-| `ShardScavengerObservationNodeClient` | data PG for durable observation rows | active primary-only authority to record, list, and resolve non-authoritative scavenger findings |
+| `ShardScavengerObservationNodeClient` | data PG for durable observation rows | opens an active primary-only route bound to one data PG; the returned interface records, lists, and resolves non-authoritative scavenger findings without accepting a replacement PG |
 | `ShardReadHandleNodeClient` | data locations carried in the handle request | active/retained authority is inherited from each validated `ShardLocation`; the lease itself remains non-cloneable |
 | `ObjectPayloadLeaseNodeClient` | object subject rather than a caller-supplied PG | active subject-bound lease acquisition, reclaim-begin, and observation; placement is validated when shard locations are acquired |
 | `RetainedObjectPayloadReclaimNodeClient` | object subject rather than a caller-supplied PG | retained exact-claim reclaim completion and fence cleanup; opaque lease objects retain their own release authority |
@@ -3920,6 +3920,33 @@ Ninety-fourth Phase 3 slice:
   cross-epoch checkpoint-import regressions. Formatting, the storage boundary
   checker, workspace-wide strict Clippy, and the full 7,726-test workspace
   suite also pass.
+
+Ninety-fifth Phase 3 slice:
+
+- shard-scavenger observation mutation now opens a scoped
+  `ShardScavengerObservationRoute` bound to the data PG selected by the active
+  primary route. Record, list, and resolve operations no longer accept a
+  replacement PG after the route is opened.
+- embedded and Unix routes validate the data PG embedded in record/resolve
+  subjects before PgStore or transport access, and validate every listed row
+  before returning it through the scoped interface. A foreign-PG Unix response
+  fails as a transport payload error. Storage-node RPC dispatch keeps its
+  independent active-route, primary, and wire-subject validation before it
+  constructs the embedded route; the cluster scavenger retains one scoped
+  route throughout each PG audit.
+- an embedded regression seeds exact canaries in both PGs and requires
+  redirected record/resolve attempts to leave both unchanged. A Unix
+  regression performs the same subject redirection without a listening server,
+  proving rejection before RPC. A fake Unix peer returns an otherwise valid
+  foreign-PG list row and must be rejected at the response boundary, while the
+  full Unix shard-client test covers successful record/list/resolve dispatch.
+  Replacing the remaining stateful method families with scoped or opaque
+  operation capabilities remains open in Phase 3.
+- all 2,404 storage tests pass, including the focused scoped-route, malformed
+  response, raw RPC,
+  and full Unix dispatch regressions. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full 7,729-test workspace suite also
+  pass.
 
 ### Phase 4 — type metadata-command publication
 

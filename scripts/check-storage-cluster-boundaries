@@ -228,7 +228,8 @@ migrated_shard_scavenger_metadata_bypasses=$(
             if (pending_shard_scavenger_observation_client \
                 || $0 ~ /\.shard_scavenger_observation_client\(\)/ \
                 || $0 ~ /shard_scavenger_observation_client\./ \
-                || $0 ~ /observation_client\./) {
+                || $0 ~ /observation_client\./ \
+                || $0 ~ /observation_route\./) {
                 pending_shard_scavenger_observation_client = 0
                 next
             }

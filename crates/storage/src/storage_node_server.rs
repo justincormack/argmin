@@ -12842,7 +12842,14 @@ impl StorageNodeConnectionHandler {
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.record_shard_scavenger_observation(data_pg_id, &request.observation) {
+        let observation_route =
+            match local_client.open_shard_scavenger_observation_route(data_pg_id) {
+                Ok(observation_route) => observation_route,
+                Err(error) => {
+                    return encode_storage_rpc_error_response(&store_error_response(error));
+                }
+            };
+        match observation_route.record_shard_scavenger_observation(&request.observation) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
         }
@@ -12863,7 +12870,14 @@ impl StorageNodeConnectionHandler {
         }
         let data_pg_id = self.validated_data_pg(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.list_shard_scavenger_observations(data_pg_id) {
+        let observation_route =
+            match local_client.open_shard_scavenger_observation_route(data_pg_id) {
+                Ok(observation_route) => observation_route,
+                Err(error) => {
+                    return encode_storage_rpc_error_response(&store_error_response(error));
+                }
+            };
+        match observation_route.list_shard_scavenger_observations() {
             Ok(observations) => Ok(encode_storage_rpc_success_response(
                 &encode_scavenger_observations_response(&observations),
             )),
@@ -12897,7 +12911,14 @@ impl StorageNodeConnectionHandler {
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.resolve_shard_scavenger_observation(data_pg_id, &request.key) {
+        let observation_route =
+            match local_client.open_shard_scavenger_observation_route(data_pg_id) {
+                Ok(observation_route) => observation_route,
+                Err(error) => {
+                    return encode_storage_rpc_error_response(&store_error_response(error));
+                }
+            };
+        match observation_route.resolve_shard_scavenger_observation(&request.key) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
         }

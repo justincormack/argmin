@@ -1313,20 +1313,28 @@ pub(crate) trait ShardScavengerNodeClient: Send + Sync {
 /// separate from scan access prevents an inventory client from publishing or
 /// resolving observations.
 pub(crate) trait ShardScavengerObservationNodeClient: Send + Sync {
-    fn record_shard_scavenger_observation(
+    /// Bind primary-only scavenger observation state to one routed data PG.
+    ///
+    /// The returned interface omits a PG argument so record/list/resolve calls
+    /// cannot redirect authority selected for another observation partition.
+    fn open_shard_scavenger_observation_route(
         &self,
         data_pg_id: DataPgId,
+    ) -> Result<Box<dyn ShardScavengerObservationRoute + '_>, StoreError>;
+}
+
+pub(crate) trait ShardScavengerObservationRoute: Send {
+    fn record_shard_scavenger_observation(
+        &self,
         observation: &ShardScavengerObservationRecord,
     ) -> Result<(), StoreError>;
 
     fn list_shard_scavenger_observations(
         &self,
-        data_pg_id: DataPgId,
     ) -> Result<Vec<ShardScavengerObservation>, StoreError>;
 
     fn resolve_shard_scavenger_observation(
         &self,
-        data_pg_id: DataPgId,
         key: &ShardScavengerObservationKey,
     ) -> Result<(), StoreError>;
 }

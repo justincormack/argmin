@@ -13880,7 +13880,9 @@ impl StorageCluster {
             let data_pg = self.validated_data_pg(route.pg_id())?;
             let data_pg_id = data_pg.get();
             let scavenger_client = primary_node.shard_scavenger_client();
-            let observation_client = primary_node.shard_scavenger_observation_client();
+            let observation_route = primary_node
+                .shard_scavenger_observation_client()
+                .open_shard_scavenger_observation_route(data_pg)?;
             let shard_rows = scavenger_client.list_scavenger_shard_rows(data_pg)?;
             let rows_by_key: HashMap<ShardKey, WriteAck> = shard_rows
                 .iter()
@@ -13914,15 +13916,14 @@ impl StorageCluster {
             }
 
             if !reference_scan_errors.is_empty() {
-                observation_client.record_shard_scavenger_observation(
-                    data_pg,
+                observation_route.record_shard_scavenger_observation(
                     &Self::shard_scavenger_scan_incomplete_observation(
                         primary_node_id,
                         data_pg_id,
                         &reference_scan_errors,
                     ),
                 )?;
-                observations.extend(observation_client.list_shard_scavenger_observations(data_pg)?);
+                observations.extend(observation_route.list_shard_scavenger_observations()?);
                 continue;
             }
 
@@ -13932,14 +13933,13 @@ impl StorageCluster {
                     errors_by_node.entry(node_id).or_default().push(error);
                 }
                 for (node_id, errors) in errors_by_node {
-                    observation_client.record_shard_scavenger_observation(
-                        data_pg,
+                    observation_route.record_shard_scavenger_observation(
                         &Self::shard_scavenger_scan_incomplete_observation(
                             node_id, data_pg_id, &errors,
                         ),
                     )?;
                 }
-                observations.extend(observation_client.list_shard_scavenger_observations(data_pg)?);
+                observations.extend(observation_route.list_shard_scavenger_observations()?);
                 continue;
             }
 
@@ -13956,8 +13956,7 @@ impl StorageCluster {
                     };
                     let Some(row_ack) = rows_by_key.get(&file.key).copied() else {
                         active_observations.insert(observation_key.clone());
-                        observation_client.record_shard_scavenger_observation(
-                            data_pg,
+                        observation_route.record_shard_scavenger_observation(
                             &ShardScavengerObservationRecord {
                                 key: observation_key,
                                 data_size: Some(file.size),
@@ -13975,8 +13974,7 @@ impl StorageCluster {
                         continue;
                     }
                     active_observations.insert(observation_key.clone());
-                    observation_client.record_shard_scavenger_observation(
-                        data_pg,
+                    observation_route.record_shard_scavenger_observation(
                         &ShardScavengerObservationRecord {
                             key: observation_key,
                             data_size: Some(row_ack.stored_size),
@@ -14008,8 +14006,7 @@ impl StorageCluster {
                             shard_key: row.key.clone(),
                         };
                         active_observations.insert(observation_key.clone());
-                        observation_client.record_shard_scavenger_observation(
-                            data_pg,
+                        observation_route.record_shard_scavenger_observation(
                             &ShardScavengerObservationRecord {
                                 key: observation_key,
                                 data_size: Some(row.ack.stored_size),
@@ -14046,8 +14043,7 @@ impl StorageCluster {
                     shard_key: row.key,
                 };
                 active_observations.insert(observation_key.clone());
-                observation_client.record_shard_scavenger_observation(
-                    data_pg,
+                observation_route.record_shard_scavenger_observation(
                     &ShardScavengerObservationRecord {
                         key: observation_key,
                         data_size: Some(row.ack.stored_size),
@@ -14060,7 +14056,7 @@ impl StorageCluster {
                 )?;
             }
 
-            for observation in observation_client.list_shard_scavenger_observations(data_pg)? {
+            for observation in observation_route.list_shard_scavenger_observations()? {
                 if observation.key.data_pg_id != data_pg_id
                     || observation.resolved_at.is_some()
                     || !matches!(
@@ -14074,12 +14070,11 @@ impl StorageCluster {
                     continue;
                 }
                 if !active_observations.contains(&observation.key) {
-                    observation_client
-                        .resolve_shard_scavenger_observation(data_pg, &observation.key)?;
+                    observation_route.resolve_shard_scavenger_observation(&observation.key)?;
                 }
             }
 
-            observations.extend(observation_client.list_shard_scavenger_observations(data_pg)?);
+            observations.extend(observation_route.list_shard_scavenger_observations()?);
         }
 
         Ok(observations)
@@ -16955,7 +16950,8 @@ impl StorageCluster {
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .shard_scavenger_observation_client()
-            .list_shard_scavenger_observations(self.validated_data_pg(pg_id)?)
+            .open_shard_scavenger_observation_route(self.validated_data_pg(pg_id)?)?
+            .list_shard_scavenger_observations()
     }
 
     fn emit_best_effort_payload_cleanup_error(&self, operation: &'static str, error: &StoreError) {

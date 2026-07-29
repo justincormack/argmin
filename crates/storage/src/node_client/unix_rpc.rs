@@ -338,7 +338,7 @@ impl UnixStorageNodeClient {
         })
     }
 
-    pub(crate) fn record_shard_scavenger_observation(
+    fn record_shard_scavenger_observation(
         &self,
         data_pg_id: DataPgId,
         observation: &ShardScavengerObservationRecord,
@@ -367,7 +367,7 @@ impl UnixStorageNodeClient {
         }
     }
 
-    pub(crate) fn list_shard_scavenger_observations(
+    fn list_shard_scavenger_observations(
         &self,
         data_pg_id: DataPgId,
     ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
@@ -388,7 +388,7 @@ impl UnixStorageNodeClient {
         })
     }
 
-    pub(crate) fn resolve_shard_scavenger_observation(
+    fn resolve_shard_scavenger_observation(
         &self,
         data_pg_id: DataPgId,
         key: &ShardScavengerObservationKey,
@@ -1317,28 +1317,74 @@ impl ShardScavengerNodeClient for UnixStorageNodeClient {
     }
 }
 
+struct UnixShardScavengerObservationRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    data_pg_id: DataPgId,
+}
+
+impl UnixShardScavengerObservationRoute<'_> {
+    fn validate_key(&self, key: &ShardScavengerObservationKey) -> Result<(), StoreError> {
+        if key.data_pg_id != self.data_pg_id.get() {
+            return Err(StoreError::ShardScavengerObservationWrongPg {
+                store_pg_id: self.data_pg_id.get(),
+                observation_pg_id: key.data_pg_id,
+            });
+        }
+        Ok(())
+    }
+}
+
 impl ShardScavengerObservationNodeClient for UnixStorageNodeClient {
-    fn record_shard_scavenger_observation(
+    fn open_shard_scavenger_observation_route(
         &self,
         data_pg_id: DataPgId,
+    ) -> Result<Box<dyn ShardScavengerObservationRoute + '_>, StoreError> {
+        Ok(Box::new(UnixShardScavengerObservationRoute {
+            client: self,
+            data_pg_id,
+        }))
+    }
+}
+
+impl ShardScavengerObservationRoute for UnixShardScavengerObservationRoute<'_> {
+    fn record_shard_scavenger_observation(
+        &self,
         observation: &ShardScavengerObservationRecord,
     ) -> Result<(), StoreError> {
-        UnixStorageNodeClient::record_shard_scavenger_observation(self, data_pg_id, observation)
+        self.validate_key(&observation.key)?;
+        UnixStorageNodeClient::record_shard_scavenger_observation(
+            self.client,
+            self.data_pg_id,
+            observation,
+        )
     }
 
     fn list_shard_scavenger_observations(
         &self,
-        data_pg_id: DataPgId,
     ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
-        UnixStorageNodeClient::list_shard_scavenger_observations(self, data_pg_id)
+        let observations =
+            UnixStorageNodeClient::list_shard_scavenger_observations(self.client, self.data_pg_id)?;
+        for observation in &observations {
+            self.validate_key(&observation.key).map_err(|error| {
+                self.client.rpc_payload_error(
+                    "validate shard scavenger observations response",
+                    error.to_string(),
+                )
+            })?;
+        }
+        Ok(observations)
     }
 
     fn resolve_shard_scavenger_observation(
         &self,
-        data_pg_id: DataPgId,
         key: &ShardScavengerObservationKey,
     ) -> Result<(), StoreError> {
-        UnixStorageNodeClient::resolve_shard_scavenger_observation(self, data_pg_id, key)
+        self.validate_key(key)?;
+        UnixStorageNodeClient::resolve_shard_scavenger_observation(
+            self.client,
+            self.data_pg_id,
+            key,
+        )
     }
 }
 
