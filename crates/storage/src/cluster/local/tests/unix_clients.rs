@@ -1,5 +1,7 @@
 use super::*;
-use crate::node_client::{ObjectPayloadLeaseKind, ObjectPayloadLeaseRoute};
+use crate::node_client::{
+    ObjectPayloadLeaseKind, ObjectPayloadLeaseRoute, RetainedPlacedShardRoute,
+};
 use crate::storage_rpc::StorageRpcErrorCode;
 use crate::{
     ObjectPayloadReclaimKind, PlacedSegmentShardBackfillClaimAcquire,
@@ -24,6 +26,8 @@ struct RecordingPlacedShardClient {
     node_id: NodeId,
     writes: Mutex<Vec<(DataPgId, ShardKey, Vec<u8>)>>,
 }
+
+struct RecordingRetainedPlacedShardRoute;
 
 impl RecordingPlacedShardClient {
     fn new(node_id: NodeId) -> Self {
@@ -111,10 +115,18 @@ impl PlacedShardNodeClient for RecordingPlacedShardClient {
 }
 
 impl RetainedPlacedShardNodeClient for RecordingPlacedShardClient {
-    fn read_placed_shard_for_historical_inspection(
+    fn open_retained_placed_shard_route(
         &self,
         _location: ShardLocation,
         _key: &ShardKey,
+    ) -> Result<Box<dyn RetainedPlacedShardRoute + '_>, StoreError> {
+        Ok(Box::new(RecordingRetainedPlacedShardRoute))
+    }
+}
+
+impl RetainedPlacedShardRoute for RecordingRetainedPlacedShardRoute {
+    fn read_placed_shard_for_historical_inspection(
+        &self,
         _expected_ack: WriteAck,
     ) -> Result<Vec<u8>, StoreError> {
         Err(StoreError::Io {
@@ -123,11 +135,7 @@ impl RetainedPlacedShardNodeClient for RecordingPlacedShardClient {
         })
     }
 
-    fn delete_placed_shard_for_historical_cleanup(
-        &self,
-        _location: ShardLocation,
-        _key: &ShardKey,
-    ) -> Result<(), StoreError> {
+    fn delete_placed_shard_for_historical_cleanup(&self) -> Result<(), StoreError> {
         Ok(())
     }
 }
@@ -10251,7 +10259,11 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     );
     let server_thread = {
         let server = Arc::clone(&server);
-        thread::spawn(move || server.accept_one().unwrap())
+        thread::spawn(move || {
+            for _ in 0..2 {
+                server.accept_one().unwrap();
+            }
+        })
     };
     map.install_unix_shard_clients([LocalUnixShardNodeClientConfig::new(
         target_node,
@@ -10276,6 +10288,12 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
         ),
         "frontend-local shard should remain absent: {local_read:?}"
     );
+    map.delete_payload_shard_for_historical_cleanup(location, &shard_key)
+        .unwrap();
+    assert!(matches!(
+        remote.read_shard_file(data_pg_id.get(), &shard_key),
+        Err(StoreError::NotFound)
+    ));
     server_thread.join().unwrap();
 }
 

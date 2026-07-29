@@ -26,6 +26,12 @@ struct LocalRetainedObjectPayloadReclaimRoute {
     authority: ObjectPayloadReclaimClaimProof,
 }
 
+struct LocalRetainedPlacedShardRoute {
+    storage_node: Arc<SharedStorageNode>,
+    location: crate::cluster::ShardLocation,
+    key: ShardKey,
+}
+
 impl ObjectPayloadLeaseNodeLease for LocalObjectPayloadLease {
     fn release(&mut self) -> Result<usize, StoreError> {
         if self.released {
@@ -254,37 +260,44 @@ impl PlacedShardNodeClient for LocalStorageNodeClient {
 }
 
 impl RetainedPlacedShardNodeClient for LocalStorageNodeClient {
+    fn open_retained_placed_shard_route(
+        &self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+    ) -> Result<Box<dyn RetainedPlacedShardRoute + '_>, StoreError> {
+        if location.node_id() != self.node_id {
+            return Err(StoreError::NodeNotFound {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+            });
+        }
+        if location.shard_index() != key.shard_index() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open retained placed shard route",
+            });
+        }
+        drop(self.storage_node.get_pg(location.data_pg_id().get())?);
+        Ok(Box::new(LocalRetainedPlacedShardRoute {
+            storage_node: Arc::clone(&self.storage_node),
+            location,
+            key: key.clone(),
+        }))
+    }
+}
+
+impl RetainedPlacedShardRoute for LocalRetainedPlacedShardRoute {
     fn read_placed_shard_for_historical_inspection(
         &self,
-        location: crate::cluster::ShardLocation,
-        key: &ShardKey,
         _expected_ack: WriteAck,
     ) -> Result<Vec<u8>, StoreError> {
-        if location.node_id() != self.node_id {
-            return Err(StoreError::NodeNotFound {
-                node_id: location.node_id().as_u32(),
-                pg_id: location.data_pg_id().get(),
-                cluster_epoch: location.cluster_epoch(),
-            });
-        }
         self.storage_node
-            .read_shard_file(location.data_pg_id().get(), key)
+            .read_shard_file(self.location.data_pg_id().get(), &self.key)
     }
 
-    fn delete_placed_shard_for_historical_cleanup(
-        &self,
-        location: crate::cluster::ShardLocation,
-        key: &ShardKey,
-    ) -> Result<(), StoreError> {
-        if location.node_id() != self.node_id {
-            return Err(StoreError::NodeNotFound {
-                node_id: location.node_id().as_u32(),
-                pg_id: location.data_pg_id().get(),
-                cluster_epoch: location.cluster_epoch(),
-            });
-        }
+    fn delete_placed_shard_for_historical_cleanup(&self) -> Result<(), StoreError> {
         self.storage_node
-            .delete_shard_file(location.data_pg_id().get(), key)
+            .delete_shard_file(self.location.data_pg_id().get(), &self.key)
     }
 }
 

@@ -4408,7 +4408,8 @@ impl LocalClusterMap {
             })?;
         let data = node
             .retained_shard_client()
-            .read_placed_shard_for_historical_inspection(location, key, expected)
+            .open_retained_placed_shard_route(location, key)
+            .and_then(|route| route.read_placed_shard_for_historical_inspection(expected))
             .map_err(|source| ShardIoError::Store {
                 node_id: location.node_id().as_u32(),
                 pg_id: location.data_pg_id().get(),
@@ -4543,7 +4544,8 @@ impl LocalClusterMap {
                 cluster_epoch: location.cluster_epoch(),
             })?;
         node.retained_shard_client()
-            .delete_placed_shard_for_historical_cleanup(location, key)
+            .open_retained_placed_shard_route(location, key)
+            .and_then(|route| route.delete_placed_shard_for_historical_cleanup())
             .map_err(|source| ShardIoError::Store {
                 node_id: location.node_id().as_u32(),
                 pg_id: location.data_pg_id().get(),

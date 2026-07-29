@@ -1,6 +1,12 @@
 use super::*;
 use crate::BucketAclSummary;
 
+struct UnixRetainedPlacedShardRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    location: crate::cluster::ShardLocation,
+    key: ShardKey,
+}
+
 impl UnixStorageNodeClient {
     pub(crate) fn write_placed_shard(
         &self,
@@ -988,26 +994,57 @@ impl PlacedShardNodeClient for UnixStorageNodeClient {
 }
 
 impl RetainedPlacedShardNodeClient for UnixStorageNodeClient {
-    fn read_placed_shard_for_historical_inspection(
+    fn open_retained_placed_shard_route(
         &self,
         location: crate::cluster::ShardLocation,
         key: &ShardKey,
+    ) -> Result<Box<dyn RetainedPlacedShardRoute + '_>, StoreError> {
+        if location.node_id() != self.node_id {
+            return Err(StoreError::NodeNotFound {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+            });
+        }
+        if location.cluster_epoch() > self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: location.data_pg_id().get(),
+                operation_epoch: location.cluster_epoch(),
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        if location.shard_index() != key.shard_index() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open retained placed shard route",
+            });
+        }
+        Ok(Box::new(UnixRetainedPlacedShardRoute {
+            client: self,
+            location,
+            key: key.clone(),
+        }))
+    }
+}
+
+impl RetainedPlacedShardRoute for UnixRetainedPlacedShardRoute<'_> {
+    fn read_placed_shard_for_historical_inspection(
+        &self,
         expected_ack: WriteAck,
     ) -> Result<Vec<u8>, StoreError> {
         UnixStorageNodeClient::read_placed_shard_for_historical_inspection(
-            self,
-            location,
-            key,
+            self.client,
+            self.location,
+            &self.key,
             expected_ack,
         )
     }
 
-    fn delete_placed_shard_for_historical_cleanup(
-        &self,
-        location: crate::cluster::ShardLocation,
-        key: &ShardKey,
-    ) -> Result<(), StoreError> {
-        UnixStorageNodeClient::delete_placed_shard_at_location(self, location, key)
+    fn delete_placed_shard_for_historical_cleanup(&self) -> Result<(), StoreError> {
+        UnixStorageNodeClient::delete_placed_shard_at_location(
+            self.client,
+            self.location,
+            &self.key,
+        )
     }
 }
 

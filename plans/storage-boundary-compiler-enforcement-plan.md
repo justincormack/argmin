@@ -4053,6 +4053,30 @@ Ninety-ninth Phase 3 slice:
   boundary checker, workspace-wide strict Clippy, and the full 7,757-test
   workspace suite also pass.
 
+One-hundredth Phase 3 slice:
+
+- retained placed-shard access now opens a `RetainedPlacedShardRoute` bound to
+  one exact historical `ShardLocation` and `ShardKey`. Historical inspection
+  and cleanup no longer accept replacement placement or shard subjects after
+  the route is opened.
+- embedded and Unix factories reject a foreign node, PG, epoch, or shard index
+  before storage or transport access as applicable. The opened routes retain
+  the same historical-read acknowledgement validation and read-handle deletion
+  fence semantics, while storage-node RPC dispatch keeps its independent
+  retained-route, acting-set, and wire-subject validation.
+- an embedded regression proves the route reads and deletes only its captured
+  shard while a foreign shard remains intact, and rejects an unavailable PG
+  before storage access. A no-listener Unix regression proves foreign node,
+  future epoch, and shard-index subjects fail before RPC. The installed-Unix
+  integration regression now performs both a historical read and cleanup
+  delete against the remote storage node, proving the complete transport path.
+  Replacing the remaining stateful method families with scoped or opaque
+  operation capabilities remains open in Phase 3.
+- all 2,433 storage tests pass, including the four focused retained placed-
+  shard route regressions. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full 7,759-test workspace suite also
+  pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

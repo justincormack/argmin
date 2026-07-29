@@ -1076,18 +1076,20 @@ pub(crate) trait PlacedShardNodeClient: Send + Sync {
 /// Retained access to exact shard placements which may outlive the active
 /// data route that originally wrote them.
 pub(crate) trait RetainedPlacedShardNodeClient: Send + Sync {
-    fn read_placed_shard_for_historical_inspection(
+    fn open_retained_placed_shard_route(
         &self,
         location: crate::cluster::ShardLocation,
         key: &ShardKey,
+    ) -> Result<Box<dyn RetainedPlacedShardRoute + '_>, StoreError>;
+}
+
+pub(crate) trait RetainedPlacedShardRoute: Send {
+    fn read_placed_shard_for_historical_inspection(
+        &self,
         expected_ack: WriteAck,
     ) -> Result<Vec<u8>, StoreError>;
 
-    fn delete_placed_shard_for_historical_cleanup(
-        &self,
-        location: crate::cluster::ShardLocation,
-        key: &ShardKey,
-    ) -> Result<(), StoreError>;
+    fn delete_placed_shard_for_historical_cleanup(&self) -> Result<(), StoreError>;
 }
 
 pub(crate) trait ShardReadHandleLease: Send {
