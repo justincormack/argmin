@@ -663,8 +663,9 @@ Node-client role classification (2026-07-19):
 | `ObjectPayloadLeaseNodeClient` | object subject rather than a caller-supplied PG | active subject-bound lease acquisition, reclaim-begin, and observation; placement is validated when shard locations are acquired |
 | `RetainedObjectPayloadReclaimNodeClient` | object subject rather than a caller-supplied PG | retained exact-claim reclaim completion and fence cleanup; opaque lease objects retain their own release authority |
 | `MetadataCommandInspectionNodeClient` | genuinely generic metadata PG | read-only command state, checkpoints, retained-log ranges, acceptance, and abandonment inspection |
-| `MetadataCommandNodeClient` | genuinely generic metadata PG | active publisher/convergence authority; broader recovery/reissue separation remains open |
+| `MetadataCommandNodeClient` | genuinely generic metadata PG | ordinary active publisher and convergence authority; cannot replace pending slots, apply authorized recovery, or record abandonment |
 | `MetadataCommandPeeringNodeClient` | genuinely generic metadata PG | quiesced-PG replay validation, retained-log catch-up, and metadata-transfer initialization/adoption; no command-ID allocation or pending-slot publication |
+| `MetadataCommandRecoveryNodeClient` | genuinely generic metadata PG | pending-slot reissue, explicitly authorized recovery apply, and durable abandonment; exposes only the inspection needed while holding its recovery critical section |
 | `RetainedMetadataCommandNodeClient` | genuinely generic metadata PG | exact retained-route authority for applying and finishing a previously prepared stream-upload abort |
 | `StorageNodeClient` | removed transitional mixed aggregate | production and cross-boundary test callers use role-specific interfaces; deliberately process-local assertions use the sanctioned raw-node test facade; private local helpers implement the embedded adapter without exposing another trait surface |
 
@@ -3787,6 +3788,33 @@ Eighty-ninth Phase 3 slice:
   and 80-test metadata-transfer groups. Formatting, the storage boundary
   checker, and workspace-wide strict Clippy pass, as does the full 7,689-test
   workspace suite.
+
+Ninetieth Phase 3 slice:
+
+- pending-command reissue, explicitly authorized recovery apply, and durable
+  abandonment are now removed from `MetadataCommandNodeClient` and owned by
+  `MetadataCommandRecoveryNodeClient`. The recovery role exposes only the
+  command-state reads needed to make replacement and apply decisions while
+  holding its critical section; it cannot allocate command IDs, install fresh
+  request-path commands, remove completed slots, or apply ordinary commands.
+- `LocalNodeStore` and `LocalNodeClients` retain a separate recovery trait
+  object, and both Unix-client installers wire that role independently.
+  Ordinary primary-first fanout continues through the active publisher;
+  reissue and authorized historical-route recovery select the recovery role
+  explicitly, including a distinct locked Unix recovery session. Acting-set
+  maximum-log inspection during reissue uses only the read-only inspection
+  role and never acquires an active publisher.
+- the successful Unix idempotent-reissue regression now performs both slot
+  replacements through one locked recovery session, while malformed
+  abandonment responses are exercised through the same narrow role. The
+  storage boundary checker recognizes recovery clients and no longer exempts
+  the complete reissue function from inspection. Replacing the remaining
+  stateful method families with opaque operation capabilities remains open in
+  Phase 3.
+- all 2,370 storage tests pass, including the focused 104-test recovery and
+  39-test Unix metadata-RPC groups. Formatting, the storage boundary checker,
+  and workspace-wide strict Clippy pass, as does the full 7,689-test workspace
+  suite.
 
 ### Phase 4 — type metadata-command publication
 

@@ -1396,7 +1396,7 @@ fn reissue_accepts_terminal_pending_command_after_stale_primary_max_snapshot() {
         .matching_reissued_pending_command_if_safe(
             pg_id,
             primary.node_id(),
-            primary.metadata_command_client().as_ref(),
+            primary.metadata_command_recovery_client().as_ref(),
             0,
             command.id().log_index().get(),
             &command,
@@ -1432,7 +1432,7 @@ fn terminal_pending_reissue_rejects_different_stale_payload() {
         .matching_reissued_pending_command_if_safe(
             pg_id,
             primary.node_id(),
-            primary.metadata_command_client().as_ref(),
+            primary.metadata_command_recovery_client().as_ref(),
             0,
             current.id().log_index().get(),
             &stale,
@@ -1491,7 +1491,7 @@ fn terminal_pending_reissue_rejects_divergent_replica_prefix() {
             NodeId::new(1),
             map.node(NodeId::new(1))
                 .unwrap()
-                .metadata_command_client()
+                .metadata_command_recovery_client()
                 .as_ref(),
             0,
             current.id().log_index().get(),
@@ -1551,7 +1551,7 @@ fn terminal_pending_reissue_rejects_live_replica_ahead_of_stale_max() {
             NodeId::new(1),
             map.node(NodeId::new(1))
                 .unwrap()
-                .metadata_command_client()
+                .metadata_command_recovery_client()
                 .as_ref(),
             0,
             current.id().log_index().get(),

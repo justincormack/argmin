@@ -50,8 +50,9 @@ use crate::node::SharedStorageNode;
 use crate::node_client::{
     BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
     CreateStreamUploadPrecondition, MetadataCommandInspectionNodeClient, MetadataCommandNodeClient,
-    MetadataCommandPeeringNodeClient, ObjectListingMetadataNodeClient, ObjectPayloadLeaseNodeLease,
-    RetainedShardAckNodeClient, ShardAckNodeClient,
+    MetadataCommandPeeringNodeClient, MetadataCommandRecoveryNodeClient,
+    ObjectListingMetadataNodeClient, ObjectPayloadLeaseNodeLease, RetainedShardAckNodeClient,
+    ShardAckNodeClient,
 };
 pub use crate::peering::PgMetadataTransferArtifact;
 use crate::peering::{
@@ -6164,7 +6165,7 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         primary_node_id: NodeId,
-        primary_metadata_client: &dyn MetadataCommandNodeClient,
+        primary_metadata_client: &dyn MetadataCommandRecoveryNodeClient,
         primary_max_log_index: u64,
         acting_set_max_log_index: u64,
         stale_command: &MetadataCommandEnvelope,
@@ -6187,7 +6188,7 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         primary_node_id: NodeId,
-        primary_metadata_client: &dyn MetadataCommandNodeClient,
+        primary_metadata_client: &dyn MetadataCommandRecoveryNodeClient,
         primary_max_log_index: u64,
         acting_set_max_log_index: u64,
         expected_payload: &MetadataCommandPayload,
@@ -6340,7 +6341,7 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         primary_node_id: NodeId,
-        primary_metadata_client: &dyn MetadataCommandNodeClient,
+        primary_metadata_client: &dyn MetadataCommandRecoveryNodeClient,
         acting_set_max_log_index: u64,
         primary_state: &MetadataCommandReplicaState,
         current: MetadataCommandEnvelope,
@@ -6379,15 +6380,18 @@ impl StorageCluster {
                 .metadata_pg_acting_nodes_for_metadata_command_recovery(route_epoch, pg_id),
         }?;
         for node in nodes {
-            let metadata_client: &dyn MetadataCommandNodeClient =
-                if node.node_id() == primary_node_id {
-                    primary_metadata_client
-                } else {
-                    node.metadata_command_client().as_ref()
-                };
-            let node_max_log_index =
-                metadata_client.max_metadata_command_log_index(pg_id, route_epoch)?;
-            let node_state = metadata_client.metadata_command_replica_state(pg_id)?;
+            let (node_max_log_index, node_state) = if node.node_id() == primary_node_id {
+                (
+                    primary_metadata_client.max_metadata_command_log_index(pg_id, route_epoch)?,
+                    primary_metadata_client.metadata_command_replica_state(pg_id)?,
+                )
+            } else {
+                let metadata_client = node.metadata_command_inspection_client();
+                (
+                    metadata_client.max_metadata_command_log_index(pg_id, route_epoch)?,
+                    metadata_client.metadata_command_replica_state(pg_id)?,
+                )
+            };
             if node_max_log_index > current_log_index {
                 return Err(self.metadata_command_conflict(
                     node.node_id(),
@@ -6408,11 +6412,21 @@ impl StorageCluster {
                 }
                 continue;
             }
-            if !metadata_client.has_matching_applied_metadata_command_log_entry(
-                pg_id,
-                &current,
-                previous_log_hash,
-            )? {
+            let matches_applied = if node.node_id() == primary_node_id {
+                primary_metadata_client.has_matching_applied_metadata_command_log_entry(
+                    pg_id,
+                    &current,
+                    previous_log_hash,
+                )?
+            } else {
+                node.metadata_command_inspection_client()
+                    .has_matching_applied_metadata_command_log_entry(
+                        pg_id,
+                        &current,
+                        previous_log_hash,
+                    )?
+            };
+            if !matches_applied {
                 return Err(self.metadata_command_conflict(
                     node.node_id(),
                     pg_id,
@@ -6475,11 +6489,10 @@ impl StorageCluster {
             "reissue_attempt",
             Some(command.payload().kind_name()),
         );
-        let primary_metadata_client = primary.metadata_command_client();
+        let primary_metadata_client = primary.metadata_command_recovery_client();
         let acting_set_max_log_index = self
             .max_metadata_command_log_index_on_acting_set_with_route_mode(
                 pg_id,
-                None,
                 route_mode,
                 route_epoch,
             )?;
@@ -6495,7 +6508,7 @@ impl StorageCluster {
 
         let replace_outcome = {
             let primary_critical_section = primary_metadata_client
-                .open_metadata_command_critical_section(pg_id, route_epoch)?;
+                .open_metadata_command_recovery_critical_section(pg_id, route_epoch)?;
             let primary_max_log_index =
                 primary_critical_section.max_metadata_command_log_index(pg_id, route_epoch)?;
             let Some(current) =
@@ -6568,7 +6581,6 @@ impl StorageCluster {
                 let acting_set_max_log_index = self
                     .max_metadata_command_log_index_on_acting_set_with_route_mode(
                         pg_id,
-                        None,
                         route_mode,
                         route_epoch,
                     )?;
@@ -6599,7 +6611,6 @@ impl StorageCluster {
     fn max_metadata_command_log_index_on_acting_set_with_route_mode(
         &self,
         pg_id: PgId,
-        primary_override: Option<(NodeId, &dyn MetadataCommandNodeClient)>,
         route_mode: MetadataCommandRouteMode,
         route_epoch: ClusterEpoch,
     ) -> Result<u64, StoreError> {
@@ -6613,12 +6624,7 @@ impl StorageCluster {
                 .metadata_pg_acting_nodes_for_metadata_command_recovery(route_epoch, pg_id),
         }?;
         for node in nodes {
-            let metadata_client: &dyn MetadataCommandNodeClient = match primary_override.as_ref() {
-                Some((primary_node_id, primary_client)) if *primary_node_id == node.node_id() => {
-                    *primary_client
-                }
-                _ => node.metadata_command_client().as_ref(),
-            };
+            let metadata_client = node.metadata_command_inspection_client();
             max_log_index = max_log_index
                 .max(metadata_client.max_metadata_command_log_index(pg_id, route_epoch)?);
         }

@@ -3954,6 +3954,142 @@ impl MetadataCommandPeeringNodeClient for LocalStorageNodeClient {
     }
 }
 
+impl MetadataCommandRecoveryNodeClient for LocalStorageNodeClient {
+    fn open_metadata_command_recovery_critical_section(
+        &self,
+        _pg_id: PgId,
+        _cluster_epoch: ClusterEpoch,
+    ) -> Result<Box<dyn MetadataCommandRecoveryNodeClient>, StoreError> {
+        Ok(Box::new(self.clone()))
+    }
+
+    fn max_metadata_command_log_index(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<u64, StoreError> {
+        MetadataCommandInspectionNodeClient::max_metadata_command_log_index(
+            self,
+            pg_id,
+            cluster_epoch,
+        )
+    }
+
+    fn pending_metadata_command_envelope(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        MetadataCommandInspectionNodeClient::pending_metadata_command_envelope(
+            self,
+            pg_id,
+            cluster_epoch,
+        )
+    }
+
+    fn metadata_command_replica_state(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        MetadataCommandInspectionNodeClient::metadata_command_replica_state(self, pg_id)
+    }
+
+    fn metadata_command_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        MetadataCommandInspectionNodeClient::metadata_command_acceptance(self, pg_id, command)
+    }
+
+    fn metadata_command_abandon_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        MetadataCommandInspectionNodeClient::metadata_command_abandon_acceptance(
+            self, pg_id, command,
+        )
+    }
+
+    fn applied_metadata_command_log_entry_hashes(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        MetadataCommandInspectionNodeClient::applied_metadata_command_log_entry_hashes(
+            self, pg_id, command,
+        )
+    }
+
+    fn has_matching_applied_metadata_command_log_entry(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        expected_previous_log_hash: u64,
+    ) -> Result<bool, StoreError> {
+        MetadataCommandInspectionNodeClient::has_matching_applied_metadata_command_log_entry(
+            self,
+            pg_id,
+            command,
+            expected_previous_log_hash,
+        )
+    }
+
+    fn replace_pending_metadata_command_slot_for_reissue(
+        &self,
+        pg_id: PgId,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+    ) -> Result<bool, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.replace_pending_metadata_command_slot_for_reissue(
+            self.node_id.as_u32(),
+            previous,
+            replacement,
+            bucket,
+        )
+    }
+
+    fn replace_pending_metadata_command_slot_for_recovery(
+        &self,
+        pg_id: PgId,
+        _authorized_source: &MetadataCommandEnvelope,
+        _abandoned_source: Option<&MetadataCommandEnvelope>,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+    ) -> Result<bool, StoreError> {
+        MetadataCommandRecoveryNodeClient::replace_pending_metadata_command_slot_for_reissue(
+            self,
+            pg_id,
+            previous,
+            replacement,
+            bucket,
+        )
+    }
+
+    fn apply_metadata_command_and_record_for_recovery(
+        &self,
+        pg_id: PgId,
+        _authorized_source: &MetadataCommandEnvelope,
+        _abandoned_source: Option<&MetadataCommandEnvelope>,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        self.apply_metadata_command_and_record_inner(pg_id, command)
+    }
+
+    fn record_metadata_command_abandoned(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.record_metadata_command_abandoned(self.node_id.as_u32(), command)
+    }
+}
+
 impl RetainedMetadataCommandNodeClient for LocalStorageNodeClient {
     fn apply_retained_stream_upload_abort(
         &self,
@@ -4072,34 +4208,6 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, StoreError> {
         self.remove_pending_metadata_command_slot_inner(pg_id, command)
-    }
-
-    fn replace_pending_metadata_command_slot_for_reissue(
-        &self,
-        pg_id: PgId,
-        previous: &MetadataCommandEnvelope,
-        replacement: &MetadataCommandEnvelope,
-        bucket: Option<&BucketName>,
-    ) -> Result<bool, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.replace_pending_metadata_command_slot_for_reissue(
-            self.node_id.as_u32(),
-            previous,
-            replacement,
-            bucket,
-        )
-    }
-
-    fn replace_pending_metadata_command_slot_for_recovery(
-        &self,
-        pg_id: PgId,
-        _authorized_source: &MetadataCommandEnvelope,
-        _abandoned_source: Option<&MetadataCommandEnvelope>,
-        previous: &MetadataCommandEnvelope,
-        replacement: &MetadataCommandEnvelope,
-        bucket: Option<&BucketName>,
-    ) -> Result<bool, StoreError> {
-        self.replace_pending_metadata_command_slot_for_reissue(pg_id, previous, replacement, bucket)
     }
 
     fn metadata_command_replica_state(
@@ -4234,24 +4342,5 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
         self.apply_metadata_command_and_record_inner(pg_id, command)
-    }
-
-    fn apply_metadata_command_and_record_for_recovery(
-        &self,
-        pg_id: PgId,
-        _authorized_source: &MetadataCommandEnvelope,
-        _abandoned_source: Option<&MetadataCommandEnvelope>,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        self.apply_metadata_command_and_record(pg_id, command)
-    }
-
-    fn record_metadata_command_abandoned(
-        &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        pg.record_metadata_command_abandoned(self.node_id.as_u32(), command)
     }
 }

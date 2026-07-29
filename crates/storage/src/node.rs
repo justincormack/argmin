@@ -19,14 +19,14 @@ use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState, Canonic
 use super::clients::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
     LocalStorageNodeClient, MetadataCommandInspectionNodeClient, MetadataCommandNodeClient,
-    MetadataCommandPeeringNodeClient, ObjectGenerationMetadataNodeClient,
-    ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
-    ObjectPayloadLeaseNodeClient, ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
-    PlacedShardNodeClient, RetainedBucketWriteReservationNodeClient,
-    RetainedMetadataCommandNodeClient, RetainedObjectMutationMetadataNodeClient,
-    RetainedObjectPayloadReclaimNodeClient, RetainedPlacedShardNodeClient,
-    RetainedShardAckNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient,
-    ShardScavengerNodeClient, ShardScavengerObservationNodeClient,
+    MetadataCommandPeeringNodeClient, MetadataCommandRecoveryNodeClient,
+    ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
+    ObjectMutationMetadataNodeClient, ObjectPayloadLeaseNodeClient, ObjectReadMetadataNodeClient,
+    ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
+    RetainedBucketWriteReservationNodeClient, RetainedMetadataCommandNodeClient,
+    RetainedObjectMutationMetadataNodeClient, RetainedObjectPayloadReclaimNodeClient,
+    RetainedPlacedShardNodeClient, RetainedShardAckNodeClient, ShardAckNodeClient,
+    ShardReadHandleNodeClient, ShardScavengerNodeClient, ShardScavengerObservationNodeClient,
 };
 use super::{BucketPgId, DataPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 use crate::cluster::ProcessLocalRegistryKey;
@@ -427,6 +427,7 @@ pub(crate) struct LocalNodeClients {
     pub(crate) metadata_command: Arc<dyn MetadataCommandNodeClient>,
     pub(crate) metadata_command_inspection: Arc<dyn MetadataCommandInspectionNodeClient>,
     pub(crate) metadata_command_peering: Arc<dyn MetadataCommandPeeringNodeClient>,
+    pub(crate) metadata_command_recovery: Arc<dyn MetadataCommandRecoveryNodeClient>,
     pub(crate) retained_metadata_command: Arc<dyn RetainedMetadataCommandNodeClient>,
     pub(crate) shard: Arc<dyn PlacedShardNodeClient>,
     pub(crate) retained_shard: Arc<dyn RetainedPlacedShardNodeClient>,
@@ -492,6 +493,7 @@ impl LocalNodeRuntime {
             metadata_command: self.client.clone(),
             metadata_command_inspection: self.client.clone(),
             metadata_command_peering: self.client.clone(),
+            metadata_command_recovery: self.client.clone(),
             retained_metadata_command: self.client.clone(),
             shard: self.client.clone(),
             retained_shard: self.client.clone(),

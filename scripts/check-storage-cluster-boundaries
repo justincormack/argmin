@@ -487,25 +487,21 @@ migrated_metadata_pg_bypasses=$(
         if (in_test_hook) {
             next
         }
-        if (current_fn == "reissue_pending_metadata_command" \
-            || current_fn == "reissue_pending_metadata_command_with_route_mode") {
-            next
-        }
-        if ($0 ~ /\.metadata_command_(inspection_|peering_)?client\(\)/ \
-            || $0 ~ /metadata_command_(inspection_|peering_)?client[[:space:]]*$/ \
-            || $0 ~ /(primary_metadata_client|metadata_client)[[:space:]]*$/) {
+        if ($0 ~ /\.metadata_command_(inspection_|peering_|recovery_)?client\(\)/ \
+            || $0 ~ /metadata_command_(inspection_|peering_|recovery_)?client[[:space:]]*$/ \
+            || $0 ~ /(primary_metadata_client|metadata_client|primary_critical_section)[[:space:]]*$/) {
             pending_metadata_command_client = 1
         }
-        if ($0 ~ /\.(max_metadata_command_log_index|pending_metadata_command_slot|pending_metadata_command_envelope|try_insert_pending_metadata_command_slot|try_insert_bucket_control_pending_metadata_command_slot|remove_pending_metadata_command_slot|replace_pending_metadata_command_slot_for_reissue|metadata_command_replica_state|validate_metadata_command_replay_state|validate_metadata_command_replay_state_preserving_pending_slot|metadata_command_acceptance|metadata_command_abandon_acceptance|applied_metadata_command_log_entry_hashes|has_matching_applied_metadata_command_log_entry|apply_metadata_command_and_record|record_metadata_command_abandoned|metadata_command_abandoned)\(/) {
+        if ($0 ~ /\.(max_metadata_command_log_index|pending_metadata_command_slot|pending_metadata_command_envelope|try_insert_pending_metadata_command_slot|try_insert_bucket_control_pending_metadata_command_slot|remove_pending_metadata_command_slot|replace_pending_metadata_command_slot_for_(reissue|recovery)|metadata_command_replica_state|validate_metadata_command_replay_state|validate_metadata_command_replay_state_preserving_pending_slot|metadata_command_acceptance|metadata_command_abandon_acceptance|applied_metadata_command_log_entry_hashes|has_matching_applied_metadata_command_log_entry|apply_metadata_command_and_record(_for_recovery)?|record_metadata_command_abandoned|metadata_command_abandoned)\(/) {
             if (pending_metadata_command_client \
-                || $0 ~ /\.metadata_command_(inspection_|peering_)?client\(\)/) {
+                || $0 ~ /\.metadata_command_(inspection_|peering_|recovery_)?client\(\)/) {
                 pending_metadata_command_client = 0
                 next
             }
-            if ($0 ~ /metadata_command_(inspection_|peering_)?client\./) {
+            if ($0 ~ /metadata_command_(inspection_|peering_|recovery_)?client\./) {
                 next
             }
-            if ($0 ~ /(primary_metadata_client|metadata_client)\./) {
+            if ($0 ~ /(primary_metadata_client|metadata_client|primary_critical_section)\./) {
                 next
             }
             print FILENAME ":" FNR ":" $0

@@ -30,7 +30,7 @@ use crate::node::{
 use crate::node_client::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
     LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandInspectionNodeClient,
-    MetadataCommandNodeClient, MetadataCommandPeeringNodeClient,
+    MetadataCommandNodeClient, MetadataCommandPeeringNodeClient, MetadataCommandRecoveryNodeClient,
     ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
     ObjectMutationMetadataNodeClient, ObjectPayloadLeaseNodeClient, ObjectPayloadLeaseNodeLease,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
@@ -511,6 +511,7 @@ pub struct LocalNodeStore {
     metadata_command_client: Arc<dyn MetadataCommandNodeClient>,
     metadata_command_inspection_client: Arc<dyn MetadataCommandInspectionNodeClient>,
     metadata_command_peering_client: Arc<dyn MetadataCommandPeeringNodeClient>,
+    metadata_command_recovery_client: Arc<dyn MetadataCommandRecoveryNodeClient>,
     retained_metadata_command_client: Arc<dyn RetainedMetadataCommandNodeClient>,
     shard_client: Arc<dyn PlacedShardNodeClient>,
     retained_shard_client: Arc<dyn RetainedPlacedShardNodeClient>,
@@ -545,6 +546,7 @@ impl LocalNodeStore {
             metadata_command_client: clients.metadata_command,
             metadata_command_inspection_client: clients.metadata_command_inspection,
             metadata_command_peering_client: clients.metadata_command_peering,
+            metadata_command_recovery_client: clients.metadata_command_recovery,
             retained_metadata_command_client: clients.retained_metadata_command,
             shard_client: clients.shard,
             retained_shard_client: clients.retained_shard,
@@ -666,6 +668,12 @@ impl LocalNodeStore {
         &self,
     ) -> &Arc<dyn MetadataCommandPeeringNodeClient> {
         &self.metadata_command_peering_client
+    }
+
+    pub(crate) fn metadata_command_recovery_client(
+        &self,
+    ) -> &Arc<dyn MetadataCommandRecoveryNodeClient> {
+        &self.metadata_command_recovery_client
     }
 
     pub(crate) fn retained_metadata_command_client(
@@ -2392,6 +2400,8 @@ impl LocalClusterMap {
                 client.clone();
             let metadata_command_peering_client: Arc<dyn MetadataCommandPeeringNodeClient> =
                 client.clone();
+            let metadata_command_recovery_client: Arc<dyn MetadataCommandRecoveryNodeClient> =
+                client.clone();
             let retained_metadata_command_client: Arc<dyn RetainedMetadataCommandNodeClient> =
                 client.clone();
             let object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient> =
@@ -2429,6 +2439,7 @@ impl LocalClusterMap {
             node.metadata_command_client = metadata_command_client;
             node.metadata_command_inspection_client = metadata_command_inspection_client;
             node.metadata_command_peering_client = metadata_command_peering_client;
+            node.metadata_command_recovery_client = metadata_command_recovery_client;
             node.retained_metadata_command_client = retained_metadata_command_client;
             node.object_generation_metadata_client = object_generation_metadata_client;
             node.object_version_metadata_client = object_version_metadata_client;
@@ -2543,11 +2554,14 @@ impl LocalClusterMap {
                 client.clone();
             let metadata_command_peering_client: Arc<dyn MetadataCommandPeeringNodeClient> =
                 client.clone();
+            let metadata_command_recovery_client: Arc<dyn MetadataCommandRecoveryNodeClient> =
+                client.clone();
             let retained_metadata_command_client: Arc<dyn RetainedMetadataCommandNodeClient> =
                 client;
             node.metadata_command_client = metadata_command_client;
             node.metadata_command_inspection_client = metadata_command_inspection_client;
             node.metadata_command_peering_client = metadata_command_peering_client;
+            node.metadata_command_recovery_client = metadata_command_recovery_client;
             node.retained_metadata_command_client = retained_metadata_command_client;
         }
         Ok(())

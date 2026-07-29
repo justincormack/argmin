@@ -1495,6 +1495,91 @@ pub(crate) trait MetadataCommandPeeringNodeClient:
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
 }
 
+/// Pending-command convergence and explicitly authorized recovery mutation.
+/// Ordinary publishers cannot replace an existing pending slot, apply a
+/// recovery command, or record abandonment through their active interface.
+pub(crate) trait MetadataCommandRecoveryNodeClient: Send + Sync {
+    fn open_metadata_command_recovery_critical_section(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Box<dyn MetadataCommandRecoveryNodeClient>, StoreError>;
+
+    fn max_metadata_command_log_index(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<u64, StoreError>;
+
+    fn pending_metadata_command_envelope(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError>;
+
+    fn metadata_command_replica_state(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    fn metadata_command_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError>;
+
+    fn metadata_command_abandon_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError>;
+
+    fn applied_metadata_command_log_entry_hashes(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<(u64, u64)>, StoreError>;
+
+    fn has_matching_applied_metadata_command_log_entry(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        expected_previous_log_hash: u64,
+    ) -> Result<bool, StoreError>;
+
+    fn replace_pending_metadata_command_slot_for_reissue(
+        &self,
+        pg_id: PgId,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+    ) -> Result<bool, StoreError>;
+
+    fn replace_pending_metadata_command_slot_for_recovery(
+        &self,
+        pg_id: PgId,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+    ) -> Result<bool, StoreError>;
+
+    fn apply_metadata_command_and_record_for_recovery(
+        &self,
+        pg_id: PgId,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
+
+    fn record_metadata_command_abandoned(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+}
+
 pub(crate) trait MetadataCommandNodeClient: Send + Sync {
     fn open_metadata_command_critical_section(
         &self,
@@ -1564,24 +1649,6 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
-    ) -> Result<bool, StoreError>;
-
-    fn replace_pending_metadata_command_slot_for_reissue(
-        &self,
-        pg_id: PgId,
-        previous: &MetadataCommandEnvelope,
-        replacement: &MetadataCommandEnvelope,
-        bucket: Option<&BucketName>,
-    ) -> Result<bool, StoreError>;
-
-    fn replace_pending_metadata_command_slot_for_recovery(
-        &self,
-        pg_id: PgId,
-        authorized_source: &MetadataCommandEnvelope,
-        abandoned_source: Option<&MetadataCommandEnvelope>,
-        previous: &MetadataCommandEnvelope,
-        replacement: &MetadataCommandEnvelope,
-        bucket: Option<&BucketName>,
     ) -> Result<bool, StoreError>;
 
     fn metadata_command_replica_state(
@@ -1663,18 +1730,4 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
-
-    fn apply_metadata_command_and_record_for_recovery(
-        &self,
-        pg_id: PgId,
-        authorized_source: &MetadataCommandEnvelope,
-        abandoned_source: Option<&MetadataCommandEnvelope>,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
-
-    fn record_metadata_command_abandoned(
-        &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, StoreError>;
 }

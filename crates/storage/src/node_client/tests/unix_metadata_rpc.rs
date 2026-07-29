@@ -986,7 +986,7 @@ fn unix_storage_node_client_inserts_pending_metadata_command_slot_idempotently()
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = StorageNodeServer::bind(config.clone()).unwrap();
     let server_thread = thread::spawn(move || {
-        for _ in 0..5 {
+        for _ in 0..4 {
             server.accept_one().unwrap();
         }
     });
@@ -1013,9 +1013,16 @@ fn unix_storage_node_client_inserts_pending_metadata_command_slot_idempotently()
         Some(&bucket),
     )
     .unwrap();
-    assert!(
-        MetadataCommandNodeClient::replace_pending_metadata_command_slot_for_reissue(
+    let recovery_session =
+        MetadataCommandRecoveryNodeClient::open_metadata_command_recovery_critical_section(
             &client,
+            PgId::new(0),
+            config.cluster_epoch,
+        )
+        .unwrap();
+    assert!(
+        MetadataCommandRecoveryNodeClient::replace_pending_metadata_command_slot_for_reissue(
+            recovery_session.as_ref(),
             PgId::new(0),
             &command,
             &replacement,
@@ -1024,8 +1031,8 @@ fn unix_storage_node_client_inserts_pending_metadata_command_slot_idempotently()
         .unwrap()
     );
     assert!(
-        MetadataCommandNodeClient::replace_pending_metadata_command_slot_for_reissue(
-            &client,
+        MetadataCommandRecoveryNodeClient::replace_pending_metadata_command_slot_for_reissue(
+            recovery_session.as_ref(),
             PgId::new(0),
             &command,
             &replacement,
@@ -1034,6 +1041,7 @@ fn unix_storage_node_client_inserts_pending_metadata_command_slot_idempotently()
         .unwrap(),
         "replacing after a lost response should be idempotent"
     );
+    drop(recovery_session);
     let conflict = MetadataCommandNodeClient::try_insert_pending_metadata_command_slot(
         &client,
         PgId::new(0),
@@ -1149,8 +1157,12 @@ fn unix_storage_node_client_removes_pending_metadata_command_slot_idempotently()
         Some(&bucket),
     )
     .unwrap();
-    MetadataCommandNodeClient::record_metadata_command_abandoned(&client, PgId::new(0), &command)
-        .unwrap();
+    MetadataCommandRecoveryNodeClient::record_metadata_command_abandoned(
+        &client,
+        PgId::new(0),
+        &command,
+    )
+    .unwrap();
     assert!(
         MetadataCommandNodeClient::remove_pending_metadata_command_slot(
             &client,
@@ -1201,13 +1213,13 @@ fn unix_storage_node_client_records_abandoned_metadata_command_idempotently() {
     );
     let command = test_metadata_command(0, 1);
 
-    let first = MetadataCommandNodeClient::record_metadata_command_abandoned(
+    let first = MetadataCommandRecoveryNodeClient::record_metadata_command_abandoned(
         &client,
         PgId::new(0),
         &command,
     )
     .unwrap();
-    let second = MetadataCommandNodeClient::record_metadata_command_abandoned(
+    let second = MetadataCommandRecoveryNodeClient::record_metadata_command_abandoned(
         &client,
         PgId::new(0),
         &command,
@@ -1433,6 +1445,56 @@ fn metadata_command_session_result_from_fake_response<R>(
     result
 }
 
+fn metadata_command_recovery_session_result_from_fake_response<R>(
+    target_payload: Vec<u8>,
+    call: impl FnOnce(Box<dyn MetadataCommandRecoveryNodeClient>) -> R,
+) -> R {
+    let tmp = test_util::tempdir();
+    let socket_path = tmp.path().join("sock").join("storage.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let join = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let acquire = read_storage_rpc_frame_from(&mut stream).unwrap();
+        assert_eq!(
+            acquire.kind,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire
+        );
+        let acquire_response = StorageRpcFrame {
+            request_id: acquire.request_id,
+            kind: acquire.kind,
+            payload: encode_storage_rpc_success_response(&[]),
+        };
+        write_storage_rpc_frame_to(&mut stream, &acquire_response).unwrap();
+
+        let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+        let response = StorageRpcFrame {
+            request_id: request.request_id,
+            kind: request.kind,
+            payload: encode_storage_rpc_success_response(&target_payload),
+        };
+        write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+
+        assert!(matches!(
+            read_storage_rpc_frame_from(&mut stream),
+            Err(StorageRpcStreamError::Io(_))
+        ));
+    });
+    let client =
+        UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+    let session =
+        MetadataCommandRecoveryNodeClient::open_metadata_command_recovery_critical_section(
+            &client,
+            PgId::new(0),
+            ClusterEpoch::new(1).unwrap(),
+        )
+        .unwrap();
+
+    let result = call(session);
+    join.join().unwrap();
+    result
+}
+
 #[test]
 fn unix_storage_node_session_rejects_malformed_log_conflicts() {
     let command = test_metadata_command(0, 1);
@@ -1575,7 +1637,7 @@ fn unix_storage_node_session_rejects_malformed_log_conflicts() {
         },
     );
     let abandoned_error =
-        metadata_command_session_result_from_fake_response(abandoned_payload, |session| {
+        metadata_command_recovery_session_result_from_fake_response(abandoned_payload, |session| {
             session
                 .record_metadata_command_abandoned(PgId::new(0), &command)
                 .unwrap_err()
@@ -1700,7 +1762,7 @@ fn unix_storage_node_client_preserves_record_abandoned_log_conflict() {
         let client =
             UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
 
-        let err = MetadataCommandNodeClient::record_metadata_command_abandoned(
+        let err = MetadataCommandRecoveryNodeClient::record_metadata_command_abandoned(
             &client,
             PgId::new(0),
             &test_metadata_command(0, 1),

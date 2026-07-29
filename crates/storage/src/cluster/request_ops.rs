@@ -1807,68 +1807,112 @@ impl super::StorageCluster {
         let mut admission_witnessed = false;
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
             if node.node_id() == primary_node_id {
-                let primary_critical_section = node
-                    .metadata_command_client()
-                    .open_metadata_command_critical_section(pg_id, command.id().cluster_epoch())
-                    .map_err(|source| MetadataCommandApplyFailure {
-                        applied_nodes,
-                        source: BucketSnapshotLoadError::Store(source),
-                    })?;
-                let metadata_client = primary_critical_section.as_ref();
-                let acceptance = metadata_client
-                    .metadata_command_acceptance(pg_id, command)
-                    .map_err(|source| MetadataCommandApplyFailure {
-                        applied_nodes,
-                        source: BucketSnapshotLoadError::Store(source),
-                    })?;
-                if acceptance == MetadataCommandAcceptance::AlreadyApplied {
-                    let apply = match authorized_source {
-                        Some(source) => metadata_client
+                if let Some(source) = authorized_source {
+                    let primary_critical_section = node
+                        .metadata_command_recovery_client()
+                        .open_metadata_command_recovery_critical_section(
+                            pg_id,
+                            command.id().cluster_epoch(),
+                        )
+                        .map_err(|source| MetadataCommandApplyFailure {
+                            applied_nodes,
+                            source: BucketSnapshotLoadError::Store(source),
+                        })?;
+                    let metadata_client = primary_critical_section.as_ref();
+                    let acceptance = metadata_client
+                        .metadata_command_acceptance(pg_id, command)
+                        .map_err(|source| MetadataCommandApplyFailure {
+                            applied_nodes,
+                            source: BucketSnapshotLoadError::Store(source),
+                        })?;
+                    if acceptance == MetadataCommandAcceptance::AlreadyApplied {
+                        metadata_client
                             .apply_metadata_command_and_record_for_recovery(
                                 pg_id,
                                 source,
                                 abandoned_source,
                                 command,
-                            ),
-                        None => metadata_client.apply_metadata_command_and_record(pg_id, command),
-                    };
-                    apply.map_err(|source| MetadataCommandApplyFailure {
-                        applied_nodes,
-                        source,
-                    })?;
-                    admission_witnessed = true;
-                    continue;
-                }
-                if !admission_witnessed {
+                            )
+                            .map_err(|source| MetadataCommandApplyFailure {
+                                applied_nodes,
+                                source,
+                            })?;
+                        admission_witnessed = true;
+                        continue;
+                    }
                     reservation_authority
                         .validate_metadata_command_bucket_write_reservation(command)
                         .map_err(|source| MetadataCommandApplyFailure {
                             applied_nodes,
                             source,
                         })?;
-                }
-                maybe_run_before_metadata_command_apply_hook(
-                    self.metadata_command_apply_test_hook_scope_id(),
-                    node.node_id(),
-                    command,
-                )
-                .map_err(|source| MetadataCommandApplyFailure {
-                    applied_nodes,
-                    source: source.into(),
-                })?;
-                let apply = match authorized_source {
-                    Some(source) => metadata_client.apply_metadata_command_and_record_for_recovery(
-                        pg_id,
-                        source,
-                        abandoned_source,
+                    maybe_run_before_metadata_command_apply_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        node.node_id(),
                         command,
-                    ),
-                    None => metadata_client.apply_metadata_command_and_record(pg_id, command),
-                };
-                apply.map_err(|source| MetadataCommandApplyFailure {
-                    applied_nodes,
-                    source,
-                })?;
+                    )
+                    .map_err(|source| MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source: source.into(),
+                    })?;
+                    metadata_client
+                        .apply_metadata_command_and_record_for_recovery(
+                            pg_id,
+                            source,
+                            abandoned_source,
+                            command,
+                        )
+                        .map_err(|source| MetadataCommandApplyFailure {
+                            applied_nodes,
+                            source,
+                        })?;
+                } else {
+                    let primary_critical_section = node
+                        .metadata_command_client()
+                        .open_metadata_command_critical_section(pg_id, command.id().cluster_epoch())
+                        .map_err(|source| MetadataCommandApplyFailure {
+                            applied_nodes,
+                            source: BucketSnapshotLoadError::Store(source),
+                        })?;
+                    let metadata_client = primary_critical_section.as_ref();
+                    let acceptance = metadata_client
+                        .metadata_command_acceptance(pg_id, command)
+                        .map_err(|source| MetadataCommandApplyFailure {
+                            applied_nodes,
+                            source: BucketSnapshotLoadError::Store(source),
+                        })?;
+                    if acceptance == MetadataCommandAcceptance::AlreadyApplied {
+                        metadata_client
+                            .apply_metadata_command_and_record(pg_id, command)
+                            .map_err(|source| MetadataCommandApplyFailure {
+                                applied_nodes,
+                                source,
+                            })?;
+                        admission_witnessed = true;
+                        continue;
+                    }
+                    reservation_authority
+                        .validate_metadata_command_bucket_write_reservation(command)
+                        .map_err(|source| MetadataCommandApplyFailure {
+                            applied_nodes,
+                            source,
+                        })?;
+                    maybe_run_before_metadata_command_apply_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        node.node_id(),
+                        command,
+                    )
+                    .map_err(|source| MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source: source.into(),
+                    })?;
+                    metadata_client
+                        .apply_metadata_command_and_record(pg_id, command)
+                        .map_err(|source| MetadataCommandApplyFailure {
+                            applied_nodes,
+                            source,
+                        })?;
+                }
                 admission_witnessed = true;
                 continue;
             }
@@ -1877,7 +1921,6 @@ impl super::StorageCluster {
                 admission_witnessed,
                 "metadata primary must be visited first"
             );
-            let metadata_client = node.metadata_command_client();
             let acceptance = match route_mode {
                 MetadataCommandRouteMode::Normal => {
                     self.local_map.validate_metadata_command_for_replica(
@@ -1902,13 +1945,17 @@ impl super::StorageCluster {
             })?;
             if acceptance == MetadataCommandAcceptance::AlreadyApplied {
                 let apply = match authorized_source {
-                    Some(source) => metadata_client.apply_metadata_command_and_record_for_recovery(
-                        pg_id,
-                        source,
-                        abandoned_source,
-                        command,
-                    ),
-                    None => metadata_client.apply_metadata_command_and_record(pg_id, command),
+                    Some(source) => node
+                        .metadata_command_recovery_client()
+                        .apply_metadata_command_and_record_for_recovery(
+                            pg_id,
+                            source,
+                            abandoned_source,
+                            command,
+                        ),
+                    None => node
+                        .metadata_command_client()
+                        .apply_metadata_command_and_record(pg_id, command),
                 };
                 apply.map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,
@@ -1926,13 +1973,17 @@ impl super::StorageCluster {
                 source: source.into(),
             })?;
             let apply = match authorized_source {
-                Some(source) => metadata_client.apply_metadata_command_and_record_for_recovery(
-                    pg_id,
-                    source,
-                    abandoned_source,
-                    command,
-                ),
-                None => metadata_client.apply_metadata_command_and_record(pg_id, command),
+                Some(source) => node
+                    .metadata_command_recovery_client()
+                    .apply_metadata_command_and_record_for_recovery(
+                        pg_id,
+                        source,
+                        abandoned_source,
+                        command,
+                    ),
+                None => node
+                    .metadata_command_client()
+                    .apply_metadata_command_and_record(pg_id, command),
             };
             apply.map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes,
@@ -2008,8 +2059,11 @@ impl super::StorageCluster {
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
             let metadata_client = if node.node_id() == primary_node_id {
                 let primary_critical_section = node
-                    .metadata_command_client()
-                    .open_metadata_command_critical_section(pg_id, command.id().cluster_epoch())
+                    .metadata_command_recovery_client()
+                    .open_metadata_command_recovery_critical_section(
+                        pg_id,
+                        command.id().cluster_epoch(),
+                    )
                     .map_err(|source| MetadataCommandApplyFailure {
                         applied_nodes,
                         source: BucketSnapshotLoadError::Store(source),
@@ -2031,7 +2085,7 @@ impl super::StorageCluster {
                 }
                 continue;
             } else {
-                node.metadata_command_client().as_ref()
+                node.metadata_command_recovery_client().as_ref()
             };
             let acceptance = self
                 .local_map

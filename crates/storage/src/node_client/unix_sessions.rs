@@ -687,6 +687,277 @@ impl Drop for UnixStorageNodeMetadataCommandSession {
         self.close_metadata_command_pg_lock_on_drop();
     }
 }
+
+impl MetadataCommandRecoveryNodeClient for UnixStorageNodeMetadataCommandSession {
+    fn open_metadata_command_recovery_critical_section(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Box<dyn MetadataCommandRecoveryNodeClient>, StoreError> {
+        if cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        let held_pg_id = self.inner.lock().unwrap_or_else(|e| e.into_inner()).pg_id;
+        if pg_id != held_pg_id {
+            return Err(self.rpc_payload_error(
+                "open nested metadata command recovery critical section",
+                format!(
+                    "session holds metadata command PG {}, not requested PG {}",
+                    held_pg_id.get(),
+                    pg_id.get()
+                ),
+            ));
+        }
+        Err(self.rpc_payload_error(
+            "open nested metadata command recovery critical section",
+            "nested metadata command critical sections are not supported".to_string(),
+        ))
+    }
+
+    fn max_metadata_command_log_index(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<u64, StoreError> {
+        MetadataCommandNodeClient::max_metadata_command_log_index(self, pg_id, cluster_epoch)
+    }
+
+    fn pending_metadata_command_envelope(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        MetadataCommandNodeClient::pending_metadata_command_envelope(self, pg_id, cluster_epoch)
+    }
+
+    fn metadata_command_replica_state(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        MetadataCommandNodeClient::metadata_command_replica_state(self, pg_id)
+    }
+
+    fn metadata_command_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        MetadataCommandNodeClient::metadata_command_acceptance(self, pg_id, command)
+    }
+
+    fn metadata_command_abandon_acceptance(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        MetadataCommandNodeClient::metadata_command_abandon_acceptance(self, pg_id, command)
+    }
+
+    fn applied_metadata_command_log_entry_hashes(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        MetadataCommandNodeClient::applied_metadata_command_log_entry_hashes(self, pg_id, command)
+    }
+
+    fn has_matching_applied_metadata_command_log_entry(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        expected_previous_log_hash: u64,
+    ) -> Result<bool, StoreError> {
+        MetadataCommandNodeClient::has_matching_applied_metadata_command_log_entry(
+            self,
+            pg_id,
+            command,
+            expected_previous_log_hash,
+        )
+    }
+
+    fn replace_pending_metadata_command_slot_for_reissue(
+        &self,
+        pg_id: PgId,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+    ) -> Result<bool, StoreError> {
+        let request = StorageRpcMetadataCommandPendingSlotReplaceRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            previous: previous.clone(),
+            replacement: replacement.clone(),
+            scope_bucket: bucket.cloned(),
+        };
+        let payload =
+            encode_metadata_command_pending_slot_replace_request(&request).map_err(|error| {
+                self.rpc_payload_error(
+                    "encode metadata command pending slot replace request",
+                    error.to_string(),
+                )
+            })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandPendingSlotReplace,
+            payload,
+        )?;
+        decode_metadata_command_pending_slot_remove_response(&response)
+            .map(|response| response.removed)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command pending slot replace response",
+                    error.to_string(),
+                )
+            })
+    }
+
+    fn replace_pending_metadata_command_slot_for_recovery(
+        &self,
+        pg_id: PgId,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+    ) -> Result<bool, StoreError> {
+        let request = StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            authorized_source: authorized_source.clone(),
+            abandoned_source: abandoned_source.cloned(),
+            previous: previous.clone(),
+            replacement: replacement.clone(),
+            scope_bucket: bucket.cloned(),
+        };
+        let payload = encode_metadata_command_recovery_pending_slot_replace_request(&request)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "encode metadata command recovery pending slot replace request",
+                    error.to_string(),
+                )
+            })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace,
+            payload,
+        )?;
+        decode_metadata_command_pending_slot_remove_response(&response)
+            .map(|response| response.removed)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command recovery pending slot replace response",
+                    error.to_string(),
+                )
+            })
+    }
+
+    fn apply_metadata_command_and_record_for_recovery(
+        &self,
+        pg_id: PgId,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        let request = StorageRpcMetadataCommandRecoveryRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            authorized_source: authorized_source.clone(),
+            abandoned_source: abandoned_source.cloned(),
+            command: command.clone(),
+        };
+        let payload = encode_metadata_command_recovery_request(&request)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "encode metadata command recovery apply and record request",
+                    error.to_string(),
+                )
+            })
+            .map_err(BucketSnapshotLoadError::Store)?;
+        self.metadata_command_apply_and_record_with_payload(
+            pg_id,
+            command,
+            StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord,
+            payload,
+            "decode metadata command recovery apply and record response",
+        )
+    }
+
+    fn record_metadata_command_abandoned(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let payload = self.encode_metadata_command_request(pg_id, command)?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandRecordAbandoned,
+            payload,
+        )?;
+        let response =
+            decode_metadata_command_state_outcome_response(&response).map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    error.to_string(),
+                )
+            })?;
+        match response.outcome {
+            StorageRpcMetadataCommandStateOutcome::State(state) => Ok(state),
+            StorageRpcMetadataCommandStateOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(metadata_command_log_conflict_error(
+                self.cluster_epoch,
+                pg_id,
+                "decode metadata command record abandoned response",
+                |operation, message| self.rpc_payload_error(operation, message),
+                MetadataCommandLogConflictRpcFields {
+                    node_id,
+                    pg_id: conflict_pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            )),
+            StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
+                ..
+            } => Err(self.rpc_payload_error(
+                "decode metadata command record abandoned response",
+                "record abandoned response cannot contain object generation reservation conflict"
+                    .to_string(),
+            )),
+            StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict { .. } => {
+                Err(self.rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    "record abandoned response cannot contain object version reservation conflict"
+                        .to_string(),
+                ))
+            }
+            StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand { .. } => Err(self
+                .rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    "record abandoned response cannot contain stale bucket metadata command"
+                        .to_string(),
+                )),
+            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand { .. } => Err(self
+                .rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    "record abandoned response cannot contain stale object write command"
+                        .to_string(),
+                )),
+            StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict { .. } => Err(self
+                .rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    "record abandoned response cannot contain stream segment conflict".to_string(),
+                )),
+        }
+    }
+}
+
 impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
     fn open_metadata_command_critical_section(
         &self,
@@ -977,82 +1248,6 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
             .map_err(|error| {
                 self.rpc_payload_error(
                     "decode metadata command pending slot remove response",
-                    error.to_string(),
-                )
-            })
-    }
-
-    fn replace_pending_metadata_command_slot_for_reissue(
-        &self,
-        pg_id: PgId,
-        previous: &MetadataCommandEnvelope,
-        replacement: &MetadataCommandEnvelope,
-        bucket: Option<&BucketName>,
-    ) -> Result<bool, StoreError> {
-        let request = StorageRpcMetadataCommandPendingSlotReplaceRequest {
-            node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
-            pg_id,
-            previous: previous.clone(),
-            replacement: replacement.clone(),
-            scope_bucket: bucket.cloned(),
-        };
-        let payload =
-            encode_metadata_command_pending_slot_replace_request(&request).map_err(|error| {
-                self.rpc_payload_error(
-                    "encode metadata command pending slot replace request",
-                    error.to_string(),
-                )
-            })?;
-        let response = self.rpc_request(
-            StorageRpcMessageKind::MetadataCommandPendingSlotReplace,
-            payload,
-        )?;
-        decode_metadata_command_pending_slot_remove_response(&response)
-            .map(|response| response.removed)
-            .map_err(|error| {
-                self.rpc_payload_error(
-                    "decode metadata command pending slot replace response",
-                    error.to_string(),
-                )
-            })
-    }
-
-    fn replace_pending_metadata_command_slot_for_recovery(
-        &self,
-        pg_id: PgId,
-        authorized_source: &MetadataCommandEnvelope,
-        abandoned_source: Option<&MetadataCommandEnvelope>,
-        previous: &MetadataCommandEnvelope,
-        replacement: &MetadataCommandEnvelope,
-        bucket: Option<&BucketName>,
-    ) -> Result<bool, StoreError> {
-        let request = StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest {
-            node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
-            pg_id,
-            authorized_source: authorized_source.clone(),
-            abandoned_source: abandoned_source.cloned(),
-            previous: previous.clone(),
-            replacement: replacement.clone(),
-            scope_bucket: bucket.cloned(),
-        };
-        let payload = encode_metadata_command_recovery_pending_slot_replace_request(&request)
-            .map_err(|error| {
-                self.rpc_payload_error(
-                    "encode metadata command recovery pending slot replace request",
-                    error.to_string(),
-                )
-            })?;
-        let response = self.rpc_request(
-            StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace,
-            payload,
-        )?;
-        decode_metadata_command_pending_slot_remove_response(&response)
-            .map(|response| response.removed)
-            .map_err(|error| {
-                self.rpc_payload_error(
-                    "decode metadata command recovery pending slot replace response",
                     error.to_string(),
                 )
             })
@@ -1413,108 +1608,6 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
             StorageRpcMessageKind::MetadataCommandApplyAndRecord,
             "decode metadata command apply and record response",
         )
-    }
-
-    fn apply_metadata_command_and_record_for_recovery(
-        &self,
-        pg_id: PgId,
-        authorized_source: &MetadataCommandEnvelope,
-        abandoned_source: Option<&MetadataCommandEnvelope>,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        let request = StorageRpcMetadataCommandRecoveryRequest {
-            node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
-            pg_id,
-            authorized_source: authorized_source.clone(),
-            abandoned_source: abandoned_source.cloned(),
-            command: command.clone(),
-        };
-        let payload = encode_metadata_command_recovery_request(&request)
-            .map_err(|error| {
-                self.rpc_payload_error(
-                    "encode metadata command recovery apply and record request",
-                    error.to_string(),
-                )
-            })
-            .map_err(BucketSnapshotLoadError::Store)?;
-        self.metadata_command_apply_and_record_with_payload(
-            pg_id,
-            command,
-            StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord,
-            payload,
-            "decode metadata command recovery apply and record response",
-        )
-    }
-
-    fn record_metadata_command_abandoned(
-        &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let payload = self.encode_metadata_command_request(pg_id, command)?;
-        let response = self.rpc_request(
-            StorageRpcMessageKind::MetadataCommandRecordAbandoned,
-            payload,
-        )?;
-        let response =
-            decode_metadata_command_state_outcome_response(&response).map_err(|error| {
-                self.rpc_payload_error(
-                    "decode metadata command record abandoned response",
-                    error.to_string(),
-                )
-            })?;
-        match response.outcome {
-            StorageRpcMetadataCommandStateOutcome::State(state) => Ok(state),
-            StorageRpcMetadataCommandStateOutcome::LogConflict {
-                node_id,
-                pg_id: conflict_pg_id,
-                cluster_epoch,
-                log_index,
-            } => Err(metadata_command_log_conflict_error(
-                self.cluster_epoch,
-                pg_id,
-                "decode metadata command record abandoned response",
-                |operation, message| self.rpc_payload_error(operation, message),
-                MetadataCommandLogConflictRpcFields {
-                    node_id,
-                    pg_id: conflict_pg_id,
-                    cluster_epoch,
-                    log_index,
-                },
-            )),
-            StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
-                ..
-            } => Err(self.rpc_payload_error(
-                "decode metadata command record abandoned response",
-                "record abandoned response cannot contain object generation reservation conflict"
-                    .to_string(),
-            )),
-            StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict { .. } => {
-                Err(self.rpc_payload_error(
-                    "decode metadata command record abandoned response",
-                    "record abandoned response cannot contain object version reservation conflict"
-                        .to_string(),
-                ))
-            }
-            StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand { .. } => Err(self
-                .rpc_payload_error(
-                    "decode metadata command record abandoned response",
-                    "record abandoned response cannot contain stale bucket metadata command"
-                        .to_string(),
-                )),
-            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand { .. } => Err(self
-                .rpc_payload_error(
-                    "decode metadata command record abandoned response",
-                    "record abandoned response cannot contain stale object write command"
-                        .to_string(),
-                )),
-            StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict { .. } => Err(self
-                .rpc_payload_error(
-                    "decode metadata command record abandoned response",
-                    "record abandoned response cannot contain stream segment conflict".to_string(),
-                )),
-        }
     }
 }
 impl ShardReadHandleNodeClient for UnixStorageNodeClient {
