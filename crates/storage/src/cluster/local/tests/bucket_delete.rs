@@ -45,7 +45,7 @@ fn finalized_bucket_delete_clears_pending_versioning_command_for_recreate() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let _serial = lock_metadata_command_apply_hook_test();
     let fail_once = Arc::new(AtomicBool::new(true));
@@ -167,7 +167,7 @@ fn finalized_bucket_delete_removes_replicated_create_rows() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let created_generation = map
         .node(NodeId::new(1))
@@ -274,7 +274,7 @@ fn finalized_bucket_delete_after_reopen_does_not_need_begin_waiter() {
 
     {
         let map = Arc::new(map);
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
         create_test_bucket(&cluster, &bucket);
         cluster
             .test_begin_bucket_delete_if_current(&bucket)
@@ -284,7 +284,7 @@ fn finalized_bucket_delete_after_reopen_does_not_need_begin_waiter() {
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
     set_route_primary(&mut map, 1, NodeId::new(1));
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     assert_clean_metadata_command_stream(&map, &[1]);
     drop(cluster);
     drop(map);
@@ -292,7 +292,8 @@ fn finalized_bucket_delete_after_reopen_does_not_need_begin_waiter() {
     let mut reopened = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
     set_route_primary(&mut reopened, 1, NodeId::new(1));
     let reopened = Arc::new(reopened);
-    let reopened_cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+    let reopened_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&reopened)).unwrap();
 
     assert_eq!(
         reopened_cluster
@@ -332,7 +333,7 @@ fn bucket_delete_finalizer_resumes_bounded_pg_scan_after_reopen() {
             bucket_for_pg(topology, 1, "bounded-finalizer-reopen-")
         };
         let map = Arc::new(map);
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
         create_test_bucket(&cluster, &bucket);
         cluster
             .test_begin_bucket_delete_if_current(&bucket)
@@ -360,7 +361,7 @@ fn bucket_delete_finalizer_resumes_bounded_pg_scan_after_reopen() {
         set_route_primary(&mut reopened, *pg_id, NodeId::new(1));
     }
     let reopened = Arc::new(reopened);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&reopened)).unwrap();
     assert_eq!(
         cluster.try_finalize_bucket_delete(&bucket).unwrap(),
         crate::BucketDeleteFinalizeOutcome::Pending
@@ -426,7 +427,7 @@ fn durable_bucket_finalize_scan_recovers_lost_local_queue_after_reopen() {
         };
         set_route_primary(&mut map, 1, NodeId::new(1));
         let map = Arc::new(map);
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
         create_test_bucket(&cluster, &bucket);
         cluster
             .test_begin_bucket_delete_if_current(&bucket)
@@ -437,7 +438,8 @@ fn durable_bucket_finalize_scan_recovers_lost_local_queue_after_reopen() {
     let mut reopened = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
     set_route_primary(&mut reopened, 1, NodeId::new(1));
     let reopened = Arc::new(reopened);
-    let reopened_cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+    let reopened_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&reopened)).unwrap();
 
     let scan = reopened_cluster.enqueue_durable_bucket_delete_finalize_roots();
     assert_eq!(scan.errors, 0);
@@ -480,7 +482,7 @@ fn durable_reclaim_discovery_scans_bounded_pg_batches() {
             bucket_for_pg(topology, 16, "bounded-durable-discovery-")
         };
         let map = Arc::new(map);
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
         create_test_bucket(&cluster, &bucket);
         cluster
             .test_begin_bucket_delete_if_current(&bucket)
@@ -493,7 +495,7 @@ fn durable_reclaim_discovery_scans_bounded_pg_batches() {
         set_route_primary(&mut reopened, *pg_id, NodeId::new(1));
     }
     let reopened = Arc::new(reopened);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&reopened)).unwrap();
     let excluded_payload = HashSet::new();
     let excluded_begin = HashSet::new();
     let excluded_finalize = HashSet::new();
@@ -558,7 +560,7 @@ fn durable_bucket_finalize_scan_skips_excluded_bucket() {
     };
     set_route_primary(&mut map, 1, NodeId::new(1));
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     cluster
         .test_begin_bucket_delete_if_current(&bucket)
@@ -605,7 +607,7 @@ fn durable_bucket_finalize_scan_prioritizes_expired_claimed_bucket() {
     );
     set_route_primary(&mut map, 1, NodeId::new(1));
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket_a);
     create_test_bucket(&cluster, &bucket_b);
     cluster
@@ -688,7 +690,7 @@ fn durable_bucket_finalize_scan_continues_after_unavailable_pg() {
     };
     set_route_primary(&mut map, 1, NodeId::new(1));
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     cluster
         .test_begin_bucket_delete_if_current(&bucket)
@@ -698,7 +700,7 @@ fn durable_bucket_finalize_scan_continues_after_unavailable_pg() {
     let mut map = Arc::try_unwrap(map).expect("test should hold the only map reference");
     map.pg_routes.get_mut(&PgId::new(0)).unwrap().state = PgState::Peering;
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     let scan = cluster.enqueue_durable_bucket_delete_finalize_roots();
     assert_eq!(
@@ -733,7 +735,7 @@ fn bucket_finalize_durable_claim_blocks_second_worker_until_released() {
     };
     set_route_primary(&mut map, 1, NodeId::new(1));
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     cluster
         .test_begin_bucket_delete_if_current(&bucket)
@@ -813,7 +815,7 @@ fn stale_bucket_finalize_claim_for_deleted_generation_does_not_block_recreated_b
     };
     set_route_primary(&mut map, 1, NodeId::new(1));
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     cluster
         .test_begin_bucket_delete_if_current(&bucket)
@@ -901,7 +903,7 @@ fn finalized_bucket_delete_releases_finalizer_claim_for_next_same_pg_bucket() {
     };
     set_route_primary(&mut map, 1, NodeId::new(1));
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket_a);
     create_test_bucket(&cluster, &bucket_b);
 
@@ -943,7 +945,7 @@ fn finalized_bucket_delete_waits_for_reclaim_then_finalizes_after_worker_progres
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let committed =
         write_committed_direct_segment_for(&cluster, &bucket, &key, b"finalize reclaim");
     let lease = cluster
@@ -1013,7 +1015,7 @@ fn finalized_bucket_delete_ignores_volatile_read_lease_without_reclaim_root() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let phantom_key = crate::ObjectKey::try_from("phantom-read".to_string()).unwrap();
@@ -1056,7 +1058,7 @@ fn finalized_bucket_delete_preserves_unrelated_same_pg_pending_command() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &deleting_bucket);
     create_test_bucket(&cluster, &pending_bucket);
     cluster
@@ -1134,7 +1136,7 @@ fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let bucket_identity = crate::cluster::BucketIdentityGenerations::from_bucket_info(
         &cluster.head_bucket_info(&bucket).unwrap(),
@@ -1273,7 +1275,7 @@ fn begin_bucket_delete_retries_after_partial_mark_deleting_conflict() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let bucket_identity = crate::cluster::BucketIdentityGenerations::from_bucket_info(
         &cluster.head_bucket_info(&bucket).unwrap(),
@@ -1352,7 +1354,7 @@ fn begin_bucket_delete_reissues_stale_duplicate_mark_deleting_index() {
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let pg_id = PgId::new(1);
     let (occupant_bucket, delete_bucket) = {
         let topology = map
@@ -1448,7 +1450,7 @@ fn begin_bucket_delete_reissue_waits_for_primary_last_apply_window() {
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let pg_id = PgId::new(1);
     let (occupant_bucket, delete_bucket) = {
         let topology = map
@@ -1619,7 +1621,7 @@ fn begin_bucket_delete_retries_after_partial_object_pg_drain_conflict() {
     set_route_primary(&mut map, 2, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let object_pg_id = PgId::new(2);
@@ -1734,7 +1736,7 @@ fn begin_bucket_delete_skips_unrelated_all_pg_drain_slot() {
     set_route_primary(&mut map, 2, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     create_test_bucket(&cluster, &pending_bucket);
 
@@ -1810,7 +1812,7 @@ fn begin_bucket_delete_fails_closed_on_divergent_same_index_after_partial_apply(
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let pg_id = PgId::new(1);
@@ -1889,7 +1891,7 @@ fn begin_bucket_delete_partial_mark_deleting_reopens_and_converges() {
     };
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let pg_id = PgId::new(1);
@@ -1997,7 +1999,7 @@ fn bucket_update_fails_closed_on_divergent_same_index_after_partial_apply() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let pg_id = PgId::new(1);
@@ -2078,7 +2080,7 @@ fn finalized_bucket_delete_fails_closed_on_active_replica() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     cluster
         .test_begin_bucket_delete_if_current(&bucket)
@@ -2162,7 +2164,7 @@ fn bucket_snapshot_pair_routes_to_bucket_pg_primaries() {
     set_route_primary(&mut map, 2, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &source_bucket);
     create_test_bucket(&cluster, &destination_bucket);
     cluster
@@ -2217,7 +2219,8 @@ fn bucket_snapshot_pair_routes_to_bucket_pg_primaries() {
         crate::LoadedBucketSubresource::Loaded("<CORSConfiguration/>".to_string())
     );
 
-    let runtime_map = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let runtime_map =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = runtime_map.admit_current_route().unwrap();
     let admitted_pair = admission
         .active_bucket_route_pair(&source_bucket, &destination_bucket)
@@ -2255,7 +2258,7 @@ fn bucket_snapshot_fails_closed_while_bucket_pg_is_peering() {
             .pg_topology();
         bucket_for_pg(topology, 1, "snapshot-peering-")
     };
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     drop(cluster);
 
@@ -2265,7 +2268,7 @@ fn bucket_snapshot_fails_closed_while_bucket_pg_is_peering() {
         .get_mut(&PgId::new(1))
         .unwrap()
         .state = PgState::Peering;
-    let cluster = crate::StorageCluster::from_local_map(map).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
 
     let err = cluster
         .load_bucket_snapshot(&bucket, crate::BucketSnapshotRequest::default())
@@ -2300,7 +2303,7 @@ fn bucket_snapshot_pair_fails_closed_while_either_bucket_pg_is_peering() {
                 bucket_for_pg(topology, 2, "snapshot-pair-destination-peering-"),
             )
         };
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
         create_test_bucket(&cluster, &source_bucket);
         create_test_bucket(&cluster, &destination_bucket);
         drop(cluster);
@@ -2311,7 +2314,7 @@ fn bucket_snapshot_pair_fails_closed_while_either_bucket_pg_is_peering() {
             .get_mut(&PgId::new(peering_pg))
             .unwrap()
             .state = PgState::Peering;
-        let cluster = crate::StorageCluster::from_local_map(map).unwrap();
+        let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
 
         let err = cluster
             .load_bucket_snapshot_pair(
@@ -2358,7 +2361,7 @@ fn composite_multipart_and_lifecycle_scans_fan_out_to_routed_pg_primaries() {
     set_route_primary(&mut map, 2, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &lifecycle_bucket);
     create_test_bucket(&cluster, &aborting_bucket);
     cluster
@@ -2480,7 +2483,7 @@ fn bucket_control_plane_pending_install_waits_behind_durable_delete_drain() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let pg_id = PgId::new(1);
     let primary = map.node(NodeId::new(1)).unwrap().storage_node();
@@ -2643,7 +2646,7 @@ fn begin_bucket_delete_waits_for_durable_reservation_and_post_drains_visible_wri
     set_route_primary(&mut map, 2, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let reservation = cluster
         .acquire_durable_bucket_write_reservation(&bucket, "test-held-write", Some(key.as_str()))
@@ -2814,7 +2817,7 @@ fn begin_bucket_delete_records_reservation_wait_blocker_and_adopts_after_release
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let reservation = cluster
         .acquire_durable_bucket_write_reservation(
@@ -2929,7 +2932,7 @@ fn begin_bucket_delete_reaps_expired_durable_write_reservation() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let bucket_pg = map
         .node(NodeId::new(1))
@@ -2994,7 +2997,7 @@ fn begin_bucket_delete_adopts_live_same_generation_delete_drain() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let bucket_pg = map
         .node(NodeId::new(1))
@@ -3061,7 +3064,7 @@ fn begin_bucket_delete_adopts_active_delete_drain_after_reopen() {
     };
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let clock = Arc::new(crate::clock::test_time_override_guard(1_000));
     let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
@@ -3077,7 +3080,8 @@ fn begin_bucket_delete_adopts_active_delete_drain_after_reopen() {
 
     let reopened =
         Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
-    let reopened_cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+    let reopened_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&reopened)).unwrap();
     let advanced_during_proof = Arc::new(AtomicBool::new(false));
     let advanced_during_proof_for_hook = Arc::clone(&advanced_during_proof);
     let clock_for_hook = Arc::clone(&clock);
@@ -3149,7 +3153,7 @@ fn durable_scan_skips_live_and_queues_expired_delete_begin_drain_after_reopen() 
     };
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let bucket_info = cluster.test_head_bucket_raw(&bucket).unwrap();
     let live_drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
@@ -3163,7 +3167,8 @@ fn durable_scan_skips_live_and_queues_expired_delete_begin_drain_after_reopen() 
 
     let reopened =
         Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
-    let reopened_cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+    let reopened_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&reopened)).unwrap();
     let expected_root = crate::BucketDeleteBeginRoot {
         bucket: bucket.clone(),
         bucket_execution_generation: bucket_info.bucket_execution_generation,
@@ -3252,7 +3257,7 @@ fn durable_scan_paginates_past_excluded_delete_begin_drains() {
     };
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let mut drains = Vec::new();
     let mut roots = Vec::new();
     let now = crate::clock::current_time_millis();
@@ -3287,7 +3292,8 @@ fn durable_scan_paginates_past_excluded_delete_begin_drains() {
 
     let reopened =
         Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
-    let reopened_cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+    let reopened_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&reopened)).unwrap();
     let excluded = roots
         .iter()
         .take(PAGE_LIMIT)
@@ -3337,7 +3343,7 @@ fn begin_bucket_delete_records_final_visibility_phase_before_mark_command() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let pg_id = PgId::new(1);
@@ -3413,7 +3419,7 @@ fn begin_bucket_delete_adopts_final_visibility_phase_without_repeating_post_rese
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
         crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
@@ -3507,7 +3513,7 @@ fn begin_bucket_delete_adopts_final_visibility_proven_without_repeating_visibili
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
         crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
@@ -3597,7 +3603,7 @@ fn begin_bucket_delete_renews_drain_after_final_visibility_proof_before_retryabl
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let clock = Arc::new(crate::clock::test_time_override_guard(1_000));
     let advanced_during_visibility = Arc::new(AtomicBool::new(false));
@@ -3717,7 +3723,7 @@ fn begin_bucket_delete_route_expiry_after_final_visibility_preserves_for_fenced_
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let initial_bucket = cluster.test_head_bucket_raw(&bucket).unwrap();
 
@@ -3840,7 +3846,7 @@ fn begin_bucket_delete_committed_response_loss_retry_observes_deleting() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let bucket_identity = crate::cluster::BucketIdentityGenerations::from_bucket_info(
         &cluster.head_bucket_info(&bucket).unwrap(),
@@ -3942,8 +3948,9 @@ fn begin_bucket_delete_treats_retryable_error_after_concurrent_mark_deleting_as_
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-    let concurrent_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let concurrent_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let hook_ran = Arc::new(AtomicBool::new(false));
@@ -4014,8 +4021,9 @@ fn begin_bucket_delete_does_not_suppress_route_error_after_concurrent_mark_delet
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-    let concurrent_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let concurrent_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let hook_ran = Arc::new(AtomicBool::new(false));
@@ -4082,7 +4090,7 @@ fn begin_bucket_delete_adopts_stream_cleanup_phase_and_revalidates_after_reserva
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
         crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
@@ -4171,7 +4179,7 @@ fn begin_bucket_delete_records_reservation_wait_phase_after_stream_cleanup() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let hook_ran = Arc::new(AtomicBool::new(false));
@@ -4240,7 +4248,7 @@ fn active_delete_attempt_authorization_snapshot_requires_drained_bucket_writes()
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let reservation = cluster
         .acquire_durable_bucket_write_reservation(&bucket, "held-policy-write", None)
@@ -4298,7 +4306,7 @@ fn begin_bucket_delete_adopts_reservation_wait_phase_without_repeating_initial_s
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
         crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
@@ -4407,7 +4415,7 @@ fn begin_bucket_delete_adopts_post_reservation_phase_after_budget_exhaustion() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let stage = Arc::new(AtomicUsize::new(0));
@@ -4519,7 +4527,7 @@ fn begin_bucket_delete_adopted_attempt_clears_drain_on_bucket_not_empty() {
     set_route_primary(&mut map, 2, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     write_committed_direct_segment_for_with_okh(
         &cluster,
@@ -4624,7 +4632,7 @@ fn post_reservation_exact_bucket_frontier_is_identity_fenced_and_resettable() {
     };
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
         crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
@@ -4715,7 +4723,7 @@ fn post_reservation_exact_bucket_frontier_resumes_after_recorded_pg() {
     );
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
         crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
@@ -4803,7 +4811,7 @@ fn begin_bucket_delete_adopts_completed_post_reservation_frontier_without_rescan
     set_route_primary(&mut map, 2, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let initial_bucket = {
         let bucket_pg = map
@@ -4914,7 +4922,7 @@ fn begin_bucket_delete_adopts_preserved_post_reservation_frontier() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let initial_bucket = {
         let bucket_pg = map
@@ -5156,7 +5164,7 @@ fn begin_bucket_delete_adopts_preserved_initial_frontier_then_resets_before_stre
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let initial_bucket = {
         let bucket_pg = map
@@ -5360,7 +5368,7 @@ fn begin_bucket_delete_drains_pending_delete_marker_before_emptiness_decision() 
     set_route_primary(&mut map, 2, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     cluster
         .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
@@ -5466,7 +5474,7 @@ fn begin_bucket_delete_drains_pending_specific_version_delete_that_empties_bucke
     set_route_primary(&mut map, object_pg_id, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     cluster
         .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
@@ -5580,7 +5588,7 @@ fn begin_bucket_delete_drains_pending_lifecycle_current_expiry_marker() {
     set_route_primary(&mut map, data_pg_id, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
     put_test_lifecycle(&cluster, &bucket);
     let committed = write_committed_direct_segment_for_with_versioning(
@@ -5697,7 +5705,7 @@ fn begin_bucket_delete_drains_pending_lifecycle_noncurrent_expiry() {
     set_route_primary(&mut map, data_pg_id, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
     put_test_lifecycle(&cluster, &bucket);
     let older = write_committed_direct_segment_for_with_versioning(
@@ -5830,7 +5838,7 @@ fn begin_bucket_delete_drains_pending_lifecycle_expired_delete_marker_cleanup() 
     set_route_primary(&mut map, data_pg_id, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
     put_test_lifecycle(&cluster, &bucket);
     let live = write_committed_direct_segment_for_with_versioning(
@@ -5964,7 +5972,7 @@ fn stale_delete_drain_identity_cannot_clear_recreated_bucket_drain() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     cluster
         .test_begin_bucket_delete_if_current(&bucket)
@@ -6048,7 +6056,7 @@ fn begin_bucket_delete_recovers_expired_durable_drain_after_reopen() {
         bucket_for_pg(topology, 1, "expired-delete-drain-")
     };
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let old_drain_id = "expired-delete-drain-before-reopen";
     {
@@ -6075,7 +6083,8 @@ fn begin_bucket_delete_recovers_expired_durable_drain_after_reopen() {
 
     let reopened =
         Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
-    let reopened_cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+    let reopened_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&reopened)).unwrap();
     reopened_cluster
         .test_begin_bucket_delete_if_current(&bucket)
         .unwrap();
@@ -6127,7 +6136,7 @@ fn pending_delete_finalized_bucket_recovery_uses_expired_active_route() {
         bucket_for_pg(topology, 1, "pending-finalized-recovery-")
     };
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     cluster
         .test_begin_bucket_delete_if_current(&bucket)

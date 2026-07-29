@@ -106,7 +106,7 @@ fn trace_node_ids_with_spare() -> [NodeId; 7] {
 }
 
 pub(super) fn current_cluster(map: &Arc<LocalClusterMap>) -> Arc<crate::StorageCluster> {
-    crate::StorageCluster::from_local_map(Arc::clone(map)).unwrap()
+    crate::StorageCluster::from_static_local_map(Arc::clone(map)).unwrap()
 }
 
 fn stale_cluster(

@@ -24,8 +24,10 @@ fn direct_put_pending_install_race_reruns_precondition_action() {
 
     let first_map = Arc::new(first_map);
     let second_map = Arc::new(second_map);
-    let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
-    let second_cluster = crate::StorageCluster::from_local_map(Arc::clone(&second_map)).unwrap();
+    let first_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&first_map)).unwrap();
+    let second_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&second_map)).unwrap();
     create_test_bucket(&first_cluster, &bucket);
 
     let loser_payload = b"loser direct put";
@@ -192,8 +194,10 @@ fn direct_put_pending_install_race_keeps_bucket_write_proof_for_retry() {
 
     let first_map = Arc::new(first_map);
     let second_map = Arc::new(second_map);
-    let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
-    let second_cluster = crate::StorageCluster::from_local_map(Arc::clone(&second_map)).unwrap();
+    let first_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&first_map)).unwrap();
+    let second_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&second_map)).unwrap();
     create_test_bucket(&first_cluster, &bucket);
 
     let loser_payload = b"loser direct put with command proof";
@@ -365,7 +369,7 @@ fn direct_put_committed_response_loss_retry_returns_existing_commit() {
     set_route_primary(&mut map, 1, NodeId::new(1));
     set_route_primary(&mut map, 2, NodeId::new(1));
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let reservation_id =
@@ -459,7 +463,7 @@ fn direct_put_overwrite_committed_response_loss_retry_preserves_reclaim_generati
     set_route_primary(&mut map, 1, NodeId::new(1));
     set_route_primary(&mut map, 2, NodeId::new(1));
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let first_reservation_id =
@@ -605,7 +609,7 @@ fn copy_object_destination_committed_response_loss_retry_returns_existing_commit
     }
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let source_payload = b"copied object payload after response loss";
     let source_segment = write_committed_direct_segment_for_with_okh(
         &cluster,
@@ -745,7 +749,7 @@ fn stale_direct_put_reservation_cannot_resurrect_deleted_null_version() {
     set_route_primary(&mut map, 2, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let stale_payload = b"stale direct put";
@@ -899,7 +903,7 @@ fn direct_put_pre_command_route_error_releases_bucket_write_proof() {
     set_route_primary(&mut local_map, data_pg, NodeId::new(2));
 
     let mut map = Arc::new(local_map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let bucket_pg_id = cluster.bucket_metadata_pg_id(&bucket);
     let reservation_id =
@@ -946,7 +950,7 @@ fn direct_put_pre_command_route_error_releases_bucket_write_proof() {
         .get_mut(&PgId::new(object_pg))
         .unwrap()
         .state = PgState::Peering;
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let err = cluster
         .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
             Ok::<(), ()>(())
@@ -997,7 +1001,7 @@ fn non_current_epoch_direct_put_commit_fails_closed_and_cleans_unowned_state() {
     set_route_primary(&mut local_map, data_pg, NodeId::new(2));
 
     let map = Arc::new(local_map);
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&current_cluster, &bucket);
 
     let reservation_id =
@@ -1175,7 +1179,8 @@ fn control_plane_peering_direct_put_old_primary_fails_closed_and_cleans_unowned_
             .pg_topology();
         bucket_key_with_distinct_object_and_data_pg(topology)
     };
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
 
     let reservation_id =
@@ -1374,7 +1379,8 @@ fn control_plane_peering_direct_put_old_primary_fails_closed_and_cleans_unowned_
             "old-primary direct PUT must release bucket write reservations on node {node_id:?}"
         );
     }
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&current_map)).unwrap();
+    let current_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&current_map)).unwrap();
     for shard_index in 0..written.ec.k + written.ec.m {
         assert!(!current_cluster
             .test_payload_shard_file_exists(
@@ -1496,7 +1502,8 @@ fn control_plane_peering_copy_object_destination_old_primary_fails_closed_and_cl
             .unwrap();
         key_for_object_pg(topology, &bucket, source_pg, "copy-source-")
     };
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
     let source_payload = b"control-plane peering stale copy source payload";
     let source_segment = write_committed_direct_segment_for_with_okh(
@@ -1713,7 +1720,8 @@ fn control_plane_peering_copy_object_destination_old_primary_fails_closed_and_cl
             "old-primary CopyObject destination must release bucket write reservations on node {node_id:?}"
         );
     }
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&current_map)).unwrap();
+    let current_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&current_map)).unwrap();
     for shard_index in 0..written.ec.k + written.ec.m {
         assert!(!current_cluster
             .test_payload_shard_file_exists(
@@ -1765,7 +1773,7 @@ fn direct_put_publish_validation_fails_closed_when_acknowledged_shard_file_is_mi
     set_route_primary(&mut local_map, 1, NodeId::new(1));
     set_route_primary(&mut local_map, 2, NodeId::new(1));
     let map = Arc::new(local_map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let reservation_id =
@@ -1869,7 +1877,7 @@ fn direct_put_publish_validation_rejects_truncated_shard_batch() {
     set_route_primary(&mut local_map, 1, NodeId::new(1));
     set_route_primary(&mut local_map, 2, NodeId::new(1));
     let map = Arc::new(local_map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let reservation_id =
@@ -1949,8 +1957,10 @@ fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
 
     let first_map = Arc::new(first_map);
     let second_map = Arc::new(second_map);
-    let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
-    let second_cluster = crate::StorageCluster::from_local_map(Arc::clone(&second_map)).unwrap();
+    let first_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&first_map)).unwrap();
+    let second_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&second_map)).unwrap();
     create_test_bucket(&first_cluster, &bucket);
 
     let loser_payload = b"loser direct put command id";
@@ -2110,7 +2120,7 @@ fn direct_put_log_conflict_pending_visibility_error_cleans_new_payload() {
     set_route_primary(&mut local_map, 2, NodeId::new(1));
 
     let map = Arc::new(local_map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let reservation_id =
@@ -2209,7 +2219,8 @@ fn direct_put_stale_commit_snapshot_reruns_precondition_action() {
     set_route_primary(&mut first_map, 2, NodeId::new(1));
 
     let first_map = Arc::new(first_map);
-    let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+    let first_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&first_map)).unwrap();
     create_test_bucket(&first_cluster, &bucket);
 
     let loser_payload = b"loser direct put stale snapshot";

@@ -6,7 +6,22 @@ use ec::EcConfig;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use storage::{NodeId, StorageCluster, StorageClusterRuntimeMapHandle};
+use storage::{
+    NodeId, StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
+    StorageClusterRuntimeMapRefreshError,
+};
+
+fn test_support_storage_route_handle(
+    storage_cluster: Arc<StorageCluster>,
+) -> StorageClusterRouteHandle {
+    match StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster)) {
+        Ok(runtime) => runtime.route_handle(),
+        Err(StorageClusterRuntimeMapRefreshError::StaticRouteAuthorityRefresh) => {
+            StorageClusterRouteHandle::from_static_cluster(storage_cluster).unwrap()
+        }
+        Err(error) => panic!("invalid test storage cluster route authority: {error}"),
+    }
+}
 
 pub(crate) const NO_READ: &ReadCondition = &ReadCondition {
     if_match: None,
@@ -223,7 +238,7 @@ pub(crate) fn setup_same_process_coordinator_with_storage_cluster_without_backgr
 ) -> Coordinator {
     let shared_caches = shared_caches_for_storage_cluster(&storage_cluster);
     Coordinator::new_with_shared_caches_and_background_sweeper_factories(
-        StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster)),
+        test_support_storage_route_handle(Arc::clone(&storage_cluster)),
         storage_cluster,
         shared_caches,
         "us-east-1".to_string(),
@@ -356,7 +371,7 @@ pub(crate) fn open_test_storage_cluster_with_ec_shape(
 ) -> Arc<StorageCluster> {
     let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
     let node_ids: Vec<NodeId> = (0..node_count).map(NodeId::new).collect();
-    StorageCluster::open_local_nodes(dir, &node_ids, pg_ids, ec_shape)
+    StorageCluster::open_static_local_nodes(dir, &node_ids, pg_ids, ec_shape)
         .expect("open local storage cluster")
 }
 

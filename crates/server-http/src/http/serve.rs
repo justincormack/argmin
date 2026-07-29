@@ -5339,13 +5339,33 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use ring::hmac;
     use server_core::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider};
-    use storage::{NodeId, StorageCluster};
+    use storage::{
+        NodeId, StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
+    };
 
     use crate::metadata_blob::MetadataBlob;
 
     const TEST_ACCESS_KEY: &str = "AKID";
     const TEST_SECRET_KEY: &str = "test-secret";
     const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
+
+    fn test_storage_route_handle(initial: Arc<StorageCluster>) -> StorageClusterRouteHandle {
+        match StorageClusterRuntimeMapHandle::new(Arc::clone(&initial)) {
+            Ok(runtime) => runtime.route_handle(),
+            Err(storage::StorageClusterRuntimeMapRefreshError::StaticRouteAuthorityRefresh) => {
+                StorageClusterRouteHandle::from_static_cluster(initial).unwrap()
+            }
+            Err(error) => panic!("invalid test storage cluster route authority: {error}"),
+        }
+    }
+
+    fn test_dynamic_storage_route_handles(
+        initial: Arc<StorageCluster>,
+    ) -> (StorageClusterRuntimeMapHandle, StorageClusterRouteHandle) {
+        let runtime = StorageClusterRuntimeMapHandle::new(initial).unwrap();
+        let route = runtime.route_handle();
+        (runtime, route)
+    }
 
     fn open_test_storage_cluster(dir: &std::path::Path, pg_ids: &[u32]) -> Arc<StorageCluster> {
         let ec_config = ec::EcConfig::default();
@@ -5355,7 +5375,7 @@ mod tests {
         };
         let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
         let node_ids: Vec<NodeId> = (0..node_count).map(NodeId::new).collect();
-        StorageCluster::open_local_nodes(dir, &node_ids, pg_ids, ec_shape)
+        StorageCluster::open_static_local_nodes(dir, &node_ids, pg_ids, ec_shape)
             .expect("open local storage cluster")
     }
 
@@ -5446,7 +5466,7 @@ mod tests {
     fn streaming_body_frame_timeout_uses_captured_route_deadline() {
         let tmp = test_util::tempdir();
         let cluster = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
-        let handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+        let handle = test_storage_route_handle(Arc::clone(&cluster));
         let admission = storage::clock::with_time_override(1_000, || {
             cluster
                 .test_store_route_map_validity(storage::RouteMapValidity::until_ms(5_000).unwrap());
@@ -5486,25 +5506,23 @@ mod tests {
     fn setup_frontend(dir: &std::path::Path) -> Arc<HttpFrontend> {
         let pg_ids: Vec<u32> = (0..1).collect();
         let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
-        let storage_handle =
-            storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
+        let storage_handle = test_storage_route_handle(Arc::clone(&storage_cluster));
         setup_frontend_with_storage_handle(storage_handle)
     }
 
     fn setup_dynamic_frontend(dir: &std::path::Path) -> Arc<HttpFrontend> {
         let storage_cluster = open_dynamic_test_storage_cluster(dir, &[0]);
-        let storage_handle =
-            storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
+        let storage_handle = test_storage_route_handle(Arc::clone(&storage_cluster));
         setup_frontend_with_storage_handle(storage_handle)
     }
 
     fn setup_frontend_with_storage_handle(
-        storage_handle: storage::StorageClusterRuntimeMapHandle,
+        storage_handle: storage::StorageClusterRouteHandle,
     ) -> Arc<HttpFrontend> {
         let sse_s3_provider = StaticManagedKeyProvider::single(
             ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
         );
-        let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
                 storage_handle,
                 "us-east-1".to_string(),
                 None,
@@ -5794,8 +5812,7 @@ mod tests {
     async fn buffered_invalid_signature_precedes_expired_route_admission() {
         let tmp = test_util::tempdir();
         let storage_cluster = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
-        let storage_handle =
-            storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
+        let storage_handle = test_storage_route_handle(Arc::clone(&storage_cluster));
         let frontend = setup_frontend_with_storage_handle(storage_handle);
         create_test_bucket(&frontend, "mybucket");
         frontend
@@ -5865,7 +5882,8 @@ Connection: close\r\n\r\n",
 
         let tmp = test_util::tempdir();
         let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
-        let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+        let (runtime_handle, storage_handle) =
+            test_dynamic_storage_route_handles(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
         create_test_bucket(&frontend, "route-admission-bucket");
         let config = ServeConfig {
@@ -5912,7 +5930,7 @@ Connection: close\r\n\r\n",
         .unwrap();
 
         let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
-        let install_handle = storage_handle.clone();
+        let install_handle = runtime_handle.clone();
         let installed_candidate = Arc::clone(&candidate);
         let installer = std::thread::spawn(move || {
             install_handle.install(installed_candidate).unwrap();
@@ -5943,7 +5961,8 @@ Connection: close\r\n\r\n",
 
         let tmp = test_util::tempdir();
         let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
-        let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+        let (runtime_handle, storage_handle) =
+            test_dynamic_storage_route_handles(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
         create_test_bucket(&frontend, "route-expiry-bucket");
         initial.test_store_route_map_validity(
@@ -6027,7 +6046,7 @@ Content-Length: {}\r\n\
             .is_ok());
 
         let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
-        let install_handle = storage_handle.clone();
+        let install_handle = runtime_handle.clone();
         let installed_candidate = Arc::clone(&candidate);
         let installer = std::thread::spawn(move || {
             install_handle.install(installed_candidate).unwrap();
@@ -6188,7 +6207,7 @@ Connection: close\r\n\r\n",
     async fn post_and_upload_part_acquire_cleanup_authority_before_creating_sessions() {
         let tmp = test_util::tempdir();
         let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
-        let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+        let storage_handle = test_storage_route_handle(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle);
         create_test_bucket(&frontend, "post-cleanup-authority-bucket");
         initial.test_store_route_map_validity(
@@ -6417,7 +6436,8 @@ Connection: close\r\n\r\n",
     async fn expired_promoted_post_cleanup_handoff_does_not_block_route_publication() {
         let tmp = test_util::tempdir();
         let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
-        let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+        let (runtime_handle, storage_handle) =
+            test_dynamic_storage_route_handles(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
         create_test_bucket(&frontend, "post-route-expiry-bucket");
         initial.test_store_route_map_validity(
@@ -6483,7 +6503,7 @@ Connection: close\r\n\r\n",
             }));
 
         let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
-        let install_handle = storage_handle.clone();
+        let install_handle = runtime_handle.clone();
         let installed_candidate = Arc::clone(&candidate);
         let installer = std::thread::spawn(move || {
             install_handle.install(installed_candidate).unwrap();
@@ -6548,7 +6568,8 @@ Connection: close\r\n\r\n",
     async fn expired_promoted_upload_part_cleanup_handoff_does_not_block_publication() {
         let tmp = test_util::tempdir();
         let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
-        let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+        let (runtime_handle, storage_handle) =
+            test_dynamic_storage_route_handles(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
         let upload_id = create_test_bucket_and_upload(&frontend, "part-route-expiry-bucket", "key");
         initial.test_store_route_map_validity(
@@ -6621,7 +6642,7 @@ Connection: close\r\n\r\n",
             }));
 
         let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
-        let install_handle = storage_handle.clone();
+        let install_handle = runtime_handle.clone();
         let installed_candidate = Arc::clone(&candidate);
         let installer = std::thread::spawn(move || {
             install_handle.install(installed_candidate).unwrap();

@@ -607,7 +607,7 @@ fn run_multipart_trace(ops: &[MultipartTraceOp]) -> TestCaseResult {
     set_route_primary(&mut initial_map, 3, NodeId::new(2));
 
     let mut map = Arc::new(initial_map);
-    let mut cluster = crate::StorageCluster::from_local_map(Arc::clone(&map))
+    let mut cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map))
         .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
     create_test_bucket(&cluster, &bucket);
 
@@ -762,7 +762,7 @@ fn run_multipart_trace(ops: &[MultipartTraceOp]) -> TestCaseResult {
                 set_route_primary(&mut reopened, 2, NodeId::new(1));
                 set_route_primary(&mut reopened, 3, NodeId::new(2));
                 map = Arc::new(reopened);
-                cluster = crate::StorageCluster::from_local_map(Arc::clone(&map))
+                cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map))
                     .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
                 assert_clean_metadata_command_stream(&map, &[1, 2, 3]);
             }

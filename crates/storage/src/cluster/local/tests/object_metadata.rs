@@ -25,7 +25,8 @@ fn object_metadata_pending_install_race_drains_winner_and_retries() {
 
     let first_map = Arc::new(first_map);
     let second_map = Arc::new(second_map);
-    let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+    let first_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&first_map)).unwrap();
     create_test_bucket(&first_cluster, &bucket);
     let first_committed = write_committed_direct_segment_for_with_okh(
         &first_cluster,
@@ -155,7 +156,8 @@ fn object_metadata_pending_install_race_reruns_precondition_action() {
 
     let first_map = Arc::new(first_map);
     let second_map = Arc::new(second_map);
-    let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+    let first_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&first_map)).unwrap();
     create_test_bucket(&first_cluster, &bucket);
     write_committed_direct_segment_for_with_okh(
         &first_cluster,

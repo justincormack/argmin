@@ -2818,6 +2818,41 @@ fail_with_matches \
     "Canonical ACL storage strings and exact-current decoding are private to s3-types/storage; other crates must pass logical AclGrants values" \
     "$acl_codec_leaks"
 
+route_authority_capability_leaks=$(
+    {
+        rg -n --color=never \
+            '\bStorageCluster::(from_local_map|open_local_nodes)\b|pub fn (from_local_map|open_local_nodes)\b' \
+            crates plans \
+            -g '*.rs' \
+            -g '*.md' \
+            || true
+        rg -n --color=never \
+            '\bStorageClusterRuntimeMapHandle\b' \
+            crates \
+            -g '*.rs' \
+            -g '!crates/storage/**' \
+            -g '!crates/argmin-s3/src/main.rs' \
+            -g '!crates/server-core/src/coordinator/core_tests.rs' \
+            -g '!crates/server-core/src/coordinator/test_support.rs' \
+            -g '!crates/server-http/src/http/serve.rs' \
+            || true
+        awk '
+            /^mod tests \{/ { exit }
+            /StorageClusterRuntimeMapHandle/ {
+                print FILENAME ":" FNR ":" $0
+            }
+        ' crates/server-http/src/http/serve.rs
+        rg -n --color=never \
+            '\btest_from_route_handle\b|pub[[:space:]]+fn[[:space:]]+from_authorized_cluster\b' \
+            crates \
+            -g '*.rs' \
+            || true
+    }
+)
+fail_with_matches \
+    "Static construction must be explicit, generic route-handle construction cannot be public, request consumers receive only StorageClusterRouteHandle, and no request handle can be upgraded to dynamic publication authority" \
+    "$route_authority_capability_leaks"
+
 session_token_format_leaks=$(
     {
         rg -n --color=never \

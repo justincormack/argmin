@@ -484,7 +484,7 @@ Phase 2 implementation notes:
    - it carries `ClusterEpoch::INITIAL`
    - it assigns stable placement `NodeId`s to local stores
    - node 0 is the default metadata primary for the initial harness
-2. `StorageCluster::open_local_nodes` opens one independent
+2. `StorageCluster::open_static_local_nodes` opens one independent
    `SharedStorageNode` per local node under `node-<id>` subdirectories.
    - duplicate node IDs are rejected
    - duplicate/canonical-equivalent data directories are rejected

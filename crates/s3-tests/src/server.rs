@@ -120,7 +120,7 @@ pub fn open_test_storage_cluster(data_path: &Path, pg_ids: &[u32]) -> Arc<storag
     };
     let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
     let node_ids: Vec<storage::NodeId> = (0..node_count).map(storage::NodeId::new).collect();
-    storage::StorageCluster::open_local_nodes(data_path, &node_ids, pg_ids, ec_shape)
+    storage::StorageCluster::open_static_local_nodes(data_path, &node_ids, pg_ids, ec_shape)
         .expect("open local storage cluster")
 }
 
@@ -346,7 +346,8 @@ impl TestServer {
             auth::IdentityProvider::in_memory_with_authorization(credentials, roles, authorization)
                 .expect("initialize session-token key ring");
         let frontend_storage_handle =
-            storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
+            storage::StorageClusterRouteHandle::from_static_cluster(Arc::clone(&storage_cluster))
+                .unwrap();
         let frontends: Vec<server_http::http::HttpFrontend> = (0..POOL_SIZE)
             .map(|_| {
                 let sse_c_validator = server_core::sse::SseCustomerValidatorConfig::from_base64(
@@ -360,7 +361,7 @@ impl TestServer {
                 )
                 .map(server_core::sse::StaticManagedKeyProvider::single)
                 .expect("valid test SSE-S3 wrapping key");
-                let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+                let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
                         frontend_storage_handle.clone(),
                         region.to_string(),
                         Some(sse_c_validator),

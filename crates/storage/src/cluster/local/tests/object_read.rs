@@ -1,5 +1,5 @@
 use super::*;
-use crate::{SegmentStoredBytesRequest, StorageClusterRuntimeMapHandle};
+use crate::{SegmentStoredBytesRequest, StorageClusterRouteHandle};
 
 #[test]
 fn retained_object_payload_read_rejects_a_crossed_segment_descriptor() {
@@ -26,7 +26,7 @@ fn retained_object_payload_read_rejects_a_crossed_segment_descriptor() {
         b"retained payload",
     );
 
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = handle.admit_current_route().unwrap();
     let route = admission
         .active_object_read_route(
@@ -121,7 +121,7 @@ fn retained_object_payload_handoff_rejects_another_version_of_the_same_key() {
     );
     assert_ne!(older.version_id, newer.version_id);
 
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = handle.admit_current_route().unwrap();
     let older_route = admission
         .active_object_read_route(

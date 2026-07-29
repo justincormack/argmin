@@ -7625,13 +7625,14 @@ transport_profile_id = "internal"
         manifest.initialize_selected_storage().unwrap();
 
         let cluster = crate::build_legacy_local_storage_cluster(&config, &ec_config).unwrap();
-        let handle = storage::StorageClusterRuntimeMapHandle::new(cluster.cluster());
+        let handle =
+            storage::StorageClusterRouteHandle::from_static_cluster(cluster.cluster()).unwrap();
 
         assert_eq!(
             handle.current().cluster_epoch(),
             storage::ClusterEpoch::new(7).unwrap()
         );
-        assert!(crate::maybe_spawn_frontend_control_plane_refresh_loop(handle, &config).is_none());
+        assert!(crate::maybe_spawn_frontend_control_plane_refresh_loop(None, &config).is_none());
         assert!(!socket_path.exists());
     }
 

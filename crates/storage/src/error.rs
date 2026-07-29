@@ -808,6 +808,9 @@ pub enum ClusterBuildError {
     #[error("static route authority must have unbounded validity")]
     StaticRouteAuthorityBoundedValidity,
 
+    #[error("dynamic route authority requires a runtime-map publication capability")]
+    DynamicRouteAuthorityRequiresRuntimeMapHandle,
+
     #[error("dynamic route authority for epoch {epoch} must have bounded validity")]
     DynamicRouteAuthorityUnboundedValidity { epoch: ClusterEpoch },
 

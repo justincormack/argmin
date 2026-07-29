@@ -248,7 +248,7 @@ fn unix_broad_payload_lease_survives_frontend_runtime_map_refresh() {
         map
     };
     let map_a = Arc::new(open_frontend_map());
-    let cluster_a = StorageCluster::from_local_map(Arc::clone(&map_a)).unwrap();
+    let cluster_a = StorageCluster::from_static_local_map(Arc::clone(&map_a)).unwrap();
     let bucket = BucketName::new("lease-refresh-bucket").unwrap();
     let key = ObjectKey::new("source").unwrap();
     let original = write_committed_direct_segment_for(&cluster_a, &bucket, &key, b"original");
@@ -262,7 +262,7 @@ fn unix_broad_payload_lease_survives_frontend_runtime_map_refresh() {
 
     let mut map_b = open_frontend_map();
     map_b.inherit_process_local_state_from(&map_a);
-    let cluster_b = StorageCluster::from_local_map(Arc::new(map_b)).unwrap();
+    let cluster_b = StorageCluster::from_static_local_map(Arc::new(map_b)).unwrap();
     assert_eq!(
         cluster_b
             .reclaim_object_payload_if_unleased_with_outcome(&bucket, &key, original.generation_id,)
@@ -671,7 +671,7 @@ fn assert_historical_pending_command_recovery_over_unix(
     historical_map
         .install_unix_storage_node_clients(client_configs)
         .unwrap();
-    let cluster = StorageCluster::from_local_map(Arc::new(historical_map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::new(historical_map)).unwrap();
 
     assert_eq!(
         cluster
@@ -920,7 +920,8 @@ fn unix_historical_recovery_reissues_then_cleans_stale_stream_generation() {
     historical_map
         .install_unix_storage_node_clients([client_config.clone()])
         .unwrap();
-    let historical_cluster = StorageCluster::from_local_map(Arc::new(historical_map)).unwrap();
+    let historical_cluster =
+        StorageCluster::from_static_local_map(Arc::new(historical_map)).unwrap();
     let conflict = MetadataCommandEnvelope::new(
         source.id(),
         MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
@@ -978,7 +979,7 @@ fn unix_historical_recovery_reissues_then_cleans_stale_stream_generation() {
     current_map
         .install_unix_storage_node_clients([client_config])
         .unwrap();
-    let current_cluster = StorageCluster::from_local_map(Arc::new(current_map)).unwrap();
+    let current_cluster = StorageCluster::from_static_local_map(Arc::new(current_map)).unwrap();
 
     assert_eq!(
         historical_cluster
@@ -1759,7 +1760,7 @@ fn frontend_unix_metadata_command_mode_uses_storage_node_owned_data_dir() {
     )])
     .unwrap();
     let map = Arc::new(map);
-    let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let bucket = crate::tests::bucket_name("remote-metadata-command-bucket");
     let command = create_bucket_metadata_command(PgId::new(0), 1, bucket.clone());
 
@@ -1853,7 +1854,7 @@ fn peering_replay_catches_up_replicas_through_unix_storage_clients() {
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
     let map = Arc::new(map);
-    let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     let decision = cluster
         .replay_pg_peering_catchup_from_retained_metadata_log(pg_id, NodeId::new(0))
@@ -1941,7 +1942,7 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
     )])
     .unwrap();
     let map = Arc::new(map);
-    let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let bucket = crate::tests::bucket_name("remote-bucket-metadata-create");
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
@@ -1987,7 +1988,8 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
         crate::BucketCreateAttemptOutcome::Created(_)
     ));
 
-    let runtime_map = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let runtime_map =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = runtime_map.admit_current_route().unwrap();
     let active_bucket_route = admission.active_bucket_route(&bucket).unwrap();
     assert_eq!(active_bucket_route.head_bucket_info().unwrap().name, bucket);
@@ -2102,7 +2104,7 @@ fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows
         )])
         .unwrap();
         let map = Arc::new(map);
-        let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
         (map, cluster)
     };
 
@@ -2246,7 +2248,7 @@ fn frontend_unix_durable_reclaim_scan_stops_after_first_stale_route() {
         socket_path,
     )])
     .unwrap();
-    let cluster = StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
 
     let scan = cluster.enqueue_durable_object_payload_reclaim_roots_excluding(&HashSet::new());
     assert_eq!(scan.errors, 1, "one stale response must end the PG scan");
@@ -2352,7 +2354,7 @@ fn frontend_unix_delete_bucket_reaps_expired_reservation_from_older_epoch() {
     )])
     .unwrap();
     let map = Arc::new(map);
-    let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     cluster
         .test_begin_bucket_delete_if_current(&bucket)
@@ -2456,7 +2458,7 @@ fn frontend_unix_delete_bucket_adopts_live_drain_from_older_epoch() {
     )])
     .unwrap();
     let map = Arc::new(map);
-    let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     cluster
         .test_begin_bucket_delete_if_current(&bucket)
@@ -2531,7 +2533,7 @@ fn frontend_unix_lifecycle_claims_resume_from_storage_node_owned_rows() {
         )])
         .unwrap();
         let map = Arc::new(map);
-        let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
         (map, cluster)
     };
 
@@ -2701,7 +2703,7 @@ fn frontend_unix_stream_session_scavenger_lists_storage_node_owned_rows() {
     )])
     .unwrap();
     let map = Arc::new(map);
-    let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
     assert!(
@@ -2930,7 +2932,7 @@ fn frontend_unix_stream_session_scavenger_rejects_wrong_pg_rows() {
         socket_path,
     )])
     .unwrap();
-    let cluster = StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
 
     assert_eq!(cluster.object_metadata_pg_id(&bucket, &key), 1);
     assert!(
@@ -3034,7 +3036,7 @@ fn frontend_unix_bucket_metadata_mode_reads_bucket_batches_from_storage_node() {
     )])
     .unwrap();
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
     assert!(crate::PgMetadataStore::head_bucket_raw(&*frontend_pg, &bucket).is_err());
@@ -3078,7 +3080,7 @@ fn bucket_list_page_validation_rejects_wrong_pg_bucket() {
         .map(|index| crate::tests::bucket_name(format!("list-page-wrong-pg-{index}")))
         .find(|bucket| map.bucket_pg_for(bucket) == 1)
         .expect("two-PG topology must place a test bucket on PG 1");
-    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
     let owner = crate::CanonicalUserId::from_principal("owner");
     let correct_info = test_bucket_list_info(correct_bucket, &owner);
     let wrong_info = test_bucket_list_info(wrong_bucket, &owner);
@@ -3189,7 +3191,7 @@ fn frontend_unix_object_generation_mode_reserves_on_storage_node() {
     ])
     .unwrap();
     let map = Arc::new(map);
-    let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let bucket = crate::tests::bucket_name("remote-object-generation-reserve");
     let key = crate::tests::object_key("key");
     let reservation_id = crate::tests::stream_session_id("remote-obj-gen");
@@ -3286,7 +3288,7 @@ fn frontend_unix_object_version_mode_reserves_on_storage_node() {
     ])
     .unwrap();
     let map = Arc::new(map);
-    let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let bucket = crate::tests::bucket_name("remote-object-version-reserve");
     let key = crate::tests::object_key("key");
 
@@ -3404,7 +3406,7 @@ fn frontend_unix_bucket_write_reservation_mode_uses_storage_node() {
     ])
     .unwrap();
     let map = Arc::new(map);
-    let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     let reservation = cluster
         .acquire_durable_bucket_write_reservation(&bucket, "bucket-write-snapshot", None)
@@ -3633,7 +3635,7 @@ fn frontend_unix_stream_heartbeat_renews_old_epoch_proof_and_session_row() {
         socket_path,
     )])
     .unwrap();
-    let cluster = StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
 
     cluster
         .heartbeat_put_object_stream_session(&bucket, &key, &session_id)
@@ -3752,7 +3754,7 @@ fn frontend_unix_bucket_snapshot_pair_mode_uses_storage_node() {
     )])
     .unwrap();
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     let pair = cluster
         .load_bucket_snapshot_pair(
@@ -3977,7 +3979,7 @@ fn frontend_unix_object_generation_loser_retries_stale_generation() {
         ])
         .unwrap();
         let map = Arc::new(map);
-        let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
         (map, cluster)
     };
     let (loser_map, loser) = build_frontend("frontend-loser");
@@ -4110,7 +4112,7 @@ fn frontend_unix_object_generation_loser_retries_rpc_reservation_conflict() {
         ])
         .unwrap();
         let map = Arc::new(map);
-        let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
         (map, cluster)
     };
     let (map, loser) = build_frontend("frontend-loser");
@@ -4573,7 +4575,7 @@ fn unix_object_mutation_client_repeats_suspended_null_delete_marker() {
         socket_path,
     )])
     .unwrap();
-    let cluster = StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
 
     let repeated = cluster
         .insert_current_delete_marker_if(
@@ -4761,7 +4763,7 @@ fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
     map.install_unix_shard_clients(shard_client_configs)
         .unwrap();
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     let committed = write_committed_direct_segment(&cluster, b"direct put remote payload");
 
@@ -4884,7 +4886,7 @@ fn non_current_epoch_unix_direct_put_commit_fails_closed_and_cleans_remote_state
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
     let map = Arc::new(map);
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&current_cluster, &bucket);
 
     let reservation_id =
@@ -5089,7 +5091,8 @@ fn control_plane_peering_unix_direct_put_old_primary_fails_closed_and_cleans_rem
             .pg_topology();
         bucket_key_with_distinct_object_and_data_pg(topology)
     };
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
 
     let reservation_id =
@@ -5483,7 +5486,8 @@ fn control_plane_peering_unix_copy_object_destination_old_primary_cleans_remote_
             .unwrap();
         key_for_object_pg(topology, &bucket, source_pg, "copy-source-")
     };
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
     let source_payload = b"control-plane peering stale unix copy source payload";
     let source_segment = write_committed_direct_segment_for_with_okh(
@@ -5894,7 +5898,8 @@ fn control_plane_peering_unix_object_delete_old_primary_fails_closed_without_rem
             .pg_topology();
         bucket_key_with_distinct_object_and_data_pg(topology)
     };
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     let committed = write_committed_direct_segment_for(
         &source_cluster,
         &bucket,
@@ -6192,7 +6197,8 @@ fn control_plane_peering_unix_object_metadata_old_primary_fails_closed_without_r
             .pg_topology();
         bucket_key_with_distinct_object_and_data_pg(topology)
     };
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     let committed = write_committed_direct_segment_for(
         &source_cluster,
         &bucket,
@@ -6496,7 +6502,8 @@ fn control_plane_peering_unix_multipart_completion_old_primary_fails_closed_with
             .pg_topology();
         bucket_key_with_distinct_object_and_data_pg(topology)
     };
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
     let (req, _) =
         seed_streamed_multipart_completion(&source_cluster, &bucket, &key, "unixpeeringcomplete");
@@ -6812,7 +6819,8 @@ fn control_plane_peering_unix_multipart_abort_old_primary_fails_closed_without_r
         let key = key_for_object_pg(topology, &bucket, object_pg, "object-");
         (bucket, key, object_pg)
     };
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
     let (req, _) =
         seed_streamed_multipart_completion(&source_cluster, &bucket, &key, "unixpeeringabort");
@@ -7115,7 +7123,8 @@ fn control_plane_peering_unix_upload_part_session_old_primary_fails_closed_witho
             .pg_topology();
         bucket_key_with_distinct_object_and_data_pg(topology)
     };
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
     let upload_id = upload_id_from_label("unixpeeringuppart");
     let create = crate::CreateMultipartUploadReq {
@@ -7451,7 +7460,8 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
             .pg_topology();
         bucket_key_with_distinct_object_and_data_pg(topology)
     };
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
     let upload_id = upload_id_from_label("unixpeerfin");
     let create = crate::CreateMultipartUploadReq {
@@ -7916,7 +7926,8 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
             .pg_topology();
         bucket_key_with_distinct_object_and_data_pg(topology)
     };
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
     let session_id = crate::tests::stream_session_id("unixpeerputfin");
     source_cluster
@@ -8354,7 +8365,8 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
             .pg_topology();
         bucket_key_with_distinct_object_and_data_pg(topology)
     };
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
     let upload_id = upload_id_from_label("unixpeercopyfin");
     let create = crate::CreateMultipartUploadReq {
@@ -8827,7 +8839,7 @@ fn non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_st
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
     let map = Arc::new(map);
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&current_cluster, &bucket);
     let session_id = crate::tests::stream_session_id("unixstaleappend");
     current_cluster
@@ -9031,7 +9043,7 @@ fn non_current_epoch_unix_upload_part_stream_session_create_fails_closed_without
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
     let map = Arc::new(map);
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&current_cluster, &bucket);
     let upload_id = upload_id_from_label("unixstaleuppart");
     let create = crate::CreateMultipartUploadReq {
@@ -9220,7 +9232,7 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
     let map = Arc::new(map);
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&current_cluster, &bucket);
     let upload_id = upload_id_from_label("unixstalefinal");
     let create = crate::CreateMultipartUploadReq {
@@ -9492,7 +9504,7 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
     let map = Arc::new(map);
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&current_cluster, &bucket);
     let upload_id = upload_id_from_label("unixstalecopyfin");
     let create = crate::CreateMultipartUploadReq {
@@ -9782,7 +9794,7 @@ fn non_current_epoch_unix_multipart_completion_fails_closed_without_remote_mutat
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
     let map = Arc::new(map);
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&current_cluster, &bucket);
     let (req, _) =
         seed_streamed_multipart_completion(&current_cluster, &bucket, &key, "unixstalecomplete");
@@ -9943,7 +9955,7 @@ fn non_current_epoch_unix_object_metadata_update_fails_closed_without_remote_mut
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
     let map = Arc::new(map);
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let committed = write_committed_direct_segment_for(
         &current_cluster,
         &bucket,
@@ -10100,7 +10112,7 @@ fn non_current_epoch_unix_object_delete_fails_closed_without_remote_mutation() {
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
     let map = Arc::new(map);
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let committed = write_committed_direct_segment_for(
         &current_cluster,
         &bucket,
@@ -10369,7 +10381,8 @@ fn cross_epoch_segment_read_uses_retained_route_over_unix_storage_nodes() {
     current_map
         .install_unix_shard_clients(shard_client_configs.clone())
         .unwrap();
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::new(current_map)).unwrap();
+    let current_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::new(current_map)).unwrap();
     let committed =
         write_committed_direct_segment(&current_cluster, b"cross epoch historical unix read");
     let request = crate::SegmentStoredBytesRequest {
@@ -10394,7 +10407,7 @@ fn cross_epoch_segment_read_uses_retained_route_over_unix_storage_nodes() {
     next_map
         .install_unix_shard_clients(shard_client_configs)
         .unwrap();
-    let next_cluster = crate::StorageCluster::from_local_map(Arc::new(next_map)).unwrap();
+    let next_cluster = crate::StorageCluster::from_static_local_map(Arc::new(next_map)).unwrap();
 
     let mut current_route_read = Vec::new();
     let current_route_error = next_cluster
@@ -10518,7 +10531,7 @@ fn remote_shard_files_without_ack_rows_are_not_publishable() {
     map.install_unix_shard_clients(shard_client_configs)
         .unwrap();
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let direct_written = cluster
         .write_direct_put_segment_payload_shards(
             &bucket,
@@ -10666,7 +10679,7 @@ fn remote_shard_ack_rows_on_wrong_node_are_not_publishable() {
     map.install_unix_shard_clients(shard_client_configs)
         .unwrap();
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let direct_written = cluster
         .write_direct_put_segment_payload_shards(
             &bucket,

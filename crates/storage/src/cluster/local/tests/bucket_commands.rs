@@ -1,5 +1,5 @@
 use super::*;
-use crate::{BucketAclSummary, StorageClusterRuntimeMapHandle};
+use crate::{BucketAclSummary, StorageClusterRouteHandle};
 
 #[test]
 fn composite_object_listings_fan_out_to_routed_pg_primaries() {
@@ -20,7 +20,7 @@ fn composite_object_listings_fan_out_to_routed_pg_primaries() {
     set_route_primary(&mut map, 2, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     write_committed_direct_segment_for_with_okh(&cluster, &bucket, &key_b, [52; 16], b"payload-b");
     write_committed_direct_segment_for_with_okh(&cluster, &bucket, &key_a, [53; 16], b"payload-a");
 
@@ -142,7 +142,7 @@ fn object_and_multipart_listing_select_global_first_page_at_production_cap_volum
         pg.refresh_metadata_command_state_digest().unwrap();
     }
 
-    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
     let listed = cluster
         .list_objects_for_bucket(&bucket, None, None, None, MAX_KEYS)
         .unwrap();
@@ -209,7 +209,7 @@ fn multipart_upload_global_merge_uses_pg_listing_position_order() {
         )
         .unwrap();
 
-    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
     let first = cluster
         .list_multipart_uploads_for_bucket(&bucket, None, None, None, None, 2)
         .unwrap();
@@ -272,7 +272,7 @@ fn multipart_upload_delimiter_pagination_merges_common_prefix_across_pgs() {
         )
         .unwrap();
 
-    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
     let first = cluster
         .list_multipart_uploads_for_bucket(&bucket, None, Some("/"), None, None, 1)
         .unwrap();
@@ -340,7 +340,7 @@ fn composite_bucket_listings_fail_closed_while_any_metadata_pg_is_peering() {
     let mut map =
         Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
     let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     write_committed_direct_segment_for_with_okh(
         &cluster,
         &bucket,
@@ -356,7 +356,7 @@ fn composite_bucket_listings_fail_closed_while_any_metadata_pg_is_peering() {
         .get_mut(&PgId::new(1))
         .unwrap()
         .state = PgState::Peering;
-    let cluster = crate::StorageCluster::from_local_map(map).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
 
     let err = cluster
         .list_objects_for_bucket(&bucket, None, None, None, 100)
@@ -401,9 +401,9 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
-    let cluster = Arc::new(crate::StorageCluster::from_local_map(map).unwrap());
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(map).unwrap());
     let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let time = Arc::new(crate::clock::test_time_override_guard(1_000));
     let prepare_scan = || {
         time.set(1_000);
@@ -502,7 +502,7 @@ fn composite_bucket_listing_fan_out_to_routed_pg_primaries() {
     seed_bucket_record(&map, NodeId::new(2), 2, &bucket_b, &owner);
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     let bridge_node = map.node(NodeId::new(0)).unwrap().storage_node();
     assert!(bridge_node.test_head_bucket_raw(&bucket_a).is_err());
@@ -536,7 +536,7 @@ fn create_bucket_command_applies_to_all_acting_pg_nodes() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
     let created = cluster
@@ -624,7 +624,7 @@ fn create_bucket_command_retry_reuses_pending_partial_replica_command() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
     let _serial = lock_metadata_command_apply_hook_test();
@@ -771,7 +771,7 @@ fn create_bucket_retries_partial_exact_command_conflict() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
     let _serial = lock_metadata_command_apply_hook_test();
@@ -850,7 +850,7 @@ fn create_bucket_retries_partial_exact_command_conflict_on_first_replica() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
     let _serial = lock_metadata_command_apply_hook_test();
@@ -928,7 +928,7 @@ fn create_bucket_drains_different_bucket_pending_command_on_same_pg() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
 
@@ -1031,7 +1031,7 @@ fn put_bucket_versioning_command_applies_to_all_acting_pg_nodes() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let original = {
         let primary = map.node(NodeId::new(1)).unwrap().storage_node();
@@ -1074,7 +1074,7 @@ fn put_bucket_versioning_command_retry_reuses_pending_partial_replica_command() 
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let _serial = lock_metadata_command_apply_hook_test();
     let fail_once = Arc::new(AtomicBool::new(true));
@@ -1204,7 +1204,7 @@ fn same_bucket_pending_metadata_command_drains_before_later_acl() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let _serial = lock_metadata_command_apply_hook_test();
     let fail_once = Arc::new(AtomicBool::new(true));
@@ -1314,7 +1314,7 @@ fn bucket_update_cleans_terminal_pending_slot_before_new_command() {
         .pg_topology();
     let bucket = bucket_for_pg(topology, 1, "terminal-pending-next-op-");
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let pg_id = PgId::new(1);
     let command = create_bucket_metadata_command(pg_id, 1, bucket.clone());
     cluster
@@ -1371,7 +1371,7 @@ fn put_bucket_acl_command_applies_to_all_acting_pg_nodes() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let original = {
         let primary = map.node(NodeId::new(1)).unwrap().storage_node();
@@ -1426,7 +1426,7 @@ fn put_bucket_acl_command_retry_reuses_pending_partial_replica_command() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let acl_grants = crate::AclGrants::default();
     let _serial = lock_metadata_command_apply_hook_test();
@@ -1552,7 +1552,7 @@ fn bucket_acl_drains_pending_multipart_completion_barrier_command() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let pg_id = PgId::new(1);
@@ -1653,7 +1653,7 @@ fn existing_create_bucket_preserves_pending_acl_command_for_retry() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let acl_grants = crate::AclGrants::default();
     let _serial = lock_metadata_command_apply_hook_test();
@@ -1782,7 +1782,7 @@ fn bucket_acl_retry_rejects_same_acl_with_mismatched_post_image() {
     };
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let acl_grants = crate::AclGrants::default();
     let current = {
@@ -1851,7 +1851,7 @@ fn bucket_property_commands_apply_to_all_acting_pg_nodes() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let mut previous_generation = {
         let primary = map.node(NodeId::new(1)).unwrap().storage_node();
@@ -1998,7 +1998,7 @@ fn bucket_property_command_retry_reuses_pending_partial_replica_command() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let public_access_block = crate::PublicAccessBlockConfig {
         block_public_acls: true,
@@ -2117,7 +2117,7 @@ fn invalid_bucket_property_command_does_not_poison_bucket_command_stream() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let initial_generation = {
         let primary = map.node(NodeId::new(1)).unwrap().storage_node();
@@ -2193,7 +2193,7 @@ fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let mut previous_generation = {
         let primary = map.node(NodeId::new(1)).unwrap().storage_node();
@@ -2422,7 +2422,7 @@ fn bucket_subresource_command_retry_reuses_pending_partial_replica_command() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let policy_body = r#"{"Statement":[]}"#;
     let expected_mutation = BucketSubresourceMutation::PutPolicy {
@@ -2563,7 +2563,7 @@ fn invalid_bucket_subresource_command_does_not_poison_bucket_command_stream() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let initial_generation = {
         let primary = map.node(NodeId::new(1)).unwrap().storage_node();

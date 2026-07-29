@@ -249,7 +249,7 @@ fn multipart_upload_lifecycle() {
     ];
     let ec = EcShape { k: 4, m: 2 };
     let map = Arc::new(crate::LocalClusterMap::open(dir.path(), &node_ids, &[0], ec).unwrap());
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let metadata_node = Arc::clone(map.node(crate::NodeId::new(0)).unwrap().test_node());
     let bucket = bucket_name("bucket");
     let key = object_key("k");
@@ -424,7 +424,7 @@ fn multipart_upload_lifecycle() {
 
     // Load and retain the same full-payload snapshot consumed by normal object
     // reads, then reconstruct each part through its committed segment rows.
-    let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = handle.admit_current_route().unwrap();
     let route = admission
         .active_object_read_route(

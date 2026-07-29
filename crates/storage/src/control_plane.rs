@@ -36023,7 +36023,9 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
         )
         .unwrap();
-        let handle = crate::cluster::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+        let handle = crate::cluster::StorageClusterRouteHandle::from_authorized_cluster(
+            Arc::clone(&initial),
+        );
         let mut renewed_map = initial_map.clone();
         let renewed_deadline = initial_map.valid_until_ms().unwrap().saturating_add(5_000);
         renewed_map.validity = RouteMapValidity::until_ms(renewed_deadline).unwrap();
@@ -36058,7 +36060,9 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
         )
         .unwrap();
-        let handle = crate::cluster::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+        let handle = crate::cluster::StorageClusterRouteHandle::from_authorized_cluster(
+            Arc::clone(&initial),
+        );
         let mut changed_map = initial_map;
         changed_map.nodes[0].endpoint = "/tmp/argmin-node-1-replaced.sock".to_owned();
         let mut source = CountingRuntimeMapSource {
@@ -43980,7 +43984,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_cluster_runtime_map_handle_refresh_installs_current_map() {
+    fn storage_cluster_route_handle_refresh_installs_current_map() {
         let _clock = crate::clock::test_time_override_guard(1_050);
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -44001,7 +44005,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
         )
         .unwrap();
-        let handle = crate::StorageClusterRuntimeMapHandle::new(cluster);
+        let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(cluster);
         assert_eq!(
             handle
                 .current()
@@ -44037,7 +44041,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_cluster_runtime_map_handle_rejects_epoch_downgrade() {
+    fn storage_cluster_route_handle_rejects_epoch_downgrade() {
         let _clock = crate::clock::test_time_override_guard(2_001);
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -44058,7 +44062,8 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
         )
         .unwrap();
-        let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&older_cluster));
+        let handle =
+            crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&older_cluster));
 
         authority
             .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
@@ -44154,7 +44159,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_cluster_runtime_map_handle_accepts_same_epoch_shorter_bounded_validity() {
+    fn storage_cluster_route_handle_accepts_same_epoch_shorter_bounded_validity() {
         crate::clock::with_time_override(12_000, || {
             let mut current_map = runtime_map_test_snapshot_with_active_route();
             current_map.validity = RouteMapValidity::until_ms(14_000).unwrap();
@@ -44165,7 +44170,7 @@ mod tests {
                 crate::EcShape { k: 1, m: 0 },
             )
             .unwrap();
-            let handle = crate::StorageClusterRuntimeMapHandle::new(current_cluster);
+            let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(current_cluster);
             let mut shorter_map = current_map.clone();
             shorter_map.validity = RouteMapValidity::until_ms(13_500).unwrap();
             let shorter_cluster = crate::StorageCluster::from_runtime_map(
@@ -44181,7 +44186,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_cluster_runtime_map_handle_extends_all_pinned_same_epoch_validity() {
+    fn storage_cluster_route_handle_extends_all_pinned_same_epoch_validity() {
         let _clock = crate::clock::test_time_override_guard(500);
         let route = PgRouteSnapshot::reconstructed(
             ClusterEpoch::INITIAL,
@@ -44206,7 +44211,8 @@ mod tests {
         )
         .unwrap();
         pinned_cluster.test_store_route_map_validity(RouteMapValidity::until_ms(1_000).unwrap());
-        let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned_cluster));
+        let handle =
+            crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&pinned_cluster));
         let candidate_map = crate::cluster::LocalClusterMap::open_frontend_topology_only_with_pg_routes_and_validity(
             NodeId::new(1),
             [NodeId::new(1)],
@@ -44265,7 +44271,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_cluster_runtime_map_handle_does_not_extend_pinned_previous_epoch_validity() {
+    fn storage_cluster_route_handle_does_not_extend_pinned_previous_epoch_validity() {
         let _clock = crate::clock::test_time_override_guard(500);
         let initial_route = PgRouteSnapshot::reconstructed(
             ClusterEpoch::INITIAL,
@@ -44290,7 +44296,8 @@ mod tests {
         )
         .unwrap();
         pinned_cluster.test_store_route_map_validity(RouteMapValidity::until_ms(1_000).unwrap());
-        let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned_cluster));
+        let handle =
+            crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&pinned_cluster));
         let next_epoch = ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 1).unwrap();
         let next_route = PgRouteSnapshot::reconstructed(
             next_epoch,
@@ -44323,7 +44330,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_cluster_runtime_map_handle_rejects_static_to_dynamic_same_epoch() {
+    fn storage_cluster_route_handle_rejects_static_to_dynamic_same_epoch() {
         let _clock = crate::clock::test_time_override_guard(1_050);
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -44371,7 +44378,9 @@ mod tests {
             active_map.cluster_epoch(),
         )
         .unwrap();
-        let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&unbounded_cluster));
+        let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(
+            &unbounded_cluster,
+        ));
         assert_eq!(
             active_cluster.cluster_epoch(),
             unbounded_cluster.cluster_epoch()
@@ -44417,7 +44426,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
         )
         .unwrap();
-        let handle = crate::StorageClusterRuntimeMapHandle::new(cluster);
+        let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(cluster);
 
         authority
             .complete_pg_peering(
@@ -44588,7 +44597,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
         )
         .unwrap();
-        let handle = crate::StorageClusterRuntimeMapHandle::new(cluster);
+        let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(cluster);
         let discovery_now_ms = Arc::new(AtomicU64::new(u64::MAX));
         let recovery_now_ms = Arc::new(Mutex::new(Vec::new()));
         let refresh_now_ms = Arc::new(AtomicU64::new(u64::MAX));
@@ -44702,7 +44711,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
         )
         .unwrap();
-        let handle = crate::StorageClusterRuntimeMapHandle::new(cluster);
+        let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(cluster);
         let source = FailOnceRuntimeMapSource {
             snapshot: authority.snapshot().clone(),
             failures_remaining: AtomicU64::new(1),
@@ -44754,7 +44763,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
         )
         .unwrap();
-        let handle = crate::StorageClusterRuntimeMapHandle::new(cluster);
+        let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(cluster);
 
         assert!(matches!(
             handle.spawn_control_plane_refresh_loop(authority, Duration::ZERO, || 1_000),

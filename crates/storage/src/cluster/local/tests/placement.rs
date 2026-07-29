@@ -11,7 +11,7 @@ fn storage_cluster_opens_local_node_map() {
         NodeId::new(4),
         NodeId::new(5),
     ];
-    let cluster = crate::StorageCluster::open_local_nodes(
+    let cluster = crate::StorageCluster::open_static_local_nodes(
         tmp.path(),
         &node_ids,
         &[0, 1],
@@ -44,7 +44,7 @@ fn current_payload_placement_uses_pg_acting_set() {
         .get_mut(&PgId::new(0))
         .unwrap()
         .acting_set = Arc::from([NodeId::new(0), NodeId::new(1)]);
-    let cluster = crate::StorageCluster::from_local_map(map).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
 
     let locations = cluster
         .place_payload_shards(
@@ -74,9 +74,13 @@ fn places_payload_shards_deterministically_on_distinct_nodes() {
         NodeId::new(7),
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
-    let cluster =
-        crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape)
-            .unwrap();
+    let cluster = crate::StorageCluster::open_static_local_nodes(
+        tmp.path(),
+        &node_ids,
+        &[0, 1, 2, 3],
+        ec_shape,
+    )
+    .unwrap();
     let data_pg_id = DataPgId::new_for_test(crate::PgId::new(3));
 
     let first = cluster
@@ -121,9 +125,13 @@ fn places_payload_shards_for_explicit_pg_route_without_current_route_lookup() {
         NodeId::new(7),
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
-    let cluster =
-        crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape)
-            .unwrap();
+    let cluster = crate::StorageCluster::open_static_local_nodes(
+        tmp.path(),
+        &node_ids,
+        &[0, 1, 2, 3],
+        ec_shape,
+    )
+    .unwrap();
     let data_pg_id = DataPgId::new_for_test(crate::PgId::new(3));
     let placement_key = b"historical-placement-key";
 
@@ -424,7 +432,7 @@ fn storage_cluster_dispatches_payload_shard_io_to_placed_local_node() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let data_pg_id = DataPgId::new_for_test(crate::PgId::new(1));
     let location = cluster
         .place_payload_shards(data_pg_id, ec_shape, b"stable-payload-key")
@@ -505,7 +513,7 @@ fn storage_cluster_payload_write_uses_handle_operation_epoch() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let stale_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
         Arc::clone(&map),
         ClusterEpoch::new(2).unwrap(),
@@ -611,7 +619,7 @@ fn stale_storage_cluster_handle_cannot_use_current_epoch_location() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let stale_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
         Arc::clone(&map),
         ClusterEpoch::new(2).unwrap(),
@@ -670,7 +678,7 @@ fn stale_storage_cluster_handle_rejects_bucket_metadata_before_mutation() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let stale_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
         Arc::clone(&map),
         ClusterEpoch::new(2).unwrap(),
@@ -726,7 +734,7 @@ fn stale_storage_cluster_handle_rejects_object_metadata_before_mutation() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let stale_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
         Arc::clone(&map),
         ClusterEpoch::new(2).unwrap(),
@@ -773,7 +781,7 @@ fn stale_storage_cluster_handle_rejects_multipart_metadata_before_lookup() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let stale_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
         Arc::clone(&map),
         ClusterEpoch::new(2).unwrap(),
@@ -818,7 +826,7 @@ fn object_payload_lease_token_releases_after_cluster_epoch_transition() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let mut map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
     let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
     let generation_id = crate::GenerationId::MIN;
@@ -833,7 +841,8 @@ fn object_payload_lease_token_releases_after_cluster_epoch_transition() {
     drop(current_cluster);
 
     Arc::get_mut(&mut map).unwrap().epoch = ClusterEpoch::new(2).unwrap();
-    let current_epoch_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_epoch_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let stale_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
         Arc::clone(&map),
         ClusterEpoch::INITIAL,
@@ -889,7 +898,7 @@ fn placed_payload_shard_io_rejects_key_location_shard_index_mismatch() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let data_pg_id = DataPgId::new_for_test(crate::PgId::new(1));
     let locations = cluster
         .place_payload_shards(data_pg_id, ec_shape, b"stable-payload-key")
@@ -1208,7 +1217,7 @@ fn direct_put_payload_write_fails_closed_when_required_shard_node_leaves_acting_
     };
 
     let mut map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let reservation_id = crate::SessionId::try_from("56".repeat(16)).unwrap();
     let generation_id = cluster
@@ -1251,7 +1260,7 @@ fn direct_put_payload_write_fails_closed_when_required_shard_node_leaves_acting_
         }
         route.acting_set = Arc::from(acting_set);
     }
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     let err = cluster
         .write_direct_put_segment_payload_shards(
@@ -1310,7 +1319,7 @@ fn placed_segment_recovery_propagates_non_active_pg_route() {
         let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
         let mut map =
             Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
         let segment = write_committed_direct_segment(&cluster, b"phase-six-seven-route-read");
         let data_pg_id = DataPgId::new_for_test(PgId::new(segment.written.data_pg_id));
         drop(cluster);
@@ -1321,7 +1330,7 @@ fn placed_segment_recovery_propagates_non_active_pg_route() {
             .get_mut(&data_pg_id.pg_id())
             .unwrap()
             .state = state;
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
         let shard_size = segment
             .payload
             .len()
@@ -1371,7 +1380,8 @@ fn placed_payload_delete_propagates_missing_pg_route() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let cluster =
-        crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        crate::StorageCluster::open_static_local_nodes(tmp.path(), &node_ids, &[0], ec_shape)
+            .unwrap();
 
     let err = cluster
         .delete_payload_shard_set(99, ec_shape, &[17; 16], crate::GenerationId::MIN)
@@ -1399,7 +1409,8 @@ fn placed_segment_recovery_propagates_missing_shard_pg_route() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let cluster =
-        crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        crate::StorageCluster::open_static_local_nodes(tmp.path(), &node_ids, &[0], ec_shape)
+            .unwrap();
     let segment = write_committed_direct_segment(&cluster, b"phase-five-missing-pg-route");
     let shard_size = segment
         .payload
@@ -1454,7 +1465,8 @@ fn placed_segment_recovery_propagates_node_not_in_acting_set() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let cluster =
-        crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        crate::StorageCluster::open_static_local_nodes(tmp.path(), &node_ids, &[0], ec_shape)
+            .unwrap();
     let segment = write_committed_direct_segment(&cluster, b"phase-five-acting-set-route");
     let shard_size = segment
         .payload
@@ -1509,7 +1521,8 @@ fn placed_segment_recovery_propagates_stale_shard_location() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let cluster =
-        crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        crate::StorageCluster::open_static_local_nodes(tmp.path(), &node_ids, &[0], ec_shape)
+            .unwrap();
     let segment = write_committed_direct_segment(&cluster, b"phase-five-stale-location");
     let shard_size = segment
         .payload
@@ -1567,7 +1580,8 @@ fn placed_segment_recovery_propagates_shard_index_mismatch() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let cluster =
-        crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+        crate::StorageCluster::open_static_local_nodes(tmp.path(), &node_ids, &[0], ec_shape)
+            .unwrap();
     let segment = write_committed_direct_segment(&cluster, b"phase-five-shard-index-route");
     let shard_size = segment
         .payload
@@ -1625,7 +1639,7 @@ fn placed_segment_recovery_wraps_node_store_error_with_shard_route() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let mut map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let segment = write_committed_direct_segment(&cluster, b"phase-five-shard-store-route");
     drop(cluster);
 
@@ -1638,7 +1652,7 @@ fn placed_segment_recovery_wraps_node_store_error_with_shard_route() {
             Arc::<[NodeId]>::from(node_ids.to_vec()),
         ),
     );
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let shard_size = segment
         .payload
         .len()
@@ -1695,7 +1709,7 @@ fn placed_segment_recovery_treats_length_corrupt_shard_as_recoverable() {
             NodeId::new(4),
             NodeId::new(5),
         ];
-        let cluster = crate::StorageCluster::open_local_nodes(
+        let cluster = crate::StorageCluster::open_static_local_nodes(
             tmp.path(),
             &node_ids,
             &[0],
@@ -1753,7 +1767,7 @@ fn placed_segment_recovery_treats_checksum_corrupt_shard_as_recoverable() {
         NodeId::new(4),
         NodeId::new(5),
     ];
-    let cluster = crate::StorageCluster::open_local_nodes(
+    let cluster = crate::StorageCluster::open_static_local_nodes(
         tmp.path(),
         &node_ids,
         &[0],
@@ -1806,7 +1820,7 @@ fn placed_segment_recovery_treats_missing_shard_as_recoverable() {
         NodeId::new(4),
         NodeId::new(5),
     ];
-    let cluster = crate::StorageCluster::open_local_nodes(
+    let cluster = crate::StorageCluster::open_static_local_nodes(
         tmp.path(),
         &node_ids,
         &[0],
@@ -1854,7 +1868,7 @@ fn placed_segment_recovery_rejects_more_missing_shards_than_ec_can_tolerate() {
         NodeId::new(4),
         NodeId::new(5),
     ];
-    let cluster = crate::StorageCluster::open_local_nodes(
+    let cluster = crate::StorageCluster::open_static_local_nodes(
         tmp.path(),
         &node_ids,
         &[0],
@@ -1926,7 +1940,7 @@ fn repair_placed_segment_payload_shards_restores_multiple_missing_physical_shard
         NodeId::new(4),
         NodeId::new(5),
     ];
-    let cluster = crate::StorageCluster::open_local_nodes(
+    let cluster = crate::StorageCluster::open_static_local_nodes(
         tmp.path(),
         &node_ids,
         &[0],
@@ -2010,7 +2024,7 @@ fn placed_segment_payload_shard_repair_targets_identifies_and_clears_missing_and
         NodeId::new(4),
         NodeId::new(5),
     ];
-    let cluster = crate::StorageCluster::open_local_nodes(
+    let cluster = crate::StorageCluster::open_static_local_nodes(
         tmp.path(),
         &node_ids,
         &[0],
@@ -2169,7 +2183,8 @@ fn placed_segment_payload_shard_health_uses_reconstructed_pg_route_snapshot() {
         )
         .unwrap(),
     );
-    let historical_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let historical_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let segment = write_committed_direct_segment(&historical_cluster, b"phase-eleven-route-health");
     let req = crate::SegmentStoredBytesRequest {
         data_pg_id: segment.written.data_pg_id,
@@ -2190,7 +2205,7 @@ fn placed_segment_payload_shard_health_uses_reconstructed_pg_route_snapshot() {
     .unwrap();
     current_map.test_install_historical_pg_routes([route.clone()]);
     let current_map = Arc::new(current_map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&current_map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&current_map)).unwrap();
     assert_ne!(route.cluster_epoch(), cluster.cluster_epoch());
 
     let health = cluster
@@ -2387,7 +2402,8 @@ fn backfill_route_fixture(payload: &[u8]) -> BackfillRouteFixture {
         )
         .unwrap(),
     );
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     let segment = write_committed_direct_segment(&source_cluster, payload);
     let req = crate::SegmentStoredBytesRequest {
         data_pg_id: segment.written.data_pg_id,
@@ -2411,7 +2427,8 @@ fn backfill_route_fixture(payload: &[u8]) -> BackfillRouteFixture {
     .unwrap();
     desired_map.test_install_historical_pg_routes([source_route.clone()]);
     let desired_map = Arc::new(desired_map);
-    let desired_cluster = crate::StorageCluster::from_local_map(Arc::clone(&desired_map)).unwrap();
+    let desired_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&desired_map)).unwrap();
 
     BackfillRouteFixture {
         _tmp: tmp,
@@ -2601,7 +2618,8 @@ fn placed_segment_payload_backfill_work_item_targets_current_pg_route() {
     )
     .unwrap();
     current_map.test_install_historical_pg_routes([fixture.source_route.clone()]);
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::new(current_map)).unwrap();
+    let current_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::new(current_map)).unwrap();
     let work_item = crate::PlacedSegmentShardBackfillWorkItem {
         request: fixture.req,
         source_cluster_epoch: fixture.source_route.cluster_epoch(),
@@ -2693,7 +2711,7 @@ fn local_cluster_map_history_reference_summary_merges_node_pg_references() {
         Some(ClusterEpoch::new(3).unwrap())
     );
 
-    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
     assert_eq!(
         cluster.cluster_map_history_reference_summary().unwrap(),
         summary
@@ -3047,7 +3065,7 @@ fn shard_scavenger_backfill_candidate_scan_skips_unchanged_effective_placement()
     );
     same_placement_map.test_install_historical_pg_routes([same_placement_historical_route]);
     let same_placement_cluster =
-        crate::StorageCluster::from_local_map(Arc::new(same_placement_map)).unwrap();
+        crate::StorageCluster::from_static_local_map(Arc::new(same_placement_map)).unwrap();
 
     let bucket = crate::BucketName::try_from("backfill-scan-same-bucket".to_string()).unwrap();
     let key = crate::ObjectKey::try_from("backfill-scan-same-key".to_string()).unwrap();
@@ -3283,7 +3301,7 @@ fn placed_segment_payload_shard_repair_targets_rejects_invalid_ec_shape() {
         NodeId::new(4),
         NodeId::new(5),
     ];
-    let cluster = crate::StorageCluster::open_local_nodes(
+    let cluster = crate::StorageCluster::open_static_local_nodes(
         tmp.path(),
         &node_ids,
         &[0],
@@ -3316,7 +3334,7 @@ fn repair_placed_segment_payload_shards_if_needed_noops_for_clean_segment() {
         NodeId::new(4),
         NodeId::new(5),
     ];
-    let cluster = crate::StorageCluster::open_local_nodes(
+    let cluster = crate::StorageCluster::open_static_local_nodes(
         tmp.path(),
         &node_ids,
         &[0],
@@ -3361,7 +3379,7 @@ fn placed_segment_payload_shard_health_treats_zero_byte_segment_as_full_shard_se
         NodeId::new(4),
         NodeId::new(5),
     ];
-    let cluster = crate::StorageCluster::open_local_nodes(
+    let cluster = crate::StorageCluster::open_static_local_nodes(
         tmp.path(),
         &node_ids,
         &[0],
@@ -3410,7 +3428,7 @@ fn repair_placed_segment_payload_shards_if_needed_repairs_identified_targets() {
         NodeId::new(4),
         NodeId::new(5),
     ];
-    let cluster = crate::StorageCluster::open_local_nodes(
+    let cluster = crate::StorageCluster::open_static_local_nodes(
         tmp.path(),
         &node_ids,
         &[0],
@@ -3484,7 +3502,7 @@ fn read_recovery_queues_observed_corrupt_placed_shard_repair_once() {
         NodeId::new(4),
         NodeId::new(5),
     ];
-    let cluster = crate::StorageCluster::open_local_nodes(
+    let cluster = crate::StorageCluster::open_static_local_nodes(
         tmp.path(),
         &node_ids,
         &[0],
@@ -3569,7 +3587,7 @@ fn repair_placed_segment_payload_shard_queues_other_failed_shards_after_verifica
         NodeId::new(4),
         NodeId::new(5),
     ];
-    let cluster = crate::StorageCluster::open_local_nodes(
+    let cluster = crate::StorageCluster::open_static_local_nodes(
         tmp.path(),
         &node_ids,
         &[0],
@@ -3645,7 +3663,7 @@ fn repair_placed_segment_payload_shards_restores_checksum_corrupt_physical_shard
         NodeId::new(4),
         NodeId::new(5),
     ];
-    let cluster = crate::StorageCluster::open_local_nodes(
+    let cluster = crate::StorageCluster::open_static_local_nodes(
         tmp.path(),
         &node_ids,
         &[0],
@@ -3736,7 +3754,7 @@ fn repair_placed_segment_payload_shards_rejects_non_active_pg_route_without_writ
         let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
         let mut map =
             Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
         let segment = write_committed_direct_segment(&cluster, b"phase-eleven-repair-route");
         let shard_index = ShardIndex::new(0);
         let shard_path = cluster
@@ -3757,7 +3775,7 @@ fn repair_placed_segment_payload_shards_rejects_non_active_pg_route_without_writ
             .get_mut(&PgId::new(segment.written.data_pg_id))
             .unwrap()
             .state = state;
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
         let err = cluster
             .repair_placed_segment_payload_shards(
@@ -3801,7 +3819,7 @@ fn repair_placed_segment_payload_shards_rejects_stale_operation_epoch_without_wr
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let segment = write_committed_direct_segment(&current_cluster, b"phase-eleven-stale-repair");
     let shard_index = ShardIndex::new(0);
     let shard_path = current_cluster
@@ -3858,7 +3876,7 @@ fn repair_placed_segment_payload_shards_rejects_invalid_target_sets() {
         NodeId::new(4),
         NodeId::new(5),
     ];
-    let cluster = crate::StorageCluster::open_local_nodes(
+    let cluster = crate::StorageCluster::open_static_local_nodes(
         tmp.path(),
         &node_ids,
         &[0],

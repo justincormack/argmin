@@ -66,7 +66,7 @@ fn bucket_payload_reclaim_root_validation_rejects_wrong_object_pg() {
     let bucket = bucket_for_pg(topology, 0, "payload-root-validation-");
     let key_pg0 = key_for_object_pg(topology, &bucket, 0, "object-pg0-");
     let key_pg1 = key_for_object_pg(topology, &bucket, 1, "object-pg1-");
-    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
 
     cluster
         .validate_bucket_payload_reclaim_root_for_pg(
@@ -119,7 +119,7 @@ fn stream_append_registers_payload_acks_on_routed_data_pg_primary() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("03".repeat(16)).unwrap();
     cluster
@@ -214,7 +214,7 @@ fn lease_release_requeues_routed_reclaim_after_worker_defers_for_active_lease() 
     set_route_primary(&mut map, object_pg, NodeId::new(1));
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
-    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
     let committed = write_committed_direct_segment_for(&cluster, &bucket, &key, b"leased payload");
     assert_eq!(committed.written.data_pg_id, data_pg);
 
@@ -331,7 +331,7 @@ fn object_payload_reclaim_defers_behind_unrelated_pending_object_command() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let old = write_committed_direct_segment_for_with_versioning(
         &cluster,
         &bucket,
@@ -415,7 +415,7 @@ fn object_payload_reclaim_acquires_and_releases_durable_claim() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let committed = write_committed_direct_segment_for(&cluster, &bucket, &key, b"claim payload");
     cluster
         .delete_current_object_if(&bucket, &key, |stored| {
@@ -475,7 +475,7 @@ fn object_payload_reclaim_retry_releases_surviving_terminal_claim() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let committed =
         write_committed_direct_segment_for(&cluster, &bucket, &key, b"retry claim payload");
     let generation_id = committed.generation_id;
@@ -564,7 +564,7 @@ fn durable_reclaim_scan_recovers_lost_local_queue_after_reopen() {
                 .pg_topology();
             bucket_key_with_distinct_object_and_data_pg(topology)
         };
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
         let committed =
             write_committed_direct_segment_for(&cluster, &bucket, &key, b"lost hint payload");
         cluster
@@ -586,7 +586,7 @@ fn durable_reclaim_scan_recovers_lost_local_queue_after_reopen() {
     let reopened_map =
         Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap());
     let reopened_cluster =
-        crate::StorageCluster::from_local_map(Arc::clone(&reopened_map)).unwrap();
+        crate::StorageCluster::from_static_local_map(Arc::clone(&reopened_map)).unwrap();
     assert_eq!(
         reopened_cluster
             .enqueue_durable_object_payload_reclaim_roots_excluding(&HashSet::new())
@@ -633,7 +633,7 @@ fn durable_reclaim_scan_retries_same_pg_until_all_reopened_roots_are_discovered(
             .pg_topology();
         let key_a = key_for_object_pg(topology, &bucket, 1, "reopened-root-a-");
         let key_b = key_for_object_pg(topology, &bucket, 1, "reopened-root-b-");
-        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
         let committed_a = write_committed_direct_segment_for_with_okh(
             &cluster,
             &bucket,
@@ -662,7 +662,7 @@ fn durable_reclaim_scan_retries_same_pg_until_all_reopened_roots_are_discovered(
 
     let reopened_map =
         Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap());
-    let reopened_cluster = crate::StorageCluster::from_local_map(reopened_map).unwrap();
+    let reopened_cluster = crate::StorageCluster::from_static_local_map(reopened_map).unwrap();
     let mut discovered = Vec::new();
     for expected_remaining in [2, 1] {
         let batch = reopened_cluster.enqueue_durable_reclaim_work_batch_excluding(
@@ -752,7 +752,7 @@ fn durable_reclaim_scan_continues_after_unavailable_pg() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let committed =
         write_committed_direct_segment_for(&cluster, &bucket, &key, b"later pg reclaim");
     cluster
@@ -764,7 +764,7 @@ fn durable_reclaim_scan_continues_after_unavailable_pg() {
     let mut map = Arc::try_unwrap(map).expect("test should hold the only map reference");
     map.pg_routes.get_mut(&PgId::new(0)).unwrap().state = PgState::Peering;
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     let scan = cluster.enqueue_durable_object_payload_reclaim_roots_excluding(&HashSet::new());
     assert_eq!(
@@ -798,7 +798,7 @@ fn durable_reclaim_scan_defers_before_pg_walk_when_route_map_expired() {
     let ec_shape = EcShape { k: 2, m: 1 };
     let map =
         Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap());
-    let cluster = crate::StorageCluster::from_local_map(map).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(0).unwrap());
 
     let batch = cluster.enqueue_durable_reclaim_work_batch_excluding(
@@ -835,8 +835,8 @@ fn payload_lease_blocks_reclaim_across_cluster_handles() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
     set_route_primary(&mut map, data_pg, NodeId::new(2));
     let map = Arc::new(map);
-    let reader_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-    let reclaim_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let reader_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let reclaim_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let committed =
         write_committed_direct_segment_for(&reader_cluster, &bucket, &key, b"shared lease");
 
@@ -893,7 +893,7 @@ fn payload_lease_for_shard_locations_only_acquires_selected_storage_nodes() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
     set_route_primary(&mut map, data_pg, NodeId::new(2));
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let committed =
         write_committed_direct_segment_for(&cluster, &bucket, &key, b"selected shard lease");
     let selected = committed.locations[0];
@@ -1024,7 +1024,7 @@ fn payload_lease_for_shard_locations_releases_partial_acquire_on_fence() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
     set_route_primary(&mut map, data_pg, NodeId::new(2));
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let committed = write_committed_direct_segment_for(&cluster, &bucket, &key, b"partial acquire");
     let first = committed.locations[0];
     let fenced = committed
@@ -1148,7 +1148,7 @@ fn payload_reclaim_in_progress_blocks_new_payload_leases() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
-    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
     let committed =
         write_committed_direct_segment_for(&cluster, &bucket, &key, b"reclaim race payload");
     cluster
@@ -1229,7 +1229,7 @@ fn reclaim_payload_cleanup_failure_keeps_payload_lease_fence_until_retry() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
     set_route_primary(&mut map, data_pg, NodeId::new(2));
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     let committed =
         write_committed_direct_segment_for(&cluster, &bucket, &key, b"cleanup fence payload");
@@ -1324,7 +1324,7 @@ fn reclaim_payload_metadata_delete_applies_to_object_pg_acting_set() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
     set_route_primary(&mut map, data_pg, NodeId::new(2));
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     let committed = write_committed_direct_segment_for(&cluster, &bucket, &key, b"reclaim payload");
     cluster
@@ -1399,7 +1399,7 @@ fn reclaim_payload_metadata_delete_retry_reuses_pending_partial_command() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
     set_route_primary(&mut map, data_pg, NodeId::new(2));
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
 
     let committed = write_committed_direct_segment_for(&cluster, &bucket, &key, b"retry payload");
     cluster

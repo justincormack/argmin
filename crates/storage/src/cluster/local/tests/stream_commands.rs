@@ -20,7 +20,7 @@ fn stream_put_create_partial_apply_retry_reuses_existing_session() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("34".repeat(16)).unwrap();
     let create = crate::CreateStreamUploadReq {
@@ -155,7 +155,7 @@ fn stream_put_create_retry_rejects_same_request_with_mismatched_created_at() {
     };
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("7a".repeat(16)).unwrap();
     let create = crate::CreateStreamUploadReq {
@@ -226,7 +226,7 @@ fn stream_put_create_retry_rejects_same_request_with_mismatched_allocator_floor(
     };
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("7b".repeat(16)).unwrap();
     let create = crate::CreateStreamUploadReq {
@@ -298,7 +298,7 @@ fn stream_put_create_drains_unrelated_pending_create_before_new_session() {
         bucket_key_with_distinct_object_and_data_pg(topology)
     };
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let first_session_id = crate::SessionId::try_from("37".repeat(16)).unwrap();
     let second_session_id = crate::SessionId::try_from("38".repeat(16)).unwrap();
@@ -401,7 +401,7 @@ fn stream_put_create_retries_after_pending_install_conflict() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("39".repeat(16)).unwrap();
     let unrelated_session_id = crate::SessionId::try_from("3a".repeat(16)).unwrap();
@@ -515,7 +515,7 @@ fn stream_abort_missing_session_does_not_succeed_after_unrelated_pending_command
         bucket_key_with_distinct_object_and_data_pg(topology)
     };
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let missing_session_id = crate::SessionId::try_from("35".repeat(16)).unwrap();
@@ -592,7 +592,7 @@ fn stream_put_append_partial_apply_keeps_payload_for_pending_retry() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("33".repeat(16)).unwrap();
     cluster
@@ -754,7 +754,7 @@ fn stream_append_publish_validation_fails_closed_when_acknowledged_shard_file_is
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("37".repeat(16)).unwrap();
     cluster
@@ -864,8 +864,8 @@ fn stream_put_append_command_id_race_drains_winner_before_ack_publish() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-    let contender = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let contender = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("34".repeat(16)).unwrap();
     cluster
@@ -977,8 +977,8 @@ fn stream_append_budget_exhaustion_after_competing_publish_preserves_payload() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-    let contender = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let contender = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("35".repeat(16)).unwrap();
     cluster
@@ -1144,7 +1144,7 @@ fn stream_append_install_collision_after_competing_publish_preserves_payload() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("36".repeat(16)).unwrap();
     cluster
@@ -1312,7 +1312,7 @@ fn stream_append_log_conflict_drain_failure_cleans_unreferenced_payload() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("3b".repeat(16)).unwrap();
     cluster
@@ -1508,7 +1508,7 @@ fn stream_append_unrelated_pending_duplicate_cleans_staged_payload() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("37".repeat(16)).unwrap();
     cluster
@@ -1694,7 +1694,7 @@ fn stream_append_unrelated_install_contention_cleans_staged_payload() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("39".repeat(16)).unwrap();
     cluster
@@ -1841,7 +1841,7 @@ fn stream_abort_pending_drain_cleans_terminal_stream_session() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("45".repeat(16)).unwrap();
     cluster
@@ -1966,7 +1966,7 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("4b".repeat(16)).unwrap();
     cluster
@@ -2145,7 +2145,7 @@ fn stream_abort_matching_pending_install_race_returns_success() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("48".repeat(16)).unwrap();
     cluster
@@ -2229,7 +2229,7 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let bucket_pg = cluster.bucket_metadata_pg_id(&bucket);
     let session_id = crate::SessionId::try_from("49".repeat(16)).unwrap();
@@ -2458,7 +2458,8 @@ fn control_plane_peering_stream_put_finalize_old_primary_fails_closed_and_preser
         let key = key_for_object_pg(topology, &bucket, object_pg, "object-");
         (bucket, key, object_pg)
     };
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
     let session_id = crate::tests::stream_session_id("peeringputfinal");
     source_cluster
@@ -2688,7 +2689,7 @@ fn stream_put_finalize_missing_session_same_pg_does_not_call_action() {
     let key = key_for_object_pg(topology, &bucket, 1, "object-");
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     assert_eq!(cluster.bucket_metadata_pg_id(&bucket), 1);
     assert_eq!(cluster.object_metadata_pg_id(&bucket, &key), 1);
@@ -2753,7 +2754,7 @@ fn stream_put_finalize_action_failure_preserves_stream_write_proof() {
     let key = key_for_object_pg(topology, &bucket, 1, "object-");
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     assert_eq!(cluster.bucket_metadata_pg_id(&bucket), 1);
     assert_eq!(cluster.object_metadata_pg_id(&bucket, &key), 1);
@@ -2804,7 +2805,7 @@ fn stream_put_finalize_releases_only_its_session_write_proof() {
     let key = key_for_object_pg(topology, &bucket, 1, "object-");
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let first_session = crate::SessionId::try_from("7f".repeat(16)).unwrap();
     let second_session = crate::SessionId::try_from("80".repeat(16)).unwrap();
@@ -2905,7 +2906,7 @@ fn generic_pending_drain_rejects_stream_put_with_substituted_proof() {
     let key = key_for_object_pg(topology, &bucket, 1, "object-");
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let first_session = crate::SessionId::try_from("81".repeat(16)).unwrap();
     let second_session = crate::SessionId::try_from("82".repeat(16)).unwrap();
@@ -3095,7 +3096,7 @@ fn stream_put_finalize_rejects_unencrypted_etag_crc64_mismatch() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let session_id = crate::SessionId::try_from("8f".repeat(16)).unwrap();
@@ -3196,7 +3197,7 @@ fn stream_put_finalize_rejects_encrypted_payload_crc64_mismatch() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let encryption = crate::ObjectEncryption::SseS3(
@@ -3298,7 +3299,7 @@ fn stream_part_finalize_rejects_staged_payload_crc64_mismatch() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("partcrcmismatch");
     let create = crate::CreateMultipartUploadReq {
@@ -3444,7 +3445,7 @@ fn stream_put_finalize_matching_pending_install_race_returns_success() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("4c".repeat(16)).unwrap();
     cluster
@@ -3633,7 +3634,7 @@ fn versioned_stream_put_finalize_reserves_object_version_through_command_stream(
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
     let session_id = crate::SessionId::try_from("76".repeat(16)).unwrap();
     cluster
@@ -3760,7 +3761,7 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("partfinalizedrain");
     let create = crate::CreateMultipartUploadReq {
@@ -3962,7 +3963,7 @@ fn stream_part_finalize_matching_pending_install_race_returns_success() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("partfinalizematch");
     let create = crate::CreateMultipartUploadReq {
@@ -4164,7 +4165,7 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("partfinalizereopen");
     let create = crate::CreateMultipartUploadReq {
@@ -4369,7 +4370,7 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("terminalslot");
     let create = crate::CreateMultipartUploadReq {
@@ -4579,7 +4580,7 @@ fn upload_part_stream_finalize_committed_response_loss_retry_sees_terminal_part(
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("partlostresp");
     let create = crate::CreateMultipartUploadReq {
@@ -4818,7 +4819,8 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
 
     let first_map = Arc::new(first_map);
     let second_map = Arc::new(second_map);
-    let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
+    let first_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&first_map)).unwrap();
     create_test_bucket(&first_cluster, &bucket);
     let upload_id = upload_id_from_label("partfinalizeabort");
     let create = crate::CreateMultipartUploadReq {
@@ -5079,7 +5081,7 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
     set_route_primary(&mut map, 2, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let (req, mut expected_segment) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "completewinsfinalize");
@@ -5430,7 +5432,7 @@ fn upload_part_stream_finalize_replaces_same_part_with_displaced_cleanup() {
     set_route_primary(&mut map, 2, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("partreplace");
     let create = crate::CreateMultipartUploadReq {
@@ -5562,7 +5564,7 @@ fn stream_segment_prepare_uses_durable_session_vid_allocator() {
     };
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("7b".repeat(16)).unwrap();
     cluster
@@ -5612,7 +5614,7 @@ fn stream_segment_prepare_allocates_vid_after_validation() {
     };
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let session_id = crate::SessionId::try_from("7c".repeat(16)).unwrap();
     let req = crate::PrepareStreamUploadSegmentAppendReq {

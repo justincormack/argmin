@@ -6760,7 +6760,7 @@ mod tests {
         };
         let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
         let node_ids: Vec<NodeId> = (0..node_count).map(NodeId::new).collect();
-        StorageCluster::open_local_nodes(dir, &node_ids, pg_ids, ec_shape)
+        StorageCluster::open_static_local_nodes(dir, &node_ids, pg_ids, ec_shape)
             .expect("open local storage cluster")
     }
 

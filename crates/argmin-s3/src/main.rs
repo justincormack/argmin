@@ -74,7 +74,7 @@ use storage::{
     CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgId,
     PgMetadataTransferArtifact, PgMetadataTransferError, PgState, RouteMapValidity, StorageCluster,
-    StorageClusterRuntimeMapHandle, StorageNodeFailureClass, StoreError,
+    StorageClusterRouteHandle, StorageClusterRuntimeMapHandle, StorageNodeFailureClass, StoreError,
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
@@ -6402,7 +6402,7 @@ async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_con
     run_frontend_server(
         config,
         host_id,
-        FrontendStorageClusters::shared(storage_cluster),
+        FrontendStorageClusters::static_shared(storage_cluster),
         server_core::coordinator::BackgroundWorkerMode::all(),
     )
     .await;
@@ -6473,9 +6473,10 @@ fn build_legacy_local_storage_cluster(
             cluster_epoch,
         )
         .map_err(|error| error.to_string())?;
-        StorageCluster::from_local_map(Arc::new(local_map)).map_err(|error| error.to_string())?
+        StorageCluster::from_static_local_map(Arc::new(local_map))
+            .map_err(|error| error.to_string())?
     } else {
-        StorageCluster::open_local_nodes(data_dir, &node_ids, &pg_ids, ec_shape)
+        StorageCluster::open_static_local_nodes(data_dir, &node_ids, &pg_ids, ec_shape)
             .map_err(|error| error.to_string())?
     };
     Ok(OpenedLegacyLocalStorageCluster {
@@ -6507,7 +6508,7 @@ async fn build_remote_frontend_storage_cluster_retrying_startup(
 ) -> Result<FrontendStorageClusters, String> {
     if config.control_plane_socket_path.is_none() {
         let foreground = build_remote_frontend_storage_cluster(config, ec_config)?;
-        return Ok(FrontendStorageClusters::shared(foreground));
+        return Ok(FrontendStorageClusters::static_shared(foreground));
     }
 
     let retry_deadline = frontend_control_plane_startup_retry_deadline(config);
@@ -6540,23 +6541,40 @@ async fn build_remote_frontend_storage_cluster_retrying_startup(
 }
 
 struct FrontendStorageClusters {
+    authority: FrontendStorageRouteAuthority,
     foreground: Arc<StorageCluster>,
     distinct_maintenance: Option<Arc<StorageCluster>>,
 }
 
+#[derive(Clone, Copy)]
+enum FrontendStorageRouteAuthority {
+    Static,
+    Dynamic,
+}
+
 impl FrontendStorageClusters {
-    fn shared(foreground: Arc<StorageCluster>) -> Self {
+    fn static_shared(foreground: Arc<StorageCluster>) -> Self {
         Self {
+            authority: FrontendStorageRouteAuthority::Static,
             foreground,
             distinct_maintenance: None,
         }
     }
 
-    fn with_distinct_maintenance(
+    fn dynamic_shared(foreground: Arc<StorageCluster>) -> Self {
+        Self {
+            authority: FrontendStorageRouteAuthority::Dynamic,
+            foreground,
+            distinct_maintenance: None,
+        }
+    }
+
+    fn dynamic_with_distinct_maintenance(
         foreground: Arc<StorageCluster>,
         maintenance: Arc<StorageCluster>,
     ) -> Self {
         Self {
+            authority: FrontendStorageRouteAuthority::Dynamic,
             foreground,
             distinct_maintenance: Some(maintenance),
         }
@@ -6711,7 +6729,7 @@ fn build_remote_frontend_storage_cluster(
             })
         })
         .map_err(|e| e.to_string())?;
-    StorageCluster::from_local_map(Arc::new(local_map)).map_err(|e| e.to_string())
+    StorageCluster::from_static_local_map(Arc::new(local_map)).map_err(|e| e.to_string())
 }
 
 fn build_control_plane_frontend_storage_cluster(
@@ -6755,9 +6773,9 @@ fn build_control_plane_frontend_storage_clusters(
         build_maintenance_storage_cluster_from_runtime_map(config, ec_config, &runtime_map)
             .map_err(FrontendControlPlaneStartupError::permanent)?
     else {
-        return Ok(FrontendStorageClusters::shared(foreground));
+        return Ok(FrontendStorageClusters::dynamic_shared(foreground));
     };
-    Ok(FrontendStorageClusters::with_distinct_maintenance(
+    Ok(FrontendStorageClusters::dynamic_with_distinct_maintenance(
         foreground,
         maintenance,
     ))
@@ -6913,12 +6931,22 @@ async fn run_frontend_server(
                 std::process::exit(1);
             });
 
-    let (storage_cluster_handle, maintenance_storage_cluster_handle) =
-        frontend_runtime_map_handles(storage_clusters);
-    let frontend_runtime_map_refresh_loop =
-        maybe_spawn_frontend_control_plane_refresh_loop(storage_cluster_handle.clone(), &config);
+    let handles = frontend_route_handles(storage_clusters).unwrap_or_else(|error| {
+        eprintln!("failed to establish frontend route authority: {error}");
+        std::process::exit(1);
+    });
+    if handles.foreground_runtime.is_some() != config.control_plane_socket_path.is_some() {
+        eprintln!(
+            "frontend route authority does not match the configured control-plane startup mode"
+        );
+        std::process::exit(1);
+    }
+    let frontend_runtime_map_refresh_loop = maybe_spawn_frontend_control_plane_refresh_loop(
+        handles.foreground_runtime.clone(),
+        &config,
+    );
     let _maintenance_runtime_map_refresh_loop = maybe_spawn_maintenance_control_plane_refresh_loop(
-        maintenance_storage_cluster_handle.clone(),
+        handles.maintenance_runtime.clone(),
         &config,
     );
     let frontend_runtime_map_refresh_status = frontend_runtime_map_refresh_loop
@@ -6934,9 +6962,9 @@ async fn run_frontend_server(
     let mut frontends = Vec::with_capacity(config.workers as usize);
     for _ in 0..config.workers {
         let coordinator =
-            Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handles_with_background_worker_mode(
-                storage_cluster_handle.clone(),
-                maintenance_storage_cluster_handle.clone(),
+            Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handles_with_background_worker_mode(
+                handles.foreground_route.clone(),
+                handles.maintenance_route.clone(),
                 config.region.clone(),
                 sse_c_validator.clone(),
                 managed_key_provider.clone(),
@@ -7041,24 +7069,55 @@ async fn run_frontend_server(
     }
 }
 
-fn frontend_runtime_map_handles(
+struct FrontendRouteHandles {
+    foreground_route: StorageClusterRouteHandle,
+    maintenance_route: StorageClusterRouteHandle,
+    foreground_runtime: Option<StorageClusterRuntimeMapHandle>,
+    maintenance_runtime: Option<StorageClusterRuntimeMapHandle>,
+}
+
+fn frontend_route_handles(
     storage_clusters: FrontendStorageClusters,
-) -> (
-    StorageClusterRuntimeMapHandle,
-    StorageClusterRuntimeMapHandle,
-) {
-    let storage_cluster_handle = StorageClusterRuntimeMapHandle::new(storage_clusters.foreground);
-    let maintenance_storage_cluster_handle = storage_clusters
-        .distinct_maintenance
-        .map(StorageClusterRuntimeMapHandle::new)
-        .unwrap_or_else(|| storage_cluster_handle.clone());
-    (storage_cluster_handle, maintenance_storage_cluster_handle)
+) -> Result<FrontendRouteHandles, storage::StorageClusterRuntimeMapRefreshError> {
+    match storage_clusters.authority {
+        FrontendStorageRouteAuthority::Dynamic => {
+            let foreground_runtime =
+                StorageClusterRuntimeMapHandle::new(storage_clusters.foreground)?;
+            let maintenance_runtime = storage_clusters
+                .distinct_maintenance
+                .map(StorageClusterRuntimeMapHandle::new)
+                .transpose()?
+                .unwrap_or_else(|| foreground_runtime.clone());
+            Ok(FrontendRouteHandles {
+                foreground_route: foreground_runtime.route_handle(),
+                maintenance_route: maintenance_runtime.route_handle(),
+                foreground_runtime: Some(foreground_runtime),
+                maintenance_runtime: Some(maintenance_runtime),
+            })
+        }
+        FrontendStorageRouteAuthority::Static => {
+            let foreground_route =
+                StorageClusterRouteHandle::from_static_cluster(storage_clusters.foreground)?;
+            let maintenance_route = storage_clusters
+                .distinct_maintenance
+                .map(StorageClusterRouteHandle::from_static_cluster)
+                .transpose()?
+                .unwrap_or_else(|| foreground_route.clone());
+            Ok(FrontendRouteHandles {
+                foreground_route,
+                maintenance_route,
+                foreground_runtime: None,
+                maintenance_runtime: None,
+            })
+        }
+    }
 }
 
 fn maybe_spawn_frontend_control_plane_refresh_loop(
-    storage_cluster_handle: StorageClusterRuntimeMapHandle,
+    storage_cluster_handle: Option<StorageClusterRuntimeMapHandle>,
     config: &ServerConfig,
 ) -> Option<storage::StorageClusterRuntimeMapRefreshLoop> {
+    let storage_cluster_handle = storage_cluster_handle?;
     let socket_path = config.control_plane_socket_path.as_deref()?;
     let admission_settings = unix_storage_node_client_admission_settings(config);
     let loop_handle = storage_cluster_handle
@@ -7084,9 +7143,10 @@ fn maybe_spawn_frontend_control_plane_refresh_loop(
 }
 
 fn maybe_spawn_maintenance_control_plane_refresh_loop(
-    storage_cluster_handle: StorageClusterRuntimeMapHandle,
+    storage_cluster_handle: Option<StorageClusterRuntimeMapHandle>,
     config: &ServerConfig,
 ) -> Option<storage::StorageClusterRuntimeMapRefreshLoop> {
+    let storage_cluster_handle = storage_cluster_handle?;
     let socket_path = config.control_plane_socket_path.as_deref()?;
     config.storage_rpc_maintenance_client_auth.as_ref()?;
     let loop_handle = storage_cluster_handle
@@ -14717,6 +14777,12 @@ mod tests {
 
     #[test]
     fn frontend_without_maintenance_auth_shares_refreshed_runtime_map_handle() {
+        storage::clock::with_time_and_monotonic_override(10_000_000, 5_000_000, || {
+            frontend_without_maintenance_auth_shares_refreshed_runtime_map_handle_at_fixed_time();
+        });
+    }
+
+    fn frontend_without_maintenance_auth_shares_refreshed_runtime_map_handle_at_fixed_time() {
         let tmp = short_unix_socket_test_dir("shared-maintenance-map");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
@@ -14743,9 +14809,10 @@ mod tests {
         assert!(storage_clusters.distinct_maintenance.is_none());
         server.join().unwrap();
 
-        let (foreground_handle, maintenance_handle) =
-            frontend_runtime_map_handles(storage_clusters);
-        assert!(foreground_handle.shares_route_admission_with(&maintenance_handle));
+        let handles = frontend_route_handles(storage_clusters).unwrap();
+        assert!(handles
+            .foreground_route
+            .shares_route_admission_with(&handles.maintenance_route));
 
         let mut replacement_config = config.clone();
         let replacement_socket_path = tmp.join("replacement-cp.sock");
@@ -14761,10 +14828,21 @@ mod tests {
         assert!(replacement_clusters.distinct_maintenance.is_none());
         let replacement = replacement_clusters.foreground;
         replacement_server.join().unwrap();
-        foreground_handle.install(Arc::clone(&replacement)).unwrap();
+        handles
+            .foreground_runtime
+            .as_ref()
+            .unwrap()
+            .install(Arc::clone(&replacement))
+            .unwrap();
 
-        assert!(Arc::ptr_eq(&foreground_handle.current(), &replacement));
-        assert!(Arc::ptr_eq(&maintenance_handle.current(), &replacement));
+        assert!(Arc::ptr_eq(
+            &handles.foreground_route.current(),
+            &replacement
+        ));
+        assert!(Arc::ptr_eq(
+            &handles.maintenance_route.current(),
+            &replacement
+        ));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -14800,6 +14878,8 @@ mod tests {
         endpoint: String,
         serving_pg_routes: bool,
     ) -> std::thread::JoinHandle<()> {
+        const TEST_LEASE_DURATION_MS: u64 = 10_000;
+
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let state_path = socket_path.with_extension("state");
         let store = FileControlPlaneStore::new(state_path);
@@ -14831,7 +14911,7 @@ mod tests {
                         node_incarnation: 1,
                         endpoint: endpoint.clone(),
                         observed_epoch,
-                        requested_lease_duration_ms: 1_000,
+                        requested_lease_duration_ms: TEST_LEASE_DURATION_MS,
                         cluster_map_history_route_references: Default::default(),
                         pg_observations: pg_observations.clone(),
                     },
@@ -14862,7 +14942,7 @@ mod tests {
                         node_incarnation: 1,
                         endpoint: endpoint.clone(),
                         observed_epoch: authority.snapshot().cluster_epoch(),
-                        requested_lease_duration_ms: 1_000,
+                        requested_lease_duration_ms: TEST_LEASE_DURATION_MS,
                         cluster_map_history_route_references: Default::default(),
                         pg_observations: vec![NodePgHeartbeatObservation {
                             pg_id: PgId::new(0),
@@ -15289,9 +15369,9 @@ mod tests {
             PgState::Active
         );
 
-        let handle = StorageClusterRuntimeMapHandle::new(cluster);
+        let handle = StorageClusterRuntimeMapHandle::new(cluster).unwrap();
         let mut refresh_loop =
-            maybe_spawn_frontend_control_plane_refresh_loop(handle.clone(), &config).unwrap();
+            maybe_spawn_frontend_control_plane_refresh_loop(Some(handle.clone()), &config).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         loop {
             let status = refresh_loop.status();
@@ -15445,9 +15525,9 @@ mod tests {
             NodeId::new(1)
         );
 
-        let handle = StorageClusterRuntimeMapHandle::new(cluster);
+        let handle = StorageClusterRuntimeMapHandle::new(cluster).unwrap();
         let mut refresh_loop =
-            maybe_spawn_frontend_control_plane_refresh_loop(handle.clone(), &frontend_config)
+            maybe_spawn_frontend_control_plane_refresh_loop(Some(handle.clone()), &frontend_config)
                 .expect("frontend runtime-map refresh loop should start");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         loop {

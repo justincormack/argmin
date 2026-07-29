@@ -251,7 +251,8 @@ The implementation scope includes every no-control-plane construction path, not 
 named `build_legacy_local_storage_cluster`:
 
 - standalone manifests and environment-only legacy-local startup;
-- no-control-plane remote frontend construction through `StorageCluster::from_local_map`;
+- no-control-plane remote frontend construction through
+  `StorageCluster::from_static_local_map`;
 - standalone storage-node configuration using `RouteMapValidity::Forever`.
 
 Manifest-based standalone startup must bind the storage-owned canonical route digest into its
@@ -288,13 +289,24 @@ Implementation status (2026-07-29):
   mismatched dynamic maps fail at construction rather than surviving until a later publication
   attempt. Same-epoch renewal and pinned-generation lease extension additionally remain bound to
   the authority incarnation that issued the installed generation.
-- The old unbounded/undigested to bounded/digested same-epoch transition is removed. The existing
-  common runtime-map handle now fails closed if publication or refresh is attempted for a static
-  authority.
-- Remaining work starts at item 2: replace the public generic `from_local_map` surface with an
-  explicit static constructor, split static admission from dynamic publication capabilities, move
-  the coordinator to the opaque common handle, and then add durable standalone identity binding
-  for every no-control-plane startup path.
+- The old unbounded/undigested to bounded/digested same-epoch transition is removed.
+- The constructor and capability slice is complete. Public local construction is explicitly
+  static through `from_static_local_map` and `open_static_local_nodes`; the generic names are
+  removed. Coordinators and request processing receive only `StorageClusterRouteHandle`, which
+  supports current-generation access and admission. `StorageClusterRuntimeMapHandle` is a
+  distinct capability whose constructor rejects a static generation and is the only public
+  surface for publication, renewal, and refresh-loop construction. Frontend startup retains that
+  capability only for control-plane-backed topology and passes the opaque common route handle to
+  server-core. Direct route-handle construction proves static authority and therefore cannot
+  create a second admission/publication domain for a dynamic generation. Cross-crate interleaving
+  tests retain the dynamic capability used to derive their request route handle; there is no
+  reverse test hook that upgrades a request handle back into publication authority. Public
+  coordinator constructors that accept an `Arc<StorageCluster>` are likewise static-only, while
+  dynamic wiring must pass the route handle derived from its retained runtime-map capability. The
+  repository boundary check locks these constructor and capability surfaces.
+- Remaining work starts at item 5: bind the storage-owned canonical static route digest into the
+  durable standalone identity for every no-control-plane startup path, fail closed on mismatch,
+  and finish the `legacy-local` to `standalone` deployment-role rename.
 
 Exit criteria:
 
@@ -305,7 +317,8 @@ Exit criteria:
 - Environment-only and manifest-based standalone topology changes without the required durable
   identity/epoch change fail closed before serving.
 - The boundary check rejects unbound production constructors and use of dynamic refresh APIs from
-  static startup paths.
+  static startup paths, public generic route-handle constructors, and any reverse conversion from
+  request handles to dynamic publication capability.
 - Tests pin static construction/admission, dynamic bounded construction/renewal, digest mismatch,
   durable standalone identity mismatch, and restart-only mode changes.
 
@@ -933,9 +946,10 @@ Raft peer client and server transports are storage-owned and boundary-checked.
 5. **In progress:** the unused legacy authority-clock constructor is removed and sample-driven
    construction is test-only. The optional digest and live static-to-dynamic transition are now
    replaced by mandatory static/dynamic authority proofs, with bounded validity required at
-   dynamic construction. Remaining work is to replace the public generic `from_local_map`
-   surface, split refresh capability from static admission, migrate every no-control-plane startup
-   path, and bind standalone topology durably.
+   dynamic construction. Explicit static constructors, the opaque common route handle, the
+   dynamic-only publication/refresh capability, frontend/coordinator migration, and boundary
+   checks are complete. Remaining work is to bind every no-control-plane topology to durable
+   standalone identity and finish the deployment-role rename.
 6. **Complete:** owner-local exact-current rejection fixtures cover every boundary listed in the
    2026-07-29 audit, including resealed enclosing checksums, digests, and authenticators.
 7. **Complete:** session-token version selection is contained inside `auth`, with semantic APIs

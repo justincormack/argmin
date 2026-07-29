@@ -15,7 +15,7 @@ fn cluster_shard_scavenger_marks_slow_writer_candidate_and_resolves_after_publis
         .pg_topology();
     let (bucket, key, _object_pg, _data_pg) = bucket_key_with_distinct_object_and_data_pg(topology);
     let map = Arc::new(local_map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let reservation_id =
@@ -120,7 +120,7 @@ fn cluster_shard_scavenger_audit_does_not_wait_for_non_primary_pg_mutex() {
     let mut local_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
     set_route_primary(&mut local_map, 0, NodeId::new(0));
     let map = Arc::new(local_map);
-    let cluster = Arc::new(crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap());
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
 
     let non_primary_pg_guard = map
         .node(NodeId::new(1))
@@ -162,7 +162,7 @@ fn cluster_shard_scavenger_treats_pending_direct_put_as_referenced() {
         .pg_topology();
     let (bucket, key, object_pg, _data_pg) = bucket_key_with_distinct_object_and_data_pg(topology);
     let map = Arc::new(local_map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let reservation_id =
@@ -256,7 +256,7 @@ fn cluster_shard_scavenger_treats_pending_multipart_completion_as_referenced() {
         .pg_topology();
     let (bucket, key, object_pg, _data_pg) = bucket_key_with_distinct_object_and_data_pg(topology);
     let map = Arc::new(local_map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let (req, expected_segment) =
@@ -347,7 +347,7 @@ fn cluster_shard_scavenger_reports_wrong_node_file_and_expected_missing_file() {
         .pg_topology();
     let (bucket, key, _object_pg, _data_pg) = bucket_key_with_distinct_object_and_data_pg(topology);
     let map = Arc::new(local_map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let reservation_id =
@@ -494,7 +494,7 @@ fn cluster_shard_scavenger_scan_incomplete_suppresses_negative_reference_claims(
     let malformed_path = malformed_dir.join("not-a-shard-key");
     std::fs::write(&malformed_path, b"junk").unwrap();
 
-    let cluster = crate::StorageCluster::from_local_map(Arc::new(local_map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(local_map)).unwrap();
     let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
     assert!(
         observations.iter().any(|observation| {
@@ -585,7 +585,7 @@ fn cluster_shard_scavenger_reference_scan_failure_suppresses_negative_reference_
     drop(reference_pg);
 
     let map = Arc::new(local_map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
     assert!(
         observations.iter().any(|observation| {

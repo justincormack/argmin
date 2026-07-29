@@ -1689,6 +1689,15 @@ impl StorageClusterRouteAuthority {
             Self::Dynamic(proof) => Ok(proof),
         }
     }
+
+    fn require_static(self) -> Result<StaticRouteAuthorityProof, ClusterBuildError> {
+        match self {
+            Self::Static(proof) => Ok(proof),
+            Self::Dynamic(_) => {
+                Err(ClusterBuildError::DynamicRouteAuthorityRequiresRuntimeMapHandle)
+            }
+        }
+    }
 }
 
 pub struct StorageCluster {
@@ -1704,10 +1713,21 @@ pub struct StorageCluster {
 }
 
 #[derive(Clone)]
-pub struct StorageClusterRuntimeMapHandle {
+pub struct StorageClusterRouteHandle {
     cluster: Arc<RwLock<Arc<StorageCluster>>>,
     same_epoch_generations: Arc<Mutex<Vec<Weak<StorageCluster>>>>,
     route_admission: StorageClusterRouteAdmissionGate,
+}
+
+/// Capability for publishing and renewing control-plane-authorized dynamic
+/// route maps.
+///
+/// Request handling receives only [`StorageClusterRouteHandle`]. Constructing
+/// this capability verifies that the initial generation has dynamic authority,
+/// so static topology cannot acquire publication or refresh operations.
+#[derive(Clone)]
+pub struct StorageClusterRuntimeMapHandle {
+    route_handle: StorageClusterRouteHandle,
 }
 
 #[derive(Clone, Default)]
@@ -1939,8 +1959,8 @@ impl StorageClusterRouteAdmission {
     /// Revalidate this admission immediately before an effect through its
     /// captured runtime-map generation.
     ///
-    /// Callers which own a [`StorageClusterRuntimeMapHandle`] must first use
-    /// [`StorageClusterRuntimeMapHandle::require_admission_valid_now`] so the
+    /// Callers which own a [`StorageClusterRouteHandle`] must first use
+    /// [`StorageClusterRouteHandle::require_admission_valid_now`] so the
     /// frontend publication-admission domain is validated as well.
     pub fn require_valid_now_for(
         &self,
@@ -3799,13 +3819,23 @@ impl Drop for StorageClusterRuntimeMapRefreshLoop {
     }
 }
 
-impl StorageClusterRuntimeMapHandle {
-    pub fn new(initial: Arc<StorageCluster>) -> Self {
+impl StorageClusterRouteHandle {
+    pub(crate) fn from_authorized_cluster(initial: Arc<StorageCluster>) -> Self {
         Self {
             same_epoch_generations: Arc::new(Mutex::new(vec![Arc::downgrade(&initial)])),
             cluster: Arc::new(RwLock::new(initial)),
             route_admission: StorageClusterRouteAdmissionGate::default(),
         }
+    }
+
+    /// Construct request-admission capability for a static storage cluster.
+    ///
+    /// Dynamically published clusters must instead retain a
+    /// [`StorageClusterRuntimeMapHandle`] and derive this capability through
+    /// [`StorageClusterRuntimeMapHandle::route_handle`].
+    pub fn from_static_cluster(initial: Arc<StorageCluster>) -> Result<Self, ClusterBuildError> {
+        initial.route_authority.require_static()?;
+        Ok(Self::from_authorized_cluster(initial))
     }
 
     pub fn current(&self) -> Arc<StorageCluster> {
@@ -3885,7 +3915,7 @@ impl StorageClusterRuntimeMapHandle {
         Ok(admission)
     }
 
-    pub fn install(
+    pub(crate) fn install(
         &self,
         candidate: Arc<StorageCluster>,
     ) -> Result<(), StorageClusterRuntimeMapRefreshError> {
@@ -4056,7 +4086,7 @@ impl StorageClusterRuntimeMapHandle {
         });
     }
 
-    pub fn refresh_from_control_plane_runtime_map(
+    pub(crate) fn refresh_from_control_plane_runtime_map(
         &self,
         control_plane: &impl ControlPlaneRuntimeMapSource,
         authority_now_ms: u64,
@@ -4095,7 +4125,7 @@ impl StorageClusterRuntimeMapHandle {
         Ok(candidate)
     }
 
-    pub fn refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
+    pub(crate) fn refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
         &self,
         control_plane: &impl ControlPlaneRuntimeMapSource,
         authority_now_ms: u64,
@@ -4147,7 +4177,7 @@ impl StorageClusterRuntimeMapHandle {
         Ok(candidate)
     }
 
-    pub fn spawn_control_plane_refresh_loop<S, F>(
+    pub(crate) fn spawn_control_plane_refresh_loop<S, F>(
         self,
         control_plane: S,
         refresh_interval: Duration,
@@ -4166,7 +4196,7 @@ impl StorageClusterRuntimeMapHandle {
         )
     }
 
-    pub fn spawn_control_plane_refresh_loop_with_unix_storage_node_clients<S, F>(
+    pub(crate) fn spawn_control_plane_refresh_loop_with_unix_storage_node_clients<S, F>(
         self,
         control_plane: S,
         refresh_interval: Duration,
@@ -4186,7 +4216,7 @@ impl StorageClusterRuntimeMapHandle {
         )
     }
 
-    pub fn spawn_control_plane_refresh_only_loop_with_unix_storage_node_clients<S, F>(
+    pub(crate) fn spawn_control_plane_refresh_only_loop_with_unix_storage_node_clients<S, F>(
         self,
         control_plane: S,
         refresh_interval: Duration,
@@ -4529,6 +4559,114 @@ impl StorageClusterRuntimeMapHandle {
     }
 }
 
+impl StorageClusterRuntimeMapHandle {
+    /// Construct dynamic publication capability for an authoritative runtime
+    /// map generation.
+    pub fn new(initial: Arc<StorageCluster>) -> Result<Self, StorageClusterRuntimeMapRefreshError> {
+        initial.route_authority.dynamic_proof()?;
+        Ok(Self {
+            route_handle: StorageClusterRouteHandle::from_authorized_cluster(initial),
+        })
+    }
+
+    /// Return the opaque request-admission capability shared with coordinators
+    /// and other consumers that must not publish route maps.
+    pub fn route_handle(&self) -> StorageClusterRouteHandle {
+        self.route_handle.clone()
+    }
+
+    pub fn current(&self) -> Arc<StorageCluster> {
+        self.route_handle.current()
+    }
+
+    pub fn install(
+        &self,
+        candidate: Arc<StorageCluster>,
+    ) -> Result<(), StorageClusterRuntimeMapRefreshError> {
+        self.route_handle.install(candidate)
+    }
+
+    pub fn refresh_from_control_plane_runtime_map(
+        &self,
+        control_plane: &impl ControlPlaneRuntimeMapSource,
+        authority_now_ms: u64,
+    ) -> Result<Arc<StorageCluster>, StorageClusterRuntimeMapRefreshError> {
+        self.route_handle
+            .refresh_from_control_plane_runtime_map(control_plane, authority_now_ms)
+    }
+
+    pub fn refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
+        &self,
+        control_plane: &impl ControlPlaneRuntimeMapSource,
+        authority_now_ms: u64,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+    ) -> Result<Arc<StorageCluster>, StorageClusterRuntimeMapRefreshError> {
+        self.route_handle
+            .refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
+                control_plane,
+                authority_now_ms,
+                admission_settings,
+            )
+    }
+
+    pub fn spawn_control_plane_refresh_loop<S, F>(
+        self,
+        control_plane: S,
+        refresh_interval: Duration,
+        authority_now_ms: F,
+    ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
+    where
+        S: ControlPlaneRuntimeMapSource + Send + 'static,
+        F: Fn() -> u64 + Send + 'static,
+    {
+        self.route_handle.spawn_control_plane_refresh_loop(
+            control_plane,
+            refresh_interval,
+            authority_now_ms,
+        )
+    }
+
+    pub fn spawn_control_plane_refresh_loop_with_unix_storage_node_clients<S, F>(
+        self,
+        control_plane: S,
+        refresh_interval: Duration,
+        authority_now_ms: F,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+    ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
+    where
+        S: ControlPlaneRuntimeMapSource + Send + 'static,
+        F: Fn() -> u64 + Send + 'static,
+    {
+        self.route_handle
+            .spawn_control_plane_refresh_loop_with_unix_storage_node_clients(
+                control_plane,
+                refresh_interval,
+                authority_now_ms,
+                admission_settings,
+            )
+    }
+
+    pub fn spawn_control_plane_refresh_only_loop_with_unix_storage_node_clients<S, F>(
+        self,
+        control_plane: S,
+        refresh_interval: Duration,
+        authority_now_ms: F,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+    ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
+    where
+        S: ControlPlaneRuntimeMapSource + Send + 'static,
+        F: Fn() -> u64 + Send + 'static,
+    {
+        self.route_handle
+            .spawn_control_plane_refresh_only_loop_with_unix_storage_node_clients(
+                control_plane,
+                refresh_interval,
+                authority_now_ms,
+                admission_settings,
+            )
+    }
+}
+
 fn runtime_map_refresh_error_requires_current_map_invalidation(
     error: &StorageClusterRuntimeMapRefreshError,
 ) -> bool {
@@ -4617,7 +4755,7 @@ mod runtime_map_refresh_invalidation_tests {
                 ),
             ])
             .unwrap();
-        StorageCluster::from_local_map(Arc::new(local_map)).unwrap()
+        StorageCluster::from_static_local_map(Arc::new(local_map)).unwrap()
     }
 
     #[test]
@@ -4663,7 +4801,7 @@ mod runtime_map_refresh_invalidation_tests {
                     std::ffi::OsString::from_vec(endpoint),
                 )])
                 .unwrap();
-            StorageCluster::from_local_map(Arc::new(local_map)).unwrap()
+            StorageCluster::from_static_local_map(Arc::new(local_map)).unwrap()
         }
 
         let first = cluster_for_endpoint(b"/tmp/static-route-\xff.sock".to_vec());
@@ -4678,14 +4816,14 @@ mod runtime_map_refresh_invalidation_tests {
     fn static_route_authority_digest_binds_embedded_node_directories() {
         let first_dir = test_util::tempdir();
         let second_dir = test_util::tempdir();
-        let first = StorageCluster::open_local_nodes(
+        let first = StorageCluster::open_static_local_nodes(
             first_dir.path(),
             &[NodeId::new(0)],
             &[31],
             EcShape { k: 1, m: 0 },
         )
         .unwrap();
-        let second = StorageCluster::open_local_nodes(
+        let second = StorageCluster::open_static_local_nodes(
             second_dir.path(),
             &[NodeId::new(0)],
             &[31],
@@ -4720,8 +4858,28 @@ mod runtime_map_refresh_invalidation_tests {
         .unwrap();
 
         assert!(matches!(
-            StorageCluster::from_local_map(Arc::new(local_map)),
+            StorageCluster::from_static_local_map(Arc::new(local_map)),
             Err(ClusterBuildError::StaticRouteAuthorityBoundedValidity)
+        ));
+    }
+
+    #[test]
+    fn static_route_authority_cannot_acquire_runtime_map_capability() {
+        let cluster = static_topology_cluster("capability", EcShape { k: 1, m: 1 });
+
+        assert!(matches!(
+            StorageClusterRuntimeMapHandle::new(cluster),
+            Err(StorageClusterRuntimeMapRefreshError::StaticRouteAuthorityRefresh)
+        ));
+    }
+
+    #[test]
+    fn dynamic_route_authority_cannot_acquire_static_route_handle() {
+        let cluster = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
+
+        assert!(matches!(
+            StorageClusterRouteHandle::from_static_cluster(cluster),
+            Err(ClusterBuildError::DynamicRouteAuthorityRequiresRuntimeMapHandle)
         ));
     }
 
@@ -5025,7 +5183,7 @@ mod runtime_map_refresh_invalidation_tests {
     #[test]
     fn authoritative_pending_metadata_refresh_failure_expires_same_epoch_generations() {
         let pinned = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
-        let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned));
+        let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&pinned));
         let current = handle.current();
 
         handle.expire_same_epoch_generations(5_000);
@@ -5165,7 +5323,8 @@ mod runtime_map_refresh_invalidation_tests {
             crate::clock::with_time_override(1_000, || {
                 let pinned = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
                 pinned.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
-                let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned));
+                let handle =
+                    StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&pinned));
                 let old_current = handle.current();
                 let candidate = active_test_cluster(RouteMapValidity::until_ms(4_000).unwrap());
                 candidate.test_store_route_map_validity(RouteMapValidity::until_ms(4_000).unwrap());
@@ -5195,7 +5354,7 @@ mod runtime_map_refresh_invalidation_tests {
         let (pinned, handle, mut candidate) = crate::clock::with_time_override(1_000, || {
             let pinned = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
             pinned.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
-            let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned));
+            let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&pinned));
             let candidate = active_test_cluster(RouteMapValidity::until_ms(9_000).unwrap());
             candidate.test_store_route_map_validity(RouteMapValidity::until_ms(9_000).unwrap());
             (pinned, handle, candidate)
@@ -5251,7 +5410,8 @@ mod runtime_map_refresh_invalidation_tests {
             crate::clock::with_time_override(1_000, || {
                 let pinned = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
                 pinned.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-                let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned));
+                let handle =
+                    StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&pinned));
                 let admission = handle.admit_current_route().unwrap();
                 let candidate = active_test_cluster(RouteMapValidity::until_ms(9_000).unwrap());
                 candidate.test_store_route_map_validity(RouteMapValidity::until_ms(9_000).unwrap());
@@ -5286,7 +5446,8 @@ mod runtime_map_refresh_invalidation_tests {
             crate::clock::with_time_override(1_000, || {
                 let current = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
                 current.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-                let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&current));
+                let handle =
+                    StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&current));
                 let admission = handle.admit_current_route().unwrap();
                 let candidate = active_test_cluster(RouteMapValidity::until_ms(1_500).unwrap());
                 candidate.test_store_route_map_validity(RouteMapValidity::until_ms(1_500).unwrap());
@@ -5328,14 +5489,15 @@ mod runtime_map_refresh_invalidation_tests {
     }
 
     #[test]
-    fn frontend_route_admission_domain_is_shared_only_by_handle_clones() {
+    fn runtime_map_route_handles_share_the_capability_admission_domain() {
         let cluster = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
-        let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+        let runtime = StorageClusterRuntimeMapHandle::new(cluster).unwrap();
+        let handle = runtime.route_handle();
         let clone = handle.clone();
-        let independent = StorageClusterRuntimeMapHandle::new(cluster);
+        let separately_derived = runtime.route_handle();
 
         assert!(handle.shares_route_admission_with(&clone));
-        assert!(!handle.shares_route_admission_with(&independent));
+        assert!(handle.shares_route_admission_with(&separately_derived));
     }
 
     #[test]
@@ -5343,7 +5505,7 @@ mod runtime_map_refresh_invalidation_tests {
         let (cluster, admission) = crate::clock::with_time_override(1_000, || {
             let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
             cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
-            let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+            let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
             let admission = handle.admit_current_route().unwrap();
             (cluster, admission)
         });
@@ -5373,7 +5535,8 @@ mod runtime_map_refresh_invalidation_tests {
                 .test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
             unrelated_cluster
                 .test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
-            let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&admitted_cluster));
+            let handle =
+                StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&admitted_cluster));
             let admission = handle.admit_current_route().unwrap();
 
             admission.require_valid_now_for(&admitted_cluster).unwrap();
@@ -5393,8 +5556,10 @@ mod runtime_map_refresh_invalidation_tests {
         crate::clock::with_time_override(1_000, || {
             let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
             cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
-            let admitted_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
-            let unrelated_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+            let admitted_handle =
+                StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+            let unrelated_handle =
+                StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
             let admission = admitted_handle.admit_current_route().unwrap();
 
             admitted_handle
@@ -5416,7 +5581,7 @@ mod runtime_map_refresh_invalidation_tests {
         let (cluster, admission) = crate::clock::with_time_override(1_000, || {
             let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
             cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
-            let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+            let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
             let admission = handle.admit_current_route().unwrap();
             (cluster, admission)
         });
@@ -5450,7 +5615,7 @@ mod runtime_map_refresh_invalidation_tests {
             cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
             cluster
         });
-        let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+        let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
         let admission =
             crate::clock::with_time_override(1_000, || handle.admit_current_route().unwrap());
         let bucket = BucketName::try_from("capability-bucket").unwrap();
@@ -5504,7 +5669,7 @@ mod runtime_map_refresh_invalidation_tests {
         crate::clock::with_time_override(1_000, || {
             let cluster = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
             cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-            let handle = StorageClusterRuntimeMapHandle::new(cluster);
+            let handle = StorageClusterRouteHandle::from_authorized_cluster(cluster);
             let admission = handle.admit_current_route().unwrap();
             let routed_bucket = BucketName::try_from("create-route-subject").unwrap();
             let other_bucket = BucketName::try_from("create-config-subject").unwrap();
@@ -5542,7 +5707,7 @@ mod runtime_map_refresh_invalidation_tests {
             cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
             let renewed = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
             renewed.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-            let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+            let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
             (cluster, renewed, handle)
         });
 
@@ -5597,7 +5762,7 @@ mod runtime_map_refresh_invalidation_tests {
         let (handle, _admission) = crate::clock::with_time_override(1_000, || {
             let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
             cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
-            let handle = StorageClusterRuntimeMapHandle::new(cluster);
+            let handle = StorageClusterRouteHandle::from_authorized_cluster(cluster);
             let admission = handle.admit_current_route().unwrap();
             (handle, admission)
         });
@@ -5613,7 +5778,7 @@ mod runtime_map_refresh_invalidation_tests {
     fn expired_frontend_route_cannot_be_admitted() {
         crate::clock::with_time_override(5_000, || {
             let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
-            let handle = StorageClusterRuntimeMapHandle::new(cluster);
+            let handle = StorageClusterRouteHandle::from_authorized_cluster(cluster);
             assert!(matches!(
                 handle.admit_current_route(),
                 Err(StoreError::RouteMapExpired {
@@ -8524,7 +8689,7 @@ impl StorageCluster {
     ) {
     }
 
-    pub fn open_local_nodes(
+    pub fn open_static_local_nodes(
         data_dir: &std::path::Path,
         node_ids: &[NodeId],
         pg_ids: &[u32],
@@ -8536,10 +8701,15 @@ impl StorageCluster {
             pg_ids,
             default_ec_shape,
         )?);
-        Self::from_local_map(local_map)
+        Self::from_static_local_map(local_map)
     }
 
-    pub fn from_local_map(local_map: Arc<LocalClusterMap>) -> Result<Arc<Self>, ClusterBuildError> {
+    /// Construct an immutable static-authority cluster from a complete local
+    /// topology. Dynamic runtime-map generations use [`Self::from_runtime_map`]
+    /// or one of its transport-specific variants instead.
+    pub fn from_static_local_map(
+        local_map: Arc<LocalClusterMap>,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
         let operation_epoch = local_map.epoch();
         let route_authority = StorageClusterRouteAuthority::static_for(&local_map)?;
         Self::from_local_map_with_epoch_and_authority(local_map, operation_epoch, route_authority)

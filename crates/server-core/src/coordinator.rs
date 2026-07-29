@@ -27,7 +27,7 @@ use storage::ShardKey;
 #[cfg(test)]
 use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig, ObjectLayout};
 use storage::{
-    BucketName, ObjectKey, ProcessLocalRegistryKey, StorageCluster, StorageClusterRuntimeMapHandle,
+    BucketName, ObjectKey, ProcessLocalRegistryKey, StorageCluster, StorageClusterRouteHandle,
 };
 #[cfg(test)]
 use storage::{
@@ -562,7 +562,7 @@ fn spawn_bucket_fast_path_watcher(
 }
 
 pub struct Coordinator {
-    storage_node: StorageClusterRuntimeMapHandle,
+    storage_node: StorageClusterRouteHandle,
     shared_caches: Arc<CoordinatorSharedCaches>,
     payload_buffer_pool: Arc<PayloadBufferPool>,
     region: String,

@@ -23,11 +23,29 @@ use storage::{
     LocalNodeStoreConfig, LocalPgRoute, LocalUnixStorageNodeClientConfig,
     MetadataCommandApplyTestKind, NodeId, PgId, PgState, PlacedSegmentShardBackfillWorkItem,
     RouteMapValidity, SegmentStoredBytesRequest, ShardScavengerObservationReason, StorageCluster,
-    StorageClusterRuntimeMapHandle,
+    StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
 };
 
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 const BUCKET_FAST_PATH_WATCH_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn test_storage_route_handle(initial: Arc<StorageCluster>) -> StorageClusterRouteHandle {
+    match StorageClusterRuntimeMapHandle::new(Arc::clone(&initial)) {
+        Ok(runtime) => runtime.route_handle(),
+        Err(storage::StorageClusterRuntimeMapRefreshError::StaticRouteAuthorityRefresh) => {
+            StorageClusterRouteHandle::from_static_cluster(initial).unwrap()
+        }
+        Err(error) => panic!("invalid test storage cluster route authority: {error}"),
+    }
+}
+
+fn test_dynamic_storage_route_handles(
+    initial: Arc<StorageCluster>,
+) -> (StorageClusterRuntimeMapHandle, StorageClusterRouteHandle) {
+    let runtime = StorageClusterRuntimeMapHandle::new(initial).unwrap();
+    let route = runtime.route_handle();
+    (runtime, route)
+}
 
 #[test]
 fn malformed_stored_tag_envelopes_fail_closed() {
@@ -72,11 +90,12 @@ enum LockWaitEvent {
 fn setup_direct_coordinator_with_storage_cluster(
     storage_cluster: Arc<StorageCluster>,
 ) -> Coordinator {
-    Coordinator::new_with_managed_key_provider_for_storage_cluster(
-        storage_cluster,
+    Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
+        test_storage_route_handle(storage_cluster),
         "us-east-1".to_string(),
         None,
         test_sse_s3_provider(),
+        BackgroundWorkerMode::all(),
     )
     .unwrap()
 }
@@ -102,7 +121,7 @@ fn setup_coordinator_with_only_shard_repair_worker(
 }
 
 fn setup_coordinator_with_only_shard_backfill_worker(
-    storage_handle: StorageClusterRuntimeMapHandle,
+    storage_handle: StorageClusterRouteHandle,
     storage_cluster: Arc<StorageCluster>,
 ) -> Coordinator {
     Coordinator::new_with_shared_caches_and_background_sweeper_factories(
@@ -125,7 +144,7 @@ fn setup_coordinator_with_only_shard_backfill_worker(
 }
 
 fn setup_coordinator_with_only_reclaim_worker(
-    storage_handle: StorageClusterRuntimeMapHandle,
+    storage_handle: StorageClusterRouteHandle,
     storage_cluster: Arc<StorageCluster>,
 ) -> Coordinator {
     Coordinator::new_with_shared_caches_and_background_sweeper_factories(
@@ -148,7 +167,7 @@ fn setup_coordinator_with_only_reclaim_worker(
 }
 
 fn setup_coordinator_with_only_stream_session_worker(
-    storage_handle: StorageClusterRuntimeMapHandle,
+    storage_handle: StorageClusterRouteHandle,
     storage_cluster: Arc<StorageCluster>,
 ) -> Coordinator {
     Coordinator::new_with_shared_caches_and_background_sweeper_factories(
@@ -213,9 +232,9 @@ fn stop_storage_node_server_loops(
 fn coordinator_storage_node_tracks_runtime_map_handle_install() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -230,9 +249,28 @@ fn coordinator_storage_node_tracks_runtime_map_handle_install() {
     let candidate =
         make_dynamic_runtime_map_candidate(open_test_storage_cluster(next_tmp.path(), &[0, 1]));
     assert!(!Arc::ptr_eq(&coord.storage_node(), &candidate));
-    handle.install(Arc::clone(&candidate)).unwrap();
+    runtime_handle.install(Arc::clone(&candidate)).unwrap();
 
     assert!(Arc::ptr_eq(&coord.storage_node(), &candidate));
+}
+
+#[test]
+fn arc_storage_cluster_coordinator_constructor_rejects_dynamic_authority() {
+    let tmp = test_util::tempdir();
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
+
+    let result = Coordinator::new_with_managed_key_provider_for_storage_cluster(
+        initial,
+        "us-east-1".to_string(),
+        None,
+        test_sse_s3_provider(),
+    );
+
+    assert!(matches!(
+        result,
+        Err(ServerError::InternalError { reason })
+            if reason == "dynamic route authority requires a runtime-map publication capability"
+    ));
 }
 
 #[test]
@@ -2584,8 +2622,8 @@ fn list_parts_pins_runtime_map_after_authorization() {
     let bucket = "list-parts-pinned-bucket";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
-    let coord = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
+    let coord = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
         handle.clone(),
         "us-east-1".to_string(),
         None,
@@ -2632,6 +2670,7 @@ fn list_parts_pins_runtime_map_after_authorization() {
     let publication_thread = Arc::new(Mutex::new(None));
     let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -2639,7 +2678,7 @@ fn list_parts_pins_runtime_map_after_authorization() {
     let _hook = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some((bucket.to_string(), "logs/archive".to_string())),
         after_list_parts_authorized: Some(Arc::new(move || {
-            let publishing_handle = hook_handle.clone();
+            let publishing_handle = hook_runtime_handle.clone();
             let publishing_candidate = Arc::clone(&candidate);
             let thread = thread::spawn(move || {
                 publishing_handle.install(publishing_candidate).unwrap();
@@ -3610,9 +3649,9 @@ fn object_snapshot_route_rechecks_deadline_after_warm_bucket_fast_path() {
 fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
     let tmp = test_util::tempdir();
     let cluster = open_test_storage_cluster(tmp.path(), &[0]);
-    let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
-    let foreign_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
-    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+    let local_handle = test_storage_route_handle(Arc::clone(&cluster));
+    let foreign_handle = test_storage_route_handle(Arc::clone(&cluster));
+    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
         local_handle,
         "us-east-1".to_string(),
         None,
@@ -3620,7 +3659,7 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
         BackgroundWorkerMode::none(),
     )
     .unwrap();
-    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
         foreign_handle,
         "us-east-1".to_string(),
         None,
@@ -4331,9 +4370,9 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
 fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator() {
     let tmp = test_util::tempdir();
     let cluster = open_test_storage_cluster(tmp.path(), &[0]);
-    let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
-    let foreign_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
-    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+    let local_handle = test_storage_route_handle(Arc::clone(&cluster));
+    let foreign_handle = test_storage_route_handle(Arc::clone(&cluster));
+    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
         local_handle,
         "us-east-1".to_string(),
         None,
@@ -4341,7 +4380,7 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
         BackgroundWorkerMode::none(),
     )
     .unwrap();
-    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
         foreign_handle,
         "us-east-1".to_string(),
         None,
@@ -4637,9 +4676,9 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
 fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
     let tmp = test_util::tempdir();
     let cluster = open_test_storage_cluster(tmp.path(), &[0]);
-    let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
-    let foreign_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
-    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+    let local_handle = test_storage_route_handle(Arc::clone(&cluster));
+    let foreign_handle = test_storage_route_handle(Arc::clone(&cluster));
+    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
         local_handle,
         "us-east-1".to_string(),
         None,
@@ -4647,7 +4686,7 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
         BackgroundWorkerMode::none(),
     )
     .unwrap();
-    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
         foreign_handle,
         "us-east-1".to_string(),
         None,
@@ -5104,9 +5143,9 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
 fn retained_stream_cleanup_rejects_admission_from_an_unrelated_coordinator() {
     let tmp = test_util::tempdir();
     let cluster = open_test_storage_cluster(tmp.path(), &[0]);
-    let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
-    let foreign_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
-    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+    let local_handle = test_storage_route_handle(Arc::clone(&cluster));
+    let foreign_handle = test_storage_route_handle(Arc::clone(&cluster));
+    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
         local_handle,
         "us-east-1".to_string(),
         None,
@@ -5114,7 +5153,7 @@ fn retained_stream_cleanup_rejects_admission_from_an_unrelated_coordinator() {
         BackgroundWorkerMode::none(),
     )
     .unwrap();
-    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
         foreign_handle,
         "us-east-1".to_string(),
         None,
@@ -5216,9 +5255,10 @@ fn retained_stream_cleanup_does_not_retry_after_its_deadline() {
 fn bucket_exists_rejects_stale_admission_from_an_unrelated_coordinator() {
     let initial_tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(initial_tmp.path(), &[0]);
-    let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
-    let foreign_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
-    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+    let (local_runtime_handle, local_handle) =
+        test_dynamic_storage_route_handles(Arc::clone(&initial));
+    let foreign_handle = test_storage_route_handle(Arc::clone(&initial));
+    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
         local_handle.clone(),
         "us-east-1".to_string(),
         None,
@@ -5226,7 +5266,7 @@ fn bucket_exists_rejects_stale_admission_from_an_unrelated_coordinator() {
         BackgroundWorkerMode::none(),
     )
     .unwrap();
-    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
         foreign_handle,
         "us-east-1".to_string(),
         None,
@@ -5246,7 +5286,9 @@ fn bucket_exists_rejects_stale_admission_from_an_unrelated_coordinator() {
     let replacement_tmp = test_util::tempdir();
     let replacement =
         make_dynamic_runtime_map_candidate(open_test_storage_cluster(replacement_tmp.path(), &[0]));
-    local_handle.install(Arc::clone(&replacement)).unwrap();
+    local_runtime_handle
+        .install(Arc::clone(&replacement))
+        .unwrap();
     assert!(Arc::ptr_eq(&local.storage_node(), &replacement));
     assert!(foreign
         .bucket_exists_on_admitted_route(&foreign_admission, &bucket)
@@ -5267,9 +5309,10 @@ fn bucket_exists_rejects_stale_admission_from_an_unrelated_coordinator() {
 fn bucket_cors_read_rejects_stale_admission_from_an_unrelated_coordinator() {
     let initial_tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(initial_tmp.path(), &[0]);
-    let local_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
-    let foreign_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
-    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+    let (local_runtime_handle, local_handle) =
+        test_dynamic_storage_route_handles(Arc::clone(&initial));
+    let foreign_handle = test_storage_route_handle(Arc::clone(&initial));
+    let local = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
         local_handle.clone(),
         "us-east-1".to_string(),
         None,
@@ -5277,7 +5320,7 @@ fn bucket_cors_read_rejects_stale_admission_from_an_unrelated_coordinator() {
         BackgroundWorkerMode::none(),
     )
     .unwrap();
-    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+    let foreign = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
         foreign_handle,
         "us-east-1".to_string(),
         None,
@@ -5306,7 +5349,9 @@ fn bucket_cors_read_rejects_stale_admission_from_an_unrelated_coordinator() {
     let replacement_tmp = test_util::tempdir();
     let replacement =
         make_dynamic_runtime_map_candidate(open_test_storage_cluster(replacement_tmp.path(), &[0]));
-    local_handle.install(Arc::clone(&replacement)).unwrap();
+    local_runtime_handle
+        .install(Arc::clone(&replacement))
+        .unwrap();
     local
         .create_bucket_for_owner("default-owner", "cors-bucket", false)
         .unwrap();
@@ -5336,9 +5381,9 @@ fn bucket_cors_read_rejects_stale_admission_from_an_unrelated_coordinator() {
 fn maintenance_worker_operations_sample_epoch_refreshed_runtime_map() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -5348,7 +5393,7 @@ fn maintenance_worker_operations_sample_epoch_refreshed_runtime_map() {
         .unwrap();
     let stale_lifecycle_runtime = coord.read_runtime();
 
-    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+    install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
     let refreshed = handle.current();
     assert!(refreshed.cluster_epoch() > initial.cluster_epoch());
 
@@ -5364,7 +5409,7 @@ fn maintenance_worker_operations_sample_epoch_refreshed_runtime_map() {
 fn shard_backfill_worker_uses_refreshed_runtime_map_handle() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let _coord =
         setup_coordinator_with_only_shard_backfill_worker(handle.clone(), Arc::clone(&initial));
 
@@ -5425,7 +5470,7 @@ fn shard_backfill_worker_uses_refreshed_runtime_map_handle() {
     let refreshed =
         StorageCluster::test_from_local_map_with_epoch(Arc::new(refreshed_map), desired_epoch)
             .unwrap();
-    handle.install(Arc::clone(&refreshed)).unwrap();
+    runtime_handle.install(Arc::clone(&refreshed)).unwrap();
 
     let work_item = PlacedSegmentShardBackfillWorkItem {
         request: SegmentStoredBytesRequest {
@@ -5566,7 +5611,7 @@ fn shard_backfill_worker_resolves_missing_payload_after_source_metadata_is_gone(
     )
     .unwrap();
     map.test_install_historical_pg_routes([source_route]);
-    let cluster = StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
     let work_item = PlacedSegmentShardBackfillWorkItem {
         request: SegmentStoredBytesRequest {
             data_pg_id: pg_id.get(),
@@ -5635,7 +5680,7 @@ fn shard_backfill_candidate_scanner_retains_cursor_across_runtime_map_replacemen
         [LocalPgRoute::from(&source_route)],
     )
     .unwrap();
-    let source_cluster = StorageCluster::from_local_map(Arc::new(source_map)).unwrap();
+    let source_cluster = StorageCluster::from_static_local_map(Arc::new(source_map)).unwrap();
     // This regression drives the candidate scanner explicitly below. Keep the
     // production sweepers from racing its exact one-candidate assertions.
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
@@ -5758,7 +5803,7 @@ fn shard_backfill_candidate_scanner_retains_cursor_across_runtime_map_replacemen
         .unwrap()
         .is_complete());
 
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&desired_cluster));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&desired_cluster));
     let mut scanner = super::runtime::ShardBackfillCandidateScanner::default();
     let first_scan = scanner.scan_with_limit(&handle, 1).unwrap();
     assert_eq!(first_scan.already_complete, 1);
@@ -5789,7 +5834,7 @@ fn shard_backfill_candidate_scanner_retains_cursor_across_runtime_map_replacemen
         replacement_epoch,
     )
     .unwrap();
-    handle.install(Arc::clone(&replacement)).unwrap();
+    runtime_handle.install(Arc::clone(&replacement)).unwrap();
     assert!(Arc::ptr_eq(&handle.current(), &replacement));
 
     let second_scan = scanner.scan_with_limit(&handle, 1).unwrap();
@@ -5912,7 +5957,7 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
         )
         .unwrap(),
     );
-    let source_cluster = StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster = StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     let bucket = trusted_bucket_name("remote-backfill-bucket");
     let key = trusted_object_key("remote-backfill-key");
     let segment_okh = [0xD7; 16];
@@ -5997,7 +6042,7 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
     desired_map
         .install_unix_storage_node_clients(client_configs)
         .unwrap();
-    let desired_cluster = StorageCluster::from_local_map(Arc::new(desired_map)).unwrap();
+    let desired_cluster = StorageCluster::from_static_local_map(Arc::new(desired_map)).unwrap();
     let source_health = desired_cluster
         .placed_segment_payload_shard_health_for_pg_route_snapshot(&source_route, work_item.request)
         .unwrap();
@@ -6055,9 +6100,9 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
 fn get_object_pins_runtime_map_for_snapshot_and_body() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -6095,6 +6140,7 @@ fn get_object_pins_runtime_map_for_snapshot_and_body() {
     let publication_thread = Arc::new(Mutex::new(None));
     let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -6102,7 +6148,7 @@ fn get_object_pins_runtime_map_for_snapshot_and_body() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some(("bucket".to_string(), "key".to_string())),
         after_object_read_snapshot: Some(Arc::new(move || {
-            let publishing_handle = hook_handle.clone();
+            let publishing_handle = hook_runtime_handle.clone();
             let publishing_candidate = Arc::clone(&candidate);
             let thread = thread::spawn(move || {
                 publishing_handle.install(publishing_candidate).unwrap();
@@ -6142,9 +6188,9 @@ fn get_object_pins_runtime_map_for_snapshot_and_body() {
 fn copy_object_pins_runtime_map_for_source_and_destination() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -6182,6 +6228,7 @@ fn copy_object_pins_runtime_map_for_source_and_destination() {
     let publication_thread = Arc::new(Mutex::new(None));
     let hook_publication_thread = Arc::clone(&publication_thread);
     let handle_for_hook = handle.clone();
+    let runtime_handle_for_hook = runtime_handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -6189,7 +6236,7 @@ fn copy_object_pins_runtime_map_for_source_and_destination() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some(("bucket".to_string(), "src".to_string())),
         after_object_read_snapshot: Some(Arc::new(move || {
-            let publishing_handle = handle_for_hook.clone();
+            let publishing_handle = runtime_handle_for_hook.clone();
             let publishing_candidate = Arc::clone(&candidate);
             let thread = thread::spawn(move || {
                 publishing_handle.install(publishing_candidate).unwrap();
@@ -6229,7 +6276,7 @@ fn copy_object_pins_runtime_map_for_source_and_destination() {
         .join()
         .unwrap();
 
-    handle
+    runtime_handle
         .install(make_dynamic_runtime_map_candidate(initial))
         .unwrap();
     let result = coord
@@ -6253,9 +6300,9 @@ fn copy_object_pins_runtime_map_for_source_and_destination() {
 fn object_metadata_pins_runtime_map_after_policy_context_load() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -6291,6 +6338,7 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
         &[0, 1],
     ));
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let hook_invocations = Arc::new(AtomicUsize::new(0));
     let hook_invocations_for_hook = Arc::clone(&hook_invocations);
     let publication_threads = Arc::new(Mutex::new(Vec::new()));
@@ -6303,7 +6351,7 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
         bucket: Some("bucket".to_string()),
         after_object_metadata_policy_context: Some(Arc::new(move || {
             hook_invocations_for_hook.fetch_add(1, Ordering::SeqCst);
-            let publishing_handle = hook_handle.clone();
+            let publishing_handle = hook_runtime_handle.clone();
             let publishing_candidate = Arc::clone(&candidate);
             let thread = thread::spawn(move || {
                 publishing_handle.install(publishing_candidate).unwrap();
@@ -6332,7 +6380,7 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
         .join()
         .unwrap();
 
-    handle
+    runtime_handle
         .install(make_dynamic_runtime_map_candidate(initial))
         .unwrap();
     let tags = get_object_tags_test(&coord, "bucket", "key", None, test_requester(), None)
@@ -6354,9 +6402,9 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
 fn delete_object_pins_runtime_map_after_authorization() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -6391,7 +6439,7 @@ fn delete_object_pins_runtime_map_after_authorization() {
         candidate_tmp.path(),
         &[0, 1],
     ));
-    let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -6399,7 +6447,7 @@ fn delete_object_pins_runtime_map_after_authorization() {
     let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_loaded: Some(Arc::new(move || {
-            hook_handle.install(Arc::clone(&candidate)).unwrap();
+            hook_runtime_handle.install(Arc::clone(&candidate)).unwrap();
         })),
         ..BucketWriteHandleTestHooks::default()
     });
@@ -6415,7 +6463,7 @@ fn delete_object_pins_runtime_map_after_authorization() {
         ))
         .unwrap();
 
-    handle
+    runtime_handle
         .install(make_dynamic_runtime_map_candidate(initial))
         .unwrap();
     let err = coord
@@ -6438,9 +6486,9 @@ fn delete_object_pins_runtime_map_after_authorization() {
 fn delete_bucket_pins_runtime_map_after_authorization() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -6458,6 +6506,7 @@ fn delete_bucket_pins_runtime_map_after_authorization() {
         &[0, 1],
     ));
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let publication_threads = Arc::new(Mutex::new(Vec::new()));
     let hook_publication_threads = Arc::clone(&publication_threads);
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
@@ -6467,7 +6516,7 @@ fn delete_bucket_pins_runtime_map_after_authorization() {
     let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_loaded: Some(Arc::new(move || {
-            let publishing_handle = hook_handle.clone();
+            let publishing_handle = hook_runtime_handle.clone();
             let publishing_candidate = Arc::clone(&candidate);
             let thread = thread::spawn(move || {
                 publishing_handle.install(publishing_candidate).unwrap();
@@ -6487,7 +6536,7 @@ fn delete_bucket_pins_runtime_map_after_authorization() {
         .join()
         .unwrap();
 
-    handle
+    runtime_handle
         .install(make_dynamic_runtime_map_candidate(initial))
         .unwrap();
     let err = coord
@@ -6504,13 +6553,13 @@ fn delete_bucket_pins_runtime_map_after_authorization() {
 fn reclaim_worker_follows_runtime_map_refresh_for_bucket_finalize() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&initial));
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    install_same_store_same_epoch_runtime_map(&handle, &initial, tmp.path());
+    install_same_store_same_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
     thread::sleep(Duration::from_millis(250));
 
     delete_bucket_test(&coord, "bucket").unwrap();
@@ -6549,7 +6598,7 @@ fn reclaim_worker_resamples_runtime_map_after_dequeue() {
         .unwrap();
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let root = storage::BucketDeleteFinalizeRoot {
         bucket: trusted_bucket_name("reclaim-refresh-after-dequeue"),
         bucket_incarnation_generation: 1,
@@ -6574,7 +6623,7 @@ fn reclaim_worker_resamples_runtime_map_after_dequeue() {
     gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
 
     install_same_store_same_epoch_runtime_map_with_primary(
-        &handle,
+        &runtime_handle,
         &initial,
         tmp.path(),
         NodeId::new(1),
@@ -6600,7 +6649,7 @@ fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
     let tmp = test_util::tempdir();
     let pg_ids = (0..32).collect::<Vec<_>>();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &pg_ids);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let bucket = trusted_bucket_name("deferred-finalize-runtime-refresh");
     let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
     direct_coord
@@ -6626,14 +6675,14 @@ fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_for_hook = Arc::clone(&attempts);
-    let handle_for_hook = handle.clone();
+    let runtime_handle_for_hook = runtime_handle.clone();
     let replacement_for_hook = Arc::clone(&replacement);
     let duplicate_root = root.clone();
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target_reclaim_worker_registry_key: Some(initial.process_local_registry_key()),
         before_reclaim_work_execute: Some(Arc::new(move |_execution_cluster| {
             if attempts_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
-                handle_for_hook
+                runtime_handle_for_hook
                     .install(Arc::clone(&replacement_for_hook))
                     .unwrap();
                 replacement_for_hook.enqueue_bucket_delete_finalize(duplicate_root.clone());
@@ -6672,9 +6721,9 @@ fn deferred_object_reclaim_clears_original_and_duplicate_runtime_map_queue_owner
         .unwrap();
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -6750,7 +6799,7 @@ fn deferred_object_reclaim_clears_original_and_duplicate_runtime_map_queue_owner
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_for_hook = Arc::clone(&attempts);
-    let handle_for_hook = handle.clone();
+    let runtime_handle_for_hook = runtime_handle.clone();
     let replacement_for_hook = Arc::clone(&replacement);
     let duplicate_bucket = bucket.clone();
     let duplicate_key = key.clone();
@@ -6758,7 +6807,7 @@ fn deferred_object_reclaim_clears_original_and_duplicate_runtime_map_queue_owner
         target_reclaim_worker_registry_key: Some(initial.process_local_registry_key()),
         before_reclaim_work_execute: Some(Arc::new(move |_execution_cluster| {
             if attempts_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
-                handle_for_hook
+                runtime_handle_for_hook
                     .install(Arc::clone(&replacement_for_hook))
                     .unwrap();
                 replacement_for_hook.enqueue_object_payload_reclaim(
@@ -6801,7 +6850,7 @@ fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
     initial.test_store_route_map_validity(long_lived_test_route_map_validity());
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
         setup_coordinator_with_only_stream_session_worker(handle.clone(), Arc::clone(&initial));
     coord
@@ -6822,7 +6871,7 @@ fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
         )
         .unwrap();
 
-    install_same_store_same_epoch_runtime_map(&handle, &initial, tmp.path());
+    install_same_store_same_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
     assert!(!Arc::ptr_eq(&coord.storage_node(), &initial));
 
     let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
@@ -6865,7 +6914,7 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
         tmp.path(),
         RouteMapValidity::until_ms(1).unwrap(),
     );
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&expired));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&expired));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&expired));
 
     expired.test_enqueue_bucket_delete_begin(
@@ -6882,7 +6931,7 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
         "expired route map should make the first background begin retryable before it can mark deleting"
     );
 
-    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+    install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
 
     let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
     loop {
@@ -6920,7 +6969,7 @@ fn bucket_delete_begin_marks_deleting_on_retained_route_after_runtime_map_primar
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-retained-route");
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1, 2]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
@@ -6938,13 +6987,13 @@ fn bucket_delete_begin_marks_deleting_on_retained_route_after_runtime_map_primar
 
     let installed_next_epoch = Arc::new(AtomicBool::new(false));
     let installed_next_epoch_for_hook = Arc::clone(&installed_next_epoch);
-    let handle_for_hook = handle.clone();
+    let runtime_handle_for_hook = runtime_handle.clone();
     let initial_for_hook = Arc::clone(&initial);
     let node_root = tmp.path().to_path_buf();
     let _hook_guard = initial.test_install_after_bucket_delete_final_visibility_proven_hook(
         Arc::new(move || {
             install_same_store_next_epoch_runtime_map_with_primary(
-                &handle_for_hook,
+                &runtime_handle_for_hook,
                 &initial_for_hook,
                 &node_root,
                 NodeId::new(1),
@@ -7025,7 +7074,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
             },
         ));
 
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
 
     let err = initial
@@ -7113,7 +7162,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_stream_cleanup_phase() {
             },
         ));
 
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
     initial.test_enqueue_bucket_delete_begin(
         &bucket,
@@ -7203,7 +7252,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_reservation_wait_phase() {
             },
         ));
 
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
     initial.test_enqueue_bucket_delete_begin(
         &bucket,
@@ -7282,7 +7331,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_phase() {
         }),
     );
 
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
     initial.test_enqueue_bucket_delete_begin(
         &bucket,
@@ -7354,7 +7403,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_proven_phase(
             })
         }));
 
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
     initial.test_enqueue_bucket_delete_begin(
         &bucket,
@@ -7412,7 +7461,7 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
         tmp.path(),
         RouteMapValidity::until_ms(1).unwrap(),
     );
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&expired));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&expired));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&expired));
 
     expired.test_enqueue_bucket_delete_begin(
@@ -7435,7 +7484,7 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
         old_identity.bucket_incarnation_generation
     );
 
-    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+    install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
 
     let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
     loop {
@@ -7461,9 +7510,9 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
 fn bucket_subresource_write_pins_runtime_map_after_authorization() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -7483,6 +7532,7 @@ fn bucket_subresource_write_pins_runtime_map_after_authorization() {
     let publication_thread = Arc::new(Mutex::new(None));
     let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -7490,7 +7540,7 @@ fn bucket_subresource_write_pins_runtime_map_after_authorization() {
     let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_loaded: Some(Arc::new(move || {
-            let publishing_handle = hook_handle.clone();
+            let publishing_handle = hook_runtime_handle.clone();
             let publishing_candidate = Arc::clone(&candidate);
             let thread = thread::spawn(move || {
                 publishing_handle.install(publishing_candidate).unwrap();
@@ -7511,7 +7561,7 @@ fn bucket_subresource_write_pins_runtime_map_after_authorization() {
         .join()
         .unwrap();
 
-    handle
+    runtime_handle
         .install(make_dynamic_runtime_map_candidate(initial))
         .unwrap();
     let stored = coord
@@ -7529,9 +7579,9 @@ fn bucket_subresource_write_pins_runtime_map_after_authorization() {
 fn bucket_subresource_write_pins_runtime_map_before_authorization() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -7551,6 +7601,7 @@ fn bucket_subresource_write_pins_runtime_map_before_authorization() {
     let publication_thread = Arc::new(Mutex::new(None));
     let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -7558,7 +7609,7 @@ fn bucket_subresource_write_pins_runtime_map_before_authorization() {
     let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_bucket_mutation_storage_node_capture: Some(Arc::new(move || {
-            let publishing_handle = hook_handle.clone();
+            let publishing_handle = hook_runtime_handle.clone();
             let publishing_candidate = Arc::clone(&candidate);
             let thread = thread::spawn(move || {
                 publishing_handle.install(publishing_candidate).unwrap();
@@ -7579,7 +7630,7 @@ fn bucket_subresource_write_pins_runtime_map_before_authorization() {
         .join()
         .unwrap();
 
-    handle
+    runtime_handle
         .install(make_dynamic_runtime_map_candidate(initial))
         .unwrap();
     let stored = coord
@@ -7597,9 +7648,9 @@ fn bucket_subresource_write_pins_runtime_map_before_authorization() {
 fn upload_part_copy_pins_runtime_map_after_stream_session_create() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -7650,6 +7701,7 @@ fn upload_part_copy_pins_runtime_map_after_stream_session_create() {
     let publication_thread = Arc::new(Mutex::new(None));
     let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -7657,7 +7709,7 @@ fn upload_part_copy_pins_runtime_map_after_stream_session_create() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some(("bucket".to_string(), "dst".to_string())),
         after_upload_part_copy_stream_session: Some(Arc::new(move || {
-            let publishing_handle = hook_handle.clone();
+            let publishing_handle = hook_runtime_handle.clone();
             let publishing_candidate = Arc::clone(&candidate);
             let thread = thread::spawn(move || {
                 publishing_handle.install(publishing_candidate).unwrap();
@@ -7699,9 +7751,9 @@ fn put_object_pins_runtime_map_after_bucket_write_reservation() {
     let bucket = "direct-put-pinned-bucket";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -7721,6 +7773,7 @@ fn put_object_pins_runtime_map_after_bucket_write_reservation() {
     let publication_thread = Arc::new(Mutex::new(None));
     let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -7728,7 +7781,7 @@ fn put_object_pins_runtime_map_after_bucket_write_reservation() {
     let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some(bucket.to_string()),
         after_loaded: Some(Arc::new(move || {
-            let publishing_handle = hook_handle.clone();
+            let publishing_handle = hook_runtime_handle.clone();
             let publishing_candidate = Arc::clone(&candidate);
             let thread = thread::spawn(move || {
                 publishing_handle.install(publishing_candidate).unwrap();
@@ -7764,7 +7817,7 @@ fn put_object_pins_runtime_map_after_bucket_write_reservation() {
         .join()
         .unwrap();
 
-    handle
+    runtime_handle
         .install(make_dynamic_runtime_map_candidate(initial))
         .unwrap();
     let result = coord
@@ -7847,11 +7900,11 @@ fn install_next_epoch_runtime_map_with_historical_routes(
 }
 
 fn begin_next_epoch_runtime_map_publication_with_historical_routes(
-    handle: &StorageClusterRuntimeMapHandle,
+    runtime_handle: &StorageClusterRuntimeMapHandle,
     initial: &Arc<StorageCluster>,
     node_root: &std::path::Path,
 ) -> thread::JoinHandle<()> {
-    let publishing_handle = handle.clone();
+    let publishing_handle = runtime_handle.clone();
     let publishing_initial = Arc::clone(initial);
     let publishing_node_root = node_root.to_path_buf();
     let publication_thread = thread::spawn(move || {
@@ -7861,7 +7914,9 @@ fn begin_next_epoch_runtime_map_publication_with_historical_routes(
             &publishing_node_root,
         );
     });
-    handle.test_wait_until_route_publication_is_pending();
+    runtime_handle
+        .route_handle()
+        .test_wait_until_route_publication_is_pending();
     publication_thread
 }
 
@@ -8112,7 +8167,7 @@ fn same_epoch_cluster_with_stale_current_pg_routes(
         })
         .collect::<Vec<_>>();
     local_map.test_install_pg_routes(stale_current_routes);
-    StorageCluster::from_local_map(Arc::new(local_map)).unwrap()
+    StorageCluster::from_static_local_map(Arc::new(local_map)).unwrap()
 }
 
 fn install_same_store_next_epoch_runtime_map_with_peering_pg(
@@ -8235,9 +8290,9 @@ fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() 
     let key = "key";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord = Arc::new(
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -8301,7 +8356,7 @@ fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() 
     );
 
     let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &handle,
+        &runtime_handle,
         &initial,
         tmp.path(),
     );
@@ -8355,9 +8410,9 @@ fn overwrite_object_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
     let key = "key";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord = Arc::new(
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -8439,7 +8494,7 @@ fn overwrite_object_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
     );
 
     let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &handle,
+        &runtime_handle,
         &initial,
         tmp.path(),
     );
@@ -8491,9 +8546,9 @@ fn copy_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route()
     let dst_key = "dst";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord = Arc::new(
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -8592,7 +8647,7 @@ fn copy_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route()
         "copy should apply the expected destination command prefix before the gated commit"
     );
 
-    let publishing_handle = handle.clone();
+    let publishing_handle = runtime_handle.clone();
     let publishing_initial = Arc::clone(&initial);
     let publishing_node_root = tmp.path().to_path_buf();
     let publication_thread = thread::spawn(move || {
@@ -8653,9 +8708,9 @@ fn delete_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route
     let key = "key";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord = Arc::new(
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -8728,7 +8783,7 @@ fn delete_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route
     );
 
     let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &handle,
+        &runtime_handle,
         &initial,
         tmp.path(),
     );
@@ -8778,9 +8833,9 @@ fn complete_multipart_epoch_change_before_metadata_apply_commits_once_on_pinned_
     let key = "key";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord = Arc::new(
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -8844,7 +8899,7 @@ fn complete_multipart_epoch_change_before_metadata_apply_commits_once_on_pinned_
     );
 
     let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &handle,
+        &runtime_handle,
         &initial,
         tmp.path(),
     );
@@ -8895,9 +8950,9 @@ fn upload_part_finalize_epoch_change_before_metadata_apply_commits_once_on_pinne
     let key = "key";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord = Arc::new(
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -8979,7 +9034,7 @@ fn upload_part_finalize_epoch_change_before_metadata_apply_commits_once_on_pinne
         "UploadPart finalization should not apply an object-PG command before the pre-commit gate"
     );
 
-    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+    install_next_epoch_runtime_map_with_historical_routes(&runtime_handle, &initial, tmp.path());
 
     gate.release();
     let part = finalize_thread.join().unwrap().unwrap();
@@ -9046,9 +9101,9 @@ fn upload_part_copy_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
     let dst_key = "dst";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord = Arc::new(
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -9158,7 +9213,7 @@ fn upload_part_copy_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
         "UploadPartCopy should apply the expected destination command prefix before the gated part commit"
     );
 
-    let publishing_handle = handle.clone();
+    let publishing_handle = runtime_handle.clone();
     let publishing_initial = Arc::clone(&initial);
     let publishing_node_root = tmp.path().to_path_buf();
     let publication_thread = thread::spawn(move || {
@@ -9235,9 +9290,9 @@ fn put_object_tags_epoch_change_before_metadata_apply_commits_once_on_pinned_rou
     let key = "key";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord = Arc::new(
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -9316,7 +9371,7 @@ fn put_object_tags_epoch_change_before_metadata_apply_commits_once_on_pinned_rou
     );
 
     let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &handle,
+        &runtime_handle,
         &initial,
         tmp.path(),
     );
@@ -9358,9 +9413,9 @@ fn put_object_legal_hold_epoch_change_before_metadata_apply_commits_once_on_pinn
     let key = "key";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord = Arc::new(
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -9445,7 +9500,7 @@ fn put_object_legal_hold_epoch_change_before_metadata_apply_commits_once_on_pinn
     );
 
     let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &handle,
+        &runtime_handle,
         &initial,
         tmp.path(),
     );
@@ -9485,9 +9540,9 @@ fn put_object_retention_epoch_change_before_metadata_apply_commits_once_on_pinne
     let key = "key";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord = Arc::new(
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -9577,7 +9632,7 @@ fn put_object_retention_epoch_change_before_metadata_apply_commits_once_on_pinne
     );
 
     let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &handle,
+        &runtime_handle,
         &initial,
         tmp.path(),
     );
@@ -9617,9 +9672,9 @@ fn put_object_acl_epoch_change_before_metadata_apply_commits_once_on_pinned_rout
     let key = "key";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord = Arc::new(
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -9705,7 +9760,7 @@ fn put_object_acl_epoch_change_before_metadata_apply_commits_once_on_pinned_rout
     );
 
     let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &handle,
+        &runtime_handle,
         &initial,
         tmp.path(),
     );
@@ -9752,9 +9807,9 @@ fn get_object_epoch_change_after_read_snapshot_uses_pinned_route() {
     let key = "key";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -9785,6 +9840,7 @@ fn get_object_epoch_change_after_read_snapshot_uses_pinned_route() {
     .unwrap();
 
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let hook_initial = Arc::clone(&initial);
     let hook_node_root = tmp.path().to_path_buf();
     let publication_thread = Arc::new(Mutex::new(None));
@@ -9796,7 +9852,7 @@ fn get_object_epoch_change_after_read_snapshot_uses_pinned_route() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some((bucket.to_string(), key.to_string())),
         after_object_read_snapshot: Some(Arc::new(move || {
-            let publishing_handle = hook_handle.clone();
+            let publishing_handle = hook_runtime_handle.clone();
             let publishing_initial = Arc::clone(&hook_initial);
             let publishing_node_root = hook_node_root.clone();
             let thread = thread::spawn(move || {
@@ -9841,9 +9897,9 @@ fn head_object_epoch_change_after_read_snapshot_uses_pinned_route() {
     let key = "key";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -9874,6 +9930,7 @@ fn head_object_epoch_change_after_read_snapshot_uses_pinned_route() {
     .unwrap();
 
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let hook_initial = Arc::clone(&initial);
     let hook_node_root = tmp.path().to_path_buf();
     let publication_thread = Arc::new(Mutex::new(None));
@@ -9885,7 +9942,7 @@ fn head_object_epoch_change_after_read_snapshot_uses_pinned_route() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some((bucket.to_string(), key.to_string())),
         after_object_read_snapshot: Some(Arc::new(move || {
-            let publishing_handle = hook_handle.clone();
+            let publishing_handle = hook_runtime_handle.clone();
             let publishing_initial = Arc::clone(&hook_initial);
             let publishing_node_root = hook_node_root.clone();
             let thread = thread::spawn(move || {
@@ -9972,9 +10029,9 @@ fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read()
     let current_cluster =
         StorageCluster::test_from_local_map_with_epoch(Arc::new(current_map), current_epoch)
             .unwrap();
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&current_cluster));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&current_cluster));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -10092,7 +10149,7 @@ fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read()
     let current_unix_cluster =
         StorageCluster::test_from_local_map_with_epoch(Arc::new(current_unix_map), current_epoch)
             .unwrap();
-    handle.install(current_unix_cluster).unwrap();
+    runtime_handle.install(current_unix_cluster).unwrap();
 
     let read = coord
         .get_object(&GetObjectRequest {
@@ -10165,7 +10222,7 @@ fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read()
     next_map.test_set_route_map_validity(long_lived_test_route_map_validity());
     let next_cluster =
         StorageCluster::test_from_local_map_with_epoch(Arc::new(next_map), next_epoch).unwrap();
-    handle.install(next_cluster).unwrap();
+    runtime_handle.install(next_cluster).unwrap();
 
     assert_eq!(read.body.read_all().unwrap(), payload);
     let head = coord
@@ -10226,9 +10283,9 @@ fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
     let bucket = "list-epoch-change-bucket";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -10275,6 +10332,7 @@ fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
 
     let candidate_tmp = test_util::tempdir();
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let hook_initial = Arc::clone(&initial);
     let hook_node_root = candidate_tmp.path().to_path_buf();
     let publication_thread = Arc::new(Mutex::new(None));
@@ -10286,7 +10344,7 @@ fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
     let _hook_guard = install_list_objects_test_hooks(ListObjectsTestHooks {
         bucket: Some(bucket.to_string()),
         before_storage_list: Some(Arc::new(move || {
-            let publishing_handle = hook_handle.clone();
+            let publishing_handle = hook_runtime_handle.clone();
             let publishing_initial = Arc::clone(&hook_initial);
             let publishing_node_root = hook_node_root.clone();
             let thread = thread::spawn(move || {
@@ -10332,9 +10390,9 @@ fn list_objects_continuation_survives_epoch_change_between_pages() {
     let bucket = "list-continuation-epoch-change-bucket";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -10384,7 +10442,7 @@ fn list_objects_continuation_survives_epoch_change_between_pages() {
     assert!(first.is_truncated);
     assert_eq!(first.next_continuation_token.as_deref(), Some("a/2"));
 
-    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+    install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
 
     let second = coord
         .list_objects_v2(&ListObjectsV2Request {
@@ -10563,9 +10621,9 @@ fn list_objects_delimiter_continuation_survives_epoch_change_between_pages() {
     let bucket = "list-delimiter-continuation-epoch-change-bucket";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -10622,7 +10680,7 @@ fn list_objects_delimiter_continuation_survives_epoch_change_between_pages() {
     assert!(first.is_truncated);
     assert_eq!(first.next_continuation_token.as_deref(), Some("b/"));
 
-    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+    install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
 
     let second = coord
         .list_objects_v2(&ListObjectsV2Request {
@@ -10650,9 +10708,9 @@ fn read_and_list_fail_closed_while_object_metadata_pg_is_peering() {
     let bucket = "object-peering-read-bucket";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -10689,7 +10747,7 @@ fn read_and_list_fail_closed_while_object_metadata_pg_is_peering() {
     .unwrap();
 
     let current_epoch = install_same_store_next_epoch_runtime_map_with_peering_pg(
-        &handle,
+        &runtime_handle,
         &initial,
         tmp.path(),
         peering_pg,
@@ -10771,9 +10829,9 @@ fn large_put_object_pins_runtime_map_after_stream_session_create() {
     let bucket = "large-put-pinned-bucket";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -10793,6 +10851,7 @@ fn large_put_object_pins_runtime_map_after_stream_session_create() {
     let publication_thread = Arc::new(Mutex::new(None));
     let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -10800,7 +10859,7 @@ fn large_put_object_pins_runtime_map_after_stream_session_create() {
     let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some(bucket.to_string()),
         after_loaded: Some(Arc::new(move || {
-            let publishing_handle = hook_handle.clone();
+            let publishing_handle = hook_runtime_handle.clone();
             let publishing_candidate = Arc::clone(&candidate);
             let thread = thread::spawn(move || {
                 publishing_handle.install(publishing_candidate).unwrap();
@@ -10837,7 +10896,7 @@ fn large_put_object_pins_runtime_map_after_stream_session_create() {
         .join()
         .unwrap();
 
-    handle
+    runtime_handle
         .install(make_dynamic_runtime_map_candidate(initial))
         .unwrap();
     let result = coord
@@ -10861,9 +10920,9 @@ fn streaming_upload_part_pins_runtime_map_after_session_create() {
     let bucket = "stream-part-pinned-bucket";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -10896,7 +10955,7 @@ fn streaming_upload_part_pins_runtime_map_after_session_create() {
         candidate_tmp.path(),
         &[0, 1],
     ));
-    let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -10906,7 +10965,7 @@ fn streaming_upload_part_pins_runtime_map_after_session_create() {
             coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
                 bucket: Some(bucket.to_string()),
                 after_loaded: Some(Arc::new(move || {
-                    hook_handle.install(Arc::clone(&candidate)).unwrap();
+                    hook_runtime_handle.install(Arc::clone(&candidate)).unwrap();
                 })),
                 ..BucketWriteHandleTestHooks::default()
             });
@@ -10967,7 +11026,7 @@ fn streaming_upload_part_pins_runtime_map_after_session_create() {
         )
         .unwrap();
 
-    handle
+    runtime_handle
         .install(make_dynamic_runtime_map_candidate(initial))
         .unwrap();
     coord
@@ -11011,9 +11070,9 @@ fn complete_multipart_upload_pins_runtime_map_between_snapshot_and_commit() {
     let bucket = "complete-multipart-pinned-bucket";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -11037,6 +11096,7 @@ fn complete_multipart_upload_pins_runtime_map_between_snapshot_and_commit() {
         &[0, 1],
     ));
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let publication_thread = Arc::new(Mutex::new(None));
     let hook_publication_thread = Arc::clone(&publication_thread);
     let _serial = RECLAMATION_TEST_SERIAL
@@ -11046,7 +11106,7 @@ fn complete_multipart_upload_pins_runtime_map_between_snapshot_and_commit() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some((bucket.to_string(), "key".to_string())),
         after_multipart_complete_pre_commit: Some(Arc::new(move || {
-            let install_handle = hook_handle.clone();
+            let install_handle = hook_runtime_handle.clone();
             let install_candidate = Arc::clone(&candidate);
             let thread = thread::spawn(move || {
                 install_handle.install(install_candidate).unwrap();
@@ -11081,7 +11141,7 @@ fn complete_multipart_upload_pins_runtime_map_between_snapshot_and_commit() {
         .join()
         .unwrap();
 
-    handle
+    runtime_handle
         .install(make_dynamic_runtime_map_candidate(initial))
         .unwrap();
     let result = coord
@@ -11108,9 +11168,9 @@ fn abort_multipart_upload_pins_runtime_map_after_auth_lookup() {
     let bucket = "abort-multipart-pinned-bucket";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -11145,6 +11205,7 @@ fn abort_multipart_upload_pins_runtime_map_after_auth_lookup() {
     let publication_thread = Arc::new(Mutex::new(None));
     let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -11152,7 +11213,7 @@ fn abort_multipart_upload_pins_runtime_map_after_auth_lookup() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some((bucket.to_string(), "key".to_string())),
         after_abort_multipart_auth_lookup: Some(Arc::new(move || {
-            let publishing_handle = hook_handle.clone();
+            let publishing_handle = hook_runtime_handle.clone();
             let publishing_candidate = Arc::clone(&candidate);
             let thread = thread::spawn(move || {
                 publishing_handle.install(publishing_candidate).unwrap();
@@ -11180,7 +11241,7 @@ fn abort_multipart_upload_pins_runtime_map_after_auth_lookup() {
         .join()
         .unwrap();
 
-    handle
+    runtime_handle
         .install(make_dynamic_runtime_map_candidate(initial))
         .unwrap();
     let err = coord
@@ -11207,9 +11268,9 @@ fn abort_multipart_upload_pins_runtime_map_after_bucket_summary() {
     let bucket = "abort-multipart-bucket-summary-pinned";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -11244,6 +11305,7 @@ fn abort_multipart_upload_pins_runtime_map_after_bucket_summary() {
     let publication_thread = Arc::new(Mutex::new(None));
     let hook_publication_thread = Arc::clone(&publication_thread);
     let hook_handle = handle.clone();
+    let hook_runtime_handle = runtime_handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -11251,7 +11313,7 @@ fn abort_multipart_upload_pins_runtime_map_after_bucket_summary() {
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some((bucket.to_string(), "key".to_string())),
         after_abort_multipart_bucket_summary: Some(Arc::new(move || {
-            let publishing_handle = hook_handle.clone();
+            let publishing_handle = hook_runtime_handle.clone();
             let publishing_candidate = Arc::clone(&candidate);
             let thread = thread::spawn(move || {
                 publishing_handle.install(publishing_candidate).unwrap();
@@ -11279,7 +11341,7 @@ fn abort_multipart_upload_pins_runtime_map_after_bucket_summary() {
         .join()
         .unwrap();
 
-    handle
+    runtime_handle
         .install(make_dynamic_runtime_map_candidate(initial))
         .unwrap();
     let err = coord
@@ -12301,7 +12363,7 @@ fn phase_10_6_remote_frontend_worker_mode_enables_routed_workers() {
 fn frontend_coordinators_share_one_reclaim_sweeper_per_storage_handle() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
-    let storage_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
+    let storage_handle = test_storage_route_handle(Arc::clone(&storage_cluster));
     let first = setup_coordinator_with_only_reclaim_worker(
         storage_handle.clone(),
         Arc::clone(&storage_cluster),
@@ -12331,9 +12393,9 @@ fn reclaim_worker_rediscovers_capacity_deferred_root_while_idle() {
         .unwrap();
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 1]);
-    let storage_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
+    let storage_handle = test_storage_route_handle(Arc::clone(&storage_cluster));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             storage_handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -15785,9 +15847,9 @@ fn list_object_versions_continuation_survives_epoch_change_between_pages() {
     let bucket = "version-continuation-epoch-change-bucket";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -15887,7 +15949,7 @@ fn list_object_versions_continuation_survives_epoch_change_between_pages() {
     assert_eq!(first_page.next_key_marker.as_deref(), Some(key_a.as_str()));
     assert_eq!(first_page.next_version_id_marker, Some(older_a.version_id));
 
-    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+    install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
 
     let second_page = coord
         .list_object_versions(&ListObjectVersionsRequest {
@@ -16046,9 +16108,9 @@ fn list_object_versions_delimiter_continuation_survives_epoch_change_between_pag
     let bucket = "version-delimiter-continuation-epoch-change-bucket";
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let coord =
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
             handle.clone(),
             "us-east-1".to_string(),
             None,
@@ -16107,7 +16169,7 @@ fn list_object_versions_delimiter_continuation_survives_epoch_change_between_pag
     assert_eq!(first_page.next_key_marker.as_deref(), Some("dir/"));
     assert_eq!(first_page.next_version_id_marker, None);
 
-    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+    install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
 
     let second_page = coord
         .list_object_versions(&ListObjectVersionsRequest {

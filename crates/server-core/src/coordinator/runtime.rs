@@ -13,8 +13,8 @@ use storage::{
     ObjectEncryption, ObjectKey, PlacedSegmentShardBackfillCandidateEnqueueSummary,
     PlacedSegmentShardBackfillCandidateScanCursor, PlacedSegmentShardBackfillClaimAcquireParams,
     PlacedSegmentShardRepairClaimAcquireParams, ProcessLocalRegistryKey, ReclaimWorkItem,
-    SegmentStoredBytesRequest, StorageCluster, StorageClusterRuntimeMapHandle, StoreError,
-    UploadId, UploadState, VersionId,
+    SegmentStoredBytesRequest, StorageCluster, StorageClusterRouteHandle, StoreError, UploadId,
+    UploadState, VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -765,7 +765,7 @@ fn enqueue_durable_reclaim_work_if_due(
 
 /// The coordinator ties together EC, storage, and metadata.
 pub(super) struct ReclaimSweeper {
-    pub(super) storage_handle: StorageClusterRuntimeMapHandle,
+    pub(super) storage_handle: StorageClusterRouteHandle,
     pub(super) stop: Arc<AtomicBool>,
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -790,7 +790,7 @@ pub(super) struct ShardBackfillCandidateScanner {
 impl ShardBackfillCandidateScanner {
     fn scan(
         &mut self,
-        storage_handle: &StorageClusterRuntimeMapHandle,
+        storage_handle: &StorageClusterRouteHandle,
     ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
         storage_handle
             .current()
@@ -800,7 +800,7 @@ impl ShardBackfillCandidateScanner {
     #[cfg(test)]
     pub(super) fn scan_with_limit(
         &mut self,
-        storage_handle: &StorageClusterRuntimeMapHandle,
+        storage_handle: &StorageClusterRouteHandle,
         scan_limit: usize,
     ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
         storage_handle
@@ -813,7 +813,7 @@ impl ShardBackfillCandidateScanner {
 }
 
 pub(super) struct ShardRepairSweeper {
-    pub(super) storage_handle: StorageClusterRuntimeMapHandle,
+    pub(super) storage_handle: StorageClusterRouteHandle,
     pub(super) stop: Arc<AtomicBool>,
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -858,7 +858,7 @@ impl Drop for ReclaimSweeper {
 
 impl ReclaimSweeper {
     pub(super) fn acquire_shared(
-        storage_handle: &StorageClusterRuntimeMapHandle,
+        storage_handle: &StorageClusterRouteHandle,
         runtime: ReadRuntime,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = RECLAIM_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
@@ -880,7 +880,7 @@ impl ReclaimSweeper {
     }
 
     fn spawn(
-        storage_handle: StorageClusterRuntimeMapHandle,
+        storage_handle: StorageClusterRouteHandle,
         runtime: ReadRuntime,
     ) -> Result<Arc<Self>, ServerError> {
         let stop = Arc::new(AtomicBool::new(false));
@@ -1266,9 +1266,9 @@ impl ReclaimSweeper {
         Ok(sweeper)
     }
 
-    pub(super) fn disabled(storage_cluster: Arc<StorageCluster>) -> Arc<Self> {
+    pub(super) fn disabled(storage_handle: StorageClusterRouteHandle) -> Arc<Self> {
         Arc::new(Self {
-            storage_handle: StorageClusterRuntimeMapHandle::new(storage_cluster),
+            storage_handle,
             stop: Arc::new(AtomicBool::new(true)),
             handle: Mutex::new(None),
         })
@@ -1276,7 +1276,7 @@ impl ReclaimSweeper {
 }
 
 fn wait_for_runtime_map_reclaim_work(
-    storage_handle: &StorageClusterRuntimeMapHandle,
+    storage_handle: &StorageClusterRouteHandle,
     stop: &AtomicBool,
 ) -> Option<(Arc<StorageCluster>, ReclaimWorkItem)> {
     if stop.load(Ordering::SeqCst) {
@@ -1345,7 +1345,7 @@ impl Drop for StreamSessionSweeper {
 
 impl LifecycleSweeper {
     pub(super) fn acquire_shared(
-        storage_handle: &StorageClusterRuntimeMapHandle,
+        storage_handle: &StorageClusterRouteHandle,
         runtime: ReadRuntime,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = LIFECYCLE_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1368,7 +1368,7 @@ impl LifecycleSweeper {
     }
 
     fn spawn(
-        storage_handle: StorageClusterRuntimeMapHandle,
+        storage_handle: StorageClusterRouteHandle,
         runtime: ReadRuntime,
         admission: Arc<BackgroundWorkAdmission>,
     ) -> Result<Arc<Self>, ServerError> {
@@ -1424,7 +1424,7 @@ impl LifecycleSweeper {
 }
 
 pub(super) fn lifecycle_runtime_for_sweep(
-    storage_handle: &StorageClusterRuntimeMapHandle,
+    storage_handle: &StorageClusterRouteHandle,
     runtime: &ReadRuntime,
 ) -> ReadRuntime {
     runtime.with_storage_node(storage_handle.current())
@@ -1432,7 +1432,7 @@ pub(super) fn lifecycle_runtime_for_sweep(
 
 impl ShardScavengerSweeper {
     pub(super) fn acquire_shared(
-        storage_handle: &StorageClusterRuntimeMapHandle,
+        storage_handle: &StorageClusterRouteHandle,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = SHARD_SCAVENGER_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
         let mut registry: std::sync::MutexGuard<
@@ -1452,7 +1452,7 @@ impl ShardScavengerSweeper {
         Ok(sweeper)
     }
 
-    fn spawn(storage_handle: StorageClusterRuntimeMapHandle) -> Result<Arc<Self>, ServerError> {
+    fn spawn(storage_handle: StorageClusterRouteHandle) -> Result<Arc<Self>, ServerError> {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(false), Condvar::new()));
         let sweeper = Arc::new(Self {
@@ -1598,7 +1598,7 @@ fn shard_scavenger_sweep_interval() -> Duration {
 
 impl ShardRepairSweeper {
     pub(super) fn acquire_shared(
-        storage_handle: &StorageClusterRuntimeMapHandle,
+        storage_handle: &StorageClusterRouteHandle,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = SHARD_REPAIR_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
         let mut registry: std::sync::MutexGuard<
@@ -1620,7 +1620,7 @@ impl ShardRepairSweeper {
     }
 
     fn spawn(
-        storage_handle: StorageClusterRuntimeMapHandle,
+        storage_handle: StorageClusterRouteHandle,
         _registry_key: ProcessLocalRegistryKey,
         admission: Arc<BackgroundWorkAdmission>,
     ) -> Result<Arc<Self>, ServerError> {
@@ -1964,7 +1964,7 @@ impl ShardRepairSweeper {
         Ok(sweeper)
     }
 
-    pub(super) fn disabled(storage_handle: StorageClusterRuntimeMapHandle) -> Arc<Self> {
+    pub(super) fn disabled(storage_handle: StorageClusterRouteHandle) -> Arc<Self> {
         Arc::new(Self {
             storage_handle,
             stop: Arc::new(AtomicBool::new(true)),
@@ -1974,14 +1974,14 @@ impl ShardRepairSweeper {
 }
 
 pub(super) fn shard_repair_cluster_for_work(
-    storage_handle: &StorageClusterRuntimeMapHandle,
+    storage_handle: &StorageClusterRouteHandle,
 ) -> Arc<StorageCluster> {
     storage_handle.current()
 }
 
 impl ShardBackfillSweeper {
     pub(super) fn acquire_shared(
-        storage_handle: &StorageClusterRuntimeMapHandle,
+        storage_handle: &StorageClusterRouteHandle,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = SHARD_BACKFILL_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
         let mut registry: std::sync::MutexGuard<
@@ -2001,7 +2001,7 @@ impl ShardBackfillSweeper {
         Ok(sweeper)
     }
 
-    fn spawn(storage_handle: StorageClusterRuntimeMapHandle) -> Result<Arc<Self>, ServerError> {
+    fn spawn(storage_handle: StorageClusterRouteHandle) -> Result<Arc<Self>, ServerError> {
         let worker_identity = random_background_worker_identity("shard-backfill worker")?;
         let owner_token = format!("shard-backfill-worker-{worker_identity}");
         let stop = Arc::new(AtomicBool::new(false));
@@ -2434,7 +2434,7 @@ fn emit_shard_backfill_event(
 
 impl StreamSessionSweeper {
     pub(super) fn acquire_shared(
-        storage_handle: &StorageClusterRuntimeMapHandle,
+        storage_handle: &StorageClusterRouteHandle,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = STREAM_SESSION_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
         let mut registry: std::sync::MutexGuard<
@@ -2453,7 +2453,7 @@ impl StreamSessionSweeper {
         Ok(sweeper)
     }
 
-    fn spawn(storage_handle: StorageClusterRuntimeMapHandle) -> Result<Arc<Self>, ServerError> {
+    fn spawn(storage_handle: StorageClusterRouteHandle) -> Result<Arc<Self>, ServerError> {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(false), Condvar::new()));
         let sweeper = Arc::new(Self {

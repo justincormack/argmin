@@ -28,11 +28,11 @@ fn multipart_completion_route_rejects_crossed_same_pg_request_before_mutation() 
     assert_ne!(crossed_key, key);
 
     let map = Arc::new(map);
-    let cluster = Arc::new(crate::StorageCluster::from_local_map(map).unwrap());
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(map).unwrap());
     create_test_bucket(&cluster, &bucket);
     let (request, _) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "crossedcomplete");
-    let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = handle.admit_current_route().unwrap();
     let crossed_route = admission
         .active_multipart_object_route(&bucket, &crossed_key)
@@ -72,8 +72,9 @@ fn multipart_completion_stale_retry_rechecks_expired_route_before_reload() {
     };
 
     let map = Arc::new(map);
-    let cluster = Arc::new(crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap());
-    let contender = Arc::new(crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap());
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    let contender =
+        Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
     create_test_bucket(&cluster, &bucket);
     let (request, _) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "expirestaleretry");
@@ -85,7 +86,7 @@ fn multipart_completion_stale_retry_rechecks_expired_route_before_reload() {
         crate::RouteMapValidity::until_ms(5_000).unwrap(),
         Some(4_000),
     );
-    let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = handle.admit_current_route().unwrap();
     cluster.test_store_route_map_validity(crate::RouteMapValidity::until_ms(10_000).unwrap());
 
@@ -184,7 +185,7 @@ fn direct_put_metadata_command_retry_reuses_pending_partial_replica_command() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let bucket_pg_id = cluster.bucket_metadata_pg_id(&bucket);
     let reservation_id = crate::SessionId::try_from("14".repeat(16)).unwrap();
@@ -361,7 +362,7 @@ fn direct_put_open_time_convergence_releases_bucket_write_reservation() {
         bucket_key_with_distinct_object_and_data_pg(topology)
     };
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let bucket_pg_id = cluster.bucket_metadata_pg_id(&bucket);
     let reservation_id = crate::SessionId::try_from("51".repeat(16)).unwrap();
@@ -498,7 +499,7 @@ fn object_generation_reservation_entry_drains_pending_direct_put_commit() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let reservation_id = crate::SessionId::try_from("22".repeat(16)).unwrap();
     let generation_id = cluster
@@ -621,7 +622,7 @@ fn object_delete_drains_pending_direct_put_commit_before_delete() {
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let old_committed =
         write_committed_direct_segment_for(&cluster, &bucket, &key, b"old direct object");
@@ -787,7 +788,7 @@ fn multipart_completion_command_publishes_streamed_part_segments_to_all_acting_n
     set_route_primary(&mut map, object_pg, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let (mut req, mut expected_segment) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "streamedcomplete");
@@ -937,7 +938,7 @@ fn already_recorded_multipart_completion_fanout_cleans_terminal_stream_uploads()
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let (req, _) = seed_streamed_multipart_completion(&cluster, &bucket, &key, "mpufanout");
     let stale_session_id = crate::SessionId::try_from("69".repeat(16)).unwrap();
@@ -1031,7 +1032,7 @@ fn multipart_completion_over_standard_object_reopens_with_valid_digest() {
         bucket_key_with_distinct_object_and_data_pg(topology)
     };
 
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let old =
         write_committed_direct_segment_for(&cluster, &bucket, &key, b"old standard object payload");
@@ -1097,7 +1098,7 @@ fn conditional_multipart_completion_rejects_object_created_after_snapshot() {
         .storage_node()
         .pg_topology();
     let (bucket, key, object_pg, _) = bucket_key_with_distinct_object_and_data_pg(topology);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let (mut req, _) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "conditionalrace");
@@ -1142,7 +1143,7 @@ fn conditional_multipart_completion_detects_same_millisecond_null_marker_replace
         .storage_node()
         .pg_topology();
     let (bucket, key, object_pg, _) = bucket_key_with_distinct_object_and_data_pg(topology);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Suspended);
     let owner = crate::OwnerIdentity::from_principal("owner");
     let first_marker = cluster
@@ -1232,7 +1233,7 @@ fn multipart_completion_rejects_stale_selected_part_row() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let (req, _) = seed_streamed_multipart_completion(&cluster, &bucket, &key, "stalepart");
 
@@ -1288,7 +1289,7 @@ fn non_current_epoch_multipart_completion_fails_closed_without_mutation() {
     set_route_primary(&mut local_map, object_pg, NodeId::new(1));
 
     let map = Arc::new(local_map);
-    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let current_cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&current_cluster, &bucket);
     let (req, _) =
         seed_streamed_multipart_completion(&current_cluster, &bucket, &key, "stalecomplete");
@@ -1436,7 +1437,8 @@ fn control_plane_peering_multipart_completion_old_primary_fails_closed_without_m
             .pg_topology();
         bucket_key_with_distinct_object_and_data_pg(topology)
     };
-    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let source_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&source_map)).unwrap();
     create_test_bucket(&source_cluster, &bucket);
     let (req, _) = seed_streamed_multipart_completion(
         &source_cluster,
@@ -1631,7 +1633,7 @@ fn versioned_direct_put_and_multipart_completion_allocate_versions_via_command_s
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
     let (mut multipart_req, mut expected_multipart_segment) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "versionraceupload");
@@ -1812,8 +1814,8 @@ fn versioned_multipart_completion_uses_time_budget_under_sustained_pg_contention
     set_route_primary(&mut map, data_pg, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-    let contender = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let contender = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
     let (mut req, mut expected_segment) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "sustainedversioncontention");
@@ -1885,7 +1887,7 @@ fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("streampartcmd");
     let create = crate::CreateMultipartUploadReq {
@@ -2073,7 +2075,7 @@ fn stream_upload_part_create_rejects_raced_upload_state(target_state: crate::Upl
     set_route_primary(&mut map, object_pg, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let upload_id = upload_id_from_label("streamraced");
     let create = crate::CreateMultipartUploadReq {
@@ -2213,7 +2215,7 @@ fn multipart_barrier_sequence_is_bucket_primary_serialized_across_object_pgs() {
     set_route_primary(&mut map, object_pg_b, NodeId::new(2));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let (req_a, _) = seed_streamed_multipart_completion(&cluster, &bucket, &key_a, "bucketordera");
     let (req_b, _) = seed_streamed_multipart_completion(&cluster, &bucket, &key_b, "bucketorderb");
@@ -2322,7 +2324,7 @@ fn multipart_completion_zero_apply_failure_retains_pending_command_for_retry() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let (req, expected_segment) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "zerofailcomplete");
@@ -2426,7 +2428,7 @@ fn multipart_completion_partial_apply_reopens_and_converges() {
     };
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let (req, mut expected_segment) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "completereopen");
@@ -2548,8 +2550,10 @@ fn multipart_completion_command_id_race_drains_winner_and_resnapshots_stale_payl
 
     let first_map = Arc::new(first_map);
     let second_map = Arc::new(second_map);
-    let first_cluster = crate::StorageCluster::from_local_map(Arc::clone(&first_map)).unwrap();
-    let second_cluster = crate::StorageCluster::from_local_map(Arc::clone(&second_map)).unwrap();
+    let first_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&first_map)).unwrap();
+    let second_cluster =
+        crate::StorageCluster::from_static_local_map(Arc::clone(&second_map)).unwrap();
     create_test_bucket(&first_cluster, &bucket);
     let (req, expected_segment) =
         seed_streamed_multipart_completion(&first_cluster, &bucket, &key, "completeidrace");
@@ -2679,7 +2683,7 @@ fn multipart_completion_retries_partial_bucket_barrier_command() {
     set_route_primary(&mut map, 2, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let (req, expected_segment) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "orderretrycomplete");
@@ -2771,8 +2775,8 @@ fn multipart_completion_barrier_command_id_race_drains_winner_and_retries() {
     set_route_primary(&mut map, 1, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-    let contender = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let contender = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
 
     let hook_map = Arc::clone(&map);
@@ -2831,7 +2835,7 @@ fn multipart_completion_drains_matching_pending_completion() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let (req, mut expected_segment) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "samecomplete");
@@ -2912,7 +2916,7 @@ fn multipart_completion_pending_install_conflict_with_matching_completion_return
     set_route_primary(&mut map, object_pg, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let (req, mut expected_segment) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "racecomplete");
@@ -2997,7 +3001,7 @@ fn multipart_completion_drains_other_upload_same_key_and_resnapshots_stale_paylo
     set_route_primary(&mut map, object_pg, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let (first_req, first_segment) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "firstsamekey");
@@ -3150,7 +3154,7 @@ fn multipart_completion_drains_pending_abort_before_completing() {
     set_route_primary(&mut map, object_pg, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let (req, uploaded_segment) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "abortwinscomplete");
