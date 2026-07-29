@@ -303,7 +303,7 @@ impl HttpFrontend {
         let secret_access_key = material.secret_key().as_str().to_string();
         let session_token = self
             .identity_provider
-            .seal_session_credential_v1(material, &issuer, session_name.clone(), lifetime, None)
+            .seal_session_credential(material, &issuer, session_name.clone(), lifetime, None)
             .map_err(|_| StsRequestError::Internal)?;
         let assumed_role_id = format!(
             "{}:{}",

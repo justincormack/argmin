@@ -5935,6 +5935,21 @@ mod tests {
         (dir, path)
     }
 
+    #[test]
+    fn static_cluster_manifest_rejects_unsupported_schema_versions() {
+        for version in [0, 2] {
+            let manifest = standalone_manifest().replacen(
+                "schema_version = 1",
+                &format!("schema_version = {version}"),
+                1,
+            );
+            assert_eq!(
+                parse_static_cluster_manifest(&manifest, "all-1").unwrap_err(),
+                format!("unsupported cluster manifest schema version {version}")
+            );
+        }
+    }
+
     fn private_dir(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();

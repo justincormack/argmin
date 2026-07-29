@@ -110,8 +110,7 @@ pub use request::{
 };
 pub use session_token::{
     SessionTokenKeyRingInitError, SessionTokenKeyRingStatus, SessionTokenOpenError,
-    SessionTokenSealError, MAX_DECODED_SESSION_TOKEN_FRAME_LEN, MAX_ENCODED_SESSION_TOKEN_LEN,
-    MAX_ISSUED_V1_TOKEN_LEN, SESSION_TOKEN_V1_PREFIX,
+    SessionTokenSealError,
 };
 pub use sigv4::{parse_auth_header, SigV4Auth};
 

@@ -19233,6 +19233,23 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_raft_wal_file_header_rejects_unsupported_versions() {
+        for version in [
+            CONTROL_PLANE_RAFT_WAL_FILE_VERSION - 1,
+            CONTROL_PLANE_RAFT_WAL_FILE_VERSION + 1,
+        ] {
+            let mut header = ControlPlaneRaftWalFile::encode_file_header(0);
+            let version_offset = CONTROL_PLANE_RAFT_WAL_FILE_MAGIC.len();
+            header[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+            refresh_raft_wal_frame_checksum(&mut header);
+            assert_error_contains(
+                ControlPlaneRaftWalFile::decode_file_header(&header),
+                &format!("unsupported control-plane OpenRaft WAL file header version {version}"),
+            );
+        }
+    }
+
+    #[test]
     fn control_plane_raft_wal_frame_rejects_malformed_frames() {
         assert_error_contains(
             ControlPlaneRaftWalFrame::decode_frame(b"short"),
@@ -27592,6 +27609,26 @@ mod tests {
             .expect("stored durable restart artifact should load");
         assert_eq!(loaded.cluster_name, "test-cluster");
         assert_eq!(loaded.local_node_id, 1);
+    }
+
+    #[test]
+    fn control_plane_raft_durable_restart_sentinel_rejects_unsupported_versions() {
+        let sentinel = ControlPlaneRaftRestartSentinel {
+            cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
+        };
+        for version in [0, CONTROL_PLANE_RAFT_RESTART_SENTINEL_VERSION + 1] {
+            let mut encoded = sentinel.encode_durable_sentinel().unwrap();
+            let version_offset = CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC.len();
+            encoded[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+            refresh_raft_wal_frame_checksum(&mut encoded);
+            assert_error_contains(
+                ControlPlaneRaftRestartSentinel::decode_durable_sentinel(&encoded),
+                &format!(
+                    "unsupported control-plane OpenRaft durable restart sentinel version {version}"
+                ),
+            );
+        }
     }
 
     #[test]

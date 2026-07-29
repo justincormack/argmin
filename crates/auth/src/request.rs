@@ -1243,7 +1243,7 @@ mod tests {
         let secret_key = SecretKey::new("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN".to_string());
         let expires_at_epoch_secs = i64::try_from(now_epoch_secs).unwrap() + expires_at_offset_secs;
         let token = provider
-            .seal_session_credential_v1(
+            .seal_session_credential(
                 crate::GeneratedSessionCredentialMaterial::from_parts_for_test(
                     access_key_id.clone(),
                     secret_key.clone(),
@@ -1281,7 +1281,7 @@ mod tests {
             .unwrap();
         fixture
             .provider
-            .seal_session_credential_v1(
+            .seal_session_credential(
                 crate::GeneratedSessionCredentialMaterial::from_parts_for_test(
                     access_key_id.to_string(),
                     secret_key,

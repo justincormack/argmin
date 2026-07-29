@@ -434,8 +434,8 @@ impl ControlPlaneAuthorityClockRestartCheckpoint {
 /// but only the command issuer can compare wall-clock progress with monotonic
 /// elapsed time. Durable process startup additionally requires node-local
 /// wall/health lineage evidence whenever restored state has a timestamp
-/// high-water; the legacy constructor retains the proximity-only bootstrap for
-/// non-durable callers.
+/// high-water. Production construction always applies that restart-continuity
+/// rule; sample-driven constructors exist only on the test surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlPlaneAuthorityClockBlockedReason {
     InitialTimestampDiscontinuity,
@@ -583,19 +583,6 @@ pub struct ControlPlaneAuthorityClock {
 }
 
 impl ControlPlaneAuthorityClock {
-    pub fn new_from_process_clock(
-        max_committed_timestamp_ms: Option<u64>,
-    ) -> Result<Self, ControlPlaneError> {
-        let sample = control_plane_process_clock_sample()?;
-        Self::new_internal(
-            max_committed_timestamp_ms,
-            sample.wall_time_ms(),
-            sample.health_time_ms(),
-            None,
-            true,
-        )
-    }
-
     pub fn new_from_process_clock_with_restart_checkpoint(
         max_committed_timestamp_ms: Option<u64>,
         restart_checkpoint: Option<ControlPlaneAuthorityClockRestartCheckpoint>,
@@ -610,6 +597,7 @@ impl ControlPlaneAuthorityClock {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn new(
         max_committed_timestamp_ms: Option<u64>,
         wall_ms: u64,
@@ -624,6 +612,7 @@ impl ControlPlaneAuthorityClock {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn new_with_restart_checkpoint(
         max_committed_timestamp_ms: Option<u64>,
         wall_ms: u64,
@@ -22916,6 +22905,12 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    fn reseal_crc64_suffix(bytes: &mut [u8]) {
+        let checksum_offset = bytes.len() - std::mem::size_of::<u64>();
+        let checksum = checksum::crc64::checksum(&bytes[..checksum_offset]);
+        bytes[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+    }
+
     #[test]
     fn control_plane_rpc_preserves_openraft_operation_error_kind() {
         for kind in [
@@ -37822,6 +37817,91 @@ mod tests {
     }
 
     #[test]
+    fn single_authority_durable_formats_reject_unsupported_versions() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        let binding = ControlPlaneAuthorityClockCheckpointBinding([0x42; 32]);
+
+        for version in [0, CONTROL_PLANE_STATE_IDENTITY_VERSION + 1] {
+            store_single_authority_clock_checkpoint_binding(&path, binding).unwrap();
+            let identity_path = single_authority_identity_path(&path);
+            let mut bytes = std::fs::read(&identity_path).unwrap();
+            bytes[CONTROL_PLANE_STATE_IDENTITY_MAGIC.len()
+                ..CONTROL_PLANE_STATE_IDENTITY_MAGIC.len() + 2]
+                .copy_from_slice(&version.to_be_bytes());
+            reseal_crc64_suffix(&mut bytes);
+            std::fs::write(&identity_path, bytes).unwrap();
+            assert!(matches!(
+                load_single_authority_clock_checkpoint_binding(&path),
+                Err(ControlPlaneError::AuthorityClockCheckpoint { message })
+                    if message == format!(
+                        "unsupported single-authority durable identity version {version}"
+                    )
+            ));
+        }
+
+        for version in [0, SINGLE_AUTHORITY_INITIALIZED_VERSION + 1] {
+            store_single_authority_initialized_binding(&path, binding).unwrap();
+            let initialized_path = single_authority_initialized_path(&path);
+            let mut bytes = std::fs::read(&initialized_path).unwrap();
+            bytes[SINGLE_AUTHORITY_INITIALIZED_MAGIC.len()
+                ..SINGLE_AUTHORITY_INITIALIZED_MAGIC.len() + 2]
+                .copy_from_slice(&version.to_be_bytes());
+            reseal_crc64_suffix(&mut bytes);
+            std::fs::write(&initialized_path, bytes).unwrap();
+            assert!(matches!(
+                load_single_authority_initialized_binding(&path),
+                Err(ControlPlaneError::CommandDecode { message })
+                    if message == format!(
+                        "unsupported single-authority initialization marker version {version}"
+                    )
+            ));
+        }
+
+        let store = FileControlPlaneStore::new(&path);
+        for version in [
+            SINGLE_AUTHORITY_JOURNAL_FILE_VERSION - 1,
+            SINGLE_AUTHORITY_JOURNAL_FILE_VERSION + 1,
+        ] {
+            let mut header = store.journal.encode_file_header(0);
+            let version_offset = SINGLE_AUTHORITY_JOURNAL_FILE_MAGIC.len();
+            header[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+            reseal_crc64_suffix(&mut header);
+            assert!(matches!(
+                store.journal.decode_file_header(&header),
+                Err(ControlPlaneError::CommandDecode { message })
+                    if message == format!(
+                        "unsupported single-authority control-plane journal file header version {version}"
+                    )
+            ));
+        }
+
+        for version in [
+            SINGLE_AUTHORITY_JOURNAL_RECORD_VERSION - 1,
+            SINGLE_AUTHORITY_JOURNAL_RECORD_VERSION + 1,
+        ] {
+            let mut record = SingleAuthorityJournalRecord {
+                binding,
+                previous_chain_digest: 7,
+                resulting_chain_digest: 7,
+                command: None,
+            }
+            .encode()
+            .unwrap();
+            let version_offset = SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC.len();
+            record[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+            reseal_crc64_suffix(&mut record);
+            assert!(matches!(
+                SingleAuthorityJournalRecord::decode(&record),
+                Err(ControlPlaneError::CommandDecode { message })
+                    if message == format!(
+                        "unsupported single-authority control-plane journal record version {version}"
+                    )
+            ));
+        }
+    }
+
+    #[test]
     fn bare_control_plane_state_path_uses_current_directory_for_durability() {
         assert_eq!(
             state_parent(Path::new("control-plane.state")),
@@ -40825,6 +40905,22 @@ mod tests {
         );
 
         let checkpoint_path = authority_clock_restart_checkpoint_path(&state_path);
+        for version in [
+            CONTROL_PLANE_CLOCK_CHECKPOINT_VERSION - 1,
+            CONTROL_PLANE_CLOCK_CHECKPOINT_VERSION + 1,
+        ] {
+            let mut bytes = stored.encode();
+            let version_offset = CONTROL_PLANE_CLOCK_CHECKPOINT_MAGIC.len();
+            bytes[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+            reseal_crc64_suffix(&mut bytes);
+            std::fs::write(&checkpoint_path, bytes).unwrap();
+            assert!(matches!(
+                load_authority_clock_restart_checkpoint(&state_path, binding),
+                Err(ControlPlaneError::AuthorityClockCheckpoint { message })
+                    if message == format!("unsupported checkpoint version {version}")
+            ));
+        }
+
         let zero_generation =
             ControlPlaneAuthorityClockRestartCheckpoint::new(binding, 0, Some(4_999), 5_000, 5_000);
         std::fs::write(&checkpoint_path, zero_generation.encode()).unwrap();

@@ -859,11 +859,18 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_non_current_or_incomplete_representations() {
+        for version in [0, FORMAT_VERSION + 1] {
+            let error = SystemMetadata::deserialize(&[version, 0, 0]).unwrap_err();
+            assert!(matches!(
+                error,
+                ServerError::MetadataBlobError { reason }
+                    if reason == format!("unknown system metadata blob version: {version}")
+            ));
+        }
         for malformed in [
             &[][..],
             &[1][..],
             &[1, 0][..],
-            &[2, 0, 0][..],
             &[1, 0, 1][..],
             &[1, 0, 0, 0][..],
             &[1, CHECKSUM_BIT as u8, 0, 10, u8::MAX, 0, 0][..],

@@ -2804,6 +2804,25 @@ fail_with_matches \
     "Canonical ACL storage strings and exact-current decoding are private to s3-types/storage; other crates must pass logical AclGrants values" \
     "$acl_codec_leaks"
 
+session_token_format_leaks=$(
+    {
+        rg -n --color=never \
+            '\bseal_session_credential_v[0-9]+\b|\b(SESSION_TOKEN_V[0-9]+_PREFIX|MAX_DECODED_SESSION_TOKEN_FRAME_LEN|MAX_ENCODED_SESSION_TOKEN_LEN|MAX_ISSUED_V[0-9]+_TOKEN_LEN)\b' \
+            . \
+            -g 'crates/**/*.rs' \
+            -g '!crates/auth/**' \
+            || true
+        rg -n --color=never \
+            'pub fn seal_session_credential_v[0-9]+\b|pub const (SESSION_TOKEN_V[0-9]+_PREFIX|MAX_DECODED_SESSION_TOKEN_FRAME_LEN|MAX_ENCODED_SESSION_TOKEN_LEN|MAX_ISSUED_V[0-9]+_TOKEN_LEN)\b' \
+            crates/auth/src \
+            -g '*.rs' \
+            || true
+    }
+)
+fail_with_matches \
+    "Session-token format selection and representation constants are private to auth; callers must use semantic issuance and authentication APIs" \
+    "$session_token_format_leaks"
+
 if [[ "$failed" -ne 0 ]]; then
     echo
     echo "storage cluster boundary checks failed" >&2

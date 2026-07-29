@@ -5076,6 +5076,18 @@ mod tests {
             }
         );
         assert_eq!(abandoned_header.command_kind_name(), None);
+
+        for version in [0, ABANDONED_METADATA_COMMAND_ENCODING_VERSION + 1] {
+            let mut abandoned = envelope.abandoned_log_bytes();
+            let version_offset = 4 + ABANDONED_METADATA_COMMAND_MAGIC.len();
+            abandoned[version_offset..version_offset + 2].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(
+                decode_metadata_command_log_entry_header(&abandoned),
+                Err(format!(
+                    "unsupported abandoned metadata command encoding version {version}"
+                ))
+            );
+        }
     }
 
     #[test]

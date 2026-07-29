@@ -21,11 +21,11 @@ use crate::{
 };
 
 /// Prefix identifying Argmin's first session-token envelope version.
-pub const SESSION_TOKEN_V1_PREFIX: &str = "ARGST1.";
+pub(crate) const SESSION_TOKEN_V1_PREFIX: &str = "ARGST1.";
 /// Defensive upper bound accepted before allocating a decoded token frame.
-pub const MAX_ENCODED_SESSION_TOKEN_LEN: usize = 21_853;
+pub(crate) const MAX_ENCODED_SESSION_TOKEN_LEN: usize = 21_853;
 /// Defensive upper bound for a decoded token frame.
-pub const MAX_DECODED_SESSION_TOKEN_FRAME_LEN: usize = 16_384;
+pub(crate) const MAX_DECODED_SESSION_TOKEN_FRAME_LEN: usize = 16_384;
 
 const KEY_LEN: usize = 32;
 const KEY_ID_LEN: usize = 16;
@@ -66,7 +66,7 @@ const fn unpadded_base64_len(byte_len: usize) -> usize {
 }
 
 /// Maximum external length of a token this implementation can issue.
-pub const MAX_ISSUED_V1_TOKEN_LEN: usize =
+pub(crate) const MAX_ISSUED_V1_TOKEN_LEN: usize =
     SESSION_TOKEN_V1_PREFIX.len() + unpadded_base64_len(MAX_ISSUED_V1_FRAME_LEN);
 
 type KeyId = [u8; KEY_ID_LEN];
@@ -906,7 +906,7 @@ mod tests {
         let (provider, issuer) = resolved_role("test-role");
         let clone = provider.clone();
         let token = provider
-            .seal_session_credential_v1(
+            .seal_session_credential(
                 generated_material(),
                 &issuer,
                 RoleSessionName::new("test-session").unwrap(),
@@ -961,7 +961,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let token = provider
-            .seal_session_credential_v1(
+            .seal_session_credential(
                 generated_material(),
                 &issuer,
                 RoleSessionName::new("test-session").unwrap(),

@@ -1219,6 +1219,42 @@ mod tests {
         .unwrap();
     }
 
+    fn replace_control_plane_identity_version(bytes: &mut Vec<u8>, version: u16) {
+        let version_offset = CONTROL_PLANE_IDENTITY_MAGIC.len();
+        bytes[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+        bytes.truncate(bytes.len() - CONTROL_PLANE_IDENTITY_DIGEST_BYTES);
+        let digest = auth::canonical::sha256_hex(bytes);
+        bytes.extend_from_slice(digest.as_bytes());
+    }
+
+    #[test]
+    fn static_identities_reject_unsupported_versions() {
+        let expected = identity("storage-1", "b");
+        for version in [0, STORAGE_IDENTITY_VERSION + 1] {
+            let mut bytes = StaticStorageIdentity::new(&expected, 17).encode().unwrap();
+            let version_offset = STORAGE_IDENTITY_MAGIC.len();
+            bytes[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+            assert_eq!(
+                StaticStorageIdentity::decode(&bytes).unwrap_err(),
+                "static storage identity has an unsupported version"
+            );
+        }
+
+        for version in [
+            CONTROL_PLANE_IDENTITY_VERSION - 1,
+            CONTROL_PLANE_IDENTITY_VERSION + 1,
+        ] {
+            let mut bytes = StaticControlPlaneIdentity::new(&expected, 19)
+                .encode()
+                .unwrap();
+            replace_control_plane_identity_version(&mut bytes, version);
+            assert_eq!(
+                StaticControlPlaneIdentity::decode(&bytes).unwrap_err(),
+                "static control-plane identity has an unsupported version"
+            );
+        }
+    }
+
     #[test]
     fn static_control_plane_identity_requires_explicit_initialization_and_reopens_exact_identity() {
         let temp = test_util::tempdir();

@@ -1685,6 +1685,69 @@ mod tests {
     }
 
     #[test]
+    fn storage_rpc_auth_transport_rejects_unsupported_versions() {
+        for version in [0, STORAGE_RPC_AUTH_TRANSPORT_VERSION + 1] {
+            let mut encoded = Vec::new();
+            write_storage_rpc_auth_transport_frame(&mut encoded, b"payload").unwrap();
+            let version_offset = STORAGE_RPC_AUTH_TRANSPORT_MAGIC.len();
+            encoded[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+
+            let error =
+                read_storage_rpc_auth_transport_frame(&mut Cursor::new(encoded)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "unsupported authenticated storage RPC transport version"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_rpc_auth_binding_rejects_unsupported_versions() {
+        let credential = credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let kind = StorageRpcMessageKind::BucketCreateCommandBuild;
+        let request = frame(kind);
+        let verifier = ControlPlaneScopedCredentialStore::new(vec![credential.clone()]).unwrap();
+        for version in [0, STORAGE_RPC_AUTH_BINDING_VERSION + 1] {
+            let mut encoded =
+                encode_binding(9, TOPOLOGY_DIGEST, NodeId::new(7), None, &request).unwrap();
+            let version_offset = STORAGE_RPC_AUTH_BINDING_MAGIC.len();
+            encoded[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+            let signed = credential
+                .sign_envelope(ControlPlaneAuthSignInput {
+                    target: ControlPlaneAuthTarget::Service(ControlPlaneAuthService::StorageRpc),
+                    operation: ControlPlaneAuthOperation::StorageRpcRequest {
+                        message_kind: kind as u16,
+                    },
+                    issued_at_ms: Some(1_000),
+                    expires_at_ms: Some(2_000),
+                    sequence: Some(request.request_id),
+                    nonce: Vec::new(),
+                    payload: encoded,
+                })
+                .unwrap()
+                .encode_frame()
+                .unwrap();
+            assert!(matches!(
+                verify_storage_rpc_request(StorageRpcAuthRequestVerificationInput {
+                    verifier: &verifier,
+                    expected_cluster_id: credential.cluster_id(),
+                    expected_target_node_id: NodeId::new(7),
+                    expected_topology_generation: 9,
+                    expected_topology_digest: TOPOLOGY_DIGEST,
+                    now_ms: 1_500,
+                    max_replay_window_ms: 1_000,
+                    allowed_future_skew_ms: 0,
+                    envelope_bytes: &signed,
+                }),
+                Err(StorageRpcAuthRejectionReason::Malformed)
+            ));
+        }
+    }
+
+    #[test]
     fn storage_rpc_auth_transport_frame_reports_flush_failure() {
         let error = write_storage_rpc_auth_transport_frame(
             &mut FlushFailureWriter,

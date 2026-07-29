@@ -7032,7 +7032,7 @@ mod tests {
         .unwrap();
         let token = frontend
             .identity_provider
-            .seal_session_credential_v1(
+            .seal_session_credential(
                 material,
                 &issuer,
                 auth::RoleSessionName::new("unsupported-session").unwrap(),

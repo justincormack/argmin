@@ -1267,6 +1267,26 @@ mod tests {
     }
 
     #[test]
+    fn checksum_metadata_rejects_unsupported_versions() {
+        let checksum = ObjectChecksumMetadata::new(
+            ChecksumAlgorithm::Sha256,
+            Some(ChecksumType::FullObject),
+            "deadbeef".to_string(),
+        );
+        for version in [0, SSE_C_CHECKSUM_METADATA_VERSION + 1] {
+            let mut encoded = encode_checksum_metadata(&checksum).unwrap();
+            encoded[0] = version;
+            assert!(matches!(
+                decode_checksum_metadata(&encoded),
+                Err(ServerError::InternalError { reason })
+                    if reason == format!(
+                        "unsupported SSE-C checksum metadata version {version}"
+                    )
+            ));
+        }
+    }
+
+    #[test]
     fn sse_s3_round_trip() {
         let provider = managed_key_provider();
         let ctx = prepare_managed_encryption_write(&provider).unwrap();

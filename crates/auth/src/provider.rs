@@ -474,9 +474,11 @@ impl IdentityProvider {
         Ok(account)
     }
 
-    /// Seal one version-1 temporary credential using a provider-resolved live
-    /// role and the shared process-local key ring.
-    pub fn seal_session_credential_v1(
+    /// Seal one temporary credential using a provider-resolved live role and
+    /// the shared process-local key ring.
+    ///
+    /// The provider owns selection of the current session-token format.
+    pub fn seal_session_credential(
         &self,
         material: GeneratedSessionCredentialMaterial,
         issuer: &ResolvedRoleIdentity,
@@ -1098,7 +1100,7 @@ mod tests {
             .unwrap();
         let access_key_id = "ARGS0123456789ABCDEFGHIJ";
         let token = provider
-            .seal_session_credential_v1(
+            .seal_session_credential(
                 GeneratedSessionCredentialMaterial::from_parts_for_test(
                     access_key_id.to_string(),
                     SecretKey::new("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN".to_string()),
@@ -1355,7 +1357,7 @@ mod tests {
             .unwrap();
         let access_key_id = "ARGS0123456789ABCDEFGHIJ";
         let token = provider
-            .seal_session_credential_v1(
+            .seal_session_credential(
                 GeneratedSessionCredentialMaterial::from_parts_for_test(
                     access_key_id.to_string(),
                     SecretKey::new("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN".to_string()),

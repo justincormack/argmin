@@ -171,10 +171,10 @@ and session-token envelope all require their exact current version or representa
 
 The audit found these residual changes rather than another old-format reader:
 
-- `ControlPlaneAuthorityClock::new_from_process_clock` is an unused public legacy constructor
-  that permits proximity-only initialization without restart-checkpoint continuity. Remove it.
-  The equivalent sample-driven constructor is used only by tests and should be restricted to the
-  test surface rather than remain a public production capability.
+- **Completed 2026-07-29:** the unused
+  `ControlPlaneAuthorityClock::new_from_process_clock` constructor was removed. The equivalent
+  sample-driven constructors are now restricted to tests and the `test-hooks` feature, while
+  production construction requires restart-checkpoint continuity.
 - Standalone and environment-only startup still use the active `legacy-local` storage path. That
   path gives the shared `StorageCluster` an optional runtime-map content digest and unbounded
   route-map validity, with an explicit `None`-digest/`None`-validity transition during a later
@@ -183,15 +183,16 @@ The audit found these residual changes rather than another old-format reader:
   an authoritative current standalone map/proof or separating standalone storage from the
   dynamically refreshable cluster type; then make clustered generations require their digest and
   validity proof.
-- The session-token envelope is exact-current, but its version selection is not contained:
-  `server-http` calls `seal_session_credential_v1`, and `auth` publicly re-exports the v1 prefix and
-  representation-size constants. Replace this with a semantic current-credential issuance method,
-  keep versioned sealing and representation constants private to `auth`, and add a boundary check
-  preventing external version selection.
+- **Completed 2026-07-29:** session-token version selection is contained in `auth`.
+  `IdentityProvider::seal_session_credential` is the semantic issuance API; the v1 prefix and
+  representation-size constants are crate-private. The boundary check rejects versioned sealing
+  calls or representation constants outside `auth`, and rejects making those APIs public inside
+  the owner.
 
-The following exact-version checks exist in production but still need explicit owner-local
-unsupported-version fixtures, including a recomputed checksum or digest where the containing
-format authenticates the version field:
+Owner-local unsupported-too-old and unsupported-too-new fixtures now lock every exact-version
+check identified by the audit. Each test recomputes the enclosing checksum, digest, or
+authenticator where the containing format authenticates its version field, so it reaches the
+version rejection rather than a generic corruption path:
 
 - static cluster manifest schema and both static storage/control-plane identity files
 - system metadata and the encrypted checksum-metadata projection
@@ -295,7 +296,7 @@ Initial ownership assessment:
 | Object user/system metadata blobs | `server-core` | Keep storage's carriers opaque; make serialization entry points crate-private unless another owner has a demonstrated need to interpret them. |
 | Tag and ACL canonical value formats | `s3-types` | Keep validation and canonical value codecs central; treat their embeddings in storage rows/RPCs as separately versioned containing formats. |
 | Object encryption state | `storage` | Keep the durable codec private to storage while exposing only typed encryption state to callers. |
-| Session-token envelope | `auth` | The envelope rejects non-v1 tokens, but version selection still leaks through public `seal_session_credential_v1`, v1 prefix, and size constants. Replace them with a semantic current-credential issuance API and boundary-check that callers handle only issued token strings and authentication results. |
+| Session-token envelope | `auth` | Exact-current version selection and representation constants are private to `auth`; callers use semantic credential issuance and authentication APIs, enforced by the boundary check. |
 | Static manifest and process identity files | `argmin-s3` | The codecs are currently crate-local; inventory their coupling to storage/control-plane durable layout. |
 | Shared operator metric schema | `observability` | Decide explicitly which metrics are compatibility contracts before versioning the shared schema. Subsystem-specific persisted diagnostics must be inventoried as separate boundaries owned by their producing crate rather than treated as one shared format. |
 
@@ -837,16 +838,14 @@ Raft peer client and server transports are storage-owned and boundary-checked.
    encryption, user/system metadata, object tags, bucket tags, and ACL grants have owner-local
    codecs, boundary checks, exact current-representation goldens, and containing-format
    inventories above.
-5. **Audit complete; remediation outstanding:** remove the unused legacy authority-clock
-   constructor and replace the active `legacy-local` digest/validity exception with a current
-   standalone authority proof or a separate standalone type before making the clustered
-   invariants mandatory.
-6. Add the owner-local current-version rejection fixtures listed in the 2026-07-29 audit,
-   recomputing enclosing checksums/digests so each test reaches the version check rather than
-   passing through a generic corruption path.
-7. Contain session-token version selection inside `auth` and add a boundary check rejecting
-   versioned sealing calls or representation constants outside that owner. Continue relying on
-   crate privacy for the already-contained durable formats.
+5. **Partially complete:** the unused legacy authority-clock constructor is removed and
+   sample-driven construction is test-only. Remediation of the active `legacy-local`
+   digest/validity exception remains a separate design decision: establish a current standalone
+   authority proof or a separate standalone type before making clustered invariants mandatory.
+6. **Complete:** owner-local exact-current rejection fixtures cover every boundary listed in the
+   2026-07-29 audit, including resealed enclosing checksums, digests, and authenticators.
+7. **Complete:** session-token version selection is contained inside `auth`, with semantic APIs
+   and a boundary check rejecting external or public version-specific format surfaces.
 8. Remove the trigger-verification item from Phase 11 stabilisation tracking and keep this
     plan as the upgrade home for it; defer trigger body hashing/recreation until the upgrade
     framework is deliberately started.
