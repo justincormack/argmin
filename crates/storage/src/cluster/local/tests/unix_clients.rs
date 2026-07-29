@@ -507,7 +507,9 @@ fn unix_object_payload_reclaim_fence_rejects_crossed_claim_authority() {
         .try_begin_object_payload_reclaim(epoch, &bucket, &key, generation_id, &first)
         .unwrap());
     let error = client
-        .finish_object_payload_reclaim(epoch, &bucket, &key, generation_id, &second, false)
+        .open_retained_object_payload_reclaim_route(epoch, &bucket, &key, generation_id, &second)
+        .unwrap()
+        .finish_object_payload_reclaim(false)
         .unwrap_err();
     assert!(matches!(
         error,
@@ -528,13 +530,17 @@ fn unix_object_payload_reclaim_fence_rejects_crossed_claim_authority() {
         .is_none());
 
     client
-        .finish_object_payload_reclaim(epoch, &bucket, &key, generation_id, &first, true)
+        .open_retained_object_payload_reclaim_route(epoch, &bucket, &key, generation_id, &first)
+        .unwrap()
+        .finish_object_payload_reclaim(true)
         .unwrap();
     assert!(client
         .try_begin_object_payload_reclaim(epoch, &bucket, &key, generation_id, &second)
         .unwrap());
     let error = client
-        .clear_object_payload_reclaim_fence(epoch, &bucket, &key, generation_id, &first)
+        .open_retained_object_payload_reclaim_route(epoch, &bucket, &key, generation_id, &first)
+        .unwrap()
+        .clear_object_payload_reclaim_fence()
         .unwrap_err();
     assert!(matches!(
         error,
@@ -544,7 +550,9 @@ fn unix_object_payload_reclaim_fence_rejects_crossed_claim_authority() {
         }
     ));
     client
-        .finish_object_payload_reclaim(epoch, &bucket, &key, generation_id, &second, false)
+        .open_retained_object_payload_reclaim_route(epoch, &bucket, &key, generation_id, &second)
+        .unwrap()
+        .finish_object_payload_reclaim(false)
         .unwrap();
     let mut lease = client
         .acquire_object_payload_lease(

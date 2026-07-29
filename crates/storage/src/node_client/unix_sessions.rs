@@ -41,6 +41,14 @@ struct UnixObjectPayloadLease {
     released: bool,
 }
 
+struct UnixRetainedObjectPayloadReclaimRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    bucket: BucketName,
+    key: ObjectKey,
+    generation_id: GenerationId,
+    authority: ObjectPayloadReclaimClaimProof,
+}
+
 impl UnixStorageNodeClient {
     fn connect_session_stream(
         &self,
@@ -1701,21 +1709,37 @@ impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
 }
 
 impl RetainedObjectPayloadReclaimNodeClient for UnixStorageNodeClient {
-    fn finish_object_payload_reclaim(
+    fn open_retained_object_payload_reclaim_route(
         &self,
         route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
         authority: &ObjectPayloadReclaimClaimProof,
-        keep_fence: bool,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Box<dyn RetainedObjectPayloadReclaimRoute + '_>, StoreError> {
         if route_cluster_epoch != self.cluster_epoch {
             return Err(StoreError::RouteAdmissionClusterMismatch {
                 admitted_epoch: route_cluster_epoch,
                 operation_epoch: self.cluster_epoch,
             });
         }
+        if authority.cluster_epoch != route_cluster_epoch {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open retained object payload reclaim route",
+            });
+        }
+        Ok(Box::new(UnixRetainedObjectPayloadReclaimRoute {
+            client: self,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            authority: authority.clone(),
+        }))
+    }
+}
+
+impl RetainedObjectPayloadReclaimRoute for UnixRetainedObjectPayloadReclaimRoute<'_> {
+    fn finish_object_payload_reclaim(&self, keep_fence: bool) -> Result<(), StoreError> {
         let operation = if keep_fence {
             StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinishKeepFence
         } else {
@@ -1724,12 +1748,13 @@ impl RetainedObjectPayloadReclaimNodeClient for UnixStorageNodeClient {
         let mut last_error = None;
         for _ in 0..2 {
             let result = self
+                .client
                 .object_payload_lease_control_request(
-                    bucket,
-                    key,
-                    generation_id,
+                    &self.bucket,
+                    &self.key,
+                    self.generation_id,
                     operation,
-                    Some(authority),
+                    Some(&self.authority),
                 )
                 .map(|_| ());
             match result {
@@ -1740,29 +1765,17 @@ impl RetainedObjectPayloadReclaimNodeClient for UnixStorageNodeClient {
         Err(last_error.expect("object-payload reclaim finish attempted at least once"))
     }
 
-    fn clear_object_payload_reclaim_fence(
-        &self,
-        route_cluster_epoch: ClusterEpoch,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        authority: &ObjectPayloadReclaimClaimProof,
-    ) -> Result<(), StoreError> {
-        if route_cluster_epoch != self.cluster_epoch {
-            return Err(StoreError::RouteAdmissionClusterMismatch {
-                admitted_epoch: route_cluster_epoch,
-                operation_epoch: self.cluster_epoch,
-            });
-        }
+    fn clear_object_payload_reclaim_fence(&self) -> Result<(), StoreError> {
         let mut last_error = None;
         for _ in 0..2 {
             let result = self
+                .client
                 .object_payload_lease_control_request(
-                    bucket,
-                    key,
-                    generation_id,
+                    &self.bucket,
+                    &self.key,
+                    self.generation_id,
                     StorageRpcObjectPayloadLeaseControlOperation::ReclaimFenceClear,
-                    Some(authority),
+                    Some(&self.authority),
                 )
                 .map(|_| ());
             match result {

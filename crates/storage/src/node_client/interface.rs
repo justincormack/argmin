@@ -1144,24 +1144,20 @@ pub(crate) trait ObjectPayloadLeaseNodeClient: Send + Sync {
 /// Reclaim completion and fence release can outlive the active route which
 /// admitted the reclaim attempt.
 pub(crate) trait RetainedObjectPayloadReclaimNodeClient: Send + Sync {
-    fn finish_object_payload_reclaim(
+    fn open_retained_object_payload_reclaim_route(
         &self,
         route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
         authority: &ObjectPayloadReclaimClaimProof,
-        keep_fence: bool,
-    ) -> Result<(), StoreError>;
+    ) -> Result<Box<dyn RetainedObjectPayloadReclaimRoute + '_>, StoreError>;
+}
 
-    fn clear_object_payload_reclaim_fence(
-        &self,
-        route_cluster_epoch: ClusterEpoch,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        authority: &ObjectPayloadReclaimClaimProof,
-    ) -> Result<(), StoreError>;
+pub(crate) trait RetainedObjectPayloadReclaimRoute: Send {
+    fn finish_object_payload_reclaim(&self, keep_fence: bool) -> Result<(), StoreError>;
+
+    fn clear_object_payload_reclaim_fence(&self) -> Result<(), StoreError>;
 }
 
 pub(crate) trait ShardAckNodeClient: Send + Sync {

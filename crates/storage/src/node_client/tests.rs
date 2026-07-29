@@ -167,6 +167,97 @@ fn test_object_payload_reclaim_claim(
     }
 }
 
+fn test_object_payload_reclaim_proof(
+    cluster_epoch: ClusterEpoch,
+) -> ObjectPayloadReclaimClaimProof {
+    ObjectPayloadReclaimClaimProof {
+        bucket_incarnation_generation: 3,
+        reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+        claim_id: "retained-payload-route-claim".to_string(),
+        owner_token: "retained-payload-route-owner".to_string(),
+        cluster_epoch,
+    }
+}
+
+#[test]
+fn local_retained_object_payload_reclaim_route_is_bound_to_exact_subject() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let bucket = crate::tests::bucket_name("retained-payload-route-bucket");
+    let bound_key = crate::tests::object_key("retained-payload-route-bound-key");
+    let foreign_key = crate::tests::object_key("retained-payload-route-foreign-key");
+    let generation_id = GenerationId::new(4).unwrap();
+    let authority = test_object_payload_reclaim_proof(ClusterEpoch::INITIAL);
+
+    assert!(storage_node.try_begin_object_payload_reclaim(
+        &bucket,
+        &bound_key,
+        generation_id,
+        &authority,
+    ));
+    assert!(storage_node.try_begin_object_payload_reclaim(
+        &bucket,
+        &foreign_key,
+        generation_id,
+        &authority,
+    ));
+
+    let route = client
+        .open_retained_object_payload_reclaim_route(
+            ClusterEpoch::INITIAL,
+            &bucket,
+            &bound_key,
+            generation_id,
+            &authority,
+        )
+        .unwrap();
+    route.finish_object_payload_reclaim(true).unwrap();
+    assert!(!storage_node.test_object_payload_reclaim_is_active(
+        &bucket,
+        &bound_key,
+        generation_id,
+    ));
+    assert!(storage_node.test_object_payload_reclaim_is_active(
+        &bucket,
+        &foreign_key,
+        generation_id,
+    ));
+    assert!(!storage_node.try_acquire_object_payload_lease(&bucket, &bound_key, generation_id,));
+    route.clear_object_payload_reclaim_fence().unwrap();
+    assert!(storage_node.try_acquire_object_payload_lease(&bucket, &bound_key, generation_id,));
+    assert!(!storage_node.try_acquire_object_payload_lease(&bucket, &foreign_key, generation_id,));
+    assert_eq!(
+        storage_node.release_object_payload_lease(&bucket, &bound_key, generation_id),
+        0
+    );
+
+    let mut wrong_epoch = authority;
+    wrong_epoch.cluster_epoch = ClusterEpoch::new(2).unwrap();
+    assert!(matches!(
+        client
+            .open_retained_object_payload_reclaim_route(
+                ClusterEpoch::INITIAL,
+                &bucket,
+                &bound_key,
+                generation_id,
+                &wrong_epoch,
+            )
+            .err()
+            .expect("foreign reclaim authority epoch must be rejected"),
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open retained object payload reclaim route",
+        }
+    ));
+}
+
 #[test]
 fn local_retained_object_mutation_route_rejects_foreign_claim_before_storage() {
     let tmp = test_util::tempdir();

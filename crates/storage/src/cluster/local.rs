@@ -38,9 +38,10 @@ use crate::node_client::{
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
     RetainedBucketWriteReservationNodeClient, RetainedMetadataCommandNodeClient,
     RetainedObjectMutationMetadataNodeClient, RetainedObjectPayloadReclaimNodeClient,
-    RetainedPlacedShardNodeClient, RetainedShardAckNodeClient, ShardAckNodeClient,
-    ShardReadHandleNodeClient, ShardScavengerNodeClient, ShardScavengerObservationNodeClient,
-    UnixStorageNodeClient, UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
+    RetainedObjectPayloadReclaimRoute, RetainedPlacedShardNodeClient, RetainedShardAckNodeClient,
+    ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient,
+    ShardScavengerObservationNodeClient, UnixStorageNodeClient,
+    UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
     UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
@@ -3481,7 +3482,8 @@ impl LocalClusterMap {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<Vec<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError> {
-        let mut acquired = Vec::with_capacity(self.nodes.len());
+        let mut acquired: Vec<Box<dyn ObjectPayloadLeaseNodeLease>> =
+            Vec::with_capacity(self.nodes.len());
         for node in self.nodes.values() {
             match node
                 .object_payload_lease_client()
@@ -3569,10 +3571,27 @@ impl LocalClusterMap {
         generation_id: GenerationId,
         authority: &ObjectPayloadReclaimClaimProof,
     ) -> Result<bool, StoreError> {
-        let mut acquired = Vec::with_capacity(self.nodes.len());
+        let mut acquired: Vec<Box<dyn RetainedObjectPayloadReclaimRoute + '_>> =
+            Vec::with_capacity(self.nodes.len());
         for node in self.nodes.values() {
             let active_client = node.object_payload_lease_client();
-            let retained_client = Arc::clone(node.retained_object_payload_reclaim_client());
+            let retained_route = match node
+                .retained_object_payload_reclaim_client()
+                .open_retained_object_payload_reclaim_route(
+                    self.epoch,
+                    bucket,
+                    key,
+                    generation_id,
+                    authority,
+                ) {
+                Ok(route) => route,
+                Err(error) => {
+                    for route in acquired {
+                        let _ = route.finish_object_payload_reclaim(false);
+                    }
+                    return Err(error);
+                }
+            };
             match active_client.try_begin_object_payload_reclaim(
                 self.epoch,
                 bucket,
@@ -3581,41 +3600,20 @@ impl LocalClusterMap {
                 authority,
             ) {
                 Ok(true) => {
-                    acquired.push(retained_client);
+                    acquired.push(retained_route);
                     continue;
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    let _ = retained_client.finish_object_payload_reclaim(
-                        self.epoch,
-                        bucket,
-                        key,
-                        generation_id,
-                        authority,
-                        false,
-                    );
-                    for client in acquired {
-                        let _ = client.finish_object_payload_reclaim(
-                            self.epoch,
-                            bucket,
-                            key,
-                            generation_id,
-                            authority,
-                            false,
-                        );
+                    let _ = retained_route.finish_object_payload_reclaim(false);
+                    for route in acquired {
+                        let _ = route.finish_object_payload_reclaim(false);
                     }
                     return Err(error);
                 }
             }
-            for client in acquired {
-                let _ = client.finish_object_payload_reclaim(
-                    self.epoch,
-                    bucket,
-                    key,
-                    generation_id,
-                    authority,
-                    false,
-                );
+            for route in acquired {
+                let _ = route.finish_object_payload_reclaim(false);
             }
             return Ok(false);
         }
@@ -3632,17 +3630,17 @@ impl LocalClusterMap {
     ) -> Result<(), StoreError> {
         let mut first_error = None;
         for node in self.nodes.values() {
-            if let Err(error) = node
+            let result = node
                 .retained_object_payload_reclaim_client()
-                .finish_object_payload_reclaim(
+                .open_retained_object_payload_reclaim_route(
                     self.epoch,
                     bucket,
                     key,
                     generation_id,
                     authority,
-                    keep_fence,
                 )
-            {
+                .and_then(|route| route.finish_object_payload_reclaim(keep_fence));
+            if let Err(error) = result {
                 first_error.get_or_insert(error);
             }
         }
@@ -3671,16 +3669,17 @@ impl LocalClusterMap {
     ) -> Result<(), StoreError> {
         let mut first_error = None;
         for node in self.nodes.values() {
-            if let Err(error) = node
+            let result = node
                 .retained_object_payload_reclaim_client()
-                .clear_object_payload_reclaim_fence(
+                .open_retained_object_payload_reclaim_route(
                     self.epoch,
                     bucket,
                     key,
                     generation_id,
                     authority,
                 )
-            {
+                .and_then(|route| route.clear_object_payload_reclaim_fence());
+            if let Err(error) = result {
                 first_error.get_or_insert(error);
             }
         }

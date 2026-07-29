@@ -3999,6 +3999,32 @@ Ninety-seventh Phase 3 slice:
   checker, workspace-wide strict Clippy, and the full 7,741-test workspace
   suite also pass.
 
+Ninety-eighth Phase 3 slice:
+
+- retained object-payload reclaim completion now opens a scoped
+  `RetainedObjectPayloadReclaimRoute` bound to the historical cluster epoch,
+  exact bucket/key/generation root, and reclaim-claim proof selected when the
+  reclaim fence is acquired. Finish and fence-clear operations no longer
+  accept replacement route or authority arguments after that route is opened.
+- embedded and Unix factories reject reclaim authority from a different epoch
+  before storage or transport access; the Unix factory also rejects a route
+  epoch that differs from its retained client. Cluster rollback, terminal
+  completion, and fence clearing retain the same opened route throughout each
+  cleanup attempt. Storage-node RPC dispatch keeps its independent retained-
+  route, node, epoch, operation, and authority validation.
+- an embedded regression creates matching fences for two object roots under
+  one authority, then proves the scoped route can finish and clear only its
+  bound root while the foreign root remains fenced. A no-listener Unix
+  regression proves foreign route and authority epochs fail before RPC, while
+  the existing crossed-authority Unix regression covers successful requests
+  and server-side proof rejection through the new route. Replacing the
+  remaining stateful method families with scoped or opaque operation
+  capabilities remains open in Phase 3.
+- all 2,429 storage tests pass as part of the full workspace run, including the
+  three focused retained-reclaim route regressions. Formatting, the storage
+  boundary checker, workspace-wide strict Clippy, and the full 7,755-test
+  workspace suite also pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

@@ -10,6 +10,14 @@ struct LocalObjectPayloadLease {
     released: bool,
 }
 
+struct LocalRetainedObjectPayloadReclaimRoute {
+    storage_node: Arc<SharedStorageNode>,
+    bucket: BucketName,
+    key: ObjectKey,
+    generation_id: GenerationId,
+    authority: ObjectPayloadReclaimClaimProof,
+}
+
 impl ObjectPayloadLeaseNodeLease for LocalObjectPayloadLease {
     fn release(&mut self) -> Result<usize, StoreError> {
         if self.released {
@@ -336,31 +344,51 @@ impl ObjectPayloadLeaseNodeClient for LocalStorageNodeClient {
 }
 
 impl RetainedObjectPayloadReclaimNodeClient for LocalStorageNodeClient {
-    fn finish_object_payload_reclaim(
+    fn open_retained_object_payload_reclaim_route(
         &self,
-        _route_cluster_epoch: ClusterEpoch,
+        route_cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
         authority: &ObjectPayloadReclaimClaimProof,
-        keep_fence: bool,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Box<dyn RetainedObjectPayloadReclaimRoute + '_>, StoreError> {
+        if authority.cluster_epoch != route_cluster_epoch {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open retained object payload reclaim route",
+            });
+        }
+        Ok(Box::new(LocalRetainedObjectPayloadReclaimRoute {
+            storage_node: Arc::clone(&self.storage_node),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            authority: authority.clone(),
+        }))
+    }
+}
+
+impl RetainedObjectPayloadReclaimRoute for LocalRetainedObjectPayloadReclaimRoute {
+    fn finish_object_payload_reclaim(&self, keep_fence: bool) -> Result<(), StoreError> {
         self.storage_node
-            .finish_object_payload_reclaim(bucket, key, generation_id, authority, keep_fence)
+            .finish_object_payload_reclaim(
+                &self.bucket,
+                &self.key,
+                self.generation_id,
+                &self.authority,
+                keep_fence,
+            )
             .then_some(())
             .ok_or(StoreError::ObjectPayloadReclaimFenceAuthorityMismatch)
     }
 
-    fn clear_object_payload_reclaim_fence(
-        &self,
-        _route_cluster_epoch: ClusterEpoch,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        authority: &ObjectPayloadReclaimClaimProof,
-    ) -> Result<(), StoreError> {
+    fn clear_object_payload_reclaim_fence(&self) -> Result<(), StoreError> {
         self.storage_node
-            .clear_object_payload_reclaim_fence(bucket, key, generation_id, authority)
+            .clear_object_payload_reclaim_fence(
+                &self.bucket,
+                &self.key,
+                self.generation_id,
+                &self.authority,
+            )
             .then_some(())
             .ok_or(StoreError::ObjectPayloadReclaimFenceAuthorityMismatch)
     }
