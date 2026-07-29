@@ -11,21 +11,26 @@ use crate::storage_rpc::{
     encode_metadata_command_acceptance_response, encode_metadata_command_applied_hashes_response,
     encode_metadata_command_bool_outcome_response, encode_metadata_command_next_id_response,
     encode_metadata_command_pending_slot_insert_response,
-    encode_metadata_command_state_outcome_response, encode_read_handle_acquire_response,
-    encode_scavenger_observations_response, encode_storage_rpc_success_response,
-    read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+    encode_metadata_command_state_outcome_response,
+    encode_placed_segment_shard_backfill_claim_optional_record_response,
+    encode_placed_segment_shard_repair_claim_optional_record_response,
+    encode_read_handle_acquire_response, encode_scavenger_observations_response,
+    encode_storage_rpc_success_response, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
     StorageRpcMetadataCommandAcceptanceResponse, StorageRpcMetadataCommandAppliedHashesResponse,
     StorageRpcMetadataCommandBoolOutcomeResponse, StorageRpcMetadataCommandNextIdResponse,
     StorageRpcMetadataCommandPendingSlotInsertResponse,
-    StorageRpcMetadataCommandStateOutcomeResponse, StorageRpcReadHandleAcquireResponse,
-    StorageRpcStreamError, STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT,
+    StorageRpcMetadataCommandStateOutcomeResponse,
+    StorageRpcPlacedSegmentShardBackfillClaimOptionalRecordResponse,
+    StorageRpcPlacedSegmentShardRepairClaimOptionalRecordResponse,
+    StorageRpcReadHandleAcquireResponse, StorageRpcStreamError,
+    STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT,
 };
 use crate::types::{
     DeleteMarkerRecord, EtagKind, ObjectEncryption, ObjectLockState, SerializedMetadataBlob,
     SerializedSystemMetadataBlob, SerializedTagSet, StorageClass, StreamUploadPartSnapshot,
 };
 use crate::ShardScavengerObservationReason;
-use crate::{RouteMapValidity, ShardIndex};
+use crate::{RouteMapValidity, SegmentStoredBytesRequest, ShardIndex};
 
 fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
     StorageNodeProcessConfig {
@@ -337,11 +342,11 @@ fn local_retained_shard_ack_route_is_bound_to_exact_pg_and_key() {
         crc64: 42,
         stored_size: 52,
     };
-    client
-        .register_written_shard_acks(
-            data_pg_id,
-            &[(&bound_key, bound_ack), (&foreign_key, foreign_ack)],
-        )
+    let active_route = client
+        .open_shard_ack_route(ClusterEpoch::INITIAL, data_pg_id)
+        .unwrap();
+    active_route
+        .register_shard_acks(&[(&bound_key, bound_ack), (&foreign_key, foreign_ack)])
         .unwrap();
 
     let route = client
@@ -355,13 +360,11 @@ fn local_retained_shard_ack_route_is_bound_to_exact_pg_and_key() {
     );
     route.delete_retained_shard_ack().unwrap();
     assert!(matches!(
-        client.load_written_shard_ack(data_pg_id, &bound_key),
+        active_route.load_shard_ack(&bound_key),
         Err(StoreError::NotFound)
     ));
     assert_eq!(
-        client
-            .load_written_shard_ack(data_pg_id, &foreign_key)
-            .unwrap(),
+        active_route.load_shard_ack(&foreign_key).unwrap(),
         foreign_ack
     );
 
@@ -392,6 +395,139 @@ fn unix_retained_shard_ack_route_rejects_future_epoch_before_rpc() {
             operation_epoch,
             current_epoch,
         } if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
+}
+
+fn test_shard_repair_work_item(data_pg_id: u32, seed: u8) -> PlacedSegmentShardRepairWorkItem {
+    PlacedSegmentShardRepairWorkItem {
+        request: SegmentStoredBytesRequest {
+            data_pg_id,
+            segment_okh: [seed; 16],
+            segment_vid: GenerationId::new(u64::from(seed) + 1).unwrap(),
+            stored_size: 1024,
+            segment_crc64: u64::from(seed),
+            ec: EcShape { k: 4, m: 2 },
+        },
+        shard_index: ShardIndex::new(seed % 6),
+    }
+}
+
+fn test_shard_backfill_work_item(data_pg_id: u32, seed: u8) -> PlacedSegmentShardBackfillWorkItem {
+    PlacedSegmentShardBackfillWorkItem {
+        request: test_shard_repair_work_item(data_pg_id, seed).request,
+        source_cluster_epoch: ClusterEpoch::INITIAL,
+        desired_cluster_epoch: ClusterEpoch::new(2).unwrap(),
+    }
+}
+
+#[test]
+fn local_shard_ack_route_is_bound_to_active_epoch_and_data_pg() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), storage_node);
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
+    let route = client
+        .open_shard_ack_route(ClusterEpoch::INITIAL, data_pg_id)
+        .unwrap();
+    let repair = test_shard_repair_work_item(0, 11);
+    let backfill = test_shard_backfill_work_item(0, 12);
+    route
+        .record_placed_segment_shard_repair(&repair, None)
+        .unwrap();
+    route
+        .record_placed_segment_shard_backfill(&backfill, backfill.request.ec.m, None)
+        .unwrap();
+    assert_eq!(route.list_placed_segment_shard_repairs().unwrap().len(), 1);
+    assert_eq!(
+        route.list_placed_segment_shard_backfills().unwrap().len(),
+        1
+    );
+
+    let foreign_repair = test_shard_repair_work_item(1, 13);
+    let foreign_backfill = test_shard_backfill_work_item(1, 14);
+    assert!(matches!(
+        route.record_placed_segment_shard_repair(&foreign_repair, None),
+        Err(StoreError::PayloadShardSetMismatch { .. })
+    ));
+    assert!(matches!(
+        route.record_placed_segment_shard_backfill(
+            &foreign_backfill,
+            foreign_backfill.request.ec.m,
+            None,
+        ),
+        Err(StoreError::PayloadShardSetMismatch { .. })
+    ));
+    assert_eq!(route.list_placed_segment_shard_repairs().unwrap().len(), 1);
+    assert_eq!(
+        route.list_placed_segment_shard_backfills().unwrap().len(),
+        1
+    );
+
+    let future = ClusterEpoch::new(2).unwrap();
+    let acquire = PlacedSegmentShardRepairClaimAcquire {
+        claim_id: "foreign-epoch".to_string(),
+        owner_token: "owner".to_string(),
+        cluster_epoch: future,
+        claimed_at: 10,
+        lease_deadline: 20,
+        now: 10,
+    };
+    assert!(matches!(
+        route.acquire_placed_segment_shard_repair_claim(&acquire),
+        Err(StoreError::StalePayloadOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        }) if operation_epoch == future && current_epoch == ClusterEpoch::INITIAL
+    ));
+    assert!(matches!(
+        client
+            .open_shard_ack_route(ClusterEpoch::INITIAL, DataPgId::new_for_test(PgId::new(1)),)
+            .err()
+            .expect("unavailable active shard-ack PG must fail before storage"),
+        StoreError::PgNotFound { pg_id: 1 }
+    ));
+}
+
+#[test]
+fn unix_shard_ack_route_rejects_foreign_epoch_and_work_before_rpc() {
+    let client = test_unix_storage_node_client();
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
+    let future_epoch = ClusterEpoch::new(client.cluster_epoch.get().saturating_add(1)).unwrap();
+    assert!(matches!(
+        client
+            .open_shard_ack_route(future_epoch, data_pg_id)
+            .err()
+            .expect("future active shard-ack route must fail before RPC"),
+        StoreError::StalePayloadOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        } if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
+
+    let route = client
+        .open_shard_ack_route(client.cluster_epoch, data_pg_id)
+        .unwrap();
+    assert!(matches!(
+        route.record_placed_segment_shard_repair(&test_shard_repair_work_item(1, 21), None),
+        Err(StoreError::PayloadShardSetMismatch { .. })
+    ));
+    let foreign_backfill = test_shard_backfill_work_item(1, 22);
+    assert!(matches!(
+        route.record_placed_segment_shard_backfill(
+            &foreign_backfill,
+            foreign_backfill.request.ec.m,
+            None,
+        ),
+        Err(StoreError::PayloadShardSetMismatch { .. })
     ));
 }
 

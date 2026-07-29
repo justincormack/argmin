@@ -1356,6 +1356,233 @@ fn unix_shard_scavenger_observation_route_rejects_foreign_list_response() {
 }
 
 #[test]
+fn unix_shard_ack_route_rejects_foreign_repair_and_backfill_list_responses() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&config.socket_path).unwrap();
+    let repair = PlacedSegmentShardRepairRecord {
+        work_item: test_shard_repair_work_item(1, 31),
+        first_seen_at: 10,
+        last_seen_at: 11,
+        observation_count: 1,
+        last_error: None,
+    };
+    let backfill = PlacedSegmentShardBackfillRecord {
+        work_item: test_shard_backfill_work_item(1, 32),
+        remaining_tolerance: 2,
+        first_seen_at: 12,
+        last_seen_at: 13,
+        observation_count: 1,
+        last_error: None,
+    };
+    let repair_payload =
+        crate::storage_rpc::encode_placed_segment_shard_repairs_response(&[repair]).unwrap();
+    let backfill_payload =
+        crate::storage_rpc::encode_placed_segment_shard_backfills_response(&[backfill]).unwrap();
+    let server_thread = thread::spawn(move || {
+        for expected_kind in [
+            StorageRpcMessageKind::PlacedSegmentShardRepairs,
+            StorageRpcMessageKind::PlacedSegmentShardBackfills,
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+            assert_eq!(request.kind, expected_kind);
+            let payload = match expected_kind {
+                StorageRpcMessageKind::PlacedSegmentShardRepairs => repair_payload.clone(),
+                StorageRpcMessageKind::PlacedSegmentShardBackfills => backfill_payload.clone(),
+                _ => unreachable!(),
+            };
+            write_storage_rpc_frame_to(
+                &mut stream,
+                &StorageRpcFrame {
+                    request_id: request.request_id,
+                    kind: request.kind,
+                    payload: encode_storage_rpc_success_response(&payload),
+                },
+            )
+            .unwrap();
+        }
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let route = client
+        .open_shard_ack_route(config.cluster_epoch, DataPgId::new_for_test(PgId::new(0)))
+        .unwrap();
+
+    for (error, operation) in [
+        (
+            route.list_placed_segment_shard_repairs().unwrap_err(),
+            "validate placed segment shard repairs response",
+        ),
+        (
+            route.list_placed_segment_shard_backfills().unwrap_err(),
+            "validate placed segment shard backfills response",
+        ),
+    ] {
+        assert!(matches!(
+            error,
+            StoreError::StorageRpc {
+                operation: observed_operation,
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            } if observed_operation == operation
+        ));
+    }
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn unix_shard_ack_route_binds_acquired_claim_responses_to_requests() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&config.socket_path).unwrap();
+    let repair_acquire = PlacedSegmentShardRepairClaimAcquire {
+        claim_id: "repair-claim".to_string(),
+        owner_token: "repair-owner".to_string(),
+        cluster_epoch: config.cluster_epoch,
+        claimed_at: 30,
+        lease_deadline: 40,
+        now: 30,
+    };
+    let repair_claim = PlacedSegmentShardRepairClaimRecord {
+        work_item: test_shard_repair_work_item(0, 41),
+        claim_id: repair_acquire.claim_id.clone(),
+        owner_token: repair_acquire.owner_token.clone(),
+        cluster_epoch: repair_acquire.cluster_epoch,
+        claimed_at: repair_acquire.claimed_at,
+        lease_deadline: Some(repair_acquire.lease_deadline),
+        attempt_count: 1,
+        last_error: None,
+    };
+    let backfill_acquire = PlacedSegmentShardBackfillClaimAcquire {
+        claim_id: "backfill-claim".to_string(),
+        owner_token: "backfill-owner".to_string(),
+        cluster_epoch: config.cluster_epoch,
+        claimed_at: 50,
+        lease_deadline: 60,
+        now: 50,
+    };
+    let backfill_claim = PlacedSegmentShardBackfillClaimRecord {
+        work_item: test_shard_backfill_work_item(0, 42),
+        remaining_tolerance: 2,
+        claim_id: backfill_acquire.claim_id.clone(),
+        owner_token: backfill_acquire.owner_token.clone(),
+        cluster_epoch: backfill_acquire.cluster_epoch,
+        claimed_at: backfill_acquire.claimed_at,
+        lease_deadline: Some(backfill_acquire.lease_deadline),
+        attempt_count: 1,
+        last_error: None,
+    };
+
+    let mut repair_claims = Vec::new();
+    let mut mismatched = repair_claim.clone();
+    mismatched.claim_id = "other-repair-claim".to_string();
+    repair_claims.push(mismatched);
+    let mut mismatched = repair_claim.clone();
+    mismatched.owner_token = "other-repair-owner".to_string();
+    repair_claims.push(mismatched);
+    let mut mismatched = repair_claim.clone();
+    mismatched.claimed_at += 1;
+    repair_claims.push(mismatched);
+    let mut mismatched = repair_claim;
+    mismatched.lease_deadline = Some(repair_acquire.lease_deadline + 1);
+    repair_claims.push(mismatched);
+
+    let mut backfill_claims = Vec::new();
+    let mut mismatched = backfill_claim.clone();
+    mismatched.claim_id = "other-backfill-claim".to_string();
+    backfill_claims.push(mismatched);
+    let mut mismatched = backfill_claim.clone();
+    mismatched.owner_token = "other-backfill-owner".to_string();
+    backfill_claims.push(mismatched);
+    let mut mismatched = backfill_claim.clone();
+    mismatched.claimed_at += 1;
+    backfill_claims.push(mismatched);
+    let mut mismatched = backfill_claim;
+    mismatched.lease_deadline = Some(backfill_acquire.lease_deadline + 1);
+    backfill_claims.push(mismatched);
+
+    let mut responses = Vec::new();
+    for claim in repair_claims {
+        responses.push((
+            StorageRpcMessageKind::PlacedSegmentShardRepairClaimAcquire,
+            encode_placed_segment_shard_repair_claim_optional_record_response(
+                &StorageRpcPlacedSegmentShardRepairClaimOptionalRecordResponse {
+                    record: Some(claim),
+                },
+            )
+            .unwrap(),
+        ));
+    }
+    for claim in backfill_claims {
+        responses.push((
+            StorageRpcMessageKind::PlacedSegmentShardBackfillClaimAcquire,
+            encode_placed_segment_shard_backfill_claim_optional_record_response(
+                &StorageRpcPlacedSegmentShardBackfillClaimOptionalRecordResponse {
+                    record: Some(claim),
+                },
+            )
+            .unwrap(),
+        ));
+    }
+    let server_thread = thread::spawn(move || {
+        for (expected_kind, payload) in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+            assert_eq!(request.kind, expected_kind);
+            write_storage_rpc_frame_to(
+                &mut stream,
+                &StorageRpcFrame {
+                    request_id: request.request_id,
+                    kind: request.kind,
+                    payload: encode_storage_rpc_success_response(&payload),
+                },
+            )
+            .unwrap();
+        }
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let route = client
+        .open_shard_ack_route(config.cluster_epoch, DataPgId::new_for_test(PgId::new(0)))
+        .unwrap();
+
+    for _ in 0..4 {
+        assert!(matches!(
+            route
+                .acquire_placed_segment_shard_repair_claim(&repair_acquire)
+                .unwrap_err(),
+            StoreError::StorageRpc {
+                operation: "validate placed segment shard repair claim response",
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            }
+        ));
+    }
+    for _ in 0..4 {
+        assert!(matches!(
+            route
+                .acquire_placed_segment_shard_backfill_claim(&backfill_acquire)
+                .unwrap_err(),
+            StoreError::StorageRpc {
+                operation: "validate placed segment shard backfill claim response",
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            }
+        ));
+    }
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn unix_storage_node_client_inserts_bucket_control_pending_slot_idempotently() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);

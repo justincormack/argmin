@@ -1,7 +1,7 @@
 use super::*;
 use crate::node_client::{
     ObjectPayloadLeaseKind, ObjectPayloadLeaseRoute, RetainedPlacedShardRoute,
-    RetainedShardAckRoute,
+    RetainedShardAckRoute, ShardAckRoute,
 };
 use crate::storage_rpc::StorageRpcErrorCode;
 use crate::{
@@ -1083,6 +1083,11 @@ struct RecordingShardAckClient {
 
 struct RecordingRetainedShardAckRoute;
 
+struct RecordingShardAckRoute<'a> {
+    client: &'a RecordingShardAckClient,
+    data_pg_id: DataPgId,
+}
+
 impl RecordingShardAckClient {
     fn new() -> Self {
         Self {
@@ -1093,50 +1098,50 @@ impl RecordingShardAckClient {
 }
 
 impl ShardAckNodeClient for RecordingShardAckClient {
-    fn register_written_shard_acks(
+    fn open_shard_ack_route(
         &self,
+        _route_cluster_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
-        shard_batch: &[(&ShardKey, WriteAck)],
-    ) -> Result<(), StoreError> {
-        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+    ) -> Result<Box<dyn ShardAckRoute + '_>, StoreError> {
+        Ok(Box::new(RecordingShardAckRoute {
+            client: self,
+            data_pg_id,
+        }))
+    }
+}
+
+impl ShardAckRoute for RecordingShardAckRoute<'_> {
+    fn register_shard_acks(&self, shard_batch: &[(&ShardKey, WriteAck)]) -> Result<(), StoreError> {
+        let mut records = self
+            .client
+            .records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for (key, ack) in shard_batch {
-            records.push((data_pg_id, (*key).clone(), *ack));
+            records.push((self.data_pg_id, (*key).clone(), *ack));
         }
         Ok(())
     }
 
-    fn validate_written_shard_ack(
-        &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-        ack: WriteAck,
-    ) -> Result<(), StoreError> {
-        self.validates
+    fn validate_shard_ack(&self, key: &ShardKey, ack: WriteAck) -> Result<(), StoreError> {
+        self.client
+            .validates
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((data_pg_id, key.clone(), ack));
+            .push((self.data_pg_id, key.clone(), ack));
         Ok(())
     }
 
-    fn load_written_shard_ack(
-        &self,
-        _data_pg_id: DataPgId,
-        _key: &ShardKey,
-    ) -> Result<WriteAck, StoreError> {
+    fn load_shard_ack(&self, _key: &ShardKey) -> Result<WriteAck, StoreError> {
         Err(StoreError::NotFound)
     }
 
-    fn delete_written_shard_ack(
-        &self,
-        _data_pg_id: DataPgId,
-        _key: &ShardKey,
-    ) -> Result<(), StoreError> {
+    fn delete_shard_ack(&self, _key: &ShardKey) -> Result<(), StoreError> {
         Err(StoreError::NotFound)
     }
 
     fn record_placed_segment_shard_repair(
         &self,
-        _data_pg_id: DataPgId,
         _work_item: &PlacedSegmentShardRepairWorkItem,
         _last_error: Option<&str>,
     ) -> Result<(), StoreError> {
@@ -1145,14 +1150,12 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn list_placed_segment_shard_repairs(
         &self,
-        _data_pg_id: DataPgId,
     ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
         Ok(Vec::new())
     }
 
     fn acquire_placed_segment_shard_repair_claim(
         &self,
-        _data_pg_id: DataPgId,
         _request: &PlacedSegmentShardRepairClaimAcquire,
     ) -> Result<Option<PlacedSegmentShardRepairClaimRecord>, StoreError> {
         Ok(None)
@@ -1160,8 +1163,6 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn complete_placed_segment_shard_repair_claim(
         &self,
-        _data_pg_id: DataPgId,
-        _cluster_epoch: ClusterEpoch,
         _claim: &PlacedSegmentShardRepairClaimRecord,
     ) -> Result<bool, StoreError> {
         Ok(false)
@@ -1169,8 +1170,6 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn record_placed_segment_shard_repair_claim_error(
         &self,
-        _data_pg_id: DataPgId,
-        _cluster_epoch: ClusterEpoch,
         _claim: &PlacedSegmentShardRepairClaimRecord,
         _last_error: &str,
         _next_attempt_after: u64,
@@ -1180,7 +1179,6 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn resolve_placed_segment_shard_repair(
         &self,
-        _data_pg_id: DataPgId,
         _work_item: &PlacedSegmentShardRepairWorkItem,
     ) -> Result<(), StoreError> {
         Ok(())
@@ -1188,7 +1186,6 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn record_placed_segment_shard_backfill(
         &self,
-        _data_pg_id: DataPgId,
         _work_item: &PlacedSegmentShardBackfillWorkItem,
         _remaining_tolerance: u8,
         _last_error: Option<&str>,
@@ -1198,21 +1195,16 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn list_placed_segment_shard_backfills(
         &self,
-        _data_pg_id: DataPgId,
     ) -> Result<Vec<PlacedSegmentShardBackfillRecord>, StoreError> {
         Ok(Vec::new())
     }
 
-    fn count_placed_segment_shard_backfills(
-        &self,
-        _data_pg_id: DataPgId,
-    ) -> Result<usize, StoreError> {
+    fn count_placed_segment_shard_backfills(&self) -> Result<usize, StoreError> {
         Ok(0)
     }
 
     fn placed_segment_shard_backfill_exists(
         &self,
-        _data_pg_id: DataPgId,
         _work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<bool, StoreError> {
         Ok(false)
@@ -1220,7 +1212,6 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn acquire_placed_segment_shard_backfill_claim(
         &self,
-        _data_pg_id: DataPgId,
         _request: &PlacedSegmentShardBackfillClaimAcquire,
     ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
         Ok(None)
@@ -1228,8 +1219,6 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn complete_placed_segment_shard_backfill_claim(
         &self,
-        _data_pg_id: DataPgId,
-        _cluster_epoch: ClusterEpoch,
         _claim: &PlacedSegmentShardBackfillClaimRecord,
     ) -> Result<bool, StoreError> {
         Ok(false)
@@ -1237,8 +1226,6 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn record_placed_segment_shard_backfill_claim_error(
         &self,
-        _data_pg_id: DataPgId,
-        _cluster_epoch: ClusterEpoch,
         _claim: &PlacedSegmentShardBackfillClaimRecord,
         _last_error: &str,
         _next_attempt_after: u64,
@@ -1248,7 +1235,6 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn resolve_placed_segment_shard_backfill(
         &self,
-        _data_pg_id: DataPgId,
         _work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<(), StoreError> {
         Ok(())
@@ -1297,12 +1283,12 @@ fn metadata_pg_primary_exposes_pluggable_shard_ack_client() {
     let node = map
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
         .unwrap();
-    node.shard_ack_client()
-        .register_written_shard_acks(data_pg_id, &[(&key, ack)])
+    let route = node
+        .shard_ack_client()
+        .open_shard_ack_route(ClusterEpoch::INITIAL, data_pg_id)
         .unwrap();
-    node.shard_ack_client()
-        .validate_written_shard_ack(data_pg_id, &key, ack)
-        .unwrap();
+    route.register_shard_acks(&[(&key, ack)]).unwrap();
+    route.validate_shard_ack(&key, ack).unwrap();
 
     assert_eq!(
         *recording_client_for_assert
@@ -1517,14 +1503,12 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
     let primary = map
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(0))
         .unwrap();
-    primary
+    let route = primary
         .shard_ack_client()
-        .register_written_shard_acks(data_pg_id, &[(&key, ack)])
+        .open_shard_ack_route(ClusterEpoch::INITIAL, data_pg_id)
         .unwrap();
-    primary
-        .shard_ack_client()
-        .validate_written_shard_ack(data_pg_id, &key, ack)
-        .unwrap();
+    route.register_shard_acks(&[(&key, ack)]).unwrap();
+    route.validate_shard_ack(&key, ack).unwrap();
     assert_eq!(
         map.read_payload_shard(ClusterEpoch::INITIAL, location, &key, ack)
             .unwrap(),

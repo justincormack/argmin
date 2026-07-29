@@ -13001,11 +13001,16 @@ impl StorageNodeConnectionHandler {
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.record_placed_segment_shard_repair(
-            data_pg_id,
-            &request.work_item,
-            request.last_error.as_deref(),
-        ) {
+        let route = match local_client.open_shard_ack_route(request.route.cluster_epoch, data_pg_id)
+        {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&store_error_response(error));
+            }
+        };
+        match route
+            .record_placed_segment_shard_repair(&request.work_item, request.last_error.as_deref())
+        {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
         }
@@ -13026,7 +13031,13 @@ impl StorageNodeConnectionHandler {
         }
         let data_pg_id = self.validated_data_pg(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.list_placed_segment_shard_repairs(data_pg_id) {
+        let route = match local_client.open_shard_ack_route(request.cluster_epoch, data_pg_id) {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&store_error_response(error));
+            }
+        };
+        match route.list_placed_segment_shard_repairs() {
             Ok(repairs) => {
                 let payload = encode_placed_segment_shard_repairs_response(&repairs)?;
                 Ok(encode_storage_rpc_success_response(&payload))
@@ -13061,7 +13072,14 @@ impl StorageNodeConnectionHandler {
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.resolve_placed_segment_shard_repair(data_pg_id, &request.work_item) {
+        let route = match local_client.open_shard_ack_route(request.route.cluster_epoch, data_pg_id)
+        {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&store_error_response(error));
+            }
+        };
+        match route.resolve_placed_segment_shard_repair(&request.work_item) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
         }
@@ -13101,7 +13119,14 @@ impl StorageNodeConnectionHandler {
             lease_deadline,
             now: request.now,
         };
-        match local_client.acquire_placed_segment_shard_repair_claim(data_pg_id, &acquire) {
+        let route = match local_client.open_shard_ack_route(request.route.cluster_epoch, data_pg_id)
+        {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&store_error_response(error));
+            }
+        };
+        match route.acquire_placed_segment_shard_repair_claim(&acquire) {
             Ok(record) => {
                 let payload = encode_placed_segment_shard_repair_claim_optional_record_response(
                     &StorageRpcPlacedSegmentShardRepairClaimOptionalRecordResponse { record },
@@ -13146,11 +13171,14 @@ impl StorageNodeConnectionHandler {
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.complete_placed_segment_shard_repair_claim(
-            data_pg_id,
-            request.route.cluster_epoch,
-            &request.claim,
-        ) {
+        let route = match local_client.open_shard_ack_route(request.route.cluster_epoch, data_pg_id)
+        {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&store_error_response(error));
+            }
+        };
+        match route.complete_placed_segment_shard_repair_claim(&request.claim) {
             Ok(value) => {
                 let payload =
                     encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
@@ -13196,9 +13224,14 @@ impl StorageNodeConnectionHandler {
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.record_placed_segment_shard_repair_claim_error(
-            data_pg_id,
-            request.route.cluster_epoch,
+        let route = match local_client.open_shard_ack_route(request.route.cluster_epoch, data_pg_id)
+        {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&store_error_response(error));
+            }
+        };
+        match route.record_placed_segment_shard_repair_claim_error(
             &request.claim,
             &request.last_error,
             request.next_attempt_after,
@@ -13240,8 +13273,14 @@ impl StorageNodeConnectionHandler {
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.record_placed_segment_shard_backfill(
-            data_pg_id,
+        let route = match local_client.open_shard_ack_route(request.route.cluster_epoch, data_pg_id)
+        {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&store_error_response(error));
+            }
+        };
+        match route.record_placed_segment_shard_backfill(
             &request.work_item,
             request.remaining_tolerance,
             request.last_error.as_deref(),
@@ -13267,7 +13306,13 @@ impl StorageNodeConnectionHandler {
         }
         let data_pg_id = self.validated_data_pg(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.list_placed_segment_shard_backfills(data_pg_id) {
+        let route = match local_client.open_shard_ack_route(request.cluster_epoch, data_pg_id) {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&store_error_response(error));
+            }
+        };
+        match route.list_placed_segment_shard_backfills() {
             Ok(backfills) => {
                 let payload = encode_placed_segment_shard_backfills_response(&backfills)?;
                 Ok(encode_storage_rpc_success_response(&payload))
@@ -13292,7 +13337,13 @@ impl StorageNodeConnectionHandler {
         }
         let data_pg_id = self.validated_data_pg(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.count_placed_segment_shard_backfills(data_pg_id) {
+        let route = match local_client.open_shard_ack_route(request.cluster_epoch, data_pg_id) {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&store_error_response(error));
+            }
+        };
+        match route.count_placed_segment_shard_backfills() {
             Ok(count) => {
                 let payload = encode_placed_segment_shard_backfill_count_response(count)?;
                 Ok(encode_storage_rpc_success_response(&payload))
@@ -13327,7 +13378,14 @@ impl StorageNodeConnectionHandler {
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.placed_segment_shard_backfill_exists(data_pg_id, &request.work_item) {
+        let route = match local_client.open_shard_ack_route(request.route.cluster_epoch, data_pg_id)
+        {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&store_error_response(error));
+            }
+        };
+        match route.placed_segment_shard_backfill_exists(&request.work_item) {
             Ok(value) => {
                 let payload =
                     encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
@@ -13365,7 +13423,14 @@ impl StorageNodeConnectionHandler {
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.resolve_placed_segment_shard_backfill(data_pg_id, &request.work_item) {
+        let route = match local_client.open_shard_ack_route(request.route.cluster_epoch, data_pg_id)
+        {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&store_error_response(error));
+            }
+        };
+        match route.resolve_placed_segment_shard_backfill(&request.work_item) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
         }
@@ -13405,7 +13470,14 @@ impl StorageNodeConnectionHandler {
             lease_deadline,
             now: request.now,
         };
-        match local_client.acquire_placed_segment_shard_backfill_claim(data_pg_id, &acquire) {
+        let route = match local_client.open_shard_ack_route(request.route.cluster_epoch, data_pg_id)
+        {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&store_error_response(error));
+            }
+        };
+        match route.acquire_placed_segment_shard_backfill_claim(&acquire) {
             Ok(record) => {
                 let payload = encode_placed_segment_shard_backfill_claim_optional_record_response(
                     &StorageRpcPlacedSegmentShardBackfillClaimOptionalRecordResponse { record },
@@ -13450,11 +13522,14 @@ impl StorageNodeConnectionHandler {
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.complete_placed_segment_shard_backfill_claim(
-            data_pg_id,
-            request.route.cluster_epoch,
-            &request.claim,
-        ) {
+        let route = match local_client.open_shard_ack_route(request.route.cluster_epoch, data_pg_id)
+        {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&store_error_response(error));
+            }
+        };
+        match route.complete_placed_segment_shard_backfill_claim(&request.claim) {
             Ok(value) => {
                 let payload =
                     encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
@@ -13500,9 +13575,14 @@ impl StorageNodeConnectionHandler {
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.record_placed_segment_shard_backfill_claim_error(
-            data_pg_id,
-            request.route.cluster_epoch,
+        let route = match local_client.open_shard_ack_route(request.route.cluster_epoch, data_pg_id)
+        {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&store_error_response(error));
+            }
+        };
+        match route.record_placed_segment_shard_backfill_claim_error(
             &request.claim,
             &request.last_error,
             request.next_attempt_after,

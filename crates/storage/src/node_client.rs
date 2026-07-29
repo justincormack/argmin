@@ -289,6 +289,68 @@ use crate::types::{
 use crate::BucketDeleteBeginRoot;
 use crate::DataPgId;
 
+fn validate_placed_segment_shard_repair_route(
+    pg_id: PgId,
+    work_item: &PlacedSegmentShardRepairWorkItem,
+) -> Result<(), StoreError> {
+    if work_item.request.data_pg_id != pg_id.get() {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "durable repair work item data PG {} does not match routed PG {}",
+                work_item.request.data_pg_id,
+                pg_id.get()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_placed_segment_shard_repair_claim_epoch(
+    pg_id: PgId,
+    cluster_epoch: ClusterEpoch,
+    claim: &PlacedSegmentShardRepairClaimRecord,
+) -> Result<(), StoreError> {
+    if claim.cluster_epoch != cluster_epoch {
+        return Err(StoreError::StalePayloadOperation {
+            pg_id: pg_id.get(),
+            operation_epoch: claim.cluster_epoch,
+            current_epoch: cluster_epoch,
+        });
+    }
+    Ok(())
+}
+
+fn validate_placed_segment_shard_backfill_route(
+    pg_id: PgId,
+    work_item: &PlacedSegmentShardBackfillWorkItem,
+) -> Result<(), StoreError> {
+    if work_item.request.data_pg_id != pg_id.get() {
+        return Err(StoreError::PayloadShardSetMismatch {
+            reason: format!(
+                "durable backfill work item data PG {} does not match routed PG {}",
+                work_item.request.data_pg_id,
+                pg_id.get()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_placed_segment_shard_backfill_claim_epoch(
+    pg_id: PgId,
+    cluster_epoch: ClusterEpoch,
+    claim: &PlacedSegmentShardBackfillClaimRecord,
+) -> Result<(), StoreError> {
+    if claim.cluster_epoch != cluster_epoch {
+        return Err(StoreError::StalePayloadOperation {
+            pg_id: pg_id.get(),
+            operation_epoch: claim.cluster_epoch,
+            current_epoch: cluster_epoch,
+        });
+    }
+    Ok(())
+}
+
 #[path = "node_client/interface.rs"]
 mod interface;
 #[path = "node_client/local.rs"]

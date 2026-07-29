@@ -655,7 +655,7 @@ Node-client role classification (2026-07-19):
 | `ObjectMutationMetadataNodeClient` | object metadata | active object route for object, multipart, stream-session, and payload-reclaim mutation |
 | `RetainedObjectMutationMetadataNodeClient` | object metadata | opens a retained route bound to one epoch, object-metadata PG, bucket, and key; the returned interface prepares stream aborts and releases payload-reclaim claims without accepting replacement route or object arguments |
 | `ObjectReadMetadataNodeClient` | object metadata | active object route plus the existing subject identity/read lease |
-| `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active data route for serving I/O, current placement cleanup, and repair/backfill work |
+| `PlacedShardNodeClient`, `ShardAckNodeClient` | data | placed-shard I/O remains the next active data-route conversion; shard acknowledgement, current-placement cleanup, and repair/backfill work open an active route bound to one epoch and data PG |
 | `RetainedPlacedShardNodeClient`, `RetainedShardAckNodeClient` | data | retained exact-placement inspection and cleanup for historical shard bytes and acknowledgement rows |
 | `ShardScavengerNodeClient` | data for shard rows/files and object-metadata reference scans | read-only inventory authority for the validated active or retained scan location |
 | `ShardScavengerObservationNodeClient` | data PG for durable observation rows | opens an active primary-only route bound to one data PG; the returned interface records, lists, and resolves non-authoritative scavenger findings without accepting a replacement PG |
@@ -4103,6 +4103,38 @@ One-hundred-and-first Phase 3 slice:
   acknowledgement route regressions. Formatting, the storage boundary checker,
   workspace-wide strict Clippy, and the full 7,761-test workspace suite also
   pass.
+
+One-hundred-and-second Phase 3 slice:
+
+- active shard-acknowledgement, repair, and backfill access now opens a
+  `ShardAckRoute` bound to one active cluster epoch and data PG. Ack-row
+  registration, validation, inspection, and deletion, plus durable repair and
+  backfill record/claim workflows, no longer accept a replacement PG or epoch
+  at each operation.
+- embedded and Unix routes validate every repair/backfill work item and claim
+  against the captured PG and epoch before storage or transport access. They
+  also validate every listed or acquired durable row before returning it;
+  acquired claims must also match the requested claim ID, owner token,
+  acquisition timestamp, and lease deadline. Malformed Unix responses are
+  reported as transport payload errors rather than conferring foreign-PG or
+  foreign-claim state through the scoped interface. Storage-node RPC dispatch
+  retains its independent active-route, primary, PG-role, and wire-subject
+  checks before constructing the embedded route.
+- embedded coverage records correct-PG repair and backfill canaries, rejects
+  crossed-PG records and a crossed-epoch claim without changing those
+  canaries, and rejects unavailable PGs when constructing the route. A no-
+  listener Unix regression rejects foreign epochs and crossed-PG work before
+  RPC. A fake Unix peer returns otherwise valid foreign-PG repair and backfill
+  lists, both of which fail at the response boundary. Additional malicious
+  responses independently vary each repair/backfill acquisition identity
+  field and are rejected before the claim can reach a worker. Existing
+  installed-Unix ack and repair/backfill tests continue to exercise successful
+  dispatch through the scoped route. Active placed-shard I/O and other
+  remaining stateful method families still require scoped or opaque
+  capabilities in Phase 3.
+- all 2,441 storage tests pass, including the focused active shard-ack route
+  regressions. Formatting, the storage boundary checker, workspace-wide strict
+  Clippy, and the full 7,768-test workspace suite also pass.
 
 ### Phase 4 — type metadata-command publication
 

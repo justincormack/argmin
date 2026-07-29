@@ -1159,60 +1159,44 @@ pub(crate) trait RetainedObjectPayloadReclaimRoute: Send {
 }
 
 pub(crate) trait ShardAckNodeClient: Send + Sync {
-    fn register_written_shard_acks(
+    fn open_shard_ack_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
-        shard_batch: &[(&ShardKey, WriteAck)],
-    ) -> Result<(), StoreError>;
+    ) -> Result<Box<dyn ShardAckRoute + '_>, StoreError>;
+}
 
-    fn validate_written_shard_ack(
-        &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-        ack: WriteAck,
-    ) -> Result<(), StoreError>;
+pub(crate) trait ShardAckRoute: Send {
+    fn register_shard_acks(&self, shard_batch: &[(&ShardKey, WriteAck)]) -> Result<(), StoreError>;
 
-    fn load_written_shard_ack(
-        &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-    ) -> Result<WriteAck, StoreError>;
+    fn validate_shard_ack(&self, key: &ShardKey, ack: WriteAck) -> Result<(), StoreError>;
 
-    fn delete_written_shard_ack(
-        &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-    ) -> Result<(), StoreError>;
+    fn load_shard_ack(&self, key: &ShardKey) -> Result<WriteAck, StoreError>;
+
+    fn delete_shard_ack(&self, key: &ShardKey) -> Result<(), StoreError>;
 
     fn record_placed_segment_shard_repair(
         &self,
-        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardRepairWorkItem,
         last_error: Option<&str>,
     ) -> Result<(), StoreError>;
 
     fn list_placed_segment_shard_repairs(
         &self,
-        data_pg_id: DataPgId,
     ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError>;
 
     fn acquire_placed_segment_shard_repair_claim(
         &self,
-        data_pg_id: DataPgId,
         request: &PlacedSegmentShardRepairClaimAcquire,
     ) -> Result<Option<PlacedSegmentShardRepairClaimRecord>, StoreError>;
 
     fn complete_placed_segment_shard_repair_claim(
         &self,
-        data_pg_id: DataPgId,
-        cluster_epoch: ClusterEpoch,
         claim: &PlacedSegmentShardRepairClaimRecord,
     ) -> Result<bool, StoreError>;
 
     fn record_placed_segment_shard_repair_claim_error(
         &self,
-        data_pg_id: DataPgId,
-        cluster_epoch: ClusterEpoch,
         claim: &PlacedSegmentShardRepairClaimRecord,
         last_error: &str,
         next_attempt_after: u64,
@@ -1220,13 +1204,11 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
 
     fn resolve_placed_segment_shard_repair(
         &self,
-        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardRepairWorkItem,
     ) -> Result<(), StoreError>;
 
     fn record_placed_segment_shard_backfill(
         &self,
-        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
         remaining_tolerance: u8,
         last_error: Option<&str>,
@@ -1234,37 +1216,27 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
 
     fn list_placed_segment_shard_backfills(
         &self,
-        data_pg_id: DataPgId,
     ) -> Result<Vec<PlacedSegmentShardBackfillRecord>, StoreError>;
 
-    fn count_placed_segment_shard_backfills(
-        &self,
-        data_pg_id: DataPgId,
-    ) -> Result<usize, StoreError>;
+    fn count_placed_segment_shard_backfills(&self) -> Result<usize, StoreError>;
 
     fn placed_segment_shard_backfill_exists(
         &self,
-        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<bool, StoreError>;
 
     fn acquire_placed_segment_shard_backfill_claim(
         &self,
-        data_pg_id: DataPgId,
         request: &PlacedSegmentShardBackfillClaimAcquire,
     ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError>;
 
     fn complete_placed_segment_shard_backfill_claim(
         &self,
-        data_pg_id: DataPgId,
-        cluster_epoch: ClusterEpoch,
         claim: &PlacedSegmentShardBackfillClaimRecord,
     ) -> Result<bool, StoreError>;
 
     fn record_placed_segment_shard_backfill_claim_error(
         &self,
-        data_pg_id: DataPgId,
-        cluster_epoch: ClusterEpoch,
         claim: &PlacedSegmentShardBackfillClaimRecord,
         last_error: &str,
         next_attempt_after: u64,
@@ -1272,7 +1244,6 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
 
     fn resolve_placed_segment_shard_backfill(
         &self,
-        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<(), StoreError>;
 }
