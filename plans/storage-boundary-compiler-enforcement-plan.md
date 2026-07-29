@@ -4077,6 +4077,33 @@ One-hundredth Phase 3 slice:
   workspace-wide strict Clippy, and the full 7,759-test workspace suite also
   pass.
 
+One-hundred-and-first Phase 3 slice:
+
+- retained shard-acknowledgement access now opens a `RetainedShardAckRoute`
+  bound to one historical cluster epoch, data PG, and shard key. Historical
+  acknowledgement inspection and deletion no longer accept replacement route
+  or shard subjects after the route is opened.
+- embedded factories prove the captured data PG exists before constructing the
+  route, while Unix factories reject future route epochs before transport
+  access. Storage-node RPC dispatch retains its independent retained-route,
+  primary, PG-role, and wire-subject validation before loading or deleting the
+  acknowledgement row.
+- an embedded regression records two acknowledgement rows and proves the
+  opened route can inspect and delete only its captured row, leaving the
+  foreign row intact; it also rejects an unavailable PG before storage access.
+  A no-listener Unix regression rejects future-epoch construction before RPC.
+  The installed-Unix historical shard regression now exercises old-epoch
+  acknowledgement inspection and cleanup against the retained data-PG primary
+  alongside the corresponding payload bytes. Existing old-primary direct-PUT
+  and CopyObject regressions continue to prove retained acknowledgement
+  cleanup through the scoped route. Replacing the remaining stateful method
+  families with scoped or opaque operation capabilities remains open in Phase
+  3.
+- all 2,435 storage tests pass, including the focused retained shard-
+  acknowledgement route regressions. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full 7,761-test workspace suite also
+  pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

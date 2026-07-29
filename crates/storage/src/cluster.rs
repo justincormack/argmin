@@ -17084,11 +17084,8 @@ impl StorageCluster {
                 cluster_epoch: route.cluster_epoch(),
             })?;
         node.retained_shard_ack_client()
-            .load_written_shard_ack_for_historical_inspection(
-                route.cluster_epoch(),
-                data_pg_id,
-                shard_key,
-            )
+            .open_retained_shard_ack_route(route.cluster_epoch(), data_pg_id, shard_key)
+            .and_then(|route| route.load_written_shard_ack_for_historical_inspection())
     }
 
     fn segment_payload_locations(
@@ -17386,11 +17383,10 @@ impl StorageCluster {
                 self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);
                 continue;
             }
-            if let Err(error) = shard_ack_client.delete_written_shard_ack_at_retained_epoch(
-                operation_epoch,
-                data_pg_id,
-                shard_key,
-            ) {
+            if let Err(error) = shard_ack_client
+                .open_retained_shard_ack_route(operation_epoch, data_pg_id, shard_key)
+                .and_then(|route| route.delete_retained_shard_ack())
+            {
                 self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);
             }
         }
@@ -17495,11 +17491,12 @@ impl StorageCluster {
                 self.maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
                     .map_err(ObjectPgActionError::Store)?;
                 shard_ack_client
-                    .delete_written_shard_ack_at_retained_epoch(
+                    .open_retained_shard_ack_route(
                         segment.placement_cluster_epoch,
                         data_pg_id,
                         shard_key,
                     )
+                    .and_then(|route| route.delete_retained_shard_ack())
                     .map_err(ObjectPgActionError::Store)?;
             }
         }

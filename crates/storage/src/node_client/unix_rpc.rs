@@ -7,6 +7,13 @@ struct UnixRetainedPlacedShardRoute<'a> {
     key: ShardKey,
 }
 
+struct UnixRetainedShardAckRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    data_pg_id: DataPgId,
+    key: ShardKey,
+}
+
 impl UnixStorageNodeClient {
     pub(crate) fn write_placed_shard(
         &self,
@@ -1296,31 +1303,44 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
 }
 
 impl RetainedShardAckNodeClient for UnixStorageNodeClient {
-    fn load_written_shard_ack_for_historical_inspection(
+    fn open_retained_shard_ack_route(
         &self,
         route_cluster_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
         key: &ShardKey,
-    ) -> Result<WriteAck, StoreError> {
-        UnixStorageNodeClient::load_written_shard_ack_for_historical_inspection(
-            self,
+    ) -> Result<Box<dyn RetainedShardAckRoute + '_>, StoreError> {
+        if route_cluster_epoch > self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: data_pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        Ok(Box::new(UnixRetainedShardAckRoute {
+            client: self,
             route_cluster_epoch,
             data_pg_id,
-            key,
+            key: key.clone(),
+        }))
+    }
+}
+
+impl RetainedShardAckRoute for UnixRetainedShardAckRoute<'_> {
+    fn load_written_shard_ack_for_historical_inspection(&self) -> Result<WriteAck, StoreError> {
+        UnixStorageNodeClient::load_written_shard_ack_for_historical_inspection(
+            self.client,
+            self.route_cluster_epoch,
+            self.data_pg_id,
+            &self.key,
         )
     }
 
-    fn delete_written_shard_ack_at_retained_epoch(
-        &self,
-        cluster_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-    ) -> Result<(), StoreError> {
+    fn delete_retained_shard_ack(&self) -> Result<(), StoreError> {
         UnixStorageNodeClient::delete_written_shard_ack_at_epoch(
-            self,
-            cluster_epoch,
-            data_pg_id,
-            key,
+            self.client,
+            self.route_cluster_epoch,
+            self.data_pg_id,
+            &self.key,
         )
     }
 }

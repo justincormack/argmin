@@ -1279,19 +1279,18 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
 
 /// Retained access to acknowledgement rows for exact historical placements.
 pub(crate) trait RetainedShardAckNodeClient: Send + Sync {
-    fn load_written_shard_ack_for_historical_inspection(
+    fn open_retained_shard_ack_route(
         &self,
         route_cluster_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
         key: &ShardKey,
-    ) -> Result<WriteAck, StoreError>;
+    ) -> Result<Box<dyn RetainedShardAckRoute + '_>, StoreError>;
+}
 
-    fn delete_written_shard_ack_at_retained_epoch(
-        &self,
-        cluster_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-    ) -> Result<(), StoreError>;
+pub(crate) trait RetainedShardAckRoute: Send {
+    fn load_written_shard_ack_for_historical_inspection(&self) -> Result<WriteAck, StoreError>;
+
+    fn delete_retained_shard_ack(&self) -> Result<(), StoreError>;
 }
 
 pub(crate) trait ShardScavengerNodeClient: Send + Sync {

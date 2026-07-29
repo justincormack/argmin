@@ -1,6 +1,7 @@
 use super::*;
 use crate::node_client::{
     ObjectPayloadLeaseKind, ObjectPayloadLeaseRoute, RetainedPlacedShardRoute,
+    RetainedShardAckRoute,
 };
 use crate::storage_rpc::StorageRpcErrorCode;
 use crate::{
@@ -1073,6 +1074,8 @@ struct RecordingShardAckClient {
     validates: Mutex<Vec<(DataPgId, ShardKey, WriteAck)>>,
 }
 
+struct RecordingRetainedShardAckRoute;
+
 impl RecordingShardAckClient {
     fn new() -> Self {
         Self {
@@ -1246,22 +1249,23 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 }
 
 impl RetainedShardAckNodeClient for RecordingShardAckClient {
-    fn load_written_shard_ack_for_historical_inspection(
+    fn open_retained_shard_ack_route(
         &self,
         _route_cluster_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-    ) -> Result<WriteAck, StoreError> {
-        self.load_written_shard_ack(data_pg_id, key)
+        _data_pg_id: DataPgId,
+        _key: &ShardKey,
+    ) -> Result<Box<dyn RetainedShardAckRoute + '_>, StoreError> {
+        Ok(Box::new(RecordingRetainedShardAckRoute))
+    }
+}
+
+impl RetainedShardAckRoute for RecordingRetainedShardAckRoute {
+    fn load_written_shard_ack_for_historical_inspection(&self) -> Result<WriteAck, StoreError> {
+        Err(StoreError::NotFound)
     }
 
-    fn delete_written_shard_ack_at_retained_epoch(
-        &self,
-        _cluster_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-    ) -> Result<(), StoreError> {
-        self.delete_written_shard_ack(data_pg_id, key)
+    fn delete_retained_shard_ack(&self) -> Result<(), StoreError> {
+        Err(StoreError::NotFound)
     }
 }
 
@@ -10218,7 +10222,7 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     let historical_route = crate::control_plane::PgRouteSnapshot::reconstructed(
         historical_epoch,
         data_pg_id.pg_id(),
-        NodeId::new(0),
+        target_node,
         node_ids.to_vec(),
         PgState::Active,
     );
@@ -10239,6 +10243,11 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     .unwrap();
     let ack = remote
         .write_shard_file(data_pg_id.get(), &shard_key, payload)
+        .unwrap();
+    remote
+        .get_pg(data_pg_id.get())
+        .unwrap()
+        .register_written_shards_batch_exact(&[(&shard_key, ack)])
         .unwrap();
 
     let server = Arc::new(
@@ -10272,7 +10281,7 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     let server_thread = {
         let server = Arc::clone(&server);
         thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..4 {
                 server.accept_one().unwrap();
             }
         })
@@ -10288,6 +10297,18 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
         .unwrap();
 
     assert_eq!(observed, payload);
+    let shard_ack_route = map
+        .metadata_pg_primary_node_for_retained_cleanup(historical_epoch, data_pg_id.pg_id())
+        .unwrap()
+        .retained_shard_ack_client()
+        .open_retained_shard_ack_route(historical_epoch, data_pg_id, &shard_key)
+        .unwrap();
+    assert_eq!(
+        shard_ack_route
+            .load_written_shard_ack_for_historical_inspection()
+            .unwrap(),
+        ack
+    );
     let local_read = map
         .node(target_node)
         .unwrap()
@@ -10302,8 +10323,16 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     );
     map.delete_payload_shard_for_historical_cleanup(location, &shard_key)
         .unwrap();
+    shard_ack_route.delete_retained_shard_ack().unwrap();
     assert!(matches!(
         remote.read_shard_file(data_pg_id.get(), &shard_key),
+        Err(StoreError::NotFound)
+    ));
+    assert!(matches!(
+        remote
+            .get_pg(data_pg_id.get())
+            .unwrap()
+            .validate_written_shard_ack(&shard_key, ack),
         Err(StoreError::NotFound)
     ));
     server_thread.join().unwrap();

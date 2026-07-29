@@ -314,6 +314,87 @@ fn unix_retained_placed_shard_route_rejects_foreign_subject_before_rpc() {
 }
 
 #[test]
+fn local_retained_shard_ack_route_is_bound_to_exact_pg_and_key() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
+    let bound_key = ShardKey::new(&[0x61; 16], 31, 0);
+    let foreign_key = ShardKey::new(&[0x62; 16], 32, 0);
+    let bound_ack = WriteAck {
+        crc64: 41,
+        stored_size: 51,
+    };
+    let foreign_ack = WriteAck {
+        crc64: 42,
+        stored_size: 52,
+    };
+    client
+        .register_written_shard_acks(
+            data_pg_id,
+            &[(&bound_key, bound_ack), (&foreign_key, foreign_ack)],
+        )
+        .unwrap();
+
+    let route = client
+        .open_retained_shard_ack_route(ClusterEpoch::INITIAL, data_pg_id, &bound_key)
+        .unwrap();
+    assert_eq!(
+        route
+            .load_written_shard_ack_for_historical_inspection()
+            .unwrap(),
+        bound_ack
+    );
+    route.delete_retained_shard_ack().unwrap();
+    assert!(matches!(
+        client.load_written_shard_ack(data_pg_id, &bound_key),
+        Err(StoreError::NotFound)
+    ));
+    assert_eq!(
+        client
+            .load_written_shard_ack(data_pg_id, &foreign_key)
+            .unwrap(),
+        foreign_ack
+    );
+
+    let foreign_pg_id = DataPgId::new_for_test(PgId::new(1));
+    assert!(matches!(
+        client
+            .open_retained_shard_ack_route(ClusterEpoch::INITIAL, foreign_pg_id, &bound_key,)
+            .err()
+            .expect("foreign retained ack PG must be rejected before storage"),
+        StoreError::PgNotFound { pg_id: 1 }
+    ));
+}
+
+#[test]
+fn unix_retained_shard_ack_route_rejects_future_epoch_before_rpc() {
+    let client = test_unix_storage_node_client();
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
+    let key = ShardKey::new(&[0x71; 16], 41, 0);
+    let future_epoch = ClusterEpoch::new(client.cluster_epoch.get().saturating_add(1)).unwrap();
+
+    assert!(matches!(
+        client
+            .open_retained_shard_ack_route(future_epoch, data_pg_id, &key)
+            .err()
+            .expect("future retained ack epoch must be rejected before RPC"),
+        StoreError::StalePayloadOperation {
+            pg_id: 0,
+            operation_epoch,
+            current_epoch,
+        } if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
+}
+
+#[test]
 fn local_object_payload_lease_route_is_bound_to_exact_subject() {
     let tmp = test_util::tempdir();
     let storage_node = Arc::new(

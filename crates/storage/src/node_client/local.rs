@@ -32,6 +32,12 @@ struct LocalRetainedPlacedShardRoute {
     key: ShardKey,
 }
 
+struct LocalRetainedShardAckRoute {
+    storage_node: Arc<SharedStorageNode>,
+    data_pg_id: DataPgId,
+    key: ShardKey,
+}
+
 impl ObjectPayloadLeaseNodeLease for LocalObjectPayloadLease {
     fn release(&mut self) -> Result<usize, StoreError> {
         if self.released {
@@ -634,28 +640,34 @@ impl ShardAckNodeClient for LocalStorageNodeClient {
 }
 
 impl RetainedShardAckNodeClient for LocalStorageNodeClient {
-    fn load_written_shard_ack_for_historical_inspection(
+    fn open_retained_shard_ack_route(
         &self,
         _route_cluster_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
         key: &ShardKey,
-    ) -> Result<WriteAck, StoreError> {
-        let pg = self.storage_node.get_pg(data_pg_id.get())?;
-        let stat = pg.stat_shard(key)?;
+    ) -> Result<Box<dyn RetainedShardAckRoute + '_>, StoreError> {
+        drop(self.storage_node.get_pg(data_pg_id.get())?);
+        Ok(Box::new(LocalRetainedShardAckRoute {
+            storage_node: Arc::clone(&self.storage_node),
+            data_pg_id,
+            key: key.clone(),
+        }))
+    }
+}
+
+impl RetainedShardAckRoute for LocalRetainedShardAckRoute {
+    fn load_written_shard_ack_for_historical_inspection(&self) -> Result<WriteAck, StoreError> {
+        let pg = self.storage_node.get_pg(self.data_pg_id.get())?;
+        let stat = pg.stat_shard(&self.key)?;
         Ok(WriteAck {
             crc64: stat.crc64,
             stored_size: stat.size,
         })
     }
 
-    fn delete_written_shard_ack_at_retained_epoch(
-        &self,
-        _cluster_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-    ) -> Result<(), StoreError> {
-        let pg = self.storage_node.get_pg(data_pg_id.get())?;
-        pg.delete_shard_record(key)
+    fn delete_retained_shard_ack(&self) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(self.data_pg_id.get())?;
+        pg.delete_shard_record(&self.key)
     }
 }
 
