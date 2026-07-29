@@ -653,7 +653,7 @@ Node-client role classification (2026-07-19):
 | `ObjectGenerationMetadataNodeClient`, `ObjectVersionMetadataNodeClient`, `DirectPutMetadataNodeClient` | object metadata | active object route, with completion-specific admission represented as a narrower operation class |
 | `ObjectListingMetadataNodeClient` | object metadata scan | active object-metadata route for the scanned PG; listing fan-out constructs one capability per routed PG |
 | `ObjectMutationMetadataNodeClient` | object metadata | active object route for object, multipart, stream-session, and payload-reclaim mutation |
-| `RetainedObjectMutationMetadataNodeClient` | object metadata | retained subject-bound stream abort preparation and exact payload-reclaim claim release |
+| `RetainedObjectMutationMetadataNodeClient` | object metadata | opens a retained route bound to one epoch, object-metadata PG, bucket, and key; the returned interface prepares stream aborts and releases payload-reclaim claims without accepting replacement route or object arguments |
 | `ObjectReadMetadataNodeClient` | object metadata | active object route plus the existing subject identity/read lease |
 | `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active data route for serving I/O, current placement cleanup, and repair/backfill work |
 | `RetainedPlacedShardNodeClient`, `RetainedShardAckNodeClient` | data | retained exact-placement inspection and cleanup for historical shard bytes and acknowledgement rows |
@@ -3970,6 +3970,33 @@ Ninety-sixth Phase 3 slice:
 - all 2,406 storage tests pass, including the focused scoped-route regressions
   and the full 47-test Unix bucket-RPC module. Formatting, the storage boundary
   checker, workspace-wide strict Clippy, and the full 7,731-test workspace
+  suite also pass.
+
+Ninety-seventh Phase 3 slice:
+
+- retained object-metadata cleanup now opens a scoped
+  `RetainedObjectMutationMetadataRoute` bound to the historical cluster epoch,
+  object-metadata PG, bucket, and key selected by the retained cluster route.
+  Stream-abort preparation no longer accepts replacement route or object
+  arguments, and payload-reclaim claim release no longer accepts a replacement
+  PG.
+- embedded and Unix routes bind reclaim claims to the captured epoch, PG,
+  bucket, and key before PgStore or transport access. The embedded factory
+  additionally validates bucket/key placement before constructing the route;
+  the Unix factory rejects an epoch that does not match its retained client.
+  Storage-node RPC dispatch keeps its independent retained-route, primary, and
+  wire-subject validation before constructing the embedded route.
+- embedded and Unix regressions require foreign claim object, PG, and epoch
+  subjects to fail before storage or RPC. The embedded regression also rejects
+  route construction for a foreign object PG, while the Unix regression
+  rejects foreign-epoch construction without a listening server. Existing
+  expired-route and wrong-PG Unix regressions continue to exercise successful
+  retained stream abort and reclaim-claim cleanup through the scoped route.
+  Replacing the remaining stateful method families with scoped or opaque
+  operation capabilities remains open in Phase 3.
+- all 2,415 storage tests pass, including the focused retained-route cases and
+  the full 30-test Unix object-RPC module. Formatting, the storage boundary
+  checker, workspace-wide strict Clippy, and the full 7,741-test workspace
   suite also pass.
 
 ### Phase 4 — type metadata-command publication

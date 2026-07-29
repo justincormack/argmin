@@ -152,19 +152,19 @@ fn unix_retained_bucket_write_route_rejects_foreign_subject_before_rpc() {
             "release lifecycle sweep claim",
         ),
     ] {
-        assert_retained_bucket_write_subject_mismatch(error, operation);
+        assert_route_subject_mismatch(error, operation);
     }
 
     let mut wrong_pg = test_retained_bucket_write_subjects(bound_bucket, pg_id.get());
     wrong_pg.delete_claim.pg_id = pg_id.get().saturating_add(1);
     wrong_pg.lifecycle_claim.pg_id = pg_id.get().saturating_add(1);
-    assert_retained_bucket_write_subject_mismatch(
+    assert_route_subject_mismatch(
         route
             .release_bucket_delete_finalize_claim(&wrong_pg.delete_claim)
             .unwrap_err(),
         "release bucket delete finalize claim",
     );
-    assert_retained_bucket_write_subject_mismatch(
+    assert_route_subject_mismatch(
         route
             .release_lifecycle_sweep_claim(&wrong_pg.lifecycle_claim)
             .unwrap_err(),

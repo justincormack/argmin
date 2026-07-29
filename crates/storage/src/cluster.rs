@@ -14933,13 +14933,9 @@ impl StorageCluster {
             .metadata_pg_primary_node_for_metadata_command_recovery(cluster_epoch, pg_id)?;
         let Some(prepared) = primary
             .retained_object_mutation_metadata_client()
-            .prepare_retained_stream_upload_abort(
-                object_pg_id,
-                cluster_epoch,
-                bucket,
-                key,
-                session_id,
-            )?
+            .open_retained_object_mutation_route(object_pg_id, cluster_epoch, bucket, key)
+            .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+            .prepare_retained_stream_upload_abort(session_id)?
         else {
             return Ok(());
         };

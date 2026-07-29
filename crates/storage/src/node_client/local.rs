@@ -1748,28 +1748,74 @@ impl DirectPutMetadataNodeClient for LocalStorageNodeClient {
     }
 }
 
+struct LocalRetainedObjectMutationMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    pg_id: ObjectMetadataPgId,
+    cluster_epoch: ClusterEpoch,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
+impl LocalRetainedObjectMutationMetadataRoute<'_> {
+    fn require_claim_subject(
+        &self,
+        claim: &ObjectPayloadReclaimClaimRecord,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if claim.bucket != self.bucket
+            || claim.key != self.key
+            || claim.pg_id != self.pg_id.get()
+            || claim.cluster_epoch != self.cluster_epoch
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
+    }
+}
+
 impl RetainedObjectMutationMetadataNodeClient for LocalStorageNodeClient {
-    fn prepare_retained_stream_upload_abort(
+    fn open_retained_object_mutation_route(
         &self,
         pg_id: ObjectMetadataPgId,
         cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
+    ) -> Result<Box<dyn RetainedObjectMutationMetadataRoute + '_>, BucketSnapshotLoadError> {
+        if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open retained object mutation route",
+            }
+            .into());
+        }
+        drop(self.storage_node.get_pg(pg_id.get())?);
+        Ok(Box::new(LocalRetainedObjectMutationMetadataRoute {
+            client: self,
+            pg_id,
+            cluster_epoch,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
+    }
+}
+
+impl RetainedObjectMutationMetadataRoute for LocalRetainedObjectMutationMetadataRoute<'_> {
+    fn prepare_retained_stream_upload_abort(
+        &self,
         session_id: &SessionId,
     ) -> Result<Option<PreparedRetainedStreamUploadAbort>, ObjectPgActionError> {
-        let raw_pg_id = pg_id.pg_id();
+        let raw_pg_id = self.pg_id.pg_id();
         if let Some(pending) =
-            <Self as MetadataCommandNodeClient>::pending_metadata_command_envelope(
-                self,
+            <LocalStorageNodeClient as MetadataCommandNodeClient>::pending_metadata_command_envelope(
+                self.client,
                 raw_pg_id,
-                cluster_epoch,
+                self.cluster_epoch,
             )?
         {
             return PreparedRetainedStreamUploadAbort::new_if_matches(
-                pg_id,
-                cluster_epoch,
-                bucket,
-                key,
+                self.pg_id,
+                self.cluster_epoch,
+                &self.bucket,
+                &self.key,
                 session_id,
                 pending,
             )
@@ -1781,29 +1827,37 @@ impl RetainedObjectMutationMetadataNodeClient for LocalStorageNodeClient {
             ));
         }
 
-        let stream_session =
-            match Self::load_stream_upload_session(self, pg_id, bucket, key, session_id) {
-                Ok(session) => session,
-                Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
-                    ..
-                })) => {
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
-            };
-        let staged_segments =
-            Self::load_stream_upload_segments(self, pg_id, bucket, key, session_id)?;
-        let command_id = <Self as MetadataCommandNodeClient>::next_metadata_command_id_at_least(
-            self,
+        let stream_session = match LocalStorageNodeClient::load_stream_upload_session(
+            self.client,
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            session_id,
+        ) {
+            Ok(session) => session,
+            Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound { .. })) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let staged_segments = LocalStorageNodeClient::load_stream_upload_segments(
+            self.client,
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            session_id,
+        )?;
+        let command_id = <LocalStorageNodeClient as MetadataCommandNodeClient>::next_metadata_command_id_at_least(
+            self.client,
             raw_pg_id,
-            cluster_epoch,
+            self.cluster_epoch,
             MetadataCommandLogIndex::new(1).expect("metadata command log index starts at one"),
         )?;
         let command = MetadataCommandEnvelope::new(
             command_id,
             MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
-                bucket: bucket.clone(),
-                key: key.clone(),
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
                 session_id: session_id.clone(),
                 staged_segments,
                 stream_create_bucket_write_reservation: stream_session
@@ -1812,10 +1866,10 @@ impl RetainedObjectMutationMetadataNodeClient for LocalStorageNodeClient {
             })),
         );
         let prepared = PreparedRetainedStreamUploadAbort::new_if_matches(
-            pg_id,
-            cluster_epoch,
-            bucket,
-            key,
+            self.pg_id,
+            self.cluster_epoch,
+            &self.bucket,
+            &self.key,
             session_id,
             command,
         )
@@ -1824,21 +1878,21 @@ impl RetainedObjectMutationMetadataNodeClient for LocalStorageNodeClient {
                 context: "retained stream abort preparation produced an invalid command",
             },
         ))?;
-        <Self as MetadataCommandNodeClient>::try_insert_pending_metadata_command_slot(
-            self,
+        <LocalStorageNodeClient as MetadataCommandNodeClient>::try_insert_pending_metadata_command_slot(
+            self.client,
             raw_pg_id,
             prepared.command(),
-            Some(bucket),
+            Some(&self.bucket),
         )?;
         Ok(Some(prepared))
     }
 
     fn release_object_payload_reclaim_claim(
         &self,
-        pg_id: ObjectMetadataPgId,
         claim: &ObjectPayloadReclaimClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
-        Self::release_object_payload_reclaim_claim(self, pg_id, claim)
+        self.require_claim_subject(claim, "release object payload reclaim claim")?;
+        LocalStorageNodeClient::release_object_payload_reclaim_claim(self.client, self.pg_id, claim)
     }
 }
 

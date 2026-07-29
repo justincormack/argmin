@@ -1768,7 +1768,7 @@ impl UnixStorageNodeClient {
     }
 }
 
-impl RetainedObjectMutationMetadataNodeClient for UnixStorageNodeClient {
+impl UnixStorageNodeClient {
     fn prepare_retained_stream_upload_abort(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -1865,6 +1865,81 @@ impl RetainedObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             "decode object payload reclaim claim release response",
             &response,
         )
+    }
+}
+
+struct UnixRetainedObjectMutationMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    pg_id: ObjectMetadataPgId,
+    cluster_epoch: ClusterEpoch,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
+impl UnixRetainedObjectMutationMetadataRoute<'_> {
+    fn require_claim_subject(
+        &self,
+        claim: &ObjectPayloadReclaimClaimRecord,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if claim.bucket != self.bucket
+            || claim.key != self.key
+            || claim.pg_id != self.pg_id.get()
+            || claim.cluster_epoch != self.cluster_epoch
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
+    }
+}
+
+impl RetainedObjectMutationMetadataNodeClient for UnixStorageNodeClient {
+    fn open_retained_object_mutation_route(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        cluster_epoch: ClusterEpoch,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn RetainedObjectMutationMetadataRoute + '_>, BucketSnapshotLoadError> {
+        if cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixRetainedObjectMutationMetadataRoute {
+            client: self,
+            pg_id,
+            cluster_epoch,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
+    }
+}
+
+impl RetainedObjectMutationMetadataRoute for UnixRetainedObjectMutationMetadataRoute<'_> {
+    fn prepare_retained_stream_upload_abort(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<PreparedRetainedStreamUploadAbort>, ObjectPgActionError> {
+        self.client.prepare_retained_stream_upload_abort(
+            self.pg_id,
+            self.cluster_epoch,
+            &self.bucket,
+            &self.key,
+            session_id,
+        )
+    }
+
+    fn release_object_payload_reclaim_claim(
+        &self,
+        claim: &ObjectPayloadReclaimClaimRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_claim_subject(claim, "release object payload reclaim claim")?;
+        self.client
+            .release_object_payload_reclaim_claim(self.pg_id, claim)
     }
 }
 

@@ -6552,12 +6552,17 @@ impl StorageNodeRetainedObjectPayloadReclaimClaimRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        RetainedObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
+        let route = RetainedObjectMutationMetadataNodeClient::open_retained_object_mutation_route(
             &local_client,
             self.pg_id,
-            self.claim,
+            self.route_cluster_epoch,
+            &self.claim.bucket,
+            &self.claim.key,
         )
-        .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)
+        .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)?;
+        route
+            .release_object_payload_reclaim_claim(self.claim)
+            .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)
     }
 }
 
@@ -6908,15 +6913,22 @@ impl StorageNodeRetainedPrimaryStreamAbortSessionRoute<'_> {
             self.route.route.handler.config.node_id,
             Arc::clone(&self.route.route.handler.node),
         );
-        RetainedObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
+        let route = RetainedObjectMutationMetadataNodeClient::open_retained_object_mutation_route(
             &local_client,
             self.route.route.pg_id,
             self.route.route.route_cluster_epoch,
             self.route.route.bucket,
             self.route.route.key,
-            self.session_id,
         )
-        .map_err(StorageNodeObjectRouteError::Object)
+        .map_err(|error| {
+            StorageNodeObjectRouteError::Object(match error {
+                BucketSnapshotLoadError::Store(error) => ObjectPgActionError::Store(error),
+                BucketSnapshotLoadError::Metadata(error) => ObjectPgActionError::Metadata(error),
+            })
+        })?;
+        route
+            .prepare_retained_stream_upload_abort(self.session_id)
+            .map_err(StorageNodeObjectRouteError::Object)
     }
 }
 

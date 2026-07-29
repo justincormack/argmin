@@ -803,21 +803,28 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 /// Cleanup authority for exact object-metadata subjects which may need to
 /// outlive the active route that created them.
 pub(crate) trait RetainedObjectMutationMetadataNodeClient: Send + Sync {
-    /// Prepare the exact state-reducing abort command used by a retained
-    /// stream-cleanup capability. Implementations must serialize session and
-    /// segment loading with pending-slot allocation.
-    fn prepare_retained_stream_upload_abort(
+    /// Bind retained object cleanup to one object metadata PG and exact
+    /// bucket/key subject selected by the retained cluster route.
+    fn open_retained_object_mutation_route(
         &self,
         pg_id: ObjectMetadataPgId,
         cluster_epoch: ClusterEpoch,
         bucket: &BucketName,
         key: &ObjectKey,
+    ) -> Result<Box<dyn RetainedObjectMutationMetadataRoute + '_>, BucketSnapshotLoadError>;
+}
+
+pub(crate) trait RetainedObjectMutationMetadataRoute: Send {
+    /// Prepare the exact state-reducing abort command used by a retained
+    /// stream-cleanup capability. Implementations must serialize session and
+    /// segment loading with pending-slot allocation.
+    fn prepare_retained_stream_upload_abort(
+        &self,
         session_id: &SessionId,
     ) -> Result<Option<PreparedRetainedStreamUploadAbort>, ObjectPgActionError>;
 
     fn release_object_payload_reclaim_claim(
         &self,
-        pg_id: ObjectMetadataPgId,
         claim: &ObjectPayloadReclaimClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 }

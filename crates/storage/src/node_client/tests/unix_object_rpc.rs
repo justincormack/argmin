@@ -1,5 +1,16 @@
 use super::*;
 
+fn retained_object_mutation_route<'a>(
+    client: &'a UnixStorageNodeClient,
+    pg_id: ObjectMetadataPgId,
+    bucket: &BucketName,
+    key: &ObjectKey,
+) -> Box<dyn RetainedObjectMutationMetadataRoute + 'a> {
+    client
+        .open_retained_object_mutation_route(pg_id, client.cluster_epoch, bucket, key)
+        .unwrap()
+}
+
 fn raw_retained_stream_abort_request_error(
     client: &UnixStorageNodeClient,
     kind: StorageRpcMessageKind,
@@ -16,6 +27,64 @@ fn raw_retained_stream_abort_request_error(
     };
     let payload = encode_metadata_command_request(&request).unwrap();
     client.rpc_request(kind, payload).unwrap_err()
+}
+
+#[test]
+fn unix_retained_object_mutation_route_rejects_foreign_claim_before_rpc() {
+    let client = test_unix_storage_node_client();
+    let bound_bucket = crate::tests::bucket_name("unix-retained-object-route-bound-bucket");
+    let bound_key = crate::tests::object_key("unix-retained-object-route-bound-key");
+    let foreign_bucket = crate::tests::bucket_name("unix-retained-object-route-foreign-bucket");
+    let foreign_key = crate::tests::object_key("unix-retained-object-route-foreign-key");
+    let pg_id = ObjectMetadataPgId::new_for_test(PgId::new(0));
+    let epoch_error = client
+        .open_retained_object_mutation_route(
+            pg_id,
+            ClusterEpoch::new(client.cluster_epoch.get().saturating_add(1)).unwrap(),
+            &bound_bucket,
+            &bound_key,
+        )
+        .err()
+        .expect("foreign route epoch must be rejected");
+    assert!(matches!(
+        epoch_error,
+        BucketSnapshotLoadError::Store(StoreError::StalePayloadOperation {
+            pg_id: 0,
+            operation_epoch,
+            current_epoch,
+        }) if operation_epoch.get() == client.cluster_epoch.get() + 1
+            && current_epoch == client.cluster_epoch
+    ));
+    let route = retained_object_mutation_route(&client, pg_id, &bound_bucket, &bound_key);
+
+    assert_route_subject_mismatch(
+        route
+            .release_object_payload_reclaim_claim(&test_object_payload_reclaim_claim(
+                foreign_bucket,
+                foreign_key,
+                pg_id.get(),
+            ))
+            .unwrap_err(),
+        "release object payload reclaim claim",
+    );
+    assert_route_subject_mismatch(
+        route
+            .release_object_payload_reclaim_claim(&test_object_payload_reclaim_claim(
+                bound_bucket.clone(),
+                bound_key.clone(),
+                pg_id.get().saturating_add(1),
+            ))
+            .unwrap_err(),
+        "release object payload reclaim claim",
+    );
+    let mut wrong_epoch = test_object_payload_reclaim_claim(bound_bucket, bound_key, pg_id.get());
+    wrong_epoch.cluster_epoch = ClusterEpoch::new(2).unwrap();
+    assert_route_subject_mismatch(
+        route
+            .release_object_payload_reclaim_claim(&wrong_epoch)
+            .unwrap_err(),
+        "release object payload reclaim claim",
+    );
 }
 
 #[test]
@@ -74,11 +143,13 @@ fn unix_object_payload_reclaim_claim_release_survives_expired_route() {
         config.socket_path.clone(),
     );
 
-    RetainedObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
+    retained_object_mutation_route(
         &client,
         ObjectMetadataPgId::new_for_test(PgId::new(0)),
-        &claim,
+        &bucket,
+        &key,
     )
+    .release_object_payload_reclaim_claim(&claim)
     .expect("retained reclaim claim release must survive active route expiry");
     server_thread.join().unwrap();
 
@@ -279,14 +350,8 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
     ));
 
     assert!(matches!(
-        RetainedObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
-            &client,
-            wrong_pg,
-            config.cluster_epoch,
-            &bucket,
-            &key,
-            &session_id,
-        ),
+        retained_object_mutation_route(&client, wrong_pg, &bucket, &key)
+            .prepare_retained_stream_upload_abort(&session_id),
         Err(ObjectPgActionError::Store(StoreError::StorageRpc {
             failure: StorageRpcErrorCode::PayloadDecode,
             ..
@@ -323,16 +388,11 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
         }
     ));
 
-    let command = RetainedObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
-        &client,
-        correct_pg,
-        config.cluster_epoch,
-        &bucket,
-        &key,
-        &session_id,
-    )
-    .unwrap()
-    .expect("expired-route retained cleanup must prepare the exact abort");
+    let retained_route = retained_object_mutation_route(&client, correct_pg, &bucket, &key);
+    let command = retained_route
+        .prepare_retained_stream_upload_abort(&session_id)
+        .unwrap()
+        .expect("expired-route retained cleanup must prepare the exact abort");
     let abort = command.abort();
     assert_eq!(abort.bucket, bucket);
     assert_eq!(abort.key, key);
@@ -345,15 +405,8 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
             .unwrap()
     );
 
-    let part_command =
-        RetainedObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
-            &client,
-            correct_pg,
-            config.cluster_epoch,
-            &bucket,
-            &key,
-            &part_session_id,
-        )
+    let part_command = retained_route
+        .prepare_retained_stream_upload_abort(&part_session_id)
         .unwrap()
         .expect("expired-route retained cleanup must prepare the UploadPart abort");
     let abort = part_command.abort();
@@ -3114,11 +3167,13 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     .unwrap()
     .expect("seeded object reclaim claim should load");
     assert_eq!(loaded_claim, claim);
-    RetainedObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
+    retained_object_mutation_route(
         &client,
         ObjectMetadataPgId::new_for_test(PgId::new(0)),
-        &claim,
+        &bucket,
+        &key,
     )
+    .release_object_payload_reclaim_claim(&claim)
     .unwrap();
     client
         .validate_bucket_payload_reclaim_root_response(
@@ -3966,22 +4021,16 @@ fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
     );
 
     assert_bucket_payload_decode!(
-        RetainedObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
-            &client,
-            wrong_pg,
-            &wrong_claim,
-        )
+        retained_object_mutation_route(&client, wrong_pg, &bucket, &key)
+            .release_object_payload_reclaim_claim(&wrong_claim)
     );
     assert_bucket_payload_decode!(
         ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(&client, wrong_scan_pg)
     );
 
-    RetainedObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
-        &client,
-        correct_pg,
-        &correct_claim,
-    )
-    .unwrap();
+    retained_object_mutation_route(&client, correct_pg, &bucket, &key)
+        .release_object_payload_reclaim_claim(&correct_claim)
+        .unwrap();
     assert!(
         ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(&client, correct_scan_pg)
             .unwrap()

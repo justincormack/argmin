@@ -136,16 +136,105 @@ fn test_retained_bucket_write_subjects(
     }
 }
 
-fn assert_retained_bucket_write_subject_mismatch(
-    error: BucketSnapshotLoadError,
-    expected_operation: &'static str,
-) {
+fn assert_route_subject_mismatch(error: BucketSnapshotLoadError, expected_operation: &'static str) {
     assert!(matches!(
         error,
         BucketSnapshotLoadError::Store(StoreError::RouteCapabilitySubjectMismatch {
             operation,
         }) if operation == expected_operation
     ));
+}
+
+fn test_object_payload_reclaim_claim(
+    bucket: BucketName,
+    key: ObjectKey,
+    pg_id: u32,
+) -> ObjectPayloadReclaimClaimRecord {
+    ObjectPayloadReclaimClaimRecord {
+        bucket,
+        bucket_incarnation_generation: 3,
+        key,
+        generation_id: GenerationId::new(4).unwrap(),
+        reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+        claim_id: "retained-object-route-claim".to_string(),
+        owner_token: "retained-object-route-owner".to_string(),
+        cluster_epoch: ClusterEpoch::INITIAL,
+        pg_id,
+        claimed_at: 10,
+        lease_deadline: Some(20),
+        attempt_count: 1,
+        last_error: None,
+    }
+}
+
+#[test]
+fn local_retained_object_mutation_route_rejects_foreign_claim_before_storage() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), storage_node);
+    let bound_bucket = crate::tests::bucket_name("retained-object-route-bound-bucket");
+    let bound_key = crate::tests::object_key("retained-object-route-bound-key");
+    let foreign_bucket = crate::tests::bucket_name("retained-object-route-foreign-bucket");
+    let foreign_key = crate::tests::object_key("retained-object-route-foreign-key");
+    let pg_id = client
+        .storage_node
+        .object_metadata_pg_for(&bound_bucket, &bound_key);
+    assert_route_subject_mismatch(
+        client
+            .open_retained_object_mutation_route(
+                ObjectMetadataPgId::new_for_test(PgId::new(pg_id.get().saturating_add(1))),
+                ClusterEpoch::INITIAL,
+                &bound_bucket,
+                &bound_key,
+            )
+            .err()
+            .expect("foreign object PG must be rejected"),
+        "open retained object mutation route",
+    );
+    let route = client
+        .open_retained_object_mutation_route(
+            pg_id,
+            ClusterEpoch::INITIAL,
+            &bound_bucket,
+            &bound_key,
+        )
+        .unwrap();
+
+    assert_route_subject_mismatch(
+        route
+            .release_object_payload_reclaim_claim(&test_object_payload_reclaim_claim(
+                foreign_bucket,
+                foreign_key,
+                pg_id.get(),
+            ))
+            .unwrap_err(),
+        "release object payload reclaim claim",
+    );
+    assert_route_subject_mismatch(
+        route
+            .release_object_payload_reclaim_claim(&test_object_payload_reclaim_claim(
+                bound_bucket.clone(),
+                bound_key.clone(),
+                pg_id.get().saturating_add(1),
+            ))
+            .unwrap_err(),
+        "release object payload reclaim claim",
+    );
+    let mut wrong_epoch = test_object_payload_reclaim_claim(bound_bucket, bound_key, pg_id.get());
+    wrong_epoch.cluster_epoch = ClusterEpoch::new(2).unwrap();
+    assert_route_subject_mismatch(
+        route
+            .release_object_payload_reclaim_claim(&wrong_epoch)
+            .unwrap_err(),
+        "release object payload reclaim claim",
+    );
 }
 
 #[test]
@@ -200,19 +289,19 @@ fn local_retained_bucket_write_route_rejects_foreign_subject_before_storage() {
             "release lifecycle sweep claim",
         ),
     ] {
-        assert_retained_bucket_write_subject_mismatch(error, operation);
+        assert_route_subject_mismatch(error, operation);
     }
 
     let mut wrong_pg = test_retained_bucket_write_subjects(bound_bucket, pg_id.get());
     wrong_pg.delete_claim.pg_id = pg_id.get().saturating_add(1);
     wrong_pg.lifecycle_claim.pg_id = pg_id.get().saturating_add(1);
-    assert_retained_bucket_write_subject_mismatch(
+    assert_route_subject_mismatch(
         route
             .release_bucket_delete_finalize_claim(&wrong_pg.delete_claim)
             .unwrap_err(),
         "release bucket delete finalize claim",
     );
-    assert_retained_bucket_write_subject_mismatch(
+    assert_route_subject_mismatch(
         route
             .release_lifecycle_sweep_claim(&wrong_pg.lifecycle_claim)
             .unwrap_err(),

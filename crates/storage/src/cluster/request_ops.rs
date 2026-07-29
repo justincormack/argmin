@@ -11874,10 +11874,13 @@ impl super::StorageCluster {
         };
         let reclaim_authority = ObjectPayloadReclaimClaimProof::from(&claim);
 
+        let retained_reclaim_route = retained_mutation_client
+            .open_retained_object_mutation_route(object_pg_id, self.operation_epoch(), bucket, key)
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
         let release_reclaim_claim = || -> Result<(), ObjectPgActionError> {
             self.maybe_run_before_reclaim_claim_release_hook()?;
-            retained_mutation_client
-                .release_object_payload_reclaim_claim(object_pg_id, &claim)
+            retained_reclaim_route
+                .release_object_payload_reclaim_claim(&claim)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
         };
 
