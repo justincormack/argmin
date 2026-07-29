@@ -348,7 +348,37 @@ The bucket-tag XML is embedded in these storage-owned containing formats:
 An incompatible change to the shared canonical XML therefore requires a new tag inner version and
 coordinated advancement of both the object-tag containing formats above and the bucket-tag
 containing formats here. Current decoders have no old-version, prefix, or alternate-XML fallback.
-ACL containment remains outstanding.
+
+### Nested Durable Codec Inventory: ACL Grants (2026-07-28)
+
+`s3-types` owns the logical `AclGrant`, `AclGrantee`, `AclPermission`, and `AclGrants` values and
+their canonical durable representation. Storage APIs carry only logical `AclGrants`; HTTP and
+`server-core` neither produce nor consume the durable string. The empty set is the empty string.
+Each nonempty grant is one newline-terminated `kind:value:PERMISSION` record, with grants in the
+logical type's canonical sort order and duplicates removed. Canonical-user IDs are stored in their
+canonical lowercase form. Exact goldens pin both the empty and representative nonempty encoding.
+
+`AclGrants::to_current_storage_string()` is the only encoder and
+`AclGrants::parse_current_storage()` rejects malformed values and every parseable but
+noncanonical spelling, including reordered or duplicate grants, CRLF separators, normalized
+canonical-user IDs, and a missing final newline. PG, metadata-command, and storage-RPC decoders
+all use this exact-current decoder. Metadata-checkpoint export and installation find every
+`acl_grants` column in the storage-owned table inventory and exact-decode it after row-integrity
+validation; checksum-valid noncanonical ACL rows cannot be transferred.
+
+The ACL representation is embedded in these storage-owned containing formats:
+
+| Containing format | Current baseline | ACL embedding |
+| --- | --- | --- |
+| PG SQLite schema | schema version 1 | `buckets`, `objects`, and `multipart_uploads` store canonical ACL strings. |
+| Metadata command | encoding version 5 | Bucket, object, multipart-upload, create, commit, and ACL mutation records carry canonical ACL strings. |
+| Storage-node RPC | frame encoding version 11 | Logical bucket, object, multipart, stream-commit, and ACL mutation messages carry canonical ACL strings. |
+| Canonical PG state | encoding version 4 | The three persisted ACL columns participate in canonical row and state digests. |
+| Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry all three ACL columns and bind them into row, table, state, and checkpoint digests. |
+
+An incompatible ACL representation change requires an explicit new inner version and coordinated
+advancement of every containing format above. Current decoders have no old-version, prefix, or
+normalizing fallback.
 
 ### Nested Durable Codec Inventory: Object Encryption State (2026-07-28)
 
@@ -742,11 +772,11 @@ Raft peer client and server transports are storage-owned and boundary-checked.
    `ControlPlaneError` transport, response-loss, leader-routing, and runtime-map readiness
    classification is storage-owned. Callers cannot parse or recover retained implementation
    diagnostics, and cannot construct raw `Io`, `RpcProtocol`, or `RpcRemote` variants.
-4. **In progress:** inventory and restrict nested durable codecs for metadata, tags, ACLs, and
+4. **Complete:** inventory and restrict nested durable codecs for metadata, tags, ACLs, and
    encryption; record how containing formats advance when a nested format changes. Object
-   encryption, user/system metadata, object tags, and bucket tags are complete: their private
-   codecs are owner-local and boundary-checked, their exact current representations are
-   golden-tested, and all containing formats are recorded above. ACLs remain.
+   encryption, user/system metadata, object tags, bucket tags, and ACL grants have owner-local
+   codecs, boundary checks, exact current-representation goldens, and containing-format
+   inventories above.
 5. Audit existing version/fallback code and remove unsupported legacy compatibility where it
    worsens current invariants.
 6. Add or tighten current-version rejection tests for existing versioned formats.

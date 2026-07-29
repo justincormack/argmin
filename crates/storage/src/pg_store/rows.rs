@@ -1183,7 +1183,7 @@ impl PgStore {
         col_idx: usize,
         field_name: &'static str,
     ) -> Result<AclGrants, rusqlite::Error> {
-        AclGrants::parse(&raw).map_err(|msg| {
+        AclGrants::parse_current_storage(&raw).map_err(|msg| {
             rusqlite::Error::FromSqlConversionFailure(
                 col_idx,
                 rusqlite::types::Type::Text,

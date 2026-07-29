@@ -4614,6 +4614,43 @@ fn metadata_command_checkpoint_export_rejects_bucket_tag_aux_for_live_and_tombst
 }
 
 #[test]
+fn metadata_command_checkpoint_acl_inventory_covers_every_persisted_acl_table() {
+    assert_eq!(
+        METADATA_DIGEST_TABLES
+            .iter()
+            .filter(|table| table.columns.contains(&"acl_grants"))
+            .map(|table| table.name)
+            .collect::<Vec<_>>(),
+        vec!["buckets", "multipart_uploads", "objects"]
+    );
+}
+
+#[test]
+fn metadata_command_checkpoint_export_rejects_noncanonical_acl_grants() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-checkpoint-invalid-acl");
+    create_probe_bucket_direct(&store, &bucket);
+    store
+        .conn
+        .execute(
+            "UPDATE buckets SET acl_grants = ?1 WHERE name = ?2",
+            params!["group:all_users:READ", bucket],
+        )
+        .unwrap();
+    store.refresh_metadata_command_state_digest().unwrap();
+
+    let err = store
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataCheckpointInvalid { reason, .. }
+            if reason == "InvalidAclGrantsRow { table_name: \"buckets\", row_index: 0 }"
+    ));
+}
+
+#[test]
 fn metadata_command_checkpoint_exports_blob_backed_metadata_rows() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();
@@ -4959,6 +4996,69 @@ fn install_metadata_transfer_checkpoint_base_rejects_resealed_bucket_tag_aux() {
             "rejected checkpoint must leave the destination empty"
         );
     }
+}
+
+#[test]
+fn install_metadata_transfer_checkpoint_base_rejects_resealed_noncanonical_acl_grants() {
+    let source_tmp = test_util::tempdir();
+    let source = PgStore::open(source_tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-checkpoint-install-invalid-acl");
+    create_probe_bucket_direct(&source, &bucket);
+    source.refresh_metadata_command_state_digest().unwrap();
+    let mut checkpoint = source
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+
+    let bucket_block = checkpoint
+        .table_blocks
+        .iter_mut()
+        .find(|block| block.table_name == "buckets")
+        .expect("checkpoint must contain the buckets table");
+    let acl_column = bucket_block
+        .columns
+        .iter()
+        .position(|column| column == "acl_grants")
+        .expect("buckets checkpoint table must contain ACL grants");
+    bucket_block.rows[0].values[acl_column] =
+        MetadataCheckpointValue::Text(b"group:all_users:READ".to_vec());
+    PgStore::test_reseal_metadata_command_checkpoint(&mut checkpoint);
+    assert_eq!(
+        checkpoint.verify(),
+        Err(
+            MetadataCommandCheckpointValidationError::InvalidAclGrantsRow {
+                table_name: "buckets".to_string(),
+                row_index: 0,
+            }
+        )
+    );
+
+    let destination_tmp = test_util::tempdir();
+    let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
+    let before = destination.metadata_command_replica_state().unwrap();
+    let destination_epoch = ClusterEpoch::new(34).unwrap();
+    let err = destination
+        .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataCheckpointInvalid {
+            pg_id: 1,
+            cluster_epoch,
+            reason,
+            ..
+        } if cluster_epoch == destination_epoch
+            && reason == "InvalidAclGrantsRow { table_name: \"buckets\", row_index: 0 }"
+    ));
+    assert_eq!(
+        destination.metadata_command_replica_state().unwrap(),
+        before
+    );
+    assert!(
+        destination
+            .metadata_command_replica_state_can_initialize()
+            .unwrap(),
+        "rejected checkpoint must leave the destination empty"
+    );
 }
 
 #[test]
@@ -8626,6 +8726,27 @@ fn stored_bucket_tag_rows_reject_aux_for_live_and_tombstone_rows() {
             matches!(err, MetadataError::Db { .. }),
             "expected invalid bucket-tag aux to fail closed, got: {err:?}"
         );
+    }
+}
+
+#[test]
+fn stored_acl_grants_require_current_canonical_representation() {
+    let canonical = "group:all_users:READ\n";
+    assert_eq!(
+        PgStore::parse_acl_grants(canonical.to_string(), 0, "ACL grants")
+            .unwrap()
+            .to_current_storage_string(),
+        canonical
+    );
+
+    for noncanonical in [
+        "group:all_users:READ",
+        "group:all_users:READ\ngroup:all_users:READ\n",
+    ] {
+        assert!(matches!(
+            PgStore::parse_acl_grants(noncanonical.to_string(), 0, "ACL grants"),
+            Err(rusqlite::Error::FromSqlConversionFailure(..))
+        ));
     }
 }
 

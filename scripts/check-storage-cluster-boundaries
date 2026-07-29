@@ -2789,6 +2789,25 @@ fail_with_matches \
     "Canonical object/bucket-tag XML, exact-current decoders, and generic tagging discriminators are private to s3-types/storage; other crates must pass logical or typed tag-set values" \
     "$tag_codec_leaks"
 
+acl_codec_leaks=$(
+    {
+        rg -n --color=never \
+            '\bAclGrants::(parse_current_storage|to_current_storage_string)\b|\.to_current_storage_string\(\)' \
+            . \
+            -g 'crates/**/*.rs' \
+            -g '!crates/s3-types/**' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            'pub fn (serialized|parse_storage)\(' \
+            crates/s3-types/src/lib.rs \
+            || true
+    }
+)
+fail_with_matches \
+    "Canonical ACL storage strings and exact-current decoding are private to s3-types/storage; other crates must pass logical AclGrants values" \
+    "$acl_codec_leaks"
+
 if [[ "$failed" -ne 0 ]]; then
     echo
     echo "storage cluster boundary checks failed" >&2

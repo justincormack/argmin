@@ -2278,7 +2278,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
     }
 
     fn read_acl_grants(&mut self) -> Result<AclGrants, String> {
-        AclGrants::parse(&self.read_string("ACL grants")?)
+        AclGrants::parse_current_storage(&self.read_string("ACL grants")?)
             .map_err(|reason| format!("invalid ACL grants in metadata command: {reason}"))
     }
 
@@ -3796,7 +3796,7 @@ fn encode_multipart_upload(out: &mut Vec<u8>, upload: &MultipartUploadRecord) {
     put_bytes(out, upload.system_metadata_blob.as_slice());
     encode_owner_identity(out, &upload.initiator);
     encode_owner_identity(out, &upload.owner);
-    put_str(out, &upload.acl_grants.serialized());
+    put_str(out, &upload.acl_grants.to_current_storage_string());
     put_bool(out, upload.public_read);
     put_u64(out, upload.object_generation_id.get());
     encode_multipart_object_identity(out, upload.initiated_object_identity);
@@ -3836,7 +3836,7 @@ fn encode_put_live_object(out: &mut Vec<u8>, object: &PutLiveObjectReq) {
     encode_version_id(out, object.version_id);
     put_str(out, &object.owner.principal);
     put_str(out, object.owner.canonical_id.as_str());
-    put_str(out, &object.acl_grants.serialized());
+    put_str(out, &object.acl_grants.to_current_storage_string());
     put_bool(out, object.public_read);
     put_u64(out, object.generation_id.get());
     put_u64(out, object.size);
@@ -3865,7 +3865,7 @@ fn encode_live_object_record(out: &mut Vec<u8>, object: &LiveObjectRecord) {
     put_str(out, object.key.as_str());
     encode_version_id(out, object.version_id);
     encode_owner_identity(out, &object.owner);
-    put_str(out, &object.acl_grants.serialized());
+    put_str(out, &object.acl_grants.to_current_storage_string());
     put_bool(out, object.public_read);
     put_u64(out, object.generation_id.get());
     put_u64(out, object.size);
@@ -3901,7 +3901,7 @@ fn encode_bucket_record(out: &mut Vec<u8>, bucket: &BucketRecord) {
     put_u8(out, bucket.state as u8);
     put_u8(out, bucket.versioning as u8);
     encode_object_lock(out, bucket.object_lock);
-    put_str(out, &bucket.acl_grants.serialized());
+    put_str(out, &bucket.acl_grants.to_current_storage_string());
     put_bool(out, bucket.public_read);
     put_bool(out, bucket.public_write);
     encode_public_access_block(out, bucket.public_access_block);
@@ -4525,6 +4525,29 @@ mod tests {
         assert!(
             matches!(decoded, BucketSubresourceMutation::PutTagging(tags) if tags.tag_set().clone().into_pairs() == vec![("key".into(), "value".into())])
         );
+    }
+
+    #[test]
+    fn metadata_command_acl_grants_require_current_canonical_representation() {
+        for noncanonical in [
+            "group:all_users:READ",
+            "group:all_users:READ\ngroup:all_users:READ\n",
+        ] {
+            let mut encoded = Vec::new();
+            put_str(&mut encoded, noncanonical);
+            let error = MetadataCommandLogEntryDecoder::new(&encoded)
+                .read_acl_grants()
+                .unwrap_err();
+            assert!(error.contains("not the current canonical representation"));
+        }
+
+        let canonical = "group:all_users:READ\n";
+        let mut encoded = Vec::new();
+        put_str(&mut encoded, canonical);
+        let decoded = MetadataCommandLogEntryDecoder::new(&encoded)
+            .read_acl_grants()
+            .unwrap();
+        assert_eq!(decoded.to_current_storage_string(), canonical);
     }
 
     #[test]

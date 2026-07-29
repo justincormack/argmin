@@ -15333,7 +15333,7 @@ impl<'a> StorageRpcDecoder<'a> {
             STORAGE_RPC_MAX_BUCKET_ACL_GRANTS_LEN,
             StorageRpcPayloadError::InvalidBucketMetadataRequest("ACL grants are too large"),
         )?;
-        AclGrants::parse(&value)
+        AclGrants::parse_current_storage(&value)
             .map_err(|_| StorageRpcPayloadError::InvalidBucketMetadataRequest("invalid ACL grants"))
     }
 
@@ -16236,7 +16236,7 @@ fn put_create_bucket_config(out: &mut Vec<u8>, config: &StorageRpcCreateBucketCo
     put_string(out, config.name.as_str());
     put_string(out, &config.owner_principal);
     put_string(out, config.owner_canonical_id.as_str());
-    put_string(out, &config.acl_grants.serialized());
+    put_string(out, &config.acl_grants.to_current_storage_string());
     put_bool(out, config.public_read);
     put_bool(out, config.public_write);
     put_u8(out, config.versioning as u8);
@@ -16253,7 +16253,7 @@ fn put_bucket_info(out: &mut Vec<u8>, info: &BucketInfo) {
     put_u8(out, info.state as u8);
     put_u8(out, info.versioning as u8);
     put_bucket_object_lock_config(out, &info.object_lock);
-    put_string(out, &info.acl_grants.serialized());
+    put_string(out, &info.acl_grants.to_current_storage_string());
     put_bool(out, info.public_read);
     put_bool(out, info.public_write);
     put_optional_public_access_block_config(out, info.public_access_block);
@@ -16330,7 +16330,7 @@ fn put_bucket_metadata_control_mutation(
             summary,
         } => {
             put_u8(out, 1);
-            put_string(out, &acl_grants.serialized());
+            put_string(out, &acl_grants.to_current_storage_string());
             put_bool(out, summary.public_read);
             put_bool(out, summary.public_write);
         }
@@ -16572,7 +16572,7 @@ fn put_commit_direct_put_object_req(out: &mut Vec<u8>, request: &CommitDirectPut
     put_string(out, request.generation_reservation_id.as_str());
     put_u8(out, request.versioning as u8);
     put_owner_identity(out, &request.owner);
-    put_string(out, &request.acl_grants.serialized());
+    put_string(out, &request.acl_grants.to_current_storage_string());
     put_bool(out, request.public_read);
     put_u64(out, request.generation_id.get());
     put_u64(out, request.size);
@@ -16655,7 +16655,7 @@ fn put_put_object_metadata_mutation(out: &mut Vec<u8>, mutation: &PutObjectMetad
             public_read,
         } => {
             put_u8(out, 4);
-            put_string(out, &acl_grants.serialized());
+            put_string(out, &acl_grants.to_current_storage_string());
             put_bool(out, *public_read);
         }
     }
@@ -16843,7 +16843,7 @@ fn put_stream_put_commit_input(out: &mut Vec<u8>, commit: &StreamPutCommitInput)
     put_u8(out, commit.versioning as u8);
     put_u64(out, commit.version_id.to_u64());
     put_owner_identity(out, &commit.owner);
-    put_string(out, &commit.acl_grants.serialized());
+    put_string(out, &commit.acl_grants.to_current_storage_string());
     put_bool(out, commit.public_read);
     put_u64(out, commit.size);
     put_u64(out, commit.etag_crc64);
@@ -16864,7 +16864,7 @@ fn put_complete_multipart_commit_request(
     put_bytes(out, request.completion_fingerprint.as_bytes());
     put_u8(out, request.versioning as u8);
     put_owner_identity(out, &request.owner);
-    put_string(out, &request.acl_grants.serialized());
+    put_string(out, &request.acl_grants.to_current_storage_string());
     put_bool(out, request.public_read);
     put_u64(out, request.generation_id.get());
     put_u64(out, request.size);
@@ -17059,7 +17059,7 @@ fn put_create_multipart_upload_req(out: &mut Vec<u8>, request: &CreateMultipartU
     put_bytes(out, request.system_metadata_blob.as_slice());
     put_owner_identity(out, &request.initiator);
     put_owner_identity(out, &request.owner);
-    put_string(out, &request.acl_grants.serialized());
+    put_string(out, &request.acl_grants.to_current_storage_string());
     put_bool(out, request.public_read);
     put_object_lock_state(out, request.object_lock);
     put_optional_multipart_checksum_config(out, request.checksum);
@@ -17109,7 +17109,7 @@ fn put_multipart_upload_record(out: &mut Vec<u8>, record: &MultipartUploadRecord
     put_bytes(out, record.system_metadata_blob.as_slice());
     put_owner_identity(out, &record.initiator);
     put_owner_identity(out, &record.owner);
-    put_string(out, &record.acl_grants.serialized());
+    put_string(out, &record.acl_grants.to_current_storage_string());
     put_bool(out, record.public_read);
     put_u64(out, record.object_generation_id.get());
     put_optional_multipart_object_identity(out, record.initiated_object_identity);
@@ -17374,7 +17374,7 @@ fn put_live_object_record(out: &mut Vec<u8>, record: &LiveObjectRecord) {
     put_string(out, record.key.as_str());
     put_u64(out, record.version_id.to_u64());
     put_owner_identity(out, &record.owner);
-    put_string(out, &record.acl_grants.serialized());
+    put_string(out, &record.acl_grants.to_current_storage_string());
     put_bool(out, record.public_read);
     put_u64(out, record.generation_id.get());
     put_u64(out, record.size);
@@ -17819,6 +17819,29 @@ mod tests {
         assert!(
             matches!(decoded, BucketSubresourceMutation::PutTagging(tags) if tags.tag_set().clone().into_pairs() == vec![("key".into(), "value".into())])
         );
+    }
+
+    #[test]
+    fn storage_rpc_acl_grants_require_current_canonical_representation() {
+        for noncanonical in [
+            "group:all_users:READ",
+            "group:all_users:READ\ngroup:all_users:READ\n",
+        ] {
+            let mut encoded = Vec::new();
+            put_string(&mut encoded, noncanonical);
+            assert!(matches!(
+                StorageRpcDecoder::new(&encoded).read_acl_grants(),
+                Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
+                    "invalid ACL grants"
+                ))
+            ));
+        }
+
+        let canonical = "group:all_users:READ\n";
+        let mut encoded = Vec::new();
+        put_string(&mut encoded, canonical);
+        let decoded = StorageRpcDecoder::new(&encoded).read_acl_grants().unwrap();
+        assert_eq!(decoded.to_current_storage_string(), canonical);
     }
 
     #[test]

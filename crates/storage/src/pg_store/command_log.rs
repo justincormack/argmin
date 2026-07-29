@@ -159,6 +159,10 @@ pub enum MetadataCommandCheckpointValidationError {
     InvalidBucketTagRow {
         row_index: usize,
     },
+    InvalidAclGrantsRow {
+        table_name: String,
+        row_index: usize,
+    },
     TableDigestMismatch {
         table_name: String,
         expected_digest: u64,
@@ -327,6 +331,15 @@ impl MetadataCommandCheckpoint {
         row_index: usize,
         values: &[MetadataCheckpointValue],
     ) -> Result<(), MetadataCommandCheckpointValidationError> {
+        Self::verify_bucket_tag_row(table, row_index, values)?;
+        Self::verify_acl_grants_row(table, row_index, values)
+    }
+
+    fn verify_bucket_tag_row(
+        table: &MetadataDigestTable,
+        row_index: usize,
+        values: &[MetadataCheckpointValue],
+    ) -> Result<(), MetadataCommandCheckpointValidationError> {
         if table.name != "bucket_subresources"
             || !matches!(
                 values.get(1),
@@ -355,6 +368,38 @@ impl MetadataCommandCheckpoint {
             Ok(())
         } else {
             Err(Self::invalid_bucket_tag_row(row_index))
+        }
+    }
+
+    fn verify_acl_grants_row(
+        table: &MetadataDigestTable,
+        row_index: usize,
+        values: &[MetadataCheckpointValue],
+    ) -> Result<(), MetadataCommandCheckpointValidationError> {
+        let Some(acl_column) = table
+            .columns
+            .iter()
+            .position(|column| *column == "acl_grants")
+        else {
+            return Ok(());
+        };
+        let valid = matches!(
+            values.get(acl_column),
+            Some(MetadataCheckpointValue::Text(raw))
+                if std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|raw| AclGrants::parse_current_storage(raw).ok())
+                    .is_some()
+        );
+        if valid {
+            Ok(())
+        } else {
+            Err(
+                MetadataCommandCheckpointValidationError::InvalidAclGrantsRow {
+                    table_name: table.name.to_owned(),
+                    row_index,
+                },
+            )
         }
     }
 

@@ -889,6 +889,8 @@ pub enum AclGrantsParseError {
     InvalidGrantee { line: usize },
     #[error("invalid ACL permission in ACL grant on line {line}")]
     InvalidPermission { line: usize },
+    #[error("stored ACL grants are not the current canonical representation")]
+    NonCanonical,
 }
 
 impl AclGrants {
@@ -941,8 +943,9 @@ impl AclGrants {
         self.allows_all_users(permission) || self.allows_authenticated_users(permission)
     }
 
+    /// Encode the exact current durable ACL representation.
     #[must_use]
-    pub fn serialized(&self) -> String {
+    pub fn to_current_storage_string(&self) -> String {
         let mut out = String::new();
         for grant in &self.0 {
             let (kind, value) = grant.grantee().serialize_tag();
@@ -951,7 +954,17 @@ impl AclGrants {
         out
     }
 
-    pub fn parse(serialized: &str) -> Result<Self, AclGrantsParseError> {
+    /// Decode only the exact current durable ACL representation.
+    pub fn parse_current_storage(serialized: &str) -> Result<Self, AclGrantsParseError> {
+        let grants = Self::parse_storage(serialized)?;
+        if grants.to_current_storage_string() == serialized {
+            Ok(grants)
+        } else {
+            Err(AclGrantsParseError::NonCanonical)
+        }
+    }
+
+    fn parse_storage(serialized: &str) -> Result<Self, AclGrantsParseError> {
         if serialized.is_empty() {
             return Ok(Self::default());
         }
@@ -1403,7 +1416,7 @@ mod tests {
     }
 
     #[test]
-    fn acl_grants_round_trip_and_normalize() {
+    fn acl_grants_current_storage_round_trip_and_authorization() {
         let alt = CanonicalUserId::from_principal("alt");
         let grants = AclGrants::new(vec![
             AclGrant::new(AclGrantee::AllUsers, AclPermission::Read),
@@ -1414,8 +1427,8 @@ mod tests {
             ),
             AclGrant::new(AclGrantee::AllUsers, AclPermission::Read),
         ]);
-        let serialized = grants.serialized();
-        let parsed = AclGrants::parse(&serialized).unwrap();
+        let serialized = grants.to_current_storage_string();
+        let parsed = AclGrants::parse_current_storage(&serialized).unwrap();
         assert_eq!(parsed, grants);
         assert!(parsed.allows_all_users(AclPermission::Read));
         assert!(parsed.allows_canonical_user(&alt, AclPermission::WriteAcp));
@@ -1428,29 +1441,90 @@ mod tests {
     #[test]
     fn acl_grants_parse_reports_typed_errors() {
         assert_eq!(
-            AclGrants::parse("group").unwrap_err(),
+            AclGrants::parse_current_storage("group").unwrap_err(),
             AclGrantsParseError::MissingValue { line: 1 }
         );
         assert_eq!(
-            AclGrants::parse("group:all_users").unwrap_err(),
+            AclGrants::parse_current_storage("group:all_users").unwrap_err(),
             AclGrantsParseError::MissingPermission { line: 1 }
         );
         assert_eq!(
-            AclGrants::parse("cu:not-a-canonical-id:READ").unwrap_err(),
+            AclGrants::parse_current_storage("cu:not-a-canonical-id:READ").unwrap_err(),
             AclGrantsParseError::InvalidCanonicalUserId { line: 1 }
         );
         assert_eq!(
-            AclGrants::parse("group:unknown:READ").unwrap_err(),
+            AclGrants::parse_current_storage("group:unknown:READ").unwrap_err(),
             AclGrantsParseError::InvalidGrantee { line: 1 }
         );
         assert_eq!(
-            AclGrants::parse("group:all_users:BAD").unwrap_err(),
+            AclGrants::parse_current_storage("group:all_users:BAD").unwrap_err(),
             AclGrantsParseError::InvalidPermission { line: 1 }
         );
         assert_eq!(
-            AclGrants::parse("group:all_users:READ\ngroup:unknown:READ").unwrap_err(),
+            AclGrants::parse_current_storage("group:all_users:READ\ngroup:unknown:READ")
+                .unwrap_err(),
             AclGrantsParseError::InvalidGrantee { line: 2 }
         );
+    }
+
+    #[test]
+    fn acl_grants_current_storage_representation_is_exact() {
+        let canonical_user = CanonicalUserId::new(
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let grants = AclGrants::new(vec![
+            AclGrant::new(AclGrantee::AllUsers, AclPermission::Read),
+            AclGrant::new(
+                AclGrantee::CanonicalUser(canonical_user),
+                AclPermission::FullControl,
+            ),
+            AclGrant::new(AclGrantee::AuthenticatedUsers, AclPermission::ReadAcp),
+        ]);
+        let expected = concat!(
+            "cu:1111111111111111111111111111111111111111111111111111111111111111:FULL_CONTROL\n",
+            "group:all_users:READ\n",
+            "group:authenticated_users:READ_ACP\n",
+        );
+        assert_eq!(AclGrants::default().to_current_storage_string(), "");
+        assert_eq!(grants.to_current_storage_string(), expected);
+        assert_eq!(AclGrants::parse_current_storage(expected).unwrap(), grants);
+
+        let all_permissions = AclGrants::new(vec![
+            AclGrant::new(AclGrantee::AllUsers, AclPermission::FullControl),
+            AclGrant::new(AclGrantee::AllUsers, AclPermission::WriteAcp),
+            AclGrant::new(AclGrantee::AllUsers, AclPermission::ReadAcp),
+            AclGrant::new(AclGrantee::AllUsers, AclPermission::Write),
+            AclGrant::new(AclGrantee::AllUsers, AclPermission::Read),
+        ]);
+        let all_permissions_expected = concat!(
+            "group:all_users:READ\n",
+            "group:all_users:WRITE\n",
+            "group:all_users:READ_ACP\n",
+            "group:all_users:WRITE_ACP\n",
+            "group:all_users:FULL_CONTROL\n",
+        );
+        assert_eq!(
+            all_permissions.to_current_storage_string(),
+            all_permissions_expected
+        );
+        assert_eq!(
+            AclGrants::parse_current_storage(all_permissions_expected).unwrap(),
+            all_permissions
+        );
+
+        for noncanonical in [
+            expected.trim_end(),
+            "group:all_users:READ\ncu:1111111111111111111111111111111111111111111111111111111111111111:FULL_CONTROL\ngroup:authenticated_users:READ_ACP\n",
+            "cu:1111111111111111111111111111111111111111111111111111111111111111:FULL_CONTROL\ngroup:all_users:READ\ngroup:all_users:READ\ngroup:authenticated_users:READ_ACP\n",
+            "cu:1111111111111111111111111111111111111111111111111111111111111111:FULL_CONTROL\r\ngroup:all_users:READ\r\ngroup:authenticated_users:READ_ACP\r\n",
+            "cu:A111111111111111111111111111111111111111111111111111111111111111:FULL_CONTROL\n",
+        ] {
+            assert_eq!(
+                AclGrants::parse_current_storage(noncanonical),
+                Err(AclGrantsParseError::NonCanonical)
+            );
+        }
     }
 
     #[test]
