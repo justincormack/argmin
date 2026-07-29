@@ -160,6 +160,66 @@ the `metadata.db` filename, SQLite file magic, and metadata-file synchronisation
 Those operations must move behind a storage-owned initialization/inspection/synchronisation
 API, and the associated impossible-layout tests must move into `storage`.
 
+### Legacy Compatibility Audit (2026-07-29)
+
+The current durable and cross-process format decoders were audited for version ranges,
+per-version parsing branches, old magic values, normalising fallbacks, and speculative migration
+paths. No decoder was found that accepts an older durable or wire representation: the PG schema,
+metadata commands and checkpoints, nested metadata/tag/ACL/encryption codecs, storage RPC,
+control-plane state/RPC/authentication formats, Raft peer/WAL/restart formats, static identities,
+and session-token envelope all require their exact current version or representation.
+
+The audit found these residual changes rather than another old-format reader:
+
+- `ControlPlaneAuthorityClock::new_from_process_clock` is an unused public legacy constructor
+  that permits proximity-only initialization without restart-checkpoint continuity. Remove it.
+  The equivalent sample-driven constructor is used only by tests and should be restricted to the
+  test surface rather than remain a public production capability.
+- Standalone and environment-only startup still use the active `legacy-local` storage path. That
+  path gives the shared `StorageCluster` an optional runtime-map content digest and unbounded
+  route-map validity, with an explicit `None`-digest/`None`-validity transition during a later
+  authoritative refresh. This is a current deployment architecture, not dead compatibility code,
+  so it must not simply be deleted. Replace the shared invariant exception by either constructing
+  an authoritative current standalone map/proof or separating standalone storage from the
+  dynamically refreshable cluster type; then make clustered generations require their digest and
+  validity proof.
+- The session-token envelope is exact-current, but its version selection is not contained:
+  `server-http` calls `seal_session_credential_v1`, and `auth` publicly re-exports the v1 prefix and
+  representation-size constants. Replace this with a semantic current-credential issuance method,
+  keep versioned sealing and representation constants private to `auth`, and add a boundary check
+  preventing external version selection.
+
+The following exact-version checks exist in production but still need explicit owner-local
+unsupported-version fixtures, including a recomputed checksum or digest where the containing
+format authenticates the version field:
+
+- static cluster manifest schema and both static storage/control-plane identity files
+- system metadata and the encrypted checksum-metadata projection
+- abandoned metadata-command log entries
+- storage RPC authentication transport and binding
+- control-plane clock checkpoint, durable identity, initialized marker, and journal file/record
+- Raft WAL file header and durable restart sentinel
+
+These current-format recovery paths were reviewed and are not migration compatibility:
+
+- SQLite version zero is accepted only when the database has no user schema objects; it is the
+  engine's fresh-database state, while every nonempty unversioned database fails closed.
+- PG open removes orphan temporary shard files, reconciles provably older-epoch pending command
+  slots, and repairs cache-only digest drift only after validating materialized state.
+- Durable journals accept a missing or empty file only at replay offset zero and recover only a
+  bounded torn tail after the last complete validated frame.
+- Single-authority startup reconciles interrupted current identity, prepared-snapshot, journal,
+  and checkpoint publication, while missing acknowledged durability fails closed.
+- Raft startup handles a missing initial WAL, a bounded torn WAL tail, and interrupted publication
+  of the current restart artifact/sentinel pair.
+- Metadata-transfer checkpoint fallback is a current reconstruction strategy selected when a
+  retained command prefix cannot reconstruct the state; it does not decode an older format.
+
+The `legacy-local` path above is the only audited compatibility-labelled behavior that remains in
+the shared production invariants. Environment/configuration fallback endpoints and AWS policy
+fallback rules are current availability or service-semantics behavior, not storage-format
+compatibility.
+
 ## Phase 1: Version Boundary Inventory And Containment
 
 Document every durable or cross-process format that needs an explicit baseline version, assign
@@ -235,7 +295,7 @@ Initial ownership assessment:
 | Object user/system metadata blobs | `server-core` | Keep storage's carriers opaque; make serialization entry points crate-private unless another owner has a demonstrated need to interpret them. |
 | Tag and ACL canonical value formats | `s3-types` | Keep validation and canonical value codecs central; treat their embeddings in storage rows/RPCs as separately versioned containing formats. |
 | Object encryption state | `storage` | Keep the durable codec private to storage while exposing only typed encryption state to callers. |
-| Session-token envelope | `auth` | Keep sealing/opening/version selection in auth; callers handle only issued token strings and semantic authentication results. |
+| Session-token envelope | `auth` | The envelope rejects non-v1 tokens, but version selection still leaks through public `seal_session_credential_v1`, v1 prefix, and size constants. Replace them with a semantic current-credential issuance API and boundary-check that callers handle only issued token strings and authentication results. |
 | Static manifest and process identity files | `argmin-s3` | The codecs are currently crate-local; inventory their coupling to storage/control-plane durable layout. |
 | Shared operator metric schema | `observability` | Decide explicitly which metrics are compatibility contracts before versioning the shared schema. Subsystem-specific persisted diagnostics must be inventoried as separate boundaries owned by their producing crate rather than treated as one shared format. |
 
@@ -777,11 +837,16 @@ Raft peer client and server transports are storage-owned and boundary-checked.
    encryption, user/system metadata, object tags, bucket tags, and ACL grants have owner-local
    codecs, boundary checks, exact current-representation goldens, and containing-format
    inventories above.
-5. Audit existing version/fallback code and remove unsupported legacy compatibility where it
-   worsens current invariants.
-6. Add or tighten current-version rejection tests for existing versioned formats.
-7. Add boundary checks for the concrete leaks found in this audit, while relying on crate
-    privacy for the durable enforcement.
+5. **Audit complete; remediation outstanding:** remove the unused legacy authority-clock
+   constructor and replace the active `legacy-local` digest/validity exception with a current
+   standalone authority proof or a separate standalone type before making the clustered
+   invariants mandatory.
+6. Add the owner-local current-version rejection fixtures listed in the 2026-07-29 audit,
+   recomputing enclosing checksums/digests so each test reaches the version check rather than
+   passing through a generic corruption path.
+7. Contain session-token version selection inside `auth` and add a boundary check rejecting
+   versioned sealing calls or representation constants outside that owner. Continue relying on
+   crate privacy for the already-contained durable formats.
 8. Remove the trigger-verification item from Phase 11 stabilisation tracking and keep this
     plan as the upgrade home for it; defer trigger body hashing/recreation until the upgrade
     framework is deliberately started.
