@@ -322,11 +322,17 @@ openssl x509 -req -sha256 -days 2 -in "$material_dir/server.csr" \
 chmod 600 "$material_dir/server.key"
 chmod 644 "$material_dir/server.crt"
 
+declare -A generated_auth_secrets=()
 for role in raft storage admin; do
     for number in 1 2 3; do
-        printf 'argmin-multihost-%s-%s-%s-secret\n' "$run_id" "$role" "$number" \
-            >"$material_dir/$role-$number.key"
-        chmod 600 "$material_dir/$role-$number.key"
+        secret_path="$material_dir/$role-$number.key"
+        (umask 077 && openssl rand -hex 32 >"$secret_path")
+        secret="$(<"$secret_path")"
+        [[ "$secret" =~ ^[0-9a-f]{64}$ ]] ||
+            die "openssl generated malformed $role-$number credential material"
+        [[ -z "${generated_auth_secrets[$secret]:-}" ]] ||
+            die "openssl generated duplicate credential material for ${generated_auth_secrets[$secret]} and $role-$number"
+        generated_auth_secrets["$secret"]="$role-$number"
     done
 done
 
