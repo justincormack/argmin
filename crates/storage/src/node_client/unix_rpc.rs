@@ -3192,7 +3192,7 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-    ) -> Result<Box<dyn MetadataCommandNodeClient>, StoreError> {
+    ) -> Result<Box<dyn MetadataCommandCriticalSection>, StoreError> {
         if cluster_epoch != self.cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
                 pg_id: pg_id.get(),

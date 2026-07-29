@@ -1,4 +1,5 @@
 use super::*;
+use crate::node_runtime::clients::unix_sessions::UnixStorageNodeMetadataCommandSession;
 
 #[test]
 fn unix_storage_node_client_writes_deletes_and_validates_ack_rows() {
@@ -1123,6 +1124,61 @@ fn unix_recovery_critical_section_rejects_command_for_another_pg_without_mutatio
 }
 
 #[test]
+fn unix_active_critical_section_rejects_command_for_another_pg_without_mutation() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let active = MetadataCommandNodeClient::open_metadata_command_critical_section(
+        &client,
+        PgId::new(0),
+        config.cluster_epoch,
+    )
+    .unwrap();
+
+    let error = active
+        .apply_metadata_command_and_record(&test_metadata_command(1, 1))
+        .unwrap_err();
+    match error {
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode,
+            detail,
+            ..
+        }) => assert!(
+            detail
+                .as_str()
+                .contains("command PG does not match RPC route"),
+            "unexpected route-mismatch diagnostic: {}",
+            detail.as_str()
+        ),
+        other => panic!("expected route payload rejection, got {other:?}"),
+    }
+    drop(active);
+    server_thread.join().unwrap();
+
+    let reopened = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    assert_eq!(
+        reopened
+            .get_pg(0)
+            .unwrap()
+            .max_metadata_command_log_index(config.cluster_epoch)
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn unix_storage_node_client_inserts_bucket_control_pending_slot_idempotently() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);
@@ -1445,7 +1501,7 @@ fn unix_storage_node_client_preserves_pending_slot_log_conflict() {
 
 fn metadata_command_session_result_from_fake_response<R>(
     target_payload: Vec<u8>,
-    call: impl FnOnce(Box<dyn MetadataCommandNodeClient>) -> R,
+    call: impl FnOnce(UnixStorageNodeMetadataCommandSession) -> R,
 ) -> R {
     let tmp = test_util::tempdir();
     let socket_path = tmp.path().join("sock").join("storage.sock");
@@ -1480,12 +1536,9 @@ fn metadata_command_session_result_from_fake_response<R>(
     });
     let client =
         UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
-    let session = MetadataCommandNodeClient::open_metadata_command_critical_section(
-        &client,
-        PgId::new(0),
-        ClusterEpoch::new(1).unwrap(),
-    )
-    .unwrap();
+    let session = client
+        .open_metadata_command_critical_section(PgId::new(0))
+        .unwrap();
 
     let result = call(session);
     join.join().unwrap();
@@ -1613,8 +1666,7 @@ fn unix_storage_node_session_rejects_malformed_log_conflicts() {
         });
     let acceptance_error =
         metadata_command_session_result_from_fake_response(acceptance_payload, |session| {
-            session
-                .metadata_command_acceptance(PgId::new(0), &command)
+            MetadataCommandNodeClient::metadata_command_acceptance(&session, PgId::new(0), &command)
                 .unwrap_err()
         });
     assert!(matches!(
@@ -1661,9 +1713,12 @@ fn unix_storage_node_session_rejects_malformed_log_conflicts() {
     );
     let apply_error =
         metadata_command_session_result_from_fake_response(apply_payload, |session| {
-            session
-                .apply_metadata_command_and_record(PgId::new(0), &command)
-                .unwrap_err()
+            MetadataCommandNodeClient::apply_metadata_command_and_record(
+                &session,
+                PgId::new(0),
+                &command,
+            )
+            .unwrap_err()
         });
     assert!(matches!(
         apply_error,

@@ -1563,7 +1563,7 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-    ) -> Result<Box<dyn MetadataCommandNodeClient>, StoreError>;
+    ) -> Result<Box<dyn MetadataCommandCriticalSection>, StoreError>;
 
     fn max_metadata_command_log_index(
         &self,
@@ -1706,6 +1706,23 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
     fn apply_metadata_command_and_record(
         &self,
         pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
+}
+
+/// Active publisher authority serialized for one metadata PG and epoch.
+///
+/// PG and epoch are selected when the section is opened and cannot be
+/// replaced on individual operations. The interface exposes only operations
+/// which currently require the cross-process critical section.
+pub(crate) trait MetadataCommandCriticalSection: Send {
+    fn metadata_command_acceptance(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError>;
+
+    fn apply_metadata_command_and_record(
+        &self,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
 }

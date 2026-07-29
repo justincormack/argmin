@@ -912,12 +912,36 @@ impl MetadataCommandRecoveryCriticalSection for UnixStorageNodeMetadataCommandSe
     }
 }
 
+impl MetadataCommandCriticalSection for UnixStorageNodeMetadataCommandSession {
+    fn metadata_command_acceptance(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        MetadataCommandNodeClient::metadata_command_acceptance(
+            self,
+            self.metadata_command_pg_id(),
+            command,
+        )
+    }
+
+    fn apply_metadata_command_and_record(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        MetadataCommandNodeClient::apply_metadata_command_and_record(
+            self,
+            self.metadata_command_pg_id(),
+            command,
+        )
+    }
+}
+
 impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
     fn open_metadata_command_critical_section(
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-    ) -> Result<Box<dyn MetadataCommandNodeClient>, StoreError> {
+    ) -> Result<Box<dyn MetadataCommandCriticalSection>, StoreError> {
         if cluster_epoch != self.cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
                 pg_id: pg_id.get(),

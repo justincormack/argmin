@@ -663,7 +663,7 @@ Node-client role classification (2026-07-19):
 | `ObjectPayloadLeaseNodeClient` | object subject rather than a caller-supplied PG | active subject-bound lease acquisition, reclaim-begin, and observation; placement is validated when shard locations are acquired |
 | `RetainedObjectPayloadReclaimNodeClient` | object subject rather than a caller-supplied PG | retained exact-claim reclaim completion and fence cleanup; opaque lease objects retain their own release authority |
 | `MetadataCommandInspectionNodeClient` | genuinely generic metadata PG | read-only command state, checkpoints, retained-log ranges, acceptance, and abandonment inspection |
-| `MetadataCommandNodeClient` | genuinely generic metadata PG | ordinary active publisher and convergence authority; cannot replace pending slots, apply authorized recovery, or record abandonment |
+| `MetadataCommandNodeClient` | genuinely generic metadata PG | ordinary active publisher and convergence authority; serialized primary acceptance/application opens a non-nestable critical section bound to one PG and epoch, while recovery-only operations remain unavailable |
 | `MetadataCommandPeeringNodeClient` | genuinely generic metadata PG | quiesced-PG replay validation, retained-log catch-up, and metadata-transfer initialization/adoption; no command-ID allocation or pending-slot publication |
 | `MetadataCommandRecoveryNodeClient` | genuinely generic metadata PG | opens a non-nestable recovery critical section bound to one PG and epoch; the returned interface owns pending-slot reissue, explicitly authorized recovery apply, and durable abandonment without accepting replacement route arguments |
 | `RetainedMetadataCommandNodeClient` | genuinely generic metadata PG | exact retained-route authority for applying and finishing a previously prepared stream-upload abort |
@@ -3850,6 +3850,28 @@ Ninety-first Phase 3 review correction:
 - all 2,373 storage tests pass, including the focused 104-test recovery group.
   Formatting, the storage boundary checker, and workspace-wide strict Clippy
   pass, as does the full 7,692-test workspace suite.
+
+Ninety-second Phase 3 slice:
+
+- ordinary primary metadata-command application now opens a distinct
+  `MetadataCommandCriticalSection` bound to the PG and epoch selected when the
+  active lock is acquired. Its acceptance and apply methods accept only the
+  command envelope, so the locked authority cannot be redirected by supplying
+  another route to an individual operation.
+- the embedded implementation validates every command against the captured PG
+  and epoch before PgStore access. The Unix implementation retains the PG-lock
+  session and derives the request route from that session; its production
+  interface exposes only the two operations actually used under the active
+  critical section.
+- embedded regressions require wrong-PG and future-epoch commands to fail
+  without advancing either log. A Unix regression requires the explicit
+  command-versus-session route-mismatch diagnostic and verifies no log entry is
+  created. Replacing the remaining active and retained stateful method families
+  with opaque operation capabilities remains open in Phase 3.
+- all 2,392 storage tests pass, including the focused active-section
+  regressions and 41-test Unix metadata-RPC group. Formatting, the storage
+  boundary checker, and workspace-wide strict Clippy pass, as does the full
+  7,714-test workspace suite.
 
 ### Phase 4 — type metadata-command publication
 

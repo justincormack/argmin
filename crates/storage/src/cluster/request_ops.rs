@@ -1874,14 +1874,14 @@ impl super::StorageCluster {
                         })?;
                     let metadata_client = primary_critical_section.as_ref();
                     let acceptance = metadata_client
-                        .metadata_command_acceptance(pg_id, command)
+                        .metadata_command_acceptance(command)
                         .map_err(|source| MetadataCommandApplyFailure {
                             applied_nodes,
                             source: BucketSnapshotLoadError::Store(source),
                         })?;
                     if acceptance == MetadataCommandAcceptance::AlreadyApplied {
                         metadata_client
-                            .apply_metadata_command_and_record(pg_id, command)
+                            .apply_metadata_command_and_record(command)
                             .map_err(|source| MetadataCommandApplyFailure {
                                 applied_nodes,
                                 source,
@@ -1905,7 +1905,7 @@ impl super::StorageCluster {
                         source: source.into(),
                     })?;
                     metadata_client
-                        .apply_metadata_command_and_record(pg_id, command)
+                        .apply_metadata_command_and_record(command)
                         .map_err(|source| MetadataCommandApplyFailure {
                             applied_nodes,
                             source,

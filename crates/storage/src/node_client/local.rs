@@ -4125,13 +4125,66 @@ impl RetainedMetadataCommandNodeClient for LocalStorageNodeClient {
     }
 }
 
+struct LocalMetadataCommandCriticalSection {
+    client: LocalStorageNodeClient,
+    pg_id: PgId,
+    cluster_epoch: ClusterEpoch,
+}
+
+impl LocalMetadataCommandCriticalSection {
+    fn validate_command_route(&self, command: &MetadataCommandEnvelope) -> Result<(), StoreError> {
+        if command.id().pg_id() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id: self.client.node_id.as_u32(),
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id.get(),
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        if command.id().cluster_epoch() != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: self.pg_id.get(),
+                operation_epoch: command.id().cluster_epoch(),
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl MetadataCommandCriticalSection for LocalMetadataCommandCriticalSection {
+    fn metadata_command_acceptance(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.validate_command_route(command)?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        pg.metadata_command_acceptance(self.client.node_id.as_u32(), command)
+    }
+
+    fn apply_metadata_command_and_record(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        self.validate_command_route(command)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        self.client
+            .apply_metadata_command_and_record_inner(self.pg_id, command)
+    }
+}
+
 impl MetadataCommandNodeClient for LocalStorageNodeClient {
     fn open_metadata_command_critical_section(
         &self,
-        _pg_id: PgId,
-        _cluster_epoch: ClusterEpoch,
-    ) -> Result<Box<dyn MetadataCommandNodeClient>, StoreError> {
-        Ok(Box::new(self.clone()))
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Box<dyn MetadataCommandCriticalSection>, StoreError> {
+        drop(self.storage_node.get_pg(pg_id.get())?);
+        Ok(Box::new(LocalMetadataCommandCriticalSection {
+            client: self.clone(),
+            pg_id,
+            cluster_epoch,
+        }))
     }
 
     fn max_metadata_command_log_index(
