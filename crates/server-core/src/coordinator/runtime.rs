@@ -2200,7 +2200,13 @@ fn run_one_placed_segment_shard_backfill(
             }
         }
         Err(error) => {
-            if matches!(error, StoreError::HistoricalPgRouteNotRetained { .. }) {
+            if shard_backfill_error_may_mean_source_is_obsolete(&error) {
+                // Metadata deletion and candidate discovery are not one
+                // transaction. A candidate may therefore outlive its final
+                // payload reference and fail because cleanup has removed its
+                // source shards. Only source-loss failures justify this
+                // cluster-wide authoritative check; transport and route
+                // failures return directly to bounded backoff.
                 match storage_cluster
                     .placed_segment_shard_backfill_source_is_referenced(&claim.work_item)
                 {
@@ -2269,6 +2275,20 @@ fn run_one_placed_segment_shard_backfill(
                 );
             }
         }
+    }
+}
+
+fn shard_backfill_error_may_mean_source_is_obsolete(error: &StoreError) -> bool {
+    if error.is_payload_not_found() {
+        return true;
+    }
+    match error {
+        StoreError::ShardStore { source, .. } => {
+            shard_backfill_error_may_mean_source_is_obsolete(source)
+        }
+        StoreError::HistoricalPgRouteNotRetained { .. }
+        | StoreError::PlacedSegmentBackfillSourceUnavailable => true,
+        _ => false,
     }
 }
 
@@ -3948,6 +3968,47 @@ mod tests {
             }
         ));
         assert!(!shard_backfill_error_is_stale_retry(&StoreError::NotFound));
+    }
+
+    #[test]
+    fn shard_backfill_source_reference_check_is_limited_to_source_loss() {
+        assert!(shard_backfill_error_may_mean_source_is_obsolete(
+            &StoreError::NotFound
+        ));
+        assert!(shard_backfill_error_may_mean_source_is_obsolete(
+            &StoreError::HistoricalPgRouteNotRetained {
+                pg_id: 7,
+                cluster_epoch: storage::ClusterEpoch::INITIAL,
+            }
+        ));
+        assert!(shard_backfill_error_may_mean_source_is_obsolete(
+            &StoreError::PlacedSegmentBackfillSourceUnavailable
+        ));
+
+        for error in [
+            StoreError::PayloadShardSetMismatch {
+                reason: "target verification failed".to_string(),
+            },
+            StoreError::Io {
+                context: "contact source node",
+                source: std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "source node unavailable",
+                ),
+            },
+            StoreError::StalePayloadOperation {
+                pg_id: 7,
+                operation_epoch: storage::ClusterEpoch::INITIAL,
+                current_epoch: storage::ClusterEpoch::new(2).unwrap(),
+            },
+            StoreError::RouteMapExpired {
+                cluster_epoch: storage::ClusterEpoch::INITIAL,
+                valid_until_ms: 1,
+                now_ms: 2,
+            },
+        ] {
+            assert!(!shard_backfill_error_may_mean_source_is_obsolete(&error));
+        }
     }
 
     #[test]

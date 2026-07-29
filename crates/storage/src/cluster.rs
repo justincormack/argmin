@@ -15281,12 +15281,7 @@ impl StorageCluster {
         let plan =
             self.placed_segment_payload_shard_backfill_plan(source_route, desired_route, req)?;
         if !plan.unrecoverable_targets.is_empty() {
-            return Err(StoreError::PayloadShardSetMismatch {
-                reason: format!(
-                    "placed segment backfill cannot satisfy unrecoverable targets {:?}",
-                    plan.unrecoverable_targets
-                ),
-            });
+            return Err(StoreError::PlacedSegmentBackfillSourceUnavailable);
         }
         if plan.copy_targets.is_empty() && plan.reconstruction_targets.is_empty() {
             return Ok(Vec::new());

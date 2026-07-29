@@ -2860,6 +2860,19 @@ fn placed_segment_payload_direct_copy_backfill_rejects_unrecoverable_targets() {
         matches!(err, StoreError::PayloadShardSetMismatch { ref reason } if reason.contains("unrecoverable targets")),
         "expected unrecoverable rejection, got {err:?}"
     );
+
+    let err = fixture
+        .desired_cluster
+        .backfill_placed_segment_payload_shards(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::PlacedSegmentBackfillSourceUnavailable),
+        "expected source-unavailable rejection, got {err:?}"
+    );
 }
 
 #[test]

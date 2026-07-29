@@ -109,6 +109,9 @@ pub enum StoreError {
     #[error("payload shard set mismatch: {reason}")]
     PayloadShardSetMismatch { reason: String },
 
+    #[error("placed segment backfill source payload is unavailable")]
+    PlacedSegmentBackfillSourceUnavailable,
+
     #[error("PG {pg_id} route for cluster epoch {cluster_epoch} is not retained")]
     HistoricalPgRouteNotRetained {
         pg_id: u32,
@@ -596,6 +599,24 @@ impl StoreError {
         }
     }
 
+    /// Report whether a local or remote storage operation established that its
+    /// requested payload was absent.
+    ///
+    /// Callers must still decide whether absence is meaningful for the logical
+    /// operation. This method keeps that decision independent of the private RPC
+    /// wire representation.
+    #[must_use]
+    pub fn is_payload_not_found(&self) -> bool {
+        match self {
+            Self::NotFound => true,
+            Self::ShardStore { source, .. } => source.is_payload_not_found(),
+            Self::StorageRpc { failure, .. } => {
+                failure.wire_code() == StorageRpcWireErrorCode::NotFound
+            }
+            _ => false,
+        }
+    }
+
     /// Return a bounded diagnostic category suitable for metrics labels.
     #[must_use]
     pub fn diagnostic_kind(&self) -> &'static str {
@@ -604,6 +625,9 @@ impl StoreError {
             Self::IntegrityError { .. } => "integrity_error",
             Self::ShardAckMismatch { .. } => "shard_ack_mismatch",
             Self::PayloadShardSetMismatch { .. } => "payload_shard_set_mismatch",
+            Self::PlacedSegmentBackfillSourceUnavailable => {
+                "placed_segment_backfill_source_unavailable"
+            }
             Self::HistoricalPgRouteNotRetained { .. } => "historical_pg_route_not_retained",
             Self::ObjectPayloadReclaimFenceAuthorityMismatch => {
                 "object_payload_reclaim_fence_authority_mismatch"
@@ -1278,6 +1302,21 @@ mod tests {
         ] {
             assert_eq!(remote_failure(code).storage_node_failure_class(), None);
         }
+    }
+
+    #[test]
+    fn payload_absence_classification_unwraps_local_and_remote_storage_errors() {
+        assert!(StoreError::NotFound.is_payload_not_found());
+        assert!(remote_failure(StorageRpcErrorCode::NotFound).is_payload_not_found());
+        assert!(!remote_failure(StorageRpcErrorCode::TransportTimeout).is_payload_not_found());
+
+        let nested = StoreError::ShardStore {
+            node_id: 7,
+            pg_id: 11,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            source: Box::new(remote_failure(StorageRpcErrorCode::NotFound)),
+        };
+        assert!(nested.is_payload_not_found());
     }
 
     #[test]

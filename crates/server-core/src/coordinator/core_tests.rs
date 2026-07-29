@@ -5510,6 +5510,87 @@ fn shard_backfill_worker_resolves_missing_history_after_source_metadata_is_gone(
 }
 
 #[test]
+fn shard_backfill_worker_resolves_missing_payload_after_source_metadata_is_gone() {
+    let tmp = test_util::tempdir();
+    let source_epoch = ClusterEpoch::INITIAL;
+    let desired_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
+    let pg_id = PgId::new(0);
+    let ec_shape = EcShape { k: 4, m: 2 };
+    let source_nodes = [1, 0, 2, 3, 4, 5]
+        .into_iter()
+        .map(NodeId::new)
+        .collect::<Vec<_>>();
+    let desired_nodes = [0, 2, 3, 4, 5, 6]
+        .into_iter()
+        .map(NodeId::new)
+        .collect::<Vec<_>>();
+    let source_route = storage::control_plane::PgRouteSnapshot::reconstructed(
+        source_epoch,
+        pg_id,
+        source_nodes[0],
+        source_nodes,
+        PgState::Active,
+    );
+    let desired_route = storage::control_plane::PgRouteSnapshot::reconstructed(
+        desired_epoch,
+        pg_id,
+        desired_nodes[0],
+        desired_nodes,
+        PgState::Active,
+    );
+    let configs = (0..7)
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                NodeId::new(node_id),
+                tmp.path().join(format!("node-{node_id:04}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs,
+        &[pg_id.get()],
+        ec_shape,
+        desired_epoch,
+        [LocalPgRoute::from(&desired_route)],
+    )
+    .unwrap();
+    map.test_install_historical_pg_routes([source_route]);
+    let cluster = StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let work_item = PlacedSegmentShardBackfillWorkItem {
+        request: SegmentStoredBytesRequest {
+            data_pg_id: pg_id.get(),
+            segment_okh: [0xA6; 16],
+            segment_vid: GenerationId::MIN,
+            stored_size: 32,
+            segment_crc64: 0x5678,
+            ec: ec_shape,
+        },
+        source_cluster_epoch: source_epoch,
+        desired_cluster_epoch: desired_epoch,
+    };
+    assert!(cluster
+        .backfill_placed_segment_payload_shards_for_work_item(&work_item)
+        .is_err());
+    assert!(!cluster
+        .placed_segment_shard_backfill_source_is_referenced(&work_item)
+        .unwrap());
+    cluster
+        .record_placed_segment_shard_backfill(&work_item, None)
+        .unwrap();
+
+    super::runtime::run_one_placed_segment_shard_backfill_for_test(
+        &cluster,
+        "obsolete-payload-test",
+    );
+
+    assert!(cluster
+        .list_placed_segment_shard_backfills(pg_id.get())
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn shard_backfill_candidate_scanner_retains_cursor_across_runtime_map_replacement() {
     let tmp = test_util::tempdir();
     let ec_shape = EcShape { k: 4, m: 2 };

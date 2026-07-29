@@ -3268,23 +3268,35 @@ assert_pg_backfill_migration_final_clean() {
     local max_complete_failed="$4"
     local max_failed="$5"
     local max_record_error_failed="$6"
-    sample_frontend_metrics "$metrics_path"
-    local queue_depth
-    local candidate_failed
-    local scan_error
-    local complete_failed
-    local failed
-    local record_error_failed
-    queue_depth="$(latest_metric_sample_value "$metrics_path" shard_backfill_queue_depth)"
-    candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
-    scan_error="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_error_total)"
-    complete_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_complete_failed_total)"
-    failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_failed_total)"
-    record_error_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_record_error_failed_total)"
-    if ((queue_depth != 0 || candidate_failed > max_candidate_failed || scan_error > max_scan_error || complete_failed > max_complete_failed || failed > max_failed || record_error_failed > max_record_error_failed)); then
-        cat "$metrics_path" >&2 || true
-        die "PG backfill smoke left hard-failure state: queue_depth=$queue_depth candidate_failed=$candidate_failed scan_error=$scan_error complete_failed=$complete_failed failed=$failed record_error_failed=$record_error_failed"
-    fi
+    local start
+    start="$(date +%s)"
+    while true; do
+        sample_frontend_metrics "$metrics_path"
+        local queue_depth
+        local candidate_failed
+        local scan_error
+        local complete_failed
+        local failed
+        local record_error_failed
+        queue_depth="$(latest_metric_sample_value "$metrics_path" shard_backfill_queue_depth)"
+        candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
+        scan_error="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_error_total)"
+        complete_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_complete_failed_total)"
+        failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_failed_total)"
+        record_error_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_record_error_failed_total)"
+        if ((candidate_failed > max_candidate_failed || scan_error > max_scan_error || complete_failed > max_complete_failed || failed > max_failed || record_error_failed > max_record_error_failed)); then
+            cat "$metrics_path" >&2 || true
+            die "PG backfill smoke left hard-failure state: queue_depth=$queue_depth candidate_failed=$candidate_failed scan_error=$scan_error complete_failed=$complete_failed failed=$failed record_error_failed=$record_error_failed"
+        fi
+        if ((queue_depth == 0)); then
+            return
+        fi
+        if (($(date +%s) - start >= 30)); then
+            cat "$metrics_path" >&2 || true
+            die "PG backfill smoke did not drain final cleanup work: queue_depth=$queue_depth candidate_failed=$candidate_failed scan_error=$scan_error complete_failed=$complete_failed failed=$failed record_error_failed=$record_error_failed"
+        fi
+        sleep 0.2
+    done
 }
 
 if [[ "$smoke" == "storage-node-restart" ]]; then
