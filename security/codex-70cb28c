@@ -1,0 +1,146 @@
+Predictable UAT control-plane auth secrets
+Link: https://chatgpt.com/codex/cloud/security/findings/84adfae4b8d48191af609088cd74579b?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 70cb28c
+Fixed Commit: ac250a6c5d986fc4cce339c0d3e49b443f9bf96b
+Author: justin@specialbusservice.com
+Created: 28/07/2026, 20:31:51
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced by the new scripts/uat-multihost-raft file. The script deploys authenticated TCP endpoints but uses deterministic credential contents instead of cryptographically random secrets.
+scripts/uat-multihost-raft creates the Raft, storage-node, and admin HMAC credential files by formatting a fixed string containing run_id, role, and node number. The run_id is not treated as secret: it is based on timestamp, PID, and Bash RANDOM, is embedded in paths/unit names, and is printed to stdout. As a result, the supposedly authenticated real-host soak can be accessed by an attacker who learns or guesses the run_id and can reach the configured TCP endpoints. The attacker can derive credential material such as argmin-multihost-<run_id>-admin-1-secret and forge authenticated control-plane/admin or Raft-peer requests for the UAT cluster. Secrets should be generated with a cryptographic random source such as openssl rand or /dev/urandom, and the run identifier should not be used as credential entropy.
+
+# Resolution
+Fixed by commit https://github.com/justincormack/argmin/commit/ac250a6c5d986fc4cce339c0d3e49b443f9bf96b (`ac250a6c Randomize multihost soak credentials`).
+
+The finding was valid but limited to the multihost UAT harness rather than the production runtime. The harness now generates every Raft-peer, storage-node, and admin HMAC credential independently with `openssl rand -hex 32`. Credential material no longer contains or derives from the public `run_id`.
+
+Each credential file is created under a per-file `umask 077`, so secret material is restricted from initial publication rather than tightened after creation. Before deployment, the harness also fails closed unless every generated secret is exactly 32 random bytes encoded as 64 lowercase hexadecimal characters and all nine role/node credentials are unique.
+
+Verification for the fix:
+- `bash -n scripts/uat-multihost-raft`
+- `shellcheck scripts/uat-multihost-raft`
+- `./scripts/uat-multihost-raft --help`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo nextest run --status-level fail` (7,711 tests passed)
+- `git diff --check`
+
+# Validation
+## Rubric
+- [x] Confirm the introduced script generates run_id from non-cryptographic/non-secret values.
+- [x] Confirm run_id or paths containing it are printed or otherwise exposed.
+- [x] Reproduce actual generated credential files and show they are deterministic functions of run_id, role, and node number.
+- [x] Confirm the generated deterministic files are used as accepted raft, storage-node, and admin auth credentials for TCP endpoints.
+- [x] Confirm runtime code treats these files as HMAC credential secrets for signing/verifying authenticated internal/control-plane traffic.
+## Report
+Validated the finding at commit 70cb28c6e1dc49cc6bd2b3882421f544c194239d. Direct crash-style validation is not applicable because the issue is deterministic credential generation in a Bash UAT deployment script, not memory corruption; nevertheless I ran `bash -n scripts/uat-multihost-raft` successfully, and valgrind/gdb were unavailable in the container. Evidence: `scripts/uat-multihost-raft:229-232` builds `run_id` from timestamp, shell PID, and Bash `$RANDOM`; `scripts/uat-multihost-raft:295-297` prints `run_id` and `remote_run`; `scripts/uat-multihost-raft:325-329` writes every raft/storage/admin key as `argmin-multihost-${run_id}-${role}-${number}-secret`; `scripts/uat-multihost-raft:446-488` configures TCP raft/control/recovery/storage endpoints; and `scripts/uat-multihost-raft:494-519` registers those generated files as auth credentials with `use_for_signing = true`. I reproduced this by running the script with stubbed ssh/scp and a fake binary, allowing material and manifest generation without real hosts. The run printed `run_id=20260728T193405Z-5641-22611 ... remote_run=/tmp/argmin-remote/argmin-multihost-raft-20260728T193405Z-5641-22611`. The generated key files exactly matched externally derived values, e.g. `admin-1.key=argmin-multihost-20260728T193405Z-5641-22611-admin-1-secret`, and the derived verifier matched all 9 raft/storage/admin keys. Runtime impact is supported by `crates/argmin-s3/src/static_cluster_config.rs:684-699`, which reads each `secret_ref` into resolved auth material, `crates/argmin-s3/src/static_cluster_config.rs:1611-1656`, which converts those secrets into raft/storage/admin configured credentials, and `crates/storage/src/control_plane_auth.rs:311-330` plus `:478-513`, which sign and verify authenticated control-plane envelopes with HMAC-SHA256 over the credential secret. Therefore, anyone who learns the printed run_id can derive accepted HMAC credential material for the UAT multihost cluster.
+
+# Evidence
+scripts/uat-multihost-raft (L229 to 232)
+  Note: run_id is generated from timestamp, shell PID, and Bash RANDOM, then used as the only variable component in credential contents.
+```
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
+run_name="argmin-multihost-raft-$run_id"
+remote_run="$remote_root/$run_name"
+local_run="$(mktemp -d "${TMPDIR:-/tmp}/$run_name.XXXXXX")"
+```
+
+scripts/uat-multihost-raft (L295 to 297)
+  Note: The run_id and remote_run path are printed, so the value used to derive secrets is not kept confidential.
+```
+echo "== argmin-s3 multihost Raft soak =="
+echo "run_id=$run_id hosts=$hosts_value addresses=$addresses_value storage_profile=$storage_profile pg_count=$pg_count retained_epochs=$retained_epochs repeat=$repeat_count"
+echo "binary=$binary remote_run=$remote_run"
+```
+
+scripts/uat-multihost-raft (L325 to 329)
+  Note: All Raft, storage, and admin credential files are deterministic strings derived from run_id, role, and node number instead of cryptographically random values.
+```
+for role in raft storage admin; do
+    for number in 1 2 3; do
+        printf 'argmin-multihost-%s-%s-%s-secret\n' "$run_id" "$role" "$number" \
+            >"$material_dir/$role-$number.key"
+        chmod 600 "$material_dir/$role-$number.key"
+```
+
+scripts/uat-multihost-raft (L494 to 519)
+  Note: The manifest enables these predictable files as accepted Raft-peer, storage-node, and admin authentication credentials.
+```
+[[auth_credentials]]
+principal = "raft-peer"
+node_id = $raft_node_id
+credential_id = "raft-$number"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:$remote_run/material/raft-$number.key"
+
+[[auth_credentials]]
+principal = "storage-node"
+node_id = $number
+credential_id = "storage-$number"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:$remote_run/material/storage-$number.key"
+
+[[auth_credentials]]
+principal = "admin"
+instance_id = "control-$number-admin"
+credential_id = "admin-$number"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:$remote_run/material/admin-$number.key"
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Downgraded from medium to ignore for product criticality. The code-level claim is valid: scripts/uat-multihost-raft:229-329 creates predictable credentials from a printed run_id, scripts/uat-multihost-raft:446-519 exposes TCP endpoints and registers those files as signing credentials, and crates/storage/src/control_plane_auth.rs:311-330 and 478-513 use those secrets for HMAC-SHA256 signing/verification. But the vulnerable artifact is explicitly a UAT/multihost soak script, not the in-scope production S3 runtime or deployment; exploitation requires internal test-cluster operation, run_id disclosure/guessing, and TCP reachability to the test addresses. The issue should be fixed before using the harness in shared or production-like environments, but it does not justify a production security severity under the supplied threat model.
+## Likelihood
+low - Exploitation is conditional on the UAT harness being run, attacker visibility into run_id or enough context to guess it, and network reachability to operator-supplied TCP endpoints. Repository evidence indicates internal real-host testing, not public ingress.
+## Impact
+ignore - Within a running UAT soak, derived credentials could impersonate raft-peer, storage-node, or admin principals and affect test-cluster integrity/availability. Under the stated product threat model, the affected UAT script is outside production runtime and no customer/production data or public deployment path is evidenced.
+## Assumptions
+- The script is used as named and documented: a UAT/multihost soak harness, not the normal production deployment path for the S3 service.
+- An attacker would need network reachability to the operator-supplied UAT TCP addresses and ports.
+- An attacker would need to learn or guess the run_id from stdout, preserved artifacts, unit names, paths, CI logs, or its timestamp/PID/RANDOM-derived format.
+- Static review did not find repository IaC or manifests that expose these UAT ports through a public load balancer.
+- operator runs scripts/uat-multihost-raft against three real hosts
+- attacker learns or guesses the printed run_id
+- attacker can reach the configured TCP endpoints on the UAT addresses
+- attacker can craft valid control-plane/Raft/storage authenticated envelopes using the derived HMAC secret
+## Path
+UAT operator runs script -> run_id printed/guessable -> deterministic role keys -> attacker reaches TCP endpoints -> HMAC auth accepts forged envelope -> UAT control-plane/Raft impersonation
+## Path evidence
+- `scripts/uat-multihost-raft:12-14` - Script scope is an authenticated static-manifest Raft authority soak across three real hosts, with Argmin traffic over configured TLS/TCP endpoints.
+- `scripts/uat-multihost-raft:229-232` - run_id is derived from date, shell PID, and Bash RANDOM and embedded into local/remote run paths.
+- `scripts/uat-multihost-raft:295-297` - run_id and remote_run are printed, so the credential derivation input is not treated as confidential.
+- `scripts/uat-multihost-raft:325-329` - raft, storage, and admin key files are deterministic strings derived from run_id, role, and node number.
+- `scripts/uat-multihost-raft:344-360` - The script configures ports from the supplied port base and sets internal_auth to required for the test deployment.
+- `scripts/uat-multihost-raft:446-519` - The manifest defines TCP raft/control/recovery/storage endpoints and registers the predictable files as raft-peer, storage-node, and admin auth credentials with use_for_signing=true.
+- `crates/argmin-s3/src/static_cluster_config.rs:684-699` - Runtime configuration resolution reads credential secret_ref file contents into resolved auth material.
+- `crates/argmin-s3/src/static_cluster_config.rs:1616-1656` - Resolved secrets are converted into configured raft, storage-node, and admin control-plane auth credentials.
+- `crates/storage/src/control_plane_auth.rs:311-330` - Control-plane envelopes are signed with HMAC-SHA256 using the configured secret.
+- `crates/storage/src/control_plane_auth.rs:478-513` - Control-plane envelope verification locates the credential and verifies HMAC-SHA256 over the covered bytes.
+## Narrative
+The finding is factually supported: the UAT script builds run_id from timestamp, PID, and Bash RANDOM, prints it, and writes all raft/storage/admin HMAC credential files as deterministic strings containing that run_id. The generated manifest then exposes TCP raft/control/recovery/storage endpoints and registers those files as signing credentials; runtime code reads the file secrets and uses HMAC-SHA256 to sign/verify control-plane envelopes. However, the affected artifact is an explicit UAT soak script under scripts/, not the normal in-scope production S3 server deployment. Exploitation also requires UAT operation, run_id disclosure/guessing, and network reachability to internal test endpoints. Therefore this is a real UAT security flaw but should be ignored for production criticality under the stated threat model.
+## Controls
+- TCP endpoints require internal_auth=required
+- TCP endpoints require TLS identity and trust bundle fields
+- HMAC-SHA256 control-plane envelope verification
+- credential files chmod 600 and directories chmod 700
+- default cleanup removes local and remote UAT run material
+- deployment requires SSH access to three test hosts
+## Blindspots
+- Static-only review cannot confirm whether any organization runs this UAT script against publicly reachable addresses.
+- No repository IaC or load balancer manifest was found to prove public exposure or production adoption of the UAT ports.
+- The provided validation artifact demonstrates deterministic material generation but not a full end-to-end forged network request against a live three-host cluster.
+- Operational log handling is unknown; run_id exposure severity depends on who can read stdout, CI logs, preserved artifacts, or systemd unit names.
