@@ -2851,12 +2851,11 @@ impl UnixStorageNodeClient {
 impl RetainedMetadataCommandNodeClient for UnixStorageNodeClient {
     fn apply_retained_stream_upload_abort(
         &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
+        prepared: &PreparedRetainedStreamUploadAbort,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
         self.metadata_command_apply_and_record_with_kind(
-            pg_id,
-            command,
+            prepared.pg_id().pg_id(),
+            prepared.command(),
             StorageRpcMessageKind::MetadataCommandRetainedAbortApply,
             "decode retained stream abort apply response",
         )
@@ -2864,14 +2863,13 @@ impl RetainedMetadataCommandNodeClient for UnixStorageNodeClient {
 
     fn finish_retained_stream_upload_abort(
         &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
+        prepared: &PreparedRetainedStreamUploadAbort,
     ) -> Result<bool, StoreError> {
         let request = StorageRpcMetadataCommandRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
-            command: command.clone(),
+            pg_id: prepared.pg_id().pg_id(),
+            command: prepared.command().clone(),
         };
         let payload = encode_metadata_command_request(&request).map_err(|error| {
             self.rpc_payload_error(

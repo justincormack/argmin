@@ -5,7 +5,11 @@
 //! boundary. Crate-facing contracts are re-exported through narrow facade
 //! modules in `lib.rs`.
 
-use crate::types::PgId;
+use crate::metadata_command::{
+    is_stream_create_bucket_write_operation_kind, AbortStreamUploadCommand,
+    MetadataCommandEnvelope, MetadataCommandPayload,
+};
+use crate::types::{BucketName, ObjectKey, PgId, SessionId};
 
 /// PG containing payload shard data for an object segment or multipart part.
 ///
@@ -100,6 +104,223 @@ impl ObjectMetadataPgId {
 impl From<ObjectMetadataPgId> for PgId {
     fn from(value: ObjectMetadataPgId) -> Self {
         value.pg_id()
+    }
+}
+
+/// Exact retained stream-abort command produced by validated node state.
+///
+/// Construction is confined to the private node-runtime boundary shared by
+/// the embedded adapter, RPC client, and storage-node server. Cluster callers
+/// may inspect and fan out this value, but cannot manufacture one from an
+/// arbitrary metadata command or redirect it to another PG.
+#[derive(Debug)]
+pub(crate) struct PreparedRetainedStreamUploadAbort {
+    pg_id: ObjectMetadataPgId,
+    command: MetadataCommandEnvelope,
+}
+
+impl PreparedRetainedStreamUploadAbort {
+    pub(in crate::node_runtime) fn new_if_matches(
+        pg_id: ObjectMetadataPgId,
+        cluster_epoch: crate::types::ClusterEpoch,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        command: MetadataCommandEnvelope,
+    ) -> Option<Self> {
+        let MetadataCommandPayload::AbortStreamUpload(abort) = command.payload() else {
+            return None;
+        };
+        let proof_matches = abort.stream_create_bucket_write_reservation.is_none()
+            || abort
+                .stream_create_bucket_write_reservation
+                .as_ref()
+                .is_some_and(|proof| {
+                    proof.bucket == *bucket
+                        && proof.cluster_epoch == cluster_epoch
+                        && is_stream_create_bucket_write_operation_kind(&proof.operation_kind)
+                        && proof.target_context.as_deref() == Some(key.as_str())
+                });
+        if command.id().cluster_epoch() != cluster_epoch
+            || command.id().pg_id() != pg_id.pg_id()
+            || abort.bucket != *bucket
+            || abort.key != *key
+            || abort.session_id != *session_id
+            || abort
+                .staged_segments
+                .iter()
+                .any(|segment| segment.session_id != *session_id)
+            || !proof_matches
+        {
+            return None;
+        }
+        Some(Self { pg_id, command })
+    }
+
+    #[must_use]
+    pub(crate) const fn pg_id(&self) -> ObjectMetadataPgId {
+        self.pg_id
+    }
+
+    #[must_use]
+    pub(crate) const fn command(&self) -> &MetadataCommandEnvelope {
+        &self.command
+    }
+
+    #[must_use]
+    pub(crate) fn abort(&self) -> &AbortStreamUploadCommand {
+        let MetadataCommandPayload::AbortStreamUpload(abort) = self.command.payload() else {
+            unreachable!("prepared retained stream abort must contain an abort command");
+        };
+        abort
+    }
+}
+
+#[cfg(test)]
+mod prepared_retained_stream_upload_abort_tests {
+    use super::*;
+    use crate::metadata_command::{
+        MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
+    };
+    use crate::types::{ClusterEpoch, GenerationId, StreamUploadSegmentRecord};
+
+    fn abort_command(
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        staged_segments: Vec<StreamUploadSegmentRecord>,
+    ) -> MetadataCommandEnvelope {
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                cluster_epoch,
+                pg_id,
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                session_id: session_id.clone(),
+                staged_segments,
+                stream_create_bucket_write_reservation: None,
+            })),
+        )
+    }
+
+    #[test]
+    fn prepared_abort_binds_route_subject_and_staged_session() {
+        let cluster_epoch = ClusterEpoch::INITIAL;
+        let pg_id = ObjectMetadataPgId::new_for_test(PgId::new(0));
+        let bucket = crate::tests::bucket_name("prepared-retained-abort-bucket");
+        let key = crate::tests::object_key("prepared-retained-abort-key");
+        let session_id = crate::tests::stream_session_id("prepared-abort");
+        let segment = StreamUploadSegmentRecord {
+            session_id: session_id.clone(),
+            segment_index: 0,
+            size: 17,
+            segment_crc64: 41,
+            payload_crc64: 41,
+            segment_okh: [0x61; 16],
+            segment_vid: GenerationId::new(2).unwrap(),
+            data_pg_id: 0,
+            placement_cluster_epoch: cluster_epoch,
+            ec_k: 1,
+            ec_m: 0,
+        };
+        let command = abort_command(
+            pg_id.pg_id(),
+            cluster_epoch,
+            &bucket,
+            &key,
+            &session_id,
+            vec![segment.clone()],
+        );
+
+        let prepared = PreparedRetainedStreamUploadAbort::new_if_matches(
+            pg_id,
+            cluster_epoch,
+            &bucket,
+            &key,
+            &session_id,
+            command.clone(),
+        )
+        .expect("matching retained abort must be promoted");
+        assert_eq!(prepared.pg_id(), pg_id);
+        assert_eq!(prepared.command(), &command);
+        assert_eq!(prepared.abort().staged_segments, vec![segment.clone()]);
+
+        let wrong_bucket = crate::tests::bucket_name("wrong-prepared-retained-abort-bucket");
+        let wrong_key = crate::tests::object_key("wrong-prepared-retained-abort-key");
+        let wrong_session = crate::tests::stream_session_id("wrong-abort");
+        assert!(PreparedRetainedStreamUploadAbort::new_if_matches(
+            pg_id,
+            cluster_epoch,
+            &wrong_bucket,
+            &key,
+            &session_id,
+            command.clone(),
+        )
+        .is_none());
+        assert!(PreparedRetainedStreamUploadAbort::new_if_matches(
+            pg_id,
+            cluster_epoch,
+            &bucket,
+            &wrong_key,
+            &session_id,
+            command.clone(),
+        )
+        .is_none());
+        assert!(PreparedRetainedStreamUploadAbort::new_if_matches(
+            pg_id,
+            cluster_epoch,
+            &bucket,
+            &key,
+            &wrong_session,
+            command.clone(),
+        )
+        .is_none());
+
+        let wrong_epoch = ClusterEpoch::new(cluster_epoch.get() + 1).unwrap();
+        assert!(PreparedRetainedStreamUploadAbort::new_if_matches(
+            pg_id,
+            wrong_epoch,
+            &bucket,
+            &key,
+            &session_id,
+            command.clone(),
+        )
+        .is_none());
+        assert!(PreparedRetainedStreamUploadAbort::new_if_matches(
+            ObjectMetadataPgId::new_for_test(PgId::new(1)),
+            cluster_epoch,
+            &bucket,
+            &key,
+            &session_id,
+            command,
+        )
+        .is_none());
+
+        let wrong_segment_command = abort_command(
+            pg_id.pg_id(),
+            cluster_epoch,
+            &bucket,
+            &key,
+            &session_id,
+            vec![StreamUploadSegmentRecord {
+                session_id: wrong_session,
+                ..segment
+            }],
+        );
+        assert!(PreparedRetainedStreamUploadAbort::new_if_matches(
+            pg_id,
+            cluster_epoch,
+            &bucket,
+            &key,
+            &session_id,
+            wrong_segment_command,
+        )
+        .is_none());
     }
 }
 

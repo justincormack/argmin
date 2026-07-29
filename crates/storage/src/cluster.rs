@@ -14321,7 +14321,7 @@ impl StorageCluster {
         let primary = self
             .local_map
             .metadata_pg_primary_node_for_metadata_command_recovery(cluster_epoch, pg_id)?;
-        let Some(command) = primary
+        let Some(prepared) = primary
             .retained_object_mutation_metadata_client()
             .prepare_retained_stream_upload_abort(
                 object_pg_id,
@@ -14333,32 +14333,14 @@ impl StorageCluster {
         else {
             return Ok(());
         };
-        let MetadataCommandPayload::AbortStreamUpload(abort) = command.payload() else {
-            return Err(ObjectPgActionError::Store(
-                StoreError::MetadataCommandContention {
-                    context: "retained stream cleanup prepared a non-abort command",
-                },
-            ));
-        };
-        if command.id().cluster_epoch() != cluster_epoch
-            || command.id().pg_id() != pg_id
-            || abort.bucket != *bucket
-            || abort.key != *key
-            || abort.session_id != *session_id
-        {
-            return Err(ObjectPgActionError::Store(
-                StoreError::MetadataCommandContention {
-                    context: "retained stream cleanup command does not match captured subject",
-                },
-            ));
-        }
+        let abort = prepared.abort();
 
         for node in self
             .local_map
             .metadata_pg_acting_nodes_for_metadata_command_recovery(cluster_epoch, pg_id)?
         {
             node.retained_metadata_command_client()
-                .apply_retained_stream_upload_abort(pg_id, &command)
+                .apply_retained_stream_upload_abort(&prepared)
                 .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
         }
 
@@ -14369,7 +14351,7 @@ impl StorageCluster {
         self.delete_staged_stream_segment_payload_shards_at_retained_epoch(&abort.staged_segments)?;
         primary
             .retained_metadata_command_client()
-            .finish_retained_stream_upload_abort(pg_id, &command)?;
+            .finish_retained_stream_upload_abort(&prepared)?;
         Ok(())
     }
 

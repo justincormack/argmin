@@ -1663,7 +1663,7 @@ impl RetainedObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+    ) -> Result<Option<PreparedRetainedStreamUploadAbort>, ObjectPgActionError> {
         let raw_pg_id = pg_id.pg_id();
         if let Some(pending) =
             <Self as MetadataCommandNodeClient>::pending_metadata_command_envelope(
@@ -1672,20 +1672,20 @@ impl RetainedObjectMutationMetadataNodeClient for LocalStorageNodeClient {
                 cluster_epoch,
             )?
         {
-            return match pending.payload() {
-                MetadataCommandPayload::AbortStreamUpload(abort)
-                    if abort.bucket == *bucket
-                        && abort.key == *key
-                        && abort.session_id == *session_id =>
-                {
-                    Ok(Some(pending))
-                }
-                _ => Err(ObjectPgActionError::Store(
-                    StoreError::MetadataCommandContention {
-                        context: "retained stream abort found an unrelated pending command",
-                    },
-                )),
-            };
+            return PreparedRetainedStreamUploadAbort::new_if_matches(
+                pg_id,
+                cluster_epoch,
+                bucket,
+                key,
+                session_id,
+                pending,
+            )
+            .map(Some)
+            .ok_or(ObjectPgActionError::Store(
+                StoreError::MetadataCommandContention {
+                    context: "retained stream abort found an unrelated pending command",
+                },
+            ));
         }
 
         let stream_session =
@@ -1718,13 +1718,26 @@ impl RetainedObjectMutationMetadataNodeClient for LocalStorageNodeClient {
                     .clone(),
             })),
         );
+        let prepared = PreparedRetainedStreamUploadAbort::new_if_matches(
+            pg_id,
+            cluster_epoch,
+            bucket,
+            key,
+            session_id,
+            command,
+        )
+        .ok_or(ObjectPgActionError::Store(
+            StoreError::MetadataCommandContention {
+                context: "retained stream abort preparation produced an invalid command",
+            },
+        ))?;
         <Self as MetadataCommandNodeClient>::try_insert_pending_metadata_command_slot(
             self,
             raw_pg_id,
-            &command,
+            prepared.command(),
             Some(bucket),
         )?;
-        Ok(Some(command))
+        Ok(Some(prepared))
     }
 
     fn release_object_payload_reclaim_claim(
@@ -4110,18 +4123,19 @@ impl MetadataCommandRecoveryCriticalSection for LocalMetadataCommandRecoveryCrit
 impl RetainedMetadataCommandNodeClient for LocalStorageNodeClient {
     fn apply_retained_stream_upload_abort(
         &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
+        prepared: &PreparedRetainedStreamUploadAbort,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        self.apply_metadata_command_and_record_inner(pg_id, command)
+        self.apply_metadata_command_and_record_inner(prepared.pg_id().pg_id(), prepared.command())
     }
 
     fn finish_retained_stream_upload_abort(
         &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
+        prepared: &PreparedRetainedStreamUploadAbort,
     ) -> Result<bool, StoreError> {
-        self.remove_pending_metadata_command_slot_inner(pg_id, command)
+        self.remove_pending_metadata_command_slot_inner(
+            prepared.pg_id().pg_id(),
+            prepared.command(),
+        )
     }
 }
 

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use super::clients::LocalStorageNodeClient;
 use super::engine::SharedStorageNode;
+use super::PreparedRetainedStreamUploadAbort;
 use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneHeartbeatRuntimeMapSource,
     ControlPlaneHeartbeatSink, HeartbeatLease, NodeHeartbeat, PendingMetadataCommandObservation,
@@ -3988,12 +3989,12 @@ struct StorageNodeRetainedPrimaryStreamAbortSessionRoute<'a> {
 
 struct StorageNodeRetainedStreamAbortCommandRoute<'a> {
     route: StorageNodeRetainedStreamAbortRoute<'a>,
-    command: &'a MetadataCommandEnvelope,
+    prepared: PreparedRetainedStreamUploadAbort,
 }
 
 struct StorageNodeRetainedPrimaryStreamAbortCommandRoute<'a> {
     route: StorageNodeRetainedPrimaryStreamAbortRoute<'a>,
-    command: &'a MetadataCommandEnvelope,
+    prepared: PreparedRetainedStreamUploadAbort,
 }
 
 impl StorageNodeActiveBucketRoute<'_> {
@@ -6877,7 +6878,9 @@ impl StorageNodeRetainedPrimaryStreamAbortRoute<'_> {
 }
 
 impl StorageNodeRetainedPrimaryStreamAbortSessionRoute<'_> {
-    fn prepare(self) -> Result<Option<MetadataCommandEnvelope>, StorageNodeObjectRouteError> {
+    fn prepare(
+        self,
+    ) -> Result<Option<PreparedRetainedStreamUploadAbort>, StorageNodeObjectRouteError> {
         self.route
             .require_valid_now("retained stream abort prepare")
             .map_err(StorageNodeObjectRouteError::Route)?;
@@ -6913,8 +6916,7 @@ impl StorageNodeRetainedStreamAbortCommandRoute<'_> {
         );
         RetainedMetadataCommandNodeClient::apply_retained_stream_upload_abort(
             &local_client,
-            self.route.raw_pg_id,
-            self.command,
+            &self.prepared,
         )
         .map_err(StorageNodeRetainedStreamAbortApplyError::Apply)
     }
@@ -6931,8 +6933,7 @@ impl StorageNodeRetainedPrimaryStreamAbortCommandRoute<'_> {
         );
         RetainedMetadataCommandNodeClient::finish_retained_stream_upload_abort(
             &local_client,
-            self.route.route.raw_pg_id,
-            self.command,
+            &self.prepared,
         )
         .map_err(StorageNodeRetainedStreamAbortFinishError::Finish)
     }
@@ -10596,9 +10597,9 @@ impl StorageNodeConnectionHandler {
         };
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.object.pg_id);
         let outcome = match route.prepare() {
-            Ok(Some(command)) => {
-                StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command))
-            }
+            Ok(Some(prepared)) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(
+                prepared.command().clone(),
+            )),
             Ok(None) => StorageRpcObjectMetadataCommandBuildOutcome::Missing,
             Err(StorageNodeObjectRouteError::Route(error)) => {
                 return encode_storage_rpc_error_response(&error)
@@ -17298,10 +17299,19 @@ impl StorageNodeConnectionHandler {
             false,
             operation,
         )?;
-        Ok(StorageNodeRetainedStreamAbortCommandRoute {
-            route,
-            command: &request.command,
-        })
+        let prepared = PreparedRetainedStreamUploadAbort::new_if_matches(
+            route.pg_id,
+            request.cluster_epoch,
+            &abort.bucket,
+            &abort.key,
+            &abort.session_id,
+            request.command.clone(),
+        )
+        .ok_or_else(|| StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::PayloadDecode,
+            message: format!("{operation} command does not match its validated subject"),
+        })?;
+        Ok(StorageNodeRetainedStreamAbortCommandRoute { route, prepared })
     }
 
     fn retained_primary_stream_abort_command_route<'a>(
@@ -17324,9 +17334,21 @@ impl StorageNodeConnectionHandler {
             true,
             operation,
         )?;
+        let prepared = PreparedRetainedStreamUploadAbort::new_if_matches(
+            route.pg_id,
+            request.cluster_epoch,
+            &abort.bucket,
+            &abort.key,
+            &abort.session_id,
+            request.command.clone(),
+        )
+        .ok_or_else(|| StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::PayloadDecode,
+            message: format!("{operation} command does not match its validated subject"),
+        })?;
         Ok(StorageNodeRetainedPrimaryStreamAbortCommandRoute {
             route: StorageNodeRetainedPrimaryStreamAbortRoute { route },
-            command: &request.command,
+            prepared,
         })
     }
 

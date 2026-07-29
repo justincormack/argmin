@@ -1,5 +1,23 @@
 use super::*;
 
+fn raw_retained_stream_abort_request_error(
+    client: &UnixStorageNodeClient,
+    kind: StorageRpcMessageKind,
+    node_id: NodeId,
+    cluster_epoch: ClusterEpoch,
+    pg_id: PgId,
+    command: &MetadataCommandEnvelope,
+) -> StoreError {
+    let request = StorageRpcMetadataCommandRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        command: command.clone(),
+    };
+    let payload = encode_metadata_command_request(&request).unwrap();
+    client.rpc_request(kind, payload).unwrap_err()
+}
+
 #[test]
 fn unix_object_payload_reclaim_claim_release_survives_expired_route() {
     let tmp = test_util::tempdir();
@@ -274,27 +292,35 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
             ..
         }))
     ));
+    let wrong_apply = raw_retained_stream_abort_request_error(
+        &client,
+        StorageRpcMessageKind::MetadataCommandRetainedAbortApply,
+        config.node_id,
+        config.cluster_epoch,
+        PgId::new(wrong_pg_id),
+        &wrong_command,
+    );
     assert!(matches!(
-        RetainedMetadataCommandNodeClient::apply_retained_stream_upload_abort(
-            &client,
-            PgId::new(wrong_pg_id),
-            &wrong_command,
-        ),
-        Err(BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+        wrong_apply,
+        StoreError::StorageRpc {
             failure: StorageRpcErrorCode::PayloadDecode,
             ..
-        }))
+        }
     ));
+    let wrong_finish = raw_retained_stream_abort_request_error(
+        &client,
+        StorageRpcMessageKind::MetadataCommandRetainedAbortFinish,
+        config.node_id,
+        config.cluster_epoch,
+        PgId::new(wrong_pg_id),
+        &wrong_command,
+    );
     assert!(matches!(
-        RetainedMetadataCommandNodeClient::finish_retained_stream_upload_abort(
-            &client,
-            PgId::new(wrong_pg_id),
-            &wrong_command,
-        ),
-        Err(StoreError::StorageRpc {
+        wrong_finish,
+        StoreError::StorageRpc {
             failure: StorageRpcErrorCode::PayloadDecode,
             ..
-        })
+        }
     ));
 
     let command = RetainedObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
@@ -307,27 +333,16 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
     )
     .unwrap()
     .expect("expired-route retained cleanup must prepare the exact abort");
-    assert!(matches!(
-        command.payload(),
-        MetadataCommandPayload::AbortStreamUpload(abort)
-            if abort.bucket == bucket
-                && abort.key == key
-                && abort.session_id == session_id
-                && abort.staged_segments == vec![segment.clone()]
-    ));
-    RetainedMetadataCommandNodeClient::apply_retained_stream_upload_abort(
-        &client,
-        PgId::new(correct_pg_id),
-        &command,
-    )
-    .unwrap();
+    let abort = command.abort();
+    assert_eq!(abort.bucket, bucket);
+    assert_eq!(abort.key, key);
+    assert_eq!(abort.session_id, session_id);
+    assert_eq!(abort.staged_segments, vec![segment.clone()]);
+    RetainedMetadataCommandNodeClient::apply_retained_stream_upload_abort(&client, &command)
+        .unwrap();
     assert!(
-        RetainedMetadataCommandNodeClient::finish_retained_stream_upload_abort(
-            &client,
-            PgId::new(correct_pg_id),
-            &command,
-        )
-        .unwrap()
+        RetainedMetadataCommandNodeClient::finish_retained_stream_upload_abort(&client, &command)
+            .unwrap()
     );
 
     let part_command =
@@ -341,25 +356,17 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
         )
         .unwrap()
         .expect("expired-route retained cleanup must prepare the UploadPart abort");
-    assert!(matches!(
-        part_command.payload(),
-        MetadataCommandPayload::AbortStreamUpload(abort)
-            if abort.bucket == bucket
-                && abort.key == key
-                && abort.session_id == part_session_id
-                && abort.staged_segments == vec![part_segment.clone()]
-                && abort.stream_create_bucket_write_reservation.is_none()
-    ));
-    RetainedMetadataCommandNodeClient::apply_retained_stream_upload_abort(
-        &client,
-        PgId::new(correct_pg_id),
-        &part_command,
-    )
-    .unwrap();
+    let abort = part_command.abort();
+    assert_eq!(abort.bucket, bucket);
+    assert_eq!(abort.key, key);
+    assert_eq!(abort.session_id, part_session_id);
+    assert_eq!(abort.staged_segments, vec![part_segment.clone()]);
+    assert!(abort.stream_create_bucket_write_reservation.is_none());
+    RetainedMetadataCommandNodeClient::apply_retained_stream_upload_abort(&client, &part_command)
+        .unwrap();
     assert!(
         RetainedMetadataCommandNodeClient::finish_retained_stream_upload_abort(
             &client,
-            PgId::new(correct_pg_id),
             &part_command,
         )
         .unwrap()
@@ -458,7 +465,7 @@ fn unix_retained_stream_abort_prepare_response_binds_reservation_subject() {
     );
     client
         .validate_retained_stream_upload_abort_prepare_command(
-            &command,
+            command.clone(),
             pg_id,
             ClusterEpoch::INITIAL,
             &bucket,
@@ -483,7 +490,7 @@ fn unix_retained_stream_abort_prepare_response_binds_reservation_subject() {
     );
     client
         .validate_retained_stream_upload_abort_prepare_command(
-            &upload_part_command,
+            upload_part_command,
             pg_id,
             ClusterEpoch::INITIAL,
             &bucket,
@@ -507,7 +514,7 @@ fn unix_retained_stream_abort_prepare_response_binds_reservation_subject() {
     );
     assert!(matches!(
         client.validate_retained_stream_upload_abort_prepare_command(
-            &malformed,
+            malformed,
             pg_id,
             ClusterEpoch::INITIAL,
             &bucket,

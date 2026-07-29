@@ -666,7 +666,7 @@ Node-client role classification (2026-07-19):
 | `MetadataCommandNodeClient` | genuinely generic metadata PG | ordinary active publisher and convergence authority; serialized primary acceptance/application opens a non-nestable critical section bound to one PG and epoch, while recovery-only operations remain unavailable |
 | `MetadataCommandPeeringNodeClient` | genuinely generic metadata PG | quiesced-PG replay validation, retained-log catch-up, and metadata-transfer initialization/adoption; no command-ID allocation or pending-slot publication |
 | `MetadataCommandRecoveryNodeClient` | genuinely generic metadata PG | opens a non-nestable recovery critical section bound to one PG and epoch; the returned interface owns pending-slot reissue, explicitly authorized recovery apply, and durable abandonment without accepting replacement route arguments |
-| `RetainedMetadataCommandNodeClient` | genuinely generic metadata PG | exact retained-route authority for applying and finishing a previously prepared stream-upload abort |
+| `RetainedMetadataCommandNodeClient` | genuinely generic metadata PG | exact retained-route authority for applying and finishing an opaque stream-upload abort prepared from validated node state; callers cannot supply or redirect its PG or command |
 | `StorageNodeClient` | removed transitional mixed aggregate | production and cross-boundary test callers use role-specific interfaces; deliberately process-local assertions use the sanctioned raw-node test facade; private local helpers implement the embedded adapter without exposing another trait surface |
 
 The generic classifications are intentional. A metadata command can target a
@@ -3872,6 +3872,29 @@ Ninety-second Phase 3 slice:
   regressions and 41-test Unix metadata-RPC group. Formatting, the storage
   boundary checker, and workspace-wide strict Clippy pass, as does the full
   7,714-test workspace suite.
+
+Ninety-third Phase 3 slice:
+
+- retained stream-abort preparation now returns an opaque
+  `PreparedRetainedStreamUploadAbort` whose construction is confined to the
+  private node-runtime boundary. Promotion binds the command envelope to its
+  object-metadata PG, cluster epoch, bucket, key, session, staged-segment
+  sessions, and optional canonical PutObject/UploadPart stream-create
+  reservation proof.
+- retained abort apply and pending-slot finish consume that prepared value and
+  no longer accept caller-supplied PGs or command envelopes. Embedded, Unix,
+  storage-node RPC, and cluster fanout paths derive both values from the same
+  opaque authority; the RPC server promotes hostile wire commands only after
+  its retained-route and subject validation.
+- adversarial coverage keeps sending raw wrong-PG apply and finish frames at
+  the Unix boundary and requires `PayloadDecode`, while the constructor
+  regression rejects mismatched PG, epoch, bucket, key, session, and staged
+  segment provenance. Replacing the remaining active and retained stateful
+  method families with opaque operation capabilities remains open in Phase 3.
+- all 2,393 storage tests pass, including the focused retained-abort Unix and
+  opaque-provenance regressions. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full 7,715-test workspace suite also
+  pass.
 
 ### Phase 4 — type metadata-command publication
 

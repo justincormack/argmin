@@ -808,7 +808,7 @@ pub(crate) trait RetainedObjectMutationMetadataNodeClient: Send + Sync {
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
+    ) -> Result<Option<PreparedRetainedStreamUploadAbort>, ObjectPgActionError>;
 
     fn release_object_payload_reclaim_claim(
         &self,
@@ -1337,14 +1337,12 @@ pub(crate) trait ShardScavengerObservationNodeClient: Send + Sync {
 pub(crate) trait RetainedMetadataCommandNodeClient: Send + Sync {
     fn apply_retained_stream_upload_abort(
         &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
+        prepared: &PreparedRetainedStreamUploadAbort,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
 
     fn finish_retained_stream_upload_abort(
         &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
+        prepared: &PreparedRetainedStreamUploadAbort,
     ) -> Result<bool, StoreError>;
 }
 
