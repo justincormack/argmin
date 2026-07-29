@@ -257,6 +257,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
             cluster_epoch: config.cluster_epoch,
             state: crate::types::PgState::Active,
             primary_node_id: config.node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![config.node_id],
         },
         StorageNodePgRoute {
@@ -264,6 +265,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
             cluster_epoch: config.cluster_epoch,
             state: crate::types::PgState::Active,
             primary_node_id: config.node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![config.node_id],
         },
     ];
@@ -669,6 +671,7 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
         cluster_epoch: ClusterEpoch::new(1).unwrap(),
         state: crate::types::PgState::Active,
         primary_node_id: NodeId::new(7),
+        metadata_transfer_destination_epoch: None,
         acting_set: vec![NodeId::new(7)],
     });
     private_socket_dir(config.socket_path.parent().unwrap());
@@ -1019,6 +1022,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         },
         StorageNodePgRoute {
@@ -1026,6 +1030,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         },
     ];
@@ -1875,6 +1880,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         },
         StorageNodePgRoute {
@@ -1882,6 +1888,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         },
     ];
@@ -2497,6 +2504,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         },
         StorageNodePgRoute {
@@ -2504,6 +2512,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         },
     ];
@@ -3695,6 +3704,7 @@ fn unix_stream_uploads_list_rejects_wrong_pg_rows() {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         },
         StorageNodePgRoute {
@@ -3702,6 +3712,7 @@ fn unix_stream_uploads_list_rejects_wrong_pg_rows() {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         },
     ];
@@ -3916,6 +3927,7 @@ fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
         cluster_epoch: ClusterEpoch::new(1).unwrap(),
         state: crate::types::PgState::Active,
         primary_node_id: NodeId::new(7),
+        metadata_transfer_destination_epoch: None,
         acting_set: vec![NodeId::new(7)],
     });
     let bucket = crate::tests::bucket_name("object-reclaim-role-rpc-bucket");

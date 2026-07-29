@@ -41,6 +41,7 @@ fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         }],
         pending_metadata_command_recoveries: Vec::new(),

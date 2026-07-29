@@ -214,6 +214,7 @@ fn unix_broad_payload_lease_survives_frontend_runtime_map_refresh() {
         cluster_epoch: epoch,
         state: PgState::Active,
         primary_node_id: node_id,
+        metadata_transfer_destination_epoch: None,
         acting_set: node_ids.to_vec(),
     };
     let _server = spawn_storage_node_server(
@@ -305,6 +306,7 @@ fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() 
                 cluster_epoch: epoch,
                 state: PgState::Active,
                 primary_node_id: node_id,
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![node_id],
             }],
             pending_metadata_command_recoveries: Vec::new(),
@@ -462,6 +464,7 @@ fn unix_object_payload_reclaim_fence_rejects_crossed_claim_authority() {
                 cluster_epoch: epoch,
                 state: PgState::Active,
                 primary_node_id: node_id,
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![node_id],
             }],
             pending_metadata_command_recoveries: Vec::new(),
@@ -589,6 +592,7 @@ fn assert_historical_pending_command_recovery_over_unix(
         cluster_epoch: command_epoch,
         state: PgState::Active,
         primary_node_id: NodeId::new(0),
+        metadata_transfer_destination_epoch: None,
         acting_set: node_ids.to_vec(),
     };
     let current_route = StorageNodePgRoute {
@@ -596,6 +600,7 @@ fn assert_historical_pending_command_recovery_over_unix(
         cluster_epoch: current_epoch,
         state: PgState::Peering,
         primary_node_id: NodeId::new(0),
+        metadata_transfer_destination_epoch: None,
         acting_set: node_ids.to_vec(),
     };
 
@@ -832,6 +837,7 @@ fn unix_historical_recovery_reissues_then_cleans_stale_stream_generation() {
         cluster_epoch: command_epoch,
         state: PgState::Active,
         primary_node_id: node_id,
+        metadata_transfer_destination_epoch: None,
         acting_set: node_ids.to_vec(),
     });
     let current_routes = pg_ids.map(|raw_pg_id| StorageNodePgRoute {
@@ -843,6 +849,7 @@ fn unix_historical_recovery_reissues_then_cleans_stale_stream_generation() {
             PgState::Active
         },
         primary_node_id: node_id,
+        metadata_transfer_destination_epoch: None,
         acting_set: node_ids.to_vec(),
     });
     let data_dir = tmp.path().join("reissued-stream-cleanup-node");
@@ -1475,6 +1482,7 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: NodeId::new(1),
+            metadata_transfer_destination_epoch: None,
             acting_set: node_ids.to_vec(),
         }],
 
@@ -1664,6 +1672,7 @@ fn frontend_unix_shard_mode_uses_storage_node_owned_data_dir() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: NodeId::new(1),
+            metadata_transfer_destination_epoch: None,
             acting_set: node_ids.to_vec(),
         }],
 
@@ -1734,6 +1743,7 @@ fn frontend_unix_metadata_command_mode_uses_storage_node_owned_data_dir() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
 
@@ -1841,6 +1851,7 @@ fn peering_replay_catches_up_replicas_through_unix_storage_clients() {
                 cluster_epoch: ClusterEpoch::INITIAL,
                 state: PgState::Peering,
                 primary_node_id: NodeId::new(0),
+                metadata_transfer_destination_epoch: None,
                 acting_set: node_ids.to_vec(),
             }],
 
@@ -1914,6 +1925,7 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
 
@@ -2080,6 +2092,7 @@ fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
 
@@ -2221,6 +2234,7 @@ fn frontend_unix_durable_reclaim_scan_stops_after_first_stale_route() {
             cluster_epoch: storage_epoch,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         })
         .collect();
@@ -2332,6 +2346,7 @@ fn frontend_unix_delete_bucket_reaps_expired_reservation_from_older_epoch() {
             cluster_epoch: route_epoch,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
         pending_metadata_command_recoveries: Vec::new(),
@@ -2437,6 +2452,7 @@ fn frontend_unix_delete_bucket_adopts_live_drain_from_older_epoch() {
             cluster_epoch: route_epoch,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
         pending_metadata_command_recoveries: Vec::new(),
@@ -2509,6 +2525,7 @@ fn frontend_unix_lifecycle_claims_resume_from_storage_node_owned_rows() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
 
@@ -2644,6 +2661,7 @@ fn frontend_unix_stream_session_scavenger_lists_storage_node_owned_rows() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
 
@@ -2759,6 +2777,7 @@ fn frontend_unix_cluster_map_history_reference_summary_reads_storage_node_owned_
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
 
@@ -2876,6 +2895,7 @@ fn frontend_unix_stream_session_scavenger_rejects_wrong_pg_rows() {
                 cluster_epoch: ClusterEpoch::INITIAL,
                 state: PgState::Active,
                 primary_node_id: node_id,
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![node_id],
             },
             StorageNodePgRoute {
@@ -2883,6 +2903,7 @@ fn frontend_unix_stream_session_scavenger_rejects_wrong_pg_rows() {
                 cluster_epoch: ClusterEpoch::INITIAL,
                 state: PgState::Active,
                 primary_node_id: node_id,
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![node_id],
             },
         ],
@@ -2969,6 +2990,7 @@ fn frontend_unix_bucket_metadata_mode_reads_bucket_batches_from_storage_node() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
 
@@ -3162,6 +3184,7 @@ fn frontend_unix_object_generation_mode_reserves_on_storage_node() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
 
@@ -3259,6 +3282,7 @@ fn frontend_unix_object_version_mode_reserves_on_storage_node() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
 
@@ -3345,6 +3369,7 @@ fn frontend_unix_bucket_write_reservation_mode_uses_storage_node() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
 
@@ -3614,6 +3639,7 @@ fn frontend_unix_stream_heartbeat_renews_old_epoch_proof_and_session_row() {
                 cluster_epoch: route_epoch,
                 state: PgState::Active,
                 primary_node_id: node_id,
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![node_id],
             })
             .collect(),
@@ -3689,6 +3715,7 @@ fn frontend_unix_bucket_snapshot_pair_mode_uses_storage_node() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
 
@@ -3848,6 +3875,7 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
 
@@ -3953,6 +3981,7 @@ fn frontend_unix_object_generation_loser_retries_stale_generation() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
 
@@ -4086,6 +4115,7 @@ fn frontend_unix_object_generation_loser_retries_rpc_reservation_conflict() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
 
@@ -4558,6 +4588,7 @@ fn unix_object_mutation_client_repeats_suspended_null_delete_marker() {
             cluster_epoch: ClusterEpoch::INITIAL,
             state: PgState::Active,
             primary_node_id: node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![node_id],
         }],
         pending_metadata_command_recoveries: Vec::new(),
@@ -4743,6 +4774,7 @@ fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
                 cluster_epoch: ClusterEpoch::INITIAL,
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
+                metadata_transfer_destination_epoch: None,
                 acting_set: node_ids.to_vec(),
             }],
 
@@ -4863,6 +4895,7 @@ fn non_current_epoch_unix_direct_put_commit_fails_closed_and_cleans_remote_state
                 cluster_epoch: current_epoch,
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
+                metadata_transfer_destination_epoch: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -5201,6 +5234,7 @@ fn control_plane_peering_unix_direct_put_old_primary_fails_closed_and_cleans_rem
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -5211,6 +5245,7 @@ fn control_plane_peering_unix_direct_put_old_primary_fails_closed_and_cleans_rem
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -5588,6 +5623,7 @@ fn control_plane_peering_unix_copy_object_destination_old_primary_cleans_remote_
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -5598,6 +5634,7 @@ fn control_plane_peering_unix_copy_object_destination_old_primary_cleans_remote_
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -5948,6 +5985,7 @@ fn control_plane_peering_unix_object_delete_old_primary_fails_closed_without_rem
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -5958,6 +5996,7 @@ fn control_plane_peering_unix_object_delete_old_primary_fails_closed_without_rem
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -6247,6 +6286,7 @@ fn control_plane_peering_unix_object_metadata_old_primary_fails_closed_without_r
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -6257,6 +6297,7 @@ fn control_plane_peering_unix_object_metadata_old_primary_fails_closed_without_r
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -6549,6 +6590,7 @@ fn control_plane_peering_unix_multipart_completion_old_primary_fails_closed_with
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -6559,6 +6601,7 @@ fn control_plane_peering_unix_multipart_completion_old_primary_fails_closed_with
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -6866,6 +6909,7 @@ fn control_plane_peering_unix_multipart_abort_old_primary_fails_closed_without_r
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -6876,6 +6920,7 @@ fn control_plane_peering_unix_multipart_abort_old_primary_fails_closed_without_r
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -7199,6 +7244,7 @@ fn control_plane_peering_unix_upload_part_session_old_primary_fails_closed_witho
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -7209,6 +7255,7 @@ fn control_plane_peering_unix_upload_part_session_old_primary_fails_closed_witho
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -7614,6 +7661,7 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -7624,6 +7672,7 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -8056,6 +8105,7 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -8066,6 +8116,7 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -8535,6 +8586,7 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -8545,6 +8597,7 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -8816,6 +8869,7 @@ fn non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_st
                 cluster_epoch: current_epoch,
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
+                metadata_transfer_destination_epoch: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -9019,6 +9073,7 @@ fn non_current_epoch_unix_upload_part_stream_session_create_fails_closed_without
                 cluster_epoch: current_epoch,
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
+                metadata_transfer_destination_epoch: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -9208,6 +9263,7 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
                 cluster_epoch: current_epoch,
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
+                metadata_transfer_destination_epoch: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -9480,6 +9536,7 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
                 cluster_epoch: current_epoch,
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
+                metadata_transfer_destination_epoch: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -9770,6 +9827,7 @@ fn non_current_epoch_unix_multipart_completion_fails_closed_without_remote_mutat
                 cluster_epoch: current_epoch,
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
+                metadata_transfer_destination_epoch: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -9932,6 +9990,7 @@ fn non_current_epoch_unix_object_metadata_update_fails_closed_without_remote_mut
                 cluster_epoch: current_epoch,
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
+                metadata_transfer_destination_epoch: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -10089,6 +10148,7 @@ fn non_current_epoch_unix_object_delete_fails_closed_without_remote_mutation() {
                 cluster_epoch: current_epoch,
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
+                metadata_transfer_destination_epoch: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -10264,6 +10324,7 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
                 cluster_epoch: current_epoch,
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
+                metadata_transfer_destination_epoch: None,
                 acting_set: node_ids.to_vec(),
             }],
 
@@ -10273,6 +10334,7 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
                 cluster_epoch: historical_route.cluster_epoch(),
                 state: historical_route.state(),
                 primary_node_id: historical_route.primary_node_id(),
+                metadata_transfer_destination_epoch: None,
                 acting_set: historical_route.acting_set().to_vec(),
             }],
         })
@@ -10537,6 +10599,7 @@ fn remote_shard_files_without_ack_rows_are_not_publishable() {
                 cluster_epoch: ClusterEpoch::INITIAL,
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
+                metadata_transfer_destination_epoch: None,
                 acting_set: node_ids.to_vec(),
             }],
 
@@ -10685,6 +10748,7 @@ fn remote_shard_ack_rows_on_wrong_node_are_not_publishable() {
                 cluster_epoch: ClusterEpoch::INITIAL,
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
+                metadata_transfer_destination_epoch: None,
                 acting_set: node_ids.to_vec(),
             }],
 

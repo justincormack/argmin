@@ -56,7 +56,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 10;
+const CONTROL_PLANE_RPC_VERSION: u16 = 12;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -1582,6 +1582,7 @@ impl ClusterControlSnapshot {
             state: PgState::Active,
             primary_lease_deadline_ms: Some(primary_lease_deadline_ms),
             peering_metadata_transfer: None,
+            peering_metadata_transfer_destination_epoch: None,
             peering_metadata_transfer_source_route_epoch: None,
             peering_metadata_transfer_source_node_id: None,
             pending_metadata_command_recovery: None,
@@ -1659,6 +1660,7 @@ impl ClusterControlSnapshot {
                     state: PgState::Active,
                     primary_lease_deadline_ms: None,
                     peering_metadata_transfer: None,
+                    peering_metadata_transfer_destination_epoch: None,
                     peering_metadata_transfer_source_route_epoch: None,
                     peering_metadata_transfer_source_node_id: None,
                     pending_metadata_command_recovery: None,
@@ -1674,6 +1676,7 @@ impl ClusterControlSnapshot {
             state: PgState::Active,
             primary_lease_deadline_ms: Some(primary_lease_deadline_ms),
             peering_metadata_transfer: None,
+            peering_metadata_transfer_destination_epoch: None,
             peering_metadata_transfer_source_route_epoch: None,
             peering_metadata_transfer_source_node_id: None,
             pending_metadata_command_recovery: None,
@@ -1718,6 +1721,8 @@ impl ClusterControlSnapshot {
             state: record.state,
             primary_lease_deadline_ms: None,
             peering_metadata_transfer: record.peering_metadata_transfer,
+            peering_metadata_transfer_destination_epoch:
+                peering_metadata_transfer_destination_epoch(record)?,
             peering_metadata_transfer_source_route_epoch: record
                 .peering_metadata_transfer_source_route_epoch,
             peering_metadata_transfer_source_node_id: record
@@ -2128,6 +2133,16 @@ impl ClusterControlSnapshot {
         }
 
         for route in current_routes {
+            if let Some(destination_epoch) = route.peering_metadata_transfer_destination_epoch() {
+                if destination_epoch < self.cluster_epoch {
+                    add_required_historical_route_key(
+                        &mut required_keys,
+                        &mut pending_keys,
+                        destination_epoch,
+                        route.pg_id(),
+                    );
+                }
+            }
             if let Some(source_epoch) = route.peering_metadata_transfer_source_route_epoch() {
                 add_required_historical_route_key(
                     &mut required_keys,
@@ -3952,6 +3967,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 pg_id,
                 acting_set,
                 transfer,
+                expected_destination_epoch,
             } => {
                 validate_acting_set(self, pg_id, &acting_set)?;
                 validate_acting_set_preserves_pending_recovery(self, pg_id, &acting_set)?;
@@ -3959,14 +3975,32 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     .pg(pg_id)
                     .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
                 if record.acting_set == acting_set {
-                    if let Some(existing_transfer) = record.peering_metadata_transfer {
-                        if existing_transfer != transfer {
-                            return Err(ControlPlaneError::PgMetadataTransferProofMismatch {
+                    let existing_transfer = record.peering_metadata_transfer.ok_or(
+                        ControlPlaneError::PgMetadataMigrationRequiresTransfer {
+                            pg_id: pg_id.get(),
+                        },
+                    )?;
+                    if existing_transfer != transfer {
+                        return Err(ControlPlaneError::PgMetadataTransferProofMismatch {
+                            pg_id: pg_id.get(),
+                            expected: existing_transfer,
+                            actual: transfer,
+                        });
+                    }
+                    let actual_destination_epoch =
+                        peering_metadata_transfer_destination_epoch(record)?.ok_or(
+                            ControlPlaneError::PgMetadataMigrationRequiresTransfer {
                                 pg_id: pg_id.get(),
-                                expected: existing_transfer,
-                                actual: transfer,
-                            });
-                        }
+                            },
+                        )?;
+                    if actual_destination_epoch != expected_destination_epoch {
+                        return Err(
+                            ControlPlaneError::PgMetadataTransferDestinationEpochMismatch {
+                                pg_id: pg_id.get(),
+                                expected_destination_epoch,
+                                actual_destination_epoch,
+                            },
+                        );
                     }
                     return Ok(applied_control_plane_command(
                         self,
@@ -3974,6 +4008,16 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         ControlPlaneCommandResponse::SetPgActingSetWithMetadataTransfer,
                         false,
                     ));
+                }
+                let actual_destination_epoch = next_epoch(self.cluster_epoch)?;
+                if actual_destination_epoch != expected_destination_epoch {
+                    return Err(
+                        ControlPlaneError::PgMetadataTransferDestinationEpochMismatch {
+                            pg_id: pg_id.get(),
+                            expected_destination_epoch,
+                            actual_destination_epoch,
+                        },
+                    );
                 }
                 let state = record.state;
                 let metadata_transfer_fenced = record.metadata_transfer_fenced;
@@ -4219,7 +4263,8 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     record.metadata_transfer_fenced = true;
                     record.metadata_transfer_fence_source_lease_deadline_ms =
                         source_primary_lease_deadline_ms;
-                    record.metadata_transfer_fence_source_imported = false;
+                    record.metadata_transfer_fence_source_imported =
+                        record.peering_metadata_proof_floor_imported;
                     changed = true;
                 }
                 if changed {
@@ -4672,6 +4717,7 @@ pub struct PgRouteSnapshot {
     state: PgState,
     primary_lease_deadline_ms: Option<u64>,
     peering_metadata_transfer: Option<PgMetadataTransferProof>,
+    peering_metadata_transfer_destination_epoch: Option<ClusterEpoch>,
     peering_metadata_transfer_source_route_epoch: Option<ClusterEpoch>,
     peering_metadata_transfer_source_node_id: Option<NodeId>,
     pending_metadata_command_recovery: Option<PendingMetadataCommandRecovery>,
@@ -4693,6 +4739,7 @@ impl PgRouteSnapshot {
             state,
             primary_lease_deadline_ms: None,
             peering_metadata_transfer: None,
+            peering_metadata_transfer_destination_epoch: None,
             peering_metadata_transfer_source_route_epoch: None,
             peering_metadata_transfer_source_node_id: None,
             pending_metadata_command_recovery: None,
@@ -4732,6 +4779,11 @@ impl PgRouteSnapshot {
     #[must_use]
     pub fn peering_metadata_transfer(&self) -> Option<PgMetadataTransferProof> {
         self.peering_metadata_transfer
+    }
+
+    #[must_use]
+    pub fn peering_metadata_transfer_destination_epoch(&self) -> Option<ClusterEpoch> {
+        self.peering_metadata_transfer_destination_epoch
     }
 
     #[must_use]
@@ -4819,6 +4871,8 @@ fn pg_acting_set_retry_route_disposition(
         PgState::Peering
             if before.state == PgState::Peering
                 && before.peering_metadata_transfer == current.peering_metadata_transfer
+                && before.peering_metadata_transfer_destination_epoch
+                    == current.peering_metadata_transfer_destination_epoch
                 && before.peering_metadata_transfer_source_route_epoch
                     == current.peering_metadata_transfer_source_route_epoch
                 && before.peering_metadata_transfer_source_node_id
@@ -5295,12 +5349,20 @@ impl ClusterRuntimeMapSnapshot {
                 pg_id.get()
             )));
         }
+        let destination_epoch = route
+            .peering_metadata_transfer_destination_epoch
+            .ok_or_else(|| {
+                ControlPlaneError::rpc_protocol(format!(
+                    "metadata-transfer destination PG {} is missing its committed destination epoch",
+                    pg_id.get()
+                ))
+            })?;
         Ok(Self {
-            cluster_epoch: self.cluster_epoch,
+            cluster_epoch: destination_epoch,
             validity: self.validity,
             freshness_proof: self.freshness_proof,
             nodes: self.nodes.clone(),
-            pg_routes: vec![route.clone()],
+            pg_routes: vec![route.with_cluster_epoch(destination_epoch)],
             historical_pg_routes: self
                 .historical_pg_routes
                 .iter()
@@ -5393,6 +5455,12 @@ pub(crate) fn digest_pg_routes(hasher: &mut ChecksumHasher, routes: &[PgRouteSna
                 digest_u64(hasher, transfer.source_epoch().get());
                 digest_pg_metadata_proof(hasher, transfer.source_metadata_proof());
                 digest_pg_metadata_proof(hasher, transfer.metadata_proof());
+                digest_option_u64(
+                    hasher,
+                    route
+                        .peering_metadata_transfer_destination_epoch()
+                        .map(ClusterEpoch::get),
+                );
                 digest_option_u64(
                     hasher,
                     route
@@ -5652,6 +5720,9 @@ fn reconstruct_historical_pg_route(
         state: record.state,
         primary_lease_deadline_ms: None,
         peering_metadata_transfer: record.peering_metadata_transfer,
+        peering_metadata_transfer_destination_epoch: record
+            .peering_metadata_transfer
+            .map(|_| cluster_epoch),
         peering_metadata_transfer_source_route_epoch: record
             .peering_metadata_transfer_source_route_epoch,
         peering_metadata_transfer_source_node_id: record.peering_metadata_transfer_source_node_id,
@@ -5878,11 +5949,29 @@ fn reconstruct_pg_route_from_record(
         state: record.state,
         primary_lease_deadline_ms: None,
         peering_metadata_transfer: record.peering_metadata_transfer,
+        peering_metadata_transfer_destination_epoch: peering_metadata_transfer_destination_epoch(
+            record,
+        )?,
         peering_metadata_transfer_source_route_epoch: record
             .peering_metadata_transfer_source_route_epoch,
         peering_metadata_transfer_source_node_id: record.peering_metadata_transfer_source_node_id,
         pending_metadata_command_recovery: None,
     })
+}
+
+fn peering_metadata_transfer_destination_epoch(
+    record: &PgControlRecord,
+) -> Result<Option<ClusterEpoch>, ControlPlaneError> {
+    let Some(_) = record.peering_metadata_transfer else {
+        return Ok(None);
+    };
+    let floor_epoch = record.peering_metadata_proof_floor_epoch.ok_or_else(|| {
+        ControlPlaneError::rpc_protocol(format!(
+            "PG {} metadata transfer is missing its destination proof-floor epoch",
+            record.pg_id.get()
+        ))
+    })?;
+    next_epoch(floor_epoch).map(Some)
 }
 
 fn add_required_historical_route_key(
@@ -5910,6 +5999,8 @@ fn pg_route_configuration_eq(left: &PgRouteSnapshot, right: &PgRouteSnapshot) ->
         && left.acting_set() == right.acting_set()
         && left.state() == right.state()
         && left.peering_metadata_transfer() == right.peering_metadata_transfer()
+        && left.peering_metadata_transfer_destination_epoch()
+            == right.peering_metadata_transfer_destination_epoch()
         && left.peering_metadata_transfer_source_route_epoch()
             == right.peering_metadata_transfer_source_route_epoch()
         && left.peering_metadata_transfer_source_node_id()
@@ -7061,6 +7152,7 @@ pub trait ControlPlaneAdmin {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError>;
 
     fn transfer_raft_leadership_to(&mut self, node_id: u64) -> Result<(), ControlPlaneError> {
@@ -9200,10 +9292,27 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let expected_destination_epoch = next_epoch(self.snapshot.cluster_epoch())?;
+        self.set_pg_acting_set_with_metadata_transfer_at_epoch(
+            pg_id,
+            acting_set,
+            transfer,
+            expected_destination_epoch,
+        )
+    }
+
+    pub fn set_pg_acting_set_with_metadata_transfer_at_epoch(
+        &mut self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
         self.apply_and_commit_command(ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
             pg_id,
             acting_set,
             transfer,
+            expected_destination_epoch,
         })?;
         Ok(self.snapshot.clone())
     }
@@ -9977,9 +10086,14 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
         pg_id: PgId,
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        SingleAuthorityControlPlane::set_pg_acting_set_with_metadata_transfer(
-            self, pg_id, acting_set, transfer,
+        SingleAuthorityControlPlane::set_pg_acting_set_with_metadata_transfer_at_epoch(
+            self,
+            pg_id,
+            acting_set,
+            transfer,
+            expected_destination_epoch,
         )
     }
 }
@@ -11931,7 +12045,7 @@ impl UnixControlPlaneClient {
         pg_id: PgId,
         acting_set: &[NodeId],
         transfer: PgMetadataTransferProof,
-        min_cluster_epoch: ClusterEpoch,
+        expected_destination_epoch: ClusterEpoch,
         original_error: &ControlPlaneError,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let deadline = Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE;
@@ -11948,7 +12062,7 @@ impl UnixControlPlaneClient {
                         pg_id,
                         acting_set,
                         transfer,
-                        min_cluster_epoch,
+                        expected_destination_epoch,
                     ) {
                         return Ok(runtime_map);
                     }
@@ -12248,6 +12362,7 @@ impl UnixControlPlaneClient {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
     ) -> Result<ClusterEpoch, ControlPlaneError> {
         let mut payload = Vec::new();
         write_pg_acting_set_with_metadata_transfer_request(
@@ -12255,6 +12370,7 @@ impl UnixControlPlaneClient {
             pg_id,
             &acting_set,
             transfer,
+            expected_destination_epoch,
         )?;
         let payload = self.send_request(
             ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer,
@@ -12274,16 +12390,21 @@ impl UnixControlPlaneClient {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
-        min_cluster_epoch: ClusterEpoch,
+        expected_destination_epoch: ClusterEpoch,
     ) -> Result<ClusterEpoch, ControlPlaneError> {
-        match self.set_pg_acting_set_with_metadata_transfer(pg_id, acting_set.clone(), transfer) {
+        match self.set_pg_acting_set_with_metadata_transfer(
+            pg_id,
+            acting_set.clone(),
+            transfer,
+            expected_destination_epoch,
+        ) {
             Ok(cluster_epoch) => Ok(cluster_epoch),
             Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => self
                 .wait_for_metadata_transfer_install_applied(
                     pg_id,
                     &acting_set,
                     transfer,
-                    min_cluster_epoch,
+                    expected_destination_epoch,
                     &error,
                 )
                 .map(|runtime_map| runtime_map.cluster_epoch()),
@@ -12296,6 +12417,7 @@ impl UnixControlPlaneClient {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let mut payload = Vec::new();
         write_pg_acting_set_with_metadata_transfer_request(
@@ -12303,6 +12425,7 @@ impl UnixControlPlaneClient {
             pg_id,
             &acting_set,
             transfer,
+            expected_destination_epoch,
         )?;
         let payload = self.send_request(
             ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap,
@@ -12425,12 +12548,13 @@ impl UnixControlPlaneClient {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
-        min_cluster_epoch: ClusterEpoch,
+        expected_destination_epoch: ClusterEpoch,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         match self.set_pg_acting_set_with_metadata_transfer_runtime_map(
             pg_id,
             acting_set.clone(),
             transfer,
+            expected_destination_epoch,
         ) {
             Ok(runtime_map)
                 if metadata_transfer_install_applied(
@@ -12438,7 +12562,7 @@ impl UnixControlPlaneClient {
                     pg_id,
                     &acting_set,
                     transfer,
-                    min_cluster_epoch,
+                    expected_destination_epoch,
                 ) =>
             {
                 Ok(runtime_map)
@@ -12455,7 +12579,7 @@ impl UnixControlPlaneClient {
                     pg_id,
                     &acting_set,
                     transfer,
-                    min_cluster_epoch,
+                    expected_destination_epoch,
                     &error,
                 ),
             Err(error) => Err(error),
@@ -13018,7 +13142,7 @@ impl AuthenticatedUnixControlPlaneClient {
         pg_id: PgId,
         acting_set: &[NodeId],
         transfer: PgMetadataTransferProof,
-        min_cluster_epoch: ClusterEpoch,
+        expected_destination_epoch: ClusterEpoch,
         retry_clock: AuthenticatedAdminRetryClock,
         original_error: &ControlPlaneError,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
@@ -13036,7 +13160,7 @@ impl AuthenticatedUnixControlPlaneClient {
                         pg_id,
                         acting_set,
                         transfer,
-                        min_cluster_epoch,
+                        expected_destination_epoch,
                     ) {
                         return Ok(runtime_map);
                     }
@@ -13219,6 +13343,7 @@ impl AuthenticatedUnixControlPlaneClient {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
         authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let mut payload = Vec::new();
@@ -13227,6 +13352,7 @@ impl AuthenticatedUnixControlPlaneClient {
             pg_id,
             &acting_set,
             transfer,
+            expected_destination_epoch,
         )?;
         let payload = self.send_admin_request_with_read_timeout(
             ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap,
@@ -13245,7 +13371,7 @@ impl AuthenticatedUnixControlPlaneClient {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
-        min_cluster_epoch: ClusterEpoch,
+        expected_destination_epoch: ClusterEpoch,
         authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let retry_clock = AuthenticatedAdminRetryClock::new(authority_now_ms);
@@ -13253,6 +13379,7 @@ impl AuthenticatedUnixControlPlaneClient {
             pg_id,
             acting_set.clone(),
             transfer,
+            expected_destination_epoch,
             authority_now_ms,
         ) {
             Ok(runtime_map)
@@ -13261,7 +13388,7 @@ impl AuthenticatedUnixControlPlaneClient {
                     pg_id,
                     &acting_set,
                     transfer,
-                    min_cluster_epoch,
+                    expected_destination_epoch,
                 ) =>
             {
                 Ok(runtime_map)
@@ -13278,7 +13405,7 @@ impl AuthenticatedUnixControlPlaneClient {
                     pg_id,
                     &acting_set,
                     transfer,
-                    min_cluster_epoch,
+                    expected_destination_epoch,
                     retry_clock,
                     &error,
                 ),
@@ -13291,14 +13418,14 @@ impl AuthenticatedUnixControlPlaneClient {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
-        min_cluster_epoch: ClusterEpoch,
+        expected_destination_epoch: ClusterEpoch,
         authority_now_ms: u64,
     ) -> Result<ClusterEpoch, ControlPlaneError> {
         self.set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
             pg_id,
             acting_set,
             transfer,
-            min_cluster_epoch,
+            expected_destination_epoch,
             authority_now_ms,
         )
         .map(|runtime_map| runtime_map.cluster_epoch())
@@ -14852,9 +14979,9 @@ fn metadata_transfer_install_applied(
     pg_id: PgId,
     acting_set: &[NodeId],
     transfer: PgMetadataTransferProof,
-    min_cluster_epoch: ClusterEpoch,
+    expected_destination_epoch: ClusterEpoch,
 ) -> bool {
-    if runtime_map.cluster_epoch() < min_cluster_epoch {
+    if runtime_map.cluster_epoch() < expected_destination_epoch {
         return false;
     }
     runtime_map
@@ -14862,10 +14989,12 @@ fn metadata_transfer_install_applied(
         .iter()
         .find(|route| route.pg_id() == pg_id)
         .is_some_and(|route| {
-            route.cluster_epoch() >= min_cluster_epoch
+            route.cluster_epoch() >= expected_destination_epoch
                 && route.state() == PgState::Peering
                 && route.acting_set() == acting_set
                 && route.peering_metadata_transfer() == Some(transfer)
+                && route.peering_metadata_transfer_destination_epoch()
+                    == Some(expected_destination_epoch)
         })
 }
 
@@ -15581,12 +15710,15 @@ where
         }
         ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer => {
             let mut reader = PayloadReader::new(&payload);
-            let (pg_id, acting_set, transfer) =
+            let (pg_id, acting_set, transfer, expected_destination_epoch) =
                 read_pg_acting_set_with_metadata_transfer_request(&mut reader)?;
             reader.finish()?;
-            match control_plane
-                .set_pg_acting_set_with_metadata_transfer(pg_id, acting_set, transfer)
-            {
+            match control_plane.set_pg_acting_set_with_metadata_transfer(
+                pg_id,
+                acting_set,
+                transfer,
+                expected_destination_epoch,
+            ) {
                 Ok(snapshot) => {
                     let mut response = Vec::new();
                     write_u64(&mut response, snapshot.cluster_epoch().get());
@@ -15597,11 +15729,16 @@ where
         }
         ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap => {
             let mut reader = PayloadReader::new(&payload);
-            let (pg_id, acting_set, transfer) =
+            let (pg_id, acting_set, transfer, expected_destination_epoch) =
                 read_pg_acting_set_with_metadata_transfer_request(&mut reader)?;
             reader.finish()?;
             match control_plane
-                .set_pg_acting_set_with_metadata_transfer(pg_id, acting_set, transfer)
+                .set_pg_acting_set_with_metadata_transfer(
+                    pg_id,
+                    acting_set,
+                    transfer,
+                    expected_destination_epoch,
+                )
                 .and_then(|snapshot| {
                     snapshot.reconstructed_runtime_map_for_pg_with_fallback_validity(
                         pg_id,
@@ -17053,6 +17190,16 @@ fn encode_control_plane_rpc_response(
             write_option_u64(&mut payload, established_term);
             write_u64(&mut payload, current_term);
         }
+        Err(ControlPlaneError::PgMetadataTransferDestinationEpochMismatch {
+            pg_id,
+            expected_destination_epoch,
+            actual_destination_epoch,
+        }) => {
+            write_u8(&mut payload, 15);
+            write_u32(&mut payload, pg_id);
+            write_u64(&mut payload, expected_destination_epoch.get());
+            write_u64(&mut payload, actual_destination_epoch.get());
+        }
         Err(error) => {
             write_u8(&mut payload, 1);
             write_string(&mut payload, &error.rpc_wire_error_message())?;
@@ -17195,6 +17342,21 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
                 established_term,
                 current_term,
             })
+        }
+        15 => {
+            let pg_id = reader.read_u32()?;
+            let expected_destination_epoch =
+                read_cluster_epoch(&mut reader, "expected metadata transfer destination epoch")?;
+            let actual_destination_epoch =
+                read_cluster_epoch(&mut reader, "actual metadata transfer destination epoch")?;
+            reader.finish()?;
+            Err(
+                ControlPlaneError::PgMetadataTransferDestinationEpochMismatch {
+                    pg_id,
+                    expected_destination_epoch,
+                    actual_destination_epoch,
+                },
+            )
         }
         _ => Err(ControlPlaneError::rpc_protocol(format!(
             "invalid control-plane RPC response status {status}"
@@ -17393,21 +17555,25 @@ fn write_pg_acting_set_with_metadata_transfer_request(
     pg_id: PgId,
     acting_set: &[NodeId],
     transfer: PgMetadataTransferProof,
+    expected_destination_epoch: ClusterEpoch,
 ) -> Result<(), ControlPlaneError> {
     write_pg_acting_set_request(out, pg_id, acting_set)?;
     write_u64(out, transfer.source_epoch().get());
     write_pg_metadata_proof(out, transfer.source_metadata_proof());
     write_pg_metadata_proof(out, transfer.metadata_proof());
+    write_u64(out, expected_destination_epoch.get());
     Ok(())
 }
 
 fn read_pg_acting_set_with_metadata_transfer_request(
     reader: &mut PayloadReader<'_>,
-) -> Result<(PgId, Vec<NodeId>, PgMetadataTransferProof), ControlPlaneError> {
+) -> Result<(PgId, Vec<NodeId>, PgMetadataTransferProof, ClusterEpoch), ControlPlaneError> {
     let (pg_id, acting_set) = read_pg_acting_set_request(reader)?;
     let source_epoch = read_cluster_epoch(reader, "metadata transfer source epoch")?;
     let source_metadata_proof = read_pg_metadata_proof(reader)?;
     let imported_metadata_proof = read_pg_metadata_proof(reader)?;
+    let expected_destination_epoch =
+        read_cluster_epoch(reader, "metadata transfer destination epoch")?;
     Ok((
         pg_id,
         acting_set,
@@ -17416,6 +17582,7 @@ fn read_pg_acting_set_with_metadata_transfer_request(
             source_metadata_proof,
             imported_metadata_proof,
         ),
+        expected_destination_epoch,
     ))
 }
 
@@ -18259,6 +18426,12 @@ fn write_pg_route_snapshots(
                 write_option_u64(
                     out,
                     route
+                        .peering_metadata_transfer_destination_epoch()
+                        .map(ClusterEpoch::get),
+                );
+                write_option_u64(
+                    out,
+                    route
                         .peering_metadata_transfer_source_route_epoch()
                         .map(ClusterEpoch::get),
                 );
@@ -18571,8 +18744,11 @@ fn validate_runtime_map_routes(
         }
         if route.peering_metadata_transfer().is_some()
             && (route
-                .peering_metadata_transfer_source_route_epoch()
+                .peering_metadata_transfer_destination_epoch()
                 .is_none()
+                || route
+                    .peering_metadata_transfer_source_route_epoch()
+                    .is_none()
                 || route.peering_metadata_transfer_source_node_id().is_none())
         {
             return Err(ControlPlaneError::rpc_protocol(format!(
@@ -18598,8 +18774,11 @@ fn validate_runtime_map_routes(
         }
         if route.peering_metadata_transfer().is_none()
             && (route
-                .peering_metadata_transfer_source_route_epoch()
+                .peering_metadata_transfer_destination_epoch()
                 .is_some()
+                || route
+                    .peering_metadata_transfer_source_route_epoch()
+                    .is_some()
                 || route.peering_metadata_transfer_source_node_id().is_some())
         {
             return Err(ControlPlaneError::rpc_protocol(format!(
@@ -18692,14 +18871,25 @@ fn read_pg_route_snapshots(
         let primary_lease_deadline_ms = reader.read_option_u64()?;
         let (
             peering_metadata_transfer,
+            peering_metadata_transfer_destination_epoch,
             peering_metadata_transfer_source_route_epoch,
             peering_metadata_transfer_source_node_id,
         ) = match reader.read_u8()? {
-            0 => (None, None, None),
+            0 => (None, None, None, None),
             1 => {
                 let source_epoch = read_cluster_epoch(reader, "metadata transfer source epoch")?;
                 let source_metadata_proof = read_pg_metadata_proof(reader)?;
                 let imported_metadata_proof = read_pg_metadata_proof(reader)?;
+                let destination_epoch = reader
+                    .read_option_u64()?
+                    .map(|epoch| {
+                        ClusterEpoch::new(epoch).ok_or_else(|| {
+                            ControlPlaneError::rpc_protocol(
+                                "metadata transfer destination epoch must be nonzero".to_owned(),
+                            )
+                        })
+                    })
+                    .transpose()?;
                 let source_route_epoch = reader
                     .read_option_u64()?
                     .map(|epoch| {
@@ -18717,6 +18907,7 @@ fn read_pg_route_snapshots(
                         source_metadata_proof,
                         imported_metadata_proof,
                     )),
+                    destination_epoch,
                     source_route_epoch,
                     source_node_id,
                 )
@@ -18756,6 +18947,35 @@ fn read_pg_route_snapshots(
         for _ in 0..acting_set_len {
             acting_set.push(NodeId::new(reader.read_u32()?));
         }
+        match (
+            peering_metadata_transfer,
+            peering_metadata_transfer_destination_epoch,
+        ) {
+            (Some(transfer), Some(destination_epoch)) => {
+                if destination_epoch > route_epoch || destination_epoch <= transfer.source_epoch() {
+                    return Err(ControlPlaneError::rpc_protocol(format!(
+                        "PG {} metadata transfer destination epoch {} must be newer than source epoch {} and no newer than route epoch {}",
+                        pg_id.get(),
+                        destination_epoch.get(),
+                        transfer.source_epoch().get(),
+                        route_epoch.get(),
+                    )));
+                }
+            }
+            (Some(_), None) => {
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "PG {} metadata transfer is missing its destination epoch",
+                    pg_id.get()
+                )));
+            }
+            (None, Some(_)) => {
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "PG {} metadata transfer destination epoch requires a transfer marker",
+                    pg_id.get()
+                )));
+            }
+            (None, None) => {}
+        }
         routes.push(PgRouteSnapshot {
             cluster_epoch: route_epoch,
             pg_id,
@@ -18764,6 +18984,7 @@ fn read_pg_route_snapshots(
             state,
             primary_lease_deadline_ms,
             peering_metadata_transfer,
+            peering_metadata_transfer_destination_epoch,
             peering_metadata_transfer_source_route_epoch,
             peering_metadata_transfer_source_node_id,
             pending_metadata_command_recovery,
@@ -19441,6 +19662,15 @@ pub enum ControlPlaneError {
         pg_id: u32,
         expected: PgMetadataTransferProof,
         actual: PgMetadataTransferProof,
+    },
+
+    #[error(
+        "PG {pg_id} metadata transfer expected destination epoch {expected_destination_epoch}, but the next destination epoch is {actual_destination_epoch}"
+    )]
+    PgMetadataTransferDestinationEpochMismatch {
+        pg_id: u32,
+        expected_destination_epoch: ClusterEpoch,
+        actual_destination_epoch: ClusterEpoch,
     },
 
     #[error("control-plane bootstrap repeats PG {pg_id}")]
@@ -22761,13 +22991,15 @@ fn required_cluster_map_history_protection<'a, 'b>(
     pgs: impl IntoIterator<Item = &'a PgControlRecord>,
     nodes: impl IntoIterator<Item = &'b NodeControlRecord>,
 ) -> ClusterMapHistoryProtection {
-    let mut exact_routes: BTreeSet<_> = pgs
-        .into_iter()
-        .filter_map(|pg| {
-            pg.peering_metadata_transfer_source_route_epoch()
-                .map(|epoch| (epoch, pg.pg_id()))
-        })
-        .collect();
+    let mut exact_routes = BTreeSet::new();
+    for pg in pgs {
+        if let Some(source_epoch) = pg.peering_metadata_transfer_source_route_epoch() {
+            exact_routes.insert((source_epoch, pg.pg_id()));
+        }
+        if let Ok(Some(destination_epoch)) = peering_metadata_transfer_destination_epoch(pg) {
+            exact_routes.insert((destination_epoch, pg.pg_id()));
+        }
+    }
     for node in nodes {
         exact_routes.extend(
             node.cluster_map_history_route_references()
@@ -28157,6 +28389,30 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_rpc_preserves_metadata_transfer_destination_epoch_mismatch_identity() {
+        let expected_destination_epoch = ClusterEpoch::new(44).unwrap();
+        let actual_destination_epoch = ClusterEpoch::new(45).unwrap();
+        let encoded = encode_control_plane_rpc_response(Err(
+            ControlPlaneError::PgMetadataTransferDestinationEpochMismatch {
+                pg_id: 7,
+                expected_destination_epoch,
+                actual_destination_epoch,
+            },
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            decode_control_plane_rpc_response(encoded),
+            Err(ControlPlaneError::PgMetadataTransferDestinationEpochMismatch {
+                pg_id: 7,
+                expected_destination_epoch: decoded_expected,
+                actual_destination_epoch: decoded_actual,
+            }) if decoded_expected == expected_destination_epoch
+                && decoded_actual == actual_destination_epoch
+        ));
+    }
+
+    #[test]
     fn control_plane_rpc_preserves_acting_set_change_not_ready_identity() {
         let cluster_epoch = ClusterEpoch::new(44).unwrap();
         let encoded =
@@ -31592,6 +31848,7 @@ mod tests {
             _pg_id: PgId,
             _acting_set: Vec<NodeId>,
             _transfer: PgMetadataTransferProof,
+            _expected_destination_epoch: ClusterEpoch,
         ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
             Self::unsupported_snapshot_command()
         }
@@ -31969,6 +32226,9 @@ mod tests {
             );
             drop(response);
             drop(stream);
+            authority
+                .set_pg_acting_set(PgId::new(44), vec![NodeId::new(1)])
+                .expect("unrelated PG epoch advance should succeed");
 
             let (mut stream, _addr) = listener.accept().unwrap();
             let request = read_control_plane_unix_request(&mut stream).unwrap();
@@ -32019,13 +32279,13 @@ mod tests {
 
         server.join().unwrap();
         let runtime_map = runtime_map.unwrap();
-        assert_eq!(runtime_map.cluster_epoch(), expected_transfer_epoch);
+        assert!(runtime_map.cluster_epoch() > expected_transfer_epoch);
         let route = runtime_map
             .pg_routes()
             .iter()
             .find(|route| route.pg_id() == PgId::new(43))
             .unwrap();
-        assert_eq!(route.cluster_epoch(), expected_transfer_epoch);
+        assert_eq!(route.cluster_epoch(), runtime_map.cluster_epoch());
         assert_eq!(route.state(), PgState::Peering);
         assert_eq!(route.acting_set(), &[NodeId::new(2)]);
         assert_eq!(route.peering_metadata_transfer(), Some(transfer));
@@ -34043,8 +34303,14 @@ mod tests {
         });
 
         let client = UnixControlPlaneClient::new(&socket_path);
+        let expected_destination_epoch = next_epoch(active_epoch).unwrap();
         let cluster_epoch = client
-            .set_pg_acting_set_with_metadata_transfer(PgId::new(43), vec![NodeId::new(2)], transfer)
+            .set_pg_acting_set_with_metadata_transfer(
+                PgId::new(43),
+                vec![NodeId::new(2)],
+                transfer,
+                expected_destination_epoch,
+            )
             .unwrap();
 
         server.join().unwrap();
@@ -34230,11 +34496,13 @@ mod tests {
         });
 
         let client = UnixControlPlaneClient::new(&socket_path);
+        let expected_destination_epoch = next_epoch(active_epoch).unwrap();
         let runtime_map = client
             .set_pg_acting_set_with_metadata_transfer_runtime_map(
                 PgId::new(43),
                 vec![NodeId::new(2)],
                 transfer,
+                expected_destination_epoch,
             )
             .unwrap();
 
@@ -35563,7 +35831,9 @@ mod tests {
     #[test]
     fn control_plane_rpc_rejects_runtime_map_transfer_without_source_route() {
         let mut snapshot = runtime_map_test_snapshot_with_active_route();
+        snapshot.cluster_epoch = ClusterEpoch::new(2).unwrap();
         let route = &mut snapshot.pg_routes[0];
+        route.cluster_epoch = snapshot.cluster_epoch;
         route.state = PgState::Peering;
         route.primary_lease_deadline_ms = None;
         route.peering_metadata_transfer = Some(PgMetadataTransferProof::new(
@@ -35574,6 +35844,7 @@ mod tests {
                 state_digest: 3,
             },
         ));
+        route.peering_metadata_transfer_destination_epoch = Some(snapshot.cluster_epoch);
         let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
 
         assert!(matches!(
@@ -35618,7 +35889,9 @@ mod tests {
     #[test]
     fn control_plane_rpc_rejects_runtime_map_transfer_unknown_source_node() {
         let mut snapshot = runtime_map_test_snapshot_with_active_route();
+        snapshot.cluster_epoch = ClusterEpoch::new(2).unwrap();
         let route = &mut snapshot.pg_routes[0];
+        route.cluster_epoch = snapshot.cluster_epoch;
         route.state = PgState::Peering;
         route.primary_lease_deadline_ms = None;
         route.peering_metadata_transfer = Some(PgMetadataTransferProof::new(
@@ -35629,6 +35902,7 @@ mod tests {
                 state_digest: 3,
             },
         ));
+        route.peering_metadata_transfer_destination_epoch = Some(snapshot.cluster_epoch);
         route.peering_metadata_transfer_source_route_epoch = Some(ClusterEpoch::INITIAL);
         route.peering_metadata_transfer_source_node_id = Some(NodeId::new(99));
         let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
@@ -35694,16 +35968,19 @@ mod tests {
     fn control_plane_rpc_rejects_historical_runtime_map_transfer_source_route_forward_reference() {
         let mut snapshot = runtime_map_test_snapshot_with_transfer_route(true);
         let mut transfer_route = snapshot.pg_routes[0].clone();
-        let transfer_epoch = ClusterEpoch::new(snapshot.cluster_epoch().get() - 1).unwrap();
-        transfer_route.cluster_epoch = transfer_epoch;
-        transfer_route.peering_metadata_transfer_source_route_epoch =
-            Some(snapshot.cluster_epoch());
+        let transfer_epoch = transfer_route.cluster_epoch();
+        let current_epoch = next_epoch(transfer_epoch).unwrap();
+        snapshot.cluster_epoch = current_epoch;
+        snapshot.pg_routes[0].cluster_epoch = current_epoch;
+        transfer_route.peering_metadata_transfer_source_route_epoch = Some(current_epoch);
         transfer_route.peering_metadata_transfer_source_node_id = Some(NodeId::new(1));
         snapshot.pg_routes[0].peering_metadata_transfer = None;
+        snapshot.pg_routes[0].peering_metadata_transfer_destination_epoch = None;
         snapshot.pg_routes[0].peering_metadata_transfer_source_route_epoch = None;
         snapshot.pg_routes[0].peering_metadata_transfer_source_node_id = None;
         snapshot.historical_pg_routes.clear();
         snapshot.historical_pg_routes.push(transfer_route);
+        snapshot.historical_cluster_epochs.push(transfer_epoch);
         let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
 
         assert!(matches!(
@@ -35876,6 +36153,7 @@ mod tests {
                 state: PgState::Active,
                 primary_lease_deadline_ms: Some(12_345),
                 peering_metadata_transfer: None,
+                peering_metadata_transfer_destination_epoch: None,
                 peering_metadata_transfer_source_route_epoch: None,
                 peering_metadata_transfer_source_node_id: None,
                 pending_metadata_command_recovery: None,
@@ -36170,6 +36448,7 @@ mod tests {
                     state_digest: 3,
                 },
             ));
+            route.peering_metadata_transfer_destination_epoch = Some(destination_epoch);
             route.peering_metadata_transfer_source_route_epoch = Some(source_epoch);
             route.peering_metadata_transfer_source_node_id = Some(NodeId::new(1));
         }
@@ -36255,6 +36534,12 @@ mod tests {
         let mut snapshot = runtime_map_test_snapshot_with_transfer_route(true);
         let transfer = snapshot.pg_routes[0].peering_metadata_transfer().unwrap();
         let acting_set = snapshot.pg_routes[0].acting_set().to_vec();
+        let destination_epoch = snapshot.pg_routes[0]
+            .peering_metadata_transfer_destination_epoch()
+            .unwrap();
+        let unrelated_epoch = next_epoch(snapshot.cluster_epoch()).unwrap();
+        snapshot.cluster_epoch = unrelated_epoch;
+        snapshot.pg_routes[0].cluster_epoch = unrelated_epoch;
         let now_ms = crate::clock::current_time_millis();
         snapshot.validity = RouteMapValidity::until_ms(now_ms + 10_000).unwrap();
         snapshot.freshness_proof = RuntimeMapFreshnessProof::SingleAuthority {
@@ -36266,8 +36551,12 @@ mod tests {
             .metadata_transfer_destination_runtime_map(PgId::new(7), &acting_set, transfer)
             .unwrap();
 
+        assert_eq!(destination.cluster_epoch(), destination_epoch);
         assert_eq!(destination.pg_routes().len(), 1);
-        assert_eq!(destination.pg_routes()[0], snapshot.pg_routes()[0]);
+        assert_eq!(
+            destination.pg_routes()[0],
+            snapshot.pg_routes()[0].with_cluster_epoch(destination_epoch)
+        );
         assert!(destination
             .bind_process_local_lease_at(now_ms, 60_000)
             .unwrap()
@@ -36573,7 +36862,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_map_history_pruning_preserves_metadata_transfer_source_route_epoch() {
+    fn cluster_map_history_pruning_preserves_metadata_transfer_route_epochs() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
@@ -36622,18 +36911,20 @@ mod tests {
         );
         let initial_epoch = ClusterEpoch::INITIAL;
         let source_epoch = authority.snapshot().cluster_epoch();
+        let imported_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 12,
+            state_digest: 11,
+        };
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             source_epoch,
             active_proof,
-            PgMetadataProof {
-                applied_log_index: 9,
-                applied_log_hash: 12,
-                state_digest: 11,
-            },
+            imported_proof,
         );
         authority
             .set_pg_acting_set_with_metadata_transfer(PgId::new(42), vec![NodeId::new(2)], transfer)
             .unwrap();
+        let destination_epoch = authority.snapshot().cluster_epoch();
 
         for node_id in 10..(10 + CLUSTER_MAP_HISTORY_LIMIT as u32 + 8) {
             authority
@@ -36642,7 +36933,7 @@ mod tests {
         }
 
         let history = authority.snapshot().cluster_map_history();
-        assert_eq!(history.len(), CLUSTER_MAP_HISTORY_LIMIT + 1);
+        assert_eq!(history.len(), CLUSTER_MAP_HISTORY_LIMIT + 2);
         assert!(authority
             .snapshot()
             .cluster_map_at_epoch(source_epoch)
@@ -36654,6 +36945,23 @@ mod tests {
         assert!(protected_source.pg(PgId::new(42)).is_some());
         assert!(protected_source.pg(PgId::new(43)).is_none());
         assert_eq!(protected_source.pgs().len(), 1);
+        let protected_destination = authority
+            .snapshot()
+            .cluster_map_at_epoch(destination_epoch)
+            .unwrap();
+        assert!(protected_destination.pg(PgId::new(43)).is_none());
+        let destination_route = authority
+            .snapshot()
+            .reconstructed_pg_route_at_epoch(PgId::new(42), destination_epoch)
+            .unwrap();
+        assert_eq!(
+            destination_route.peering_metadata_transfer(),
+            Some(transfer)
+        );
+        assert_eq!(
+            destination_route.peering_metadata_transfer_destination_epoch(),
+            Some(destination_epoch)
+        );
         assert!(authority
             .snapshot()
             .cluster_map_at_epoch(initial_epoch)
@@ -36661,6 +36969,7 @@ mod tests {
 
         let persisted = store.load().unwrap().unwrap();
         assert!(persisted.cluster_map_at_epoch(source_epoch).is_some());
+        assert!(persisted.cluster_map_at_epoch(destination_epoch).is_some());
         assert_eq!(
             persisted
                 .pg(PgId::new(42))
@@ -36668,6 +36977,32 @@ mod tests {
                 .peering_metadata_transfer_source_route_epoch(),
             Some(source_epoch)
         );
+
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            42,
+            PgState::Peering,
+            imported_proof,
+            false,
+            13_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(42),
+                NodeId::new(2),
+                node_incarnation(&authority, 2),
+                13_001,
+            )
+            .unwrap();
+        assert!(authority
+            .snapshot()
+            .cluster_map_at_epoch(destination_epoch)
+            .is_none());
+        let persisted_after_completion = store.load().unwrap().unwrap();
+        assert!(persisted_after_completion
+            .cluster_map_at_epoch(destination_epoch)
+            .is_none());
     }
 
     #[test]
@@ -37457,14 +37792,19 @@ mod tests {
                 .unwrap();
         }
 
-        let missing_intermediate_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
+        let destination_epoch = next_epoch(source_epoch).unwrap();
+        let unretained_intermediate_epoch = next_epoch(destination_epoch).unwrap();
         assert!(authority
             .snapshot()
             .cluster_map_at_epoch(source_epoch)
             .is_some());
         assert!(authority
             .snapshot()
-            .cluster_map_at_epoch(missing_intermediate_epoch)
+            .cluster_map_at_epoch(destination_epoch)
+            .is_some());
+        assert!(authority
+            .snapshot()
+            .cluster_map_at_epoch(unretained_intermediate_epoch)
             .is_none());
         let current_epoch = authority.snapshot().cluster_epoch();
         let heartbeat_at_ms = authority
@@ -50371,6 +50711,17 @@ mod tests {
             active_proof,
             imported_proof,
         );
+        let snapshot_without_transfer = authority.snapshot().clone();
+        assert!(matches!(
+            authority.set_pg_acting_set_with_metadata_transfer_at_epoch(
+                PgId::new(42),
+                vec![NodeId::new(1)],
+                transfer,
+                next_epoch(active_epoch).unwrap(),
+            ),
+            Err(ControlPlaneError::PgMetadataMigrationRequiresTransfer { pg_id: 42 })
+        ));
+        assert_eq!(authority.snapshot(), &snapshot_without_transfer);
         authority
             .set_pg_acting_set_with_metadata_transfer(PgId::new(42), vec![NodeId::new(2)], transfer)
             .unwrap();
@@ -50407,8 +50758,29 @@ mod tests {
             Err(ControlPlaneError::PgMetadataTransferProofMismatch { pg_id: 42, .. })
         ));
         assert_eq!(authority.snapshot().cluster_epoch(), peering_epoch);
+        let mismatched_destination_epoch = next_epoch(peering_epoch).unwrap();
+        assert!(matches!(
+            authority.set_pg_acting_set_with_metadata_transfer_at_epoch(
+                PgId::new(42),
+                vec![NodeId::new(2)],
+                transfer,
+                mismatched_destination_epoch,
+            ),
+            Err(ControlPlaneError::PgMetadataTransferDestinationEpochMismatch {
+                pg_id: 42,
+                expected_destination_epoch,
+                actual_destination_epoch,
+            }) if expected_destination_epoch == mismatched_destination_epoch
+                && actual_destination_epoch == peering_epoch
+        ));
+        assert_eq!(authority.snapshot().cluster_epoch(), peering_epoch);
         authority
-            .set_pg_acting_set_with_metadata_transfer(PgId::new(42), vec![NodeId::new(2)], transfer)
+            .set_pg_acting_set_with_metadata_transfer_at_epoch(
+                PgId::new(42),
+                vec![NodeId::new(2)],
+                transfer,
+                peering_epoch,
+            )
             .unwrap();
         assert_eq!(authority.snapshot().cluster_epoch(), peering_epoch);
 
@@ -50668,6 +51040,196 @@ mod tests {
             .unwrap();
 
         assert_eq!(retry.source_primary_lease_deadline_ms(), Some(2_120));
+    }
+
+    #[test]
+    fn fencing_pending_recovery_peering_preserves_imported_source_provenance() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+
+        let pg_id = PgId::new(52);
+        let source_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            pg_id.get(),
+            PgState::Peering,
+            source_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                pg_id,
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            pg_id.get(),
+            PgState::Active,
+            source_proof,
+            false,
+            2_002,
+        );
+
+        authority.fence_pg_for_metadata_transfer(pg_id).unwrap();
+        let imported_proof = PgMetadataProof {
+            applied_log_index: 3,
+            applied_log_hash: 20,
+            state_digest: 21,
+        };
+        let first_transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            authority.snapshot().cluster_epoch(),
+            source_proof,
+            imported_proof,
+        );
+        authority
+            .set_pg_acting_set_with_metadata_transfer(pg_id, vec![NodeId::new(2)], first_transfer)
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            pg_id.get(),
+            PgState::Peering,
+            imported_proof,
+            false,
+            2_010,
+        );
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            pg_id.get(),
+            PgState::Peering,
+            imported_proof,
+            false,
+            3_200,
+        );
+        authority
+            .complete_pg_peering(
+                pg_id,
+                NodeId::new(2),
+                node_incarnation(&authority, 2),
+                3_201,
+            )
+            .unwrap();
+        let active_epoch = authority.snapshot().cluster_epoch();
+        assert!(authority
+            .snapshot()
+            .pg(pg_id)
+            .unwrap()
+            .active_metadata_transfer_imported());
+
+        let local_progress = PgMetadataProof {
+            applied_log_index: 2,
+            applied_log_hash: 30,
+            state_digest: 31,
+        };
+        let pending = test_pending_metadata_command(active_epoch);
+        let mut pending_heartbeat = heartbeat_from_record(&authority, 2, active_epoch, 3_220);
+        pending_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id,
+            state: PgState::Active,
+            metadata_proof: local_progress,
+            pending_metadata_command: Some(pending),
+        }];
+        authority.heartbeat(pending_heartbeat, 3_220).unwrap();
+        let recovery_epoch = authority.snapshot().cluster_epoch();
+        let recovering = authority.snapshot().pg(pg_id).unwrap();
+        assert_eq!(recovering.state(), PgState::Peering);
+        assert_eq!(
+            recovering.peering_metadata_proof_floor(),
+            Some(imported_proof)
+        );
+        assert!(recovering.peering_metadata_proof_floor_imported());
+
+        let mut cleared_heartbeat = heartbeat_from_record(&authority, 2, recovery_epoch, 3_221);
+        cleared_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id,
+            state: PgState::Peering,
+            metadata_proof: local_progress,
+            pending_metadata_command: None,
+        }];
+        authority.heartbeat(cleared_heartbeat, 3_221).unwrap();
+        authority.fence_pg_for_metadata_transfer(pg_id).unwrap();
+        let fenced = authority.snapshot().pg(pg_id).unwrap();
+        assert!(fenced.metadata_transfer_fence_source_imported);
+
+        let stale_destination_epoch = next_epoch(authority.snapshot().cluster_epoch()).unwrap();
+        let stale_second_transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            active_epoch,
+            local_progress,
+            PgMetadataProof {
+                applied_log_index: 2,
+                applied_log_hash: stale_destination_epoch.get(),
+                state_digest: local_progress.state_digest,
+            },
+        );
+        authority
+            .set_pg_acting_set(PgId::new(53), vec![NodeId::new(1)])
+            .unwrap();
+        let snapshot_after_unrelated_advance = authority.snapshot().clone();
+        let actual_destination_epoch = next_epoch(authority.snapshot().cluster_epoch()).unwrap();
+        assert!(matches!(
+            authority.set_pg_acting_set_with_metadata_transfer_at_epoch(
+                pg_id,
+                vec![NodeId::new(1)],
+                stale_second_transfer,
+                stale_destination_epoch,
+            ),
+            Err(ControlPlaneError::PgMetadataTransferDestinationEpochMismatch {
+                pg_id: 52,
+                expected_destination_epoch,
+                actual_destination_epoch: actual,
+            }) if expected_destination_epoch == stale_destination_epoch
+                && actual == actual_destination_epoch
+        ));
+        assert_eq!(authority.snapshot(), &snapshot_after_unrelated_advance);
+
+        let second_transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            active_epoch,
+            local_progress,
+            PgMetadataProof {
+                applied_log_index: 2,
+                applied_log_hash: actual_destination_epoch.get(),
+                state_digest: local_progress.state_digest,
+            },
+        );
+        authority
+            .set_pg_acting_set_with_metadata_transfer_at_epoch(
+                pg_id,
+                vec![NodeId::new(1)],
+                second_transfer,
+                actual_destination_epoch,
+            )
+            .unwrap();
+        assert_eq!(
+            authority.snapshot().cluster_epoch(),
+            actual_destination_epoch
+        );
+        let transferred = authority.snapshot().pg(pg_id).unwrap();
+        assert_eq!(transferred.acting_set(), &[NodeId::new(1)]);
+        assert_eq!(
+            transferred.peering_metadata_transfer(),
+            Some(second_transfer)
+        );
     }
 
     #[test]

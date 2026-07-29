@@ -562,8 +562,7 @@ impl StorageNodeProcessConfig {
         runtime_map: &ClusterRuntimeMapSnapshot,
         history_reference_summary: crate::PgClusterMapHistoryReferenceSummary,
     ) -> Result<Self, StorageNodeServerError> {
-        let protected_historical_route_keys =
-            metadata_transfer_source_route_keys_for_refresh(runtime_map);
+        let protected_historical_route_keys = metadata_transfer_route_keys_for_refresh(runtime_map);
         let mut next = Self::from_runtime_map(
             current.node_id,
             current.data_dir.clone(),
@@ -890,7 +889,7 @@ fn prune_refresh_historical_pg_routes(
     retained.into_values().collect()
 }
 
-fn metadata_transfer_source_route_keys_for_refresh(
+fn metadata_transfer_route_keys_for_refresh(
     runtime_map: &ClusterRuntimeMapSnapshot,
 ) -> BTreeSet<(ClusterEpoch, u32)> {
     runtime_map
@@ -899,6 +898,9 @@ fn metadata_transfer_source_route_keys_for_refresh(
         .chain(runtime_map.historical_pg_routes())
         .flat_map(|route| {
             [
+                route
+                    .peering_metadata_transfer_destination_epoch()
+                    .map(|destination_epoch| (destination_epoch, route.pg_id().get())),
                 route
                     .peering_metadata_transfer_source_route_epoch()
                     .map(|source_epoch| (source_epoch, route.pg_id().get())),
@@ -1037,7 +1039,7 @@ fn validate_process_config_matches_persisted_runtime_config(
 
 fn encode_control_plane_runtime_config(config: &StorageNodeProcessConfig) -> String {
     let mut out = String::new();
-    out.push_str("argmin-storage-node-runtime-config-v2\n");
+    out.push_str("argmin-storage-node-runtime-config-v3\n");
     out.push_str(&format!("node_id {}\n", config.node_id.as_u32()));
     out.push_str(&format!("cluster_epoch {}\n", config.cluster_epoch.get()));
     match config.route_map_validity {
@@ -1088,11 +1090,14 @@ fn encode_storage_node_routes(out: &mut String, label: &str, routes: &[StorageNo
     out.push_str(&format!("{label} {}\n", routes.len()));
     for route in routes {
         out.push_str(&format!(
-            "{} {} {} {} {}",
+            "{} {} {} {} {} {}",
             route.pg_id,
             route.cluster_epoch.get(),
             pg_state_code(route.state),
             route.primary_node_id.as_u32(),
+            route
+                .metadata_transfer_destination_epoch
+                .map_or_else(|| "-".to_owned(), |epoch| epoch.get().to_string()),
             route.acting_set.len()
         ));
         for node_id in &route.acting_set {
@@ -1112,7 +1117,7 @@ fn decode_control_plane_runtime_config(
     let magic = lines
         .next()
         .ok_or_else(|| runtime_config_invalid(path, "empty config"))?;
-    if magic != "argmin-storage-node-runtime-config-v2" {
+    if magic != "argmin-storage-node-runtime-config-v3" {
         return Err(runtime_config_invalid(path, "invalid magic"));
     }
     let node_id = NodeId::new(parse_labeled_u32(path, lines.next(), "node_id")?);
@@ -1225,6 +1230,8 @@ fn decode_storage_node_routes<'a>(
         let cluster_epoch = next_runtime_config_field(path, &mut fields, &too_few)?;
         let state = next_runtime_config_field(path, &mut fields, &too_few)?;
         let primary_node_id = next_runtime_config_field(path, &mut fields, &too_few)?;
+        let metadata_transfer_destination_epoch =
+            next_runtime_config_field(path, &mut fields, &too_few)?;
         let acting_len = next_runtime_config_field(path, &mut fields, &too_few)?;
         let acting_len = parse_usize_field(path, acting_len, "acting set length")?;
         let mut acting_set = Vec::new();
@@ -1253,6 +1260,15 @@ fn decode_storage_node_routes<'a>(
             state: pg_state_from_code(parse_u8_field(path, state, "route PG state")?)
                 .ok_or_else(|| runtime_config_invalid(path, "invalid route PG state"))?,
             primary_node_id: NodeId::new(parse_u32_field(path, primary_node_id, "primary node")?),
+            metadata_transfer_destination_epoch: if metadata_transfer_destination_epoch == "-" {
+                None
+            } else {
+                Some(parse_cluster_epoch_field(
+                    path,
+                    metadata_transfer_destination_epoch,
+                    "metadata transfer destination epoch",
+                )?)
+            },
             acting_set,
         });
     }
@@ -1509,6 +1525,7 @@ pub struct StorageNodePgRoute {
     pub cluster_epoch: ClusterEpoch,
     pub state: PgState,
     pub primary_node_id: NodeId,
+    pub metadata_transfer_destination_epoch: Option<ClusterEpoch>,
     pub acting_set: Vec<NodeId>,
 }
 
@@ -1519,6 +1536,8 @@ impl From<&PgRouteSnapshot> for StorageNodePgRoute {
             cluster_epoch: route.cluster_epoch(),
             state: route.state(),
             primary_node_id: route.primary_node_id(),
+            metadata_transfer_destination_epoch: route
+                .peering_metadata_transfer_destination_epoch(),
             acting_set: route.acting_set().to_vec(),
         }
     }
@@ -13845,7 +13864,7 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+        if let Err(error) = self.validate_pg_route_for_metadata_transfer_inspection(
             request.node_id,
             request.cluster_epoch,
             request.pg_id,
@@ -14017,10 +14036,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandTransferAdoptRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+        if let Err(error) = self.validate_pg_route_for_metadata_transfer_mutation(
             request.node_id,
             request.cluster_epoch,
             request.pg_id,
+            false,
         ) {
             return encode_storage_rpc_error_response(&error);
         }
@@ -14050,10 +14070,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandTransferEmptyStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+        if let Err(error) = self.validate_pg_route_for_metadata_transfer_mutation(
             request.node_id,
             request.cluster_epoch,
             request.pg_id,
+            false,
         ) {
             return encode_storage_rpc_error_response(&error);
         }
@@ -14082,10 +14103,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandTransferMatchingStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+        if let Err(error) = self.validate_pg_route_for_metadata_transfer_mutation(
             request.node_id,
             request.cluster_epoch,
             request.pg_id,
+            false,
         ) {
             return encode_storage_rpc_error_response(&error);
         }
@@ -14116,11 +14138,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandTransferCheckpointBaseRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_with_allowed_states(
+        if let Err(error) = self.validate_pg_route_for_metadata_transfer_mutation(
             request.node_id,
             request.cluster_epoch,
             request.pg_id,
-            &[PgState::Peering],
+            false,
         ) {
             return encode_storage_rpc_error_response(&error);
         }
@@ -14492,10 +14514,22 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        self.metadata_command_apply_and_record_response_with_allowed_states(
+        if let Err(error) = validate_metadata_command_request_epoch(&request) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let mutation_fence = match self.validate_pg_route_for_metadata_transfer_mutation(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+            true,
+        ) {
+            Ok(fence) => fence,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        self.metadata_command_apply_and_record_response_with_mutation_fence(
             session,
             request,
-            &[PgState::Peering],
+            mutation_fence,
         )
     }
 
@@ -15621,6 +15655,136 @@ impl StorageNodeConnectionHandler {
             );
         }
         self.validate_current_pg_route_for_peering_inspection(node_id, cluster_epoch, pg_id)
+    }
+
+    /// Authorizes transfer mutation at the immutable destination epoch while
+    /// requiring the current route to retain that exact transfer marker.
+    fn validate_pg_route_for_metadata_transfer_mutation(
+        &self,
+        node_id: NodeId,
+        destination_epoch: ClusterEpoch,
+        pg_id: PgId,
+        permit_unmarked_current_peering: bool,
+    ) -> Result<StorageNodeRouteFence, StorageRpcErrorResponse> {
+        if node_id != self.config.node_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownNode,
+                message: format!(
+                    "request targets node {}, but this storage node is {}",
+                    node_id.as_u32(),
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        if destination_epoch > self.config.cluster_epoch {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "metadata-transfer destination epoch {} is newer than storage-node epoch {}",
+                    destination_epoch.get(),
+                    self.config.cluster_epoch.get()
+                ),
+            });
+        }
+        self.require_current_route_map_valid_rpc()?;
+        let raw_pg_id = pg_id.get();
+        let current_route = self
+            .config
+            .pg_routes
+            .iter()
+            .find(|route| route.pg_id == raw_pg_id)
+            .ok_or_else(|| StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownPg,
+                message: format!("PG {raw_pg_id} is not configured on this storage node"),
+            })?;
+        if current_route.cluster_epoch != self.config.cluster_epoch {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "PG {raw_pg_id} route epoch {} does not match storage-node epoch {}",
+                    current_route.cluster_epoch.get(),
+                    self.config.cluster_epoch.get()
+                ),
+            });
+        }
+        if current_route.state != PgState::Peering {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::InactivePgRoute,
+                message: format!("PG {raw_pg_id} route is {}", current_route.state),
+            });
+        }
+        if !current_route.acting_set.contains(&self.config.node_id) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::NonActingSetAccess,
+                message: format!(
+                    "storage node {} is not in acting set for PG {raw_pg_id}",
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        let exact_marker =
+            current_route.metadata_transfer_destination_epoch == Some(destination_epoch);
+        if !exact_marker
+            && !(permit_unmarked_current_peering
+                && destination_epoch == self.config.cluster_epoch
+                && current_route.metadata_transfer_destination_epoch.is_none())
+        {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "PG {raw_pg_id} current route does not retain metadata-transfer destination epoch {}",
+                    destination_epoch.get()
+                ),
+            });
+        }
+        if destination_epoch == self.config.cluster_epoch {
+            return Ok(StorageNodeRouteFence::current(
+                &self.config,
+                self.current_route_map_lease(),
+            ));
+        }
+        let retained_route = self
+            .config
+            .historical_pg_routes
+            .iter()
+            .find(|route| route.pg_id == raw_pg_id && route.cluster_epoch == destination_epoch);
+        if retained_route.is_none_or(|route| {
+            route.state != PgState::Peering
+                || !route.acting_set.contains(&self.config.node_id)
+                || route.metadata_transfer_destination_epoch != Some(destination_epoch)
+        }) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "PG {raw_pg_id} metadata-transfer destination route at epoch {} is not retained",
+                    destination_epoch.get()
+                ),
+            });
+        }
+        let valid_until_ms = self.config.route_map_valid_until_ms().ok_or_else(|| {
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "PG {raw_pg_id} metadata-transfer destination epoch {} has no bounded runtime-map validity",
+                    destination_epoch.get()
+                ),
+            }
+        })?;
+        let local_valid_until_monotonic_ms = self
+            .current_route_map_lease()
+            .map(BoundRouteMapLease::local_valid_until_monotonic_ms)
+            .ok_or_else(|| StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "PG {raw_pg_id} metadata-transfer destination epoch {} has no process-bound runtime-map lease",
+                    destination_epoch.get()
+                ),
+            })?;
+        Ok(StorageNodeRouteFence::historical(
+            destination_epoch,
+            valid_until_ms,
+            local_valid_until_monotonic_ms,
+        ))
     }
 
     fn validate_current_pg_route_for_peering_inspection(
@@ -18858,6 +19022,7 @@ mod tests {
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 state: PgState::Active,
                 primary_node_id: NodeId::new(7),
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![NodeId::new(7)],
             }],
             historical_pg_routes: Vec::new(),
@@ -18968,6 +19133,7 @@ mod tests {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         }
     }
@@ -19042,6 +19208,7 @@ mod tests {
                 cluster_epoch: ClusterEpoch::new(9).unwrap(),
                 state: PgState::Active,
                 primary_node_id: NodeId::new(7),
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![NodeId::new(7), NodeId::new(8)],
             },
             StorageNodePgRoute {
@@ -19049,6 +19216,7 @@ mod tests {
                 cluster_epoch: ClusterEpoch::new(9).unwrap(),
                 state: PgState::Peering,
                 primary_node_id: NodeId::new(8),
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![NodeId::new(8), NodeId::new(7)],
             },
         ];
@@ -19058,6 +19226,7 @@ mod tests {
                 cluster_epoch: ClusterEpoch::new(3).unwrap(),
                 state: PgState::Active,
                 primary_node_id: NodeId::new(7),
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![NodeId::new(7), NodeId::new(8)],
             },
             StorageNodePgRoute {
@@ -19065,6 +19234,7 @@ mod tests {
                 cluster_epoch: ClusterEpoch::new(6).unwrap(),
                 state: PgState::Peering,
                 primary_node_id: NodeId::new(8),
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![NodeId::new(8), NodeId::new(7)],
             },
         ];
@@ -19328,6 +19498,7 @@ mod tests {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         });
 
@@ -20628,6 +20799,7 @@ mod tests {
             cluster_epoch: candidate.cluster_epoch,
             state: PgState::Peering,
             primary_node_id: candidate.node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![candidate.node_id],
         });
         candidate.pg_routes[0].cluster_epoch = candidate.cluster_epoch;
@@ -20864,6 +21036,7 @@ mod tests {
                 cluster_epoch: config.cluster_epoch,
                 state: PgState::Peering,
                 primary_node_id: NodeId::new(7),
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![NodeId::new(7)],
             },
             StorageNodePgRoute {
@@ -20871,6 +21044,7 @@ mod tests {
                 cluster_epoch: config.cluster_epoch,
                 state: PgState::Active,
                 primary_node_id: NodeId::new(7),
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![NodeId::new(7)],
             },
         ];
@@ -21574,6 +21748,7 @@ mod tests {
                 cluster_epoch,
                 state: PgState::Active,
                 primary_node_id: node_id,
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![node_id],
             });
         }
@@ -21611,7 +21786,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_node_refresh_config_keeps_metadata_transfer_source_route_epoch() {
+    fn storage_node_refresh_config_keeps_metadata_transfer_route_epochs_across_restart() {
         let tmp = test_util::tempdir();
         let node_id = NodeId::new(7);
         let destination_node_id = NodeId::new(8);
@@ -21625,7 +21800,7 @@ mod tests {
         .unwrap();
         for (idx, (heartbeat_node_id, heartbeat_socket_path)) in [
             (node_id, socket_path.clone()),
-            (destination_node_id, destination_socket_path),
+            (destination_node_id, destination_socket_path.clone()),
         ]
         .into_iter()
         .enumerate()
@@ -21712,6 +21887,20 @@ mod tests {
                 2_002,
             )
             .unwrap();
+        let source_runtime_map = authority.snapshot().runtime_map(2_003).unwrap();
+        let mut current = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &source_runtime_map,
+        )
+        .unwrap();
+        assert_eq!(current.cluster_epoch, source_epoch);
+        assert!(current
+            .historical_pg_routes
+            .iter()
+            .all(|route| { route.pg_id != pg_id.get() || route.cluster_epoch < source_epoch }));
+
         authority
             .set_pg_acting_set_with_metadata_transfer(
                 pg_id,
@@ -21719,19 +21908,7 @@ mod tests {
                 crate::control_plane::PgMetadataTransferProof::new(source_epoch, active_proof),
             )
             .unwrap();
-
-        let runtime_map = authority.snapshot().runtime_map(2_003).unwrap();
-        let mut current = StorageNodeProcessConfig::from_runtime_map(
-            node_id,
-            tmp.path().join("node"),
-            EcShape { k: 1, m: 0 },
-            &runtime_map,
-        )
-        .unwrap();
-        assert!(current
-            .historical_pg_routes
-            .iter()
-            .any(|route| route.pg_id == pg_id.get() && route.cluster_epoch == source_epoch));
+        let destination_epoch = authority.snapshot().cluster_epoch();
         for step in 0_u32..8 {
             authority
                 .set_node_membership(NodeId::new(300 + step), NodeMembershipState::Active)
@@ -21747,6 +21924,15 @@ mod tests {
             .iter()
             .any(|route| route.pg_id() == pg_id
                 && route.peering_metadata_transfer_source_route_epoch() == Some(source_epoch)));
+        assert!(delta_runtime_map
+            .historical_pg_routes()
+            .iter()
+            .any(|route| {
+                route.pg_id() == pg_id
+                    && route.cluster_epoch() == destination_epoch
+                    && route.peering_metadata_transfer_destination_epoch()
+                        == Some(destination_epoch)
+            }));
         current = StorageNodeProcessConfig::from_runtime_map_refresh(
             &current,
             &delta_runtime_map,
@@ -21758,6 +21944,63 @@ mod tests {
             .historical_pg_routes
             .iter()
             .any(|route| route.pg_id == pg_id.get() && route.cluster_epoch == source_epoch));
+        assert!(current.historical_pg_routes.iter().any(|route| {
+            route.pg_id == pg_id.get()
+                && route.cluster_epoch == destination_epoch
+                && route.metadata_transfer_destination_epoch == Some(destination_epoch)
+        }));
+
+        current.persist_control_plane_runtime_config().unwrap();
+        let restarted = StorageNodeProcessConfig::load_control_plane_runtime_config(
+            &current.data_dir,
+            current.node_id,
+            current.default_ec_shape,
+            &current.socket_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(restarted.historical_pg_routes.iter().any(|route| {
+            route.pg_id == pg_id.get()
+                && route.cluster_epoch == destination_epoch
+                && route.metadata_transfer_destination_epoch == Some(destination_epoch)
+        }));
+
+        let completion_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id: destination_node_id,
+                    node_incarnation: 12,
+                    endpoint: destination_socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: completion_epoch,
+                    requested_lease_duration_ms: 5_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
+                        pg_id,
+                        state: PgState::Peering,
+                        metadata_proof: active_proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                3_001,
+            )
+            .unwrap();
+        authority
+            .complete_pg_peering(pg_id, destination_node_id, 12, 4_003)
+            .unwrap();
+        let completed_runtime_map = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(4_004, node_id, current.cluster_epoch)
+            .unwrap();
+        let completed = StorageNodeProcessConfig::from_runtime_map_refresh(
+            &current,
+            &completed_runtime_map,
+            crate::PgClusterMapHistoryReferenceSummary::default(),
+        )
+        .unwrap();
+        assert!(!completed.historical_pg_routes.iter().any(|route| {
+            route.pg_id == pg_id.get() && route.cluster_epoch == destination_epoch
+        }));
     }
 
     #[test]
@@ -21928,6 +22171,7 @@ mod tests {
                 cluster_epoch: ClusterEpoch::INITIAL,
                 state: PgState::Active,
                 primary_node_id: node_id,
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![node_id],
             }],
 
@@ -27742,6 +27986,7 @@ mod tests {
                 cluster_epoch: ClusterEpoch::new(3).unwrap(),
                 state: PgState::Active,
                 primary_node_id: config.node_id,
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![config.node_id],
             },
             StorageNodePgRoute {
@@ -27749,6 +27994,7 @@ mod tests {
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 state: PgState::Active,
                 primary_node_id: NodeId::new(8),
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![config.node_id, NodeId::new(8)],
             },
         ];
@@ -28585,6 +28831,7 @@ mod tests {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: PgState::Active,
             primary_node_id: NodeId::new(8),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7), NodeId::new(8)],
         }];
         private_socket_dir(config.socket_path.parent().unwrap());
@@ -29738,6 +29985,7 @@ mod tests {
         config.cluster_epoch = destination_epoch;
         config.pg_routes[0].cluster_epoch = destination_epoch;
         config.pg_routes[0].state = PgState::Peering;
+        config.pg_routes[0].metadata_transfer_destination_epoch = Some(destination_epoch);
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let expected_state_digest = server
@@ -29785,6 +30033,7 @@ mod tests {
         config.cluster_epoch = destination_epoch;
         config.pg_routes[0].cluster_epoch = destination_epoch;
         config.pg_routes[0].state = PgState::Peering;
+        config.pg_routes[0].metadata_transfer_destination_epoch = Some(destination_epoch);
         private_socket_dir(config.socket_path.parent().unwrap());
         let command = test_metadata_command(0, 1);
         let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -29836,6 +30085,7 @@ mod tests {
         config.cluster_epoch = destination_epoch;
         config.pg_routes[0].cluster_epoch = destination_epoch;
         config.pg_routes[0].state = PgState::Peering;
+        config.pg_routes[0].metadata_transfer_destination_epoch = Some(destination_epoch);
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let socket_path = config.socket_path.clone();
@@ -29877,6 +30127,115 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(lifecycle.body, "<LifecycleConfiguration/>");
+    }
+
+    #[test]
+    fn storage_node_server_allows_retained_transfer_destination_after_unrelated_epoch_advance() {
+        let (bucket, checkpoint) =
+            test_metadata_checkpoint_with_bucket("metadata-rpc-retained-destination");
+        let tmp = test_util::tempdir();
+        let mut config = bounded_runtime_refresh_config(test_config(&tmp));
+        let destination_epoch = ClusterEpoch::new(2).unwrap();
+        let current_epoch = ClusterEpoch::new(3).unwrap();
+        let mut destination_route = config.pg_routes[0].clone();
+        destination_route.cluster_epoch = destination_epoch;
+        destination_route.state = PgState::Peering;
+        destination_route.metadata_transfer_destination_epoch = Some(destination_epoch);
+        config.cluster_epoch = current_epoch;
+        config.pg_routes[0] = destination_route.clone();
+        config.pg_routes[0].cluster_epoch = current_epoch;
+        config.historical_pg_routes.push(destination_route);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall,
+            encode_metadata_command_transfer_checkpoint_base_request(
+                &StorageRpcMetadataCommandTransferCheckpointBaseRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: destination_epoch,
+                    pg_id: PgId::new(0),
+                    checkpoint,
+                },
+            )
+            .unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let decoded = decode_metadata_command_state_response(&payload).unwrap();
+        assert_eq!(decoded.state.cluster_epoch, destination_epoch);
+        let destination_node =
+            crate::node::SharedStorageNode::open(&config.data_dir, &config.pg_ids).unwrap();
+        assert_eq!(
+            destination_node
+                .get_pg(0)
+                .unwrap()
+                .head_bucket(&bucket)
+                .unwrap()
+                .name,
+            bucket
+        );
+    }
+
+    #[test]
+    fn storage_node_server_rejects_retained_transfer_destination_without_current_marker() {
+        let (_bucket, checkpoint) =
+            test_metadata_checkpoint_with_bucket("metadata-rpc-stale-destination");
+        let tmp = test_util::tempdir();
+        let mut config = bounded_runtime_refresh_config(test_config(&tmp));
+        let destination_epoch = ClusterEpoch::new(2).unwrap();
+        let current_epoch = ClusterEpoch::new(3).unwrap();
+        let mut destination_route = config.pg_routes[0].clone();
+        destination_route.cluster_epoch = destination_epoch;
+        destination_route.state = PgState::Peering;
+        destination_route.metadata_transfer_destination_epoch = Some(destination_epoch);
+        config.cluster_epoch = current_epoch;
+        config.pg_routes[0] = destination_route.clone();
+        config.pg_routes[0].cluster_epoch = current_epoch;
+        config.pg_routes[0].metadata_transfer_destination_epoch = None;
+        config.historical_pg_routes.push(destination_route);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall,
+            encode_metadata_command_transfer_checkpoint_base_request(
+                &StorageRpcMetadataCommandTransferCheckpointBaseRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: destination_epoch,
+                    pg_id: PgId::new(0),
+                    checkpoint,
+                },
+            )
+            .unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let error = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+        assert!(
+            error
+                .message
+                .contains("does not retain metadata-transfer destination epoch"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]
@@ -29926,6 +30285,7 @@ mod tests {
         config.cluster_epoch = destination_epoch;
         config.pg_routes[0].cluster_epoch = destination_epoch;
         config.pg_routes[0].state = PgState::Peering;
+        config.pg_routes[0].metadata_transfer_destination_epoch = Some(destination_epoch);
         private_socket_dir(config.socket_path.parent().unwrap());
         let command = test_metadata_command(0, 1);
         let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -29975,6 +30335,7 @@ mod tests {
         config.cluster_epoch = destination_epoch;
         config.pg_routes[0].cluster_epoch = destination_epoch;
         config.pg_routes[0].state = PgState::Peering;
+        config.pg_routes[0].metadata_transfer_destination_epoch = Some(destination_epoch);
         private_socket_dir(config.socket_path.parent().unwrap());
         let command = test_metadata_command(0, 1);
         let expected_state_digest;
@@ -30055,6 +30416,7 @@ mod tests {
             cluster_epoch: source_route_epoch,
             state: PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         });
         private_socket_dir(config.socket_path.parent().unwrap());
@@ -30099,6 +30461,7 @@ mod tests {
             cluster_epoch: source_route_epoch,
             state: PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         });
         private_socket_dir(config.socket_path.parent().unwrap());
@@ -30828,6 +31191,7 @@ mod tests {
             cluster_epoch: source_route_epoch,
             state: PgState::Peering,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         });
         private_socket_dir(config.socket_path.parent().unwrap());
@@ -30932,7 +31296,7 @@ mod tests {
         let adopt_error = decode_storage_rpc_response_payload(&adopt_response.payload)
             .unwrap()
             .unwrap_err();
-        assert_eq!(adopt_error.code, StorageRpcErrorCode::StaleShardLocation);
+        assert_eq!(adopt_error.code, StorageRpcErrorCode::NonActingSetAccess);
 
         let state_payload = decode_storage_rpc_response_payload(&state_response.payload)
             .unwrap()

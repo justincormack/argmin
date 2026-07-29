@@ -3008,6 +3008,9 @@ run_metadata_pg_migration_smoke() {
 
     if [[ "$smoke" == "metadata-pg-migration-failover" ]]; then
         transfer_pg_metadata_expect_injected_failure "after-transfer-install" "return to original nodes 0,1 after transfer marker install" "$target_metadata_pg" 0 1
+        local unrelated_pg=$(((target_metadata_pg + 1) % ARGMIN_PG_COUNT))
+        set_pg_acting_set "advance unrelated PG after transfer install" "$unrelated_pg" 0 1 2
+        wait_for_control_plane_pg_active "$unrelated_pg" 20 "0:1:2"
     fi
     transfer_pg_metadata "return to original nodes 0,1 with suffix replay" "$target_metadata_pg" 0 1
     wait_for_control_plane_pg_active "$target_metadata_pg" 20 "0:1"

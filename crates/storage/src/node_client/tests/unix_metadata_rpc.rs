@@ -455,6 +455,8 @@ fn unix_storage_node_client_adopts_metadata_transfer_state() {
     let destination_epoch = ClusterEpoch::new(2).unwrap();
     config.cluster_epoch = destination_epoch;
     config.pg_routes[0].cluster_epoch = destination_epoch;
+    config.pg_routes[0].state = crate::PgState::Peering;
+    config.pg_routes[0].metadata_transfer_destination_epoch = Some(destination_epoch);
     let rebased = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
             destination_epoch,
@@ -797,6 +799,7 @@ fn unix_storage_node_client_installs_metadata_transfer_checkpoint_base() {
     config.cluster_epoch = destination_epoch;
     config.pg_routes[0].cluster_epoch = destination_epoch;
     config.pg_routes[0].state = crate::PgState::Peering;
+    config.pg_routes[0].metadata_transfer_destination_epoch = Some(destination_epoch);
     let server = StorageNodeServer::bind(config.clone()).unwrap();
     let server_thread = thread::spawn(move || {
         server.accept_one().unwrap();
@@ -898,6 +901,8 @@ fn unix_storage_node_client_rejects_empty_metadata_transfer_adoption() {
     let destination_epoch = ClusterEpoch::new(2).unwrap();
     config.cluster_epoch = destination_epoch;
     config.pg_routes[0].cluster_epoch = destination_epoch;
+    config.pg_routes[0].state = crate::PgState::Peering;
+    config.pg_routes[0].metadata_transfer_destination_epoch = Some(destination_epoch);
     let server = StorageNodeServer::bind(config.clone()).unwrap();
     let server_thread = thread::spawn(move || {
         server.accept_one().unwrap();

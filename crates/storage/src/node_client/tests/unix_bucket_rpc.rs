@@ -26,6 +26,7 @@ fn historical_bucket_delete_replica_head(
         cluster_epoch: current_epoch,
         state: crate::types::PgState::Peering,
         primary_node_id: NodeId::new(7),
+        metadata_transfer_destination_epoch: None,
         acting_set: vec![NodeId::new(7), NodeId::new(8)],
     };
     let retained_route = |cluster_epoch| StorageNodePgRoute {
@@ -33,6 +34,7 @@ fn historical_bucket_delete_replica_head(
         cluster_epoch,
         state: crate::types::PgState::Active,
         primary_node_id: NodeId::new(7),
+        metadata_transfer_destination_epoch: None,
         acting_set: vec![NodeId::new(7), NodeId::new(8)],
     };
     config
@@ -2691,6 +2693,7 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         },
         StorageNodePgRoute {
@@ -2698,6 +2701,7 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         },
     ];
@@ -2959,6 +2963,7 @@ fn unix_bucket_metadata_client_rejects_proof_release_wrong_bucket_pg() {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         },
         StorageNodePgRoute {
@@ -2966,6 +2971,7 @@ fn unix_bucket_metadata_client_rejects_proof_release_wrong_bucket_pg() {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![NodeId::new(7)],
         },
     ];
@@ -3077,6 +3083,7 @@ fn unix_bucket_write_drain_operations_reject_wrong_bucket_pg_before_access() {
             cluster_epoch: config.cluster_epoch,
             state: crate::types::PgState::Active,
             primary_node_id: config.node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![config.node_id],
         },
         StorageNodePgRoute {
@@ -3084,6 +3091,7 @@ fn unix_bucket_write_drain_operations_reject_wrong_bucket_pg_before_access() {
             cluster_epoch: config.cluster_epoch,
             state: crate::types::PgState::Active,
             primary_node_id: config.node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![config.node_id],
         },
     ];
@@ -3244,6 +3252,7 @@ fn unix_bucket_delete_finalize_claim_operations_reject_wrong_bucket_pg_before_ac
             cluster_epoch: config.cluster_epoch,
             state: crate::types::PgState::Active,
             primary_node_id: config.node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![config.node_id],
         },
         StorageNodePgRoute {
@@ -3251,6 +3260,7 @@ fn unix_bucket_delete_finalize_claim_operations_reject_wrong_bucket_pg_before_ac
             cluster_epoch: config.cluster_epoch,
             state: crate::types::PgState::Active,
             primary_node_id: config.node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![config.node_id],
         },
     ];
@@ -3408,6 +3418,7 @@ fn unix_lifecycle_sweep_claim_operations_reject_wrong_bucket_pg_before_access() 
             cluster_epoch: config.cluster_epoch,
             state: crate::types::PgState::Active,
             primary_node_id: config.node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![config.node_id],
         },
         StorageNodePgRoute {
@@ -3415,6 +3426,7 @@ fn unix_lifecycle_sweep_claim_operations_reject_wrong_bucket_pg_before_access() 
             cluster_epoch: config.cluster_epoch,
             state: crate::types::PgState::Active,
             primary_node_id: config.node_id,
+            metadata_transfer_destination_epoch: None,
             acting_set: vec![config.node_id],
         },
     ];

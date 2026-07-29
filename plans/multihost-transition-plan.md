@@ -8138,14 +8138,34 @@ Metadata PG migration and backfill design notes:
   destination Peering acting set using the exact destination runtime map
   returned by the transfer-install RPC. If that bounded map expires before or
   during import, retry obtains a fresh PG-scoped map and rebuilds the storage
-  cluster only when the refreshed map still has the exact destination epoch,
-  Peering acting set, and transfer proof; an already-Active matching PG is the
-  response-loss success case. An authoritative same/newer-epoch mismatch fails
-  immediately with the expected and actual transfer provenance rather than
+  cluster only when the refreshed map still has the exact committed transfer
+  destination epoch, Peering acting set, and transfer proof; the authority may
+  have a newer global epoch when unrelated PGs or heartbeats changed. The
+  runtime route carries that committed destination epoch, and the scoped map
+  rebases the unchanged route to it before import. Storage-node runtime config
+  v3 persists the destination epoch on current and retained routes. A delayed
+  import at the older destination epoch is admitted only while both the
+  retained destination route and current Peering route carry that marker;
+  completing or replacing the transfer therefore revokes the old mutation
+  capability. While the marker exists, authority history pruning and node-local
+  refresh pruning protect both its exact source and destination `(epoch, PG)`
+  routes, including across unrelated epoch advances and restart. An
+  already-Active matching PG is the response-loss success case.
+  An authoritative route/provenance mismatch fails immediately rather than
   waiting on a state that cannot converge back. This is still an operator/UAT
   primitive rather than an autonomous migration scheduler. The authority
   rejects stale transfer source epochs before persisting the transfer marker,
-  and import cannot switch to an arbitrary later control-plane route.
+  and import cannot switch to an arbitrary later control-plane route. The
+  transfer-install command and RPC now also carry the exact expected
+  destination epoch. An unrelated PG or heartbeat epoch advance therefore
+  rejects the stale epoch-bound imported proof before mutation. The live
+  transfer path refreshes the PG-scoped source map, verifies that the fenced
+  source route is semantically unchanged, recomputes the imported proof for
+  the new next epoch, and retries within a bounded retry window. Command codec
+  version 14 and control-plane RPC version 12 carry this precondition, the
+  committed route destination epoch, and the typed destination-epoch mismatch
+  response. Resume after transfer installation uses the marker's committed
+  destination epoch rather than the current global epoch.
 - Added a focused whole-lifetime UAT smoke for metadata PG migration. The new
   `metadata-pg-migration` smoke starts a four-node control-plane topology,
   places PGs initially on nodes `0:1`, creates bucket and object metadata on a
@@ -10933,11 +10953,12 @@ Required production shape and implementation order:
    in-memory historical PG routes after its reporters had advanced to epochs
    579/584, while restart pruned the persisted state to the normal 29,696-route
    limit. This fixes that delayed release but does not replace scalar retention.
-   Metadata-transfer source routes now protect exact `(epoch, PG)` keys inside
-   the history pruner. If an old protected record would otherwise block bounded
-   eviction, unrelated PG routes in that record are removed and only the
-   required route is retained; transfer-source dependencies are tracked with
-   the same key shape. Scalar live-payload, backfill, and pending-command
+   Metadata-transfer source and committed destination routes now protect exact
+   `(epoch, PG)` keys inside the history pruner while the transfer marker
+   exists. If an old protected record would otherwise block bounded eviction,
+   unrelated PG routes in that record are removed and only the required route
+   is retained; transfer-source dependencies are tracked with the same key
+   shape. Scalar live-payload, backfill, and pending-command
    minima still protect complete epoch ranges until the exact heartbeat report
    replaces the committed aggregate floor. In particular, current node PG
    observations identify pending commands exactly but cannot narrow retention

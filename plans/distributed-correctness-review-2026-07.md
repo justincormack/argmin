@@ -672,9 +672,15 @@ Confirmed.
   any successful runtime-map response as confirmation. Those response-loss
   confirmation probes keep a bounded but longer read timeout than ordinary
   control-plane RPCs, so a slow proof observation does not turn an already
-  applied command into `RpcUnconfirmed`. The remaining follow-up is the
-  stronger CAS-style `expected_cluster_epoch` request field, tracked in the
-  hardening plan.
+  applied command into `RpcUnconfirmed`. Metadata-transfer install now carries
+  an exact expected destination epoch through the RPC and replicated command;
+  a raced unrelated epoch advance is rejected before mutation and the live
+  transfer path refreshes the scoped route before recomputing the epoch-bound
+  proof. Once installed, the runtime transfer marker also carries the committed
+  destination epoch, so import refresh/resume can accept a newer unrelated
+  global epoch while rebuilding the destination capability at the original
+  transfer epoch. The remaining CAS follow-up is the ordinary acting-set and
+  fence command surface.
 
 ### CP9. LOW — Single-writer enforcement is external to the library
 
@@ -2094,8 +2100,9 @@ testing investment.
     implement `StorageNodeClient` lease methods on `UnixStorageNodeClient` or
     amend the invariants guide and rename `reclaim_object_payload_if_unleased`
     (CL5).
-15. CAS preconditions (`expected_cluster_epoch`) on admin acting-set/fence/
-    transfer RPCs (CP8). Guard acting-set changes for PGs with non-empty
+15. CAS preconditions (`expected_cluster_epoch`) on admin acting-set/fence
+    RPCs (CP8; transfer install now has an exact destination-epoch
+    precondition). Guard acting-set changes for PGs with non-empty
     active proofs behind the transfer-proof path (CL6). Epoch-tagged proof
     lineage so cross-epoch comparisons can verify ancestry rather than
     accepting "different hash and digest" (CP6/CP7).

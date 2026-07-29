@@ -17,7 +17,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 13;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 14;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -94,6 +94,7 @@ pub enum ControlPlaneCommand {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
+        expected_destination_epoch: ClusterEpoch,
     },
     FencePgForMetadataTransfer {
         pg_id: PgId,
@@ -209,12 +210,14 @@ impl std::fmt::Display for ControlPlaneCommand {
                 pg_id,
                 acting_set,
                 transfer,
+                expected_destination_epoch,
             } => write!(
                 f,
-                "set-pg-acting-set-with-metadata-transfer(pg={},nodes={},source_epoch={})",
+                "set-pg-acting-set-with-metadata-transfer(pg={},nodes={},source_epoch={},destination_epoch={})",
                 pg_id.get(),
                 acting_set.len(),
-                transfer.source_epoch().get()
+                transfer.source_epoch().get(),
+                expected_destination_epoch.get()
             ),
             ControlPlaneCommand::FencePgForMetadataTransfer {
                 pg_id,
@@ -319,10 +322,12 @@ pub fn encode_control_plane_command(
             pg_id,
             acting_set,
             transfer,
+            expected_destination_epoch,
         } => {
             write_u16(&mut out, 7);
             write_pg_acting_set(&mut out, *pg_id, acting_set)?;
             write_pg_metadata_transfer_proof(&mut out, *transfer);
+            write_u64(&mut out, expected_destination_epoch.get());
         }
         ControlPlaneCommand::FencePgForMetadataTransfer {
             pg_id,
@@ -595,10 +600,15 @@ pub fn decode_control_plane_command(
         7 => {
             let (pg_id, acting_set) = read_pg_acting_set(&mut reader)?;
             let transfer = read_pg_metadata_transfer_proof(&mut reader)?;
+            let expected_destination_epoch =
+                ClusterEpoch::new(reader.read_u64()?).ok_or_else(|| {
+                    command_protocol_error("metadata transfer destination epoch must be nonzero")
+                })?;
             ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
                 pg_id,
                 acting_set,
                 transfer,
+                expected_destination_epoch,
             }
         }
         8 => {
@@ -2062,6 +2072,7 @@ mod tests {
                 pg_id: PgId::new(4),
                 acting_set: vec![NodeId::new(2)],
                 transfer,
+                expected_destination_epoch: ClusterEpoch::new(10).unwrap(),
             },
             ControlPlaneCommand::FencePgForMetadataTransfer {
                 pg_id: PgId::new(3),
@@ -2149,6 +2160,7 @@ mod tests {
                     max_proof,
                     max_proof,
                 ),
+                expected_destination_epoch: ClusterEpoch::new(u64::MAX).unwrap(),
             },
             ControlPlaneCommand::CompletePgPeering {
                 pg_id: PgId::new(u32::MAX),
