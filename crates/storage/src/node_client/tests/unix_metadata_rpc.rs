@@ -2852,7 +2852,7 @@ fn unix_storage_node_read_handle_session_is_idempotent_and_disconnect_releases()
         config.node_id,
     );
     let key = ShardKey::new(&[0x55; 16], 55, 0);
-    let mut session = client.open_read_handle_session().unwrap();
+    let mut session = client.open_read_handle_session_for_test().unwrap();
 
     assert_eq!(
         session
@@ -2904,7 +2904,7 @@ fn unix_storage_node_delete_fails_while_read_handle_active() {
         key.shard_index(),
         config.node_id,
     );
-    let mut session = client.open_read_handle_session().unwrap();
+    let mut session = client.open_read_handle_session_for_test().unwrap();
     let route = client.open_placed_shard_route(location, &key).unwrap();
 
     route.write_placed_shard(b"protected payload").unwrap();
@@ -3071,7 +3071,7 @@ fn unix_storage_node_read_handle_session_admission_exhausts_before_connect() {
     let _held = client
         .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
         .unwrap();
-    let err = match client.open_read_handle_session() {
+    let err = match client.open_read_handle_session_for_test() {
         Ok(_) => panic!("read-handle session admission unexpectedly succeeded"),
         Err(err) => err,
     };
@@ -3152,7 +3152,7 @@ fn unix_storage_node_metadata_session_lock_contention_returns_typed_error() {
 }
 
 #[test]
-fn unix_storage_node_read_handle_session_rejects_mismatched_acquire_response() {
+fn unix_storage_node_read_handle_route_rejects_mismatched_acquire_response() {
     let tmp = test_util::tempdir();
     let socket_path = tmp.path().join("sock").join("storage.sock");
     private_socket_dir(socket_path.parent().unwrap());
@@ -3185,17 +3185,18 @@ fn unix_storage_node_read_handle_session_rejects_mismatched_acquire_response() {
         crate::ShardIndex::new(0),
         NodeId::new(7),
     );
-    let mut session = client.open_read_handle_session().unwrap();
-
-    let err = session
-        .acquire_read_handles(
+    let err = client
+        .open_shard_read_handle_route(
+            ClusterEpoch::new(1).unwrap(),
             "read-op",
             vec![(
                 requested_location,
                 ShardKey::new(&[0x77; 16], 77, requested_location.shard_index().get()),
             )],
         )
-        .unwrap_err();
+        .and_then(|route| route.acquire())
+        .err()
+        .expect("mismatched read-handle response must be rejected");
 
     assert!(matches!(
         err,
@@ -3204,6 +3205,5 @@ fn unix_storage_node_read_handle_session_rejects_mismatched_acquire_response() {
             ..
         }
     ));
-    drop(session);
     join.join().unwrap();
 }

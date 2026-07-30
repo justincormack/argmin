@@ -881,10 +881,12 @@ impl LocalShardNodeClient<'_> {
         &self,
     ) -> Result<Box<dyn crate::node_client::ShardReadHandleLease>, ShardIoError> {
         self.read_handle_client
-            .acquire_read_handles(
+            .open_shard_read_handle_route(
+                self.location.cluster_epoch(),
                 &self.read_operation_id(&self.key),
                 vec![(self.location, self.key.clone())],
             )
+            .and_then(|route| route.acquire())
             .map_err(|source| self.store_error(source))
     }
 
@@ -4457,7 +4459,8 @@ impl LocalClusterMap {
             let read_operation_id = client.read_operation_id_for_keys(&keys);
             match node
                 .shard_read_handle_client()
-                .acquire_read_handles(&read_operation_id, entries.clone())
+                .open_shard_read_handle_route(operation_epoch, &read_operation_id, entries.clone())
+                .and_then(|route| route.acquire())
             {
                 Ok(lease) => handle_set.push(first.0, lease),
                 Err(source) => {

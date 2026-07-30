@@ -38,6 +38,12 @@ struct LocalPlacedShardRoute {
     key: ShardKey,
 }
 
+struct LocalShardReadHandleRoute {
+    _route_cluster_epoch: ClusterEpoch,
+    _read_operation_id: String,
+    _entries: Vec<(crate::cluster::ShardLocation, ShardKey)>,
+}
+
 struct LocalRetainedShardAckRoute {
     storage_node: Arc<SharedStorageNode>,
     data_pg_id: DataPgId,
@@ -329,11 +335,38 @@ impl RetainedPlacedShardRoute for LocalRetainedPlacedShardRoute {
 }
 
 impl ShardReadHandleNodeClient for LocalStorageNodeClient {
-    fn acquire_read_handles(
+    fn open_shard_read_handle_route(
         &self,
-        _read_operation_id: &str,
-        _entries: Vec<(crate::cluster::ShardLocation, ShardKey)>,
-    ) -> Result<Box<dyn ShardReadHandleLease>, StoreError> {
+        route_cluster_epoch: ClusterEpoch,
+        read_operation_id: &str,
+        entries: Vec<(crate::cluster::ShardLocation, ShardKey)>,
+    ) -> Result<Box<dyn ShardReadHandleRoute + '_>, StoreError> {
+        if entries.is_empty() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open shard read-handle route",
+            });
+        }
+        for (location, key) in &entries {
+            if location.node_id() != self.node_id
+                || location.cluster_epoch() != route_cluster_epoch
+                || location.shard_index() != key.shard_index()
+            {
+                return Err(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "open shard read-handle route",
+                });
+            }
+            drop(self.storage_node.get_pg(location.data_pg_id().get())?);
+        }
+        Ok(Box::new(LocalShardReadHandleRoute {
+            _route_cluster_epoch: route_cluster_epoch,
+            _read_operation_id: read_operation_id.to_string(),
+            _entries: entries,
+        }))
+    }
+}
+
+impl ShardReadHandleRoute for LocalShardReadHandleRoute {
+    fn acquire(self: Box<Self>) -> Result<Box<dyn ShardReadHandleLease>, StoreError> {
         Ok(Box::new(LocalStorageNodeReadHandleLease))
     }
 }

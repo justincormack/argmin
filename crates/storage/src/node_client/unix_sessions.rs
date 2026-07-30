@@ -33,6 +33,12 @@ struct UnixStorageNodeReadHandleLease {
     released: bool,
 }
 
+struct UnixShardReadHandleRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    read_operation_id: String,
+    entries: Vec<(crate::cluster::ShardLocation, ShardKey)>,
+}
+
 struct UnixObjectPayloadLease {
     session: UnixStorageNodeReadHandleSession,
     bucket: BucketName,
@@ -82,9 +88,7 @@ impl UnixStorageNodeClient {
         self.rpc_admission.active_session_count_for_test()
     }
 
-    pub(crate) fn open_read_handle_session(
-        &self,
-    ) -> Result<UnixStorageNodeReadHandleSession, StoreError> {
+    fn open_read_handle_session(&self) -> Result<UnixStorageNodeReadHandleSession, StoreError> {
         let rpc_permit = self.acquire_rpc_admission(StorageRpcMessageKind::ReadHandlesAcquire)?;
         let (stream, io_timeout) =
             self.connect_session_stream("connect storage-node read-handle RPC endpoint")?;
@@ -98,6 +102,13 @@ impl UnixStorageNodeClient {
             _rpc_permit: Some(rpc_permit),
             _object_payload_lease_permit: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_read_handle_session_for_test(
+        &self,
+    ) -> Result<UnixStorageNodeReadHandleSession, StoreError> {
+        self.open_read_handle_session()
     }
 
     fn open_object_payload_lease_session(
@@ -1604,16 +1615,51 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
     }
 }
 impl ShardReadHandleNodeClient for UnixStorageNodeClient {
-    fn acquire_read_handles(
+    fn open_shard_read_handle_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         read_operation_id: &str,
         entries: Vec<(crate::cluster::ShardLocation, ShardKey)>,
-    ) -> Result<Box<dyn ShardReadHandleLease>, StoreError> {
-        let mut session = self.open_read_handle_session()?;
-        session.acquire_read_handles(read_operation_id, entries)?;
+    ) -> Result<Box<dyn ShardReadHandleRoute + '_>, StoreError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: entries
+                    .first()
+                    .map_or(0, |(location, _)| location.data_pg_id().get()),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        if entries.is_empty() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open shard read-handle route",
+            });
+        }
+        for (location, key) in &entries {
+            if location.node_id() != self.node_id
+                || location.cluster_epoch() != route_cluster_epoch
+                || location.shard_index() != key.shard_index()
+            {
+                return Err(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "open shard read-handle route",
+                });
+            }
+        }
+        Ok(Box::new(UnixShardReadHandleRoute {
+            client: self,
+            read_operation_id: read_operation_id.to_string(),
+            entries,
+        }))
+    }
+}
+
+impl ShardReadHandleRoute for UnixShardReadHandleRoute<'_> {
+    fn acquire(self: Box<Self>) -> Result<Box<dyn ShardReadHandleLease>, StoreError> {
+        let mut session = self.client.open_read_handle_session()?;
+        session.acquire_read_handles(&self.read_operation_id, self.entries)?;
         Ok(Box::new(UnixStorageNodeReadHandleLease {
             session,
-            read_operation_id: read_operation_id.to_string(),
+            read_operation_id: self.read_operation_id,
             released: false,
         }))
     }

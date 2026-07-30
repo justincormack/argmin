@@ -319,6 +319,172 @@ fn unix_placed_shard_route_rejects_foreign_subject_before_rpc() {
 }
 
 #[test]
+fn local_shard_read_handle_route_is_bound_to_exact_batch() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let epoch = ClusterEpoch::INITIAL;
+    let key = ShardKey::new(&[0x34; 16], 14, 0);
+    let location = crate::cluster::ShardLocation::new(
+        epoch,
+        DataPgId::new_for_test(PgId::new(0)),
+        key.shard_index(),
+        NodeId::new(7),
+    );
+    let mut lease = client
+        .open_shard_read_handle_route(epoch, "bound-read", vec![(location, key.clone())])
+        .and_then(|route| route.acquire())
+        .unwrap();
+    lease.release().unwrap();
+
+    let wrong_epoch = ClusterEpoch::new(epoch.get() + 1).unwrap();
+    assert!(matches!(
+        client
+            .open_shard_read_handle_route(
+                wrong_epoch,
+                "wrong-epoch-read",
+                vec![(location, key.clone())],
+            )
+            .err()
+            .expect("crossed route and placement epochs must fail before storage"),
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open shard read-handle route",
+        }
+    ));
+    let foreign_node_location = crate::cluster::ShardLocation::new(
+        epoch,
+        DataPgId::new_for_test(PgId::new(0)),
+        key.shard_index(),
+        NodeId::new(8),
+    );
+    assert!(matches!(
+        client
+            .open_shard_read_handle_route(
+                epoch,
+                "foreign-node-read",
+                vec![(foreign_node_location, key.clone())],
+            )
+            .err()
+            .expect("foreign read-handle node must fail before storage"),
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open shard read-handle route",
+        }
+    ));
+    let wrong_index_location = crate::cluster::ShardLocation::new(
+        epoch,
+        DataPgId::new_for_test(PgId::new(0)),
+        ShardIndex::new(1),
+        NodeId::new(7),
+    );
+    assert!(matches!(
+        client
+            .open_shard_read_handle_route(
+                epoch,
+                "wrong-index-read",
+                vec![(wrong_index_location, key.clone())],
+            )
+            .err()
+            .expect("crossed read-handle shard index must fail before storage"),
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open shard read-handle route",
+        }
+    ));
+    let foreign_pg_location = crate::cluster::ShardLocation::new(
+        epoch,
+        DataPgId::new_for_test(PgId::new(1)),
+        key.shard_index(),
+        NodeId::new(7),
+    );
+    assert!(matches!(
+        client
+            .open_shard_read_handle_route(
+                epoch,
+                "foreign-pg-read",
+                vec![(foreign_pg_location, key)],
+            )
+            .err()
+            .expect("unavailable read-handle PG must fail before storage"),
+        StoreError::PgNotFound { pg_id: 1 }
+    ));
+    assert!(matches!(
+        client
+            .open_shard_read_handle_route(epoch, "empty-read", Vec::new())
+            .err()
+            .expect("empty read-handle routes must fail before storage"),
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open shard read-handle route",
+        }
+    ));
+}
+
+#[test]
+fn unix_shard_read_handle_route_rejects_foreign_subject_before_rpc() {
+    let client = test_unix_storage_node_client();
+    let epoch = client.cluster_epoch;
+    let key = ShardKey::new(&[0x35; 16], 15, 0);
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
+    let location =
+        crate::cluster::ShardLocation::new(epoch, data_pg_id, key.shard_index(), client.node_id);
+    let future_epoch = ClusterEpoch::new(epoch.get() + 1).unwrap();
+    assert!(matches!(
+        client
+            .open_shard_read_handle_route(
+                future_epoch,
+                "future-read",
+                vec![(location, key.clone())],
+            )
+            .err()
+            .expect("future read-handle routes must fail before RPC"),
+        StoreError::StalePayloadOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        } if operation_epoch == future_epoch && current_epoch == epoch
+    ));
+    let foreign_node_location = crate::cluster::ShardLocation::new(
+        epoch,
+        data_pg_id,
+        key.shard_index(),
+        NodeId::new(client.node_id.as_u32() + 1),
+    );
+    assert!(matches!(
+        client
+            .open_shard_read_handle_route(
+                epoch,
+                "foreign-node-read",
+                vec![(foreign_node_location, key.clone())],
+            )
+            .err()
+            .expect("foreign read-handle nodes must fail before RPC"),
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open shard read-handle route",
+        }
+    ));
+    let wrong_index_location =
+        crate::cluster::ShardLocation::new(epoch, data_pg_id, ShardIndex::new(1), client.node_id);
+    assert!(matches!(
+        client
+            .open_shard_read_handle_route(
+                epoch,
+                "wrong-index-read",
+                vec![(wrong_index_location, key)],
+            )
+            .err()
+            .expect("crossed read-handle shard index must fail before RPC"),
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open shard read-handle route",
+        }
+    ));
+}
+
+#[test]
 fn local_retained_placed_shard_route_is_bound_to_exact_placement() {
     let tmp = test_util::tempdir();
     let storage_node = Arc::new(

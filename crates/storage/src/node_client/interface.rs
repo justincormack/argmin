@@ -1085,11 +1085,16 @@ pub(crate) trait ShardReadHandleLease: Send {
 }
 
 pub(crate) trait ShardReadHandleNodeClient: Send + Sync {
-    fn acquire_read_handles(
+    fn open_shard_read_handle_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         read_operation_id: &str,
         entries: Vec<(crate::cluster::ShardLocation, ShardKey)>,
-    ) -> Result<Box<dyn ShardReadHandleLease>, StoreError>;
+    ) -> Result<Box<dyn ShardReadHandleRoute + '_>, StoreError>;
+}
+
+pub(crate) trait ShardReadHandleRoute: Send {
+    fn acquire(self: Box<Self>) -> Result<Box<dyn ShardReadHandleLease>, StoreError>;
 }
 
 pub(crate) trait ObjectPayloadLeaseNodeLease: Send {

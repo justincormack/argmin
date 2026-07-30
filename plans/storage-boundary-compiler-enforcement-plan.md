@@ -659,7 +659,7 @@ Node-client role classification (2026-07-19):
 | `RetainedPlacedShardNodeClient`, `RetainedShardAckNodeClient` | data | retained exact-placement inspection and cleanup for historical shard bytes and acknowledgement rows |
 | `ShardScavengerNodeClient` | data for shard rows/files and object-metadata reference scans | read-only inventory authority for the validated active or retained scan location |
 | `ShardScavengerObservationNodeClient` | data PG for durable observation rows | opens an active primary-only route bound to one data PG; the returned interface records, lists, and resolves non-authoritative scavenger findings without accepting a replacement PG |
-| `ShardReadHandleNodeClient` | data locations carried in the handle request | active/retained authority is inherited from each validated `ShardLocation`; the lease itself remains non-cloneable |
+| `ShardReadHandleNodeClient` | data locations carried in the handle request | opens a consumed route bound to one operation ID and an exact per-node batch of validated locations/keys; active/retained authority is inherited from each location and the resulting lease remains non-cloneable |
 | `ObjectPayloadLeaseNodeClient` | object subject rather than a caller-supplied PG | active subject-bound lease acquisition, reclaim-begin, and observation; placement is validated when shard locations are acquired |
 | `RetainedObjectPayloadReclaimNodeClient` | object subject rather than a caller-supplied PG | retained exact-claim reclaim completion and fence cleanup; opaque lease objects retain their own release authority |
 | `MetadataCommandInspectionNodeClient` | genuinely generic metadata PG | read-only command state, checkpoints, retained-log ranges, acceptance, and abandonment inspection |
@@ -4170,6 +4170,35 @@ One-hundred-and-third Phase 3 slice:
   pluggable-client, and standalone route-identity regressions. Formatting, the
   storage boundary checker, workspace-wide strict Clippy, and the full
   7,794-test workspace suite also pass.
+
+One-hundred-and-fourth Phase 3 slice:
+
+- shard read-handle acquisition now opens a non-cloneable
+  `ShardReadHandleRoute` bound to one operation ID and an exact batch of shard
+  locations and keys. The route is consumed when it acquires the opaque lease,
+  so callers cannot redirect or reuse the selected batch after construction.
+  The low-level Unix session constructor is private in production; its
+  crate-visible adapter remains test-only for session idempotence and
+  disconnect cleanup coverage.
+- embedded and Unix factories reject empty batches, crossed route/location
+  epochs, foreign nodes, and shard-index/key mismatches before storage or
+  transport access. Embedded construction additionally proves every data PG
+  exists locally, while Unix construction proves the route epoch matches the
+  installed client. The cluster layer retains its independent topology and
+  acting-set validation for every entry before grouping the batch by node, and
+  storage-node dispatch retains its independent active-route, per-location,
+  session-domain, and deadline checks.
+- embedded coverage exercises successful acquire/release and rejects crossed
+  epoch, node, shard-index, unavailable-PG, and empty subjects. A no-listener
+  Unix regression rejects foreign epoch/node/index subjects before RPC, while
+  a malicious peer returning a different location is rejected at the scoped
+  route's response boundary. Existing installed-Unix deletion fencing,
+  aggregate admission saturation, and partial multi-node acquisition failure
+  regressions exercise successful leases and cleanup through the route.
+- all 2,465 storage tests pass, including the focused embedded, Unix,
+  admission-saturation, and multi-node rollback regressions. Formatting, the
+  storage boundary checker, workspace-wide strict Clippy, and the full
+  7,796-test workspace suite also pass.
 
 ### Phase 4 — type metadata-command publication
 

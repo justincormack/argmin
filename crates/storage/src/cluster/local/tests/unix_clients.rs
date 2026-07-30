@@ -396,10 +396,12 @@ fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() 
     ));
 
     let read_handle = client
-        .acquire_read_handles(
+        .open_shard_read_handle_route(
+            epoch,
             "narrow-to-read-handle-handoff",
             vec![(location, shard_key.clone())],
         )
+        .and_then(|route| route.acquire())
         .expect("narrow-lease saturation must retain one read-handle handoff slot");
     assert!(
         client.active_admitted_session_count_for_test() <= admission_limit,
@@ -1328,18 +1330,37 @@ struct RecordingReadHandleLease {
     released: bool,
 }
 
+struct RecordingReadHandleRoute {
+    fail_acquire: bool,
+    locations: Vec<ShardLocation>,
+    events: Arc<ReadHandleEvents>,
+}
+
 impl ShardReadHandleNodeClient for RecordingReadHandleClient {
-    fn acquire_read_handles(
+    fn open_shard_read_handle_route(
         &self,
+        _route_cluster_epoch: ClusterEpoch,
         _read_operation_id: &str,
         entries: Vec<(ShardLocation, ShardKey)>,
-    ) -> Result<Box<dyn crate::node_client::ShardReadHandleLease>, StoreError> {
+    ) -> Result<Box<dyn crate::node_client::ShardReadHandleRoute + '_>, StoreError> {
         let locations: Vec<ShardLocation> = entries.iter().map(|(location, _)| *location).collect();
+        Ok(Box::new(RecordingReadHandleRoute {
+            fail_acquire: self.fail_acquire,
+            locations,
+            events: Arc::clone(&self.events),
+        }))
+    }
+}
+
+impl crate::node_client::ShardReadHandleRoute for RecordingReadHandleRoute {
+    fn acquire(
+        self: Box<Self>,
+    ) -> Result<Box<dyn crate::node_client::ShardReadHandleLease>, StoreError> {
         self.events
             .acquires
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(locations.clone());
+            .push(self.locations.clone());
         if self.fail_acquire {
             return Err(StoreError::Io {
                 context: "recording read handle acquire",
@@ -1347,7 +1368,7 @@ impl ShardReadHandleNodeClient for RecordingReadHandleClient {
             });
         }
         Ok(Box::new(RecordingReadHandleLease {
-            locations,
+            locations: self.locations,
             events: Arc::clone(&self.events),
             released: false,
         }))
