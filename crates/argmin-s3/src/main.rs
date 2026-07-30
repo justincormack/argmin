@@ -2083,7 +2083,7 @@ fn control_plane_pg_runtime_map_ready(
 ) -> Result<(ClusterEpoch, ClusterEpoch), String> {
     let control_plane = build_frontend_control_plane_client_from_runtime_map_auth_env(socket_path)?;
     let runtime_map = control_plane
-        .runtime_map_snapshot(storage::clock::current_time_millis())
+        .serving_pg_runtime_map_snapshot(pg_id, storage::clock::current_time_millis())
         .map_err(|error| format!("control-plane PG runtime map is not ready: {error}"))?;
     let route = runtime_map
         .pg_routes()
@@ -14387,6 +14387,31 @@ mod tests {
             ),
             "target PG should be confirmable without requiring unrelated PGs to serve"
         );
+
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn pg_runtime_map_ready_uses_serving_pg_scope_when_unrelated_pg_is_unserved() {
+        let tmp = short_unix_socket_test_dir("pg-ready");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("cp.sock");
+        let endpoint = tmp.join("n0.sock");
+        let server = serve_control_plane_with_target_pg_and_unserved_pg(
+            socket_path.clone(),
+            NodeId::new(0),
+            endpoint.display().to_string(),
+            false,
+            1,
+        );
+
+        let (runtime_epoch, route_epoch) = storage::clock::with_time_override(2_000, || {
+            control_plane_pg_runtime_map_ready(&socket_path, PgId::new(0), &[NodeId::new(0)])
+        })
+        .unwrap();
+        assert!(runtime_epoch >= route_epoch);
 
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
