@@ -10,7 +10,7 @@ use s3_types::BucketLifecycleConfiguration;
 use storage::PgTopology;
 use storage::{
     BucketDeleteBeginRoot, BucketDeleteFinalizeRoot, BucketInfo, BucketName, EcShape, GenerationId,
-    ObjectEncryption, ObjectKey, PlacedSegmentShardBackfillCandidateEnqueueSummary,
+    ObjectEncryption, ObjectKey, PgId, PlacedSegmentShardBackfillCandidateEnqueueSummary,
     PlacedSegmentShardBackfillCandidateScanCursor, PlacedSegmentShardBackfillClaimAcquireParams,
     PlacedSegmentShardRepairClaimAcquireParams, ProcessLocalRegistryKey, ReclaimWorkItem,
     SegmentStoredBytesRequest, StorageCluster, StorageClusterRouteHandle, StoreError, UploadId,
@@ -2014,6 +2014,7 @@ impl ShardBackfillSweeper {
         let handle = std::thread::Builder::new()
             .name("argmin-shard-backfill".to_string())
             .spawn(move || {
+                let mut last_claimed_pg_id = None;
                 while !stop.load(Ordering::SeqCst) {
                     let storage_cluster = storage_handle.current();
                     let admission = background_work_admission_for(&storage_cluster);
@@ -2023,6 +2024,7 @@ impl ShardBackfillSweeper {
                         &worker_identity,
                         &owner_token,
                         &admission,
+                        &mut last_claimed_pg_id,
                     );
 
                     let stop_guard = lock_mutex_unpoisoned(&wake.0);
@@ -2060,6 +2062,7 @@ fn run_one_placed_segment_shard_backfill(
     worker_identity: &str,
     owner_token: &str,
     admission: &Arc<BackgroundWorkAdmission>,
+    last_claimed_pg_id: &mut Option<PgId>,
 ) {
     let now_ms = Coordinator::now_millis();
     let claim_id = format!(
@@ -2075,36 +2078,38 @@ fn run_one_placed_segment_shard_backfill(
         lease_deadline: now_ms.saturating_add(SHARD_BACKFILL_CLAIM_LEASE_MILLIS),
         now: now_ms,
     };
-    let claim =
-        match storage_cluster.acquire_next_placed_segment_shard_backfill_claim(&claim_acquire) {
-            Ok(Some(claim)) => {
-                emit_shard_backfill_event(
-                    Some(claim.work_item.request.data_pg_id),
-                    "claim_started",
-                    queue_depth,
-                    None,
-                );
-                claim
-            }
-            Ok(None) => {
-                emit_shard_backfill_event(None, "durable_scan_no_claim", queue_depth, None);
-                return;
-            }
-            Err(error) => {
-                emit_shard_backfill_event(None, "claim_failed", queue_depth, None);
-                observability::record_shard_backfill_error(
-                    None,
-                    "claim_failed",
-                    error.diagnostic_kind(),
-                );
-                let _ = observability::event(
-                    TRACE_TARGET,
-                    "shard_backfill_claim_error",
-                    Some(format_args!("error={error}")),
-                );
-                return;
-            }
-        };
+    let claim = match storage_cluster.acquire_next_placed_segment_shard_backfill_claim_with_cursor(
+        &claim_acquire,
+        last_claimed_pg_id,
+    ) {
+        Ok(Some(claim)) => {
+            emit_shard_backfill_event(
+                Some(claim.work_item.request.data_pg_id),
+                "claim_started",
+                queue_depth,
+                None,
+            );
+            claim
+        }
+        Ok(None) => {
+            emit_shard_backfill_event(None, "durable_scan_no_claim", queue_depth, None);
+            return;
+        }
+        Err(error) => {
+            emit_shard_backfill_event(None, "claim_failed", queue_depth, None);
+            observability::record_shard_backfill_error(
+                None,
+                "claim_failed",
+                error.diagnostic_kind(),
+            );
+            let _ = observability::event(
+                TRACE_TARGET,
+                "shard_backfill_claim_error",
+                Some(format_args!("error={error}")),
+            );
+            return;
+        }
+    };
 
     let admission_class =
         shard_backfill_admission_class(claim.remaining_tolerance, claim.work_item.request.ec.m);
@@ -2336,7 +2341,13 @@ pub(super) fn run_one_placed_segment_shard_backfill_for_test(
     owner_token: &str,
 ) {
     let admission = Arc::new(BackgroundWorkAdmission::new());
-    run_one_placed_segment_shard_backfill(storage_cluster, "test-worker", owner_token, &admission);
+    run_one_placed_segment_shard_backfill(
+        storage_cluster,
+        "test-worker",
+        owner_token,
+        &admission,
+        &mut None,
+    );
 }
 
 fn shard_backfill_admission_class(remaining_tolerance: u8, ec_m: u8) -> BackgroundWorkClass {

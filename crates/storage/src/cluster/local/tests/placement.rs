@@ -2719,6 +2719,69 @@ fn local_cluster_map_history_reference_summary_merges_node_pg_references() {
 }
 
 #[test]
+fn durable_backfill_claim_cursor_rotates_past_retrying_pg() {
+    let tmp = test_util::tempdir();
+    let cluster = crate::StorageCluster::open_static_local_nodes(
+        tmp.path(),
+        &[NodeId::new(0), NodeId::new(1)],
+        &[0, 1],
+        EcShape { k: 1, m: 1 },
+    )
+    .unwrap();
+    for pg_id in [0, 1] {
+        let work_item = crate::PlacedSegmentShardBackfillWorkItem {
+            request: crate::SegmentStoredBytesRequest {
+                data_pg_id: pg_id,
+                segment_okh: [pg_id as u8 + 1; 16],
+                segment_vid: GenerationId::new(pg_id as u64 + 1).unwrap(),
+                stored_size: 16,
+                segment_crc64: pg_id as u64 + 10,
+                ec: EcShape { k: 1, m: 1 },
+            },
+            source_cluster_epoch: ClusterEpoch::INITIAL,
+            desired_cluster_epoch: ClusterEpoch::INITIAL,
+        };
+        cluster
+            .record_placed_segment_shard_backfill(&work_item, None)
+            .unwrap();
+    }
+
+    let mut cursor = None;
+    let first = cluster
+        .acquire_next_placed_segment_shard_backfill_claim_with_cursor(
+            &crate::PlacedSegmentShardBackfillClaimAcquireParams {
+                claim_id: "first-claim".to_string(),
+                owner_token: "cursor-worker".to_string(),
+                claimed_at: 10,
+                lease_deadline: 100,
+                now: 10,
+            },
+            &mut cursor,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.work_item.request.data_pg_id, 0);
+    assert!(cluster
+        .record_placed_segment_shard_backfill_claim_error(&first, "retry", 0)
+        .unwrap());
+
+    let second = cluster
+        .acquire_next_placed_segment_shard_backfill_claim_with_cursor(
+            &crate::PlacedSegmentShardBackfillClaimAcquireParams {
+                claim_id: "second-claim".to_string(),
+                owner_token: "cursor-worker".to_string(),
+                claimed_at: 11,
+                lease_deadline: 101,
+                now: 11,
+            },
+            &mut cursor,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.work_item.request.data_pg_id, 1);
+}
+
+#[test]
 fn topology_only_cluster_map_history_reference_summary_is_empty() {
     let map = LocalClusterMap::open_frontend_topology_only_with_epoch(
         NodeId::new(0),

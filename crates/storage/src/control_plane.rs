@@ -1912,8 +1912,11 @@ impl ClusterControlSnapshot {
                 node_id: refreshing_node_id.as_u32(),
             })?
             .cluster_map_history_route_references();
+        let history_protection =
+            required_cluster_map_history_protection(self.pgs.values(), self.nodes.values());
         let historical_pg_routes = self.historical_pg_routes_for_storage_node_refresh(
             history_route_references,
+            &history_protection.exact_routes,
             refreshing_node_observed_epoch,
             &pg_routes,
             refreshing_node_id,
@@ -2089,6 +2092,7 @@ impl ClusterControlSnapshot {
     fn historical_pg_routes_for_storage_node_refresh(
         &self,
         history_route_references: &PgClusterMapHistoryRouteReferences,
+        globally_protected_route_keys: &BTreeSet<(ClusterEpoch, PgId)>,
         observed_epoch: ClusterEpoch,
         current_routes: &[PgRouteSnapshot],
         refreshing_node_id: NodeId,
@@ -2102,6 +2106,26 @@ impl ClusterControlSnapshot {
                     &mut pending_keys,
                     reference.cluster_epoch(),
                     reference.pg_id(),
+                );
+            }
+        }
+
+        // A durable reference is reported by the node hosting its metadata,
+        // while historical shard reads are served by every node in the old
+        // acting set. Give those serving nodes the same exact route authority;
+        // otherwise a remote backfill coordinator retains the route globally
+        // but its source node rejects the historical read.
+        for &(cluster_epoch, pg_id) in globally_protected_route_keys {
+            if cluster_epoch >= self.cluster_epoch {
+                continue;
+            }
+            let route = self.historical_pg_route(cluster_epoch, pg_id)?;
+            if storage_node_refresh_needs_historical_route(&route, refreshing_node_id) {
+                add_required_historical_route_key(
+                    &mut required_keys,
+                    &mut pending_keys,
+                    cluster_epoch,
+                    pg_id,
                 );
             }
         }
@@ -43468,6 +43492,58 @@ mod tests {
             "storage-node refresh retained too much unrelated route history: {} bytes",
             encoded.len()
         );
+    }
+
+    #[test]
+    fn storage_node_refresh_distributes_remote_exact_route_to_historical_actor() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2, 3] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+
+        authority
+            .set_pg_acting_set(PgId::new(30), vec![NodeId::new(1)])
+            .unwrap();
+        let source_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .set_pg_acting_set(PgId::new(30), vec![NodeId::new(2)])
+            .unwrap();
+        let observed_epoch = authority.snapshot().cluster_epoch();
+
+        let mut metadata_owner_heartbeat =
+            heartbeat_from_record(&authority, 2, observed_epoch, 2_000);
+        metadata_owner_heartbeat.cluster_map_history_route_references =
+            history_route_references([PgClusterMapHistoryRouteReference::new(
+                PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
+                source_epoch,
+                PgId::new(30),
+            )]);
+        authority
+            .heartbeat(metadata_owner_heartbeat, 2_000)
+            .unwrap();
+
+        let source_refresh = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(2_001, NodeId::new(1), observed_epoch)
+            .unwrap();
+        let historical = source_refresh
+            .reconstructed_pg_route_at_epoch(PgId::new(30), source_epoch)
+            .unwrap();
+        assert_eq!(historical.acting_set(), &[NodeId::new(1)]);
+
+        let unrelated_refresh = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(2_001, NodeId::new(3), observed_epoch)
+            .unwrap();
+        assert!(unrelated_refresh
+            .historical_pg_routes()
+            .iter()
+            .all(|route| route.pg_id() != PgId::new(30) || route.cluster_epoch() != source_epoch));
     }
 
     #[test]

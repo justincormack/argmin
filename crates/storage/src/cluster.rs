@@ -15875,13 +15875,28 @@ impl StorageCluster {
         &self,
         params: &PlacedSegmentShardBackfillClaimAcquireParams,
     ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
-        for route in self.local_pg_routes() {
-            if route.state() != PgState::Active {
-                continue;
-            }
+        self.acquire_next_placed_segment_shard_backfill_claim_with_cursor(params, &mut None)
+    }
+
+    pub fn acquire_next_placed_segment_shard_backfill_claim_with_cursor(
+        &self,
+        params: &PlacedSegmentShardBackfillClaimAcquireParams,
+        last_claimed_pg_id: &mut Option<PgId>,
+    ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
+        let mut routes: Vec<_> = self
+            .local_pg_routes()
+            .filter(|route| route.state() == PgState::Active)
+            .collect();
+        routes.sort_by_key(|route| route.pg_id());
+        let start = last_claimed_pg_id.map_or(0, |last_pg_id| {
+            routes.partition_point(|route| route.pg_id() <= last_pg_id)
+        });
+        for offset in 0..routes.len() {
+            let route = routes[(start + offset) % routes.len()];
             if let Some(claim) =
                 self.acquire_placed_segment_shard_backfill_claim(route.pg_id().get(), params)?
             {
+                *last_claimed_pg_id = Some(route.pg_id());
                 return Ok(Some(claim));
             }
         }

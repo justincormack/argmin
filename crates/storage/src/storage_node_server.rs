@@ -603,7 +603,7 @@ impl StorageNodeProcessConfig {
         runtime_map: &ClusterRuntimeMapSnapshot,
         history_reference_summary: crate::PgClusterMapHistoryReferenceSummary,
     ) -> Result<Self, StorageNodeServerError> {
-        let protected_historical_route_keys = metadata_transfer_route_keys_for_refresh(runtime_map);
+        let protected_historical_route_keys = protected_route_keys_for_refresh(runtime_map);
         let mut next = Self::from_runtime_map(
             current.node_id,
             current.data_dir.clone(),
@@ -982,29 +982,36 @@ fn prune_refresh_historical_pg_routes(
     retained.into_values().collect()
 }
 
-fn metadata_transfer_route_keys_for_refresh(
+fn protected_route_keys_for_refresh(
     runtime_map: &ClusterRuntimeMapSnapshot,
 ) -> BTreeSet<(ClusterEpoch, u32)> {
-    runtime_map
-        .pg_routes()
+    let mut protected: BTreeSet<_> = runtime_map
+        .historical_pg_routes()
         .iter()
-        .chain(runtime_map.historical_pg_routes())
-        .flat_map(|route| {
-            [
-                route
-                    .peering_metadata_transfer_destination_epoch()
-                    .map(|destination_epoch| (destination_epoch, route.pg_id().get())),
-                route
-                    .peering_metadata_transfer_source_route_epoch()
-                    .map(|source_epoch| (source_epoch, route.pg_id().get())),
-                route
-                    .pending_metadata_command_recovery()
-                    .map(|recovery| (recovery.pending().cluster_epoch(), route.pg_id().get())),
-            ]
-            .into_iter()
-            .flatten()
-        })
-        .collect()
+        .map(|route| (route.cluster_epoch(), route.pg_id().get()))
+        .collect();
+    protected.extend(
+        runtime_map
+            .pg_routes()
+            .iter()
+            .chain(runtime_map.historical_pg_routes())
+            .flat_map(|route| {
+                [
+                    route
+                        .peering_metadata_transfer_destination_epoch()
+                        .map(|destination_epoch| (destination_epoch, route.pg_id().get())),
+                    route
+                        .peering_metadata_transfer_source_route_epoch()
+                        .map(|source_epoch| (source_epoch, route.pg_id().get())),
+                    route
+                        .pending_metadata_command_recovery()
+                        .map(|recovery| (recovery.pending().cluster_epoch(), route.pg_id().get())),
+                ]
+                .into_iter()
+                .flatten()
+            }),
+    );
+    protected
 }
 
 fn control_plane_runtime_config_path(data_dir: &Path) -> PathBuf {
@@ -21837,6 +21844,161 @@ mod tests {
         assert!(next.historical_pg_routes.iter().any(|route| {
             route.cluster_epoch == current_runtime_map.cluster_epoch() && route.pg_id == pg_id.get()
         }));
+    }
+
+    #[test]
+    fn storage_node_refresh_installs_remote_backfill_source_route() {
+        let tmp = test_util::tempdir();
+        let source_node_id = NodeId::new(1);
+        let metadata_node_id = NodeId::new(2);
+        let unrelated_node_id = NodeId::new(3);
+        let pg_id = PgId::new(0);
+        let source_socket_path = tmp.path().join("sock").join("source.sock");
+        private_socket_dir(source_socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        for (index, node_id) in [source_node_id, metadata_node_id, unrelated_node_id]
+            .into_iter()
+            .enumerate()
+        {
+            authority
+                .set_node_membership(node_id, NodeMembershipState::Active)
+                .unwrap();
+            let endpoint = if node_id == source_node_id {
+                source_socket_path.clone()
+            } else {
+                tmp.path().join("sock").join(format!("node-{index}.sock"))
+            };
+            let first = authority
+                .heartbeat(
+                    NodeHeartbeat {
+                        node_id,
+                        node_incarnation: 12,
+                        endpoint: endpoint.to_str().unwrap().to_owned(),
+                        observed_epoch: authority.snapshot().cluster_epoch(),
+                        requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    1_000 + index as u64 * 2,
+                )
+                .unwrap();
+            authority
+                .heartbeat(
+                    NodeHeartbeat {
+                        node_id,
+                        node_incarnation: 12,
+                        endpoint: endpoint.to_str().unwrap().to_owned(),
+                        observed_epoch: first.cluster_epoch(),
+                        requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    1_001 + index as u64 * 2,
+                )
+                .unwrap();
+        }
+
+        authority
+            .set_pg_acting_set(pg_id, vec![source_node_id])
+            .unwrap();
+        let source_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .set_pg_acting_set(pg_id, vec![metadata_node_id])
+            .unwrap();
+        let current_epoch = authority.snapshot().cluster_epoch();
+        let history_references = crate::PgClusterMapHistoryRouteReferences::try_from_iter([
+            crate::PgClusterMapHistoryRouteReference::new(
+                crate::PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
+                source_epoch,
+                pg_id,
+            ),
+        ])
+        .unwrap();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id: metadata_node_id,
+                    node_incarnation: 12,
+                    endpoint: tmp
+                        .path()
+                        .join("sock")
+                        .join("node-1.sock")
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                    observed_epoch: current_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: history_references,
+                    pg_observations: Vec::new(),
+                },
+                2_000,
+            )
+            .unwrap();
+
+        let refresh_map = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(2_001, source_node_id, current_epoch)
+            .unwrap();
+        assert!(refresh_map
+            .historical_pg_routes()
+            .iter()
+            .any(|route| { route.cluster_epoch() == source_epoch && route.pg_id() == pg_id }));
+        let mut current = StorageNodeProcessConfig::from_runtime_map(
+            source_node_id,
+            tmp.path().join("source-node"),
+            EcShape { k: 1, m: 0 },
+            &refresh_map,
+        )
+        .unwrap();
+        current.historical_pg_routes.clear();
+        let next = StorageNodeProcessConfig::from_runtime_map_refresh(
+            &current,
+            &refresh_map,
+            crate::PgClusterMapHistoryReferenceSummary::default(),
+        )
+        .unwrap();
+        assert!(next
+            .historical_pg_routes
+            .iter()
+            .any(|route| { route.cluster_epoch == source_epoch && route.pg_id == pg_id.get() }));
+
+        let server = crate::clock::with_time_override(2_001, || {
+            StorageNodeServer::bind(next.clone()).unwrap()
+        });
+        let shard_key = test_shard_key(0);
+        let payload = b"globally protected backfill source";
+        let ack = server
+            ._node
+            .write_shard_file_if_absent(pg_id.get(), &shard_key, payload)
+            .unwrap();
+        server
+            ._node
+            .get_pg(pg_id.get())
+            .unwrap()
+            .register_written_shards_batch_exact(&[(&shard_key, ack)])
+            .unwrap();
+        let permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let loaded = server
+            .connection_handler()
+            .retained_shard_ack_inspection_route(
+                &permit,
+                &StorageRpcShardAckItemRequest {
+                    node_id: source_node_id,
+                    cluster_epoch: source_epoch,
+                    pg_id,
+                    shard_key,
+                },
+                "test globally protected historical shard ack inspection",
+            )
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(loaded, ack);
     }
 
     #[test]
