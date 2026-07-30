@@ -4600,12 +4600,14 @@ impl StorageNodeActiveObjectRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        ObjectVersionMetadataNodeClient::next_object_version_id(
+        ObjectVersionMetadataNodeClient::open_object_version_metadata_route(
             &local_client,
+            self.handler.config.cluster_epoch,
             self.pg_id,
             self.bucket,
             self.key,
         )
+        .and_then(|route| route.next_object_version_id())
         .map_err(StorageNodeObjectRouteError::Object)
     }
 }

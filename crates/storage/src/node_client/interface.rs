@@ -450,20 +450,20 @@ pub(crate) trait ObjectGenerationMetadataRoute: Send {
 }
 
 pub(crate) trait ObjectVersionMetadataNodeClient: Send + Sync {
-    fn next_object_version_id(
+    fn open_object_version_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<VersionId, ObjectPgActionError>;
+    ) -> Result<Box<dyn ObjectVersionMetadataRoute + '_>, ObjectPgActionError>;
+}
 
-    fn next_completion_object_version_id(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<VersionId, ObjectPgActionError> {
-        self.next_object_version_id(pg_id, bucket, key)
+pub(crate) trait ObjectVersionMetadataRoute: Send {
+    fn next_object_version_id(&self) -> Result<VersionId, ObjectPgActionError>;
+
+    fn next_completion_object_version_id(&self) -> Result<VersionId, ObjectPgActionError> {
+        self.next_object_version_id()
     }
 }
 

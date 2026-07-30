@@ -651,7 +651,8 @@ Node-client role classification (2026-07-19):
 | `BucketWriteReservationNodeClient` | bucket metadata | active bucket route for acquisition, heartbeat, worker scans, and claim creation |
 | `RetainedBucketWriteReservationNodeClient` | bucket metadata | opens a retained cleanup route bound to one bucket metadata PG and exact bucket; the returned interface releases exact reservation proofs, drains, and worker claims without accepting a replacement PG or bucket |
 | `ObjectGenerationMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; reservation lookup and next-generation inspection cannot replace that subject |
-| `ObjectVersionMetadataNodeClient`, `DirectPutMetadataNodeClient` | object metadata | active object route, with completion-specific admission represented as a narrower operation class |
+| `ObjectVersionMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; ordinary and completion-priority version inspection retain distinct admission classes within that route |
+| `DirectPutMetadataNodeClient` | object metadata | active object route, with completion-specific admission represented as a narrower operation class |
 | `ObjectListingMetadataNodeClient` | object metadata scan | active object-metadata route for the scanned PG; listing fan-out constructs one capability per routed PG |
 | `ObjectMutationMetadataNodeClient` | object metadata | active object route for object, multipart, stream-session, and payload-reclaim mutation |
 | `RetainedObjectMutationMetadataNodeClient` | object metadata | opens a retained route bound to one epoch, object-metadata PG, bucket, and key; the returned interface prepares stream aborts and releases payload-reclaim claims without accepting replacement route or object arguments |
@@ -4344,6 +4345,28 @@ One-hundred-and-eighth Phase 3 slice:
   correct-PG canaries.
 - all 2,481 storage tests pass. Formatting, the storage boundary checker,
   workspace-wide strict Clippy, and the full 7,813-test workspace suite also
+  pass.
+
+One-hundred-and-ninth Phase 3 slice:
+
+- object-version metadata access now opens an `ObjectVersionMetadataRoute`
+  bound to one active cluster epoch, exact object-metadata PG, bucket, and
+  key. Version inspection no longer accepts replacement placement or object
+  arguments after route construction.
+- ordinary allocation and multipart-completion allocation remain separate
+  zero-argument route operations so the Unix adapter preserves their normal
+  and completion-reserved admission classes. Acting-set inspection opens one
+  scoped route per selected node and chooses the required operation without
+  resupplying the object subject.
+- embedded construction validates exact object placement and an open PG before
+  access. Unix construction rejects a foreign epoch before transport, while
+  storage-node dispatch independently retains active admission-domain, route,
+  placement, and captured-deadline validation. Embedded and no-listener Unix
+  regressions pin construction failures, and installed Unix equivalent-state
+  coverage requires `PayloadDecode` for both ordinary and completion-priority
+  operations on a wrong PG.
+- all 2,484 storage tests pass. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full 7,815-test workspace suite also
   pass.
 
 ### Phase 4 — type metadata-command publication

@@ -84,6 +84,14 @@ struct LocalObjectGenerationMetadataRoute {
     key: ObjectKey,
 }
 
+struct LocalObjectVersionMetadataRoute {
+    storage_node: Arc<SharedStorageNode>,
+    _route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
 struct LocalObjectListingMetadataRoute {
     storage_node: Arc<SharedStorageNode>,
     _route_cluster_epoch: ClusterEpoch,
@@ -1794,14 +1802,38 @@ impl ObjectGenerationMetadataRoute for LocalObjectGenerationMetadataRoute {
 }
 
 impl ObjectVersionMetadataNodeClient for LocalStorageNodeClient {
-    fn next_object_version_id(
+    fn open_object_version_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<VersionId, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::next_version_id(&*pg, bucket, key)?)
+    ) -> Result<Box<dyn ObjectVersionMetadataRoute + '_>, ObjectPgActionError> {
+        if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open object version metadata route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalObjectVersionMetadataRoute {
+            storage_node: Arc::clone(&self.storage_node),
+            _route_cluster_epoch: route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
+    }
+}
+
+impl ObjectVersionMetadataRoute for LocalObjectVersionMetadataRoute {
+    fn next_object_version_id(&self) -> Result<VersionId, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        Ok(PgMetadataStore::next_version_id(
+            &*pg,
+            &self.bucket,
+            &self.key,
+        )?)
     }
 }
 

@@ -14,6 +14,13 @@ struct UnixObjectGenerationMetadataRoute<'a> {
     key: ObjectKey,
 }
 
+struct UnixObjectVersionMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
 struct UnixObjectListingMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
     pg_id: ObjectMetadataScanPgId,
@@ -1667,30 +1674,45 @@ impl ObjectGenerationMetadataRoute for UnixObjectGenerationMetadataRoute<'_> {
 }
 
 impl ObjectVersionMetadataNodeClient for UnixStorageNodeClient {
-    fn next_object_version_id(
+    fn open_object_version_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<VersionId, ObjectPgActionError> {
-        self.next_object_version_id_with_admission_class(
+    ) -> Result<Box<dyn ObjectVersionMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixObjectVersionMetadataRoute {
+            client: self,
             pg_id,
-            bucket,
-            key,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
+    }
+}
+
+impl ObjectVersionMetadataRoute for UnixObjectVersionMetadataRoute<'_> {
+    fn next_object_version_id(&self) -> Result<VersionId, ObjectPgActionError> {
+        self.client.next_object_version_id_with_admission_class(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
             storage_rpc_admission_class(StorageRpcMessageKind::ObjectVersionNext),
         )
     }
 
-    fn next_completion_object_version_id(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<VersionId, ObjectPgActionError> {
-        self.next_object_version_id_with_admission_class(
-            pg_id,
-            bucket,
-            key,
+    fn next_completion_object_version_id(&self) -> Result<VersionId, ObjectPgActionError> {
+        self.client.next_object_version_id_with_admission_class(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
             UnixStorageNodeRpcAdmissionClass::Completion,
         )
     }

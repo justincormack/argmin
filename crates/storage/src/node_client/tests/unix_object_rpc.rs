@@ -975,8 +975,13 @@ fn unix_object_version_metadata_client_routes_version_reads() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);
     private_socket_dir(config.socket_path.parent().unwrap());
-    let server = StorageNodeServer::bind(config.clone()).unwrap();
-    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..2)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
     let client = UnixStorageNodeClient::new(
         NodeId::new(7),
         ClusterEpoch::new(1).unwrap(),
@@ -985,17 +990,25 @@ fn unix_object_version_metadata_client_routes_version_reads() {
     let bucket = crate::tests::bucket_name("object-version-rpc-bucket");
     let key = crate::tests::object_key("object-version-rpc-key");
 
+    let route = ObjectVersionMetadataNodeClient::open_object_version_metadata_route(
+        &client,
+        ClusterEpoch::INITIAL,
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
+        &bucket,
+        &key,
+    )
+    .unwrap();
     assert_eq!(
-        ObjectVersionMetadataNodeClient::next_object_version_id(
-            &client,
-            ObjectMetadataPgId::new_for_test(PgId::new(0)),
-            &bucket,
-            &key
-        )
-        .unwrap(),
+        route.next_object_version_id().unwrap(),
         VersionId::from_u64(1)
     );
-    server_thread.join().unwrap();
+    assert_eq!(
+        route.next_completion_object_version_id().unwrap(),
+        VersionId::from_u64(1)
+    );
+    for thread in server_threads {
+        thread.join().unwrap();
+    }
 }
 
 #[test]
@@ -1103,7 +1116,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..37)
+    let server_threads: Vec<_> = (0..39)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -1147,13 +1160,15 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         })
     ));
 
-    let version_error = ObjectVersionMetadataNodeClient::next_object_version_id(
+    let wrong_version_route = ObjectVersionMetadataNodeClient::open_object_version_metadata_route(
         &client,
+        ClusterEpoch::INITIAL,
         wrong_object_pg,
         &bucket,
         &key,
     )
-    .unwrap_err();
+    .unwrap();
+    let version_error = wrong_version_route.next_object_version_id().unwrap_err();
     assert!(matches!(
         version_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
@@ -1161,6 +1176,29 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
             ..
         })
     ));
+    let completion_version_error = wrong_version_route
+        .next_completion_object_version_id()
+        .unwrap_err();
+    assert!(matches!(
+        completion_version_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+    let correct_version_route =
+        ObjectVersionMetadataNodeClient::open_object_version_metadata_route(
+            &client,
+            ClusterEpoch::INITIAL,
+            correct_object_pg,
+            &bucket,
+            &key,
+        )
+        .unwrap();
+    assert_eq!(
+        correct_version_route.next_object_version_id().unwrap(),
+        VersionId::from_u64(1)
+    );
 
     let correct_generation_route =
         ObjectGenerationMetadataNodeClient::open_object_generation_metadata_route(

@@ -11524,14 +11524,16 @@ impl StorageCluster {
             .metadata_pg_acting_nodes(self.operation_epoch(), object_pg_id.pg_id())?
         {
             let object_version_client = node.object_version_metadata_client();
+            let object_version_route = object_version_client.open_object_version_metadata_route(
+                self.operation_epoch(),
+                object_pg_id,
+                bucket,
+                key,
+            )?;
             let candidate = if completion_admission {
-                object_version_client.next_completion_object_version_id(
-                    object_pg_id,
-                    bucket,
-                    key,
-                )?
+                object_version_route.next_completion_object_version_id()?
             } else {
-                object_version_client.next_object_version_id(object_pg_id, bucket, key)?
+                object_version_route.next_object_version_id()?
             };
             if candidate.to_u64() > version_id.to_u64() {
                 version_id = candidate;
