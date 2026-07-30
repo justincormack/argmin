@@ -1,7 +1,7 @@
 # Internal Format Ownership, Upgrade And Versioning Plan
 
-Status: Phase 0 complete; Phase 1 has one residual containment item; Phase 2 evidence audit
-planned
+Status: Phase 0 complete; Phase 1 reopened for storage topology and maintenance containment;
+Phase 2 evidence audit planned
 
 ## Context
 
@@ -352,12 +352,13 @@ field shapes without establishing the authority semantics the fields represent.
 Document every durable or cross-process format that needs an explicit baseline version, assign
 its owner, and close the representation leaks before adding further version machinery.
 
-**Status: one residual item remains as of 2026-07-30.** Database, control-plane, Raft, nested
-durable value, static identity, standalone identity, and session-token representations are
-contained. Storage-node TLS profile construction is still performed by `argmin-s3`, however, so
-the storage RPC ALPN identifier and raw Rustls client/server configuration still cross the owner
-boundary. Phase 1 is complete only after that profile is constructed and validated inside
-`storage` and the regression boundary is checked.
+**Status: reopened 2026-07-30.** The representation-containment work completed so far remains
+valid, but the durable-backfill convergence fix exposed a broader class of semantic storage leaks
+that the original audit did not cover. PG identities, route state, physical payload placement,
+maintenance claim protocols, control-plane topology workflows, and implementation error variants
+still cross into `server-core`, `server-http`, or `argmin-s3`. Storage-node TLS profile construction
+also remains outside `storage`. Phase 1 is complete only after both the representation and semantic
+topology/maintenance boundaries below are closed and regression-checked.
 
 Initial inventory:
 
@@ -415,6 +416,14 @@ Containment audit targets:
   by non-owning crates.
 - Public encode/decode methods for internal nested formats when no external crate legitimately
   owns or interprets the representation.
+- PG identifiers, route states, acting sets, cluster epochs used for routing, historical-route
+  details, physical shard locations, or EC placement inputs outside `storage`.
+- Public storage maintenance claims, queue records, scan cursors, retry taxonomies, or
+  acquire/execute/complete protocols orchestrated by another crate.
+- Control-plane commands, route snapshots, metadata-transfer proofs, or topology-transition state
+  machines interpreted by the process/configuration layer rather than a storage-owned facade.
+- Public storage errors whose PG, database, shard, route, command-log, or RPC variants are matched
+  by callers instead of being translated into owner-defined semantic classifications.
 - Cross-crate tests that create impossible database, file, journal, or wire states directly.
 
 Initial ownership assessment:
@@ -426,11 +435,15 @@ Initial ownership assessment:
 | Storage-node RPC | `storage` | Framing, wire errors, transports, and malformed-wire tests are storage-owned. Residual: `argmin-s3` still imports `STORAGE_RPC_TLS_ALPN` and constructs raw Rustls client/server profiles before passing them into storage endpoints/listeners. |
 | Control-plane durable state, RPC, and auth envelope | `storage` | Complete: client and server transport are contained behind typed Unix/TLS endpoints and opaque storage-owned facades. |
 | Raft peer protocol, restart artifact, and WAL | `storage` | Peer wire and durable representations are contained: raw frames, restart artifacts, WAL records/files, and layout helpers are private; process tests use logical clients and opaque semantic recovery inspection. |
+| PG topology, route state, and physical payload placement | `storage` | Incomplete: `server-core` and `argmin-s3` still construct and interpret PG identifiers, route snapshots, acting sets, placement epochs, EC shard requests, and physical shard locations. |
+| Physical storage maintenance workflows | `storage` | Incomplete: `server-core` owns shard scavenger/repair/backfill workers, payload reclaim and bucket-finalization queues, abandoned stream-session cleanup, scan/claim state, retry decisions, and acquire/execute/complete transitions. |
+| Control-plane topology and metadata-transfer workflows | `storage` | Incomplete: `argmin-s3` constructs control-plane commands and implements PG fencing, route inspection, metadata transfer, and topology convergence. |
+| Storage implementation-error taxonomy | `storage` | Incomplete: `server-core` matches PG, database, shard, route, command-log, and RPC `StoreError` variants for diagnostics and retry behavior. |
 | Object user/system metadata blobs | `server-core` | Complete: serialization is crate-private and storage carries only opaque validated blobs. |
 | Tag and ACL canonical value formats | `s3-types` | Complete: validation and canonical codecs are centralized; storage owns and validates their containing row, command, checkpoint, digest, and RPC formats. |
 | Object encryption state | `storage` | Complete: the durable codec is private and callers receive only typed encryption state. |
 | Session-token envelope | `auth` | Exact-current version selection and representation constants are private to `auth`; callers use semantic credential issuance and authentication APIs, enforced by the boundary check. |
-| Static manifest and process identity files | `argmin-s3` | Complete: codecs are crate-local and storage/control-plane layout is accessed only through owner-defined logical initialization and inspection APIs. |
+| Static manifest and process identity files | `argmin-s3` | File codecs and process identities are contained, but the manifest's storage-topology section still becomes `Vec<(PgId, Vec<NodeId>)>` in `argmin-s3`; storage must own validation and interpretation of that subdocument. |
 | Shared operator metric schema | `observability` | Excluded from this storage-upgrade boundary: current metrics are neither persisted state nor an internal wire format, and no stable external metric-schema contract exists pre-release. If one is declared later, `observability` owns a separate compatibility plan. |
 
 These are the current owners, not placeholders shared between crates. A later extraction into
@@ -810,6 +823,77 @@ implementation order is:
    explicit-WAL constructors private; derive the WAL location inside storage; relocate direct
    durable-format and impossible-state tests into `storage`; and boundary-check these symbols.
 
+### Storage Topology And Maintenance Containment Audit (2026-07-30)
+
+Commit `c0289530640d83be81f4bddbe30dd7bbbc5779b3` correctly fixed durable-backfill
+route convergence inside storage, but its fairness fix retained `Option<PgId>` in
+`server-core` and passed it back into a storage claim scan. That cursor is storage-owned scan
+state, not S3 coordination state. The narrow fix is not to replace `PgId` with `u32`: the owner
+must retain the state behind an opaque logical capability.
+
+The follow-up audit found these related live production leaks:
+
+| Leak | Current non-owner behavior | Required owner boundary |
+| --- | --- | --- |
+| Backfill fairness and claims | `server-core` retains the last claimed PG, constructs claim-acquire parameters, inspects work-item PG/epoch/EC fields, and drives acquire/backfill/complete/error transitions. | A storage-owned backfill worker/session retains its private cursor and claim state. Callers start, stop, and wake it through an opaque capability. |
+| Shard scavenger and repair | `server-core` scans candidates, owns claim leases and retry policy, interprets physical failure variants, and records storage queue transitions. | Move physical shard maintenance state machines and their admission/retry classification into `storage`; make claim, cursor, and work-record representations private. |
+| Payload reclaim and bucket finalization | `ReclaimSweeper` in `server-core` owns durable PG scanning, physical payload-reclaim queues, deferred roots, per-PG cooldown, bucket-delete continuation/finalization work, and retry classification. | Storage owns discovery, queueing, adoption, physical reclaim, asynchronous bucket cleanup/finalization, cleanup roots, and retry scheduling after a logical delete has been accepted. `server-core` retains the S3-visible delete request, preconditions, response, and lifecycle-policy decisions and invokes one logical accepted-deletion operation. |
+| Abandoned stream-session cleanup | `StreamSessionSweeper` in `server-core` directly schedules and invokes storage session scavenging. | Storage owns stream-session expiry, discovery, cleanup, admission, and telemetry behind its maintenance runtime; this internal session lifecycle is not an S3-visible policy. |
+| Physical object payload I/O | `server-core` carries data PG IDs, placement epochs, EC `k/m`, builds `SegmentStoredBytesRequest`, and asks storage for shard locations and historical reads. | Storage returns an opaque persisted payload-segment handle and owns placement, leases, reconstruction, historical routing, and physical read/write requests. `server-core` retains S3-visible byte-range, checksum, and encryption semantics. |
+| Process control-plane orchestration | `argmin-s3` constructs `ControlPlaneCommand`, inspects `PgRouteSnapshot`/`PgState`/acting sets, and implements PG fencing plus live metadata-transfer convergence. | A storage-owned control-plane/admin facade owns topology commands and the complete metadata-transfer state machine. The process supplies lifecycle, endpoint, credentials, and operator inputs only. |
+| Static topology configuration | `argmin-s3` parses and stores `Vec<(PgId, Vec<NodeId>)>` and performs storage placement interpretation. | Keep the outer manifest in `argmin-s3`, but hand its storage-topology subdocument or logical configuration inputs to a storage-owned validator/builder without exposing PG types. |
+| Storage failure handling | `server-core` exhaustively matches `StoreError` variants for PG, database, shard, route, command-log, RPC, backfill retry, and diagnostics. | Storage exposes exhaustive semantic operation/maintenance failure classes plus opaque retained diagnostics. Implementation variants and nested causes remain private. |
+| HTTP debug operations | `server-http` parses a PG ID, obtains `StorageCluster`, invokes checkpoint operations, and formats storage snapshots. | Debug formats may remain unstable, but the operation and formatting must be owner-provided and opaque; debug status does not waive crate ownership. |
+| Storage-specific observability | `server-core` emits repair/backfill events using PG IDs because it owns the leaked workers. | Storage emits its own topology/maintenance telemetry. `observability` may remain a generic sink, but another crate must not consume those dimensions to make storage decisions. |
+
+Permitted cross-boundary values are deliberately narrower:
+
+- `StorageClusterRouteHandle` and route-admission values remain opaque storage capabilities. A
+  caller may retain or pass them but may not inspect a PG, route, generation lock, or publication
+  domain through them.
+- Process configuration may name nodes, endpoints, credentials, certificate identities, and
+  listener bindings. Node identity as deployment configuration does not grant the process layer
+  authority to construct acting sets or interpret PG transition state.
+- `server-core` owns S3 semantics, authorization, lifecycle rule evaluation, S3-visible bucket
+  deletion decisions and responses, object-visible byte ranges and checksums, and encryption
+  request behavior. Once a logical deletion is durably accepted, storage creates and owns its
+  cleanup roots and physical reclaim/finalization. `server-core` does not own physical placement,
+  erasure-shard routing, historical route selection, storage-session scavenging, or storage
+  recovery.
+- Process and HTTP tests use logical operations or opaque owner-provided test/debug facilities.
+  Impossible topology, claim, route, or physical payload states remain in storage tests.
+
+The bounded implementation order is:
+
+1. Move shard scavenger, repair, backfill, payload reclaim, asynchronous bucket cleanup/finalize,
+   and abandoned stream-session worker state machines into a storage-owned maintenance runtime.
+   Include the `c0289530` fairness cursor, durable PG scans, deferred queues and roots, per-PG
+   cooldown, candidate scans, claims, leases, admission classes, retries, completion, expiry, and
+   storage-specific telemetry. Keep lifecycle-rule evaluation and the S3-visible bucket-delete
+   request/precondition/response path in `server-core`; invoke a logical accepted-deletion
+   operation from which storage creates and owns all durable cleanup roots.
+2. Make the maintenance cursor, claim, reclaim-work, cleanup-root, session-cleanup, work-record,
+   and acquire/complete APIs crate-private once no external worker consumes them.
+3. Replace physical segment fields and requests in `server-core` with opaque storage-owned payload
+   handles and logical lease/read/write operations. Retain encryption transformation at the
+   appropriate S3/storage seam without exposing placement.
+4. Move control-plane topology transitions and live metadata-transfer orchestration behind a
+   storage-owned admin/service facade. Then move static storage-topology interpretation behind a
+   storage-owned builder while leaving outer manifest/process configuration in `argmin-s3`.
+5. Replace cross-crate `StoreError` destructuring with exhaustive storage-owned semantic
+   classifications and opaque diagnostics. Error translation into S3 outcomes remains contextual
+   in `server-core`, but cannot depend on PG, database, shard, route, or wire variants.
+6. Replace direct HTTP storage debug access with an opaque coordinator/storage diagnostic facade.
+7. Make `PgId`, `PgState`, route snapshots, physical segment requests, and maintenance records
+   non-public outside `storage` wherever no remaining logical administration surface requires
+   them. Extend `check-storage-cluster-boundaries` during migration, then rely primarily on Rust
+   visibility to prevent recurrence.
+
+This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
+those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
+separate production leak. UAT/process tests may continue to identify an operator-visible topology
+target through a supported command surface, without importing the storage representation types.
+
 Phase 1 exit criteria:
 
 - Every version boundary has one recorded owner crate and a documented public logical API.
@@ -821,9 +905,9 @@ Phase 1 exit criteria:
 - Boundary checks cover known high-risk leaks, while compiler visibility remains the primary
   enforcement mechanism.
 
-The storage-node TLS-profile item remains the only unsatisfied Phase 1 exit criterion. Phase 2
-may be inventoried in parallel, but implementation of new version boundaries does not begin until
-that containment item is complete.
+The storage-node TLS-profile item and every topology/maintenance item in the audit above remain
+unsatisfied Phase 1 exit criteria. Phase 2 may be inventoried in parallel, but implementation of
+new version boundaries does not begin until all of this containment work is complete.
 
 ## Phase 2: Baseline Version Markers
 
@@ -871,8 +955,8 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | PG SQLite schema and physical layout | `storage` | `PRAGMA user_version = 1`; version zero is valid only with no user schema objects | Recorded |
 | Metadata commands and abandoned-command records | `storage` | command encoding 5; abandoned-command encoding 1 | Evidence required |
 | Metadata checkpoints and canonical state | `storage` | checkpoint encoding 1; canonical-state encoding 4 | Evidence required |
-| Storage-node RPC and authentication | `storage` | frame encoding 11; auth binding 2; auth transport envelope 1 | Blocked on the residual Phase 1 TLS-profile containment item, then evidence required |
-| Control-plane logical state, commands, and snapshots | `storage` | state 26; command 14; snapshot 1 | Evidence required |
+| Storage-node RPC and authentication | `storage` | frame encoding 11; auth binding 2; auth transport envelope 1 | Blocked on Phase 1 TLS, topology, payload, maintenance, and error containment; then evidence required |
+| Control-plane logical state, commands, and snapshots | `storage` | state 26; command 14; snapshot 1 | Blocked on Phase 1 topology/admin-workflow containment; then evidence required |
 | Control-plane RPC and authentication | `storage` | RPC 12; shared authentication envelope 1 | Evidence required |
 | Single-authority control-plane durable artifacts | `storage` | clock checkpoint 2; state identity 1; initialized marker 1; journal file 2; journal record 2 | Evidence required |
 | Raft peer RPC and authentication | `storage` | peer RPC 2; shared authentication envelope 1 | Evidence required |
@@ -883,13 +967,14 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | Object encryption state | `storage` | SSE-C 3; SSE-S3 1, selected by a typed outer discriminator | Recorded |
 | Object-tag and bucket-tag canonical XML | `s3-types` | no independent marker; exact canonical XML is embedded in versioned storage formats | Design required: formalize outer-version binding or add a private inner frame |
 | ACL canonical string | `s3-types` | no independent marker; exact canonical string is embedded in versioned storage formats | Design required: formalize outer-version binding or add a private inner frame |
-| Static cluster manifest and static identities | `argmin-s3` | manifest schema 1; storage identity 1; control-plane identity 2 | Evidence required |
+| Static cluster manifest and static identities | `argmin-s3` | manifest schema 1; storage identity 1; control-plane identity 2 | Storage-topology subdocument is blocked on Phase 1 ownership containment; remaining evidence required |
 | Temporary-credential session token | `auth` | `ARGST1` envelope / version 1 | Recorded |
 | Internal TLS protocol identifiers | `storage` | storage RPC, control-plane RPC, and Raft peer ALPN `/1` identifiers | Storage RPC is blocked on Phase 1 containment; the other two require evidence consolidation |
 
-The evidence audit proceeds in this bounded order:
+The evidence audit proceeds in this bounded order after Phase 1 containment is complete:
 
-1. Close storage-node TLS-profile containment and make its ALPN identifier owner-private.
+1. Confirm storage-node TLS, topology, physical payload, maintenance workflow, control-plane admin,
+   and implementation-error containment are complete and boundary-checked.
 2. Expand each `storage` family above to one line per independently changeable format, recording
    its defining constant, writer, first rejecting reader, exact-current fixture, and unsupported
    version fixtures.
@@ -1021,7 +1106,8 @@ The storage-owned PG layout slice is complete:
 The higher-layer control-plane error cleanup, control-plane and Raft transport containment, raw
 diagnostic and Raft representation containment, durable Raft restart/WAL containment, nested
 durable codecs, static route authority, and session-token ownership work are complete and
-boundary-checked. Storage-node TLS-profile construction remains the sole Phase 1 containment item.
+boundary-checked. The completed work does not imply semantic topology containment: storage-node
+TLS-profile construction and the topology/maintenance audit above remain Phase 1 work.
 
 ## Immediate Next Steps
 
@@ -1062,6 +1148,24 @@ Raft peer client and server transports are storage-owned and boundary-checked.
    roots, certificate identities, endpoint names, addresses, and bindings; `storage` supplies and
    validates the protocol profile. Make `STORAGE_RPC_TLS_ALPN` owner-private and extend the
    boundary check to prevent raw storage-RPC Rustls profile construction outside `storage`.
+10. **Pending:** move shard scavenger, repair, backfill, payload reclaim, asynchronous bucket
+    cleanup/finalization, and abandoned stream-session workers into a storage-owned maintenance
+    runtime. Include scan fairness, durable PG scans, deferred queues, cooldown, claims, retries,
+    admission, expiry, completion, and storage-specific telemetry. Keep lifecycle evaluation and
+    the S3-visible bucket-delete request path in `server-core`; storage creates and owns cleanup
+    roots after one logical accepted-deletion operation. Privatize all maintenance cursor, claim,
+    reclaim-work, cleanup-root, session-cleanup, work-record, and transition APIs.
+11. **Pending:** replace server-core's data-PG, placement-epoch, EC-placement, shard-location, and
+    historical-route handling with opaque storage-owned payload handles and logical I/O/lease
+    operations.
+12. **Pending:** move PG topology transitions and live metadata-transfer orchestration behind a
+    storage-owned control-plane/admin facade; move static storage-topology interpretation behind a
+    storage-owned builder without transferring outer manifest ownership.
+13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
+    classifications and opaque diagnostics owned by storage.
+14. **Pending:** contain local debug PG operations behind owner-provided opaque diagnostics, move
+    impossible topology/route/claim fixtures into storage, and enforce the final boundary through
+    crate visibility plus `check-storage-cluster-boundaries` coverage.
 
-After item 9 is complete, work proceeds through the Phase 2 evidence gate rather than reopening
-containment opportunistically.
+After items 9 through 14 are complete, work proceeds through the Phase 2 evidence gate rather than
+reopening containment opportunistically.
