@@ -1,6 +1,7 @@
 # Internal Format Ownership, Upgrade And Versioning Plan
 
-Status: draft
+Status: Phase 0 complete; Phase 1 has one residual containment item; Phase 2 evidence audit
+planned
 
 ## Context
 
@@ -351,6 +352,13 @@ field shapes without establishing the authority semantics the fields represent.
 Document every durable or cross-process format that needs an explicit baseline version, assign
 its owner, and close the representation leaks before adding further version machinery.
 
+**Status: one residual item remains as of 2026-07-30.** Database, control-plane, Raft, nested
+durable value, static identity, standalone identity, and session-token representations are
+contained. Storage-node TLS profile construction is still performed by `argmin-s3`, however, so
+the storage RPC ALPN identifier and raw Rustls client/server configuration still cross the owner
+boundary. Phase 1 is complete only after that profile is constructed and validated inside
+`storage` and the regression boundary is checked.
+
 Initial inventory:
 
 - PG SQLite store schema, engine identity, database errors, and open/version checks.
@@ -411,19 +419,19 @@ Containment audit targets:
 
 Initial ownership assessment:
 
-| Boundary | Current owner | Current containment work |
+| Boundary | Current owner | Containment status |
 | --- | --- | --- |
-| PG schema and physical PG/shard layout | `storage` | SQL and the driver are now private to `PgStore`; remove SQLite magic, `metadata.db`, `pg-NNNN`, direct fsync, and raw shard-layout knowledge from `argmin-s3`. |
-| Metadata command log, checkpoints, and canonical metadata digests | `storage` | Codecs are largely crate-private; inventory every embedded nested format and keep recovery/corruption tests local. |
-| Storage-node RPC | `storage` | The main codec and wire error codes are private; `StorageNodeServer`, `StoreError`, and `StorageNodeFailureClass` form the logical facade. Remaining work is ALPN/TLS profile containment. |
-| Control-plane durable state, RPC, and auth envelope | `storage` | Client and server transport are contained behind typed Unix/TLS endpoints and opaque storage-owned facades. |
+| PG schema and physical PG/shard layout | `storage` | Complete: SQL, driver, SQLite identity, filenames, directory layout, synchronization, and impossible-state tests are storage-owned. |
+| Metadata command log, checkpoints, and canonical metadata digests | `storage` | Complete: codecs and recovery/corruption fixtures are private; every embedded nested format is inventoried below. |
+| Storage-node RPC | `storage` | Framing, wire errors, transports, and malformed-wire tests are storage-owned. Residual: `argmin-s3` still imports `STORAGE_RPC_TLS_ALPN` and constructs raw Rustls client/server profiles before passing them into storage endpoints/listeners. |
+| Control-plane durable state, RPC, and auth envelope | `storage` | Complete: client and server transport are contained behind typed Unix/TLS endpoints and opaque storage-owned facades. |
 | Raft peer protocol, restart artifact, and WAL | `storage` | Peer wire and durable representations are contained: raw frames, restart artifacts, WAL records/files, and layout helpers are private; process tests use logical clients and opaque semantic recovery inspection. |
-| Object user/system metadata blobs | `server-core` | Keep storage's carriers opaque; make serialization entry points crate-private unless another owner has a demonstrated need to interpret them. |
-| Tag and ACL canonical value formats | `s3-types` | Keep validation and canonical value codecs central; treat their embeddings in storage rows/RPCs as separately versioned containing formats. |
-| Object encryption state | `storage` | Keep the durable codec private to storage while exposing only typed encryption state to callers. |
+| Object user/system metadata blobs | `server-core` | Complete: serialization is crate-private and storage carries only opaque validated blobs. |
+| Tag and ACL canonical value formats | `s3-types` | Complete: validation and canonical codecs are centralized; storage owns and validates their containing row, command, checkpoint, digest, and RPC formats. |
+| Object encryption state | `storage` | Complete: the durable codec is private and callers receive only typed encryption state. |
 | Session-token envelope | `auth` | Exact-current version selection and representation constants are private to `auth`; callers use semantic credential issuance and authentication APIs, enforced by the boundary check. |
-| Static manifest and process identity files | `argmin-s3` | The codecs are currently crate-local; inventory their coupling to storage/control-plane durable layout. |
-| Shared operator metric schema | `observability` | Decide explicitly which metrics are compatibility contracts before versioning the shared schema. Subsystem-specific persisted diagnostics must be inventoried as separate boundaries owned by their producing crate rather than treated as one shared format. |
+| Static manifest and process identity files | `argmin-s3` | Complete: codecs are crate-local and storage/control-plane layout is accessed only through owner-defined logical initialization and inspection APIs. |
+| Shared operator metric schema | `observability` | Excluded from this storage-upgrade boundary: current metrics are neither persisted state nor an internal wire format, and no stable external metric-schema contract exists pre-release. If one is declared later, `observability` owns a separate compatibility plan. |
 
 These are the current owners, not placeholders shared between crates. A later extraction into
 a dedicated crate would be a deliberate ownership transfer: move the complete private
@@ -504,9 +512,10 @@ The object-tag XML is embedded in these storage-owned containing formats:
 | Canonical PG state | encoding version 4 | The tag columns participate in canonical row and state digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry tag columns and bind them into row, table, state, and checkpoint digests. |
 
-An incompatible change to the canonical object-tag XML requires an explicit new inner version and
-coordinated advancement of every containing format above; the current decoders have no legacy or
-prefix fallback.
+An incompatible change to the canonical object-tag XML is prohibited until the Phase 2 design
+gate chooses and records one of two strategies: introduce an explicit private inner version, or
+treat the complete set of containing formats above as the version boundary and advance every one
+of them together. The current decoders have no legacy or prefix fallback.
 
 Bucket tags use the same `s3-types` logical values and exact `TagSet::to_xml()` representation,
 with their separate 50-tag cardinality enforced by `storage::SerializedBucketTagSet`. The public
@@ -531,9 +540,11 @@ The bucket-tag XML is embedded in these storage-owned containing formats:
 | Canonical PG state | encoding version 4 | The bucket-subresource body participates in canonical row and state digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry the bucket-subresource row and bind it into row, table, state, and checkpoint digests. |
 
-An incompatible change to the shared canonical XML therefore requires a new tag inner version and
-coordinated advancement of both the object-tag containing formats above and the bucket-tag
-containing formats here. Current decoders have no old-version, prefix, or alternate-XML fallback.
+The Phase 2 tag decision applies jointly to object and bucket tags because they share this
+canonical XML. An incompatible change must either introduce one private tag inner version and
+advance all affected containers, or advance every object-tag and bucket-tag containing format as
+the deliberate version boundary. Current decoders have no old-version, prefix, or alternate-XML
+fallback.
 
 ### Nested Durable Codec Inventory: ACL Grants (2026-07-28)
 
@@ -562,9 +573,9 @@ The ACL representation is embedded in these storage-owned containing formats:
 | Canonical PG state | encoding version 4 | The three persisted ACL columns participate in canonical row and state digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry all three ACL columns and bind them into row, table, state, and checkpoint digests. |
 
-An incompatible ACL representation change requires an explicit new inner version and coordinated
-advancement of every containing format above. Current decoders have no old-version, prefix, or
-normalizing fallback.
+An incompatible ACL representation change is prohibited until the Phase 2 design gate chooses and
+records either a private inner version or deliberate coordinated advancement of every containing
+format above. Current decoders have no old-version, prefix, or normalizing fallback.
 
 ### Nested Durable Codec Inventory: Object Encryption State (2026-07-28)
 
@@ -616,7 +627,7 @@ but no version negotiation or supported compatibility window:
 | Surface | Current wire baseline | Authentication baseline | Negotiation and current disposition |
 | --- | --- | --- | --- |
 | Storage-node RPC | `STORAGE_RPC_FRAME_ENCODING_VERSION = 11` in `storage_rpc.rs`; frame magic, message-kind tags, checksums, and payload codecs are crate-private. | Binding version 2 and transport-envelope version 1 in `storage_rpc_auth.rs`. | Exact versions are required before dispatch. There is no negotiation. Treat any other version as incompatible until mixed-version operation is designed. |
-| Control-plane RPC | `CONTROL_PLANE_RPC_VERSION = 10` in `control_plane.rs`; the frame contains magic, version, request kind, length, checksum, and payload. Version 10 preserves the semantic authority-clock leadership-change failure across the wire without exposing arbitrary remote diagnostics. | Shared control-plane authentication-envelope version 1 in `control_plane_auth.rs`. | The frame and auth decoders reject non-current versions before logical dispatch. There is no negotiation. Treat any other version as incompatible. |
+| Control-plane RPC | `CONTROL_PLANE_RPC_VERSION = 12` in `control_plane.rs`; the frame contains magic, version, request kind, length, checksum, and payload. | Shared control-plane authentication-envelope version 1 in `control_plane_auth.rs`. | The frame and auth decoders reject non-current versions before logical dispatch. There is no negotiation. Treat any other version as incompatible. |
 | Raft peer RPC | `CONTROL_PLANE_RAFT_PEER_RPC_VERSION = 2` in `control_plane_raft.rs`; request, response, snapshot, peer-identity, checksum, and numeric OpenRaft tags share this baseline. | Shared control-plane authentication-envelope version 1, with the authenticated operation and peer identity bound to the inner frame. | The decoder rejects non-current versions before OpenRaft dispatch. There is no negotiation, and OpenRaft peers currently require the same binary. Treat any other version as incompatible. |
 
 These are ephemeral wire formats, so there is no in-place migration or authoritative rebuild
@@ -647,11 +658,14 @@ The public boundary and containment status for each surface are as follows.
   Raw-code mapping and redaction tests are storage-owned, caller policies use exhaustive matches
   over the semantic enum, and the repository boundary check prevents wire types, opaque
   diagnostic values, or their fields from being used outside storage.
-- `storage_rpc_transport` also publicly exposes the protocol ALPN and generic stream traits even
-  though no external production caller uses the stream traits. `argmin-s3` constructs Rustls
-  configurations with `argmin-storage-rpc/1` directly and tests the literal protocol profile.
-  Endpoint/listener configuration is a valid public input, but ALPN selection and validation are
-  protocol representation and must move behind storage-owned TLS endpoint constructors.
+- `storage_rpc_transport` still publicly exposes the protocol ALPN. `argmin-s3` uses it while
+  constructing raw Rustls client and server configurations with `argmin-storage-rpc/1`, then
+  passes those configurations into storage endpoints and listeners. Endpoint addresses, trust
+  roots, certificate identities, and listener bindings are valid public inputs; TLS version,
+  ALPN selection, and protocol-profile validation are storage RPC representation and must move
+  behind storage-owned TLS endpoint/listener constructors. The ALPN constant must then become
+  owner-private and the repository boundary check must reject both the constant and storage-RPC
+  Rustls profile construction outside `storage`.
 - Retry policy remains intentionally caller-owned while representation translation is
   storage-owned. `server-core` and `argmin-s3` make exhaustive decisions over
   `StorageNodeFailureClass`; storage-internal protocol handling alone may inspect wire codes or
@@ -807,6 +821,10 @@ Phase 1 exit criteria:
 - Boundary checks cover known high-risk leaks, while compiler visibility remains the primary
   enforcement mechanism.
 
+The storage-node TLS-profile item remains the only unsatisfied Phase 1 exit criterion. Phase 2
+may be inventoried in parallel, but implementation of new version boundaries does not begin until
+that containment item is complete.
+
 ## Phase 2: Baseline Version Markers
 
 After the inventory, ensure each format has a single explicit current baseline version.
@@ -827,6 +845,66 @@ Rules:
 
 This phase still does not implement upgrade steps. It only creates a clean baseline that a
 later upgrade framework can reason about.
+
+### Phase 2 Evidence Gate (2026-07-30)
+
+Phase 2 starts with an owner-by-owner evidence audit, not with speculative format changes. A row
+is `recorded` only when the plan identifies the private current marker, the current writer, the
+owner-side rejection point, and permanent tests for all applicable cases:
+
+1. the current writer always emits the current marker;
+2. missing, too-old, and too-new versions fail before dispatch, mutation, or publication;
+3. malformed magic and unsupported version are separate failures for magic-plus-version formats;
+4. exact current bytes or an equivalent sealed fixture pin the marker location and byte order;
+5. authenticated or checksummed formats have resealed unsupported-version fixtures, so a checksum
+   failure cannot accidentally stand in for version rejection; and
+6. a nested representation either carries its own private marker or has an explicit rule binding
+   every incompatible change to advancement of all containing formats.
+
+`Evidence required` means a marker exists in current code but the complete evidence above has not
+yet been consolidated in this matrix. `Design required` means the representation has no
+self-describing marker and its outer-version binding must be made explicit before deciding whether
+to add an inner frame. Neither status permits adding a fallback reader.
+
+| Boundary family | Owner | Current candidate baseline | Gate status |
+| --- | --- | --- | --- |
+| PG SQLite schema and physical layout | `storage` | `PRAGMA user_version = 1`; version zero is valid only with no user schema objects | Recorded |
+| Metadata commands and abandoned-command records | `storage` | command encoding 5; abandoned-command encoding 1 | Evidence required |
+| Metadata checkpoints and canonical state | `storage` | checkpoint encoding 1; canonical-state encoding 4 | Evidence required |
+| Storage-node RPC and authentication | `storage` | frame encoding 11; auth binding 2; auth transport envelope 1 | Blocked on the residual Phase 1 TLS-profile containment item, then evidence required |
+| Control-plane logical state, commands, and snapshots | `storage` | state 26; command 14; snapshot 1 | Evidence required |
+| Control-plane RPC and authentication | `storage` | RPC 12; shared authentication envelope 1 | Evidence required |
+| Single-authority control-plane durable artifacts | `storage` | clock checkpoint 2; state identity 1; initialized marker 1; journal file 2; journal record 2 | Evidence required |
+| Raft peer RPC and authentication | `storage` | peer RPC 2; shared authentication envelope 1 | Evidence required |
+| Raft restart, sentinel, and WAL artifacts | `storage` | restart 4; restart sentinel 1; WAL record 1; WAL file 2 | Evidence required |
+| Standalone route identity and initialization marker | `storage` | shared format version 1 with distinct magic values; initialization-marker parsing currently compares the complete expected byte string | Evidence required: separate marker magic/version rejection and add too-old/too-new marker fixtures |
+| User and system object metadata | `server-core` | user metadata 1; system metadata 1 | Recorded |
+| Checksum metadata embedded in SSE-C and SSE-S3 state | `server-core` | checksum metadata 1 | Evidence required |
+| Object encryption state | `storage` | SSE-C 3; SSE-S3 1, selected by a typed outer discriminator | Recorded |
+| Object-tag and bucket-tag canonical XML | `s3-types` | no independent marker; exact canonical XML is embedded in versioned storage formats | Design required: formalize outer-version binding or add a private inner frame |
+| ACL canonical string | `s3-types` | no independent marker; exact canonical string is embedded in versioned storage formats | Design required: formalize outer-version binding or add a private inner frame |
+| Static cluster manifest and static identities | `argmin-s3` | manifest schema 1; storage identity 1; control-plane identity 2 | Evidence required |
+| Temporary-credential session token | `auth` | `ARGST1` envelope / version 1 | Recorded |
+| Internal TLS protocol identifiers | `storage` | storage RPC, control-plane RPC, and Raft peer ALPN `/1` identifiers | Storage RPC is blocked on Phase 1 containment; the other two require evidence consolidation |
+
+The evidence audit proceeds in this bounded order:
+
+1. Close storage-node TLS-profile containment and make its ALPN identifier owner-private.
+2. Expand each `storage` family above to one line per independently changeable format, recording
+   its defining constant, writer, first rejecting reader, exact-current fixture, and unsupported
+   version fixtures.
+3. Do the same for the `server-core`, `argmin-s3`, and `auth` rows, without exposing private
+   constants or codecs to cross-crate tests.
+4. Decide the tag-XML and ACL-string strategy. If their containing formats are the version
+   boundary, record that as a deliberate invariant and require every incompatible canonical-codec
+   change to advance every listed container. Otherwise introduce a private framed carrier and
+   advance the current containing formats in the same slice.
+5. Implement only the gaps proven by the matrix, one owner and one coherent format family at a
+   time, updating the row to `Recorded` with its permanent test evidence.
+
+Phase 2 is complete only when every row is `Recorded`, no representation relies on an implicit
+version assumption, and the audit finds no older-version parser, default-version fallback, or
+mutation before version rejection.
 
 ## Phase 3: Future Upgrade Framework
 
@@ -940,9 +1018,10 @@ The storage-owned PG layout slice is complete:
 - Native-lock symlink and replacement tests are owned by `storage`; the boundary check rejects
   exposing the constant or literal filename to `argmin-s3`.
 
-The higher-layer control-plane error cleanup is complete. The RPC transports, their raw diagnostic
-payloads, raw Raft representations, and durable Raft restart/WAL formats are contained and
-boundary-checked. Residual containment work now starts with the nested durable codecs.
+The higher-layer control-plane error cleanup, control-plane and Raft transport containment, raw
+diagnostic and Raft representation containment, durable Raft restart/WAL containment, nested
+durable codecs, static route authority, and session-token ownership work are complete and
+boundary-checked. Storage-node TLS-profile construction remains the sole Phase 1 containment item.
 
 ## Immediate Next Steps
 
@@ -975,6 +1054,14 @@ Raft peer client and server transports are storage-owned and boundary-checked.
    2026-07-29 audit, including resealed enclosing checksums, digests, and authenticators.
 7. **Complete:** session-token version selection is contained inside `auth`, with semantic APIs
    and a boundary check rejecting external or public version-specific format surfaces.
-8. Remove the trigger-verification item from Phase 11 stabilisation tracking and keep this
-    plan as the upgrade home for it; defer trigger body hashing/recreation until the upgrade
-    framework is deliberately started.
+8. **Complete:** trigger SQL body verification is explicitly moved out of Phase 11 stabilisation
+   tracking and retained only in Phase 4 of this plan. Trigger hashing/recreation remains deferred
+   until the upgrade framework is deliberately started; it is not current-format recovery work.
+9. **Pending:** move storage-node TLS 1.3 and ALPN profile construction out of `argmin-s3` and
+   behind storage-owned endpoint/listener constructors. Process configuration supplies trust
+   roots, certificate identities, endpoint names, addresses, and bindings; `storage` supplies and
+   validates the protocol profile. Make `STORAGE_RPC_TLS_ALPN` owner-private and extend the
+   boundary check to prevent raw storage-RPC Rustls profile construction outside `storage`.
+
+After item 9 is complete, work proceeds through the Phase 2 evidence gate rather than reopening
+containment opportunistically.
