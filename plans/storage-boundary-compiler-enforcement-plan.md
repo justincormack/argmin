@@ -657,7 +657,7 @@ Node-client role classification (2026-07-19):
 | `ObjectReadMetadataNodeClient` | object metadata | active object route plus the existing subject identity/read lease |
 | `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active placed-shard I/O opens an exact route bound to one node, epoch, data PG, shard index, and shard key; shard acknowledgement, current-placement cleanup, and repair/backfill work open an active route bound to one epoch and data PG |
 | `RetainedPlacedShardNodeClient`, `RetainedShardAckNodeClient` | data | retained exact-placement inspection and cleanup for historical shard bytes and acknowledgement rows |
-| `ShardScavengerNodeClient` | data for shard rows/files and object-metadata reference scans | read-only inventory authority for the validated active or retained scan location |
+| `ShardScavengerNodeClient` | data for shard rows/files and object-metadata reference scans | node-wide history-reference reporting remains subject-free; PG scans open active routes bound to one epoch and exact data or object-metadata scan PG |
 | `ShardScavengerObservationNodeClient` | data PG for durable observation rows | opens an active primary-only route bound to one data PG; the returned interface records, lists, and resolves non-authoritative scavenger findings without accepting a replacement PG |
 | `ShardReadHandleNodeClient` | data locations carried in the handle request | opens a consumed route bound to one operation ID and an exact per-node batch of validated locations/keys; active/retained authority is inherited from each location and the resulting lease remains non-cloneable |
 | `ObjectPayloadLeaseNodeClient` | object subject rather than a caller-supplied PG | active subject-bound lease acquisition, reclaim-begin, and observation; placement is validated when shard locations are acquired |
@@ -4199,6 +4199,37 @@ One-hundred-and-fourth Phase 3 slice:
   admission-saturation, and multi-node rollback regressions. Formatting, the
   storage boundary checker, workspace-wide strict Clippy, and the full
   7,796-test workspace suite also pass.
+
+One-hundred-and-fifth Phase 3 slice:
+
+- shard-scavenger file/row inventory now opens a `ShardScavengerDataRoute`
+  bound to one active epoch and exact data PG. Object payload-reference
+  inventory separately opens a `ShardScavengerObjectScanRoute` bound to one
+  active epoch and exact object-metadata scan PG. Scan methods no longer accept
+  replacement PG arguments after route construction. The node-wide exact
+  history-reference report remains on the parent interface because it has no
+  caller-selected PG or operation subject.
+- embedded factories prove each captured PG exists before storage access, and
+  Unix factories reject an epoch differing from the installed client before
+  transport access. Private Unix encoding helpers remain behind the scoped
+  routes. Cluster scavenger audit, backfill discovery, and payload-ownership
+  checks continue to select nodes and role-specific PG IDs from the installed
+  topology before opening those routes.
+- storage-node file scans now construct an active, admission-domain-bound data
+  scan capability instead of validating only the raw route tuple. Row scans
+  use the existing active primary-data capability, while payload-reference
+  scans retain the active primary object-scan capability. All three recheck
+  the captured immutable route deadline immediately before node access.
+- embedded coverage exercises both correct-PG routes and rejects unavailable
+  data and object PGs before storage. A no-listener Unix regression rejects
+  future-epoch routes before RPC. Existing installed-Unix, role-validation,
+  primary-only, and file-list regressions exercise successful dispatch; the
+  active data capability regression now pins file/row scan admission-domain
+  rejection and expiry before node access.
+- all 2,470 storage tests pass, including the non-primary PG-mutex regression
+  proving shard-file inventory does not acquire the metadata-store lock.
+  Formatting, the storage boundary checker, workspace-wide strict Clippy, and
+  the full 7,801-test workspace suite also pass.
 
 ### Phase 4 — type metadata-command publication
 

@@ -898,18 +898,22 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
         ));
     }
     assert!(
-        ShardScavengerNodeClient::list_shard_scavenger_payload_references(
+        ShardScavengerNodeClient::open_shard_scavenger_object_scan_route(
             &client,
+            ClusterEpoch::INITIAL,
             installed_scan_pg,
         )
+        .and_then(|route| route.list_shard_scavenger_payload_references())
         .unwrap()
         .is_empty()
     );
     assert!(matches!(
-        ShardScavengerNodeClient::list_shard_scavenger_payload_references(
+        ShardScavengerNodeClient::open_shard_scavenger_object_scan_route(
             &client,
+            ClusterEpoch::INITIAL,
             unknown_scan_pg,
         )
+        .and_then(|route| route.list_shard_scavenger_payload_references())
         .unwrap_err(),
         StoreError::StorageRpc {
             failure: StorageRpcErrorCode::UnknownPg,

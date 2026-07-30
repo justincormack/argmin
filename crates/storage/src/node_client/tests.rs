@@ -485,6 +485,88 @@ fn unix_shard_read_handle_route_rejects_foreign_subject_before_rpc() {
 }
 
 #[test]
+fn local_shard_scavenger_routes_bind_exact_pgs() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), storage_node);
+    let data_pg = DataPgId::new_for_test(PgId::new(0));
+    assert!(client
+        .open_shard_scavenger_data_route(ClusterEpoch::INITIAL, data_pg)
+        .and_then(|route| route.list_scavenger_shard_files())
+        .unwrap()
+        .files
+        .is_empty());
+    let scan_pg = ObjectMetadataScanPgId::new_for_test(PgId::new(0));
+    assert!(client
+        .open_shard_scavenger_object_scan_route(ClusterEpoch::INITIAL, scan_pg)
+        .and_then(|route| route.list_shard_scavenger_payload_references())
+        .unwrap()
+        .is_empty());
+
+    assert!(matches!(
+        client
+            .open_shard_scavenger_data_route(
+                ClusterEpoch::INITIAL,
+                DataPgId::new_for_test(PgId::new(1)),
+            )
+            .err()
+            .expect("unknown scavenger data PG must fail before storage"),
+        StoreError::PgNotFound { pg_id: 1 }
+    ));
+    assert!(matches!(
+        client
+            .open_shard_scavenger_object_scan_route(
+                ClusterEpoch::INITIAL,
+                ObjectMetadataScanPgId::new_for_test(PgId::new(1)),
+            )
+            .err()
+            .expect("unknown scavenger object PG must fail before storage"),
+        StoreError::PgNotFound { pg_id: 1 }
+    ));
+}
+
+#[test]
+fn unix_shard_scavenger_routes_reject_foreign_epoch_before_rpc() {
+    let client = test_unix_storage_node_client();
+    let future_epoch = ClusterEpoch::new(client.cluster_epoch.get() + 1).unwrap();
+    assert!(matches!(
+        client
+            .open_shard_scavenger_data_route(
+                future_epoch,
+                DataPgId::new_for_test(PgId::new(0)),
+            )
+            .err()
+            .expect("future scavenger data route must fail before RPC"),
+        StoreError::StalePayloadOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        } if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
+    assert!(matches!(
+        client
+            .open_shard_scavenger_object_scan_route(
+                future_epoch,
+                ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+            )
+            .err()
+            .expect("future scavenger object route must fail before RPC"),
+        StoreError::StaleMetadataOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        } if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
+}
+
+#[test]
 fn local_retained_placed_shard_route_is_bound_to_exact_placement() {
     let tmp = test_util::tempdir();
     let storage_node = Arc::new(

@@ -3958,6 +3958,13 @@ struct StorageNodeActivePrimaryDataRoute<'a> {
     pg_id: DataPgId,
 }
 
+struct StorageNodeActiveDataScanRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    _route_permit: &'a StorageNodeRouteAdmissionPermit,
+    fence: StorageNodeRouteFence,
+    pg_id: DataPgId,
+}
+
 struct StorageNodeActiveObjectPayloadLeaseControl<'a> {
     handler: &'a StorageNodeConnectionHandler,
     route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -6441,8 +6448,38 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        ShardScavengerNodeClient::list_shard_scavenger_payload_references(&local_client, self.pg_id)
-            .map_err(StorageNodeObjectScanStoreError::Store)
+        ShardScavengerNodeClient::open_shard_scavenger_object_scan_route(
+            &local_client,
+            self.handler.config.cluster_epoch,
+            self.pg_id,
+        )
+        .and_then(|route| route.list_shard_scavenger_payload_references())
+        .map_err(StorageNodeObjectScanStoreError::Store)
+    }
+}
+
+impl StorageNodeActiveDataScanRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
+        self.fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )
+    }
+
+    fn list_shard_files(
+        &self,
+    ) -> Result<crate::node_runtime::pg_store::ScavengerShardFileScan, StorageNodeDataRouteError>
+    {
+        self.require_valid_now()
+            .map_err(StorageNodeDataRouteError::Route)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        local_client
+            .open_shard_scavenger_data_route(self.handler.config.cluster_epoch, self.pg_id)
+            .and_then(|route| route.list_scavenger_shard_files())
+            .map_err(StorageNodeDataRouteError::Store)
     }
 }
 
@@ -6752,6 +6789,22 @@ impl StorageNodeActivePrimaryDataRoute<'_> {
             crate::clock::current_time_millis(),
             crate::clock::monotonic_time_millis(),
         )
+    }
+
+    fn list_scavenger_shard_rows(
+        &self,
+    ) -> Result<Vec<crate::node_runtime::pg_store::ScavengerShardRow>, StorageNodeDataRouteError>
+    {
+        self.require_valid_now()
+            .map_err(StorageNodeDataRouteError::Route)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        local_client
+            .open_shard_scavenger_data_route(self.handler.config.cluster_epoch, self.pg_id)
+            .and_then(|route| route.list_scavenger_shard_rows())
+            .map_err(StorageNodeDataRouteError::Store)
     }
 
     fn record_shard_acks(
@@ -8344,7 +8397,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ShardScavengerListFiles => {
                 match decode_scavenger_list_files_request(&frame.payload) {
-                    Ok(request) => self.shard_scavenger_list_files_response(request),
+                    Ok(request) => self.shard_scavenger_list_files_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8353,7 +8406,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ShardScavengerShardRows => {
                 match decode_bucket_pg_request(&frame.payload) {
-                    Ok(request) => self.shard_scavenger_shard_rows_response(request),
+                    Ok(request) => self.shard_scavenger_shard_rows_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -12899,43 +12952,59 @@ impl StorageNodeConnectionHandler {
 
     fn shard_scavenger_list_files_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcScavengerListFilesRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.data_pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let data_pg_id = self.validated_data_pg(request.data_pg_id);
-        let response = match self.node.list_scavenger_shard_files(data_pg_id.get()) {
+        let route = match self.active_data_scan_route(
+            route_permit,
+            request.node_id,
+            request.cluster_epoch,
+            request.data_pg_id,
+            "shard scavenger list files",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let response = match route.list_shard_files() {
             Ok(scan) => {
                 let payload = encode_scavenger_list_files_response(&scan);
                 encode_storage_rpc_success_response(&payload)
             }
-            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+            Err(StorageNodeDataRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)?
+            }
+            Err(StorageNodeDataRouteError::Store(error)) => {
+                encode_storage_rpc_error_response(&store_error_response(error))?
+            }
         };
         Ok(response)
     }
 
     fn shard_scavenger_shard_rows_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketPgRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg(request.pg_id, "shard scavenger shard rows") {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let data_pg_id = self.validated_data_pg(request.pg_id);
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.list_scavenger_shard_rows(data_pg_id) {
+        let route = match self.active_primary_data_route(
+            route_permit,
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+            "shard scavenger shard rows",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.list_scavenger_shard_rows() {
             Ok(rows) => Ok(encode_storage_rpc_success_response(
                 &encode_scavenger_shard_rows_response(&rows),
             )),
-            Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
+            Err(StorageNodeDataRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeDataRouteError::Store(error)) => {
+                encode_storage_rpc_error_response(&store_error_response(error))
+            }
         }
     }
 
@@ -16829,6 +16898,29 @@ impl StorageNodeConnectionHandler {
             crate::clock::monotonic_time_millis(),
         )?;
         Ok(StorageNodeActivePrimaryDataRoute {
+            handler: self,
+            _route_permit: route_permit,
+            fence,
+            pg_id: self.validated_data_pg(pg_id),
+        })
+    }
+
+    fn active_data_scan_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        operation: &'static str,
+    ) -> Result<StorageNodeActiveDataScanRoute<'a>, StorageRpcErrorResponse> {
+        self.validate_active_admission(route_permit, operation)?;
+        self.validate_pg_route(node_id, cluster_epoch, pg_id)?;
+        let fence = StorageNodeRouteFence::current(&self.config, self.current_route_map_lease());
+        fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )?;
+        Ok(StorageNodeActiveDataScanRoute {
             handler: self,
             _route_permit: route_permit,
             fence,
@@ -28613,6 +28705,17 @@ mod tests {
                 )
                 .unwrap()
         });
+        let data_scan_route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_data_scan_route(
+                    &active_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    "test active shard scan",
+                )
+                .unwrap()
+        });
         crate::clock::with_time_override(1_000, || {
             shard_route
                 .write_if_absent(
@@ -28633,6 +28736,8 @@ mod tests {
                 .validate_shard_acks(std::slice::from_ref(&ack_item))
                 .unwrap();
             assert_eq!(ack_route.load_shard_ack(&shard_key).unwrap(), repaired_ack);
+            assert_eq!(data_scan_route.list_shard_files().unwrap().files.len(), 1);
+            assert_eq!(ack_route.list_scavenger_shard_rows().unwrap().len(), 1);
         });
 
         crate::clock::with_time_override(1_000, || {
@@ -28653,6 +28758,18 @@ mod tests {
                 match result {
                     Err(error) => assert_eq!(error.code, StorageRpcErrorCode::Internal),
                     Ok(_) => panic!("invalid admission created an active shard capability"),
+                }
+            }
+            for permit in [&retained_permit, &foreign_permit] {
+                match handler.active_data_scan_route(
+                    permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    "test active shard scan",
+                ) {
+                    Err(error) => assert_eq!(error.code, StorageRpcErrorCode::Internal),
+                    Ok(_) => panic!("invalid admission created an active data-scan capability"),
                 }
             }
             let mismatched_location = test_location_with_shard(1, 0, 7, 1);
@@ -28720,6 +28837,8 @@ mod tests {
             }]));
             assert_expired(ack_route.validate_shard_acks(std::slice::from_ref(&ack_item)));
             assert_expired(ack_route.load_shard_ack(&shard_key));
+            assert_expired(ack_route.list_scavenger_shard_rows());
+            assert_expired(data_scan_route.list_shard_files());
         });
         assert_eq!(
             server._node.read_shard_file(0, &shard_key).unwrap(),

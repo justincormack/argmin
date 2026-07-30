@@ -56,6 +56,18 @@ struct LocalShardAckRoute {
     data_pg_id: DataPgId,
 }
 
+struct LocalShardScavengerDataRoute {
+    storage_node: Arc<SharedStorageNode>,
+    _route_cluster_epoch: ClusterEpoch,
+    data_pg_id: DataPgId,
+}
+
+struct LocalShardScavengerObjectScanRoute {
+    storage_node: Arc<SharedStorageNode>,
+    _route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataScanPgId,
+}
+
 impl ObjectPayloadLeaseNodeLease for LocalObjectPayloadLease {
     fn release(&mut self) -> Result<usize, StoreError> {
         if self.released {
@@ -764,27 +776,51 @@ impl ShardScavengerNodeClient for LocalStorageNodeClient {
         self.storage_node.cluster_map_history_route_references()
     }
 
-    fn list_scavenger_shard_files(
+    fn open_shard_scavenger_data_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
-    ) -> Result<ScavengerShardFileScan, StoreError> {
+    ) -> Result<Box<dyn ShardScavengerDataRoute + '_>, StoreError> {
+        self.storage_node.require_open_pg(data_pg_id.get())?;
+        Ok(Box::new(LocalShardScavengerDataRoute {
+            storage_node: Arc::clone(&self.storage_node),
+            _route_cluster_epoch: route_cluster_epoch,
+            data_pg_id,
+        }))
+    }
+
+    fn open_shard_scavenger_object_scan_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataScanPgId,
+    ) -> Result<Box<dyn ShardScavengerObjectScanRoute + '_>, StoreError> {
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalShardScavengerObjectScanRoute {
+            storage_node: Arc::clone(&self.storage_node),
+            _route_cluster_epoch: route_cluster_epoch,
+            pg_id,
+        }))
+    }
+}
+
+impl ShardScavengerDataRoute for LocalShardScavengerDataRoute {
+    fn list_scavenger_shard_files(&self) -> Result<ScavengerShardFileScan, StoreError> {
         self.storage_node
-            .list_scavenger_shard_files(data_pg_id.get())
+            .list_scavenger_shard_files(self.data_pg_id.get())
     }
 
-    fn list_scavenger_shard_rows(
-        &self,
-        data_pg_id: DataPgId,
-    ) -> Result<Vec<ScavengerShardRow>, StoreError> {
-        let pg = self.storage_node.get_pg(data_pg_id.get())?;
-        pg.list_scavenger_shard_rows()
+    fn list_scavenger_shard_rows(&self) -> Result<Vec<ScavengerShardRow>, StoreError> {
+        self.storage_node
+            .get_pg(self.data_pg_id.get())?
+            .list_scavenger_shard_rows()
     }
+}
 
+impl ShardScavengerObjectScanRoute for LocalShardScavengerObjectScanRoute {
     fn list_shard_scavenger_payload_references(
         &self,
-        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg(self.pg_id.get())?;
         pg.list_shard_scavenger_payload_references()
     }
 }

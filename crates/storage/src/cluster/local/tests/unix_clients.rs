@@ -1541,7 +1541,8 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
         .node(NodeId::new(1))
         .unwrap()
         .shard_scavenger_client()
-        .list_scavenger_shard_files(data_pg_id)
+        .open_shard_scavenger_data_route(ClusterEpoch::INITIAL, data_pg_id)
+        .and_then(|route| route.list_scavenger_shard_files())
         .unwrap();
     assert_eq!(scan.files.len(), 1);
     assert_eq!(scan.files[0].key, key);
@@ -1559,7 +1560,8 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
         .node(NodeId::new(1))
         .unwrap()
         .shard_scavenger_client()
-        .list_scavenger_shard_rows(data_pg_id)
+        .open_shard_scavenger_data_route(ClusterEpoch::INITIAL, data_pg_id)
+        .and_then(|route| route.list_scavenger_shard_rows())
         .unwrap();
     assert_eq!(remote_rows.len(), 1);
     assert_eq!(remote_rows[0].key, key);

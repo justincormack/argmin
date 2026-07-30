@@ -1262,19 +1262,28 @@ pub(crate) trait ShardScavengerNodeClient: Send + Sync {
         &self,
     ) -> Result<crate::PgClusterMapHistoryRouteReferences, StoreError>;
 
-    fn list_scavenger_shard_files(
+    fn open_shard_scavenger_data_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
-    ) -> Result<ScavengerShardFileScan, StoreError>;
+    ) -> Result<Box<dyn ShardScavengerDataRoute + '_>, StoreError>;
 
-    fn list_scavenger_shard_rows(
+    fn open_shard_scavenger_object_scan_route(
         &self,
-        data_pg_id: DataPgId,
-    ) -> Result<Vec<ScavengerShardRow>, StoreError>;
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataScanPgId,
+    ) -> Result<Box<dyn ShardScavengerObjectScanRoute + '_>, StoreError>;
+}
 
+pub(crate) trait ShardScavengerDataRoute: Send {
+    fn list_scavenger_shard_files(&self) -> Result<ScavengerShardFileScan, StoreError>;
+
+    fn list_scavenger_shard_rows(&self) -> Result<Vec<ScavengerShardRow>, StoreError>;
+}
+
+pub(crate) trait ShardScavengerObjectScanRoute: Send {
     fn list_shard_scavenger_payload_references(
         &self,
-        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError>;
 }
 

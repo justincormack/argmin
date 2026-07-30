@@ -1424,6 +1424,16 @@ impl SharedStorageNode {
         Ok(mutex.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// Require that this node has an opened store for the PG without taking
+    /// the store mutex.
+    pub(crate) fn require_open_pg(&self, pg_id: u32) -> Result<(), StoreError> {
+        if self.stores.contains_key(&pg_id) {
+            Ok(())
+        } else {
+            Err(StoreError::PgNotFound { pg_id })
+        }
+    }
+
     pub fn pg_heartbeat_observation(
         &self,
         node_id: NodeId,

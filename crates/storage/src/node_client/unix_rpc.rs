@@ -26,6 +26,16 @@ struct UnixShardAckRoute<'a> {
     data_pg_id: DataPgId,
 }
 
+struct UnixShardScavengerDataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    data_pg_id: DataPgId,
+}
+
+struct UnixShardScavengerObjectScanRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    pg_id: ObjectMetadataScanPgId,
+}
+
 impl UnixStorageNodeClient {
     fn write_placed_shard(
         &self,
@@ -297,7 +307,7 @@ impl UnixStorageNodeClient {
         }
     }
 
-    pub(crate) fn list_scavenger_shard_files(
+    fn list_scavenger_shard_files(
         &self,
         data_pg_id: DataPgId,
     ) -> Result<ScavengerShardFileScan, StoreError> {
@@ -316,7 +326,7 @@ impl UnixStorageNodeClient {
         })
     }
 
-    pub(crate) fn list_scavenger_shard_rows(
+    fn list_scavenger_shard_rows(
         &self,
         data_pg_id: DataPgId,
     ) -> Result<Vec<ScavengerShardRow>, StoreError> {
@@ -336,7 +346,7 @@ impl UnixStorageNodeClient {
         })
     }
 
-    pub(crate) fn list_shard_scavenger_payload_references(
+    fn list_shard_scavenger_payload_references(
         &self,
         pg_id: ObjectMetadataScanPgId,
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
@@ -1481,25 +1491,58 @@ impl ShardScavengerNodeClient for UnixStorageNodeClient {
         UnixStorageNodeClient::cluster_map_history_route_references(self)
     }
 
-    fn list_scavenger_shard_files(
+    fn open_shard_scavenger_data_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
-    ) -> Result<ScavengerShardFileScan, StoreError> {
-        UnixStorageNodeClient::list_scavenger_shard_files(self, data_pg_id)
+    ) -> Result<Box<dyn ShardScavengerDataRoute + '_>, StoreError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: data_pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        Ok(Box::new(UnixShardScavengerDataRoute {
+            client: self,
+            data_pg_id,
+        }))
     }
 
-    fn list_scavenger_shard_rows(
+    fn open_shard_scavenger_object_scan_route(
         &self,
-        data_pg_id: DataPgId,
-    ) -> Result<Vec<ScavengerShardRow>, StoreError> {
-        UnixStorageNodeClient::list_scavenger_shard_rows(self, data_pg_id)
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataScanPgId,
+    ) -> Result<Box<dyn ShardScavengerObjectScanRoute + '_>, StoreError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        Ok(Box::new(UnixShardScavengerObjectScanRoute {
+            client: self,
+            pg_id,
+        }))
+    }
+}
+
+impl ShardScavengerDataRoute for UnixShardScavengerDataRoute<'_> {
+    fn list_scavenger_shard_files(&self) -> Result<ScavengerShardFileScan, StoreError> {
+        UnixStorageNodeClient::list_scavenger_shard_files(self.client, self.data_pg_id)
     }
 
+    fn list_scavenger_shard_rows(&self) -> Result<Vec<ScavengerShardRow>, StoreError> {
+        UnixStorageNodeClient::list_scavenger_shard_rows(self.client, self.data_pg_id)
+    }
+}
+
+impl ShardScavengerObjectScanRoute for UnixShardScavengerObjectScanRoute<'_> {
     fn list_shard_scavenger_payload_references(
         &self,
-        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
-        UnixStorageNodeClient::list_shard_scavenger_payload_references(self, pg_id)
+        UnixStorageNodeClient::list_shard_scavenger_payload_references(self.client, self.pg_id)
     }
 }
 

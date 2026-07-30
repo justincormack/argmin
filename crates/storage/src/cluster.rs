@@ -14773,7 +14773,9 @@ impl StorageCluster {
             let observation_route = primary_node
                 .shard_scavenger_observation_client()
                 .open_shard_scavenger_observation_route(data_pg)?;
-            let shard_rows = scavenger_client.list_scavenger_shard_rows(data_pg)?;
+            let shard_rows = scavenger_client
+                .open_shard_scavenger_data_route(self.operation_epoch(), data_pg)?
+                .list_scavenger_shard_rows()?;
             let rows_by_key: HashMap<ShardKey, WriteAck> = shard_rows
                 .iter()
                 .map(|row| (row.key.clone(), row.ack))
@@ -14787,7 +14789,8 @@ impl StorageCluster {
                 };
                 match node
                     .shard_scavenger_client()
-                    .list_scavenger_shard_files(data_pg)
+                    .open_shard_scavenger_data_route(self.operation_epoch(), data_pg)
+                    .and_then(|route| route.list_scavenger_shard_files())
                 {
                     Ok(scan) if scan.errors.is_empty() => {
                         files_by_node.push((node_id.as_u32(), scan.files));
@@ -15003,7 +15006,8 @@ impl StorageCluster {
             let scan_pg_id = self.object_metadata_scan_pg(route.pg_id());
             for reference in node
                 .shard_scavenger_client()
-                .list_shard_scavenger_payload_references(scan_pg_id)?
+                .open_shard_scavenger_object_scan_route(self.operation_epoch(), scan_pg_id)?
+                .list_shard_scavenger_payload_references()?
             {
                 match reference {
                     ShardScavengerPayloadReference::Placed(reference) => {
@@ -15641,9 +15645,12 @@ impl StorageCluster {
             };
             let references = match node
                 .shard_scavenger_client()
-                .list_shard_scavenger_payload_references(
+                .open_shard_scavenger_object_scan_route(
+                    self.operation_epoch(),
                     self.object_metadata_scan_pg(route.pg_id()),
-                ) {
+                )
+                .and_then(|route| route.list_shard_scavenger_payload_references())
+            {
                 Ok(references) => references,
                 Err(error) if shard_backfill_candidate_error_is_deferred(&error) => {
                     summary.deferred += 1;
@@ -15831,9 +15838,11 @@ impl StorageCluster {
                 .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())?;
             let references = node
                 .shard_scavenger_client()
-                .list_shard_scavenger_payload_references(
+                .open_shard_scavenger_object_scan_route(
+                    self.operation_epoch(),
                     self.object_metadata_scan_pg(route.pg_id()),
-                )?;
+                )?
+                .list_shard_scavenger_payload_references()?;
             if references.iter().any(|reference| {
                 let ShardScavengerPayloadReference::Placed(reference) = reference else {
                     return false;
@@ -17690,7 +17699,8 @@ impl StorageCluster {
                 let scan_pg_id = self.object_metadata_scan_pg(object_pg_id);
                 let references = node
                     .shard_scavenger_client()
-                    .list_shard_scavenger_payload_references(scan_pg_id)?;
+                    .open_shard_scavenger_object_scan_route(self.operation_epoch(), scan_pg_id)?
+                    .list_shard_scavenger_payload_references()?;
                 if references.iter().any(|reference| {
                     self.shard_scavenger_reference_matches_stream_segment(reference, segment)
                 }) {
