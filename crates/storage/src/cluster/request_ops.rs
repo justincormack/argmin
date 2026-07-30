@@ -9074,12 +9074,13 @@ impl super::StorageCluster {
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_read_metadata_client();
         require_valid_route()?;
-        let subject = object_read_client.load_object_read_auth_subject(
+        let object_read_route = object_read_client.open_object_read_metadata_route(
+            self.operation_epoch(),
             route.pg_id,
             route.bucket,
             route.key,
-            route.version_id,
         )?;
+        let subject = object_read_route.load_object_read_auth_subject(route.version_id)?;
         Ok(action(&subject.stored))
     }
 
@@ -9090,12 +9091,17 @@ impl super::StorageCluster {
     ) -> Result<Option<StoredObject>, ObjectPgActionError> {
         let object_pg_id = self.object_metadata_pg(bucket, key);
         let pg_id = object_pg_id.pg_id();
-        match self
+        let object_read_client = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_read_metadata_client()
-            .load_object_read_auth_subject(object_pg_id, bucket, key, None)
-        {
+            .object_read_metadata_client();
+        let object_read_route = object_read_client.open_object_read_metadata_route(
+            self.operation_epoch(),
+            object_pg_id,
+            bucket,
+            key,
+        )?;
+        match object_read_route.load_object_read_auth_subject(None) {
             Ok(subject) => match subject.stored {
                 StoredObject::Live(_) => Ok(Some(subject.stored)),
                 StoredObject::DeleteMarker(_) => Ok(None),
@@ -9135,6 +9141,12 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_read_metadata_client();
+        let object_read_route = object_read_client.open_object_read_metadata_route(
+            self.operation_epoch(),
+            route.pg_id,
+            route.bucket,
+            route.key,
+        )?;
 
         let mut work_budget =
             super::RequestWorkBudget::new(OBJECT_READ_SNAPSHOT_STALE_RETRY_BUDGET, None)
@@ -9145,21 +9157,13 @@ impl super::StorageCluster {
                 .check("load object read snapshot stale retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
             require_valid_route()?;
-            let subject = object_read_client.load_object_read_auth_subject(
-                route.pg_id,
-                route.bucket,
-                route.key,
-                route.version_id,
-            )?;
+            let subject = object_read_route.load_object_read_auth_subject(route.version_id)?;
             let value = match action(&subject.stored) {
                 Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
             };
             require_valid_route()?;
-            match object_read_client.load_object_read_snapshot_for_subject(
-                route.pg_id,
-                route.bucket,
-                route.key,
+            match object_read_route.load_object_read_snapshot_for_subject(
                 route.version_id,
                 &subject.identity,
                 route.snapshot_mode,
@@ -9209,6 +9213,12 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_read_metadata_client();
+        let object_read_route = object_read_client.open_object_read_metadata_route(
+            self.operation_epoch(),
+            object_pg_id,
+            route.bucket,
+            route.key,
+        )?;
 
         let mut work_budget =
             super::RequestWorkBudget::new(OBJECT_READ_SNAPSHOT_STALE_RETRY_BUDGET, None)
@@ -9219,12 +9229,7 @@ impl super::StorageCluster {
                 .check("load leased object read snapshot stale retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
             require_valid_route()?;
-            let subject = object_read_client.load_object_read_auth_subject(
-                object_pg_id,
-                route.bucket,
-                route.key,
-                route.version_id,
-            )?;
+            let subject = object_read_route.load_object_read_auth_subject(route.version_id)?;
             let value = match action(&subject.stored) {
                 Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
@@ -9248,10 +9253,7 @@ impl super::StorageCluster {
                 None
             };
             require_valid_route()?;
-            match object_read_client.load_object_read_snapshot_for_subject(
-                object_pg_id,
-                route.bucket,
-                route.key,
+            match object_read_route.load_object_read_snapshot_for_subject(
                 route.version_id,
                 &subject.identity,
                 route.snapshot_mode,
@@ -9313,6 +9315,12 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_read_metadata_client();
+        let object_read_route = object_read_client.open_object_read_metadata_route(
+            self.operation_epoch(),
+            object_pg_id,
+            bucket,
+            key,
+        )?;
 
         let mut work_budget =
             super::RequestWorkBudget::new(OBJECT_READ_SNAPSHOT_STALE_RETRY_BUDGET, None)
@@ -9322,20 +9330,12 @@ impl super::StorageCluster {
             work_budget
                 .check("get object tags stale retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
-            let subject = object_read_client.load_object_read_auth_subject(
-                object_pg_id,
-                bucket,
-                key,
-                version_id,
-            )?;
+            let subject = object_read_route.load_object_read_auth_subject(version_id)?;
             let authorized_version_id = match action(&subject.stored) {
                 Ok(authorized_version_id) => authorized_version_id,
                 Err(error) => return Ok(Err(error)),
             };
-            match object_read_client.get_object_tags_for_subject(
-                object_pg_id,
-                bucket,
-                key,
+            match object_read_route.get_object_tags_for_subject(
                 version_id,
                 &subject.identity,
                 authorized_version_id,
@@ -9694,11 +9694,17 @@ impl super::StorageCluster {
     ) -> Result<Result<Option<LegalHoldStatus>, E>, ObjectPgActionError> {
         let object_pg_id = self.object_metadata_pg(bucket, key);
         let pg_id = object_pg_id.pg_id();
-        let subject = self
+        let object_read_client = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_read_metadata_client()
-            .load_object_read_auth_subject(object_pg_id, bucket, key, version_id)?;
+            .object_read_metadata_client();
+        let object_read_route = object_read_client.open_object_read_metadata_route(
+            self.operation_epoch(),
+            object_pg_id,
+            bucket,
+            key,
+        )?;
+        let subject = object_read_route.load_object_read_auth_subject(version_id)?;
         Ok(action(&subject.stored))
     }
 
@@ -9711,11 +9717,17 @@ impl super::StorageCluster {
     ) -> Result<Result<Option<ObjectRetention>, E>, ObjectPgActionError> {
         let object_pg_id = self.object_metadata_pg(bucket, key);
         let pg_id = object_pg_id.pg_id();
-        let subject = self
+        let object_read_client = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_read_metadata_client()
-            .load_object_read_auth_subject(object_pg_id, bucket, key, version_id)?;
+            .object_read_metadata_client();
+        let object_read_route = object_read_client.open_object_read_metadata_route(
+            self.operation_epoch(),
+            object_pg_id,
+            bucket,
+            key,
+        )?;
+        let subject = object_read_route.load_object_read_auth_subject(version_id)?;
         Ok(action(&subject.stored))
     }
 

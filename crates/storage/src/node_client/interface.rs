@@ -830,19 +830,23 @@ pub(crate) trait RetainedObjectMutationMetadataRoute: Send {
 }
 
 pub(crate) trait ObjectReadMetadataNodeClient: Send + Sync {
-    fn load_object_read_auth_subject(
+    fn open_object_read_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
+    ) -> Result<Box<dyn ObjectReadMetadataRoute + '_>, ObjectPgActionError>;
+}
+
+pub(crate) trait ObjectReadMetadataRoute: Send {
+    fn load_object_read_auth_subject(
+        &self,
         version_id: Option<VersionId>,
     ) -> Result<ObjectReadAuthSubject, ObjectPgActionError>;
 
     fn load_object_read_snapshot_for_subject(
         &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
         version_id: Option<VersionId>,
         expected_identity: &ObjectReadAuthSubjectIdentity,
         snapshot_mode: ObjectReadSnapshotMode,
@@ -850,9 +854,6 @@ pub(crate) trait ObjectReadMetadataNodeClient: Send + Sync {
 
     fn get_object_tags_for_subject(
         &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
         version_id: Option<VersionId>,
         expected_identity: &ObjectReadAuthSubjectIdentity,
         authorized_version_id: VersionId,

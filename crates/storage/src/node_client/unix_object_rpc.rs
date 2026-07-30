@@ -1,5 +1,12 @@
 use super::*;
 
+struct UnixObjectReadMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
 impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
     fn list_objects_page(
         &self,
@@ -3699,7 +3706,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
     }
 }
 
-impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
+impl UnixStorageNodeClient {
     fn load_object_read_auth_subject(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -3824,5 +3831,72 @@ impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
                 Err(ObjectPgActionError::StaleObjectReadSubject)
             }
         }
+    }
+}
+
+impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
+    fn open_object_read_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn ObjectReadMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixObjectReadMetadataRoute {
+            client: self,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
+    }
+}
+
+impl ObjectReadMetadataRoute for UnixObjectReadMetadataRoute<'_> {
+    fn load_object_read_auth_subject(
+        &self,
+        version_id: Option<VersionId>,
+    ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
+        self.client
+            .load_object_read_auth_subject(self.pg_id, &self.bucket, &self.key, version_id)
+    }
+
+    fn load_object_read_snapshot_for_subject(
+        &self,
+        version_id: Option<VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        snapshot_mode: ObjectReadSnapshotMode,
+    ) -> Result<ObjectReadSnapshot, ObjectPgActionError> {
+        self.client.load_object_read_snapshot_for_subject(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            version_id,
+            expected_identity,
+            snapshot_mode,
+        )
+    }
+
+    fn get_object_tags_for_subject(
+        &self,
+        version_id: Option<VersionId>,
+        expected_identity: &ObjectReadAuthSubjectIdentity,
+        authorized_version_id: VersionId,
+    ) -> Result<Option<crate::SerializedTagSet>, ObjectPgActionError> {
+        self.client.get_object_tags_for_subject(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            version_id,
+            expected_identity,
+            authorized_version_id,
+        )
     }
 }

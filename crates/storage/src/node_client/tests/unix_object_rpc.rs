@@ -1177,22 +1177,28 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         reserved_generation
     );
 
-    let read_subject = ObjectReadMetadataNodeClient::load_object_read_auth_subject(
+    let correct_read_route = ObjectReadMetadataNodeClient::open_object_read_metadata_route(
         &client,
+        ClusterEpoch::INITIAL,
         correct_object_pg,
         &bucket,
         &key,
-        None,
     )
     .unwrap();
-    let read_subject_error = ObjectReadMetadataNodeClient::load_object_read_auth_subject(
+    let read_subject = correct_read_route
+        .load_object_read_auth_subject(None)
+        .unwrap();
+    let wrong_read_route = ObjectReadMetadataNodeClient::open_object_read_metadata_route(
         &client,
+        ClusterEpoch::INITIAL,
         wrong_object_pg,
         &bucket,
         &key,
-        None,
     )
-    .unwrap_err();
+    .unwrap();
+    let read_subject_error = wrong_read_route
+        .load_object_read_auth_subject(None)
+        .unwrap_err();
     assert!(matches!(
         read_subject_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
@@ -1201,16 +1207,13 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         })
     ));
 
-    let read_snapshot_error = ObjectReadMetadataNodeClient::load_object_read_snapshot_for_subject(
-        &client,
-        wrong_object_pg,
-        &bucket,
-        &key,
-        None,
-        &read_subject.identity,
-        ObjectReadSnapshotMode::StandardSegments,
-    )
-    .unwrap_err();
+    let read_snapshot_error = wrong_read_route
+        .load_object_read_snapshot_for_subject(
+            None,
+            &read_subject.identity,
+            ObjectReadSnapshotMode::StandardSegments,
+        )
+        .unwrap_err();
     assert!(matches!(
         read_snapshot_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
@@ -1219,16 +1222,9 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         })
     ));
 
-    let read_tags_error = ObjectReadMetadataNodeClient::get_object_tags_for_subject(
-        &client,
-        wrong_object_pg,
-        &bucket,
-        &key,
-        None,
-        &read_subject.identity,
-        VersionId::Null,
-    )
-    .unwrap_err();
+    let read_tags_error = wrong_read_route
+        .get_object_tags_for_subject(None, &read_subject.identity, VersionId::Null)
+        .unwrap_err();
     assert!(matches!(
         read_tags_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
@@ -2971,42 +2967,33 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
         config.socket_path.clone(),
     );
 
-    let subject = ObjectReadMetadataNodeClient::load_object_read_auth_subject(
+    let read_route = ObjectReadMetadataNodeClient::open_object_read_metadata_route(
         &client,
+        ClusterEpoch::INITIAL,
         ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
-        None,
     )
     .unwrap();
+    let subject = read_route.load_object_read_auth_subject(None).unwrap();
     assert_eq!(subject.stored.bucket(), &bucket);
     assert_eq!(subject.stored.key(), &key);
 
-    let snapshot = ObjectReadMetadataNodeClient::load_object_read_snapshot_for_subject(
-        &client,
-        ObjectMetadataPgId::new_for_test(PgId::new(0)),
-        &bucket,
-        &key,
-        None,
-        &subject.identity,
-        ObjectReadSnapshotMode::StandardSegments,
-    )
-    .unwrap();
+    let snapshot = read_route
+        .load_object_read_snapshot_for_subject(
+            None,
+            &subject.identity,
+            ObjectReadSnapshotMode::StandardSegments,
+        )
+        .unwrap();
     assert_eq!(snapshot.stored, subject.stored);
     assert_eq!(snapshot.object_segments, vec![segment]);
     assert!(snapshot.multipart_parts.is_empty());
     assert!(snapshot.multipart_part_segments.is_empty());
 
-    let tags = ObjectReadMetadataNodeClient::get_object_tags_for_subject(
-        &client,
-        ObjectMetadataPgId::new_for_test(PgId::new(0)),
-        &bucket,
-        &key,
-        None,
-        &subject.identity,
-        VersionId::Null,
-    )
-    .unwrap();
+    let tags = read_route
+        .get_object_tags_for_subject(None, &subject.identity, VersionId::Null)
+        .unwrap();
     let expected_tags = crate::tests::object_tags(
         "<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>",
     );

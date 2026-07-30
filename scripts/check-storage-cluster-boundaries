@@ -931,7 +931,8 @@ migrated_simple_object_read_bypasses=$(
         if ($0 ~ /\.(load_object_read_auth_subject|load_object_read_snapshot_for_subject|get_object_tags_for_subject)\(/) {
             if (pending_object_read_metadata_client \
                 || $0 ~ /\.object_read_metadata_client\(\)/ \
-                || $0 ~ /object_read_client\./) {
+                || $0 ~ /object_read_client\./ \
+                || $0 ~ /object_read_route\./) {
                 pending_object_read_metadata_client = 0
                 next
             }

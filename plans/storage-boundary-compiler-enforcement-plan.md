@@ -654,7 +654,7 @@ Node-client role classification (2026-07-19):
 | `ObjectListingMetadataNodeClient` | object metadata scan | active object-metadata route for the scanned PG; listing fan-out constructs one capability per routed PG |
 | `ObjectMutationMetadataNodeClient` | object metadata | active object route for object, multipart, stream-session, and payload-reclaim mutation |
 | `RetainedObjectMutationMetadataNodeClient` | object metadata | opens a retained route bound to one epoch, object-metadata PG, bucket, and key; the returned interface prepares stream aborts and releases payload-reclaim claims without accepting replacement route or object arguments |
-| `ObjectReadMetadataNodeClient` | object metadata | active object route plus the existing subject identity/read lease |
+| `ObjectReadMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; version selection and subject-identity validation remain operations within that fixed route, with payload reads separately retaining their read lease |
 | `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active placed-shard I/O opens an exact route bound to one node, epoch, data PG, shard index, and shard key; shard acknowledgement, current-placement cleanup, and repair/backfill work open an active route bound to one epoch and data PG |
 | `RetainedPlacedShardNodeClient`, `RetainedShardAckNodeClient` | data | retained exact-placement inspection and cleanup for historical shard bytes and acknowledgement rows |
 | `ShardScavengerNodeClient` | data for shard rows/files and object-metadata reference scans | node-wide history-reference reporting remains subject-free; PG scans open active routes bound to one epoch and exact data or object-metadata scan PG |
@@ -4230,6 +4230,33 @@ One-hundred-and-fifth Phase 3 slice:
   proving shard-file inventory does not acquire the metadata-store lock.
   Formatting, the storage boundary checker, workspace-wide strict Clippy, and
   the full 7,801-test workspace suite also pass.
+
+One-hundred-and-sixth Phase 3 slice:
+
+- object-read metadata access now opens an `ObjectReadMetadataRoute` bound to
+  one active cluster epoch, exact object-metadata PG, bucket, and key. Loading
+  the authorization subject, loading its identity-checked snapshot, and
+  reading its identity-checked tags no longer accept replacement placement or
+  object arguments after route construction. Version selection remains an
+  operation within the fixed object route because one request may retry the
+  same selected version after an identity conflict.
+- embedded construction validates the PG against the installed topology's
+  placement for the exact bucket/key and proves the PG store is open before
+  access. Unix construction rejects an epoch differing from its installed
+  client before transport access and keeps the raw RPC helpers private behind
+  the scoped route. Storage-node dispatch retains its independent active
+  admission-domain, route, placement, primary, and captured-deadline checks
+  before constructing the embedded route.
+- cluster authorization/snapshot/tag retry loops open the route once and can
+  vary only the version and expected durable identity. Local coverage rejects
+  a configured but crossed object PG before storage; a no-listener Unix
+  regression rejects a future epoch before RPC. Existing installed-Unix
+  correct/wrong-PG tests exercise all three operations through the route, and
+  the storage-node active-object regression continues to pin immutable
+  deadline enforcement before node access.
+- all 2,472 storage tests pass. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full 7,803-test workspace suite also
+  pass.
 
 ### Phase 4 — type metadata-command publication
 

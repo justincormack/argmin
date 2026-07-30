@@ -68,6 +68,14 @@ struct LocalShardScavengerObjectScanRoute {
     pg_id: ObjectMetadataScanPgId,
 }
 
+struct LocalObjectReadMetadataRoute {
+    storage_node: Arc<SharedStorageNode>,
+    _route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
 impl ObjectPayloadLeaseNodeLease for LocalObjectPayloadLease {
     fn release(&mut self) -> Result<usize, StoreError> {
         if self.released {
@@ -2634,33 +2642,55 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 }
 
 impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
-    fn load_object_read_auth_subject(
+    fn open_object_read_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
+    ) -> Result<Box<dyn ObjectReadMetadataRoute + '_>, ObjectPgActionError> {
+        if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open object read metadata route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalObjectReadMetadataRoute {
+            storage_node: Arc::clone(&self.storage_node),
+            _route_cluster_epoch: route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
+    }
+}
+
+impl ObjectReadMetadataRoute for LocalObjectReadMetadataRoute {
+    fn load_object_read_auth_subject(
+        &self,
         version_id: Option<VersionId>,
     ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg(self.pg_id.get())?;
         SharedStorageNode::load_object_read_auth_subject_from_object_pg(
-            &pg, bucket, key, version_id,
+            &pg,
+            &self.bucket,
+            &self.key,
+            version_id,
         )
     }
 
     fn load_object_read_snapshot_for_subject(
         &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
         version_id: Option<VersionId>,
         expected_identity: &ObjectReadAuthSubjectIdentity,
         snapshot_mode: ObjectReadSnapshotMode,
     ) -> Result<ObjectReadSnapshot, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg(self.pg_id.get())?;
         SharedStorageNode::load_object_read_snapshot_for_subject_from_object_pg(
             &pg,
-            bucket,
-            key,
+            &self.bucket,
+            &self.key,
             version_id,
             expected_identity,
             snapshot_mode,
@@ -2669,18 +2699,15 @@ impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
 
     fn get_object_tags_for_subject(
         &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
         version_id: Option<VersionId>,
         expected_identity: &ObjectReadAuthSubjectIdentity,
         authorized_version_id: VersionId,
     ) -> Result<Option<crate::SerializedTagSet>, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg(self.pg_id.get())?;
         SharedStorageNode::get_object_tags_for_subject_from_object_pg(
             &pg,
-            bucket,
-            key,
+            &self.bucket,
+            &self.key,
             version_id,
             expected_identity,
             authorized_version_id,

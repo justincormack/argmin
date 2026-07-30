@@ -5864,13 +5864,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectReadMetadataNodeClient::load_object_read_auth_subject(
+        ObjectReadMetadataNodeClient::open_object_read_metadata_route(
             &local_client,
+            self.route.handler.config.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
-            version_id,
         )
+        .and_then(|route| route.load_object_read_auth_subject(version_id))
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5885,15 +5886,20 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectReadMetadataNodeClient::load_object_read_snapshot_for_subject(
+        ObjectReadMetadataNodeClient::open_object_read_metadata_route(
             &local_client,
+            self.route.handler.config.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
-            version_id,
-            expected_identity,
-            snapshot_mode,
         )
+        .and_then(|route| {
+            route.load_object_read_snapshot_for_subject(
+                version_id,
+                expected_identity,
+                snapshot_mode,
+            )
+        })
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5908,15 +5914,16 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectReadMetadataNodeClient::get_object_tags_for_subject(
+        ObjectReadMetadataNodeClient::open_object_read_metadata_route(
             &local_client,
+            self.route.handler.config.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
-            version_id,
-            expected_identity,
-            authorized_version_id,
         )
+        .and_then(|route| {
+            route.get_object_tags_for_subject(version_id, expected_identity, authorized_version_id)
+        })
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
