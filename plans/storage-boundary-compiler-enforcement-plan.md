@@ -655,7 +655,7 @@ Node-client role classification (2026-07-19):
 | `ObjectMutationMetadataNodeClient` | object metadata | active object route for object, multipart, stream-session, and payload-reclaim mutation |
 | `RetainedObjectMutationMetadataNodeClient` | object metadata | opens a retained route bound to one epoch, object-metadata PG, bucket, and key; the returned interface prepares stream aborts and releases payload-reclaim claims without accepting replacement route or object arguments |
 | `ObjectReadMetadataNodeClient` | object metadata | active object route plus the existing subject identity/read lease |
-| `PlacedShardNodeClient`, `ShardAckNodeClient` | data | placed-shard I/O remains the next active data-route conversion; shard acknowledgement, current-placement cleanup, and repair/backfill work open an active route bound to one epoch and data PG |
+| `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active placed-shard I/O opens an exact route bound to one node, epoch, data PG, shard index, and shard key; shard acknowledgement, current-placement cleanup, and repair/backfill work open an active route bound to one epoch and data PG |
 | `RetainedPlacedShardNodeClient`, `RetainedShardAckNodeClient` | data | retained exact-placement inspection and cleanup for historical shard bytes and acknowledgement rows |
 | `ShardScavengerNodeClient` | data for shard rows/files and object-metadata reference scans | read-only inventory authority for the validated active or retained scan location |
 | `ShardScavengerObservationNodeClient` | data PG for durable observation rows | opens an active primary-only route bound to one data PG; the returned interface records, lists, and resolves non-authoritative scavenger findings without accepting a replacement PG |
@@ -4135,6 +4135,41 @@ One-hundred-and-second Phase 3 slice:
 - all 2,441 storage tests pass, including the focused active shard-ack route
   regressions. Formatting, the storage boundary checker, workspace-wide strict
   Clippy, and the full 7,768-test workspace suite also pass.
+
+One-hundred-and-third Phase 3 slice:
+
+- active placed-shard access now opens a non-cloneable `PlacedShardRoute`
+  bound to one node, cluster epoch, data PG, shard index, and exact shard key.
+  Writes, admitted writes, repair writes, reads, and deletes no longer accept
+  replaceable placement or key arguments after route construction. The
+  existing retained route remains the separate interface for historical reads
+  and cleanup after route transitions.
+- embedded and Unix route factories reject crossed node and shard-index
+  subjects before storage or transport access. The embedded route also proves
+  the data PG exists locally, while the Unix route rejects a stale or future
+  epoch before opening a socket. The admitted-write path derives its durable
+  effect check and portable RPC deadline from the epoch captured by the route,
+  rather than accepting another operation epoch at the write call.
+- the cluster placement layer continues to validate the active topology and
+  acting set before opening the node route. Storage-node RPC dispatch retains
+  its independent authenticated route, active-state, acting-set, shard-index,
+  and effect-deadline checks. Private Unix encoding helpers remain behind the
+  scoped route, so ordinary production callers can only obtain active shard
+  I/O through the bound interface.
+- embedded coverage proves that the route writes, reads, and deletes only its
+  bound shard while preserving a same-PG foreign-key canary, and rejects
+  crossed node, shard-index, and unavailable-PG construction. A no-listener
+  Unix regression rejects crossed node/index/epoch subjects before RPC.
+  Existing installed-Unix, pluggable-client, read-range, read-handle, and
+  portable TLS deadline tests exercise successful I/O and the durable effect
+  boundary through the scoped route.
+- the standalone route-identity fixture added concurrently on the branch was
+  completed with the required `metadata_transfer_destination_epoch: None`
+  field so the all-feature storage test target remains constructible.
+- all 2,463 storage tests pass, including the focused embedded, Unix, TLS,
+  pluggable-client, and standalone route-identity regressions. Formatting, the
+  storage boundary checker, workspace-wide strict Clippy, and the full
+  7,794-test workspace suite also pass.
 
 ### Phase 4 — type metadata-command publication
 

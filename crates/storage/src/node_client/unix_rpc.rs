@@ -7,6 +7,12 @@ struct UnixRetainedPlacedShardRoute<'a> {
     key: ShardKey,
 }
 
+struct UnixPlacedShardRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    location: crate::cluster::ShardLocation,
+    key: ShardKey,
+}
+
 struct UnixRetainedShardAckRoute<'a> {
     client: &'a UnixStorageNodeClient,
     route_cluster_epoch: ClusterEpoch,
@@ -21,7 +27,7 @@ struct UnixShardAckRoute<'a> {
 }
 
 impl UnixStorageNodeClient {
-    pub(crate) fn write_placed_shard(
+    fn write_placed_shard(
         &self,
         data_pg_id: DataPgId,
         key: &ShardKey,
@@ -36,7 +42,7 @@ impl UnixStorageNodeClient {
         )
     }
 
-    pub(crate) fn write_placed_shard_with_effect_fence(
+    fn write_placed_shard_with_effect_fence(
         &self,
         operation_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
@@ -66,7 +72,7 @@ impl UnixStorageNodeClient {
         )
     }
 
-    pub(crate) fn repair_placed_shard(
+    fn repair_placed_shard(
         &self,
         data_pg_id: DataPgId,
         key: &ShardKey,
@@ -109,7 +115,7 @@ impl UnixStorageNodeClient {
         })
     }
 
-    pub(crate) fn read_placed_shard(
+    fn read_placed_shard(
         &self,
         data_pg_id: DataPgId,
         key: &ShardKey,
@@ -149,7 +155,7 @@ impl UnixStorageNodeClient {
         })
     }
 
-    pub(crate) fn read_placed_shard_range(
+    fn read_placed_shard_range(
         &self,
         data_pg_id: DataPgId,
         key: &ShardKey,
@@ -173,11 +179,7 @@ impl UnixStorageNodeClient {
         })
     }
 
-    pub(crate) fn delete_placed_shard(
-        &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-    ) -> Result<(), StoreError> {
+    fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError> {
         self.delete_placed_shard_at_location(self.shard_location(data_pg_id, key), key)
     }
 
@@ -927,60 +929,88 @@ impl PlacedShardNodeClient for UnixStorageNodeClient {
         self.node_id
     }
 
-    fn write_placed_shard(
+    fn open_placed_shard_route(
         &self,
-        data_pg_id: DataPgId,
+        location: crate::cluster::ShardLocation,
         key: &ShardKey,
-        data: &[u8],
-    ) -> Result<WriteAck, StoreError> {
-        UnixStorageNodeClient::write_placed_shard(self, data_pg_id, key, data)
+    ) -> Result<Box<dyn PlacedShardRoute + '_>, StoreError> {
+        if location.node_id() != self.node_id {
+            return Err(StoreError::NodeNotFound {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+            });
+        }
+        if location.cluster_epoch() != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: location.data_pg_id().get(),
+                operation_epoch: location.cluster_epoch(),
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        if location.shard_index() != key.shard_index() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open active placed shard route",
+            });
+        }
+        Ok(Box::new(UnixPlacedShardRoute {
+            client: self,
+            location,
+            key: key.clone(),
+        }))
+    }
+}
+
+impl PlacedShardRoute for UnixPlacedShardRoute<'_> {
+    fn write_placed_shard(&self, data: &[u8]) -> Result<WriteAck, StoreError> {
+        UnixStorageNodeClient::write_placed_shard(
+            self.client,
+            self.location.data_pg_id(),
+            &self.key,
+            data,
+        )
     }
 
     fn write_placed_shard_with_effect_fence(
         &self,
-        operation_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
         data: &[u8],
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<WriteAck, StoreError> {
         UnixStorageNodeClient::write_placed_shard_with_effect_fence(
-            self,
-            operation_epoch,
-            data_pg_id,
-            key,
+            self.client,
+            self.location.cluster_epoch(),
+            self.location.data_pg_id(),
+            &self.key,
             data,
             effect_fence,
         )
     }
 
-    fn repair_placed_shard(
-        &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-        data: &[u8],
-    ) -> Result<WriteAck, StoreError> {
-        UnixStorageNodeClient::repair_placed_shard(self, data_pg_id, key, data)
+    fn repair_placed_shard(&self, data: &[u8]) -> Result<WriteAck, StoreError> {
+        UnixStorageNodeClient::repair_placed_shard(
+            self.client,
+            self.location.data_pg_id(),
+            &self.key,
+            data,
+        )
     }
 
-    fn read_placed_shard(
-        &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-        expected_ack: WriteAck,
-    ) -> Result<Vec<u8>, StoreError> {
-        UnixStorageNodeClient::read_placed_shard(self, data_pg_id, key, expected_ack)
+    fn read_placed_shard(&self, expected_ack: WriteAck) -> Result<Vec<u8>, StoreError> {
+        UnixStorageNodeClient::read_placed_shard(
+            self.client,
+            self.location.data_pg_id(),
+            &self.key,
+            expected_ack,
+        )
     }
 
     fn read_placed_shard_into(
         &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
         expected_ack: WriteAck,
         dst: &mut [u8],
     ) -> Result<(), StoreError> {
         if dst.len() as u64 != expected_ack.stored_size {
-            return Err(self.rpc_payload_error(
+            return Err(self.client.rpc_payload_error(
                 "shard read range",
                 format!(
                     "remote shard read buffer is {} bytes for expected {} byte shard",
@@ -990,9 +1020,9 @@ impl PlacedShardNodeClient for UnixStorageNodeClient {
             ));
         }
         let data = UnixStorageNodeClient::read_placed_shard_range(
-            self,
-            data_pg_id,
-            key,
+            self.client,
+            self.location.data_pg_id(),
+            &self.key,
             expected_ack,
             0,
             dst.len() as u64,
@@ -1001,8 +1031,12 @@ impl PlacedShardNodeClient for UnixStorageNodeClient {
         Ok(())
     }
 
-    fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError> {
-        UnixStorageNodeClient::delete_placed_shard(self, data_pg_id, key)
+    fn delete_placed_shard(&self) -> Result<(), StoreError> {
+        UnixStorageNodeClient::delete_placed_shard(
+            self.client,
+            self.location.data_pg_id(),
+            &self.key,
+        )
     }
 }
 

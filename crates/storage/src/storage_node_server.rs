@@ -19001,7 +19001,9 @@ mod tests {
         ControlPlaneAuthPrincipal, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
         ControlPlaneScopedCredentialStore,
     };
-    use crate::node_client::{LocalUnixStorageNodeClientAdmissionSettings, UnixStorageNodeClient};
+    use crate::node_client::{
+        LocalUnixStorageNodeClientAdmissionSettings, PlacedShardNodeClient, UnixStorageNodeClient,
+    };
     use crate::storage_rpc_transport::StorageRpcClientEndpoint;
     use crate::{BucketAclSummary, StorageRpcClientAuthConfig};
     use rustls::pki_types::pem::PemObject;
@@ -19218,6 +19220,7 @@ mod tests {
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 state: PgState::Active,
                 primary_node_id: NodeId::new(7),
+                metadata_transfer_destination_epoch: None,
                 acting_set: vec![NodeId::new(7)],
             }],
             historical_pg_routes: Vec::new(),
@@ -23181,15 +23184,21 @@ mod tests {
         assert_eq!(drain.bucket, drain_bucket);
 
         let shard_payload = b"portable fenced shard";
-        let shard_ack = crate::clock::with_time_and_monotonic_override(2_600, 10_100, || {
-            client
-                .write_placed_shard_with_effect_fence(
+        let data_pg_id = DataPgId::new_for_test(PgId::new(0));
+        let shard_route = client
+            .open_placed_shard_route(
+                crate::cluster::ShardLocation::new(
                     config.cluster_epoch,
-                    DataPgId::new_for_test(PgId::new(0)),
-                    &shard_key,
-                    shard_payload,
-                    effect_fence,
-                )
+                    data_pg_id,
+                    shard_key.shard_index(),
+                    config.node_id,
+                ),
+                &shard_key,
+            )
+            .unwrap();
+        let shard_ack = crate::clock::with_time_and_monotonic_override(2_600, 10_100, || {
+            shard_route
+                .write_placed_shard_with_effect_fence(shard_payload, effect_fence)
                 .unwrap()
         });
         assert_eq!(shard_ack.stored_size, shard_payload.len() as u64);
@@ -23241,15 +23250,20 @@ mod tests {
             "{pending_error:?}"
         );
 
-        let shard_error = crate::clock::with_time_and_monotonic_override(3_500, 11_000, || {
-            client
-                .write_placed_shard_with_effect_fence(
+        let expired_shard_route = client
+            .open_placed_shard_route(
+                crate::cluster::ShardLocation::new(
                     config.cluster_epoch,
-                    DataPgId::new_for_test(PgId::new(0)),
-                    &expired_shard_key,
-                    b"must not be written",
-                    effect_fence,
-                )
+                    data_pg_id,
+                    expired_shard_key.shard_index(),
+                    config.node_id,
+                ),
+                &expired_shard_key,
+            )
+            .unwrap();
+        let shard_error = crate::clock::with_time_and_monotonic_override(3_500, 11_000, || {
+            expired_shard_route
+                .write_placed_shard_with_effect_fence(b"must not be written", effect_fence)
                 .unwrap_err()
         });
         assert!(

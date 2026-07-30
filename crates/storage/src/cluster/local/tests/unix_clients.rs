@@ -1,6 +1,6 @@
 use super::*;
 use crate::node_client::{
-    ObjectPayloadLeaseKind, ObjectPayloadLeaseRoute, RetainedPlacedShardRoute,
+    ObjectPayloadLeaseKind, ObjectPayloadLeaseRoute, PlacedShardRoute, RetainedPlacedShardRoute,
     RetainedShardAckRoute, ShardAckRoute,
 };
 use crate::storage_rpc::StorageRpcErrorCode;
@@ -28,6 +28,12 @@ struct RecordingPlacedShardClient {
     writes: Mutex<Vec<(DataPgId, ShardKey, Vec<u8>)>>,
 }
 
+struct RecordingPlacedShardRoute<'a> {
+    client: &'a RecordingPlacedShardClient,
+    location: ShardLocation,
+    key: ShardKey,
+}
+
 struct RecordingRetainedPlacedShardRoute;
 
 impl RecordingPlacedShardClient {
@@ -44,17 +50,26 @@ impl PlacedShardNodeClient for RecordingPlacedShardClient {
         self.node_id
     }
 
-    fn write_placed_shard(
+    fn open_placed_shard_route(
         &self,
-        data_pg_id: DataPgId,
+        location: ShardLocation,
         key: &ShardKey,
-        data: &[u8],
-    ) -> Result<WriteAck, StoreError> {
-        self.writes.lock().unwrap_or_else(|e| e.into_inner()).push((
-            data_pg_id,
-            key.clone(),
-            data.to_vec(),
-        ));
+    ) -> Result<Box<dyn PlacedShardRoute + '_>, StoreError> {
+        Ok(Box::new(RecordingPlacedShardRoute {
+            client: self,
+            location,
+            key: key.clone(),
+        }))
+    }
+}
+
+impl PlacedShardRoute for RecordingPlacedShardRoute<'_> {
+    fn write_placed_shard(&self, data: &[u8]) -> Result<WriteAck, StoreError> {
+        self.client
+            .writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((self.location.data_pg_id(), self.key.clone(), data.to_vec()));
         Ok(WriteAck {
             crc64: checksum::crc64::checksum(data),
             stored_size: data.len() as u64,
@@ -63,31 +78,18 @@ impl PlacedShardNodeClient for RecordingPlacedShardClient {
 
     fn write_placed_shard_with_effect_fence(
         &self,
-        operation_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
         data: &[u8],
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<WriteAck, StoreError> {
-        effect_fence.require_valid_for(operation_epoch)?;
-        self.write_placed_shard(data_pg_id, key, data)
+        effect_fence.require_valid_for(self.location.cluster_epoch())?;
+        self.write_placed_shard(data)
     }
 
-    fn repair_placed_shard(
-        &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-        data: &[u8],
-    ) -> Result<WriteAck, StoreError> {
-        self.write_placed_shard(data_pg_id, key, data)
+    fn repair_placed_shard(&self, data: &[u8]) -> Result<WriteAck, StoreError> {
+        self.write_placed_shard(data)
     }
 
-    fn read_placed_shard(
-        &self,
-        _data_pg_id: DataPgId,
-        _key: &ShardKey,
-        _expected_ack: WriteAck,
-    ) -> Result<Vec<u8>, StoreError> {
+    fn read_placed_shard(&self, _expected_ack: WriteAck) -> Result<Vec<u8>, StoreError> {
         Err(StoreError::Io {
             context: "recording shard client read",
             source: std::io::Error::from(std::io::ErrorKind::Unsupported),
@@ -96,21 +98,15 @@ impl PlacedShardNodeClient for RecordingPlacedShardClient {
 
     fn read_placed_shard_into(
         &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
         expected_ack: WriteAck,
         dst: &mut [u8],
     ) -> Result<(), StoreError> {
-        let data = self.read_placed_shard(data_pg_id, key, expected_ack)?;
+        let data = self.read_placed_shard(expected_ack)?;
         dst.copy_from_slice(&data);
         Ok(())
     }
 
-    fn delete_placed_shard(
-        &self,
-        _data_pg_id: DataPgId,
-        _key: &ShardKey,
-    ) -> Result<(), StoreError> {
+    fn delete_placed_shard(&self) -> Result<(), StoreError> {
         Ok(())
     }
 }

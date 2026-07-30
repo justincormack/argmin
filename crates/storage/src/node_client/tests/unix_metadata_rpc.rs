@@ -19,12 +19,17 @@ fn unix_storage_node_client_writes_deletes_and_validates_ack_rows() {
     );
     let key = ShardKey::new(&[0x55; 16], 11, 0);
     let data_pg_id = DataPgId::new_for_test(PgId::new(0));
+    let location = crate::cluster::ShardLocation::new(
+        config.cluster_epoch,
+        data_pg_id,
+        key.shard_index(),
+        config.node_id,
+    );
+    let route = client.open_placed_shard_route(location, &key).unwrap();
 
     assert_eq!(client.node_id(), NodeId::new(7));
-    let ack = client
-        .write_placed_shard(data_pg_id, &key, b"remote payload")
-        .unwrap();
-    let read_back = client.read_placed_shard(data_pg_id, &key, ack).unwrap();
+    let ack = route.write_placed_shard(b"remote payload").unwrap();
+    let read_back = route.read_placed_shard(ack).unwrap();
     assert_eq!(read_back, b"remote payload");
     client
         .register_written_shard_acks(data_pg_id, &[(&key, ack)])
@@ -32,7 +37,7 @@ fn unix_storage_node_client_writes_deletes_and_validates_ack_rows() {
     client
         .validate_written_shard_acks(data_pg_id, &[(&key, ack)])
         .unwrap();
-    client.delete_placed_shard(data_pg_id, &key).unwrap();
+    route.delete_placed_shard().unwrap();
     server_thread.join().unwrap();
 
     let reopened = SharedStorageNode::open_with_default_ec_shape(
@@ -65,16 +70,20 @@ fn unix_storage_node_client_times_out_waiting_for_response() {
         config.socket_path.clone(),
     );
     let key = ShardKey::new(&[0x56; 16], 12, 0);
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
+    let location = crate::cluster::ShardLocation::new(
+        config.cluster_epoch,
+        data_pg_id,
+        key.shard_index(),
+        config.node_id,
+    );
+    let route = client.open_placed_shard_route(location, &key).unwrap();
     let started = Instant::now();
-    let err = client
-        .read_placed_shard(
-            DataPgId::new_for_test(PgId::new(0)),
-            &key,
-            WriteAck {
-                stored_size: 1,
-                crc64: 2,
-            },
-        )
+    let err = route
+        .read_placed_shard(WriteAck {
+            stored_size: 1,
+            crc64: 2,
+        })
         .unwrap_err();
     assert!(
         started.elapsed() < STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT + Duration::from_secs(2),
@@ -2798,14 +2807,17 @@ fn unix_storage_node_client_read_into_requires_full_shard_buffer() {
     );
     let key = ShardKey::new(&[0x56; 16], 12, 0);
     let data_pg_id = DataPgId::new_for_test(PgId::new(0));
-    let ack = client
-        .write_placed_shard(data_pg_id, &key, b"remote payload")
-        .unwrap();
+    let location = crate::cluster::ShardLocation::new(
+        config.cluster_epoch,
+        data_pg_id,
+        key.shard_index(),
+        config.node_id,
+    );
+    let route = client.open_placed_shard_route(location, &key).unwrap();
+    let ack = route.write_placed_shard(b"remote payload").unwrap();
 
     let mut short = vec![0; ack.stored_size as usize - 1];
-    let err =
-        PlacedShardNodeClient::read_placed_shard_into(&client, data_pg_id, &key, ack, &mut short)
-            .unwrap_err();
+    let err = route.read_placed_shard_into(ack, &mut short).unwrap_err();
     assert!(matches!(
         err,
         StoreError::StorageRpc {
@@ -2814,10 +2826,8 @@ fn unix_storage_node_client_read_into_requires_full_shard_buffer() {
             ..
         } if detail.as_str().contains("expected")
     ));
-    let ranged = client
-        .read_placed_shard_range(data_pg_id, &key, ack, 0, short.len() as u64)
-        .unwrap();
-    assert_eq!(ranged, b"remote payloa");
+    assert_eq!(route.read_placed_shard(ack).unwrap(), b"remote payload");
+    drop(route);
     drop(client);
     server_thread.join().unwrap();
 }
@@ -2895,16 +2905,15 @@ fn unix_storage_node_delete_fails_while_read_handle_active() {
         config.node_id,
     );
     let mut session = client.open_read_handle_session().unwrap();
+    let route = client.open_placed_shard_route(location, &key).unwrap();
 
-    client
-        .write_placed_shard(data_pg_id, &key, b"protected payload")
-        .unwrap();
+    route.write_placed_shard(b"protected payload").unwrap();
     session
         .acquire_read_handles("protected-read", vec![(location, key.clone())])
         .unwrap();
     assert_eq!(server.read_handle_count(location), 1);
 
-    let err = client.delete_placed_shard(data_pg_id, &key).unwrap_err();
+    let err = route.delete_placed_shard().unwrap_err();
     assert!(matches!(
         err,
         StoreError::StorageRpcResourceExhausted {
@@ -2916,7 +2925,8 @@ fn unix_storage_node_delete_fails_while_read_handle_active() {
 
     session.release_read_handles("protected-read").unwrap();
     assert_eq!(server.read_handle_count(location), 0);
-    client.delete_placed_shard(data_pg_id, &key).unwrap();
+    route.delete_placed_shard().unwrap();
+    drop(route);
     drop(session);
     for join in server_threads {
         join.join().unwrap();
@@ -3035,9 +3045,14 @@ fn unix_storage_node_shard_write_admission_exhausts_before_socket_write() {
         .acquire_rpc_admission(StorageRpcMessageKind::ShardRead)
         .unwrap();
     let key = ShardKey::new(&[0x55; 16], 55, 0);
-    let err = client
-        .write_placed_shard(DataPgId::new_for_test(PgId::new(0)), &key, &[0x5a; 4096])
-        .unwrap_err();
+    let location = crate::cluster::ShardLocation::new(
+        client.cluster_epoch,
+        DataPgId::new_for_test(PgId::new(0)),
+        key.shard_index(),
+        client.node_id,
+    );
+    let route = client.open_placed_shard_route(location, &key).unwrap();
+    let err = route.write_placed_shard(&[0x5a; 4096]).unwrap_err();
 
     assert!(matches!(
         err,

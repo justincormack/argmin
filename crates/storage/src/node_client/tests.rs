@@ -186,6 +186,139 @@ fn test_object_payload_reclaim_proof(
 }
 
 #[test]
+fn local_placed_shard_route_is_bound_to_exact_placement() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let bound_key = ShardKey::new(&[0x31; 16], 11, 0);
+    let foreign_key = ShardKey::new(&[0x32; 16], 12, 0);
+    let foreign_data = b"foreign active shard";
+    storage_node
+        .write_shard_file(0, &foreign_key, foreign_data)
+        .unwrap();
+    let location = crate::cluster::ShardLocation::new(
+        ClusterEpoch::INITIAL,
+        DataPgId::new_for_test(PgId::new(0)),
+        bound_key.shard_index(),
+        NodeId::new(7),
+    );
+    let route = client
+        .open_placed_shard_route(location, &bound_key)
+        .unwrap();
+    let bound_data = b"bound active shard";
+    let ack = route.write_placed_shard(bound_data).unwrap();
+    assert_eq!(route.read_placed_shard(ack).unwrap(), bound_data);
+    route.delete_placed_shard().unwrap();
+    assert!(storage_node.read_shard_file(0, &bound_key).is_err());
+    assert_eq!(
+        storage_node.read_shard_file(0, &foreign_key).unwrap(),
+        foreign_data
+    );
+
+    let wrong_shard_location = crate::cluster::ShardLocation::new(
+        ClusterEpoch::INITIAL,
+        DataPgId::new_for_test(PgId::new(0)),
+        ShardIndex::new(1),
+        NodeId::new(7),
+    );
+    assert!(matches!(
+        client
+            .open_placed_shard_route(wrong_shard_location, &bound_key)
+            .err()
+            .expect("foreign shard index must be rejected before storage"),
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open active placed shard route",
+        }
+    ));
+    let foreign_node_location = crate::cluster::ShardLocation::new(
+        ClusterEpoch::INITIAL,
+        DataPgId::new_for_test(PgId::new(0)),
+        bound_key.shard_index(),
+        NodeId::new(8),
+    );
+    assert!(matches!(
+        client
+            .open_placed_shard_route(foreign_node_location, &bound_key)
+            .err()
+            .expect("foreign active node must be rejected before storage"),
+        StoreError::NodeNotFound { node_id: 8, .. }
+    ));
+    let foreign_pg_location = crate::cluster::ShardLocation::new(
+        ClusterEpoch::INITIAL,
+        DataPgId::new_for_test(PgId::new(1)),
+        bound_key.shard_index(),
+        NodeId::new(7),
+    );
+    assert!(matches!(
+        client
+            .open_placed_shard_route(foreign_pg_location, &bound_key)
+            .err()
+            .expect("foreign active data PG must be rejected before storage"),
+        StoreError::PgNotFound { pg_id: 1 }
+    ));
+}
+
+#[test]
+fn unix_placed_shard_route_rejects_foreign_subject_before_rpc() {
+    let client = test_unix_storage_node_client();
+    let key = ShardKey::new(&[0x33; 16], 13, 0);
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
+    let foreign_node_location = crate::cluster::ShardLocation::new(
+        client.cluster_epoch,
+        data_pg_id,
+        key.shard_index(),
+        NodeId::new(client.node_id.as_u32() + 1),
+    );
+    assert!(matches!(
+        client
+            .open_placed_shard_route(foreign_node_location, &key)
+            .err()
+            .expect("foreign active node must be rejected before RPC"),
+        StoreError::NodeNotFound { .. }
+    ));
+    let wrong_shard_location = crate::cluster::ShardLocation::new(
+        client.cluster_epoch,
+        data_pg_id,
+        ShardIndex::new(1),
+        client.node_id,
+    );
+    assert!(matches!(
+        client
+            .open_placed_shard_route(wrong_shard_location, &key)
+            .err()
+            .expect("foreign active shard index must be rejected before RPC"),
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open active placed shard route",
+        }
+    ));
+    let future_epoch = ClusterEpoch::new(client.cluster_epoch.get() + 1).unwrap();
+    let future_location = crate::cluster::ShardLocation::new(
+        future_epoch,
+        data_pg_id,
+        key.shard_index(),
+        client.node_id,
+    );
+    assert!(matches!(
+        client
+            .open_placed_shard_route(future_location, &key)
+            .err()
+            .expect("future active epoch must be rejected before RPC"),
+        StoreError::StalePayloadOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        } if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
+}
+
+#[test]
 fn local_retained_placed_shard_route_is_bound_to_exact_placement() {
     let tmp = test_util::tempdir();
     let storage_node = Arc::new(

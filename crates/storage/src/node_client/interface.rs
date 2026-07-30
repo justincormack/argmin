@@ -1032,45 +1032,33 @@ pub(crate) enum InsertDeleteMarkerStalePayload {
 pub(crate) trait PlacedShardNodeClient: Send + Sync {
     fn node_id(&self) -> NodeId;
 
-    fn write_placed_shard(
+    fn open_placed_shard_route(
         &self,
-        data_pg_id: DataPgId,
+        location: crate::cluster::ShardLocation,
         key: &ShardKey,
-        data: &[u8],
-    ) -> Result<WriteAck, StoreError>;
+    ) -> Result<Box<dyn PlacedShardRoute + '_>, StoreError>;
+}
+
+pub(crate) trait PlacedShardRoute: Send {
+    fn write_placed_shard(&self, data: &[u8]) -> Result<WriteAck, StoreError>;
 
     fn write_placed_shard_with_effect_fence(
         &self,
-        operation_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
         data: &[u8],
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<WriteAck, StoreError>;
 
-    fn repair_placed_shard(
-        &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-        data: &[u8],
-    ) -> Result<WriteAck, StoreError>;
+    fn repair_placed_shard(&self, data: &[u8]) -> Result<WriteAck, StoreError>;
 
-    fn read_placed_shard(
-        &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-        expected_ack: WriteAck,
-    ) -> Result<Vec<u8>, StoreError>;
+    fn read_placed_shard(&self, expected_ack: WriteAck) -> Result<Vec<u8>, StoreError>;
 
     fn read_placed_shard_into(
         &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
         expected_ack: WriteAck,
         dst: &mut [u8],
     ) -> Result<(), StoreError>;
 
-    fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError>;
+    fn delete_placed_shard(&self) -> Result<(), StoreError>;
 }
 
 /// Retained access to exact shard placements which may outlive the active

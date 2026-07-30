@@ -36,7 +36,7 @@ use crate::node_client::{
     ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
     ObjectMutationMetadataNodeClient, ObjectPayloadLeaseNodeClient, ObjectPayloadLeaseNodeLease,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
-    RetainedBucketWriteReservationNodeClient, RetainedMetadataCommandNodeClient,
+    PlacedShardRoute, RetainedBucketWriteReservationNodeClient, RetainedMetadataCommandNodeClient,
     RetainedObjectMutationMetadataNodeClient, RetainedObjectPayloadReclaimNodeClient,
     RetainedObjectPayloadReclaimRoute, RetainedPlacedShardNodeClient, RetainedShardAckNodeClient,
     ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient,
@@ -791,48 +791,40 @@ impl std::fmt::Debug for LocalNodeStore {
 
 struct LocalShardNodeClient<'a> {
     node_id: NodeId,
-    client: &'a dyn PlacedShardNodeClient,
+    route: Box<dyn PlacedShardRoute + 'a>,
     read_handle_client: &'a dyn ShardReadHandleNodeClient,
-    cluster_epoch: ClusterEpoch,
-    data_pg_id: DataPgId,
     location: ShardLocation,
+    key: ShardKey,
 }
 
 impl LocalShardNodeClient<'_> {
-    fn write_shard(&self, key: &ShardKey, data: &[u8]) -> Result<WriteAck, ShardIoError> {
-        self.client
-            .write_placed_shard(self.data_pg_id, key, data)
+    fn write_shard(&self, data: &[u8]) -> Result<WriteAck, ShardIoError> {
+        self.route
+            .write_placed_shard(data)
             .map_err(|source| self.store_error(source))
     }
 
     fn write_shard_with_effect_fence(
         &self,
-        key: &ShardKey,
         data: &[u8],
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<WriteAck, ShardIoError> {
-        self.client
-            .write_placed_shard_with_effect_fence(
-                self.cluster_epoch,
-                self.data_pg_id,
-                key,
-                data,
-                effect_fence,
-            )
+        self.route
+            .write_placed_shard_with_effect_fence(data, effect_fence)
             .map_err(|source| self.store_error(source))
     }
 
-    fn repair_shard(&self, key: &ShardKey, data: &[u8]) -> Result<WriteAck, ShardIoError> {
-        self.client
-            .repair_placed_shard(self.data_pg_id, key, data)
+    fn repair_shard(&self, data: &[u8]) -> Result<WriteAck, ShardIoError> {
+        self.route
+            .repair_placed_shard(data)
             .map_err(|source| self.store_error(source))
     }
 
-    fn read_shard(&self, key: &ShardKey, expected: WriteAck) -> Result<Vec<u8>, ShardIoError> {
-        let mut read_handle = self.acquire_read_handle(key)?;
+    fn read_shard(&self, expected: WriteAck) -> Result<Vec<u8>, ShardIoError> {
+        let mut read_handle = self.acquire_read_handle()?;
         let data_result = self
-            .client
-            .read_placed_shard(self.data_pg_id, key, expected)
+            .route
+            .read_placed_shard(expected)
             .map_err(|source| self.store_error(source));
         if let Err(error) = read_handle.release() {
             return Err(self.store_error(error));
@@ -843,22 +835,17 @@ impl LocalShardNodeClient<'_> {
     }
 
     #[cfg(test)]
-    fn read_shard_into(
-        &self,
-        key: &ShardKey,
-        expected: WriteAck,
-        dst: &mut [u8],
-    ) -> Result<(), ShardIoError> {
+    fn read_shard_into(&self, expected: WriteAck, dst: &mut [u8]) -> Result<(), ShardIoError> {
         if dst.len() as u64 != expected.stored_size {
             return Err(self.store_error(StoreError::Io {
                 context: "read payload shard buffer size mismatch",
                 source: std::io::Error::from(std::io::ErrorKind::InvalidData),
             }));
         }
-        let mut read_handle = self.acquire_read_handle(key)?;
+        let mut read_handle = self.acquire_read_handle()?;
         let read_result = self
-            .client
-            .read_placed_shard_into(self.data_pg_id, key, expected, dst)
+            .route
+            .read_placed_shard_into(expected, dst)
             .map_err(|source| self.store_error(source));
         if let Err(error) = read_handle.release() {
             return Err(self.store_error(error));
@@ -869,7 +856,6 @@ impl LocalShardNodeClient<'_> {
 
     fn read_shard_into_without_handle(
         &self,
-        key: &ShardKey,
         expected: WriteAck,
         dst: &mut [u8],
     ) -> Result<(), ShardIoError> {
@@ -879,26 +865,25 @@ impl LocalShardNodeClient<'_> {
                 source: std::io::Error::from(std::io::ErrorKind::InvalidData),
             }));
         }
-        self.client
-            .read_placed_shard_into(self.data_pg_id, key, expected, dst)
+        self.route
+            .read_placed_shard_into(expected, dst)
             .map_err(|source| self.store_error(source))?;
         self.verify_read_ack(expected, dst)
     }
 
-    fn delete_shard(&self, key: &ShardKey) -> Result<(), ShardIoError> {
-        self.client
-            .delete_placed_shard(self.data_pg_id, key)
+    fn delete_shard(&self) -> Result<(), ShardIoError> {
+        self.route
+            .delete_placed_shard()
             .map_err(|source| self.store_error(source))
     }
 
     fn acquire_read_handle(
         &self,
-        key: &ShardKey,
     ) -> Result<Box<dyn crate::node_client::ShardReadHandleLease>, ShardIoError> {
         self.read_handle_client
             .acquire_read_handles(
-                &self.read_operation_id(key),
-                vec![(self.location, key.clone())],
+                &self.read_operation_id(&self.key),
+                vec![(self.location, self.key.clone())],
             )
             .map_err(|source| self.store_error(source))
     }
@@ -908,8 +893,8 @@ impl LocalShardNodeClient<'_> {
         let hex_key = std::str::from_utf8(&hex_key).expect("shard key hex is valid ASCII");
         format!(
             "read:{}:{}:{}:{}",
-            self.cluster_epoch.get(),
-            self.data_pg_id.get(),
+            self.location.cluster_epoch().get(),
+            self.location.data_pg_id().get(),
             self.node_id.as_u32(),
             hex_key
         )
@@ -918,8 +903,8 @@ impl LocalShardNodeClient<'_> {
     fn read_operation_id_for_keys(&self, keys: &[ShardKey]) -> String {
         let mut id = format!(
             "read-batch:{}:{}:{}",
-            self.cluster_epoch.get(),
-            self.data_pg_id.get(),
+            self.location.cluster_epoch().get(),
+            self.location.data_pg_id().get(),
             self.node_id.as_u32()
         );
         for key in keys {
@@ -934,8 +919,8 @@ impl LocalShardNodeClient<'_> {
     fn store_error(&self, source: StoreError) -> ShardIoError {
         ShardIoError::Store {
             node_id: self.node_id.as_u32(),
-            pg_id: self.data_pg_id.get(),
-            cluster_epoch: self.cluster_epoch,
+            pg_id: self.location.data_pg_id().get(),
+            cluster_epoch: self.location.cluster_epoch(),
             source,
         }
     }
@@ -4295,7 +4280,7 @@ impl LocalClusterMap {
         data: &[u8],
     ) -> Result<WriteAck, ShardIoError> {
         self.shard_node_client(operation_epoch, location, key)?
-            .write_shard(key, data)
+            .write_shard(data)
     }
 
     pub(crate) fn write_payload_shard_with_effect_fence(
@@ -4307,7 +4292,7 @@ impl LocalClusterMap {
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<WriteAck, ShardIoError> {
         self.shard_node_client(operation_epoch, location, key)?
-            .write_shard_with_effect_fence(key, data, effect_fence)
+            .write_shard_with_effect_fence(data, effect_fence)
     }
 
     pub fn repair_payload_shard(
@@ -4318,7 +4303,7 @@ impl LocalClusterMap {
         data: &[u8],
     ) -> Result<WriteAck, ShardIoError> {
         self.shard_node_client(operation_epoch, location, key)?
-            .repair_shard(key, data)
+            .repair_shard(data)
     }
 
     pub(crate) fn read_payload_shard(
@@ -4329,7 +4314,7 @@ impl LocalClusterMap {
         expected: WriteAck,
     ) -> Result<Vec<u8>, ShardIoError> {
         self.shard_node_client(operation_epoch, location, key)?
-            .read_shard(key, expected)
+            .read_shard(expected)
     }
 
     pub(crate) fn read_payload_shard_for_historical_inspection(
@@ -4442,7 +4427,7 @@ impl LocalClusterMap {
         dst: &mut [u8],
     ) -> Result<(), ShardIoError> {
         self.shard_node_client(operation_epoch, location, key)?
-            .read_shard_into(key, expected, dst)
+            .read_shard_into(expected, dst)
     }
 
     pub(crate) fn acquire_payload_shard_read_handles(
@@ -4498,7 +4483,7 @@ impl LocalClusterMap {
         dst: &mut [u8],
     ) -> Result<(), ShardIoError> {
         self.shard_node_client(operation_epoch, location, key)?
-            .read_shard_into_without_handle(key, expected, dst)
+            .read_shard_into_without_handle(expected, dst)
     }
 
     pub(crate) fn delete_payload_shard(
@@ -4508,7 +4493,7 @@ impl LocalClusterMap {
         key: &ShardKey,
     ) -> Result<(), ShardIoError> {
         self.shard_node_client(operation_epoch, location, key)?
-            .delete_shard(key)
+            .delete_shard()
     }
 
     pub(crate) fn delete_payload_shard_for_historical_cleanup(
@@ -4593,13 +4578,21 @@ impl LocalClusterMap {
                 pg_id: location.data_pg_id().get(),
                 cluster_epoch: self.epoch,
             })?;
+        let shard_route = node
+            .shard_client()
+            .open_placed_shard_route(location, key)
+            .map_err(|source| ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source,
+            })?;
         Ok(LocalShardNodeClient {
             node_id: node.shard_client().node_id(),
-            client: node.shard_client().as_ref(),
+            route: shard_route,
             read_handle_client: node.shard_read_handle_client().as_ref(),
-            cluster_epoch: self.epoch,
-            data_pg_id: location.data_pg_id(),
             location,
+            key: key.clone(),
         })
     }
 

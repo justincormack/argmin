@@ -32,6 +32,12 @@ struct LocalRetainedPlacedShardRoute {
     key: ShardKey,
 }
 
+struct LocalPlacedShardRoute {
+    storage_node: Arc<SharedStorageNode>,
+    location: crate::cluster::ShardLocation,
+    key: ShardKey,
+}
+
 struct LocalRetainedShardAckRoute {
     storage_node: Arc<SharedStorageNode>,
     data_pg_id: DataPgId,
@@ -213,61 +219,70 @@ impl PlacedShardNodeClient for LocalStorageNodeClient {
         self.node_id
     }
 
-    fn write_placed_shard(
+    fn open_placed_shard_route(
         &self,
-        data_pg_id: DataPgId,
+        location: crate::cluster::ShardLocation,
         key: &ShardKey,
-        data: &[u8],
-    ) -> Result<WriteAck, StoreError> {
+    ) -> Result<Box<dyn PlacedShardRoute + '_>, StoreError> {
+        if location.node_id() != self.node_id {
+            return Err(StoreError::NodeNotFound {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+            });
+        }
+        if location.shard_index() != key.shard_index() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open active placed shard route",
+            });
+        }
+        drop(self.storage_node.get_pg(location.data_pg_id().get())?);
+        Ok(Box::new(LocalPlacedShardRoute {
+            storage_node: Arc::clone(&self.storage_node),
+            location,
+            key: key.clone(),
+        }))
+    }
+}
+
+impl PlacedShardRoute for LocalPlacedShardRoute {
+    fn write_placed_shard(&self, data: &[u8]) -> Result<WriteAck, StoreError> {
         self.storage_node
-            .write_shard_file(data_pg_id.get(), key, data)
+            .write_shard_file(self.location.data_pg_id().get(), &self.key, data)
     }
 
     fn write_placed_shard_with_effect_fence(
         &self,
-        operation_epoch: ClusterEpoch,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
         data: &[u8],
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<WriteAck, StoreError> {
-        effect_fence.require_valid_for(operation_epoch)?;
+        effect_fence.require_valid_for(self.location.cluster_epoch())?;
         self.storage_node
-            .write_shard_file(data_pg_id.get(), key, data)
+            .write_shard_file(self.location.data_pg_id().get(), &self.key, data)
     }
 
-    fn repair_placed_shard(
-        &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-        data: &[u8],
-    ) -> Result<WriteAck, StoreError> {
+    fn repair_placed_shard(&self, data: &[u8]) -> Result<WriteAck, StoreError> {
         self.storage_node
-            .write_shard_file(data_pg_id.get(), key, data)
+            .write_shard_file(self.location.data_pg_id().get(), &self.key, data)
     }
 
-    fn read_placed_shard(
-        &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
-        _expected_ack: WriteAck,
-    ) -> Result<Vec<u8>, StoreError> {
-        self.storage_node.read_shard_file(data_pg_id.get(), key)
+    fn read_placed_shard(&self, _expected_ack: WriteAck) -> Result<Vec<u8>, StoreError> {
+        self.storage_node
+            .read_shard_file(self.location.data_pg_id().get(), &self.key)
     }
 
     fn read_placed_shard_into(
         &self,
-        data_pg_id: DataPgId,
-        key: &ShardKey,
         _expected_ack: WriteAck,
         dst: &mut [u8],
     ) -> Result<(), StoreError> {
         self.storage_node
-            .read_shard_file_into(data_pg_id.get(), key, dst)
+            .read_shard_file_into(self.location.data_pg_id().get(), &self.key, dst)
     }
 
-    fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError> {
-        self.storage_node.delete_shard_file(data_pg_id.get(), key)
+    fn delete_placed_shard(&self) -> Result<(), StoreError> {
+        self.storage_node
+            .delete_shard_file(self.location.data_pg_id().get(), &self.key)
     }
 }
 
