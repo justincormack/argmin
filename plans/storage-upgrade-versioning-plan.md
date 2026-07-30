@@ -893,9 +893,13 @@ Progress on item 1 (2026-07-30): the first bounded slice moved durable backfill-
 state into `StorageBackfillCandidateScanner`. Its fairness cursor, candidate summary, enqueue
 transition, implementation errors, and storage-specific telemetry are now storage-owned. The
 public scheduler operation is only `scan()`, and the exact cursor/publication regression moved
-from `server-core` to an owner-local storage test. The remaining shard-scavenger audit,
-checkpoint scheduling, repair/backfill execution, reclaim/finalization, and stream-session workers
-are still pending; this slice does not mark item 1 complete.
+from `server-core` to an owner-local storage test. The second bounded slice moved abandoned
+stream-session expiry, discovery, cleanup, shared-worker registration, thread lifecycle, retry
+diagnostics, and telemetry into `StorageStreamSessionSweeper`; `server-core` retains only the
+opaque worker handle and startup-error translation. The route-publication regression now uses a
+clock pinned before setup and advances it deterministically past the durable cleanup deadline.
+The remaining shard-scavenger audit, checkpoint scheduling, repair/backfill execution, and
+reclaim/finalization workers are still pending; these slices do not mark item 1 complete.
 
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
@@ -1163,7 +1167,8 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     the S3-visible bucket-delete request path in `server-core`; storage creates and owns cleanup
     roots after one logical accepted-deletion operation. Privatize all maintenance cursor, claim,
     reclaim-work, cleanup-root, session-cleanup, work-record, and transition APIs. The
-    backfill-candidate cursor/scheduling slice is complete; the other workers remain pending.
+    backfill-candidate cursor/scheduling and abandoned stream-session cleanup slices are complete;
+    the other workers remain pending.
 11. **Pending:** replace server-core's data-PG, placement-epoch, EC-placement, shard-location, and
     historical-route handling with opaque storage-owned payload handles and logical I/O/lease
     operations.

@@ -49,9 +49,6 @@ static SHARD_REPAIR_SWEEPER_REGISTRY: OnceLock<
 static SHARD_BACKFILL_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<ProcessLocalRegistryKey, Weak<ShardBackfillSweeper>>>,
 > = OnceLock::new();
-static STREAM_SESSION_SWEEPER_REGISTRY: OnceLock<
-    Mutex<HashMap<ProcessLocalRegistryKey, Weak<StreamSessionSweeper>>>,
-> = OnceLock::new();
 static BACKGROUND_WORK_ADMISSION_REGISTRY: OnceLock<
     Mutex<HashMap<ProcessLocalRegistryKey, Weak<BackgroundWorkAdmission>>>,
 > = OnceLock::new();
@@ -79,7 +76,6 @@ const BACKGROUND_BACKFILL_CANDIDATE_SCAN_LIMIT: usize = 1;
 const BACKGROUND_ROUTINE_BACKFILL_LIMIT: usize = 1;
 const BACKGROUND_RECLAIM_CLEANUP_LIMIT: usize = 1;
 const BACKGROUND_LIFECYCLE_CLEANUP_LIMIT: usize = 1;
-const BACKGROUND_STREAM_SESSION_CLEANUP_LIMIT: usize = 1;
 const BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT: usize = 1;
 const BACKGROUND_ROUTINE_METADATA_CHECKPOINT_LIMIT: usize = 1;
 const BACKGROUND_FOREGROUND_PRESSURE_HOLD: Duration = Duration::from_millis(1_000);
@@ -113,7 +109,6 @@ enum BackgroundWorkClass {
     RoutineBackfill,
     ReclaimCleanup,
     LifecycleCleanup,
-    StreamSessionCleanup,
     OpportunisticScan,
     RoutineMetadataCheckpoint,
 }
@@ -128,7 +123,6 @@ impl BackgroundWorkClass {
             Self::RoutineBackfill => observability::BackgroundWorkClass::RoutineBackfill,
             Self::ReclaimCleanup => observability::BackgroundWorkClass::ReclaimCleanup,
             Self::LifecycleCleanup => observability::BackgroundWorkClass::LifecycleCleanup,
-            Self::StreamSessionCleanup => observability::BackgroundWorkClass::StreamSessionCleanup,
             Self::OpportunisticScan => observability::BackgroundWorkClass::OpportunisticScan,
             Self::RoutineMetadataCheckpoint => {
                 observability::BackgroundWorkClass::RoutineMetadataCheckpoint
@@ -144,7 +138,6 @@ struct BackgroundWorkAdmissionLimits {
     routine_backfill: usize,
     reclaim_cleanup: usize,
     lifecycle_cleanup: usize,
-    stream_session_cleanup: usize,
     opportunistic_scan: usize,
     routine_metadata_checkpoint: usize,
 }
@@ -157,7 +150,6 @@ impl Default for BackgroundWorkAdmissionLimits {
             routine_backfill: BACKGROUND_ROUTINE_BACKFILL_LIMIT,
             reclaim_cleanup: BACKGROUND_RECLAIM_CLEANUP_LIMIT,
             lifecycle_cleanup: BACKGROUND_LIFECYCLE_CLEANUP_LIMIT,
-            stream_session_cleanup: BACKGROUND_STREAM_SESSION_CLEANUP_LIMIT,
             opportunistic_scan: BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT,
             routine_metadata_checkpoint: BACKGROUND_ROUTINE_METADATA_CHECKPOINT_LIMIT,
         }
@@ -173,7 +165,6 @@ struct BackgroundWorkAdmission {
     routine_backfill_active: AtomicUsize,
     reclaim_cleanup_active: AtomicUsize,
     lifecycle_cleanup_active: AtomicUsize,
-    stream_session_cleanup_active: AtomicUsize,
     opportunistic_scan_active: AtomicUsize,
     routine_metadata_checkpoint_active: AtomicUsize,
 }
@@ -212,7 +203,6 @@ impl BackgroundWorkAdmission {
             routine_backfill_active: AtomicUsize::new(0),
             reclaim_cleanup_active: AtomicUsize::new(0),
             lifecycle_cleanup_active: AtomicUsize::new(0),
-            stream_session_cleanup_active: AtomicUsize::new(0),
             opportunistic_scan_active: AtomicUsize::new(0),
             routine_metadata_checkpoint_active: AtomicUsize::new(0),
         }
@@ -274,8 +264,7 @@ impl BackgroundWorkAdmission {
         match class {
             BackgroundWorkClass::KnownDamageRepair
             | BackgroundWorkClass::ReclaimCleanup
-            | BackgroundWorkClass::LifecycleCleanup
-            | BackgroundWorkClass::StreamSessionCleanup => None,
+            | BackgroundWorkClass::LifecycleCleanup => None,
             BackgroundWorkClass::BackfillCandidateScan | BackgroundWorkClass::RoutineBackfill => {
                 if pressure.foreground {
                     Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
@@ -316,7 +305,6 @@ impl BackgroundWorkAdmission {
             BackgroundWorkClass::RoutineBackfill => &self.routine_backfill_active,
             BackgroundWorkClass::ReclaimCleanup => &self.reclaim_cleanup_active,
             BackgroundWorkClass::LifecycleCleanup => &self.lifecycle_cleanup_active,
-            BackgroundWorkClass::StreamSessionCleanup => &self.stream_session_cleanup_active,
             BackgroundWorkClass::OpportunisticScan => &self.opportunistic_scan_active,
             BackgroundWorkClass::RoutineMetadataCheckpoint => {
                 &self.routine_metadata_checkpoint_active
@@ -331,7 +319,6 @@ impl BackgroundWorkAdmission {
             BackgroundWorkClass::RoutineBackfill => self.limits.routine_backfill,
             BackgroundWorkClass::ReclaimCleanup => self.limits.reclaim_cleanup,
             BackgroundWorkClass::LifecycleCleanup => self.limits.lifecycle_cleanup,
-            BackgroundWorkClass::StreamSessionCleanup => self.limits.stream_session_cleanup,
             BackgroundWorkClass::OpportunisticScan => self.limits.opportunistic_scan,
             BackgroundWorkClass::RoutineMetadataCheckpoint => {
                 self.limits.routine_metadata_checkpoint
@@ -345,7 +332,6 @@ impl BackgroundWorkAdmission {
             + self.routine_backfill_active.load(Ordering::Acquire)
             + self.reclaim_cleanup_active.load(Ordering::Acquire)
             + self.lifecycle_cleanup_active.load(Ordering::Acquire)
-            + self.stream_session_cleanup_active.load(Ordering::Acquire)
             + self.opportunistic_scan_active.load(Ordering::Acquire)
             + self
                 .routine_metadata_checkpoint_active
@@ -788,11 +774,7 @@ pub(super) struct ShardBackfillSweeper {
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
 
-pub(super) struct StreamSessionSweeper {
-    pub(super) stop: Arc<AtomicBool>,
-    pub(super) wake: Arc<(Mutex<bool>, Condvar)>,
-    pub(super) handle: Mutex<Option<JoinHandle<()>>>,
-}
+pub(super) use storage::StorageStreamSessionSweeper as StreamSessionSweeper;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LifecycleSweepStats {
@@ -1286,17 +1268,6 @@ impl Drop for ShardRepairSweeper {
 }
 
 impl Drop for ShardBackfillSweeper {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        *lock_mutex_unpoisoned(&self.wake.0) = true;
-        self.wake.1.notify_all();
-        if let Some(handle) = lock_mutex_unpoisoned(&self.handle).take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for StreamSessionSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         *lock_mutex_unpoisoned(&self.wake.0) = true;
@@ -2385,86 +2356,14 @@ fn emit_shard_backfill_event(
     );
 }
 
-impl StreamSessionSweeper {
-    pub(super) fn acquire_shared(
-        storage_handle: &StorageClusterRouteHandle,
-    ) -> Result<Arc<Self>, ServerError> {
-        let registry = STREAM_SESSION_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut registry: std::sync::MutexGuard<
-            '_,
-            HashMap<ProcessLocalRegistryKey, Weak<StreamSessionSweeper>>,
-        > = lock_mutex_unpoisoned(registry);
-        registry.retain(|_, sweeper| sweeper.upgrade().is_some());
-
-        let key = storage_handle.current().process_local_registry_key();
-        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
-            return Ok(existing);
+pub(super) fn acquire_stream_session_sweeper(
+    storage_handle: &StorageClusterRouteHandle,
+) -> Result<Arc<StreamSessionSweeper>, ServerError> {
+    StreamSessionSweeper::acquire_shared(storage_handle).map_err(|error| {
+        ServerError::InternalError {
+            reason: error.to_string(),
         }
-
-        let sweeper = Self::spawn(storage_handle.clone())?;
-        registry.insert(key, Arc::downgrade(&sweeper));
-        Ok(sweeper)
-    }
-
-    fn spawn(storage_handle: StorageClusterRouteHandle) -> Result<Arc<Self>, ServerError> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let wake = Arc::new((Mutex::new(false), Condvar::new()));
-        let sweeper = Arc::new(Self {
-            stop: Arc::clone(&stop),
-            wake: Arc::clone(&wake),
-            handle: Mutex::new(None),
-        });
-        let handle = std::thread::Builder::new()
-            .name("argmin-stream-session-sweeper".to_string())
-            .spawn(move || {
-                while !stop.load(Ordering::SeqCst) {
-                    let storage_cluster = storage_handle.current();
-                    let admission = background_work_admission_for(&storage_cluster);
-                    if let Some(_permit) =
-                        admission.try_acquire(BackgroundWorkClass::StreamSessionCleanup)
-                    {
-                        let count = storage_cluster.scavenge_abandoned_stream_sessions(
-                            super::STREAM_SESSION_SCAVENGE_MAX_AGE_MILLIS,
-                        );
-                        if count > 0 {
-                            let _ = observability::event(
-                                TRACE_TARGET,
-                                "stream_session_sweep_abandoned",
-                                Some(format_args!("aborted_sessions={count}")),
-                            );
-                        }
-                    }
-                    if stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let stop_guard = lock_mutex_unpoisoned(&wake.0);
-                    if *stop_guard {
-                        break;
-                    }
-                    let _ = wake
-                        .1
-                        .wait_timeout_while(
-                            stop_guard,
-                            Duration::from_millis(super::STREAM_SESSION_SWEEP_INTERVAL_MILLIS),
-                            |stop_requested| !*stop_requested,
-                        )
-                        .unwrap_or_else(|e| e.into_inner());
-                }
-            })
-            .map_err(|e| ServerError::InternalError {
-                reason: format!("failed to start stream session sweeper: {e}"),
-            })?;
-        *lock_mutex_unpoisoned(&sweeper.handle) = Some(handle);
-        Ok(sweeper)
-    }
-
-    pub(super) fn disabled() -> Arc<Self> {
-        Arc::new(Self {
-            stop: Arc::new(AtomicBool::new(true)),
-            wake: Arc::new((Mutex::new(true), Condvar::new())),
-            handle: Mutex::new(None),
-        })
-    }
+    })
 }
 
 impl ReadRuntime {
@@ -3688,7 +3587,6 @@ mod tests {
                 routine_backfill: 1,
                 reclaim_cleanup: 1,
                 lifecycle_cleanup: 1,
-                stream_session_cleanup: 1,
                 opportunistic_scan: 0,
                 routine_metadata_checkpoint: 1,
             },
@@ -3722,16 +3620,7 @@ mod tests {
                 .is_none(),
             "second lifecycle cleanup permit should be denied at limit"
         );
-        let stream_session_permit = admission
-            .try_acquire(BackgroundWorkClass::StreamSessionCleanup)
-            .expect("stream session cleanup should have its own class limit");
-        assert!(
-            admission
-                .try_acquire(BackgroundWorkClass::StreamSessionCleanup)
-                .is_none(),
-            "second stream session cleanup permit should be denied at limit"
-        );
-        assert_eq!(admission.active_total(), 4);
+        assert_eq!(admission.active_total(), 3);
         let checkpoint_permit = admission
             .try_acquire(BackgroundWorkClass::RoutineMetadataCheckpoint)
             .expect("routine metadata checkpoint should have its own class limit");
@@ -3741,9 +3630,9 @@ mod tests {
                 .is_none(),
             "second routine metadata checkpoint should be denied at limit"
         );
-        assert_eq!(admission.active_total(), 5);
-        drop(checkpoint_permit);
         assert_eq!(admission.active_total(), 4);
+        drop(checkpoint_permit);
+        assert_eq!(admission.active_total(), 3);
         assert!(
             admission
                 .try_acquire(BackgroundWorkClass::OpportunisticScan)
@@ -3752,7 +3641,7 @@ mod tests {
         );
 
         drop(repair_permit);
-        assert_eq!(admission.active_total(), 3);
+        assert_eq!(admission.active_total(), 2);
         let backfill_candidate_scan_permit = admission
             .try_acquire(BackgroundWorkClass::BackfillCandidateScan)
             .expect("backfill candidate scan should have its own class limit");
@@ -3762,7 +3651,7 @@ mod tests {
                 .is_none(),
             "second backfill candidate scan permit should be denied at limit"
         );
-        assert_eq!(admission.active_total(), 4);
+        assert_eq!(admission.active_total(), 3);
         drop(backfill_candidate_scan_permit);
         let routine_backfill_permit = admission
             .try_acquire(BackgroundWorkClass::RoutineBackfill)
@@ -3773,14 +3662,13 @@ mod tests {
                 .is_none(),
             "second routine backfill permit should be denied at limit"
         );
-        assert_eq!(admission.active_total(), 4);
+        assert_eq!(admission.active_total(), 3);
         let replacement = admission
             .try_acquire(BackgroundWorkClass::KnownDamageRepair)
             .expect("dropping a permit should release class capacity");
         drop(replacement);
         drop(reclaim_permit);
         drop(lifecycle_permit);
-        drop(stream_session_permit);
         drop(routine_backfill_permit);
         assert_eq!(admission.active_total(), 0);
     }
@@ -3794,7 +3682,6 @@ mod tests {
                 routine_backfill: 1,
                 reclaim_cleanup: 0,
                 lifecycle_cleanup: 0,
-                stream_session_cleanup: 0,
                 opportunistic_scan: 0,
                 routine_metadata_checkpoint: 1,
             },
@@ -3835,7 +3722,6 @@ mod tests {
                 routine_backfill: 1,
                 reclaim_cleanup: 1,
                 lifecycle_cleanup: 1,
-                stream_session_cleanup: 1,
                 opportunistic_scan: 1,
                 routine_metadata_checkpoint: 1,
             },

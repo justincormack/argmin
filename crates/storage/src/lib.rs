@@ -98,7 +98,12 @@ pub use error::{
     ObjectPgActionError, PgMetadataTransferError, ShardIoError, StorageNodeFailureClass,
     StorageNodeFailureDetail, StoreError,
 };
-pub use maintenance::StorageBackfillCandidateScanner;
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use maintenance::StorageStreamSessionSweepTestSummary;
+pub use maintenance::{
+    StorageBackfillCandidateScanner, StorageMaintenanceStartError, StorageStreamSessionSweeper,
+};
 pub use metadata_command::BucketWriteReservationProof;
 #[cfg(test)]
 pub(crate) use node::LocalStorageNode;

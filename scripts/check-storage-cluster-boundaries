@@ -2907,6 +2907,30 @@ fail_with_matches \
     "Backfill candidate cursor, scan summary, and enqueue transition are storage-owned; schedule scans through StorageBackfillCandidateScanner" \
     "$backfill_candidate_scan_state_leaks"
 
+stream_session_maintenance_leaks=$(
+    {
+        rg -n --color=never \
+            '\bscavenge_abandoned_stream_sessions\b|\bSTREAM_SESSION_(SWEEP_INTERVAL|SCAVENGE_MAX_AGE)' \
+            crates \
+            -g '*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            'pub[[:space:]]+fn[[:space:]]+scavenge_abandoned_stream_sessions\b|pub[[:space:]]+struct[[:space:]]+StreamSessionSweeper\b' \
+            crates/storage/src \
+            -g '*.rs' \
+            || true
+        rg -n --color=never \
+            '\bBackgroundWorkClass::StreamSessionCleanup\b|struct[[:space:]]+StreamSessionSweeper\b' \
+            crates/server-core/src \
+            -g '*.rs' \
+            || true
+    }
+)
+fail_with_matches \
+    "Abandoned stream-session expiry, discovery, cleanup, scheduling, and telemetry are storage-owned; retain only the opaque StorageStreamSessionSweeper outside storage" \
+    "$stream_session_maintenance_leaks"
+
 session_token_format_leaks=$(
     {
         rg -n --color=never \

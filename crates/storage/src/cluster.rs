@@ -2241,6 +2241,15 @@ pub struct RetainedStreamUploadCleanup {
     key: ObjectKey,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamSessionSweepSummary {
+    pub(crate) discovered: usize,
+    pub(crate) due: usize,
+    pub(crate) cleaned: usize,
+    pub(crate) reservation_check_failed: usize,
+    pub(crate) abort_failed: usize,
+}
+
 impl RetainedStreamUploadCleanup {
     pub fn abort(&self, session_id: &SessionId) -> Result<(), ObjectPgActionError> {
         self.cluster
@@ -15251,7 +15260,7 @@ impl StorageCluster {
         Ok(())
     }
 
-    pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {
+    fn list_stream_upload_sessions_best_effort_inner(&self) -> Vec<StreamUploadRecord> {
         const STREAM_UPLOAD_SESSION_BEST_EFFORT_PAGE_LIMIT: u32 = 1024;
         let mut sessions = Vec::new();
         for &pg_id in self.local_map.pg_ids() {
@@ -15287,12 +15296,16 @@ impl StorageCluster {
         sessions
     }
 
-    pub fn scavenge_abandoned_stream_sessions(&self, max_age_ms: u64) -> usize {
+    pub(crate) fn scavenge_abandoned_stream_sessions(
+        &self,
+        max_age_ms: u64,
+    ) -> StreamSessionSweepSummary {
         let now = crate::clock::current_time_millis();
         let cutoff = now.saturating_sub(max_age_ms);
-        let mut count = 0;
+        let mut summary = StreamSessionSweepSummary::default();
 
-        for session in self.list_stream_upload_sessions_best_effort() {
+        for session in self.list_stream_upload_sessions_best_effort_inner() {
+            summary.discovered += 1;
             let durable_cleanup_due = session
                 .cleanup_after
                 .is_some_and(|cleanup_after| cleanup_after <= now);
@@ -15303,9 +15316,13 @@ impl StorageCluster {
                 match self.stream_upload_has_live_bucket_write_reservation(&session) {
                     Ok(true) => continue,
                     Ok(false) => {}
-                    Err(_) => continue,
+                    Err(_) => {
+                        summary.reservation_check_failed += 1;
+                        continue;
+                    }
                 }
             }
+            summary.due += 1;
             match self.abort_stream_upload_session(
                 &session.bucket,
                 &session.key,
@@ -15319,7 +15336,7 @@ impl StorageCluster {
                             &session.session_id,
                         );
                     }
-                    count += 1;
+                    summary.cleaned += 1;
                 }
                 Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
                     ..
@@ -15331,13 +15348,25 @@ impl StorageCluster {
                             &session.session_id,
                         );
                     }
-                    count += 1;
+                    summary.cleaned += 1;
                 }
-                Err(_) => {}
+                Err(_) => summary.abort_failed += 1,
             }
         }
 
-        count
+        summary
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {
+        self.list_stream_upload_sessions_best_effort_inner()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn test_scavenge_abandoned_stream_sessions(&self, max_age_ms: u64) -> usize {
+        self.scavenge_abandoned_stream_sessions(max_age_ms).cleaned
     }
 
     pub fn read_segment_payload_stored_bytes_into(

@@ -6559,7 +6559,7 @@ Connection: close\r\n\r\n",
                 storage::RouteMapValidity::until_ms(cleanup_after.saturating_add(1_000)).unwrap(),
             );
             assert_eq!(
-                initial.scavenge_abandoned_stream_sessions(60_000),
+                initial.test_scavenge_abandoned_stream_sessions(60_000),
                 1,
                 "the durable deadline must let independent current-route cleanup finish"
             );
@@ -6698,7 +6698,7 @@ Connection: close\r\n\r\n",
                 storage::RouteMapValidity::until_ms(cleanup_after.saturating_add(1_000)).unwrap(),
             );
             assert_eq!(
-                initial.scavenge_abandoned_stream_sessions(60_000),
+                initial.test_scavenge_abandoned_stream_sessions(60_000),
                 1,
                 "the durable deadline must independently clean UploadPart state"
             );

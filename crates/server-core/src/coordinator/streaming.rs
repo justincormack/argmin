@@ -944,8 +944,9 @@ impl Coordinator {
         )
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn scavenge_stale_sessions(&self, max_age_ms: u64) -> usize {
         self.storage_node()
-            .scavenge_abandoned_stream_sessions(max_age_ms)
+            .test_scavenge_abandoned_stream_sessions(max_age_ms)
     }
 }

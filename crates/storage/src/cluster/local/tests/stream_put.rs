@@ -1532,7 +1532,7 @@ fn stream_session_scavenger_aborts_only_expired_put_object_proofs() {
             )
             .unwrap();
         assert_eq!(
-            cluster.scavenge_abandoned_stream_sessions(0),
+            cluster.scavenge_abandoned_stream_sessions(0).cleaned,
             1,
             "scavenger should abort only the expired proof"
         );
@@ -1637,7 +1637,7 @@ fn stream_session_scavenger_does_not_age_abort_upload_part_sessions() {
 
     crate::clock::with_time_override(121_000, || {
         assert_eq!(
-            cluster.scavenge_abandoned_stream_sessions(60_000),
+            cluster.scavenge_abandoned_stream_sessions(60_000).cleaned,
             0,
             "periodic scavenger must not age-abort UploadPart sessions without durable liveness"
         );

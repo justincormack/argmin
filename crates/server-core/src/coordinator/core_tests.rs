@@ -114,7 +114,7 @@ fn setup_coordinator_with_only_shard_repair_worker(
             |_| Ok(ShardScavengerSweeper::disabled()),
             ShardRepairSweeper::acquire_shared,
             |_| Ok(ShardBackfillSweeper::disabled()),
-            |_| Ok(StreamSessionSweeper::disabled()),
+            |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
         ),
     )
     .unwrap()
@@ -137,7 +137,7 @@ fn setup_coordinator_with_only_shard_backfill_worker(
             |_| Ok(ShardScavengerSweeper::disabled()),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
             ShardBackfillSweeper::acquire_shared,
-            |_| Ok(StreamSessionSweeper::disabled()),
+            |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
         ),
     )
     .unwrap()
@@ -160,30 +160,7 @@ fn setup_coordinator_with_only_reclaim_worker(
             |_| Ok(ShardScavengerSweeper::disabled()),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
             |_| Ok(ShardBackfillSweeper::disabled()),
-            |_| Ok(StreamSessionSweeper::disabled()),
-        ),
-    )
-    .unwrap()
-}
-
-fn setup_coordinator_with_only_stream_session_worker(
-    storage_handle: StorageClusterRouteHandle,
-    storage_cluster: Arc<StorageCluster>,
-) -> Coordinator {
-    Coordinator::new_with_shared_caches_and_background_sweeper_factories(
-        storage_handle,
-        Arc::clone(&storage_cluster),
-        shared_caches_for_storage_cluster(&storage_cluster),
-        "us-east-1".to_string(),
-        None,
-        Some(test_sse_s3_provider()),
-        (
-            false,
-            |_, _| Ok(LifecycleSweeper::disabled()),
-            |_| Ok(ShardScavengerSweeper::disabled()),
-            |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
-            |_| Ok(ShardBackfillSweeper::disabled()),
-            StreamSessionSweeper::acquire_shared,
+            |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
         ),
     )
     .unwrap()
@@ -6645,11 +6622,14 @@ fn deferred_object_reclaim_clears_original_and_duplicate_runtime_map_queue_owner
 #[test]
 fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
     let tmp = test_util::tempdir();
+    let time = storage::clock::test_time_override_guard(1_000);
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
     initial.test_store_route_map_validity(long_lived_test_route_map_validity());
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
-    let coord =
-        setup_coordinator_with_only_stream_session_worker(handle.clone(), Arc::clone(&initial));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&initial),
+    );
+    let sweeper = StreamSessionSweeper::disabled(handle.clone());
     coord
         .create_bucket_for_owner("default-owner", "stream-cleanup-refresh", false)
         .unwrap();
@@ -6657,7 +6637,7 @@ fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
     let bucket = trusted_bucket_name("stream-cleanup-refresh");
     let key = trusted_object_key("key");
     let session_id = storage::SessionId::try_from("81818181818181818181818181818181").unwrap();
-    let cleanup_after = storage::clock::current_time_millis().saturating_add(100);
+    let cleanup_after = 1_100;
     initial
         .create_put_object_stream_session_record_with_cleanup_deadline(
             &bucket,
@@ -6669,30 +6649,65 @@ fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
         .unwrap();
 
     install_same_store_same_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
-    assert!(!Arc::ptr_eq(&coord.storage_node(), &initial));
-
-    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
-    loop {
-        match coord
-            .storage_node()
-            .load_stream_upload_session(&bucket, &key, &session_id)
-        {
-            Err(storage::ObjectPgActionError::Metadata(
-                storage::MetadataError::StreamSessionNotFound { .. },
-            )) => break,
-            Ok(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(_) => panic!("refreshed-map stream-session sweeper did not finish durable cleanup"),
-            Err(error) => panic!("unexpected durable stream cleanup error: {error:?}"),
-        }
-    }
+    let refreshed = handle.current();
+    assert!(!Arc::ptr_eq(&refreshed, &initial));
+    let refreshed_session = refreshed
+        .load_stream_upload_session(&bucket, &key, &session_id)
+        .expect("the refreshed route must observe the durable session before cleanup");
+    assert_eq!(
+        refreshed_session.cleanup_after,
+        Some(cleanup_after),
+        "the cleanup deadline must survive route publication"
+    );
+    assert!(
+        refreshed
+            .list_stream_upload_sessions_best_effort()
+            .iter()
+            .any(|session| session.session_id == session_id),
+        "the refreshed maintenance scan must discover the durable session"
+    );
+    time.set(cleanup_after + 1);
+    let sweep_summary = sweeper.test_sweep_once();
+    assert_eq!(
+        sweep_summary.cleaned, 1,
+        "storage-owned cleanup must follow the refreshed route handle; summary={sweep_summary:?}"
+    );
     assert!(matches!(
-        coord
-            .storage_node()
-            .test_object_generation_reservation_for(&bucket, &key, &session_id),
+        refreshed.load_stream_upload_session(&bucket, &key, &session_id),
+        Err(storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::StreamSessionNotFound { .. }
+        ))
+    ));
+    assert!(matches!(
+        refreshed.test_object_generation_reservation_for(&bucket, &key, &session_id),
         Err(storage::ObjectPgActionError::Metadata(
             storage::MetadataError::ObjectGenerationReservationNotFound { .. }
         ))
     ));
+}
+
+#[test]
+fn stream_session_sweeper_remains_shared_across_storage_identity_replacement() {
+    let tmp = test_util::tempdir();
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
+    initial.test_store_route_map_validity(long_lived_test_route_map_validity());
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
+    let first = storage::StorageStreamSessionSweeper::acquire_shared(&handle).unwrap();
+
+    let replacement = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+    assert_ne!(
+        initial.process_local_registry_key(),
+        replacement.process_local_registry_key(),
+        "the replacement must exercise a distinct process-local storage identity"
+    );
+    runtime_handle.install(Arc::clone(&replacement)).unwrap();
+    assert!(Arc::ptr_eq(&handle.current(), &replacement));
+
+    let reacquired = storage::StorageStreamSessionSweeper::acquire_shared(&handle).unwrap();
+    assert!(
+        Arc::ptr_eq(&first, &reacquired),
+        "one route-publication domain must retain one cleanup worker across storage identities"
+    );
 }
 
 #[test]
@@ -19890,7 +19905,7 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
             |_| Ok(ShardScavengerSweeper::disabled()),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
             |_| Ok(ShardBackfillSweeper::disabled()),
-            |_| Ok(StreamSessionSweeper::disabled()),
+            |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
         ),
     )
     .unwrap();
@@ -20026,7 +20041,7 @@ fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
             |_| Ok(ShardScavengerSweeper::disabled()),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
             |_| Ok(ShardBackfillSweeper::disabled()),
-            |_| Ok(StreamSessionSweeper::disabled()),
+            |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
         ),
     )
     .unwrap();
@@ -20147,7 +20162,7 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
             |_| Ok(ShardScavengerSweeper::disabled()),
             ShardRepairSweeper::acquire_shared,
             |_| Ok(ShardBackfillSweeper::disabled()),
-            |_| Ok(StreamSessionSweeper::disabled()),
+            |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
         ),
     )
     .unwrap();

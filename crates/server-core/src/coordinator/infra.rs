@@ -9,8 +9,8 @@ use super::read_core::ReadRuntime;
 use super::request_types::AuthorizePutObjectRequest;
 use super::response_types::{BucketSummary, ModernBucketSummary};
 use super::runtime::{
-    LifecycleSweeper, ReclaimSweeper, ShardBackfillSweeper, ShardRepairSweeper,
-    ShardScavengerSweeper, StreamSessionSweeper,
+    acquire_stream_session_sweeper, LifecycleSweeper, ReclaimSweeper, ShardBackfillSweeper,
+    ShardRepairSweeper, ShardScavengerSweeper, StreamSessionSweeper,
 };
 #[cfg(test)]
 use super::trusted_bucket_name;
@@ -486,9 +486,9 @@ impl Coordinator {
         };
         let stream_session_sweeper_factory = |storage_handle: &StorageClusterRouteHandle| {
             if background_worker_mode.stream_session {
-                StreamSessionSweeper::acquire_shared(storage_handle)
+                acquire_stream_session_sweeper(storage_handle)
             } else {
-                Ok(StreamSessionSweeper::disabled())
+                Ok(StreamSessionSweeper::disabled(storage_handle.clone()))
             }
         };
         Self::new_with_shared_caches_and_background_storage_and_sweeper_factories(
@@ -588,7 +588,7 @@ impl Coordinator {
                 ShardScavengerSweeper::acquire_shared,
                 ShardRepairSweeper::acquire_shared,
                 ShardBackfillSweeper::acquire_shared,
-                StreamSessionSweeper::acquire_shared,
+                acquire_stream_session_sweeper,
             ),
         )
     }
@@ -776,7 +776,7 @@ impl Coordinator {
             shard_scavenger: !self._shard_scavenger_sweeper.stop.load(Ordering::SeqCst),
             shard_repair: !self._shard_repair_sweeper.stop.load(Ordering::SeqCst),
             shard_backfill: !self._shard_backfill_sweeper.stop.load(Ordering::SeqCst),
-            stream_session: !self._stream_session_sweeper.stop.load(Ordering::SeqCst),
+            stream_session: self._stream_session_sweeper.test_is_enabled(),
         }
     }
 
