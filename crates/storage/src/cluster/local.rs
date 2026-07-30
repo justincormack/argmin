@@ -2609,6 +2609,7 @@ impl LocalClusterMap {
     ) -> Result<(), ClusterBuildError> {
         let configs: Vec<LocalUnixStorageNodeClientConfig> = configs.into_iter().collect();
         self.validate_unix_storage_node_client_configs(&configs)?;
+        let object_listing_topology = Arc::new(self.pg_topology.clone());
 
         for config in configs {
             let node = self
@@ -2629,7 +2630,8 @@ impl LocalClusterMap {
                             .rpc_control_admission_wait_timeout,
                     },
                     config.rpc_auth,
-                ),
+                )
+                .with_object_listing_topology(Arc::clone(&object_listing_topology)),
             );
             let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = client.clone();
             let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> =
@@ -3132,16 +3134,16 @@ impl LocalClusterMap {
                 );
             }
         }
+        let object_listing_topology = Arc::new(self.pg_topology.clone());
         for config in configs {
             let node = self
                 .nodes
                 .get_mut(&config.node_id)
                 .expect("validated remote object-listing metadata client node must exist");
-            let client = Arc::new(UnixStorageNodeClient::new(
-                config.node_id,
-                self.epoch,
-                config.socket_path,
-            ));
+            let client = Arc::new(
+                UnixStorageNodeClient::new(config.node_id, self.epoch, config.socket_path)
+                    .with_object_listing_topology(Arc::clone(&object_listing_topology)),
+            );
             let object_listing_metadata_client: Arc<dyn ObjectListingMetadataNodeClient> = client;
             node.object_listing_metadata_client = object_listing_metadata_client;
         }

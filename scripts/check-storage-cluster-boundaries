@@ -417,7 +417,8 @@ migrated_bucket_listing_bypasses=$(
         }
         if ($0 ~ /\.object_listing_metadata_client\(\)/ \
             || $0 ~ /object_listing_metadata_client[[:space:]]*$/ \
-            || $0 ~ /listing_client[[:space:]]*$/) {
+            || $0 ~ /listing_client[[:space:]]*$/ \
+            || $0 ~ /listing_route[[:space:]]*$/) {
             pending_object_listing_metadata_client = 1
         }
         if ($0 ~ /\.(list_objects|list_object_versions|list_multipart_uploads|list_objects_page|list_object_versions_page|list_multipart_uploads_page)\(/) {
@@ -426,7 +427,8 @@ migrated_bucket_listing_bypasses=$(
             }
             if (pending_object_listing_metadata_client \
                 || $0 ~ /\.object_listing_metadata_client\(\)/ \
-                || $0 ~ /listing_client\./) {
+                || $0 ~ /listing_client\./ \
+                || $0 ~ /listing_route\./) {
                 pending_object_listing_metadata_client = 0
                 pending_storage_client = 0
                 next

@@ -76,6 +76,12 @@ struct LocalObjectReadMetadataRoute {
     key: ObjectKey,
 }
 
+struct LocalObjectListingMetadataRoute {
+    storage_node: Arc<SharedStorageNode>,
+    _route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataScanPgId,
+}
+
 impl ObjectPayloadLeaseNodeLease for LocalObjectPayloadLease {
     fn release(&mut self) -> Result<usize, StoreError> {
         if self.released {
@@ -2716,31 +2722,86 @@ impl ObjectReadMetadataRoute for LocalObjectReadMetadataRoute {
 }
 
 impl ObjectListingMetadataNodeClient for LocalStorageNodeClient {
+    fn open_object_listing_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataScanPgId,
+    ) -> Result<Box<dyn ObjectListingMetadataRoute + '_>, BucketSnapshotLoadError> {
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalObjectListingMetadataRoute {
+            storage_node: Arc::clone(&self.storage_node),
+            _route_cluster_epoch: route_cluster_epoch,
+            pg_id,
+        }))
+    }
+}
+
+impl ObjectListingMetadataRoute for LocalObjectListingMetadataRoute {
     fn list_objects_page(
         &self,
-        pg_id: ObjectMetadataScanPgId,
         req: &ListObjectsReq,
     ) -> Result<ListObjectsResp, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(pg.list_objects(req)?)
+        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let response = pg.list_objects(req)?;
+        for object in &response.objects {
+            self.validate_listing_subject(
+                object.bucket(),
+                object.key(),
+                "validate object listing response scan PG",
+            )?;
+        }
+        Ok(response)
     }
 
     fn list_object_versions_page(
         &self,
-        pg_id: ObjectMetadataScanPgId,
         req: &ListObjectVersionsReq,
     ) -> Result<ListObjectVersionsResp, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(pg.list_object_versions(req)?)
+        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let response = pg.list_object_versions(req)?;
+        for object in &response.versions {
+            self.validate_listing_subject(
+                object.bucket(),
+                object.key(),
+                "validate object version listing response scan PG",
+            )?;
+        }
+        Ok(response)
     }
 
     fn list_multipart_uploads_page(
         &self,
-        pg_id: ObjectMetadataScanPgId,
         req: &ListMultipartUploadsReq,
     ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(pg.list_multipart_uploads(req)?)
+        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let response = pg.list_multipart_uploads(req)?;
+        for upload in &response.uploads {
+            self.validate_listing_subject(
+                &upload.bucket,
+                &upload.key,
+                "validate multipart upload listing response scan PG",
+            )?;
+        }
+        Ok(response)
+    }
+}
+
+impl LocalObjectListingMetadataRoute {
+    fn validate_listing_subject(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if self
+            .storage_node
+            .object_metadata_pg_for(bucket, key)
+            .pg_id()
+            != self.pg_id.pg_id()
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
     }
 }
 

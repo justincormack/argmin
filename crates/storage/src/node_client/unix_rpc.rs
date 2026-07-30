@@ -1660,10 +1660,16 @@ impl UnixStorageNodeClient {
             node_id,
             cluster_epoch,
             endpoint,
+            object_listing_topology: None,
             next_request_id: AtomicU64::new(1),
             rpc_admission,
             rpc_auth,
         }
+    }
+
+    pub(crate) fn with_object_listing_topology(mut self, pg_topology: Arc<PgTopology>) -> Self {
+        self.object_listing_topology = Some(pg_topology);
+        self
     }
 
     pub(crate) fn with_rpc_admission_settings(

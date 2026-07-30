@@ -50,7 +50,7 @@ use crate::node::SharedStorageNode;
 use crate::node_client::{
     BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
     CreateStreamUploadPrecondition, MetadataCommandInspectionNodeClient, MetadataCommandNodeClient,
-    MetadataCommandPeeringNodeClient, ObjectListingMetadataNodeClient, ObjectPayloadLeaseNodeLease,
+    MetadataCommandPeeringNodeClient, ObjectListingMetadataRoute, ObjectPayloadLeaseNodeLease,
     RetainedShardAckNodeClient, ShardAckRoute,
 };
 pub use crate::peering::PgMetadataTransferArtifact;
@@ -10126,14 +10126,19 @@ impl StorageCluster {
         Ok(summary)
     }
 
-    fn metadata_pg_primary_object_listing_client(
+    fn metadata_pg_primary_object_listing_route(
         &self,
         pg_id: PgId,
-    ) -> Result<&Arc<dyn ObjectListingMetadataNodeClient>, StoreError> {
+    ) -> Result<Box<dyn ObjectListingMetadataRoute + '_>, BucketSnapshotLoadError> {
         let node = self
             .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        Ok(node.object_listing_metadata_client())
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        node.object_listing_metadata_client()
+            .open_object_listing_metadata_route(
+                self.operation_epoch(),
+                self.object_metadata_scan_pg(pg_id),
+            )
     }
 
     fn bucket_metadata_pg_id(&self, bucket: &BucketName) -> u32 {

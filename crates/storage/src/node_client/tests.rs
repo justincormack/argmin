@@ -1597,6 +1597,209 @@ fn local_peering_route_rejects_future_epoch_command_without_mutation() {
 }
 
 #[test]
+fn local_object_listing_metadata_route_binds_scan_pg() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let bucket = crate::tests::bucket_name("object-listing-route-bucket");
+
+    assert!(matches!(
+        client
+            .open_object_listing_metadata_route(
+                ClusterEpoch::INITIAL,
+                ObjectMetadataScanPgId::new_for_test(PgId::new(1)),
+            )
+            .err()
+            .expect("unavailable object-listing PG must fail before storage"),
+        BucketSnapshotLoadError::Store(StoreError::PgNotFound { pg_id: 1 })
+    ));
+
+    let route = client
+        .open_object_listing_metadata_route(
+            ClusterEpoch::INITIAL,
+            ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+        )
+        .unwrap();
+    assert!(route
+        .list_objects_page(&ListObjectsReq {
+            bucket: bucket.clone(),
+            prefix: None,
+            start_after: None,
+            start_at: None,
+            max_keys: 1,
+        })
+        .unwrap()
+        .objects
+        .is_empty());
+    assert!(route
+        .list_object_versions_page(&ListObjectVersionsReq {
+            bucket: bucket.clone(),
+            prefix: None,
+            key_marker: None,
+            version_id_marker: None,
+            start_at: None,
+            max_keys: 1,
+        })
+        .unwrap()
+        .versions
+        .is_empty());
+    assert!(route
+        .list_multipart_uploads_page(&ListMultipartUploadsReq {
+            bucket,
+            prefix: None,
+            page_start: None,
+            max_uploads: 1,
+        })
+        .unwrap()
+        .uploads
+        .is_empty());
+}
+
+#[test]
+fn local_object_listing_metadata_route_rejects_foreign_scan_pg_rows() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0, 1],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let bucket = crate::tests::bucket_name("foreign-local-listing-row-bucket");
+    let key = (0..10_000)
+        .map(|index| crate::tests::object_key(format!("foreign-local-listing-row-{index}")))
+        .find(|key| storage_node.object_metadata_pg_for(&bucket, key).get() == 1)
+        .expect("test must find a key placed on the foreign scan PG");
+    let upload_id = UploadId::try_from("u".repeat(crate::UPLOAD_ID_LEN)).unwrap();
+    let pg = storage_node.get_pg(0).unwrap();
+    PgMetadataStore::put_object_with_segments(
+        &*pg,
+        &PutLiveObjectReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::new(10).unwrap(),
+            size: 0,
+            etag: ObjectEtag::single_part(0),
+            ec: EcShape { k: 4, m: 2 },
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        },
+        &[],
+    )
+    .unwrap();
+    PgMetadataStore::create_multipart_upload(
+        &*pg,
+        &CreateMultipartUploadReq {
+            upload_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            initiator: OwnerIdentity::from_principal("owner"),
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_lock: ObjectLockState::default(),
+            checksum: None,
+            encryption: ObjectEncryption::None,
+        },
+    )
+    .unwrap();
+    drop(pg);
+
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let route = client
+        .open_object_listing_metadata_route(
+            ClusterEpoch::INITIAL,
+            ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+        )
+        .unwrap();
+    let Err(object_error) = route.list_objects_page(&ListObjectsReq {
+        bucket: bucket.clone(),
+        prefix: None,
+        start_after: None,
+        start_at: None,
+        max_keys: 1,
+    }) else {
+        panic!("misplaced object listing row must fail closed");
+    };
+    let Err(version_error) = route.list_object_versions_page(&ListObjectVersionsReq {
+        bucket: bucket.clone(),
+        prefix: None,
+        key_marker: None,
+        version_id_marker: None,
+        start_at: None,
+        max_keys: 1,
+    }) else {
+        panic!("misplaced object-version listing row must fail closed");
+    };
+    let Err(upload_error) = route.list_multipart_uploads_page(&ListMultipartUploadsReq {
+        bucket,
+        prefix: None,
+        page_start: None,
+        max_uploads: 1,
+    }) else {
+        panic!("misplaced multipart-upload listing row must fail closed");
+    };
+
+    for (error, operation) in [
+        (object_error, "validate object listing response scan PG"),
+        (
+            version_error,
+            "validate object version listing response scan PG",
+        ),
+        (
+            upload_error,
+            "validate multipart upload listing response scan PG",
+        ),
+    ] {
+        assert!(matches!(
+            error,
+            BucketSnapshotLoadError::Store(StoreError::RouteCapabilitySubjectMismatch {
+                operation: actual,
+            }) if actual == operation
+        ));
+    }
+}
+
+#[test]
+fn unix_object_listing_metadata_route_rejects_foreign_epoch_before_rpc() {
+    let client = test_unix_storage_node_client();
+    let future_epoch = ClusterEpoch::new(client.cluster_epoch.get() + 1).unwrap();
+    assert!(matches!(
+        client
+            .open_object_listing_metadata_route(
+                future_epoch,
+                ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+            )
+            .err()
+            .expect("future object-listing route must fail before RPC"),
+        BucketSnapshotLoadError::Store(StoreError::StaleMetadataOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        }) if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
+}
+
+#[test]
 fn local_object_read_metadata_route_binds_exact_object_subject() {
     let tmp = test_util::tempdir();
     let storage_node = Arc::new(
@@ -2020,6 +2223,7 @@ fn test_unix_storage_node_client() -> UnixStorageNodeClient {
         ClusterEpoch::new(1).unwrap(),
         tmp.path().join("unused.sock"),
     )
+    .with_object_listing_topology(Arc::new(PgTopology::new(&[0]).unwrap()))
 }
 
 fn test_unix_storage_node_client_with_rpc_admission_timeout(

@@ -1432,11 +1432,8 @@ impl super::StorageCluster {
         req: &ListObjectsReq,
     ) -> Result<ListObjectsResp, ObjectPgActionError> {
         let pg_id = PgId::new(pg_id);
-        let scan_pg_id = self.object_metadata_scan_pg(pg_id);
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_listing_metadata_client()
-            .list_objects_page(scan_pg_id, req)
+        self.metadata_pg_primary_object_listing_route(pg_id)
+            .and_then(|listing_route| listing_route.list_objects_page(req))
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
@@ -1446,11 +1443,8 @@ impl super::StorageCluster {
         req: &ListObjectVersionsReq,
     ) -> Result<ListObjectVersionsResp, ObjectPgActionError> {
         let pg_id = PgId::new(pg_id);
-        let scan_pg_id = self.object_metadata_scan_pg(pg_id);
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_listing_metadata_client()
-            .list_object_versions_page(scan_pg_id, req)
+        self.metadata_pg_primary_object_listing_route(pg_id)
+            .and_then(|listing_route| listing_route.list_object_versions_page(req))
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
@@ -1460,11 +1454,8 @@ impl super::StorageCluster {
         req: &ListMultipartUploadsReq,
     ) -> Result<ListMultipartUploadsResp, ObjectPgActionError> {
         let pg_id = PgId::new(pg_id);
-        let scan_pg_id = self.object_metadata_scan_pg(pg_id);
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_listing_metadata_client()
-            .list_multipart_uploads_page(scan_pg_id, req)
+        self.metadata_pg_primary_object_listing_route(pg_id)
+            .and_then(|listing_route| listing_route.list_multipart_uploads_page(req))
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
@@ -7346,41 +7337,37 @@ impl super::StorageCluster {
         pg_id: PgId,
         include_stream_uploads: bool,
     ) -> Result<Option<BucketVisibleDataSource>, BucketWriteDrainError> {
-        let scan_pg_id = self.object_metadata_scan_pg(pg_id);
-        let listing_client = self.metadata_pg_primary_object_listing_client(pg_id)?;
-        let versions = listing_client
-            .list_object_versions_page(
-                scan_pg_id,
-                &ListObjectVersionsReq {
-                    bucket: bucket.clone(),
-                    prefix: None,
-                    key_marker: None,
-                    version_id_marker: None,
-                    start_at: None,
-                    max_keys: 1,
-                },
-            )
+        let listing_route = self
+            .metadata_pg_primary_object_listing_route(pg_id)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        let versions = listing_route
+            .list_object_versions_page(&ListObjectVersionsReq {
+                bucket: bucket.clone(),
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                start_at: None,
+                max_keys: 1,
+            })
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
         if !versions.versions.is_empty() {
             return Ok(Some(BucketVisibleDataSource::ObjectVersion { pg_id }));
         }
 
-        let uploads = listing_client
-            .list_multipart_uploads_page(
-                scan_pg_id,
-                &ListMultipartUploadsReq {
-                    bucket: bucket.clone(),
-                    prefix: None,
-                    page_start: None,
-                    max_uploads: 1,
-                },
-            )
+        let uploads = listing_route
+            .list_multipart_uploads_page(&ListMultipartUploadsReq {
+                bucket: bucket.clone(),
+                prefix: None,
+                page_start: None,
+                max_uploads: 1,
+            })
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
         if !uploads.uploads.is_empty() {
             return Ok(Some(BucketVisibleDataSource::MultipartUpload { pg_id }));
         }
 
         if include_stream_uploads {
+            let scan_pg_id = self.object_metadata_scan_pg(pg_id);
             let node = self
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
@@ -15692,17 +15679,17 @@ impl super::StorageCluster {
             };
             match node
                 .object_listing_metadata_client()
-                .list_object_versions_page(
-                    scan_pg_id,
-                    &ListObjectVersionsReq {
+                .open_object_listing_metadata_route(self.operation_epoch(), scan_pg_id)
+                .and_then(|route| {
+                    route.list_object_versions_page(&ListObjectVersionsReq {
                         bucket: bucket.clone(),
                         prefix: None,
                         key_marker: None,
                         version_id_marker: None,
                         start_at: None,
                         max_keys: 1,
-                    },
-                ) {
+                    })
+                }) {
                 Ok(resp) => {
                     if let Some(stored) = resp.versions.into_iter().next() {
                         object_version_samples

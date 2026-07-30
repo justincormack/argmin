@@ -686,72 +686,66 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
         NodeId::new(7),
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
-    );
+    )
+    .with_object_listing_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
     let bucket = crate::tests::bucket_name("object-listing-scan-pg-bucket");
     let installed_scan_pg = ObjectMetadataScanPgId::new_for_test(PgId::new(1));
     let unknown_scan_pg = ObjectMetadataScanPgId::new_for_test(PgId::new(2));
+    let installed_route = client
+        .open_object_listing_metadata_route(ClusterEpoch::INITIAL, installed_scan_pg)
+        .unwrap();
 
-    let objects = ObjectListingMetadataNodeClient::list_objects_page(
-        &client,
-        installed_scan_pg,
-        &ListObjectsReq {
+    let objects = installed_route
+        .list_objects_page(&ListObjectsReq {
             bucket: bucket.clone(),
             prefix: None,
             start_after: None,
             start_at: None,
             max_keys: 10,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert!(objects.objects.is_empty());
     assert!(!objects.is_truncated);
     assert!(objects.next_start_after.is_none());
 
-    let versions = ObjectListingMetadataNodeClient::list_object_versions_page(
-        &client,
-        installed_scan_pg,
-        &ListObjectVersionsReq {
+    let versions = installed_route
+        .list_object_versions_page(&ListObjectVersionsReq {
             bucket: bucket.clone(),
             prefix: None,
             key_marker: None,
             version_id_marker: None,
             start_at: None,
             max_keys: 10,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert!(versions.versions.is_empty());
     assert!(!versions.is_truncated);
     assert!(versions.next_key_marker.is_none());
     assert!(versions.next_version_id_marker.is_none());
 
-    let uploads = ObjectListingMetadataNodeClient::list_multipart_uploads_page(
-        &client,
-        installed_scan_pg,
-        &ListMultipartUploadsReq {
+    let uploads = installed_route
+        .list_multipart_uploads_page(&ListMultipartUploadsReq {
             bucket: bucket.clone(),
             prefix: None,
             page_start: None,
             max_uploads: 10,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert!(uploads.uploads.is_empty());
     assert!(!uploads.is_truncated);
     assert!(uploads.next_key_marker.is_none());
     assert!(uploads.next_upload_id_marker.is_none());
 
-    let Err(object_error) = ObjectListingMetadataNodeClient::list_objects_page(
-        &client,
-        unknown_scan_pg,
-        &ListObjectsReq {
-            bucket: bucket.clone(),
-            prefix: None,
-            start_after: None,
-            start_at: None,
-            max_keys: 10,
-        },
-    ) else {
+    let unknown_route = client
+        .open_object_listing_metadata_route(ClusterEpoch::INITIAL, unknown_scan_pg)
+        .unwrap();
+    let Err(object_error) = unknown_route.list_objects_page(&ListObjectsReq {
+        bucket: bucket.clone(),
+        prefix: None,
+        start_after: None,
+        start_at: None,
+        max_keys: 10,
+    }) else {
         panic!("unknown scan PG must not reach object listing");
     };
     assert!(matches!(
@@ -762,18 +756,14 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
         })
     ));
 
-    let Err(version_error) = ObjectListingMetadataNodeClient::list_object_versions_page(
-        &client,
-        unknown_scan_pg,
-        &ListObjectVersionsReq {
-            bucket: bucket.clone(),
-            prefix: None,
-            key_marker: None,
-            version_id_marker: None,
-            start_at: None,
-            max_keys: 10,
-        },
-    ) else {
+    let Err(version_error) = unknown_route.list_object_versions_page(&ListObjectVersionsReq {
+        bucket: bucket.clone(),
+        prefix: None,
+        key_marker: None,
+        version_id_marker: None,
+        start_at: None,
+        max_keys: 10,
+    }) else {
         panic!("unknown scan PG must not reach object-version listing");
     };
     assert!(matches!(
@@ -784,16 +774,12 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
         })
     ));
 
-    let Err(upload_error) = ObjectListingMetadataNodeClient::list_multipart_uploads_page(
-        &client,
-        unknown_scan_pg,
-        &ListMultipartUploadsReq {
-            bucket: bucket.clone(),
-            prefix: None,
-            page_start: None,
-            max_uploads: 10,
-        },
-    ) else {
+    let Err(upload_error) = unknown_route.list_multipart_uploads_page(&ListMultipartUploadsReq {
+        bucket: bucket.clone(),
+        prefix: None,
+        page_start: None,
+        max_uploads: 10,
+    }) else {
         panic!("unknown scan PG must not reach multipart-upload listing");
     };
     assert!(matches!(
@@ -2880,6 +2866,142 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
         )
     );
 
+    for thread in server_threads {
+        thread.join().unwrap();
+    }
+}
+
+#[test]
+fn installed_unix_object_listing_routes_reject_misplaced_durable_rows_as_payload_decode() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.pg_ids = vec![0, 1];
+    config.pg_routes.push(StorageNodePgRoute {
+        pg_id: 1,
+        cluster_epoch: ClusterEpoch::INITIAL,
+        state: crate::types::PgState::Active,
+        primary_node_id: config.node_id,
+        metadata_transfer_destination_epoch: None,
+        acting_set: vec![config.node_id],
+    });
+    let pg_topology = Arc::new(PgTopology::new(&config.pg_ids).unwrap());
+    let bucket = crate::tests::bucket_name("misplaced-unix-listing-row-bucket");
+    let key = (0..10_000)
+        .map(|index| crate::tests::object_key(format!("misplaced-unix-listing-row-{index}")))
+        .find(|key| pg_topology.object_pg_for(&bucket, key) == 1)
+        .expect("test must find a key placed on the foreign scan PG");
+    let upload_id = crate::tests::multipart_upload_id("misplaced-unix-listing-upload");
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let wrong_pg = node.get_pg(0).unwrap();
+        PgMetadataStore::put_object_with_segments(
+            &*wrong_pg,
+            &PutLiveObjectReq {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::Null,
+                owner: OwnerIdentity::from_principal("owner"),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                generation_id: GenerationId::new(10).unwrap(),
+                size: 0,
+                etag: ObjectEtag::single_part(0),
+                ec: EcShape { k: 4, m: 2 },
+                layout: ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: None,
+                system_metadata_blob: None,
+                object_lock: ObjectLockState::default(),
+                encryption: ObjectEncryption::None,
+            },
+            &[],
+        )
+        .unwrap();
+        PgMetadataStore::create_multipart_upload(
+            &*wrong_pg,
+            &CreateMultipartUploadReq {
+                upload_id,
+                bucket: bucket.clone(),
+                key,
+                tags: None,
+                metadata_blob: SerializedMetadataBlob::default(),
+                system_metadata_blob: SerializedSystemMetadataBlob::default(),
+                initiator: OwnerIdentity::from_principal("owner"),
+                owner: OwnerIdentity::from_principal("owner"),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                object_lock: ObjectLockState::default(),
+                checksum: None,
+                encryption: ObjectEncryption::None,
+            },
+        )
+        .unwrap();
+        wrong_pg.refresh_metadata_command_state_digest().unwrap();
+    }
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..3)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    )
+    .with_object_listing_topology(pg_topology);
+    let route = client
+        .open_object_listing_metadata_route(
+            config.cluster_epoch,
+            ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+        )
+        .unwrap();
+
+    let Err(object_error) = route.list_objects_page(&ListObjectsReq {
+        bucket: bucket.clone(),
+        prefix: None,
+        start_after: None,
+        start_at: None,
+        max_keys: 1,
+    }) else {
+        panic!("misplaced object listing row must fail over installed Unix RPC");
+    };
+    let Err(version_error) = route.list_object_versions_page(&ListObjectVersionsReq {
+        bucket: bucket.clone(),
+        prefix: None,
+        key_marker: None,
+        version_id_marker: None,
+        start_at: None,
+        max_keys: 1,
+    }) else {
+        panic!("misplaced version listing row must fail over installed Unix RPC");
+    };
+    let Err(upload_error) = route.list_multipart_uploads_page(&ListMultipartUploadsReq {
+        bucket,
+        prefix: None,
+        page_start: None,
+        max_uploads: 1,
+    }) else {
+        panic!("misplaced upload listing row must fail over installed Unix RPC");
+    };
+
+    for error in [object_error, version_error, upload_error] {
+        assert!(matches!(
+            error,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            })
+        ));
+    }
     for thread in server_threads {
         thread.join().unwrap();
     }

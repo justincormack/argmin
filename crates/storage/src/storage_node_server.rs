@@ -6232,6 +6232,29 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
         )
     }
 
+    fn validate_listing_subject(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        operation: &'static str,
+    ) -> Result<(), StorageNodeBucketRouteError> {
+        self.handler
+            .validate_pg_for_object(self.pg_id.pg_id(), bucket, key, operation)
+            .map_err(StorageNodeBucketRouteError::Route)
+    }
+
+    fn map_listing_error(error: BucketSnapshotLoadError) -> StorageNodeBucketRouteError {
+        match error {
+            BucketSnapshotLoadError::Store(
+                error @ StoreError::RouteCapabilitySubjectMismatch { .. },
+            ) => StorageNodeBucketRouteError::Route(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: error.to_string(),
+            }),
+            error => StorageNodeBucketRouteError::Bucket(error),
+        }
+    }
+
     fn validate_root(
         &self,
         root: &PayloadReclaimRoot,
@@ -6337,8 +6360,21 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        ObjectListingMetadataNodeClient::list_objects_page(&local_client, self.pg_id, request)
-            .map_err(StorageNodeBucketRouteError::Bucket)
+        let response = ObjectListingMetadataNodeClient::open_object_listing_metadata_route(
+            &local_client,
+            self.fence.cluster_epoch,
+            self.pg_id,
+        )
+        .and_then(|route| route.list_objects_page(request))
+        .map_err(Self::map_listing_error)?;
+        for object in &response.objects {
+            self.validate_listing_subject(
+                object.bucket(),
+                object.key(),
+                "object listing response scan PG",
+            )?;
+        }
+        Ok(response)
     }
 
     fn list_object_versions_page(
@@ -6351,12 +6387,21 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        ObjectListingMetadataNodeClient::list_object_versions_page(
+        let response = ObjectListingMetadataNodeClient::open_object_listing_metadata_route(
             &local_client,
+            self.fence.cluster_epoch,
             self.pg_id,
-            request,
         )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        .and_then(|route| route.list_object_versions_page(request))
+        .map_err(Self::map_listing_error)?;
+        for object in &response.versions {
+            self.validate_listing_subject(
+                object.bucket(),
+                object.key(),
+                "object version listing response scan PG",
+            )?;
+        }
+        Ok(response)
     }
 
     fn list_multipart_uploads_page(
@@ -6369,12 +6414,21 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        ObjectListingMetadataNodeClient::list_multipart_uploads_page(
+        let response = ObjectListingMetadataNodeClient::open_object_listing_metadata_route(
             &local_client,
+            self.fence.cluster_epoch,
             self.pg_id,
-            request,
         )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        .and_then(|route| route.list_multipart_uploads_page(request))
+        .map_err(Self::map_listing_error)?;
+        for upload in &response.uploads {
+            self.validate_listing_subject(
+                &upload.bucket,
+                &upload.key,
+                "multipart upload listing response scan PG",
+            )?;
+        }
+        Ok(response)
     }
 
     fn validate_stream_uploads(

@@ -7,10 +7,17 @@ struct UnixObjectReadMetadataRoute<'a> {
     key: ObjectKey,
 }
 
-impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
-    fn list_objects_page(
+struct UnixObjectListingMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    pg_id: ObjectMetadataScanPgId,
+    pg_topology: Arc<PgTopology>,
+}
+
+impl UnixStorageNodeClient {
+    fn list_objects_page_rpc(
         &self,
         pg_id: ObjectMetadataScanPgId,
+        pg_topology: &PgTopology,
         req: &ListObjectsReq,
     ) -> Result<ListObjectsResp, BucketSnapshotLoadError> {
         let request = StorageRpcListObjectsRequest {
@@ -42,13 +49,14 @@ impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
                 self.rpc_payload_error("decode object list response", error.to_string()),
             )
         })?;
-        validate_list_objects_response(self, &response.response, req)?;
+        validate_list_objects_response(self, pg_id, pg_topology, &response.response, req)?;
         Ok(response.response)
     }
 
-    fn list_object_versions_page(
+    fn list_object_versions_page_rpc(
         &self,
         pg_id: ObjectMetadataScanPgId,
+        pg_topology: &PgTopology,
         req: &ListObjectVersionsReq,
     ) -> Result<ListObjectVersionsResp, BucketSnapshotLoadError> {
         let request = StorageRpcListObjectVersionsRequest {
@@ -81,13 +89,14 @@ impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
                 self.rpc_payload_error("decode object version list response", error.to_string()),
             )
         })?;
-        validate_list_object_versions_response(self, &response.response, req)?;
+        validate_list_object_versions_response(self, pg_id, pg_topology, &response.response, req)?;
         Ok(response.response)
     }
 
-    fn list_multipart_uploads_page(
+    fn list_multipart_uploads_page_rpc(
         &self,
         pg_id: ObjectMetadataScanPgId,
+        pg_topology: &PgTopology,
         req: &ListMultipartUploadsReq,
     ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError> {
         let request = StorageRpcListMultipartUploadsRequest {
@@ -118,13 +127,93 @@ impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
                 self.rpc_payload_error("decode multipart upload list response", error.to_string()),
             )
         })?;
-        validate_list_multipart_uploads_response(self, &response.response, req)?;
+        validate_list_multipart_uploads_response(
+            self,
+            pg_id,
+            pg_topology,
+            &response.response,
+            req,
+        )?;
         Ok(response.response)
     }
 }
 
+impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
+    fn open_object_listing_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataScanPgId,
+    ) -> Result<Box<dyn ObjectListingMetadataRoute + '_>, BucketSnapshotLoadError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(BucketSnapshotLoadError::Store(
+                StoreError::StaleMetadataOperation {
+                    pg_id: pg_id.get(),
+                    operation_epoch: route_cluster_epoch,
+                    current_epoch: self.cluster_epoch,
+                },
+            ));
+        }
+        let pg_topology = self.object_listing_topology.as_ref().ok_or_else(|| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "open object listing metadata route",
+                "object listing client has no installed PG topology".to_string(),
+            ))
+        })?;
+        Ok(Box::new(UnixObjectListingMetadataRoute {
+            client: self,
+            pg_id,
+            pg_topology: Arc::clone(pg_topology),
+        }))
+    }
+}
+
+impl ObjectListingMetadataRoute for UnixObjectListingMetadataRoute<'_> {
+    fn list_objects_page(
+        &self,
+        req: &ListObjectsReq,
+    ) -> Result<ListObjectsResp, BucketSnapshotLoadError> {
+        self.client
+            .list_objects_page_rpc(self.pg_id, &self.pg_topology, req)
+    }
+
+    fn list_object_versions_page(
+        &self,
+        req: &ListObjectVersionsReq,
+    ) -> Result<ListObjectVersionsResp, BucketSnapshotLoadError> {
+        self.client
+            .list_object_versions_page_rpc(self.pg_id, &self.pg_topology, req)
+    }
+
+    fn list_multipart_uploads_page(
+        &self,
+        req: &ListMultipartUploadsReq,
+    ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError> {
+        self.client
+            .list_multipart_uploads_page_rpc(self.pg_id, &self.pg_topology, req)
+    }
+}
+
+fn validate_listing_subject_pg(
+    client: &UnixStorageNodeClient,
+    pg_id: ObjectMetadataScanPgId,
+    pg_topology: &PgTopology,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    operation: &'static str,
+) -> Result<(), BucketSnapshotLoadError> {
+    if pg_topology.object_pg_for(bucket, key) != pg_id.get() {
+        return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
+            operation,
+            "listing response object does not belong to the scoped scan PG".to_string(),
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_list_objects_response(
     client: &UnixStorageNodeClient,
+    pg_id: ObjectMetadataScanPgId,
+    pg_topology: &PgTopology,
     response: &ListObjectsResp,
     req: &ListObjectsReq,
 ) -> Result<(), BucketSnapshotLoadError> {
@@ -141,6 +230,14 @@ pub(super) fn validate_list_objects_response(
                 "object list response bucket does not match request".to_string(),
             )));
         }
+        validate_listing_subject_pg(
+            client,
+            pg_id,
+            pg_topology,
+            object.bucket(),
+            object.key(),
+            "validate object list response",
+        )?;
     }
     match (response.is_truncated, response.next_start_after.as_ref()) {
         (false, None) => {}
@@ -167,6 +264,8 @@ pub(super) fn validate_list_objects_response(
 
 pub(super) fn validate_list_object_versions_response(
     client: &UnixStorageNodeClient,
+    pg_id: ObjectMetadataScanPgId,
+    pg_topology: &PgTopology,
     response: &ListObjectVersionsResp,
     req: &ListObjectVersionsReq,
 ) -> Result<(), BucketSnapshotLoadError> {
@@ -183,6 +282,14 @@ pub(super) fn validate_list_object_versions_response(
                 "object version list response bucket does not match request".to_string(),
             )));
         }
+        validate_listing_subject_pg(
+            client,
+            pg_id,
+            pg_topology,
+            object.bucket(),
+            object.key(),
+            "validate object version list response",
+        )?;
     }
     match (
         response.is_truncated,
@@ -215,6 +322,8 @@ pub(super) fn validate_list_object_versions_response(
 
 pub(super) fn validate_list_multipart_uploads_response(
     client: &UnixStorageNodeClient,
+    pg_id: ObjectMetadataScanPgId,
+    pg_topology: &PgTopology,
     response: &ListMultipartUploadsResp,
     req: &ListMultipartUploadsReq,
 ) -> Result<(), BucketSnapshotLoadError> {
@@ -231,6 +340,14 @@ pub(super) fn validate_list_multipart_uploads_response(
                 "multipart upload list response bucket does not match request".to_string(),
             )));
         }
+        validate_listing_subject_pg(
+            client,
+            pg_id,
+            pg_topology,
+            &upload.bucket,
+            &upload.key,
+            "validate multipart upload list response",
+        )?;
     }
     match (
         response.is_truncated,

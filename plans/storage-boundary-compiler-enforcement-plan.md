@@ -4258,6 +4258,68 @@ One-hundred-and-sixth Phase 3 slice:
   workspace-wide strict Clippy, and the full 7,803-test workspace suite also
   pass.
 
+One-hundred-and-seventh Phase 3 slice:
+
+- object, object-version, and multipart-upload page reads now open an
+  `ObjectListingMetadataRoute` bound to one active cluster epoch and exact
+  object-metadata scan PG. Page operations no longer accept a replacement PG
+  after route construction, while their bucket, prefix, and cursor requests
+  remain per-operation values within that fixed scan partition.
+- embedded construction proves the scan PG is open before storage access.
+  Unix construction rejects an epoch differing from its installed client
+  before transport access and keeps the raw RPC encoding helpers private
+  behind the scoped route. Storage-node dispatch retains its independent
+  active admission-domain, route, primary, PG-role, and captured-deadline
+  checks before constructing the embedded route.
+- cluster listing fan-out opens one route for each selected PG. Bucket-delete
+  visibility checks reuse one route for their version and multipart-upload
+  probes, and diagnostic scans also construct the scoped route before reading
+  a page. Embedded coverage rejects an unavailable scan PG before storage; a
+  no-listener Unix regression rejects a future epoch before RPC. The existing
+  installed-Unix matrix exercises all three successful operations and keeps
+  server-side unknown-PG rejection pinned.
+- all 2,474 storage tests pass. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full 7,805-test workspace suite also
+  pass.
+
+One-hundred-and-seventh Phase 3 review correction:
+
+- scoped listing authority now covers returned subjects as well as request
+  routing. Embedded object, object-version, and multipart-upload page reads
+  fail closed if any returned `(bucket, key)` maps to a different object
+  metadata PG, and the storage-node response boundary independently validates
+  every row before encoding it for an RPC peer.
+- Unix object-listing routes own an immutable snapshot of the installed PG
+  topology. The full Unix client installer and the role-specific listing
+  installer bind that snapshot when the client is constructed; opening a
+  listing route without it fails before transport. Response validators use
+  the snapshot and scoped scan PG to reject a misplaced row from an otherwise
+  authenticated peer before it can enter the cluster-wide merge.
+- adversarial embedded and Unix regressions inject a foreign-PG object row,
+  object-version row, and multipart-upload row while retaining the expected
+  bucket and valid pagination shape. All three listing forms must reject the
+  response rather than returning partially trusted results.
+- all 2,476 storage tests pass. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full 7,807-test workspace suite also
+  pass.
+
+One-hundred-and-seventh Phase 3 review follow-up:
+
+- a misplaced durable row is normally detected by the embedded scoped route
+  before the storage-node response boundary can inspect the successful page.
+  The listing capability now translates that listing-specific
+  `RouteCapabilitySubjectMismatch` into `PayloadDecode`; it does not pass
+  through the general bucket-snapshot mapper as an internal server failure.
+- an installed Unix server/client regression writes an object and multipart
+  upload deliberately into the wrong durable PG, then proves object,
+  object-version, and multipart-upload listing RPCs all return
+  `PayloadDecode`. The direct Unix response-validator regression remains to
+  cover a faulty authenticated peer that encodes a successful but crossed-PG
+  page.
+- all 2,477 storage tests pass as part of the full suite. Formatting, the
+  storage boundary checker, workspace-wide strict Clippy, and the full
+  7,808-test workspace suite also pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

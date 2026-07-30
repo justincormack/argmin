@@ -177,6 +177,8 @@ fn unix_retained_bucket_write_route_rejects_foreign_subject_before_rpc() {
 #[test]
 fn unix_object_list_response_requires_truncated_marker_identity() {
     let client = test_unix_storage_node_client();
+    let pg_id = ObjectMetadataScanPgId::new_for_test(PgId::new(0));
+    let pg_topology = PgTopology::new(&[0]).unwrap();
     let bucket = crate::tests::bucket_name("list-marker-bucket");
     let key = crate::tests::object_key("list-marker-key");
     let object = test_live_stored_object(
@@ -197,18 +199,20 @@ fn unix_object_list_response_requires_truncated_marker_identity() {
         is_truncated: true,
         next_start_after: None,
     };
-    assert!(validate_list_objects_response(&client, &response, &req).is_err());
+    assert!(validate_list_objects_response(&client, pg_id, &pg_topology, &response, &req).is_err());
 
     response.next_start_after = Some(crate::tests::object_key("wrong-marker"));
-    assert!(validate_list_objects_response(&client, &response, &req).is_err());
+    assert!(validate_list_objects_response(&client, pg_id, &pg_topology, &response, &req).is_err());
 
     response.next_start_after = Some(key);
-    validate_list_objects_response(&client, &response, &req).unwrap();
+    validate_list_objects_response(&client, pg_id, &pg_topology, &response, &req).unwrap();
 }
 
 #[test]
 fn unix_object_version_list_response_requires_truncated_marker_identity() {
     let client = test_unix_storage_node_client();
+    let pg_id = ObjectMetadataScanPgId::new_for_test(PgId::new(0));
+    let pg_topology = PgTopology::new(&[0]).unwrap();
     let bucket = crate::tests::bucket_name("version-list-marker-bucket");
     let key = crate::tests::object_key("version-list-marker-key");
     let version_id = VersionId::from_u64(44);
@@ -236,18 +240,26 @@ fn unix_object_version_list_response_requires_truncated_marker_identity() {
         next_key_marker: Some(key.clone()),
         next_version_id_marker: None,
     };
-    assert!(validate_list_object_versions_response(&client, &response, &req).is_err());
+    assert!(
+        validate_list_object_versions_response(&client, pg_id, &pg_topology, &response, &req)
+            .is_err()
+    );
 
     response.next_version_id_marker = Some(VersionId::from_u64(45));
-    assert!(validate_list_object_versions_response(&client, &response, &req).is_err());
+    assert!(
+        validate_list_object_versions_response(&client, pg_id, &pg_topology, &response, &req)
+            .is_err()
+    );
 
     response.next_version_id_marker = Some(version_id);
-    validate_list_object_versions_response(&client, &response, &req).unwrap();
+    validate_list_object_versions_response(&client, pg_id, &pg_topology, &response, &req).unwrap();
 }
 
 #[test]
 fn unix_multipart_upload_list_response_requires_final_upload_marker_identity() {
     let client = test_unix_storage_node_client();
+    let pg_id = ObjectMetadataScanPgId::new_for_test(PgId::new(0));
+    let pg_topology = PgTopology::new(&[0]).unwrap();
     let bucket = crate::tests::bucket_name("mpu-list-marker-bucket");
     let key = crate::tests::object_key("mpu-list-marker-key");
     let upload_id = UploadId::try_from("u".repeat(crate::UPLOAD_ID_LEN)).unwrap();
@@ -269,17 +281,33 @@ fn unix_multipart_upload_list_response_requires_final_upload_marker_identity() {
         next_key_marker: Some(key.clone()),
         next_upload_id_marker: None,
     };
-    assert!(validate_list_multipart_uploads_response(&client, &response, &req).is_err());
+    assert!(validate_list_multipart_uploads_response(
+        &client,
+        pg_id,
+        &pg_topology,
+        &response,
+        &req
+    )
+    .is_err());
 
     response.next_upload_id_marker =
         Some(UploadId::try_from("v".repeat(crate::UPLOAD_ID_LEN)).unwrap());
-    assert!(validate_list_multipart_uploads_response(&client, &response, &req).is_err());
+    assert!(validate_list_multipart_uploads_response(
+        &client,
+        pg_id,
+        &pg_topology,
+        &response,
+        &req
+    )
+    .is_err());
 
     response.next_upload_id_marker = Some(upload_id.clone());
-    validate_list_multipart_uploads_response(&client, &response, &req).unwrap();
+    validate_list_multipart_uploads_response(&client, pg_id, &pg_topology, &response, &req)
+        .unwrap();
 
     response.is_truncated = true;
-    validate_list_multipart_uploads_response(&client, &response, &req).unwrap();
+    validate_list_multipart_uploads_response(&client, pg_id, &pg_topology, &response, &req)
+        .unwrap();
 
     let mut empty = ListMultipartUploadsResp {
         uploads: Vec::new(),
@@ -287,16 +315,118 @@ fn unix_multipart_upload_list_response_requires_final_upload_marker_identity() {
         next_key_marker: None,
         next_upload_id_marker: None,
     };
-    validate_list_multipart_uploads_response(&client, &empty, &req).unwrap();
+    validate_list_multipart_uploads_response(&client, pg_id, &pg_topology, &empty, &req).unwrap();
 
     empty.next_key_marker = Some(key);
     empty.next_upload_id_marker = Some(upload_id);
-    assert!(validate_list_multipart_uploads_response(&client, &empty, &req).is_err());
+    assert!(
+        validate_list_multipart_uploads_response(&client, pg_id, &pg_topology, &empty, &req)
+            .is_err()
+    );
 
     empty.next_key_marker = None;
     empty.next_upload_id_marker = None;
     empty.is_truncated = true;
-    assert!(validate_list_multipart_uploads_response(&client, &empty, &req).is_err());
+    assert!(
+        validate_list_multipart_uploads_response(&client, pg_id, &pg_topology, &empty, &req)
+            .is_err()
+    );
+}
+
+#[test]
+fn unix_listing_response_validators_reject_foreign_scan_pg_rows() {
+    let client = test_unix_storage_node_client();
+    let pg_id = ObjectMetadataScanPgId::new_for_test(PgId::new(0));
+    let pg_topology = PgTopology::new(&[0, 1]).unwrap();
+    let bucket = crate::tests::bucket_name("foreign-listing-row-bucket");
+    let key = (0..10_000)
+        .map(|index| crate::tests::object_key(format!("foreign-listing-row-{index}")))
+        .find(|key| pg_topology.object_pg_for(&bucket, key) == 1)
+        .expect("test must find a key placed on the foreign scan PG");
+    let object = test_live_stored_object(
+        bucket.clone(),
+        key.clone(),
+        GenerationId::new(10).unwrap(),
+        ObjectLayout::Standard,
+    );
+    let object_request = ListObjectsReq {
+        bucket: bucket.clone(),
+        prefix: None,
+        start_after: None,
+        start_at: None,
+        max_keys: 1,
+    };
+    let object_error = validate_list_objects_response(
+        &client,
+        pg_id,
+        &pg_topology,
+        &ListObjectsResp {
+            objects: vec![object.clone()],
+            is_truncated: false,
+            next_start_after: None,
+        },
+        &object_request,
+    )
+    .unwrap_err();
+
+    let version_request = ListObjectVersionsReq {
+        bucket: bucket.clone(),
+        prefix: None,
+        key_marker: None,
+        version_id_marker: None,
+        start_at: None,
+        max_keys: 1,
+    };
+    let version_error = validate_list_object_versions_response(
+        &client,
+        pg_id,
+        &pg_topology,
+        &ListObjectVersionsResp {
+            versions: vec![object],
+            is_truncated: false,
+            next_key_marker: None,
+            next_version_id_marker: None,
+        },
+        &version_request,
+    )
+    .unwrap_err();
+
+    let upload_id = UploadId::try_from("u".repeat(crate::UPLOAD_ID_LEN)).unwrap();
+    let upload = test_multipart_upload_record(
+        bucket.clone(),
+        key.clone(),
+        upload_id.clone(),
+        UploadState::InProgress,
+    );
+    let upload_request = ListMultipartUploadsReq {
+        bucket,
+        prefix: None,
+        page_start: None,
+        max_uploads: 1,
+    };
+    let upload_error = validate_list_multipart_uploads_response(
+        &client,
+        pg_id,
+        &pg_topology,
+        &ListMultipartUploadsResp {
+            uploads: vec![upload],
+            is_truncated: false,
+            next_key_marker: Some(key),
+            next_upload_id_marker: Some(upload_id),
+        },
+        &upload_request,
+    )
+    .unwrap_err();
+
+    for error in [object_error, version_error, upload_error] {
+        assert!(matches!(
+            error,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            })
+        ));
+    }
 }
 
 fn test_bucket_info(
