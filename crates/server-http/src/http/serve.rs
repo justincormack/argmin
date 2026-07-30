@@ -942,6 +942,10 @@ async fn handle(
             ));
         }
     };
+    // Keep the foreground-pressure signal active for the complete admitted
+    // request, including body collection and storage RPCs. The response body
+    // takes over this signal when the handler returns.
+    let _inflight_request_guard = observability::inflight_requests_guard();
 
     // Check if this request should use the streaming write path.
     let streaming_op = match is_streaming_write_for_endpoint(state.endpoint_kind, &parts) {
@@ -5758,6 +5762,7 @@ mod tests {
             ..ServeConfig::default()
         };
         let (addr, _guard) = start_test_server_with_config(frontend, config, 1).await;
+        let inflight_before = observability::metrics_snapshot().inflight_requests;
 
         let mut holder = tokio::net::TcpStream::connect(&addr).await.unwrap();
         holder
@@ -5773,6 +5778,14 @@ mod tests {
             )
             .await
             .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observability::metrics_snapshot().inflight_requests <= inflight_before {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("body collection must retain the admitted foreground-request signal");
 
         let mut delayed = tokio::net::TcpStream::connect(&addr).await.unwrap();
         delayed

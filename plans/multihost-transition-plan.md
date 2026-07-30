@@ -7704,8 +7704,12 @@ Shard repair design:
   repair, reclaim/bucket finalization, lifecycle cleanup, and stream-session
   cleanup cannot starve each other behind a single shared cleanup permit.
   `OpportunisticScan` now denies with `denied_foreground_pressure` when recent
-  request admission or storage-RPC admission pressure is observed, or while
-  foreground request/read/write/list work is active. Process-wide
+  request-admission pressure is observed or while an admitted foreground S3
+  request is active. The request signal spans the full handler and response-body
+  lifetime, including storage RPC waits. Unattributed storage-RPC activity and
+  admission counters include background lifecycle, scavenger, checkpoint, and
+  backfill work, so they are diagnostic only and cannot make background classes
+  deny one another. Process-wide
   metadata-command recovery counters are not treated as foreground pressure
   until they carry caller/class attribution. It denies with
   `denied_backlog_pressure` while durable cleanup or shard repair queues are

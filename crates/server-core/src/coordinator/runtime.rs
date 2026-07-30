@@ -404,15 +404,10 @@ fn background_work_foreground_pressure_delta(
 ) -> bool {
     current.request_admission_wait_total > last.request_admission_wait_total
         || current.request_admission_timeout_total > last.request_admission_timeout_total
-        || current.storage_rpc_admission_wait_total > last.storage_rpc_admission_wait_total
-        || current.storage_rpc_admission_timeout_total > last.storage_rpc_admission_timeout_total
 }
 
 fn background_work_foreground_pressure_active(snapshot: observability::MetricsSnapshot) -> bool {
     snapshot.inflight_requests > 0
-        || snapshot.storage_rpc_active_read > 0
-        || snapshot.storage_rpc_active_start_write > 0
-        || snapshot.storage_rpc_active_list > 0
 }
 
 fn background_work_durable_backlog_active(snapshot: observability::MetricsSnapshot) -> bool {
@@ -4044,7 +4039,7 @@ mod tests {
             "counter deltas observed after a scavenger sweep gap are stale"
         );
 
-        snapshot.storage_rpc_admission_wait_total += 1;
+        snapshot.request_admission_timeout_total += 1;
         let sampler_tick_before_next_scan = now + (production_sweep_gap * 2)
             - BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL
             - Duration::from_millis(20);
@@ -4056,7 +4051,7 @@ mod tests {
             }
         );
 
-        snapshot.storage_rpc_admission_timeout_total += 1;
+        snapshot.request_admission_wait_total += 1;
         let recent = now + (production_sweep_gap * 2);
         assert_eq!(
             state.observe(recent, snapshot),
@@ -4132,6 +4127,47 @@ mod tests {
                 foreground: false,
                 durable_backlog: true,
             }
+        );
+    }
+
+    #[test]
+    fn background_work_pressure_does_not_treat_background_storage_rpcs_as_foreground() {
+        let mut state = BackgroundWorkPressureState::default();
+        let now = Instant::now();
+        let mut snapshot = observability::MetricsSnapshot::default();
+
+        assert_eq!(
+            state.observe(now, snapshot),
+            BackgroundWorkPressure {
+                foreground: false,
+                durable_backlog: false,
+            }
+        );
+
+        snapshot.storage_rpc_admission_wait_total = 1;
+        snapshot.storage_rpc_admission_timeout_total = 1;
+        snapshot.storage_rpc_active_total = 4;
+        snapshot.storage_rpc_active_read = 1;
+        snapshot.storage_rpc_active_start_write = 1;
+        snapshot.storage_rpc_active_list = 2;
+
+        assert_eq!(
+            state.observe(now + Duration::from_millis(10), snapshot),
+            BackgroundWorkPressure {
+                foreground: false,
+                durable_backlog: false,
+            },
+            "unattributed storage RPC activity includes background workflows and must not make background classes deny one another"
+        );
+
+        snapshot.inflight_requests = 1;
+        assert_eq!(
+            state.observe(now + Duration::from_millis(20), snapshot),
+            BackgroundWorkPressure {
+                foreground: true,
+                durable_backlog: false,
+            },
+            "the admitted request lifetime identifies foreground storage activity"
         );
     }
 
