@@ -1124,7 +1124,7 @@ pub struct PlacedSegmentShardBackfillPlan {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct PlacedSegmentShardBackfillCandidateEnqueueSummary {
+pub(crate) struct PlacedSegmentShardBackfillCandidateEnqueueSummary {
     pub scanned: usize,
     pub current_epoch: usize,
     pub already_queued: usize,
@@ -1165,7 +1165,7 @@ impl PlacedSegmentShardBackfillCandidateKey {
 
 /// Resume position for bounded placed-segment backfill candidate verification.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PlacedSegmentShardBackfillCandidateScanCursor {
+pub(crate) struct PlacedSegmentShardBackfillCandidateScanCursor {
     after: Option<PlacedSegmentShardBackfillCandidateKey>,
 }
 
@@ -15591,7 +15591,7 @@ impl StorageCluster {
         Ok(depth)
     }
 
-    pub fn enqueue_placed_segment_shard_backfills_from_scavenger_references(
+    pub(crate) fn enqueue_placed_segment_shard_backfills_from_scavenger_references(
         &self,
         cursor: &mut PlacedSegmentShardBackfillCandidateScanCursor,
     ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
@@ -15613,19 +15613,7 @@ impl StorageCluster {
         )
     }
 
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn test_enqueue_placed_segment_shard_backfills_from_scavenger_references_with_limit(
-        &self,
-        cursor: &mut PlacedSegmentShardBackfillCandidateScanCursor,
-        scan_limit: usize,
-    ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
-        self.enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
-            cursor, scan_limit,
-        )
-    }
-
-    fn enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
+    pub(crate) fn enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
         &self,
         cursor: &mut PlacedSegmentShardBackfillCandidateScanCursor,
         scan_limit: usize,

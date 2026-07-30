@@ -889,6 +889,14 @@ The bounded implementation order is:
    them. Extend `check-storage-cluster-boundaries` during migration, then rely primarily on Rust
    visibility to prevent recurrence.
 
+Progress on item 1 (2026-07-30): the first bounded slice moved durable backfill-candidate scan
+state into `StorageBackfillCandidateScanner`. Its fairness cursor, candidate summary, enqueue
+transition, implementation errors, and storage-specific telemetry are now storage-owned. The
+public scheduler operation is only `scan()`, and the exact cursor/publication regression moved
+from `server-core` to an owner-local storage test. The remaining shard-scavenger audit,
+checkpoint scheduling, repair/backfill execution, reclaim/finalization, and stream-session workers
+are still pending; this slice does not mark item 1 complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1148,13 +1156,14 @@ Raft peer client and server transports are storage-owned and boundary-checked.
    roots, certificate identities, endpoint names, addresses, and bindings; `storage` supplies and
    validates the protocol profile. Make `STORAGE_RPC_TLS_ALPN` owner-private and extend the
    boundary check to prevent raw storage-RPC Rustls profile construction outside `storage`.
-10. **Pending:** move shard scavenger, repair, backfill, payload reclaim, asynchronous bucket
+10. **In progress:** move shard scavenger, repair, backfill, payload reclaim, asynchronous bucket
     cleanup/finalization, and abandoned stream-session workers into a storage-owned maintenance
     runtime. Include scan fairness, durable PG scans, deferred queues, cooldown, claims, retries,
     admission, expiry, completion, and storage-specific telemetry. Keep lifecycle evaluation and
     the S3-visible bucket-delete request path in `server-core`; storage creates and owns cleanup
     roots after one logical accepted-deletion operation. Privatize all maintenance cursor, claim,
-    reclaim-work, cleanup-root, session-cleanup, work-record, and transition APIs.
+    reclaim-work, cleanup-root, session-cleanup, work-record, and transition APIs. The
+    backfill-candidate cursor/scheduling slice is complete; the other workers remain pending.
 11. **Pending:** replace server-core's data-PG, placement-epoch, EC-placement, shard-location, and
     historical-route handling with opaque storage-owned payload handles and logical I/O/lease
     operations.

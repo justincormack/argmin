@@ -2888,6 +2888,25 @@ fail_with_matches \
     "Static construction and standalone durable binding must remain storage-owned and explicit; generic route-handle construction cannot be public, request consumers receive only StorageClusterRouteHandle, no request handle can be upgraded to dynamic publication authority, and the obsolete legacy-local role cannot return" \
     "$route_authority_capability_leaks"
 
+backfill_candidate_scan_state_leaks=$(
+    {
+        rg -n --color=never \
+            '\bPlacedSegmentShardBackfillCandidate(ScanCursor|EnqueueSummary)\b|\benqueue_placed_segment_shard_backfills_from_scavenger_references(_with_cursor_and_limit)?\b' \
+            crates \
+            -g '*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            'pub[[:space:]]+(struct[[:space:]]+PlacedSegmentShardBackfillCandidate(ScanCursor|EnqueueSummary)|fn[[:space:]]+enqueue_placed_segment_shard_backfills_from_scavenger_references(_with_cursor_and_limit)?)\b' \
+            crates/storage/src \
+            -g '*.rs' \
+            || true
+    }
+)
+fail_with_matches \
+    "Backfill candidate cursor, scan summary, and enqueue transition are storage-owned; schedule scans through StorageBackfillCandidateScanner" \
+    "$backfill_candidate_scan_state_leaks"
+
 session_token_format_leaks=$(
     {
         rg -n --color=never \

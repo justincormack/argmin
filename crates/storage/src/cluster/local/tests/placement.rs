@@ -3417,6 +3417,153 @@ fn shard_scavenger_backfill_candidate_scan_cursor_advances_past_complete_candida
 }
 
 #[test]
+fn storage_backfill_candidate_scanner_retains_cursor_across_route_publication() {
+    let fixture = backfill_route_fixture(b"storage-owned-backfill-cursor-first");
+    fixture
+        .desired_cluster
+        .backfill_placed_segment_payload_shard_direct_copies(
+            &fixture.source_route,
+            &fixture.desired_route,
+            fixture.req,
+        )
+        .unwrap();
+
+    let first_bucket =
+        crate::BucketName::try_from("backfill-runtime-cursor-bucket-a".to_string()).unwrap();
+    let first_key =
+        crate::ObjectKey::try_from("backfill-runtime-cursor-key-a".to_string()).unwrap();
+    record_backfill_scavenger_object_segment_reference_on_pg(
+        &fixture.desired_cluster,
+        PgId::new(1),
+        fixture.source_route.cluster_epoch(),
+        fixture.req,
+        first_bucket,
+        first_key,
+    );
+
+    let second_bucket =
+        crate::BucketName::try_from("backfill-runtime-cursor-bucket-b".to_string()).unwrap();
+    let second_key =
+        crate::ObjectKey::try_from("backfill-runtime-cursor-key-b".to_string()).unwrap();
+    let second_segment_okh = [0x72; 16];
+    let second_generation_id = crate::GenerationId::new(2).unwrap();
+    let second_payload = b"storage-owned-backfill-cursor-second";
+    let second_written = fixture
+        .source_cluster
+        .write_direct_put_segment_payload_shards(
+            &second_bucket,
+            &second_key,
+            second_generation_id,
+            0,
+            &second_segment_okh,
+            second_payload,
+        )
+        .unwrap();
+    fixture
+        .source_cluster
+        .test_register_payload_shard_acks(second_written.data_pg_id, &second_written.written_shards)
+        .unwrap();
+    let second_req = crate::SegmentStoredBytesRequest {
+        data_pg_id: second_written.data_pg_id,
+        segment_okh: second_segment_okh,
+        segment_vid: second_generation_id,
+        stored_size: second_payload.len(),
+        segment_crc64: checksum::crc64::checksum(second_payload),
+        ec: second_written.ec,
+    };
+    assert!(fixture.req.segment_vid.get() < second_req.segment_vid.get());
+    record_backfill_scavenger_object_segment_reference_on_pg(
+        &fixture.desired_cluster,
+        PgId::new(1),
+        fixture.source_route.cluster_epoch(),
+        second_req,
+        second_bucket,
+        second_key,
+    );
+
+    let desired_epoch = fixture.desired_route.cluster_epoch();
+    let desired_routes = [0, 1].map(|pg_id| {
+        crate::control_plane::PgRouteSnapshot::reconstructed(
+            desired_epoch,
+            PgId::new(pg_id),
+            fixture.desired_route.primary_node_id(),
+            fixture.desired_route.acting_set().to_vec(),
+            PgState::Active,
+        )
+    });
+    let source_routes = [0, 1].map(|pg_id| {
+        crate::control_plane::PgRouteSnapshot::reconstructed(
+            fixture.source_route.cluster_epoch(),
+            PgId::new(pg_id),
+            fixture.source_route.primary_node_id(),
+            fixture.source_route.acting_set().to_vec(),
+            PgState::Active,
+        )
+    });
+    let mut desired_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        fixture.configs.clone(),
+        &[0, 1],
+        fixture.ec_shape,
+        desired_epoch,
+        desired_routes.iter().map(LocalPgRoute::from),
+    )
+    .unwrap();
+    desired_map.test_install_historical_pg_routes(source_routes.clone());
+    desired_map.test_set_route_map_validity(RouteMapValidity::until_ms(u64::MAX - 1).unwrap());
+    let desired_cluster =
+        crate::StorageCluster::test_from_local_map_with_epoch(Arc::new(desired_map), desired_epoch)
+            .unwrap();
+    let runtime_handle = crate::StorageClusterRuntimeMapHandle::new(desired_cluster).unwrap();
+    let route_handle = runtime_handle.route_handle();
+    let scanner = crate::maintenance::StorageBackfillCandidateScanner::new(route_handle.clone());
+
+    let first_scan = scanner.scan_with_limit(1).unwrap();
+    assert_eq!(first_scan.already_complete, 1);
+    assert_eq!(first_scan.enqueued, 0);
+    assert!(first_scan.limit_reached);
+
+    let replacement_epoch = ClusterEpoch::new(desired_epoch.get() + 1).unwrap();
+    let replacement_routes = [0, 1].map(|pg_id| {
+        crate::control_plane::PgRouteSnapshot::reconstructed(
+            replacement_epoch,
+            PgId::new(pg_id),
+            fixture.desired_route.primary_node_id(),
+            fixture.desired_route.acting_set().to_vec(),
+            PgState::Active,
+        )
+    });
+    let mut replacement_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        fixture.configs,
+        &[0, 1],
+        fixture.ec_shape,
+        replacement_epoch,
+        replacement_routes.iter().map(LocalPgRoute::from),
+    )
+    .unwrap();
+    replacement_map.test_install_historical_pg_routes(source_routes);
+    replacement_map.test_set_route_map_validity(RouteMapValidity::until_ms(u64::MAX - 1).unwrap());
+    let replacement = crate::StorageCluster::test_from_local_map_with_epoch(
+        Arc::new(replacement_map),
+        replacement_epoch,
+    )
+    .unwrap();
+    runtime_handle.install(Arc::clone(&replacement)).unwrap();
+    assert!(Arc::ptr_eq(&route_handle.current(), &replacement));
+
+    let second_scan = scanner.scan_with_limit(1).unwrap();
+    assert_eq!(second_scan.enqueued, 1);
+    assert!(replacement
+        .placed_segment_shard_backfill_exists(&crate::PlacedSegmentShardBackfillWorkItem {
+            request: second_req,
+            source_cluster_epoch: fixture.source_route.cluster_epoch(),
+            desired_cluster_epoch: replacement_epoch,
+        })
+        .unwrap());
+}
+
+#[test]
 fn placed_segment_payload_shard_repair_targets_rejects_invalid_ec_shape() {
     let tmp = test_util::tempdir();
     let node_ids = [

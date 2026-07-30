@@ -36,6 +36,7 @@ pub(crate) mod data_dir;
 pub mod deadline_io;
 pub(crate) mod durable_journal;
 pub mod error;
+mod maintenance;
 pub(crate) mod metadata_command;
 mod node_runtime;
 pub(crate) mod peering;
@@ -78,13 +79,11 @@ pub use cluster::{
     LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
     LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
     LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PgMetadataTransferArtifact,
-    PlacedSegmentShardBackfillCandidateEnqueueSummary,
-    PlacedSegmentShardBackfillCandidateScanCursor, PlacedSegmentShardBackfillCopyTarget,
-    PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth, PlacedSegmentShardSetHealth,
-    PlacedSegmentShardSetRisk, PlacedSegmentShardValidation, PreparedStandaloneEmbeddedTopology,
-    ProcessLocalRegistryKey, ReleasedObjectPayloadLease, RetainedObjectPayloadRead,
-    RetainedStreamUploadCleanup, ShardLocation, StorageCluster, StorageClusterRouteAdmission,
-    StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
+    PlacedSegmentShardBackfillCopyTarget, PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth,
+    PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk, PlacedSegmentShardValidation,
+    PreparedStandaloneEmbeddedTopology, ProcessLocalRegistryKey, ReleasedObjectPayloadLease,
+    RetainedObjectPayloadRead, RetainedStreamUploadCleanup, ShardLocation, StorageCluster,
+    StorageClusterRouteAdmission, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
     StorageClusterRuntimeMapRefreshError, StorageClusterRuntimeMapRefreshLoop,
     StorageClusterRuntimeMapRefreshLoopFailure, StorageClusterRuntimeMapRefreshLoopStatus,
     StorageClusterRuntimeMapRefreshLoopStatusHandle, StorageClusterRuntimeMapRefreshLoopSuccess,
@@ -99,6 +98,7 @@ pub use error::{
     ObjectPgActionError, PgMetadataTransferError, ShardIoError, StorageNodeFailureClass,
     StorageNodeFailureDetail, StoreError,
 };
+pub use maintenance::StorageBackfillCandidateScanner;
 pub use metadata_command::BucketWriteReservationProof;
 #[cfg(test)]
 pub(crate) use node::LocalStorageNode;
