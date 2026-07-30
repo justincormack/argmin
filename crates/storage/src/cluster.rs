@@ -11107,25 +11107,23 @@ impl StorageCluster {
                 continue;
             }
 
-            match self
-                .object_generation_metadata_primary_client(bucket, key)?
-                .object_generation_reservation(object_pg_id, bucket, key, reservation_id)
-            {
+            let generation_client = self.object_generation_metadata_primary_client(bucket, key)?;
+            let generation_route = generation_client.open_object_generation_metadata_route(
+                self.operation_epoch(),
+                object_pg_id,
+                bucket,
+                key,
+            )?;
+            match generation_route.object_generation_reservation(reservation_id) {
                 Ok(generation_id) => return Ok(generation_id),
                 Err(ObjectPgActionError::Metadata(
                     MetadataError::ObjectGenerationReservationNotFound { .. },
                 )) => {}
                 Err(error) => return Err(error),
             }
-            let generation_id = self
-                .object_generation_metadata_primary_client(bucket, key)?
-                .next_object_generation_id(object_pg_id, bucket, key)?;
+            let generation_id = generation_route.next_object_generation_id()?;
             self.maybe_run_before_object_generation_command_id_hook();
-            if self
-                .object_generation_metadata_primary_client(bucket, key)?
-                .next_object_generation_id(object_pg_id, bucket, key)?
-                != generation_id
-            {
+            if generation_route.next_object_generation_id()? != generation_id {
                 work_budget
                     .sleep_after_contention(
                         "object generation reservation stale generation retry budget exhausted",

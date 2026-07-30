@@ -7,6 +7,13 @@ struct UnixObjectReadMetadataRoute<'a> {
     key: ObjectKey,
 }
 
+struct UnixObjectGenerationMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
 struct UnixObjectListingMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
     pg_id: ObjectMetadataScanPgId,
@@ -1574,30 +1581,53 @@ impl RetainedBucketWriteReservationRoute for UnixRetainedBucketWriteReservationR
 }
 
 impl ObjectGenerationMetadataNodeClient for UnixStorageNodeClient {
-    fn object_generation_reservation(
+    fn open_object_generation_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
+    ) -> Result<Box<dyn ObjectGenerationMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixObjectGenerationMetadataRoute {
+            client: self,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
+    }
+}
+
+impl ObjectGenerationMetadataRoute for UnixObjectGenerationMetadataRoute<'_> {
+    fn object_generation_reservation(
+        &self,
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
         let request = StorageRpcObjectGenerationReservationRequest {
             object: StorageRpcObjectRequest {
-                node_id: self.node_id,
-                cluster_epoch: self.cluster_epoch,
-                pg_id: pg_id.pg_id(),
-                bucket: bucket.clone(),
-                key: key.clone(),
+                node_id: self.client.node_id,
+                cluster_epoch: self.client.cluster_epoch,
+                pg_id: self.pg_id.pg_id(),
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
             },
             reservation_id: reservation_id.clone(),
         };
         let payload = encode_object_generation_reservation_request(&request);
         let response = self
+            .client
             .rpc_request(StorageRpcMessageKind::ObjectGenerationReservation, payload)
             .map_err(ObjectPgActionError::Store)?;
         let response =
             decode_object_generation_reservation_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
                     "decode object generation reservation response",
                     error.to_string(),
                 ))
@@ -1612,28 +1642,25 @@ impl ObjectGenerationMetadataNodeClient for UnixStorageNodeClient {
         }
     }
 
-    fn next_object_generation_id(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<GenerationId, ObjectPgActionError> {
+    fn next_object_generation_id(&self) -> Result<GenerationId, ObjectPgActionError> {
         let request = StorageRpcObjectRequest {
-            node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
-            pg_id: pg_id.pg_id(),
-            bucket: bucket.clone(),
-            key: key.clone(),
+            node_id: self.client.node_id,
+            cluster_epoch: self.client.cluster_epoch,
+            pg_id: self.pg_id.pg_id(),
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
         };
         let payload = encode_object_request(&request);
         let response = self
+            .client
             .rpc_request(StorageRpcMessageKind::ObjectGenerationNext, payload)
             .map_err(ObjectPgActionError::Store)?;
         decode_object_generation_response(&response)
             .map(|response| response.generation_id)
             .map_err(|error| {
                 ObjectPgActionError::Store(
-                    self.rpc_payload_error("decode object generation response", error.to_string()),
+                    self.client
+                        .rpc_payload_error("decode object generation response", error.to_string()),
                 )
             })
     }

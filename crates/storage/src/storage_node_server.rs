@@ -5827,12 +5827,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectGenerationMetadataNodeClient::next_object_generation_id(
+        ObjectGenerationMetadataNodeClient::open_object_generation_metadata_route(
             &local_client,
+            self.route.handler.config.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
         )
+        .and_then(|route| route.next_object_generation_id())
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5845,13 +5847,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectGenerationMetadataNodeClient::object_generation_reservation(
+        ObjectGenerationMetadataNodeClient::open_object_generation_metadata_route(
             &local_client,
+            self.route.handler.config.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
-            reservation_id,
         )
+        .and_then(|route| route.object_generation_reservation(reservation_id))
         .map_err(StorageNodeObjectRouteError::Object)
     }
 

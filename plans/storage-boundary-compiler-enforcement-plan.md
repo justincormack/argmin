@@ -650,7 +650,8 @@ Node-client role classification (2026-07-19):
 | `BucketMetadataNodeClient` | bucket metadata | active bucket route; reads may later receive a read-only projection |
 | `BucketWriteReservationNodeClient` | bucket metadata | active bucket route for acquisition, heartbeat, worker scans, and claim creation |
 | `RetainedBucketWriteReservationNodeClient` | bucket metadata | opens a retained cleanup route bound to one bucket metadata PG and exact bucket; the returned interface releases exact reservation proofs, drains, and worker claims without accepting a replacement PG or bucket |
-| `ObjectGenerationMetadataNodeClient`, `ObjectVersionMetadataNodeClient`, `DirectPutMetadataNodeClient` | object metadata | active object route, with completion-specific admission represented as a narrower operation class |
+| `ObjectGenerationMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; reservation lookup and next-generation inspection cannot replace that subject |
+| `ObjectVersionMetadataNodeClient`, `DirectPutMetadataNodeClient` | object metadata | active object route, with completion-specific admission represented as a narrower operation class |
 | `ObjectListingMetadataNodeClient` | object metadata scan | active object-metadata route for the scanned PG; listing fan-out constructs one capability per routed PG |
 | `ObjectMutationMetadataNodeClient` | object metadata | active object route for object, multipart, stream-session, and payload-reclaim mutation |
 | `RetainedObjectMutationMetadataNodeClient` | object metadata | opens a retained route bound to one epoch, object-metadata PG, bucket, and key; the returned interface prepares stream aborts and releases payload-reclaim claims without accepting replacement route or object arguments |
@@ -4319,6 +4320,31 @@ One-hundred-and-seventh Phase 3 review follow-up:
 - all 2,477 storage tests pass as part of the full suite. Formatting, the
   storage boundary checker, workspace-wide strict Clippy, and the full
   7,808-test workspace suite also pass.
+
+One-hundred-and-eighth Phase 3 slice:
+
+- object-generation metadata access now opens an
+  `ObjectGenerationMetadataRoute` bound to one active cluster epoch, exact
+  object-metadata PG, bucket, and key. Reservation lookup and next-generation
+  inspection no longer accept replacement placement or object arguments after
+  route construction.
+- embedded construction validates the PG against the installed topology's
+  placement for the exact bucket/key and proves the PG store is open before
+  access. Unix construction rejects an epoch differing from its installed
+  client before transport and keeps raw RPC encoding behind the scoped route.
+  Storage-node dispatch retains its independent active admission-domain,
+  route, placement, primary, and captured-deadline checks before constructing
+  the embedded route.
+- object-generation reservation allocation opens the route once per retry
+  iteration and uses that same scoped route for the reservation lookup and
+  both next-generation observations. Embedded coverage rejects a configured
+  but crossed object PG before storage, a no-listener Unix regression rejects
+  a future epoch before RPC, and the installed Unix equivalent-state matrix
+  requires `PayloadDecode` for both operations on a wrong PG while preserving
+  correct-PG canaries.
+- all 2,481 storage tests pass. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full 7,813-test workspace suite also
+  pass.
 
 ### Phase 4 — type metadata-command publication
 

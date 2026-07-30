@@ -947,25 +947,22 @@ fn unix_object_generation_metadata_client_routes_generation_reads() {
         config.socket_path.clone(),
     );
 
+    let route = client
+        .open_object_generation_metadata_route(
+            ClusterEpoch::INITIAL,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+        )
+        .unwrap();
     assert_eq!(
-        client
-            .object_generation_reservation(
-                ObjectMetadataPgId::new_for_test(PgId::new(0)),
-                &bucket,
-                &key,
-                &reservation_id,
-            )
+        route
+            .object_generation_reservation(&reservation_id)
             .unwrap(),
         reserved_generation
     );
     assert_eq!(
-        client
-            .next_object_generation_id(
-                ObjectMetadataPgId::new_for_test(PgId::new(0)),
-                &bucket,
-                &key,
-            )
-            .unwrap(),
+        route.next_object_generation_id().unwrap(),
         GenerationId::new(reserved_generation.get() + 1).unwrap()
     );
     for thread in server_threads {
@@ -1106,7 +1103,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..36)
+    let server_threads: Vec<_> = (0..37)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -1120,16 +1117,30 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     let wrong_object_pg = ObjectMetadataPgId::new_for_test(PgId::new(wrong_pg_id));
     let correct_object_pg = ObjectMetadataPgId::new_for_test(PgId::new(correct_pg_id));
 
-    let reservation_error = ObjectGenerationMetadataNodeClient::object_generation_reservation(
-        &client,
-        wrong_object_pg,
-        &bucket,
-        &key,
-        &reservation_id,
-    )
-    .unwrap_err();
+    let wrong_generation_route =
+        ObjectGenerationMetadataNodeClient::open_object_generation_metadata_route(
+            &client,
+            ClusterEpoch::INITIAL,
+            wrong_object_pg,
+            &bucket,
+            &key,
+        )
+        .unwrap();
+    let reservation_error = wrong_generation_route
+        .object_generation_reservation(&reservation_id)
+        .unwrap_err();
     assert!(matches!(
         reservation_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+    let next_generation_error = wrong_generation_route
+        .next_object_generation_id()
+        .unwrap_err();
+    assert!(matches!(
+        next_generation_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
             failure: StorageRpcErrorCode::PayloadDecode,
             ..
@@ -1151,15 +1162,19 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         })
     ));
 
-    assert_eq!(
-        ObjectGenerationMetadataNodeClient::object_generation_reservation(
+    let correct_generation_route =
+        ObjectGenerationMetadataNodeClient::open_object_generation_metadata_route(
             &client,
+            ClusterEpoch::INITIAL,
             correct_object_pg,
             &bucket,
             &key,
-            &reservation_id,
         )
-        .unwrap(),
+        .unwrap();
+    assert_eq!(
+        correct_generation_route
+            .object_generation_reservation(&reservation_id)
+            .unwrap(),
         reserved_generation
     );
 

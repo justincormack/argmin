@@ -431,20 +431,22 @@ pub(crate) trait RetainedBucketWriteReservationRoute: Send {
 }
 
 pub(crate) trait ObjectGenerationMetadataNodeClient: Send + Sync {
-    fn object_generation_reservation(
+    fn open_object_generation_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
+    ) -> Result<Box<dyn ObjectGenerationMetadataRoute + '_>, ObjectPgActionError>;
+}
+
+pub(crate) trait ObjectGenerationMetadataRoute: Send {
+    fn object_generation_reservation(
+        &self,
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError>;
 
-    fn next_object_generation_id(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<GenerationId, ObjectPgActionError>;
+    fn next_object_generation_id(&self) -> Result<GenerationId, ObjectPgActionError>;
 }
 
 pub(crate) trait ObjectVersionMetadataNodeClient: Send + Sync {
