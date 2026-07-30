@@ -178,9 +178,9 @@ impl PgStore {
     /// Persist a segment-level backfill candidate between two cluster-map epochs.
     ///
     /// The row records that a scanner or planner has verified useful work for
-    /// moving a segment from its historical source placement to the desired
-    /// placement. The later worker reconstructs both routes from retained
-    /// cluster-map history instead of treating this row as placement authority.
+    /// moving a segment from its historical source placement. The first desired
+    /// epoch is a catch-up lower bound, not part of the logical work identity:
+    /// later observations coalesce because the worker targets the current route.
     pub fn record_placed_segment_shard_backfill(
         &self,
         work_item: &PlacedSegmentShardBackfillWorkItem,
@@ -205,13 +205,12 @@ impl PgStore {
                                 ec_k, ec_m, source_cluster_epoch, desired_cluster_epoch \
                          FROM placed_segment_shard_backfills \
                          WHERE data_pg_id = ?1 AND segment_okh = ?2 AND segment_vid = ?3 \
-                           AND source_cluster_epoch = ?4 AND desired_cluster_epoch = ?5",
+                           AND source_cluster_epoch = ?4",
                         params![
                             work_item.request.data_pg_id as i64,
                             work_item.request.segment_okh.as_slice(),
                             work_item.request.segment_vid.get() as i64,
                             work_item.source_cluster_epoch.get(),
-                            work_item.desired_cluster_epoch.get(),
                         ],
                         placed_segment_shard_backfill_work_item_from_row,
                     )
@@ -226,18 +225,17 @@ impl PgStore {
                         .conn
                         .execute(
                             "UPDATE placed_segment_shard_backfills \
-                             SET last_seen_at = ?6, \
+                             SET last_seen_at = ?5, \
                                  observation_count = observation_count + 1, \
-                                 remaining_tolerance = min(remaining_tolerance, ?7), \
-                                 last_error = COALESCE(?8, last_error) \
+                                 remaining_tolerance = min(remaining_tolerance, ?6), \
+                                 last_error = COALESCE(?7, last_error) \
                              WHERE data_pg_id = ?1 AND segment_okh = ?2 AND segment_vid = ?3 \
-                               AND source_cluster_epoch = ?4 AND desired_cluster_epoch = ?5",
+                               AND source_cluster_epoch = ?4",
                             params![
                                 work_item.request.data_pg_id as i64,
                                 work_item.request.segment_okh.as_slice(),
                                 work_item.request.segment_vid.get() as i64,
                                 work_item.source_cluster_epoch.get(),
-                                work_item.desired_cluster_epoch.get(),
                                 now as i64,
                                 i64::from(remaining_tolerance),
                                 last_error,
@@ -384,31 +382,32 @@ impl PgStore {
     ) -> Result<bool, StoreError> {
         validate_placed_segment_shard_backfill_work_item(work_item)?;
         validate_placed_segment_shard_backfill_pg(self.pg_id(), work_item)?;
-        self.conn
+        let existing = self
+            .conn
             .query_row(
-                "SELECT EXISTS( \
-                    SELECT 1 FROM placed_segment_shard_backfills \
-                    WHERE data_pg_id = ?1 AND segment_okh = ?2 AND segment_vid = ?3 \
-                      AND stored_size = ?4 AND segment_crc64 = ?5 AND ec_k = ?6 AND ec_m = ?7 \
-                      AND source_cluster_epoch = ?8 AND desired_cluster_epoch = ?9 \
-                 )",
+                "SELECT data_pg_id, segment_okh, segment_vid, stored_size, segment_crc64, \
+                        ec_k, ec_m, source_cluster_epoch, desired_cluster_epoch \
+                 FROM placed_segment_shard_backfills \
+                 WHERE data_pg_id = ?1 AND segment_okh = ?2 AND segment_vid = ?3 \
+                   AND source_cluster_epoch = ?4",
                 params![
                     work_item.request.data_pg_id as i64,
                     work_item.request.segment_okh.as_slice(),
                     work_item.request.segment_vid.get() as i64,
-                    work_item.request.stored_size as i64,
-                    work_item.request.segment_crc64 as i64,
-                    work_item.request.ec.k as i64,
-                    work_item.request.ec.m as i64,
                     work_item.source_cluster_epoch.get(),
-                    work_item.desired_cluster_epoch.get(),
                 ],
-                |row| row.get::<_, bool>(0),
+                placed_segment_shard_backfill_work_item_from_row,
             )
+            .optional()
             .map_err(|source| StoreError::Db {
                 context: "check placed segment shard backfill exists",
                 source: source.into(),
-            })
+            })?;
+        let Some(existing) = existing else {
+            return Ok(false);
+        };
+        validate_placed_segment_shard_backfill_coalesces_exactly(&existing, work_item)?;
+        Ok(true)
     }
 
     pub fn resolve_placed_segment_shard_backfill(
@@ -2478,6 +2477,44 @@ mod tests {
         assert_eq!(backfills.len(), 1);
         assert_eq!(backfills[0].remaining_tolerance, 0);
         assert_eq!(backfills[0].observation_count, 3);
+    }
+
+    #[test]
+    fn placed_segment_shard_backfill_coalesces_superseding_desired_epoch() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let work_item = PlacedSegmentShardBackfillWorkItem {
+            request: SegmentStoredBytesRequest {
+                data_pg_id: 7,
+                segment_okh: [0xC3; 16],
+                segment_vid: GenerationId::new(42).unwrap(),
+                stored_size: 1024,
+                segment_crc64: 0x1234,
+                ec: EcShape { k: 4, m: 2 },
+            },
+            source_cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            desired_cluster_epoch: ClusterEpoch::new(5).unwrap(),
+        };
+        let superseding = PlacedSegmentShardBackfillWorkItem {
+            desired_cluster_epoch: ClusterEpoch::new(9).unwrap(),
+            ..work_item
+        };
+
+        store
+            .record_placed_segment_shard_backfill(&work_item, 2, None)
+            .unwrap();
+        store
+            .record_placed_segment_shard_backfill(&superseding, 1, None)
+            .unwrap();
+
+        assert!(store
+            .placed_segment_shard_backfill_exists(&superseding)
+            .unwrap());
+        let backfills = store.list_placed_segment_shard_backfills().unwrap();
+        assert_eq!(backfills.len(), 1);
+        assert_eq!(backfills[0].work_item, work_item);
+        assert_eq!(backfills[0].remaining_tolerance, 1);
+        assert_eq!(backfills[0].observation_count, 2);
     }
 
     #[test]

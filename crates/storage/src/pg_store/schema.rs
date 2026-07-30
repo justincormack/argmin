@@ -72,6 +72,8 @@ CREATE TABLE placed_segment_shard_repairs (
 
 /// Durable backfill queue for segment shard sets whose desired PG placement
 /// differs from the historical placement used by existing segment metadata.
+/// One source placement has at most one outstanding row; later desired-route
+/// observations supersede it because execution always targets the current map.
 const CREATE_PLACED_SEGMENT_SHARD_BACKFILLS_TABLE: &str = "\
 CREATE TABLE placed_segment_shard_backfills (
     data_pg_id             INTEGER NOT NULL CHECK (data_pg_id >= 0),
@@ -101,7 +103,7 @@ CREATE TABLE placed_segment_shard_backfills (
         OR
         (claim_id IS NOT NULL AND owner_token IS NOT NULL AND cluster_epoch IS NOT NULL AND claimed_at IS NOT NULL AND lease_deadline IS NOT NULL)
     ),
-    PRIMARY KEY (data_pg_id, segment_okh, segment_vid, source_cluster_epoch, desired_cluster_epoch)
+    PRIMARY KEY (data_pg_id, segment_okh, segment_vid, source_cluster_epoch)
 ) STRICT";
 
 /// Per-PG object metadata table.

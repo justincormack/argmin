@@ -3097,6 +3097,69 @@ fn shard_scavenger_backfill_candidate_scan_records_historical_payloads() {
 }
 
 #[test]
+fn shard_scavenger_backfill_candidate_scan_ignores_unrelated_epoch_advance() {
+    let fixture = backfill_route_fixture(b"backfill-candidate-unrelated-epoch");
+    let bucket = crate::BucketName::try_from("backfill-scan-epoch-bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("backfill-scan-epoch-key".to_string()).unwrap();
+    record_backfill_scavenger_object_segment_reference(
+        &fixture.desired_cluster,
+        fixture.source_route.cluster_epoch(),
+        fixture.req,
+        bucket,
+        key,
+    );
+    let mut cursor = crate::cluster::PlacedSegmentShardBackfillCandidateScanCursor::default();
+    let first = fixture
+        .desired_cluster
+        .enqueue_placed_segment_shard_backfills_from_scavenger_references(&mut cursor)
+        .unwrap();
+    assert_eq!(first.enqueued, 1);
+
+    let current_epoch = fixture.desired_cluster.cluster_epoch();
+    let unrelated_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+    let current_pg1 = fixture
+        .desired_cluster
+        .reconstructed_pg_route_at_epoch(PgId::new(1), current_epoch)
+        .unwrap();
+    let advanced_pg0 = crate::control_plane::PgRouteSnapshot::reconstructed(
+        unrelated_epoch,
+        fixture.desired_route.pg_id(),
+        fixture.desired_route.primary_node_id(),
+        fixture.desired_route.acting_set().to_vec(),
+        fixture.desired_route.state(),
+    );
+    let unrelated_pg1 = crate::control_plane::PgRouteSnapshot::reconstructed(
+        unrelated_epoch,
+        current_pg1.pg_id(),
+        current_pg1.primary_node_id(),
+        current_pg1.acting_set().to_vec(),
+        current_pg1.state(),
+    );
+    let advanced = fixture
+        .desired_cluster
+        .test_clone_with_pg_routes(
+            unrelated_epoch,
+            [advanced_pg0, unrelated_pg1],
+            [fixture.source_route.clone()],
+        )
+        .unwrap();
+
+    let second = advanced
+        .enqueue_placed_segment_shard_backfills_from_scavenger_references(&mut cursor)
+        .unwrap();
+    assert_eq!(second.enqueued, 0);
+    assert_eq!(second.already_queued, 1);
+    let rows = advanced
+        .list_placed_segment_shard_backfills(fixture.req.data_pg_id)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].work_item.desired_cluster_epoch,
+        fixture.desired_route.cluster_epoch()
+    );
+}
+
+#[test]
 fn shard_scavenger_backfill_candidate_scan_skips_unchanged_effective_placement() {
     let fixture = backfill_route_fixture(b"phase-eleven-scanner-backfill-same-placement");
     let source_epoch = fixture.source_route.cluster_epoch();
