@@ -3021,12 +3021,12 @@ fn delete_bucket_expires_at_drain_and_pending_install_effect_boundaries() {
     assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
     drop(hook);
     drop(admission);
-    let snapshot = cluster
-        .bucket_delete_debug_snapshot(&trusted_bucket_name("delete-drain"))
+    let progress = cluster
+        .test_bucket_delete_progress(&trusted_bucket_name("delete-drain"))
         .unwrap();
-    assert_eq!(snapshot.bucket_row.unwrap().state, BucketState::Active);
-    assert!(snapshot.durable_write_drain.is_none());
-    assert!(snapshot.pending_metadata_command.is_none());
+    assert_eq!(progress.bucket_state, Some(BucketState::Active));
+    assert!(!progress.has_durable_write_drain);
+    assert!(!progress.has_pending_metadata_command);
 
     clock.set(1_000);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
@@ -3045,13 +3045,12 @@ fn delete_bucket_expires_at_drain_and_pending_install_effect_boundaries() {
     assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
     drop(hook);
     drop(admission);
-    let snapshot = cluster
-        .bucket_delete_debug_snapshot(&trusted_bucket_name("delete-mark"))
+    let progress = cluster
+        .test_bucket_delete_progress(&trusted_bucket_name("delete-mark"))
         .unwrap();
-    let bucket_row = snapshot.bucket_row.unwrap();
-    assert_eq!(bucket_row.state, BucketState::Active);
-    assert!(snapshot.durable_write_drain.is_some());
-    assert!(snapshot.pending_metadata_command.is_none());
+    assert_eq!(progress.bucket_state, Some(BucketState::Active));
+    assert!(progress.has_durable_write_drain);
+    assert!(!progress.has_pending_metadata_command);
 }
 
 #[test]
@@ -7041,8 +7040,8 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_stream_cleanup_phase() {
     initial
         .test_seed_bucket_delete_attempt_outcome(
             &bucket,
-            storage::BucketDeleteAttemptOutcomeKind::Retryable,
-            storage::BucketDeleteAttemptPhase::StreamCleanup,
+            storage::TestBucketDeleteAttemptOutcomeKind::Retryable,
+            storage::TestBucketDeleteAttemptPhase::StreamCleanup,
             "seeded stream-cleanup retryable attempt".to_string(),
             None,
         )
@@ -7130,8 +7129,8 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_reservation_wait_phase() {
     initial
         .test_seed_bucket_delete_attempt_outcome(
             &bucket,
-            storage::BucketDeleteAttemptOutcomeKind::Retryable,
-            storage::BucketDeleteAttemptPhase::ReservationWait,
+            storage::TestBucketDeleteAttemptOutcomeKind::Retryable,
+            storage::TestBucketDeleteAttemptPhase::ReservationWait,
             "seeded reservation-wait retryable attempt".to_string(),
             None,
         )
@@ -7220,8 +7219,8 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_phase() {
     initial
         .test_seed_bucket_delete_attempt_outcome(
             &bucket,
-            storage::BucketDeleteAttemptOutcomeKind::Retryable,
-            storage::BucketDeleteAttemptPhase::FinalVisibilityCheck,
+            storage::TestBucketDeleteAttemptOutcomeKind::Retryable,
+            storage::TestBucketDeleteAttemptPhase::FinalVisibilityCheck,
             "seeded final-visibility retryable attempt".to_string(),
             Some(0),
         )
@@ -7295,8 +7294,8 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_proven_phase(
     initial
         .test_seed_bucket_delete_attempt_outcome(
             &bucket,
-            storage::BucketDeleteAttemptOutcomeKind::Retryable,
-            storage::BucketDeleteAttemptPhase::FinalVisibilityProven,
+            storage::TestBucketDeleteAttemptOutcomeKind::Retryable,
+            storage::TestBucketDeleteAttemptPhase::FinalVisibilityProven,
             "seeded final-visibility-proven retryable attempt".to_string(),
             Some(0),
         )
@@ -16429,8 +16428,8 @@ fn delete_bucket_authorization_adopts_active_preserved_attempt_without_drain_wai
     storage_cluster
         .test_seed_bucket_delete_attempt_outcome(
             &bucket_name,
-            storage::BucketDeleteAttemptOutcomeKind::Retryable,
-            storage::BucketDeleteAttemptPhase::ReservationWait,
+            storage::TestBucketDeleteAttemptOutcomeKind::Retryable,
+            storage::TestBucketDeleteAttemptPhase::ReservationWait,
             "seeded reservation-wait attempt for auth adoption".to_string(),
             None,
         )

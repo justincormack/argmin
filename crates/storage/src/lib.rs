@@ -172,6 +172,234 @@ impl From<ReclaimWorkItem> for TestReclaimWorkItem {
         }
     }
 }
+
+/// Test-only input for one segment in an impossible durable reclaim fixture.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestObjectSegmentsReclaimSegmentRecord {
+    pub segment_index: u32,
+    pub segment_okh: [u8; 16],
+    pub segment_vid: GenerationId,
+    pub data_pg_id: u32,
+    pub ec: EcShape,
+}
+
+/// Test-only input for an impossible durable segmented-object reclaim fixture.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestObjectSegmentsReclaimRecord {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub generation_id: GenerationId,
+    pub created_at: u64,
+    pub segments: Vec<TestObjectSegmentsReclaimSegmentRecord>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<&TestObjectSegmentsReclaimRecord> for types::ObjectSegmentsReclaimRecord {
+    fn from(reclaim: &TestObjectSegmentsReclaimRecord) -> Self {
+        Self {
+            bucket: reclaim.bucket.clone(),
+            key: reclaim.key.clone(),
+            generation_id: reclaim.generation_id,
+            created_at: reclaim.created_at,
+            segments: reclaim
+                .segments
+                .iter()
+                .map(|segment| types::ObjectSegmentsReclaimSegmentRecord {
+                    segment_index: segment.segment_index,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    data_pg_id: segment.data_pg_id,
+                    ec: segment.ec,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<types::ObjectSegmentsReclaimRecord> for TestObjectSegmentsReclaimRecord {
+    fn from(reclaim: types::ObjectSegmentsReclaimRecord) -> Self {
+        Self {
+            bucket: reclaim.bucket,
+            key: reclaim.key,
+            generation_id: reclaim.generation_id,
+            created_at: reclaim.created_at,
+            segments: reclaim
+                .segments
+                .into_iter()
+                .map(|segment| TestObjectSegmentsReclaimSegmentRecord {
+                    segment_index: segment.segment_index,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    data_pg_id: segment.data_pg_id,
+                    ec: segment.ec,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Test-only input for one segment in an impossible durable multipart reclaim fixture.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestMultipartReclaimPartSegmentRecord {
+    pub part_number: u32,
+    pub segment_index: u32,
+    pub segment_okh: [u8; 16],
+    pub segment_vid: GenerationId,
+    pub data_pg_id: u32,
+    pub ec: EcShape,
+}
+
+/// Test-only input for one multipart part in an impossible durable reclaim fixture.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestMultipartReclaimPartRecord {
+    pub part_number: u32,
+    pub segments: Vec<TestMultipartReclaimPartSegmentRecord>,
+}
+
+/// Test-only input for an impossible durable multipart reclaim fixture.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestMultipartReclaimRecord {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub generation_id: GenerationId,
+    pub created_at: u64,
+    pub parts: Vec<TestMultipartReclaimPartRecord>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<&TestMultipartReclaimRecord> for types::MultipartReclaimRecord {
+    fn from(reclaim: &TestMultipartReclaimRecord) -> Self {
+        Self {
+            bucket: reclaim.bucket.clone(),
+            key: reclaim.key.clone(),
+            generation_id: reclaim.generation_id,
+            created_at: reclaim.created_at,
+            parts: reclaim
+                .parts
+                .iter()
+                .map(|part| types::MultipartReclaimPartRecord {
+                    part_number: part.part_number,
+                    segments: part
+                        .segments
+                        .iter()
+                        .map(|segment| types::MultipartReclaimPartSegmentRecord {
+                            part_number: segment.part_number,
+                            segment_index: segment.segment_index,
+                            segment_okh: segment.segment_okh,
+                            segment_vid: segment.segment_vid,
+                            data_pg_id: segment.data_pg_id,
+                            ec: segment.ec,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Test-only observation of a bucket-scoped durable reclaim root.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestPayloadReclaimRoot {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub generation_id: GenerationId,
+}
+
+/// Test-only logical observation of accepted bucket-deletion progress.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TestBucketDeleteProgress {
+    pub bucket_state: Option<BucketState>,
+    pub has_durable_write_drain: bool,
+    pub has_pending_metadata_command: bool,
+}
+
+/// Test-only durable bucket-deletion outcome fixture.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestBucketDeleteAttemptOutcomeKind {
+    Retryable,
+    NotEmpty,
+    StaleGeneration,
+    MarkDeleting,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<TestBucketDeleteAttemptOutcomeKind> for types::BucketDeleteAttemptOutcomeKind {
+    fn from(value: TestBucketDeleteAttemptOutcomeKind) -> Self {
+        match value {
+            TestBucketDeleteAttemptOutcomeKind::Retryable => Self::Retryable,
+            TestBucketDeleteAttemptOutcomeKind::NotEmpty => Self::NotEmpty,
+            TestBucketDeleteAttemptOutcomeKind::StaleGeneration => Self::StaleGeneration,
+            TestBucketDeleteAttemptOutcomeKind::MarkDeleting => Self::MarkDeleting,
+        }
+    }
+}
+
+/// Test-only durable bucket-deletion phase fixture.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestBucketDeleteAttemptPhase {
+    Initial,
+    ReservationWait,
+    PostReservationObjectDrain,
+    StreamCleanup,
+    FinalVisibilityCheck,
+    FinalVisibilityProven,
+    MarkDeleting,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<TestBucketDeleteAttemptPhase> for types::BucketDeleteAttemptPhase {
+    fn from(value: TestBucketDeleteAttemptPhase) -> Self {
+        match value {
+            TestBucketDeleteAttemptPhase::Initial => Self::Initial,
+            TestBucketDeleteAttemptPhase::ReservationWait => Self::ReservationWait,
+            TestBucketDeleteAttemptPhase::PostReservationObjectDrain => {
+                Self::PostReservationObjectDrain
+            }
+            TestBucketDeleteAttemptPhase::StreamCleanup => Self::StreamCleanup,
+            TestBucketDeleteAttemptPhase::FinalVisibilityCheck => Self::FinalVisibilityCheck,
+            TestBucketDeleteAttemptPhase::FinalVisibilityProven => Self::FinalVisibilityProven,
+            TestBucketDeleteAttemptPhase::MarkDeleting => Self::MarkDeleting,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<types::BucketDeleteAttemptPhase> for TestBucketDeleteAttemptPhase {
+    fn from(value: types::BucketDeleteAttemptPhase) -> Self {
+        match value {
+            types::BucketDeleteAttemptPhase::Initial => Self::Initial,
+            types::BucketDeleteAttemptPhase::ReservationWait => Self::ReservationWait,
+            types::BucketDeleteAttemptPhase::PostReservationObjectDrain => {
+                Self::PostReservationObjectDrain
+            }
+            types::BucketDeleteAttemptPhase::StreamCleanup => Self::StreamCleanup,
+            types::BucketDeleteAttemptPhase::FinalVisibilityCheck => Self::FinalVisibilityCheck,
+            types::BucketDeleteAttemptPhase::FinalVisibilityProven => Self::FinalVisibilityProven,
+            types::BucketDeleteAttemptPhase::MarkDeleting => Self::MarkDeleting,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<types::PayloadReclaimRoot> for TestPayloadReclaimRoot {
+    fn from(root: types::PayloadReclaimRoot) -> Self {
+        Self {
+            bucket: root.bucket,
+            key: root.key,
+            generation_id: root.generation_id,
+        }
+    }
+}
 pub use metadata_command::BucketWriteReservationProof;
 #[cfg(test)]
 pub(crate) use node::LocalStorageNode;
@@ -217,13 +445,7 @@ pub(crate) use types::BucketSubresourceAux;
 pub use types::{
     key_prefix_upper_bound, object_key_common_prefix, object_key_prefix_upper_bound,
     AbortMultipartUploadCleanup, AclGrants, AuthorizedMultipartUploadRecord,
-    BeginUploadPartStreamSessionReq, BucketAclSummary, BucketDeleteAttemptOutcomeKind,
-    BucketDeleteAttemptOutcomeRecord, BucketDeleteAttemptPhase, BucketDeleteDebugBucketRow,
-    BucketDeleteDebugDrain, BucketDeleteDebugFinalizeClaim, BucketDeleteDebugObjectVersionKind,
-    BucketDeleteDebugObjectVersionSample, BucketDeleteDebugObjectVersionSampleError,
-    BucketDeleteDebugPayloadReclaimClaim, BucketDeleteDebugPayloadReclaimClaimError,
-    BucketDeleteDebugPayloadReclaimRoot, BucketDeleteDebugPayloadReclaimRootError,
-    BucketDeleteDebugPendingCommand, BucketDeleteDebugSnapshot, BucketDeleteFinalizeClaimRecord,
+    BeginUploadPartStreamSessionReq, BucketAclSummary, BucketDeleteDiagnostic,
     BucketEncryptionConfig, BucketFastPathIdentity, BucketFastPathInfo, BucketFastPathPolicy,
     BucketFastPathTags, BucketInfo, BucketName, BucketNameError, BucketObjectLockConfig,
     BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot, BucketSnapshotPair,
@@ -247,16 +469,13 @@ pub use types::{
     ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource, ManagedEncryptionAlgorithm,
     MultipartChecksumConfig, MultipartCompletionFingerprint, MultipartCompletionPreflight,
     MultipartCompletionReplay, MultipartCompletionSnapshot, MultipartObjectIdentity,
-    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
-    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadIdKey,
+    MultipartPartRecord, MultipartPartSegmentRecord, MultipartUploadIdKey,
     MultipartUploadListMarker, MultipartUploadManagementLookup, MultipartUploadRecord,
     ObjectEncryption, ObjectEncryptionStateError, ObjectEtag, ObjectKey, ObjectKeyError,
     ObjectLayout, ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState,
-    ObjectPartRangeRecord, ObjectPartRecord, ObjectPayloadReclaimClaimRecord,
-    ObjectPayloadReclaimKind, ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity,
+    ObjectPartRangeRecord, ObjectPartRecord, ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity,
     ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention,
-    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
-    ObjectState, OpaqueBucketSubresourceKind, OwnerIdentity, PayloadReclaimRoot, PgId, PgState,
+    ObjectSegmentRecord, ObjectState, OpaqueBucketSubresourceKind, OwnerIdentity, PgId, PgState,
     PrepareStreamUploadSegmentAppendReq, PreparedStreamPartCommit, PreparedStreamPutCommit,
     PublicAccessBlockConfig, PutBucketSubresource, PutDeleteMarkerReq, PutLiveObjectReq,
     PutLiveObjectValidationError, PutObjectReq, RawChecksum, RetentionPeriod, RouteMapValidUntilMs,
@@ -270,23 +489,27 @@ pub use types::{
     StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadRecordPage,
     StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord,
     UploadId, UploadIdError, UploadState, VersionId, WriteAck, WrittenShardAck,
-    BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN, MULTIPART_PART_SEGMENT_STAGING_VERSION_ID,
-    MULTIPART_UPLOAD_ID_KEY_LEN, OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN,
-    OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN, OBJECT_ENCRYPTION_SEGMENT_NONCE_SCOPE_LEN,
-    OBJECT_ENCRYPTION_SEGMENT_TAG_LEN, OBJECT_ENCRYPTION_WRAPPED_DEK_LEN,
-    OBJECT_ENCRYPTION_WRAP_NONCE_LEN, SESSION_ID_LEN, SHARD_KEY_HEX_LEN, SHARD_KEY_HEX_PREFIX_LEN,
-    SHARD_KEY_LEN, SSE_C_CHECKSUM_NONCE_LEN, SSE_C_SEGMENT_NONCE_PREFIX_LEN,
-    SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN, SSE_C_VALIDATOR_SALT_LEN,
-    SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN, SSE_S3_CHECKSUM_NONCE_LEN,
-    SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN, SSE_S3_WRAP_NONCE_LEN,
-    UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
+    MULTIPART_PART_SEGMENT_STAGING_VERSION_ID, MULTIPART_UPLOAD_ID_KEY_LEN,
+    OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN, OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN,
+    OBJECT_ENCRYPTION_SEGMENT_NONCE_SCOPE_LEN, OBJECT_ENCRYPTION_SEGMENT_TAG_LEN,
+    OBJECT_ENCRYPTION_WRAPPED_DEK_LEN, OBJECT_ENCRYPTION_WRAP_NONCE_LEN, SESSION_ID_LEN,
+    SHARD_KEY_HEX_LEN, SHARD_KEY_HEX_PREFIX_LEN, SHARD_KEY_LEN, SSE_C_CHECKSUM_NONCE_LEN,
+    SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN,
+    SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
+    SSE_S3_CHECKSUM_NONCE_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN,
+    SSE_S3_WRAP_NONCE_LEN, UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
 };
-pub(crate) use types::{BucketDeleteFinalizeRoot, BucketSubresourceKind};
+pub(crate) use types::{
+    BucketDeleteAttemptOutcomeKind, BucketDeleteAttemptOutcomeRecord, BucketDeleteAttemptPhase,
+    BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketSubresourceKind,
+    ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, PayloadReclaimRoot,
+    BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN,
+};
 #[cfg(test)]
 pub(crate) use types::{
-    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
-    PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
-    PlacedSegmentShardBackfillWorkItem,
+    ObjectSegmentsReclaimRecord, PlacedSegmentShardBackfillClaimAcquire,
+    PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
+    PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
 };
 
 #[cfg(test)]

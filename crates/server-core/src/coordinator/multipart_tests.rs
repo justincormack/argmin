@@ -4,7 +4,7 @@ use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
 use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
 use std::sync::Arc;
-use storage::{EcShape, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord};
+use storage::{EcShape, TestObjectSegmentsReclaimRecord, TestObjectSegmentsReclaimSegmentRecord};
 
 fn create_bucket_with_explicit_writer_grant(
     coord: &Coordinator,
@@ -1323,12 +1323,12 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
         .test_put_object_segments_reclaim(
             &bucket,
             &key,
-            &ObjectSegmentsReclaimRecord {
+            &TestObjectSegmentsReclaimRecord {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 generation_id,
                 created_at: 1,
-                segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                segments: vec![TestObjectSegmentsReclaimSegmentRecord {
                     segment_index: 0,
                     segment_okh: object_key_hash("bucket", "ghost"),
                     segment_vid: generation_id,

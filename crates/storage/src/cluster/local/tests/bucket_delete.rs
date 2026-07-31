@@ -4260,8 +4260,8 @@ fn active_delete_attempt_authorization_snapshot_requires_drained_bucket_writes()
     cluster
         .test_seed_bucket_delete_attempt_outcome(
             &bucket,
-            crate::BucketDeleteAttemptOutcomeKind::Retryable,
-            crate::BucketDeleteAttemptPhase::ReservationWait,
+            crate::TestBucketDeleteAttemptOutcomeKind::Retryable,
+            crate::TestBucketDeleteAttemptPhase::ReservationWait,
             "seeded reservation-wait attempt".to_string(),
             None,
         )
@@ -4429,7 +4429,7 @@ fn begin_bucket_delete_adopts_post_reservation_phase_after_budget_exhaustion() {
     let _progress_hook_guard = cluster.test_install_after_bucket_delete_exact_drain_progress_hook(
         Arc::new(move |phase, next_object_pg_id| {
             match (stage_for_hook.load(Ordering::SeqCst), phase) {
-                (0, crate::BucketDeleteAttemptPhase::PostReservationObjectDrain)
+                (0, crate::TestBucketDeleteAttemptPhase::PostReservationObjectDrain)
                     if next_object_pg_id > 0 =>
                 {
                     stage_for_hook.store(1, Ordering::SeqCst);
@@ -4437,7 +4437,7 @@ fn begin_bucket_delete_adopts_post_reservation_phase_after_budget_exhaustion() {
                         context: "bucket delete exact-bucket drain budget exhausted",
                     });
                 }
-                (1, crate::BucketDeleteAttemptPhase::Initial) => {
+                (1, crate::TestBucketDeleteAttemptPhase::Initial) => {
                     return Err(StoreError::Io {
                         context: "unexpected initial exact-bucket drain after post-reservation budget exhaustion",
                         source: std::io::Error::other(format!(
@@ -4445,7 +4445,7 @@ fn begin_bucket_delete_adopts_post_reservation_phase_after_budget_exhaustion() {
                         )),
                     });
                 }
-                (1, crate::BucketDeleteAttemptPhase::PostReservationObjectDrain) => {
+                (1, crate::TestBucketDeleteAttemptPhase::PostReservationObjectDrain) => {
                     post_reservation_retry_seen_for_hook.store(true, Ordering::SeqCst);
                 }
                 _ => {}
@@ -5189,7 +5189,7 @@ fn begin_bucket_delete_adopts_preserved_initial_frontier_then_resets_before_stre
     let _progress_hook_guard = cluster.test_install_after_bucket_delete_exact_drain_progress_hook(
         Arc::new(move |phase, next_object_pg_id| {
             match (hook_stage_for_hook.load(Ordering::SeqCst), phase) {
-                (0, crate::BucketDeleteAttemptPhase::Initial)
+                (0, crate::TestBucketDeleteAttemptPhase::Initial)
                     if next_object_pg_id > 0 && next_object_pg_id < pg_count =>
                 {
                     first_frontier_for_hook.store(next_object_pg_id as usize, Ordering::SeqCst);
@@ -5200,7 +5200,9 @@ fn begin_bucket_delete_adopts_preserved_initial_frontier_then_resets_before_stre
                         now_ms: 1,
                     });
                 }
-                (1, crate::BucketDeleteAttemptPhase::Initial) if next_object_pg_id == pg_count => {
+                (1, crate::TestBucketDeleteAttemptPhase::Initial)
+                    if next_object_pg_id == pg_count =>
+                {
                     hook_stage_for_hook.store(2, Ordering::SeqCst);
                     return Err(StoreError::RouteMapExpired {
                         cluster_epoch: ClusterEpoch::INITIAL,
@@ -5208,7 +5210,9 @@ fn begin_bucket_delete_adopts_preserved_initial_frontier_then_resets_before_stre
                         now_ms: 1,
                     });
                 }
-                (_, crate::BucketDeleteAttemptPhase::StreamCleanup) if next_object_pg_id == 0 => {
+                (_, crate::TestBucketDeleteAttemptPhase::StreamCleanup)
+                    if next_object_pg_id == 0 =>
+                {
                     reset_seen_for_hook.store(true, Ordering::SeqCst);
                 }
                 _ => {}

@@ -2857,7 +2857,7 @@ fail_with_matches \
 reclaim_maintenance_boundary_leaks=$(
     {
         rg -n --color=never \
-            'storage::(cluster::)?(ReclaimWorkItem|BucketDeleteBeginRoot|BucketDeleteFinalizeRoot|DurableReclaimScanBatch|DurableReclaimScanOutcome|ObjectPayloadReclaimAttempt)\b|\.(try_take_reclaim_work|finish_object_payload_reclaim_work|finish_bucket_delete_finalize_work|enqueue_durable_reclaim_work_batch_excluding|wait_for_queued_reclaim_work_poll|wake_reclaim_workers|continue_adopted_bucket_delete|reclaim_object_payload_if_unleased_with_outcome)\(' \
+            'storage::(cluster::|types::)?(ReclaimWorkItem|BucketDeleteBeginRoot|BucketDeleteFinalizeRoot|BucketDeleteFinalizeClaimRecord|BucketDeleteAttemptOutcomeKind|BucketDeleteAttemptOutcomeRecord|BucketDeleteAttemptPhase|BucketDeleteDebug[A-Za-z]*|DurableReclaimScanBatch|DurableReclaimScanOutcome|MultipartReclaimPartRecord|MultipartReclaimPartSegmentRecord|MultipartReclaimRecord|ObjectPayloadReclaimAttempt|ObjectPayloadReclaimClaimRecord|ObjectPayloadReclaimKind|ObjectSegmentsReclaimRecord|ObjectSegmentsReclaimSegmentRecord|PayloadReclaimRoot)\b|\.(bucket_delete_debug_snapshot|try_take_reclaim_work|finish_object_payload_reclaim_work|finish_bucket_delete_finalize_work|enqueue_durable_reclaim_work_batch_excluding|wait_for_queued_reclaim_work_poll|wake_reclaim_workers|continue_adopted_bucket_delete|reclaim_object_payload_if_unleased_with_outcome)\(' \
             . \
             -g 'crates/**/*.rs' \
             -g '!crates/storage/**' \
@@ -2866,10 +2866,14 @@ reclaim_maintenance_boundary_leaks=$(
             '^[[:space:]]*pub fn (try_take_reclaim_work|finish_object_payload_reclaim_work|finish_bucket_delete_finalize_work|enqueue_durable_reclaim_work_batch_excluding|wait_for_queued_reclaim_work_poll|wake_reclaim_workers|continue_adopted_bucket_delete|reclaim_object_payload_if_unleased_with_outcome)\(' \
             crates/storage/src/cluster/request_ops.rs \
             || true
+        rg -n --color=never \
+            '^[[:space:]]*pub (struct|enum) (BucketDeleteFinalizeClaimRecord|BucketDeleteAttemptOutcomeKind|BucketDeleteAttemptOutcomeRecord|BucketDeleteAttemptPhase|BucketDeleteDebug[A-Za-z]*|MultipartReclaimPartRecord|MultipartReclaimPartSegmentRecord|MultipartReclaimRecord|ObjectPayloadReclaimClaimRecord|ObjectPayloadReclaimKind|ObjectSegmentsReclaimRecord|ObjectSegmentsReclaimSegmentRecord|PayloadReclaimRoot)\b' \
+            crates/storage/src/types.rs \
+            || true
     }
 )
 fail_with_matches \
-    "Reclaim queues, durable scan state, cleanup roots, and physical worker transitions are storage-owned; use StorageReclaimSweeper or explicit test-only facilities" \
+    "Reclaim queues, durable scan state, claims, cleanup roots, debug snapshots, and physical worker transitions are storage-owned; use StorageReclaimSweeper, BucketDeleteDiagnostic, or explicit Test-prefixed facilities" \
     "$reclaim_maintenance_boundary_leaks"
 
 object_encryption_codec_leaks=$(

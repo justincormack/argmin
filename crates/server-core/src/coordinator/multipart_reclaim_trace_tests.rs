@@ -5,8 +5,9 @@ use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestCaseRes
 use std::fmt::Write as _;
 use std::path::Path;
 use storage::{
-    MultipartReclaimPartRecord, MultipartReclaimRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, PgTopology, TestReclaimWorkItem as ReclaimWorkItem,
+    PgTopology, TestMultipartReclaimPartRecord, TestMultipartReclaimRecord,
+    TestObjectSegmentsReclaimRecord, TestObjectSegmentsReclaimSegmentRecord,
+    TestReclaimWorkItem as ReclaimWorkItem,
 };
 
 const TRACE_BUCKET: &str = "bucket";
@@ -42,7 +43,7 @@ fn trace_object_segments_reclaim(
     key: &str,
     generation_id: GenerationId,
     created_at: u64,
-) -> ObjectSegmentsReclaimRecord {
+) -> TestObjectSegmentsReclaimRecord {
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
     let data_pg_id = runtime
@@ -50,12 +51,12 @@ fn trace_object_segments_reclaim(
         .object_generation_segment_data_pg(&bucket_name, &object_key, generation_id, 0)
         .get();
 
-    ObjectSegmentsReclaimRecord {
+    TestObjectSegmentsReclaimRecord {
         bucket: bucket_name,
         key: object_key,
         generation_id,
         created_at,
-        segments: vec![ObjectSegmentsReclaimSegmentRecord {
+        segments: vec![TestObjectSegmentsReclaimSegmentRecord {
             segment_index: 0,
             segment_okh: object_key_hash(bucket, key),
             segment_vid: generation_id,
@@ -71,7 +72,7 @@ fn trace_multipart_reclaim(
     key: &str,
     generation_id: GenerationId,
     created_at: u64,
-) -> MultipartReclaimRecord {
+) -> TestMultipartReclaimRecord {
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
     let data_pg_id = runtime
@@ -79,14 +80,14 @@ fn trace_multipart_reclaim(
         .object_generation_multipart_part_data_pg(&bucket_name, &object_key, generation_id, 1)
         .get();
 
-    MultipartReclaimRecord {
+    TestMultipartReclaimRecord {
         bucket: bucket_name,
         key: object_key,
         generation_id,
         created_at,
-        parts: vec![MultipartReclaimPartRecord {
+        parts: vec![TestMultipartReclaimPartRecord {
             part_number: 1,
-            segments: vec![storage::MultipartReclaimPartSegmentRecord {
+            segments: vec![storage::TestMultipartReclaimPartSegmentRecord {
                 part_number: 1,
                 segment_index: 0,
                 segment_okh: object_key_hash(bucket, key),

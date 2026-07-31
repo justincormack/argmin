@@ -47,7 +47,16 @@ use crate::storage_rpc::StorageRpcErrorCode;
 use crate::traits::DurableBucketWriteReservationAcquire;
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::traits::PgMetadataStore;
-use crate::types::AdmittedRouteEffectFence;
+use crate::types::{
+    AdmittedRouteEffectFence, BucketDeleteDebugBucketRow, BucketDeleteDebugDrain,
+    BucketDeleteDebugFinalizeClaim, BucketDeleteDebugObjectVersionKind,
+    BucketDeleteDebugObjectVersionSample, BucketDeleteDebugObjectVersionSampleError,
+    BucketDeleteDebugPayloadReclaimClaim, BucketDeleteDebugPayloadReclaimClaimError,
+    BucketDeleteDebugPayloadReclaimRoot, BucketDeleteDebugPayloadReclaimRootError,
+    BucketDeleteDebugPendingCommand, BucketDeleteDebugSnapshot,
+};
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::types::{MultipartReclaimRecord, ObjectSegmentsReclaimRecord};
 use crate::*;
 
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
@@ -302,7 +311,7 @@ pub type BucketDeletePostReservationProgressTestHook =
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub type BucketDeleteExactDrainProgressTestHook =
-    Arc<dyn Fn(BucketDeleteAttemptPhase, u32) -> Result<(), StoreError> + Send + Sync>;
+    Arc<dyn Fn(crate::TestBucketDeleteAttemptPhase, u32) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub type BucketDeleteExactDrainStartTestHook =
@@ -822,7 +831,7 @@ fn maybe_run_after_bucket_delete_exact_drain_progress_hook(
         .get(&_scope_id)
         .cloned();
     if let Some(hook) = hook {
-        hook(_phase, _next_object_pg_id)?;
+        hook(_phase.into(), _next_object_pg_id)?;
     }
     Ok(())
 }
@@ -3917,8 +3926,8 @@ impl super::StorageCluster {
     pub fn test_seed_bucket_delete_attempt_outcome(
         &self,
         bucket: &BucketName,
-        outcome: BucketDeleteAttemptOutcomeKind,
-        phase: BucketDeleteAttemptPhase,
+        outcome: crate::TestBucketDeleteAttemptOutcomeKind,
+        phase: crate::TestBucketDeleteAttemptPhase,
         detail: String,
         post_reservation_next_object_pg_id: Option<u32>,
     ) -> Result<(), BucketWriteDrainError> {
@@ -3941,8 +3950,8 @@ impl super::StorageCluster {
             drain_id: drain.record.drain_id.clone(),
             cluster_epoch: drain.record.cluster_epoch,
             bucket_execution_generation: drain.record.bucket_execution_generation,
-            outcome,
-            phase,
+            outcome: outcome.into(),
+            phase: phase.into(),
             detail,
             post_reservation_next_object_pg_id,
             finalizer_next_object_pg_id: None,
@@ -15582,19 +15591,15 @@ impl super::StorageCluster {
         )
     }
 
-    pub fn bucket_delete_attempt_outcome(
+    pub fn bucket_delete_diagnostic(
         &self,
         bucket: &BucketName,
-    ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError> {
-        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
-        let node = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        node.bucket_write_reservation_client()
-            .bucket_delete_attempt_outcome(self.validated_bucket_metadata_pg(pg_id), bucket)
+    ) -> Result<BucketDeleteDiagnostic, BucketSnapshotLoadError> {
+        self.bucket_delete_debug_snapshot(bucket)
+            .map(|snapshot| BucketDeleteDiagnostic::from_snapshot(&snapshot))
     }
 
-    pub fn bucket_delete_debug_snapshot(
+    fn bucket_delete_debug_snapshot(
         &self,
         bucket: &BucketName,
     ) -> Result<BucketDeleteDebugSnapshot, BucketSnapshotLoadError> {
@@ -15824,6 +15829,19 @@ impl super::StorageCluster {
         })
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_bucket_delete_progress(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<crate::TestBucketDeleteProgress, BucketSnapshotLoadError> {
+        let snapshot = self.bucket_delete_debug_snapshot(bucket)?;
+        Ok(crate::TestBucketDeleteProgress {
+            bucket_state: snapshot.bucket_row.map(|row| row.state),
+            has_durable_write_drain: snapshot.durable_write_drain.is_some(),
+            has_pending_metadata_command: snapshot.pending_metadata_command.is_some(),
+        })
+    }
+
     fn bucket_delete_debug_object_sample(
         object_pg_id: u32,
         stored: StoredObject,
@@ -16033,9 +16051,10 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) -> Result<Option<ObjectSegmentsReclaimRecord>, ObjectPgActionError> {
+    ) -> Result<Option<crate::TestObjectSegmentsReclaimRecord>, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_get_object_segments_reclaim(bucket, key, generation_id)
+            .map(|reclaim| reclaim.map(Into::into))
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -16043,15 +16062,16 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-        reclaim: &ObjectSegmentsReclaimRecord,
+        reclaim: &crate::TestObjectSegmentsReclaimRecord,
     ) -> Result<(), ObjectPgActionError> {
+        let reclaim = ObjectSegmentsReclaimRecord::from(reclaim);
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         for node in self
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
             let pg = node.test_node().get_pg(pg_id.get())?;
-            pg.put_object_segments_reclaim(reclaim)?;
+            pg.put_object_segments_reclaim(&reclaim)?;
             pg.refresh_metadata_command_state_digest()?;
         }
         Ok(())
@@ -16062,15 +16082,16 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-        reclaim: &MultipartReclaimRecord,
+        reclaim: &crate::TestMultipartReclaimRecord,
     ) -> Result<(), ObjectPgActionError> {
+        let reclaim = MultipartReclaimRecord::from(reclaim);
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         for node in self
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
             let pg = node.test_node().get_pg(pg_id.get())?;
-            pg.put_multipart_reclaim(reclaim)?;
+            pg.put_multipart_reclaim(&reclaim)?;
             pg.refresh_metadata_command_state_digest()?;
         }
         Ok(())
@@ -16102,9 +16123,10 @@ impl super::StorageCluster {
     pub fn test_list_bucket_payload_reclaim_roots(
         &self,
         bucket: &BucketName,
-    ) -> Result<Vec<PayloadReclaimRoot>, ObjectPgActionError> {
+    ) -> Result<Vec<crate::TestPayloadReclaimRoot>, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_list_bucket_payload_reclaim_roots(bucket)
+            .map(|roots| roots.into_iter().map(Into::into).collect())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

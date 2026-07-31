@@ -9,9 +9,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, MutexGuard};
 use storage::{
-    EcShape, MultipartPartSegmentRecord, MultipartUploadRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, PayloadReclaimRoot, PgTopology, StreamUploadRecord,
-    StreamUploadSegmentRecord,
+    EcShape, MultipartPartSegmentRecord, MultipartUploadRecord, PgTopology, StreamUploadRecord,
+    StreamUploadSegmentRecord, TestObjectSegmentsReclaimRecord,
+    TestObjectSegmentsReclaimSegmentRecord, TestPayloadReclaimRoot,
 };
 
 const NO_READ: &ReadCondition = &ReadCondition {
@@ -272,7 +272,7 @@ impl<'a> InvariantHarness<'a> {
             .collect()
     }
 
-    fn pending_reclaim_roots_for(&self, bucket: &str, key: &str) -> Vec<PayloadReclaimRoot> {
+    fn pending_reclaim_roots_for(&self, bucket: &str, key: &str) -> Vec<TestPayloadReclaimRoot> {
         let bucket_name = trusted_bucket_name(bucket);
         let key_name = trusted_object_key(key);
         self.coord
@@ -2053,12 +2053,12 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
             .test_put_object_segments_reclaim(
                 &bucket,
                 &key,
-                &ObjectSegmentsReclaimRecord {
+                &TestObjectSegmentsReclaimRecord {
                     bucket: bucket.clone(),
                     key: key.clone(),
                     generation_id,
                     created_at: 1,
-                    segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                    segments: vec![TestObjectSegmentsReclaimSegmentRecord {
                         segment_index: 0,
                         segment_okh: object_key_hash("bucket", "key"),
                         segment_vid: generation_id,
