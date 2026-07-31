@@ -827,6 +827,29 @@ pub struct S3HyperBody {
     _unread_request_body: Option<Incoming>,
 }
 
+pub(crate) struct HttpRequestAdmission {
+    permit: OwnedSemaphorePermit,
+    inflight_requests_guard: observability::InflightRequestsGuard,
+}
+
+impl HttpRequestAdmission {
+    pub(crate) fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            permit,
+            inflight_requests_guard: observability::inflight_requests_guard(),
+        }
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        Option<OwnedSemaphorePermit>,
+        Option<observability::InflightRequestsGuard>,
+    ) {
+        (Some(self.permit), Some(self.inflight_requests_guard))
+    }
+}
+
 impl S3HyperBody {
     fn buffered(
         body: Vec<u8>,
@@ -5224,14 +5247,18 @@ fn percent_encode_location_key(value: &str) -> String {
 
 /// Convert an `S3Response` into a hyper-compatible HTTP response.
 #[must_use]
-pub fn s3_response_to_hyper(
+pub(crate) fn s3_response_to_hyper(
     resp: S3Response,
-    permit: Option<OwnedSemaphorePermit>,
+    admission: Option<HttpRequestAdmission>,
     stream_read_chunk_size: usize,
     panic_on_500: bool,
     abort_on_500: bool,
     trace_meta: ResponseTraceMeta,
 ) -> http::Response<S3HyperBody> {
+    let (permit, inflight_requests_guard) = admission
+        .map(HttpRequestAdmission::into_parts)
+        .unwrap_or((None, None));
+
     fn fail_on_500_diagnostic(message: String, panic_on_500: bool, abort_on_500: bool) {
         if abort_on_500 {
             use std::io::Write as _;
@@ -5260,6 +5287,7 @@ pub fn s3_response_to_hyper(
     fn internal_error_response(
         reason: String,
         permit: Option<OwnedSemaphorePermit>,
+        inflight_requests_guard: Option<observability::InflightRequestsGuard>,
         panic_on_500: bool,
         abort_on_500: bool,
         trace_meta: ResponseTraceMeta,
@@ -5285,9 +5313,6 @@ pub fn s3_response_to_hyper(
         if panic_on_500 || abort_on_500 {
             fail_on_500_diagnostic(diagnostic_message, panic_on_500, abort_on_500);
         }
-        let inflight_requests_guard = permit
-            .as_ref()
-            .map(|_| observability::inflight_requests_guard());
         let mut response = http::Response::new(S3HyperBody::buffered(
             resp.body,
             permit,
@@ -5394,6 +5419,7 @@ pub fn s3_response_to_hyper(
             return internal_error_response(
                 format!("invalid response status code {}: {err}", resp.status_code),
                 permit,
+                inflight_requests_guard,
                 panic_on_500,
                 abort_on_500,
                 trace_meta,
@@ -5411,6 +5437,7 @@ pub fn s3_response_to_hyper(
                 return internal_error_response(
                     format!("invalid response header name {name:?}: {err}"),
                     permit,
+                    inflight_requests_guard,
                     panic_on_500,
                     abort_on_500,
                     trace_meta,
@@ -5423,6 +5450,7 @@ pub fn s3_response_to_hyper(
                 return internal_error_response(
                     format!("invalid response header value for {name}: {err}"),
                     permit,
+                    inflight_requests_guard,
                     panic_on_500,
                     abort_on_500,
                     trace_meta,
@@ -5467,9 +5495,6 @@ pub fn s3_response_to_hyper(
         resp.stream.is_some(),
     );
     let error_diagnostic = resp.error_diagnostic.clone();
-    let inflight_requests_guard = permit
-        .as_ref()
-        .map(|_| observability::inflight_requests_guard());
     let mut body = match resp.stream {
         Some(stream) => S3HyperBody::streaming(
             stream,
@@ -7909,6 +7934,50 @@ mod tests {
             ),
         );
         assert_eq!(hyper_resp.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn s3_response_to_hyper_transfers_inflight_request_guard_without_recounting() {
+        let before = observability::metrics_snapshot().inflight_requests;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore
+            .try_acquire_owned()
+            .expect("request permit should be available");
+        let admission = HttpRequestAdmission::new(permit);
+        assert_eq!(
+            observability::metrics_snapshot().inflight_requests,
+            before + 1
+        );
+
+        let response = s3_response_to_hyper(
+            S3Response {
+                status_code: 200,
+                headers: Vec::new(),
+                body: b"ok".to_vec(),
+                stream: None,
+                error_diagnostic: None,
+                include_wire_ids: true,
+            },
+            Some(admission),
+            8192,
+            false,
+            false,
+            ResponseTraceMeta::new(
+                crate::http::new_request_trace_context(),
+                Arc::<str>::from("host-id"),
+                "GET",
+                "/",
+                "",
+            ),
+        );
+        assert_eq!(
+            observability::metrics_snapshot().inflight_requests,
+            before + 1,
+            "response conversion must transfer rather than duplicate the guard"
+        );
+
+        drop(response);
+        assert_eq!(observability::metrics_snapshot().inflight_requests, before);
     }
 
     #[test]

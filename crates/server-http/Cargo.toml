@@ -40,4 +40,5 @@ tokio-rustls = "0.26"
 [dev-dependencies]
 test-util = { path = "../test-util" }
 server-core = { path = "../server-core", default-features = false, features = ["test-utils"] }
+tokio = { version = "1", features = ["test-util"] }
 storage = { path = "../storage", default-features = false, features = ["test-hooks"] }

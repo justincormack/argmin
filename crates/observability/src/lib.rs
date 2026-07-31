@@ -91,6 +91,7 @@ static TRACE_SINK: OnceLock<TraceSink> = OnceLock::new();
 static TRACE_SINK_OVERRIDE: OnceLock<TraceSink> = OnceLock::new();
 static REQUEST_START_TOTAL: AtomicU64 = AtomicU64::new(0);
 static INFLIGHT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static REQUEST_ADMISSION_CAPACITY: AtomicU64 = AtomicU64::new(0);
 static REQUEST_FINISH_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REQUEST_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static HTTP_500_RESPONSE_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -2725,6 +2726,7 @@ struct StorageRpcPendingEnvelopeActiveRecord {
 pub struct MetricsSnapshot {
     pub request_start_total: u64,
     pub inflight_requests: u64,
+    pub request_admission_capacity: u64,
     pub request_finish_total: u64,
     pub request_error_total: u64,
     pub http_500_response_total: u64,
@@ -2838,6 +2840,10 @@ impl MetricsSnapshot {
         [
             ("request_start_total", self.request_start_total),
             ("inflight_requests", self.inflight_requests),
+            (
+                "request_admission_capacity",
+                self.request_admission_capacity,
+            ),
             ("request_finish_total", self.request_finish_total),
             ("request_error_total", self.request_error_total),
             ("http_500_response_total", self.http_500_response_total),
@@ -3235,6 +3241,10 @@ pub struct InflightRequestsGuard {
     active: bool,
 }
 
+pub struct RequestAdmissionCapacityGuard {
+    capacity: u64,
+}
+
 pub struct StreamUploadActiveSessionGuard {
     active: bool,
 }
@@ -3251,6 +3261,15 @@ impl Drop for InflightRequestsGuard {
         if self.active {
             INFLIGHT_REQUESTS.fetch_sub(1, Ordering::Relaxed);
             self.active = false;
+        }
+    }
+}
+
+impl Drop for RequestAdmissionCapacityGuard {
+    fn drop(&mut self) {
+        if self.capacity > 0 {
+            REQUEST_ADMISSION_CAPACITY.fetch_sub(self.capacity, Ordering::Relaxed);
+            self.capacity = 0;
         }
     }
 }
@@ -3306,6 +3325,12 @@ impl Drop for StreamUploadActiveSessionGuard {
 pub fn inflight_requests_guard() -> InflightRequestsGuard {
     INFLIGHT_REQUESTS.fetch_add(1, Ordering::Relaxed);
     InflightRequestsGuard { active: true }
+}
+
+#[must_use]
+pub fn request_admission_capacity_guard(capacity: u64) -> RequestAdmissionCapacityGuard {
+    REQUEST_ADMISSION_CAPACITY.fetch_add(capacity, Ordering::Relaxed);
+    RequestAdmissionCapacityGuard { capacity }
 }
 
 #[must_use]
@@ -3389,6 +3414,7 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
     MetricsSnapshot {
         request_start_total: REQUEST_START_TOTAL.load(Ordering::Relaxed),
         inflight_requests: INFLIGHT_REQUESTS.load(Ordering::Relaxed),
+        request_admission_capacity: REQUEST_ADMISSION_CAPACITY.load(Ordering::Relaxed),
         request_finish_total: REQUEST_FINISH_TOTAL.load(Ordering::Relaxed),
         request_error_total: REQUEST_ERROR_TOTAL.load(Ordering::Relaxed),
         http_500_response_total: HTTP_500_RESPONSE_TOTAL.load(Ordering::Relaxed),
@@ -5483,6 +5509,26 @@ mod tests {
         }
         let after = metrics_snapshot();
         assert_eq!(after.inflight_requests, before.inflight_requests);
+    }
+
+    #[test]
+    fn request_admission_capacity_guard_updates_snapshot() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let before = metrics_snapshot();
+        {
+            let capacity_guard = request_admission_capacity_guard(32);
+            let during = metrics_snapshot();
+            assert_eq!(
+                during.request_admission_capacity,
+                before.request_admission_capacity + 32
+            );
+            drop(capacity_guard);
+        }
+        let after = metrics_snapshot();
+        assert_eq!(
+            after.request_admission_capacity,
+            before.request_admission_capacity
+        );
     }
 
     #[test]

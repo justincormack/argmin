@@ -75,7 +75,7 @@ non-confidential deployment mode.
 ## 3. Attack surface, mitigations and attacker stories
 ### HTTP entrypoints and request parsing
 - **Surface:** Hyper-based HTTP/1 server (`server-http/src/http/serve.rs`) accepts TCP connections; risks include request smuggling, slowloris, oversized bodies, and malformed headers.
-- **Mitigations:** configurable `max_connections`/`max_inflight_requests`, header and body idle timeouts, bounded buffered control-plane bodies (`MAX_BUFFERED_CONTROL_BODY_SIZE` in `request.rs`), content-length validation, and UTF‑8 validation of header values.
+- **Mitigations:** configurable `max_connections`/`max_inflight_requests`, header and body idle timeouts, a non-resetting deadline for body bytes consumed before authentication, bounded buffered control-plane bodies (`MAX_BUFFERED_CONTROL_BODY_SIZE` in `request.rs`), content-length validation, and UTF‑8 validation of header values. Background maintenance yields only when admitted requests reach the process-wide request-capacity high-water mark or request admission records contention; one slow request is not itself foreground pressure.
 - **Input validation:** bucket names follow S3-style constraints and object
   keys are limited to 1-1024 bytes with NUL-byte rejection (`router.rs`),
   strict percent-decoding, and explicit per-surface header/body validation.

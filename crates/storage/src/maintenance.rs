@@ -458,7 +458,12 @@ fn maintenance_foreground_pressure_delta(
 }
 
 fn maintenance_foreground_pressure_active(snapshot: observability::MetricsSnapshot) -> bool {
-    snapshot.inflight_requests > 0
+    let capacity = snapshot.request_admission_capacity;
+    if capacity == 0 {
+        return false;
+    }
+    let high_water = capacity.saturating_sub(capacity / 4).max(1);
+    snapshot.inflight_requests >= high_water
 }
 
 fn maintenance_durable_backlog_active(snapshot: observability::MetricsSnapshot) -> bool {
@@ -1479,7 +1484,8 @@ mod tests {
                 .foreground
         );
 
-        snapshot.inflight_requests = 1;
+        snapshot.request_admission_capacity = 8;
+        snapshot.inflight_requests = 6;
         snapshot.reclaim_work_queue_depth = 7;
         assert_eq!(
             state.observe(now + Duration::from_millis(20), snapshot),
@@ -1518,15 +1524,47 @@ mod tests {
             "unattributed storage RPC activity includes background workflows and must not make background classes deny one another"
         );
 
+        snapshot.request_admission_capacity = 32;
         snapshot.inflight_requests = 1;
         assert_eq!(
             state.observe(now + Duration::from_millis(20), snapshot),
             StorageMaintenancePressure {
+                foreground: false,
+                durable_backlog: false,
+            },
+            "one admitted request must not suppress background work when capacity remains"
+        );
+
+        snapshot.inflight_requests = 24;
+        assert_eq!(
+            state.observe(now + Duration::from_millis(30), snapshot),
+            StorageMaintenancePressure {
                 foreground: true,
                 durable_backlog: false,
             },
-            "the admitted request lifetime identifies foreground storage activity"
+            "the admission high-water mark identifies foreground pressure"
         );
+    }
+
+    #[test]
+    fn maintenance_foreground_pressure_reserves_one_quarter_of_request_capacity() {
+        for (capacity, below_high_water, high_water) in
+            [(1, 0, 1), (2, 1, 2), (4, 2, 3), (8, 5, 6), (32, 23, 24)]
+        {
+            let below = observability::MetricsSnapshot {
+                inflight_requests: below_high_water,
+                request_admission_capacity: capacity,
+                ..observability::MetricsSnapshot::default()
+            };
+            assert!(!maintenance_foreground_pressure_active(below));
+
+            let at = observability::MetricsSnapshot {
+                inflight_requests: high_water,
+                request_admission_capacity: capacity,
+                ..observability::MetricsSnapshot::default()
+            };
+            assert!(maintenance_foreground_pressure_active(at));
+        }
     }
 
     #[test]

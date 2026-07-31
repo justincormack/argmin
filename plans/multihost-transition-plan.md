@@ -7704,9 +7704,14 @@ Shard repair design:
   repair, reclaim/bucket finalization, lifecycle cleanup, and stream-session
   cleanup cannot starve each other behind a single shared cleanup permit.
   `OpportunisticScan` now denies with `denied_foreground_pressure` when recent
-  request-admission pressure is observed or while an admitted foreground S3
-  request is active. The request signal spans the full handler and response-body
-  lifetime, including storage RPC waits. Unattributed storage-RPC activity and
+  request-admission pressure is observed or while admitted foreground S3
+  requests reach the process-wide 75% request-capacity high-water mark. The
+  request signal spans the full handler and response-body lifetime, including
+  storage RPC waits, but one slow request cannot suppress maintenance while
+  request capacity remains. The HTTP boundary also applies a non-resetting
+  60-second deadline to body bytes consumed before authentication, alongside
+  the per-frame idle timeout; authenticated streaming payloads remain bounded
+  by idle and route-validity deadlines. Unattributed storage-RPC activity and
   admission counters include background lifecycle, scavenger, checkpoint, and
   backfill work, so they are diagnostic only and cannot make background classes
   deny one another. Process-wide

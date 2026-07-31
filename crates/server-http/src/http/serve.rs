@@ -17,7 +17,8 @@ use hyper::Request;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use md5_legacy::Digest;
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
+use tokio::time::Instant as TokioInstant;
 use tokio_rustls::TlsAcceptor;
 
 #[cfg(any(test, feature = "local-debug-endpoints"))]
@@ -32,7 +33,7 @@ use super::router::{
     ServiceRouteError,
 };
 use super::s3_response_to_hyper;
-use super::{HttpFrontend, S3HyperBody};
+use super::{HttpFrontend, HttpRequestAdmission, S3HyperBody};
 use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
@@ -185,6 +186,10 @@ pub struct ServeConfig {
     /// slow-but-steady uploads complete; only truly stalled connections are
     /// killed.
     pub body_idle_timeout: Duration,
+    /// Absolute deadline for request-body bytes received before authentication
+    /// and authorization complete. This bounds slow-but-steady unauthenticated
+    /// clients without limiting authorized streaming object payloads.
+    pub pre_auth_body_timeout: Duration,
     /// Chunk size used when pulling data from core `ReadHandle`s into the HTTP
     /// response body stream.
     pub stream_read_chunk_size: usize,
@@ -216,6 +221,7 @@ impl Default for ServeConfig {
             header_read_timeout: Duration::from_secs(30),
             request_wait_timeout: Duration::from_secs(5),
             body_idle_timeout: Duration::from_secs(30),
+            pre_auth_body_timeout: Duration::from_secs(60),
             stream_read_chunk_size: server_core::coordinator::INTERNAL_SEGMENT_SIZE,
             panic_on_500: false,
             abort_on_500: false,
@@ -232,6 +238,7 @@ struct ServerState {
     host_id: Arc<str>,
     counter: AtomicUsize,
     request_semaphore: Arc<Semaphore>,
+    _request_admission_capacity_guard: observability::RequestAdmissionCapacityGuard,
     segment_buffer_pool: SegmentBufferPool,
     config: ServeConfig,
     endpoint_kind: EndpointKind,
@@ -616,6 +623,9 @@ async fn serve_plain_or_tls(
         host_id,
         counter: AtomicUsize::new(0),
         request_semaphore: Arc::new(Semaphore::new(max_inflight_requests as usize)),
+        _request_admission_capacity_guard: observability::request_admission_capacity_guard(
+            u64::from(max_inflight_requests),
+        ),
         segment_buffer_pool: SegmentBufferPool::new(max_inflight_requests as usize),
         config,
         endpoint_kind,
@@ -945,7 +955,7 @@ async fn handle(
     // Keep the foreground-pressure signal active for the complete admitted
     // request, including body collection and storage RPCs. The response body
     // takes over this signal when the handler returns.
-    let _inflight_request_guard = observability::inflight_requests_guard();
+    let request_admission = HttpRequestAdmission::new(req_permit);
 
     // Check if this request should use the streaming write path.
     let streaming_op = match is_streaming_write_for_endpoint(state.endpoint_kind, &parts) {
@@ -960,7 +970,7 @@ async fn handle(
                 &state,
                 S3Response::error_with_ids(&err, "", &wire_ids),
                 body,
-                Some(req_permit),
+                Some(request_admission),
                 response_trace,
             ));
         }
@@ -980,7 +990,7 @@ async fn handle(
                     &state,
                     S3Response::error_with_ids(&err, "", &wire_ids),
                     body,
-                    Some(req_permit),
+                    Some(request_admission),
                     response_trace,
                 ))
             }
@@ -994,7 +1004,7 @@ async fn handle(
                     &state,
                     S3Response::error_with_ids(&err, "", &wire_ids),
                     body,
-                    Some(req_permit),
+                    Some(request_admission),
                     response_trace,
                 ))
             }
@@ -1058,7 +1068,7 @@ async fn handle(
             &state,
             resp,
             body,
-            Some(req_permit),
+            Some(request_admission),
             response_trace,
         ));
     }
@@ -1079,7 +1089,7 @@ async fn handle(
                         &state,
                         S3Response::error_with_ids(&err, "", &wire_ids),
                         body,
-                        Some(req_permit),
+                        Some(request_admission),
                         response_trace,
                     ));
                 }
@@ -1108,7 +1118,7 @@ async fn handle(
                 &state,
                 resp,
                 body,
-                Some(req_permit),
+                Some(request_admission),
                 response_trace,
             ));
         }
@@ -1129,7 +1139,7 @@ async fn handle(
                     &state,
                     S3Response::error_with_ids(&err, "", &wire_ids),
                     body,
-                    Some(req_permit),
+                    Some(request_admission),
                     response_trace,
                 ));
             }
@@ -1156,7 +1166,7 @@ async fn handle(
             &state,
             resp,
             body,
-            Some(req_permit),
+            Some(request_admission),
             response_trace,
         ));
     }
@@ -1167,6 +1177,7 @@ async fn handle(
     let body_bytes = match collect_body_with_limit(
         &mut body,
         state.config.body_idle_timeout,
+        state.config.pre_auth_body_timeout,
         body_limit,
     )
     .await
@@ -1177,7 +1188,7 @@ async fn handle(
                 &state,
                 S3Response::error_with_ids(&err, "", &wire_ids),
                 body,
-                Some(req_permit),
+                Some(request_admission),
                 response_trace,
             ));
         }
@@ -1198,7 +1209,7 @@ async fn handle(
                 &state,
                 S3Response::error_with_ids(&err, "", &wire_ids),
                 body,
-                Some(req_permit),
+                Some(request_admission),
                 response_trace,
             ));
         }
@@ -1224,7 +1235,7 @@ async fn handle(
         &state,
         resp,
         body,
-        Some(req_permit),
+        Some(request_admission),
         response_trace,
     ))
 }
@@ -2826,6 +2837,63 @@ fn route_bounded_body_frame_timeout(
     Ok(remaining.map_or(idle_timeout, |remaining| idle_timeout.min(remaining)))
 }
 
+fn pre_auth_body_deadline(timeout: Duration) -> TokioInstant {
+    let now = TokioInstant::now();
+    now.checked_add(timeout).unwrap_or(now)
+}
+
+fn pre_auth_body_frame_deadline(
+    idle_timeout: Duration,
+    absolute_deadline: TokioInstant,
+) -> Result<TokioInstant, ServerError> {
+    let now = TokioInstant::now();
+    if now >= absolute_deadline {
+        return Err(ServerError::InvalidRequest {
+            reason: "request body authentication deadline expired".to_string(),
+        });
+    }
+    Ok(now
+        .checked_add(idle_timeout)
+        .unwrap_or(absolute_deadline)
+        .min(absolute_deadline))
+}
+
+fn pre_auth_body_timeout_error(deadline: TokioInstant) -> ServerError {
+    ServerError::InvalidRequest {
+        reason: if TokioInstant::now() >= deadline {
+            "request body authentication deadline expired"
+        } else {
+            "request body read timed out"
+        }
+        .to_string(),
+    }
+}
+
+async fn await_pre_auth_body_frame<F, T>(
+    frame: F,
+    idle_timeout: Duration,
+    absolute_deadline: TokioInstant,
+) -> Result<T, ServerError>
+where
+    F: std::future::Future<Output = T>,
+{
+    let frame_deadline = pre_auth_body_frame_deadline(idle_timeout, absolute_deadline)?;
+    let timer = tokio::time::sleep_until(frame_deadline);
+    tokio::pin!(timer);
+    let result = tokio::select! {
+        biased;
+        _ = &mut timer => return Err(pre_auth_body_timeout_error(absolute_deadline)),
+        result = frame => result,
+    };
+
+    // Also cover scheduler preemption after the timer poll but before the
+    // ready frame is returned to the caller.
+    if TokioInstant::now() >= absolute_deadline {
+        return Err(pre_auth_body_timeout_error(absolute_deadline));
+    }
+    Ok(result)
+}
+
 fn route_bounded_body_timeout_error(
     admission: Option<&storage::StorageClusterRouteAdmission>,
 ) -> ServerError {
@@ -2847,6 +2915,7 @@ async fn handle_streaming_post_object(
     wire_ids: WireResponseIds,
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
+    let pre_auth_deadline = pre_auth_body_deadline(state.config.pre_auth_body_timeout);
 
     let req_arc = Arc::new(s3req);
 
@@ -2904,19 +2973,27 @@ async fn handle_streaming_post_object(
     let mut upload_buf = PooledSegmentBuffer::new(&state);
 
     loop {
-        let frame_timeout = match route_bounded_body_frame_timeout(
-            ctx.as_ref().map(|ctx| ctx.storage_route_admission()),
-            idle_timeout,
-        ) {
-            Ok(timeout) => timeout,
-            Err(err) => {
-                if let Some(ref c) = ctx {
-                    abort_streaming_post_object(&state, c).await;
-                }
-                return error_response(&err, &wire_ids);
+        let next_frame: Result<_, ServerError> = match ctx.as_ref() {
+            Some(ctx) => {
+                let frame_timeout = match route_bounded_body_frame_timeout(
+                    Some(ctx.storage_route_admission()),
+                    idle_timeout,
+                ) {
+                    Ok(timeout) => timeout,
+                    Err(err) => {
+                        abort_streaming_post_object(&state, ctx).await;
+                        return error_response(&err, &wire_ids);
+                    }
+                };
+                tokio::time::timeout(frame_timeout, body.frame())
+                    .await
+                    .map_err(|_| {
+                        route_bounded_body_timeout_error(Some(ctx.storage_route_admission()))
+                    })
             }
+            None => await_pre_auth_body_frame(body.frame(), idle_timeout, pre_auth_deadline).await,
         };
-        match tokio::time::timeout(frame_timeout, body.frame()).await {
+        match next_frame {
             Ok(Some(Ok(frame))) => {
                 if let Some(chunk) = frame.data_ref() {
                     let events = match parser.feed(chunk) {
@@ -3118,16 +3195,11 @@ async fn handle_streaming_post_object(
                 );
             }
             Ok(None) => break,
-            Err(_) => {
+            Err(error) => {
                 if let Some(ref c) = ctx {
                     abort_streaming_post_object(&state, c).await;
                 }
-                return error_response(
-                    &route_bounded_body_timeout_error(
-                        ctx.as_ref().map(|ctx| ctx.storage_route_admission()),
-                    ),
-                    &wire_ids,
-                );
+                return error_response(&error, &wire_ids);
             }
         }
     }
@@ -4093,7 +4165,7 @@ fn response_to_hyper_with_request_body(
     state: &ServerState,
     mut resp: S3Response,
     request_body: TrackedIncoming,
-    permit: Option<OwnedSemaphorePermit>,
+    admission: Option<HttpRequestAdmission>,
     response_trace: super::ResponseTraceMeta,
 ) -> http::Response<S3HyperBody> {
     let (request_body, eof_observed) = request_body.into_parts();
@@ -4103,7 +4175,7 @@ fn response_to_hyper_with_request_body(
     }
     let mut response = s3_response_to_hyper(
         resp,
-        permit,
+        admission,
         state.config.stream_read_chunk_size,
         state.config.panic_on_500,
         state.config.abort_on_500,
@@ -5264,29 +5336,30 @@ fn acquire_frontend(state: &ServerState) -> Arc<HttpFrontend> {
     Arc::clone(&state.pool[idx])
 }
 
-/// Collect a request body with size limiting and per-frame idle timeout.
+/// Collect an unauthenticated request body with size, idle, and absolute limits.
 ///
-/// Each call to `frame()` is individually wrapped in a timeout that resets on
-/// every chunk. A client sending data steadily (even slowly) will never be
-/// timed out; only truly stalled connections are killed.
+/// The idle timeout resets on each frame, while the absolute timeout bounds the
+/// complete pre-authentication exchange even when a client keeps sending.
 async fn collect_body_with_limit(
     body: &mut TrackedIncoming,
     idle_timeout: Duration,
+    absolute_timeout: Duration,
     max_size: usize,
 ) -> Result<Bytes, ServerError> {
     let mut limited = Limited::new(body, max_size);
     let mut data = Vec::new();
+    let deadline = pre_auth_body_deadline(absolute_timeout);
 
     loop {
-        match tokio::time::timeout(idle_timeout, limited.frame()).await {
+        match await_pre_auth_body_frame(limited.frame(), idle_timeout, deadline).await? {
             // Got a data/trailers frame
-            Ok(Some(Ok(frame))) => {
+            Some(Ok(frame)) => {
                 if let Some(chunk) = frame.data_ref() {
                     data.extend_from_slice(chunk);
                 }
             }
             // Body stream error (includes size limit exceeded)
-            Ok(Some(Err(e))) => {
+            Some(Err(e)) => {
                 if e.downcast_ref::<LengthLimitError>().is_some() {
                     return Err(ServerError::MaxMessageLengthExceeded {
                         max_message_length_bytes: max_size,
@@ -5297,13 +5370,7 @@ async fn collect_body_with_limit(
                 });
             }
             // Body complete
-            Ok(None) => break,
-            // No data frame within BODY_IDLE_TIMEOUT
-            Err(_) => {
-                return Err(ServerError::InvalidRequest {
-                    reason: "request body read timed out".to_string(),
-                });
-            }
+            None => break,
         }
     }
 
@@ -5657,6 +5724,9 @@ mod tests {
             host_id,
             counter: AtomicUsize::new(0),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(request_slots)),
+            _request_admission_capacity_guard: observability::request_admission_capacity_guard(
+                u64::try_from(request_slots).unwrap_or(u64::MAX),
+            ),
             segment_buffer_pool: SegmentBufferPool::new(segment_buffer_pool_slots),
             config,
             endpoint_kind: EndpointKind::S3Only,
@@ -5819,6 +5889,97 @@ mod tests {
             "request should use admission timestamp captured before clock advance: {response}"
         );
         assert!(response.ends_with("time-body"), "{response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn buffered_body_absolute_deadline_does_not_reset_on_steady_chunks() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let config = ServeConfig {
+            body_idle_timeout: Duration::from_millis(200),
+            pre_auth_body_timeout: Duration::from_millis(80),
+            ..ServeConfig::default()
+        };
+        let (addr, _guard) = start_test_server_with_config(frontend, config, 8).await;
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "POST /deadline-bucket?delete HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Transfer-Encoding: chunked\r\n\
+Connection: close\r\n\r\n\
+1\r\na\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        client.write_all(b"1\r\nb\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        client.write_all(b"1\r\nc\r\n").await.unwrap();
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = client.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "response ended before its body was complete");
+                response.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&response);
+                if let Some(header_end) = text.find("\r\n\r\n") {
+                    let headers = &text[..header_end];
+                    if response_body_complete(&response, header_end, headers) {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("absolute pre-authentication body deadline should respond");
+
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(
+            response.contains("request body authentication deadline expired"),
+            "{response}"
+        );
+    }
+
+    #[test]
+    fn pre_auth_body_frame_deadline_preserves_absolute_cap() {
+        let absolute_deadline = TokioInstant::now() + Duration::from_secs(1);
+        assert_eq!(
+            pre_auth_body_frame_deadline(Duration::from_secs(30), absolute_deadline).unwrap(),
+            absolute_deadline
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pre_auth_body_frame_expiry_wins_over_a_ready_frame() {
+        let absolute_deadline = TokioInstant::now() + Duration::from_secs(1);
+        let frame_consumed = std::cell::Cell::new(false);
+        let frame = async {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            frame_consumed.set(true);
+            b"ready frame"
+        };
+
+        let error = await_pre_auth_body_frame(frame, Duration::from_secs(30), absolute_deadline)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServerError::InvalidRequest { reason }
+                if reason == "request body authentication deadline expired"
+        ));
+        assert!(
+            !frame_consumed.get(),
+            "the timer must win before the expired ready frame is consumed"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6497,6 +6658,7 @@ Connection: close\r\n\r\n",
             host_id: frontend.host_id.clone(),
             counter: AtomicUsize::new(0),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            _request_admission_capacity_guard: observability::request_admission_capacity_guard(8),
             segment_buffer_pool: SegmentBufferPool::new(8),
             config: ServeConfig::default(),
             endpoint_kind: EndpointKind::S3Only,
@@ -6636,6 +6798,7 @@ Connection: close\r\n\r\n",
             host_id: frontend.host_id.clone(),
             counter: AtomicUsize::new(0),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            _request_admission_capacity_guard: observability::request_admission_capacity_guard(8),
             segment_buffer_pool: SegmentBufferPool::new(8),
             config: ServeConfig::default(),
             endpoint_kind: EndpointKind::S3Only,
@@ -9513,6 +9676,7 @@ Connection: close\r\n\r\n",
             host_id: frontend.host_id.clone(),
             counter: AtomicUsize::new(0),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            _request_admission_capacity_guard: observability::request_admission_capacity_guard(8),
             segment_buffer_pool: SegmentBufferPool::new(8),
             config: ServeConfig::default(),
             endpoint_kind: EndpointKind::S3Only,
@@ -9738,6 +9902,7 @@ Connection: close\r\n\r\n",
             host_id: frontend.host_id.clone(),
             counter: AtomicUsize::new(0),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            _request_admission_capacity_guard: observability::request_admission_capacity_guard(8),
             segment_buffer_pool: SegmentBufferPool::new(8),
             config: ServeConfig::default(),
             endpoint_kind: EndpointKind::S3Only,
@@ -9777,6 +9942,7 @@ Connection: close\r\n\r\n",
             host_id: frontend.host_id.clone(),
             counter: AtomicUsize::new(0),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            _request_admission_capacity_guard: observability::request_admission_capacity_guard(8),
             segment_buffer_pool: SegmentBufferPool::new(8),
             config: ServeConfig::default(),
             endpoint_kind: EndpointKind::S3Only,
@@ -9833,6 +9999,7 @@ Connection: close\r\n\r\n",
             host_id: frontend.host_id.clone(),
             counter: AtomicUsize::new(0),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            _request_admission_capacity_guard: observability::request_admission_capacity_guard(8),
             segment_buffer_pool: SegmentBufferPool::new(8),
             config: ServeConfig::default(),
             endpoint_kind: EndpointKind::S3Only,
