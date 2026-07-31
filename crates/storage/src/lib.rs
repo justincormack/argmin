@@ -102,7 +102,8 @@ pub use error::{
 #[doc(hidden)]
 pub use maintenance::StorageStreamSessionSweepTestSummary;
 pub use maintenance::{
-    StorageBackfillCandidateScanner, StorageMaintenanceStartError, StorageStreamSessionSweeper,
+    StorageMaintenanceAdmission, StorageMaintenancePermit, StorageMaintenanceStartError,
+    StorageShardScavengerSweeper, StorageStreamSessionSweeper,
 };
 pub use metadata_command::BucketWriteReservationProof;
 #[cfg(test)]

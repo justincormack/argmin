@@ -898,8 +898,15 @@ stream-session expiry, discovery, cleanup, shared-worker registration, thread li
 diagnostics, and telemetry into `StorageStreamSessionSweeper`; `server-core` retains only the
 opaque worker handle and startup-error translation. The route-publication regression now uses a
 clock pinned before setup and advances it deterministically past the durable cleanup deadline.
-The remaining shard-scavenger audit, checkpoint scheduling, repair/backfill execution, and
-reclaim/finalization workers are still pending; these slices do not mark item 1 complete.
+The third bounded slice moved shard-audit scheduling, backfill-candidate discovery, routine
+metadata-checkpoint scheduling, their shared pressure/admission policy, worker registration,
+thread lifecycle, and storage-specific telemetry into `storage`. The raw audit and checkpoint
+operations are now crate-private, the integration harness receives only an owner-formatted test
+diagnostic, and the file-without-row impossible-state regression is owner-local. Admission,
+shard-scavenger, and stream-session registries are keyed by route-publication domain rather than
+process-local storage identity, so independent domains over one initial cluster cannot share a
+worker and refreshing one domain cannot strand the other. The remaining repair/backfill execution
+and reclaim/finalization workers are still pending; these slices do not mark item 1 complete.
 
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
@@ -1167,8 +1174,9 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     the S3-visible bucket-delete request path in `server-core`; storage creates and owns cleanup
     roots after one logical accepted-deletion operation. Privatize all maintenance cursor, claim,
     reclaim-work, cleanup-root, session-cleanup, work-record, and transition APIs. The
-    backfill-candidate cursor/scheduling and abandoned stream-session cleanup slices are complete;
-    the other workers remain pending.
+    backfill-candidate cursor, shard-audit/checkpoint scheduler, shared maintenance admission, and
+    abandoned stream-session cleanup slices are complete; repair/backfill execution and
+    reclaim/finalization remain pending.
 11. **Pending:** replace server-core's data-PG, placement-epoch, EC-placement, shard-location, and
     historical-route handling with opaque storage-owned payload handles and logical I/O/lease
     operations.

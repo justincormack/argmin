@@ -511,42 +511,7 @@ fn shard_scavenger_clean_check_message(
     storage_cluster: &storage::StorageCluster,
     context: &str,
 ) -> Result<(), String> {
-    let observations = storage_cluster
-        .audit_shard_storage_for_scavenger()
-        .map_err(|error| format!("shard scavenger final audit failed for {context}: {error}"))?;
-    let unresolved: Vec<_> = observations
-        .iter()
-        .filter(|observation| observation.resolved_at.is_none())
-        .collect();
-    if unresolved.is_empty() {
-        return Ok(());
-    }
-
-    let mut message = format!(
-        "shard scavenger final audit found {} unresolved observation(s) for {context}",
-        unresolved.len()
-    );
-    for observation in unresolved.iter().take(16) {
-        message.push_str(&format!(
-            "\n  node={} data_pg={} shard_index={} shard_key={} reason={:?} file_exists={} shard_row_exists={} count={} last_error={}",
-            observation.key.node_id,
-            observation.key.data_pg_id,
-            observation.key.shard_index.get(),
-            observation.key.shard_key.hex(),
-            observation.reason,
-            observation.file_exists,
-            observation.shard_row_exists,
-            observation.observation_count,
-            observation.last_error.as_deref().unwrap_or("<none>"),
-        ));
-    }
-    if unresolved.len() > 16 {
-        message.push_str(&format!(
-            "\n  ... {} more unresolved observation(s) omitted",
-            unresolved.len() - 16
-        ));
-    }
-    Err(message)
+    storage_cluster.test_shard_scavenger_clean_check(context)
 }
 
 fn configure_local_tracing() {

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -12,8 +12,8 @@ use storage::{
     BucketDeleteBeginRoot, BucketDeleteFinalizeRoot, BucketInfo, BucketName, EcShape, GenerationId,
     ObjectEncryption, ObjectKey, PgId, PlacedSegmentShardBackfillClaimAcquireParams,
     PlacedSegmentShardRepairClaimAcquireParams, ProcessLocalRegistryKey, ReclaimWorkItem,
-    SegmentStoredBytesRequest, StorageBackfillCandidateScanner, StorageCluster,
-    StorageClusterRouteHandle, StoreError, UploadId, UploadState, VersionId,
+    SegmentStoredBytesRequest, StorageCluster, StorageClusterRouteHandle,
+    StorageMaintenanceAdmission, StoreError, UploadId, UploadState, VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -40,17 +40,11 @@ static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<
 static RECLAIM_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<ProcessLocalRegistryKey, Weak<ReclaimSweeper>>>,
 > = OnceLock::new();
-static SHARD_SCAVENGER_SWEEPER_REGISTRY: OnceLock<
-    Mutex<HashMap<ProcessLocalRegistryKey, Weak<ShardScavengerSweeper>>>,
-> = OnceLock::new();
 static SHARD_REPAIR_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<ProcessLocalRegistryKey, Weak<ShardRepairSweeper>>>,
 > = OnceLock::new();
 static SHARD_BACKFILL_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<ProcessLocalRegistryKey, Weak<ShardBackfillSweeper>>>,
-> = OnceLock::new();
-static BACKGROUND_WORK_ADMISSION_REGISTRY: OnceLock<
-    Mutex<HashMap<ProcessLocalRegistryKey, Weak<BackgroundWorkAdmission>>>,
 > = OnceLock::new();
 static SHARD_REPAIR_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SHARD_BACKFILL_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -71,16 +65,6 @@ const SHARD_BACKFILL_CLAIM_LEASE_MILLIS: u64 = 30_000;
 const SHARD_BACKFILL_ERROR_BACKOFF_MILLIS: u64 = 1_000;
 const LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS: usize = 256;
 const LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS: usize = 1024;
-const BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT: usize = 1;
-const BACKGROUND_BACKFILL_CANDIDATE_SCAN_LIMIT: usize = 1;
-const BACKGROUND_ROUTINE_BACKFILL_LIMIT: usize = 1;
-const BACKGROUND_RECLAIM_CLEANUP_LIMIT: usize = 1;
-const BACKGROUND_LIFECYCLE_CLEANUP_LIMIT: usize = 1;
-const BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT: usize = 1;
-const BACKGROUND_ROUTINE_METADATA_CHECKPOINT_LIMIT: usize = 1;
-const BACKGROUND_FOREGROUND_PRESSURE_HOLD: Duration = Duration::from_millis(1_000);
-const BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
-const BACKGROUND_FOREGROUND_PRESSURE_MAX_SAMPLE_GAP: Duration = Duration::from_millis(1_250);
 
 type ObjectPayloadReclaimRoot = (BucketName, ObjectKey, GenerationId);
 
@@ -100,351 +84,6 @@ fn random_background_worker_identity(context: &'static str) -> Result<String, Se
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
     Ok(encoded)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackgroundWorkClass {
-    KnownDamageRepair,
-    BackfillCandidateScan,
-    RoutineBackfill,
-    ReclaimCleanup,
-    LifecycleCleanup,
-    OpportunisticScan,
-    RoutineMetadataCheckpoint,
-}
-
-impl BackgroundWorkClass {
-    fn observability_class(self) -> observability::BackgroundWorkClass {
-        match self {
-            Self::KnownDamageRepair => observability::BackgroundWorkClass::KnownDamageRepair,
-            Self::BackfillCandidateScan => {
-                observability::BackgroundWorkClass::BackfillCandidateScan
-            }
-            Self::RoutineBackfill => observability::BackgroundWorkClass::RoutineBackfill,
-            Self::ReclaimCleanup => observability::BackgroundWorkClass::ReclaimCleanup,
-            Self::LifecycleCleanup => observability::BackgroundWorkClass::LifecycleCleanup,
-            Self::OpportunisticScan => observability::BackgroundWorkClass::OpportunisticScan,
-            Self::RoutineMetadataCheckpoint => {
-                observability::BackgroundWorkClass::RoutineMetadataCheckpoint
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BackgroundWorkAdmissionLimits {
-    known_damage_repair: usize,
-    backfill_candidate_scan: usize,
-    routine_backfill: usize,
-    reclaim_cleanup: usize,
-    lifecycle_cleanup: usize,
-    opportunistic_scan: usize,
-    routine_metadata_checkpoint: usize,
-}
-
-impl Default for BackgroundWorkAdmissionLimits {
-    fn default() -> Self {
-        Self {
-            known_damage_repair: BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT,
-            backfill_candidate_scan: BACKGROUND_BACKFILL_CANDIDATE_SCAN_LIMIT,
-            routine_backfill: BACKGROUND_ROUTINE_BACKFILL_LIMIT,
-            reclaim_cleanup: BACKGROUND_RECLAIM_CLEANUP_LIMIT,
-            lifecycle_cleanup: BACKGROUND_LIFECYCLE_CLEANUP_LIMIT,
-            opportunistic_scan: BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT,
-            routine_metadata_checkpoint: BACKGROUND_ROUTINE_METADATA_CHECKPOINT_LIMIT,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct BackgroundWorkAdmission {
-    limits: BackgroundWorkAdmissionLimits,
-    pressure: Mutex<BackgroundWorkPressureState>,
-    known_damage_repair_active: AtomicUsize,
-    backfill_candidate_scan_active: AtomicUsize,
-    routine_backfill_active: AtomicUsize,
-    reclaim_cleanup_active: AtomicUsize,
-    lifecycle_cleanup_active: AtomicUsize,
-    opportunistic_scan_active: AtomicUsize,
-    routine_metadata_checkpoint_active: AtomicUsize,
-}
-
-#[derive(Debug, Default)]
-struct BackgroundWorkPressureState {
-    last_snapshot: Option<observability::MetricsSnapshot>,
-    last_snapshot_at: Option<Instant>,
-    foreground_pressure_until: Option<Instant>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BackgroundWorkPressure {
-    foreground: bool,
-    durable_backlog: bool,
-}
-
-struct BackgroundWorkPermit {
-    admission: Arc<BackgroundWorkAdmission>,
-    class: BackgroundWorkClass,
-    started_at: Instant,
-    active: bool,
-}
-
-impl BackgroundWorkAdmission {
-    fn new() -> Self {
-        Self::with_limits(BackgroundWorkAdmissionLimits::default())
-    }
-
-    fn with_limits(limits: BackgroundWorkAdmissionLimits) -> Self {
-        Self {
-            limits,
-            pressure: Mutex::new(BackgroundWorkPressureState::default()),
-            known_damage_repair_active: AtomicUsize::new(0),
-            backfill_candidate_scan_active: AtomicUsize::new(0),
-            routine_backfill_active: AtomicUsize::new(0),
-            reclaim_cleanup_active: AtomicUsize::new(0),
-            lifecycle_cleanup_active: AtomicUsize::new(0),
-            opportunistic_scan_active: AtomicUsize::new(0),
-            routine_metadata_checkpoint_active: AtomicUsize::new(0),
-        }
-    }
-
-    fn try_acquire(self: &Arc<Self>, class: BackgroundWorkClass) -> Option<BackgroundWorkPermit> {
-        if let Some(event) = self.policy_denial_event(class) {
-            self.emit(class, event, None);
-            return None;
-        }
-
-        let counter = self.counter_for(class);
-        let limit = self.limit_for(class);
-        let mut active = counter.load(Ordering::Acquire);
-        while active < limit {
-            match counter.compare_exchange_weak(
-                active,
-                active + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    self.emit(
-                        class,
-                        observability::BackgroundWorkAdmissionEvent::Admitted,
-                        None,
-                    );
-                    return Some(BackgroundWorkPermit {
-                        admission: Arc::clone(self),
-                        class,
-                        started_at: Instant::now(),
-                        active: true,
-                    });
-                }
-                Err(observed) => active = observed,
-            }
-        }
-        self.emit(
-            class,
-            observability::BackgroundWorkAdmissionEvent::DeniedLimit,
-            None,
-        );
-        None
-    }
-
-    fn policy_denial_event(
-        &self,
-        class: BackgroundWorkClass,
-    ) -> Option<observability::BackgroundWorkAdmissionEvent> {
-        let pressure = self.observe_pressure();
-        self.policy_denial_event_for_pressure(class, pressure)
-    }
-
-    fn policy_denial_event_for_pressure(
-        &self,
-        class: BackgroundWorkClass,
-        pressure: BackgroundWorkPressure,
-    ) -> Option<observability::BackgroundWorkAdmissionEvent> {
-        match class {
-            BackgroundWorkClass::KnownDamageRepair
-            | BackgroundWorkClass::ReclaimCleanup
-            | BackgroundWorkClass::LifecycleCleanup => None,
-            BackgroundWorkClass::BackfillCandidateScan | BackgroundWorkClass::RoutineBackfill => {
-                if pressure.foreground {
-                    Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
-                } else if self.known_damage_repair_active.load(Ordering::Acquire) > 0 {
-                    Some(observability::BackgroundWorkAdmissionEvent::DeniedKnownDamageActive)
-                } else {
-                    None
-                }
-            }
-            BackgroundWorkClass::OpportunisticScan => {
-                if pressure.foreground {
-                    Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
-                } else if pressure.durable_backlog {
-                    Some(observability::BackgroundWorkAdmissionEvent::DeniedBacklogPressure)
-                } else {
-                    None
-                }
-            }
-            BackgroundWorkClass::RoutineMetadataCheckpoint => {
-                if pressure.foreground {
-                    Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
-    fn observe_pressure(&self) -> BackgroundWorkPressure {
-        let snapshot = observability::metrics_snapshot();
-        lock_mutex_unpoisoned(&self.pressure).observe(Instant::now(), snapshot)
-    }
-
-    fn counter_for(&self, class: BackgroundWorkClass) -> &AtomicUsize {
-        match class {
-            BackgroundWorkClass::KnownDamageRepair => &self.known_damage_repair_active,
-            BackgroundWorkClass::BackfillCandidateScan => &self.backfill_candidate_scan_active,
-            BackgroundWorkClass::RoutineBackfill => &self.routine_backfill_active,
-            BackgroundWorkClass::ReclaimCleanup => &self.reclaim_cleanup_active,
-            BackgroundWorkClass::LifecycleCleanup => &self.lifecycle_cleanup_active,
-            BackgroundWorkClass::OpportunisticScan => &self.opportunistic_scan_active,
-            BackgroundWorkClass::RoutineMetadataCheckpoint => {
-                &self.routine_metadata_checkpoint_active
-            }
-        }
-    }
-
-    fn limit_for(&self, class: BackgroundWorkClass) -> usize {
-        match class {
-            BackgroundWorkClass::KnownDamageRepair => self.limits.known_damage_repair,
-            BackgroundWorkClass::BackfillCandidateScan => self.limits.backfill_candidate_scan,
-            BackgroundWorkClass::RoutineBackfill => self.limits.routine_backfill,
-            BackgroundWorkClass::ReclaimCleanup => self.limits.reclaim_cleanup,
-            BackgroundWorkClass::LifecycleCleanup => self.limits.lifecycle_cleanup,
-            BackgroundWorkClass::OpportunisticScan => self.limits.opportunistic_scan,
-            BackgroundWorkClass::RoutineMetadataCheckpoint => {
-                self.limits.routine_metadata_checkpoint
-            }
-        }
-    }
-
-    fn active_total(&self) -> usize {
-        self.known_damage_repair_active.load(Ordering::Acquire)
-            + self.backfill_candidate_scan_active.load(Ordering::Acquire)
-            + self.routine_backfill_active.load(Ordering::Acquire)
-            + self.reclaim_cleanup_active.load(Ordering::Acquire)
-            + self.lifecycle_cleanup_active.load(Ordering::Acquire)
-            + self.opportunistic_scan_active.load(Ordering::Acquire)
-            + self
-                .routine_metadata_checkpoint_active
-                .load(Ordering::Acquire)
-    }
-
-    fn emit(
-        &self,
-        class: BackgroundWorkClass,
-        event: observability::BackgroundWorkAdmissionEvent,
-        elapsed_us: Option<u64>,
-    ) {
-        let _ = observability::emit_background_work_admission_event(
-            TRACE_TARGET,
-            observability::BackgroundWorkAdmissionSummary {
-                class: class.observability_class(),
-                event,
-                active_total: self.active_total(),
-                elapsed_us,
-            },
-        );
-    }
-}
-
-impl BackgroundWorkPressureState {
-    fn observe(
-        &mut self,
-        now: Instant,
-        snapshot: observability::MetricsSnapshot,
-    ) -> BackgroundWorkPressure {
-        if self.last_snapshot.zip(self.last_snapshot_at).is_some_and(
-            |(last_snapshot, last_snapshot_at)| {
-                now.checked_duration_since(last_snapshot_at)
-                    .is_some_and(|elapsed| elapsed <= BACKGROUND_FOREGROUND_PRESSURE_MAX_SAMPLE_GAP)
-                    && background_work_foreground_pressure_delta(last_snapshot, snapshot)
-            },
-        ) {
-            self.foreground_pressure_until = Some(now + BACKGROUND_FOREGROUND_PRESSURE_HOLD);
-        }
-        self.last_snapshot = Some(snapshot);
-        self.last_snapshot_at = Some(now);
-
-        BackgroundWorkPressure {
-            foreground: self
-                .foreground_pressure_until
-                .is_some_and(|pressure_until| now < pressure_until)
-                || background_work_foreground_pressure_active(snapshot),
-            durable_backlog: background_work_durable_backlog_active(snapshot),
-        }
-    }
-}
-
-fn background_work_foreground_pressure_delta(
-    last: observability::MetricsSnapshot,
-    current: observability::MetricsSnapshot,
-) -> bool {
-    current.request_admission_wait_total > last.request_admission_wait_total
-        || current.request_admission_timeout_total > last.request_admission_timeout_total
-}
-
-fn background_work_foreground_pressure_active(snapshot: observability::MetricsSnapshot) -> bool {
-    snapshot.inflight_requests > 0
-}
-
-fn background_work_durable_backlog_active(snapshot: observability::MetricsSnapshot) -> bool {
-    snapshot.reclaim_work_queue_depth > 0
-        || snapshot.object_payload_reclaim_queue_depth > 0
-        || snapshot.object_payload_reclaim_outstanding_depth > 0
-        || snapshot.bucket_delete_begin_queue_depth > 0
-        || snapshot.bucket_delete_finalize_queue_depth > 0
-        || snapshot.bucket_delete_finalize_outstanding_depth > 0
-        || snapshot.shard_repair_queue_depth > 0
-        || snapshot.shard_backfill_queue_depth > 0
-}
-
-impl Drop for BackgroundWorkPermit {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let previous = self
-            .admission
-            .counter_for(self.class)
-            .fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0);
-        let elapsed_us = u64::try_from(self.started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
-        self.admission.emit(
-            self.class,
-            observability::BackgroundWorkAdmissionEvent::Finished,
-            Some(elapsed_us),
-        );
-        self.active = false;
-    }
-}
-
-fn background_work_admission_for(
-    storage_cluster: &Arc<StorageCluster>,
-) -> Arc<BackgroundWorkAdmission> {
-    let registry = BACKGROUND_WORK_ADMISSION_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut registry: std::sync::MutexGuard<
-        '_,
-        HashMap<ProcessLocalRegistryKey, Weak<BackgroundWorkAdmission>>,
-    > = lock_mutex_unpoisoned(registry);
-    registry.retain(|_, admission| admission.upgrade().is_some());
-
-    let key = storage_cluster.process_local_registry_key();
-    if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
-        return existing;
-    }
-
-    let admission = Arc::new(BackgroundWorkAdmission::new());
-    registry.insert(key, Arc::downgrade(&admission));
-    admission
 }
 
 fn earliest_object_payload_reclaim_retry_sleep(
@@ -699,6 +338,7 @@ impl DurableReclaimScanSchedule {
 
 fn enqueue_durable_reclaim_work_if_due(
     storage_node: &Arc<StorageCluster>,
+    admission: &Arc<StorageMaintenanceAdmission>,
     excluded_object_payload_roots: &HashSet<ObjectPayloadReclaimRoot>,
     excluded_bucket_delete_begin_roots: &HashSet<BucketDeleteBeginRoot>,
     excluded_bucket_delete_finalize_roots: &HashSet<BucketDeleteFinalizeRoot>,
@@ -716,8 +356,7 @@ fn enqueue_durable_reclaim_work_if_due(
         .iter()
         .map(|root| root.bucket.clone())
         .collect();
-    let admission = background_work_admission_for(storage_node);
-    let Some(_scan_permit) = admission.try_acquire(BackgroundWorkClass::ReclaimCleanup) else {
+    let Some(_scan_permit) = admission.try_reclaim_cleanup() else {
         schedule.next_scan_at = Instant::now() + OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN;
         return;
     };
@@ -756,12 +395,6 @@ pub(super) struct LifecycleSweeper {
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
 
-pub(super) struct ShardScavengerSweeper {
-    pub(super) stop: Arc<AtomicBool>,
-    pub(super) wake: Arc<(Mutex<bool>, Condvar)>,
-    pub(super) handle: Mutex<Option<JoinHandle<()>>>,
-}
-
 pub(super) struct ShardRepairSweeper {
     pub(super) storage_handle: StorageClusterRouteHandle,
     pub(super) stop: Arc<AtomicBool>,
@@ -774,6 +407,7 @@ pub(super) struct ShardBackfillSweeper {
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
 
+pub(super) use storage::StorageShardScavengerSweeper as ShardScavengerSweeper;
 pub(super) use storage::StorageStreamSessionSweeper as StreamSessionSweeper;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -829,6 +463,7 @@ impl ReclaimSweeper {
         storage_handle: StorageClusterRouteHandle,
         runtime: ReadRuntime,
     ) -> Result<Arc<Self>, ServerError> {
+        let admission = StorageMaintenanceAdmission::acquire_shared(&storage_handle);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let storage_handle_for_drop = storage_handle.clone();
@@ -868,6 +503,7 @@ impl ReclaimSweeper {
                     let current_worker_node = storage_handle.current();
                     enqueue_durable_reclaim_work_if_due(
                         &current_worker_node,
+                        &admission,
                         &deferred_object_payload_reclaim_roots,
                         &deferred_bucket_delete_begin_roots,
                         &deferred_bucket_delete_finalize_roots,
@@ -889,6 +525,7 @@ impl ReclaimSweeper {
                             }
                             enqueue_durable_reclaim_work_if_due(
                                 &current_worker_node,
+                                &admission,
                                 &deferred_object_payload_reclaim_roots,
                                 &deferred_bucket_delete_begin_roots,
                                 &deferred_bucket_delete_finalize_roots,
@@ -968,10 +605,7 @@ impl ReclaimSweeper {
                         Arc::clone(&execution_node),
                     );
                     let current_runtime = runtime.with_storage_node(Arc::clone(&execution_node));
-                    let admission = background_work_admission_for(&execution_node);
-                    let Some(_cleanup_permit) =
-                        admission.try_acquire(BackgroundWorkClass::ReclaimCleanup)
-                    else {
+                    let Some(_cleanup_permit) = admission.try_reclaim_cleanup() else {
                         pending_work = Some((queue_owner, work));
                         std::thread::sleep(OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN);
                         continue;
@@ -1174,6 +808,7 @@ impl ReclaimSweeper {
                     {
                         enqueue_durable_reclaim_work_if_due(
                             &execution_node,
+                            &admission,
                             &deferred_object_payload_reclaim_roots,
                             &deferred_bucket_delete_begin_roots,
                             &deferred_bucket_delete_finalize_roots,
@@ -1244,17 +879,6 @@ impl Drop for LifecycleSweeper {
     }
 }
 
-impl Drop for ShardScavengerSweeper {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        *lock_mutex_unpoisoned(&self.wake.0) = true;
-        self.wake.1.notify_all();
-        if let Some(handle) = lock_mutex_unpoisoned(&self.handle).take() {
-            let _ = handle.join();
-        }
-    }
-}
-
 impl Drop for ShardRepairSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -1296,7 +920,7 @@ impl LifecycleSweeper {
             return Ok(existing);
         }
 
-        let admission = background_work_admission_for(&storage_cluster);
+        let admission = StorageMaintenanceAdmission::acquire_shared(storage_handle);
         let sweeper = Self::spawn(storage_handle.clone(), runtime, admission)?;
         registry.insert(key, Arc::downgrade(&sweeper));
         Ok(sweeper)
@@ -1305,7 +929,7 @@ impl LifecycleSweeper {
     fn spawn(
         storage_handle: StorageClusterRouteHandle,
         runtime: ReadRuntime,
-        admission: Arc<BackgroundWorkAdmission>,
+        admission: Arc<StorageMaintenanceAdmission>,
     ) -> Result<Arc<Self>, ServerError> {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1318,9 +942,7 @@ impl LifecycleSweeper {
             .name("argmin-lifecycle".to_string())
             .spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
-                    if let Some(_permit) =
-                        admission.try_acquire(BackgroundWorkClass::LifecycleCleanup)
-                    {
+                    if let Some(_permit) = admission.try_lifecycle_cleanup() {
                         let current_runtime =
                             lifecycle_runtime_for_sweep(&storage_handle, &runtime);
                         let _ = current_runtime.run_lifecycle_sweep_at(Coordinator::now_millis());
@@ -1365,150 +987,6 @@ pub(super) fn lifecycle_runtime_for_sweep(
     runtime.with_storage_node(storage_handle.current())
 }
 
-impl ShardScavengerSweeper {
-    pub(super) fn acquire_shared(
-        storage_handle: &StorageClusterRouteHandle,
-    ) -> Result<Arc<Self>, ServerError> {
-        let registry = SHARD_SCAVENGER_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut registry: std::sync::MutexGuard<
-            '_,
-            HashMap<ProcessLocalRegistryKey, Weak<ShardScavengerSweeper>>,
-        > = lock_mutex_unpoisoned(registry);
-        registry.retain(|_, sweeper| sweeper.upgrade().is_some());
-
-        let storage_cluster = storage_handle.current();
-        let key = storage_cluster.process_local_registry_key();
-        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
-            return Ok(existing);
-        }
-
-        let sweeper = Self::spawn(storage_handle.clone())?;
-        registry.insert(key, Arc::downgrade(&sweeper));
-        Ok(sweeper)
-    }
-
-    fn spawn(storage_handle: StorageClusterRouteHandle) -> Result<Arc<Self>, ServerError> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let wake = Arc::new((Mutex::new(false), Condvar::new()));
-        let sweeper = Arc::new(Self {
-            stop: Arc::clone(&stop),
-            wake: Arc::clone(&wake),
-            handle: Mutex::new(None),
-        });
-        let handle = std::thread::Builder::new()
-            .name("argmin-shard-scavenger".to_string())
-            .spawn(move || {
-                let sweep_interval = shard_scavenger_sweep_interval();
-                let pressure_sample_interval = BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL;
-                let mut next_sweep = Instant::now();
-                let backfill_candidate_scanner =
-                    StorageBackfillCandidateScanner::new(storage_handle.clone());
-                while !stop.load(Ordering::SeqCst) {
-                    let storage_cluster = storage_handle.current();
-                    let admission = background_work_admission_for(&storage_cluster);
-                    admission.observe_pressure();
-                    let now = Instant::now();
-                    if now >= next_sweep {
-                        if let Some(_permit) =
-                            admission.try_acquire(BackgroundWorkClass::OpportunisticScan)
-                        {
-                            if let Err(error) = storage_cluster.audit_shard_storage_for_scavenger()
-                            {
-                                let _ = observability::event(
-                                    TRACE_TARGET,
-                                    "shard_scavenger_audit_error",
-                                    Some(format_args!("error={error}")),
-                                );
-                            }
-                        }
-                        if let Some(_permit) =
-                            admission.try_acquire(BackgroundWorkClass::BackfillCandidateScan)
-                        {
-                            backfill_candidate_scanner.scan();
-                        }
-                        if let Some(_permit) =
-                            admission.try_acquire(BackgroundWorkClass::RoutineMetadataCheckpoint)
-                        {
-                            match storage_cluster.record_routine_metadata_command_checkpoints() {
-                                Ok(summary) => {
-                                    let _ = observability::emit_metadata_command_checkpoint_record_scan(
-                                        TRACE_TARGET,
-                                        observability::MetadataCommandCheckpointRecordSummary {
-                                            scanned: summary.scanned,
-                                            recorded: summary.recorded,
-                                            already_current: summary.already_current,
-                                            skipped_cadence: summary.skipped_cadence,
-                                            skipped_inactive: summary.skipped_inactive,
-                                            skipped_empty: summary.skipped_empty,
-                                            skipped_stale_epoch: summary.skipped_stale_epoch,
-                                            compacted: summary.compacted,
-                                            compaction_deleted_entries: summary
-                                                .compaction_deleted_entries,
-                                            compaction_noop: summary.compaction_noop,
-                                            compaction_no_checkpoint: summary
-                                                .compaction_no_checkpoint,
-                                            compaction_pending: summary.compaction_pending,
-                                            compaction_failed: summary.compaction_failed,
-                                            failed: summary.failed,
-                                            limit_reached: summary.limit_reached,
-                                        },
-                                    );
-                                }
-                                Err(error) => {
-                                    let _ =
-                                        observability::emit_metadata_command_checkpoint_record_scan_error(
-                                            TRACE_TARGET,
-                                            &error,
-                                        );
-                                }
-                            }
-                        }
-                        next_sweep = Instant::now() + sweep_interval;
-                    }
-                    if stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let stop_guard = lock_mutex_unpoisoned(&wake.0);
-                    if *stop_guard {
-                        break;
-                    }
-                    let now = Instant::now();
-                    let wait_for = next_sweep
-                        .checked_duration_since(now)
-                        .unwrap_or_default()
-                        .min(pressure_sample_interval);
-                    let _ = wake
-                        .1
-                        .wait_timeout_while(stop_guard, wait_for, |stop_requested| !*stop_requested)
-                        .unwrap_or_else(|e| e.into_inner());
-                }
-            })
-            .map_err(|e| ServerError::InternalError {
-                reason: format!("failed to start shard scavenger worker: {e}"),
-            })?;
-        *lock_mutex_unpoisoned(&sweeper.handle) = Some(handle);
-        Ok(sweeper)
-    }
-
-    pub(super) fn disabled() -> Arc<Self> {
-        Arc::new(Self {
-            stop: Arc::new(AtomicBool::new(true)),
-            wake: Arc::new((Mutex::new(true), Condvar::new())),
-            handle: Mutex::new(None),
-        })
-    }
-}
-
-fn shard_scavenger_sweep_interval() -> Duration {
-    match std::env::var("ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS") {
-        Ok(value) => match value.parse::<u64>() {
-            Ok(0) | Err(_) => Duration::from_millis(super::SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS),
-            Ok(ms) => Duration::from_millis(ms),
-        },
-        Err(_) => Duration::from_millis(super::SHARD_SCAVENGER_SWEEP_INTERVAL_MILLIS),
-    }
-}
-
 impl ShardRepairSweeper {
     pub(super) fn acquire_shared(
         storage_handle: &StorageClusterRouteHandle,
@@ -1526,7 +1004,7 @@ impl ShardRepairSweeper {
             return Ok(existing);
         }
 
-        let admission = background_work_admission_for(&storage_cluster);
+        let admission = StorageMaintenanceAdmission::acquire_shared(storage_handle);
         let sweeper = Self::spawn(storage_handle.clone(), key, admission)?;
         registry.insert(key, Arc::downgrade(&sweeper));
         Ok(sweeper)
@@ -1535,7 +1013,7 @@ impl ShardRepairSweeper {
     fn spawn(
         storage_handle: StorageClusterRouteHandle,
         _registry_key: ProcessLocalRegistryKey,
-        admission: Arc<BackgroundWorkAdmission>,
+        admission: Arc<StorageMaintenanceAdmission>,
     ) -> Result<Arc<Self>, ServerError> {
         let worker_identity = random_background_worker_identity("shard-repair worker")?;
         let owner_token = format!("shard-repair-worker-{worker_identity}");
@@ -1696,9 +1174,7 @@ impl ShardRepairSweeper {
                         }
                     };
 
-                    let Some(_repair_permit) =
-                        admission.try_acquire(BackgroundWorkClass::KnownDamageRepair)
-                    else {
+                    let Some(_repair_permit) = admission.try_known_damage_repair() else {
                         let _ = observability::emit_shard_repair_event(
                             TRACE_TARGET,
                             observability::ShardRepairEventSummary {
@@ -1915,6 +1391,7 @@ impl ShardBackfillSweeper {
     }
 
     fn spawn(storage_handle: StorageClusterRouteHandle) -> Result<Arc<Self>, ServerError> {
+        let admission = StorageMaintenanceAdmission::acquire_shared(&storage_handle);
         let worker_identity = random_background_worker_identity("shard-backfill worker")?;
         let owner_token = format!("shard-backfill-worker-{worker_identity}");
         let stop = Arc::new(AtomicBool::new(false));
@@ -1930,7 +1407,6 @@ impl ShardBackfillSweeper {
                 let mut last_claimed_pg_id = None;
                 while !stop.load(Ordering::SeqCst) {
                     let storage_cluster = storage_handle.current();
-                    let admission = background_work_admission_for(&storage_cluster);
                     admission.observe_pressure();
                     run_one_placed_segment_shard_backfill(
                         &storage_cluster,
@@ -1974,7 +1450,7 @@ fn run_one_placed_segment_shard_backfill(
     storage_cluster: &StorageCluster,
     worker_identity: &str,
     owner_token: &str,
-    admission: &Arc<BackgroundWorkAdmission>,
+    admission: &Arc<StorageMaintenanceAdmission>,
     last_claimed_pg_id: &mut Option<PgId>,
 ) {
     let now_ms = Coordinator::now_millis();
@@ -2026,7 +1502,11 @@ fn run_one_placed_segment_shard_backfill(
 
     let admission_class =
         shard_backfill_admission_class(claim.remaining_tolerance, claim.work_item.request.ec.m);
-    let Some(_permit) = admission.try_acquire(admission_class) else {
+    let permit = match admission_class {
+        ShardBackfillAdmission::KnownDamageRepair => admission.try_known_damage_repair(),
+        ShardBackfillAdmission::RoutineBackfill => admission.try_routine_backfill(),
+    };
+    let Some(_permit) = permit else {
         emit_shard_backfill_event(
             Some(claim.work_item.request.data_pg_id),
             "admission_denied",
@@ -2250,10 +1730,13 @@ fn complete_obsolete_placed_segment_shard_backfill(
 
 #[cfg(test)]
 pub(super) fn run_one_placed_segment_shard_backfill_for_test(
-    storage_cluster: &StorageCluster,
+    storage_cluster: &Arc<StorageCluster>,
     owner_token: &str,
 ) {
-    let admission = Arc::new(BackgroundWorkAdmission::new());
+    let storage_handle =
+        StorageClusterRouteHandle::from_static_cluster(Arc::clone(storage_cluster))
+            .expect("test cluster should admit a static maintenance route");
+    let admission = StorageMaintenanceAdmission::acquire_shared(&storage_handle);
     run_one_placed_segment_shard_backfill(
         storage_cluster,
         "test-worker",
@@ -2263,11 +1746,17 @@ pub(super) fn run_one_placed_segment_shard_backfill_for_test(
     );
 }
 
-fn shard_backfill_admission_class(remaining_tolerance: u8, ec_m: u8) -> BackgroundWorkClass {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShardBackfillAdmission {
+    KnownDamageRepair,
+    RoutineBackfill,
+}
+
+fn shard_backfill_admission_class(remaining_tolerance: u8, ec_m: u8) -> ShardBackfillAdmission {
     if remaining_tolerance < ec_m {
-        BackgroundWorkClass::KnownDamageRepair
+        ShardBackfillAdmission::KnownDamageRepair
     } else {
-        BackgroundWorkClass::RoutineBackfill
+        ShardBackfillAdmission::RoutineBackfill
     }
 }
 
@@ -2360,6 +1849,16 @@ pub(super) fn acquire_stream_session_sweeper(
     storage_handle: &StorageClusterRouteHandle,
 ) -> Result<Arc<StreamSessionSweeper>, ServerError> {
     StreamSessionSweeper::acquire_shared(storage_handle).map_err(|error| {
+        ServerError::InternalError {
+            reason: error.to_string(),
+        }
+    })
+}
+
+pub(super) fn acquire_shard_scavenger_sweeper(
+    storage_handle: &StorageClusterRouteHandle,
+) -> Result<Arc<ShardScavengerSweeper>, ServerError> {
+    ShardScavengerSweeper::acquire_shared(storage_handle).map_err(|error| {
         ServerError::InternalError {
             reason: error.to_string(),
         }
@@ -3579,208 +3078,22 @@ mod tests {
     }
 
     #[test]
-    fn background_work_admission_limits_and_releases_per_class() {
-        let admission = Arc::new(BackgroundWorkAdmission::with_limits(
-            BackgroundWorkAdmissionLimits {
-                known_damage_repair: 1,
-                backfill_candidate_scan: 1,
-                routine_backfill: 1,
-                reclaim_cleanup: 1,
-                lifecycle_cleanup: 1,
-                opportunistic_scan: 0,
-                routine_metadata_checkpoint: 1,
-            },
-        ));
-
-        let repair_permit = admission
-            .try_acquire(BackgroundWorkClass::KnownDamageRepair)
-            .expect("first repair permit should fit limit");
-        assert!(
-            admission
-                .try_acquire(BackgroundWorkClass::KnownDamageRepair)
-                .is_none(),
-            "second repair permit should be denied at limit"
-        );
-
-        let reclaim_permit = admission
-            .try_acquire(BackgroundWorkClass::ReclaimCleanup)
-            .expect("reclaim cleanup should have its own class limit");
-        assert!(
-            admission
-                .try_acquire(BackgroundWorkClass::ReclaimCleanup)
-                .is_none(),
-            "second reclaim cleanup permit should be denied at limit"
-        );
-        let lifecycle_permit = admission
-            .try_acquire(BackgroundWorkClass::LifecycleCleanup)
-            .expect("lifecycle cleanup should have its own class limit");
-        assert!(
-            admission
-                .try_acquire(BackgroundWorkClass::LifecycleCleanup)
-                .is_none(),
-            "second lifecycle cleanup permit should be denied at limit"
-        );
-        assert_eq!(admission.active_total(), 3);
-        let checkpoint_permit = admission
-            .try_acquire(BackgroundWorkClass::RoutineMetadataCheckpoint)
-            .expect("routine metadata checkpoint should have its own class limit");
-        assert!(
-            admission
-                .try_acquire(BackgroundWorkClass::RoutineMetadataCheckpoint)
-                .is_none(),
-            "second routine metadata checkpoint should be denied at limit"
-        );
-        assert_eq!(admission.active_total(), 4);
-        drop(checkpoint_permit);
-        assert_eq!(admission.active_total(), 3);
-        assert!(
-            admission
-                .try_acquire(BackgroundWorkClass::OpportunisticScan)
-                .is_none(),
-            "zero-limit scan class should deny"
-        );
-
-        drop(repair_permit);
-        assert_eq!(admission.active_total(), 2);
-        let backfill_candidate_scan_permit = admission
-            .try_acquire(BackgroundWorkClass::BackfillCandidateScan)
-            .expect("backfill candidate scan should have its own class limit");
-        assert!(
-            admission
-                .try_acquire(BackgroundWorkClass::BackfillCandidateScan)
-                .is_none(),
-            "second backfill candidate scan permit should be denied at limit"
-        );
-        assert_eq!(admission.active_total(), 3);
-        drop(backfill_candidate_scan_permit);
-        let routine_backfill_permit = admission
-            .try_acquire(BackgroundWorkClass::RoutineBackfill)
-            .expect("routine backfill should have its own class limit");
-        assert!(
-            admission
-                .try_acquire(BackgroundWorkClass::RoutineBackfill)
-                .is_none(),
-            "second routine backfill permit should be denied at limit"
-        );
-        assert_eq!(admission.active_total(), 3);
-        let replacement = admission
-            .try_acquire(BackgroundWorkClass::KnownDamageRepair)
-            .expect("dropping a permit should release class capacity");
-        drop(replacement);
-        drop(reclaim_permit);
-        drop(lifecycle_permit);
-        drop(routine_backfill_permit);
-        assert_eq!(admission.active_total(), 0);
-    }
-
-    #[test]
-    fn background_work_admission_denies_routine_backfill_behind_known_damage() {
-        let admission = Arc::new(BackgroundWorkAdmission::with_limits(
-            BackgroundWorkAdmissionLimits {
-                known_damage_repair: 1,
-                backfill_candidate_scan: 1,
-                routine_backfill: 1,
-                reclaim_cleanup: 0,
-                lifecycle_cleanup: 0,
-                opportunistic_scan: 0,
-                routine_metadata_checkpoint: 1,
-            },
-        ));
-
-        let repair_permit = admission
-            .try_acquire(BackgroundWorkClass::KnownDamageRepair)
-            .expect("known damage should fit its class limit");
-        assert!(
-            admission
-                .try_acquire(BackgroundWorkClass::RoutineBackfill)
-                .is_none(),
-            "routine backfill should wait while known-damage work is active"
-        );
-        assert!(
-            admission
-                .try_acquire(BackgroundWorkClass::BackfillCandidateScan)
-                .is_none(),
-            "backfill candidate scan should wait while known-damage work is active"
-        );
-        drop(repair_permit);
-        let scan_permit = admission
-            .try_acquire(BackgroundWorkClass::BackfillCandidateScan)
-            .expect("backfill candidate scan should run once known-damage work is idle");
-        drop(scan_permit);
-        let routine_permit = admission
-            .try_acquire(BackgroundWorkClass::RoutineBackfill)
-            .expect("routine backfill should run once known-damage work is idle");
-        drop(routine_permit);
-    }
-
-    #[test]
-    fn background_work_admission_keeps_checkpoints_available_under_backlog() {
-        let admission = Arc::new(BackgroundWorkAdmission::with_limits(
-            BackgroundWorkAdmissionLimits {
-                known_damage_repair: 1,
-                backfill_candidate_scan: 1,
-                routine_backfill: 1,
-                reclaim_cleanup: 1,
-                lifecycle_cleanup: 1,
-                opportunistic_scan: 1,
-                routine_metadata_checkpoint: 1,
-            },
-        ));
-        let backlog = BackgroundWorkPressure {
-            foreground: false,
-            durable_backlog: true,
-        };
-
-        assert_eq!(
-            admission
-                .policy_denial_event_for_pressure(BackgroundWorkClass::OpportunisticScan, backlog),
-            Some(observability::BackgroundWorkAdmissionEvent::DeniedBacklogPressure),
-            "opportunistic scans should still wait behind durable cleanup/backfill backlog"
-        );
-        assert_eq!(
-            admission.policy_denial_event_for_pressure(
-                BackgroundWorkClass::RoutineMetadataCheckpoint,
-                backlog,
-            ),
-            None,
-            "checkpoint cadence must continue under durable backlog to bound command-log growth"
-        );
-    }
-
-    #[test]
-    fn background_work_admission_keeps_checkpoints_foreground_sensitive() {
-        let admission = Arc::new(BackgroundWorkAdmission::new());
-        let foreground = BackgroundWorkPressure {
-            foreground: true,
-            durable_backlog: false,
-        };
-
-        assert_eq!(
-            admission.policy_denial_event_for_pressure(
-                BackgroundWorkClass::RoutineMetadataCheckpoint,
-                foreground,
-            ),
-            Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
-        );
-    }
-
-    #[test]
     fn shard_backfill_admission_class_uses_ec_risk_tolerance() {
         assert_eq!(
             shard_backfill_admission_class(2, 2),
-            BackgroundWorkClass::RoutineBackfill
+            ShardBackfillAdmission::RoutineBackfill
         );
         assert_eq!(
             shard_backfill_admission_class(1, 2),
-            BackgroundWorkClass::KnownDamageRepair
+            ShardBackfillAdmission::KnownDamageRepair
         );
         assert_eq!(
             shard_backfill_admission_class(0, 2),
-            BackgroundWorkClass::KnownDamageRepair
+            ShardBackfillAdmission::KnownDamageRepair
         );
         assert_eq!(
             shard_backfill_admission_class(0, 0),
-            BackgroundWorkClass::RoutineBackfill
+            ShardBackfillAdmission::RoutineBackfill
         );
     }
 
@@ -3897,163 +3210,6 @@ mod tests {
         assert_eq!(
             shard_backfill_record_error_event(&StoreError::NotFound),
             "record_error_failed"
-        );
-    }
-
-    #[test]
-    fn background_work_pressure_uses_recent_counter_deltas() {
-        let mut state = BackgroundWorkPressureState::default();
-        let now = Instant::now();
-        let mut snapshot = observability::MetricsSnapshot::default();
-
-        assert_eq!(
-            state.observe(now, snapshot),
-            BackgroundWorkPressure {
-                foreground: false,
-                durable_backlog: false,
-            }
-        );
-
-        snapshot.request_admission_wait_total += 1;
-        let production_sweep_gap = Duration::from_millis(60_000);
-        assert_eq!(
-            state.observe(now + production_sweep_gap, snapshot),
-            BackgroundWorkPressure {
-                foreground: false,
-                durable_backlog: false,
-            },
-            "counter deltas observed after a scavenger sweep gap are stale"
-        );
-
-        snapshot.request_admission_timeout_total += 1;
-        let sampler_tick_before_next_scan = now + (production_sweep_gap * 2)
-            - BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL
-            - Duration::from_millis(20);
-        assert_eq!(
-            state.observe(sampler_tick_before_next_scan, snapshot),
-            BackgroundWorkPressure {
-                foreground: false,
-                durable_backlog: false,
-            }
-        );
-
-        snapshot.request_admission_wait_total += 1;
-        let recent = now + (production_sweep_gap * 2);
-        assert_eq!(
-            state.observe(recent, snapshot),
-            BackgroundWorkPressure {
-                foreground: true,
-                durable_backlog: false,
-            },
-            "a faster sampler catches pressure just before a production scan"
-        );
-
-        assert_eq!(
-            state.observe(
-                recent + BACKGROUND_FOREGROUND_PRESSURE_HOLD + Duration::from_millis(20),
-                snapshot,
-            ),
-            BackgroundWorkPressure {
-                foreground: false,
-                durable_backlog: false,
-            },
-            "old cumulative counters must not keep scans denied forever"
-        );
-    }
-
-    #[test]
-    fn background_work_pressure_ignores_metadata_recovery_counters() {
-        let mut state = BackgroundWorkPressureState::default();
-        let now = Instant::now();
-        let mut snapshot = observability::MetricsSnapshot::default();
-
-        assert_eq!(
-            state.observe(now, snapshot),
-            BackgroundWorkPressure {
-                foreground: false,
-                durable_backlog: false,
-            }
-        );
-
-        snapshot.metadata_command_recovery_wait_total += 1;
-        snapshot.metadata_command_recovery_timeout_total += 1;
-        snapshot.metadata_command_budget_exhausted_total += 1;
-        assert_eq!(
-            state.observe(now + Duration::from_millis(10), snapshot),
-            BackgroundWorkPressure {
-                foreground: false,
-                durable_backlog: false,
-            },
-            "process-wide metadata recovery contention is not necessarily foreground S3 pressure"
-        );
-    }
-
-    #[test]
-    fn background_work_pressure_detects_active_foreground_and_durable_backlog() {
-        let mut state = BackgroundWorkPressureState::default();
-        let now = Instant::now();
-        let mut snapshot = observability::MetricsSnapshot {
-            inflight_requests: 1,
-            reclaim_work_queue_depth: 7,
-            ..observability::MetricsSnapshot::default()
-        };
-
-        assert_eq!(
-            state.observe(now, snapshot),
-            BackgroundWorkPressure {
-                foreground: true,
-                durable_backlog: true,
-            }
-        );
-
-        snapshot.inflight_requests = 0;
-        assert_eq!(
-            state.observe(now + Duration::from_millis(10), snapshot),
-            BackgroundWorkPressure {
-                foreground: false,
-                durable_backlog: true,
-            }
-        );
-    }
-
-    #[test]
-    fn background_work_pressure_does_not_treat_background_storage_rpcs_as_foreground() {
-        let mut state = BackgroundWorkPressureState::default();
-        let now = Instant::now();
-        let mut snapshot = observability::MetricsSnapshot::default();
-
-        assert_eq!(
-            state.observe(now, snapshot),
-            BackgroundWorkPressure {
-                foreground: false,
-                durable_backlog: false,
-            }
-        );
-
-        snapshot.storage_rpc_admission_wait_total = 1;
-        snapshot.storage_rpc_admission_timeout_total = 1;
-        snapshot.storage_rpc_active_total = 4;
-        snapshot.storage_rpc_active_read = 1;
-        snapshot.storage_rpc_active_start_write = 1;
-        snapshot.storage_rpc_active_list = 2;
-
-        assert_eq!(
-            state.observe(now + Duration::from_millis(10), snapshot),
-            BackgroundWorkPressure {
-                foreground: false,
-                durable_backlog: false,
-            },
-            "unattributed storage RPC activity includes background workflows and must not make background classes deny one another"
-        );
-
-        snapshot.inflight_requests = 1;
-        assert_eq!(
-            state.observe(now + Duration::from_millis(20), snapshot),
-            BackgroundWorkPressure {
-                foreground: true,
-                durable_backlog: false,
-            },
-            "the admitted request lifetime identifies foreground storage activity"
         );
     }
 

@@ -1,24 +1,140 @@
-use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cluster::{
     PlacedSegmentShardBackfillCandidateEnqueueSummary,
-    PlacedSegmentShardBackfillCandidateScanCursor, StorageClusterRouteHandle,
-    StreamSessionSweepSummary,
+    PlacedSegmentShardBackfillCandidateScanCursor, StorageClusterRouteAdmissionDomain,
+    StorageClusterRouteHandle, StreamSessionSweepSummary,
 };
 use crate::StoreError;
 
 const TRACE_TARGET: &str = "storage";
+#[cfg(test)]
+const SHARD_SCAVENGER_SWEEP_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const SHARD_SCAVENGER_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const STREAM_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 const STREAM_SESSION_SCAVENGE_MAX_AGE_MILLIS: u64 = 60_000;
+const BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT: usize = 1;
+const BACKGROUND_BACKFILL_CANDIDATE_SCAN_LIMIT: usize = 1;
+const BACKGROUND_ROUTINE_BACKFILL_LIMIT: usize = 1;
+const BACKGROUND_RECLAIM_CLEANUP_LIMIT: usize = 1;
+const BACKGROUND_LIFECYCLE_CLEANUP_LIMIT: usize = 1;
+const BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT: usize = 1;
+const BACKGROUND_ROUTINE_METADATA_CHECKPOINT_LIMIT: usize = 1;
+const BACKGROUND_FOREGROUND_PRESSURE_HOLD: Duration = Duration::from_millis(1_000);
+const BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+const BACKGROUND_FOREGROUND_PRESSURE_MAX_SAMPLE_GAP: Duration = Duration::from_millis(1_250);
 
-static STREAM_SESSION_SWEEPER_REGISTRY: OnceLock<
-    Mutex<HashMap<crate::ProcessLocalRegistryKey, Weak<StorageStreamSessionSweeper>>>,
+static MAINTENANCE_ADMISSION_REGISTRY: OnceLock<
+    Mutex<Vec<StorageMaintenanceAdmissionRegistration>>,
 > = OnceLock::new();
+static SHARD_SCAVENGER_SWEEPER_REGISTRY: OnceLock<Mutex<Vec<Weak<StorageShardScavengerSweeper>>>> =
+    OnceLock::new();
+
+static STREAM_SESSION_SWEEPER_REGISTRY: OnceLock<Mutex<Vec<Weak<StorageStreamSessionSweeper>>>> =
+    OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageMaintenanceClass {
+    KnownDamageRepair,
+    BackfillCandidateScan,
+    RoutineBackfill,
+    ReclaimCleanup,
+    LifecycleCleanup,
+    OpportunisticScan,
+    RoutineMetadataCheckpoint,
+}
+
+impl StorageMaintenanceClass {
+    fn observability_class(self) -> observability::BackgroundWorkClass {
+        match self {
+            Self::KnownDamageRepair => observability::BackgroundWorkClass::KnownDamageRepair,
+            Self::BackfillCandidateScan => {
+                observability::BackgroundWorkClass::BackfillCandidateScan
+            }
+            Self::RoutineBackfill => observability::BackgroundWorkClass::RoutineBackfill,
+            Self::ReclaimCleanup => observability::BackgroundWorkClass::ReclaimCleanup,
+            Self::LifecycleCleanup => observability::BackgroundWorkClass::LifecycleCleanup,
+            Self::OpportunisticScan => observability::BackgroundWorkClass::OpportunisticScan,
+            Self::RoutineMetadataCheckpoint => {
+                observability::BackgroundWorkClass::RoutineMetadataCheckpoint
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StorageMaintenanceAdmissionLimits {
+    known_damage_repair: usize,
+    backfill_candidate_scan: usize,
+    routine_backfill: usize,
+    reclaim_cleanup: usize,
+    lifecycle_cleanup: usize,
+    opportunistic_scan: usize,
+    routine_metadata_checkpoint: usize,
+}
+
+impl Default for StorageMaintenanceAdmissionLimits {
+    fn default() -> Self {
+        Self {
+            known_damage_repair: BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT,
+            backfill_candidate_scan: BACKGROUND_BACKFILL_CANDIDATE_SCAN_LIMIT,
+            routine_backfill: BACKGROUND_ROUTINE_BACKFILL_LIMIT,
+            reclaim_cleanup: BACKGROUND_RECLAIM_CLEANUP_LIMIT,
+            lifecycle_cleanup: BACKGROUND_LIFECYCLE_CLEANUP_LIMIT,
+            opportunistic_scan: BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT,
+            routine_metadata_checkpoint: BACKGROUND_ROUTINE_METADATA_CHECKPOINT_LIMIT,
+        }
+    }
+}
+
+/// Opaque, storage-owned admission domain shared by physical maintenance workers.
+///
+/// Callers may request permits for the remaining higher-layer workers while
+/// those workers are migrated, but neither the admission classes nor their
+/// counters and pressure policy cross the storage boundary.
+#[derive(Debug)]
+pub struct StorageMaintenanceAdmission {
+    limits: StorageMaintenanceAdmissionLimits,
+    pressure: Mutex<StorageMaintenancePressureState>,
+    known_damage_repair_active: AtomicUsize,
+    backfill_candidate_scan_active: AtomicUsize,
+    routine_backfill_active: AtomicUsize,
+    reclaim_cleanup_active: AtomicUsize,
+    lifecycle_cleanup_active: AtomicUsize,
+    opportunistic_scan_active: AtomicUsize,
+    routine_metadata_checkpoint_active: AtomicUsize,
+}
+
+struct StorageMaintenanceAdmissionRegistration {
+    route_domain: StorageClusterRouteAdmissionDomain,
+    admission: Weak<StorageMaintenanceAdmission>,
+}
+
+#[derive(Debug, Default)]
+struct StorageMaintenancePressureState {
+    last_snapshot: Option<observability::MetricsSnapshot>,
+    last_snapshot_at: Option<Instant>,
+    foreground_pressure_until: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StorageMaintenancePressure {
+    foreground: bool,
+    durable_backlog: bool,
+}
+
+/// Opaque proof that one storage-maintenance operation was admitted.
+pub struct StorageMaintenancePermit {
+    admission: Arc<StorageMaintenanceAdmission>,
+    class: StorageMaintenanceClass,
+    started_at: Instant,
+    active: bool,
+}
 
 /// Opaque failure to start a storage-owned maintenance worker.
 pub struct StorageMaintenanceStartError {
@@ -56,18 +172,326 @@ impl fmt::Display for StorageMaintenanceStartError {
 
 impl std::error::Error for StorageMaintenanceStartError {}
 
+impl StorageMaintenanceAdmission {
+    /// Return the maintenance admission domain associated with this route
+    /// publication domain, including across runtime-map generations.
+    #[must_use]
+    pub fn acquire_shared(storage_handle: &StorageClusterRouteHandle) -> Arc<Self> {
+        let registry = MAINTENANCE_ADMISSION_REGISTRY.get_or_init(|| Mutex::new(Vec::new()));
+        let mut registry = registry.lock().unwrap_or_else(|error| error.into_inner());
+        registry.retain(|registration| registration.admission.upgrade().is_some());
+
+        if let Some(existing) = registry.iter().find_map(|registration| {
+            registration
+                .route_domain
+                .matches(storage_handle)
+                .then(|| registration.admission.upgrade())
+                .flatten()
+        }) {
+            return existing;
+        }
+
+        let admission = Arc::new(Self::new());
+        registry.push(StorageMaintenanceAdmissionRegistration {
+            route_domain: storage_handle.route_admission_domain(),
+            admission: Arc::downgrade(&admission),
+        });
+        admission
+    }
+
+    fn new() -> Self {
+        Self::with_limits(StorageMaintenanceAdmissionLimits::default())
+    }
+
+    fn with_limits(limits: StorageMaintenanceAdmissionLimits) -> Self {
+        Self {
+            limits,
+            pressure: Mutex::new(StorageMaintenancePressureState::default()),
+            known_damage_repair_active: AtomicUsize::new(0),
+            backfill_candidate_scan_active: AtomicUsize::new(0),
+            routine_backfill_active: AtomicUsize::new(0),
+            reclaim_cleanup_active: AtomicUsize::new(0),
+            lifecycle_cleanup_active: AtomicUsize::new(0),
+            opportunistic_scan_active: AtomicUsize::new(0),
+            routine_metadata_checkpoint_active: AtomicUsize::new(0),
+        }
+    }
+
+    #[must_use]
+    pub fn try_known_damage_repair(self: &Arc<Self>) -> Option<StorageMaintenancePermit> {
+        self.try_acquire(StorageMaintenanceClass::KnownDamageRepair)
+    }
+
+    #[must_use]
+    pub fn try_routine_backfill(self: &Arc<Self>) -> Option<StorageMaintenancePermit> {
+        self.try_acquire(StorageMaintenanceClass::RoutineBackfill)
+    }
+
+    #[must_use]
+    pub fn try_reclaim_cleanup(self: &Arc<Self>) -> Option<StorageMaintenancePermit> {
+        self.try_acquire(StorageMaintenanceClass::ReclaimCleanup)
+    }
+
+    #[must_use]
+    pub fn try_lifecycle_cleanup(self: &Arc<Self>) -> Option<StorageMaintenancePermit> {
+        self.try_acquire(StorageMaintenanceClass::LifecycleCleanup)
+    }
+
+    fn try_backfill_candidate_scan(self: &Arc<Self>) -> Option<StorageMaintenancePermit> {
+        self.try_acquire(StorageMaintenanceClass::BackfillCandidateScan)
+    }
+
+    fn try_opportunistic_scan(self: &Arc<Self>) -> Option<StorageMaintenancePermit> {
+        self.try_acquire(StorageMaintenanceClass::OpportunisticScan)
+    }
+
+    fn try_routine_metadata_checkpoint(self: &Arc<Self>) -> Option<StorageMaintenancePermit> {
+        self.try_acquire(StorageMaintenanceClass::RoutineMetadataCheckpoint)
+    }
+
+    /// Refresh process-wide pressure observations for workers whose main loop
+    /// samples more frequently than it requests a permit.
+    pub fn observe_pressure(&self) {
+        let _ = self.current_pressure();
+    }
+
+    fn try_acquire(
+        self: &Arc<Self>,
+        class: StorageMaintenanceClass,
+    ) -> Option<StorageMaintenancePermit> {
+        if let Some(event) = self.policy_denial_event(class) {
+            self.emit(class, event, None);
+            return None;
+        }
+
+        let counter = self.counter_for(class);
+        let limit = self.limit_for(class);
+        let mut active = counter.load(Ordering::Acquire);
+        while active < limit {
+            match counter.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.emit(
+                        class,
+                        observability::BackgroundWorkAdmissionEvent::Admitted,
+                        None,
+                    );
+                    return Some(StorageMaintenancePermit {
+                        admission: Arc::clone(self),
+                        class,
+                        started_at: Instant::now(),
+                        active: true,
+                    });
+                }
+                Err(observed) => active = observed,
+            }
+        }
+        self.emit(
+            class,
+            observability::BackgroundWorkAdmissionEvent::DeniedLimit,
+            None,
+        );
+        None
+    }
+
+    fn policy_denial_event(
+        &self,
+        class: StorageMaintenanceClass,
+    ) -> Option<observability::BackgroundWorkAdmissionEvent> {
+        self.policy_denial_event_for_pressure(class, self.current_pressure())
+    }
+
+    fn policy_denial_event_for_pressure(
+        &self,
+        class: StorageMaintenanceClass,
+        pressure: StorageMaintenancePressure,
+    ) -> Option<observability::BackgroundWorkAdmissionEvent> {
+        match class {
+            StorageMaintenanceClass::KnownDamageRepair
+            | StorageMaintenanceClass::ReclaimCleanup
+            | StorageMaintenanceClass::LifecycleCleanup => None,
+            StorageMaintenanceClass::BackfillCandidateScan
+            | StorageMaintenanceClass::RoutineBackfill => {
+                if pressure.foreground {
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
+                } else if self.known_damage_repair_active.load(Ordering::Acquire) > 0 {
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedKnownDamageActive)
+                } else {
+                    None
+                }
+            }
+            StorageMaintenanceClass::OpportunisticScan => {
+                if pressure.foreground {
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
+                } else if pressure.durable_backlog {
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedBacklogPressure)
+                } else {
+                    None
+                }
+            }
+            StorageMaintenanceClass::RoutineMetadataCheckpoint => {
+                if pressure.foreground {
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn current_pressure(&self) -> StorageMaintenancePressure {
+        let snapshot = observability::metrics_snapshot();
+        self.pressure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .observe(Instant::now(), snapshot)
+    }
+
+    fn counter_for(&self, class: StorageMaintenanceClass) -> &AtomicUsize {
+        match class {
+            StorageMaintenanceClass::KnownDamageRepair => &self.known_damage_repair_active,
+            StorageMaintenanceClass::BackfillCandidateScan => &self.backfill_candidate_scan_active,
+            StorageMaintenanceClass::RoutineBackfill => &self.routine_backfill_active,
+            StorageMaintenanceClass::ReclaimCleanup => &self.reclaim_cleanup_active,
+            StorageMaintenanceClass::LifecycleCleanup => &self.lifecycle_cleanup_active,
+            StorageMaintenanceClass::OpportunisticScan => &self.opportunistic_scan_active,
+            StorageMaintenanceClass::RoutineMetadataCheckpoint => {
+                &self.routine_metadata_checkpoint_active
+            }
+        }
+    }
+
+    fn limit_for(&self, class: StorageMaintenanceClass) -> usize {
+        match class {
+            StorageMaintenanceClass::KnownDamageRepair => self.limits.known_damage_repair,
+            StorageMaintenanceClass::BackfillCandidateScan => self.limits.backfill_candidate_scan,
+            StorageMaintenanceClass::RoutineBackfill => self.limits.routine_backfill,
+            StorageMaintenanceClass::ReclaimCleanup => self.limits.reclaim_cleanup,
+            StorageMaintenanceClass::LifecycleCleanup => self.limits.lifecycle_cleanup,
+            StorageMaintenanceClass::OpportunisticScan => self.limits.opportunistic_scan,
+            StorageMaintenanceClass::RoutineMetadataCheckpoint => {
+                self.limits.routine_metadata_checkpoint
+            }
+        }
+    }
+
+    fn active_total(&self) -> usize {
+        self.known_damage_repair_active.load(Ordering::Acquire)
+            + self.backfill_candidate_scan_active.load(Ordering::Acquire)
+            + self.routine_backfill_active.load(Ordering::Acquire)
+            + self.reclaim_cleanup_active.load(Ordering::Acquire)
+            + self.lifecycle_cleanup_active.load(Ordering::Acquire)
+            + self.opportunistic_scan_active.load(Ordering::Acquire)
+            + self
+                .routine_metadata_checkpoint_active
+                .load(Ordering::Acquire)
+    }
+
+    fn emit(
+        &self,
+        class: StorageMaintenanceClass,
+        event: observability::BackgroundWorkAdmissionEvent,
+        elapsed_us: Option<u64>,
+    ) {
+        let _ = observability::emit_background_work_admission_event(
+            TRACE_TARGET,
+            observability::BackgroundWorkAdmissionSummary {
+                class: class.observability_class(),
+                event,
+                active_total: self.active_total(),
+                elapsed_us,
+            },
+        );
+    }
+}
+
+impl StorageMaintenancePressureState {
+    fn observe(
+        &mut self,
+        now: Instant,
+        snapshot: observability::MetricsSnapshot,
+    ) -> StorageMaintenancePressure {
+        if self.last_snapshot.zip(self.last_snapshot_at).is_some_and(
+            |(last_snapshot, last_snapshot_at)| {
+                now.checked_duration_since(last_snapshot_at)
+                    .is_some_and(|elapsed| elapsed <= BACKGROUND_FOREGROUND_PRESSURE_MAX_SAMPLE_GAP)
+                    && maintenance_foreground_pressure_delta(last_snapshot, snapshot)
+            },
+        ) {
+            self.foreground_pressure_until = Some(now + BACKGROUND_FOREGROUND_PRESSURE_HOLD);
+        }
+        self.last_snapshot = Some(snapshot);
+        self.last_snapshot_at = Some(now);
+
+        StorageMaintenancePressure {
+            foreground: self
+                .foreground_pressure_until
+                .is_some_and(|pressure_until| now < pressure_until)
+                || maintenance_foreground_pressure_active(snapshot),
+            durable_backlog: maintenance_durable_backlog_active(snapshot),
+        }
+    }
+}
+
+fn maintenance_foreground_pressure_delta(
+    last: observability::MetricsSnapshot,
+    current: observability::MetricsSnapshot,
+) -> bool {
+    current.request_admission_wait_total > last.request_admission_wait_total
+        || current.request_admission_timeout_total > last.request_admission_timeout_total
+}
+
+fn maintenance_foreground_pressure_active(snapshot: observability::MetricsSnapshot) -> bool {
+    snapshot.inflight_requests > 0
+}
+
+fn maintenance_durable_backlog_active(snapshot: observability::MetricsSnapshot) -> bool {
+    snapshot.reclaim_work_queue_depth > 0
+        || snapshot.object_payload_reclaim_queue_depth > 0
+        || snapshot.object_payload_reclaim_outstanding_depth > 0
+        || snapshot.bucket_delete_begin_queue_depth > 0
+        || snapshot.bucket_delete_finalize_queue_depth > 0
+        || snapshot.bucket_delete_finalize_outstanding_depth > 0
+        || snapshot.shard_repair_queue_depth > 0
+        || snapshot.shard_backfill_queue_depth > 0
+}
+
+impl Drop for StorageMaintenancePermit {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let previous = self
+            .admission
+            .counter_for(self.class)
+            .fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+        let elapsed_us = u64::try_from(self.started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.admission.emit(
+            self.class,
+            observability::BackgroundWorkAdmissionEvent::Finished,
+            Some(elapsed_us),
+        );
+        self.active = false;
+    }
+}
+
 /// Opaque storage-owned state for bounded backfill-candidate discovery.
 ///
 /// The cursor is deliberately retained with the route handle so callers can
 /// request a scan without learning or persisting placement-group scan state.
-pub struct StorageBackfillCandidateScanner {
+pub(crate) struct StorageBackfillCandidateScanner {
     storage_handle: StorageClusterRouteHandle,
     cursor: Mutex<PlacedSegmentShardBackfillCandidateScanCursor>,
 }
 
 impl StorageBackfillCandidateScanner {
     #[must_use]
-    pub fn new(storage_handle: StorageClusterRouteHandle) -> Self {
+    pub(crate) fn new(storage_handle: StorageClusterRouteHandle) -> Self {
         Self {
             storage_handle,
             cursor: Mutex::new(PlacedSegmentShardBackfillCandidateScanCursor::default()),
@@ -78,7 +502,7 @@ impl StorageBackfillCandidateScanner {
     ///
     /// Candidate counts, cursor state, and implementation failures remain
     /// inside storage; the caller merely schedules the maintenance operation.
-    pub fn scan(&self) {
+    pub(crate) fn scan(&self) {
         match self.scan_inner() {
             Ok(summary) => emit_scan_summary(summary),
             Err(error) => {
@@ -133,6 +557,194 @@ fn emit_scan_summary(summary: PlacedSegmentShardBackfillCandidateEnqueueSummary)
     );
 }
 
+/// Opaque storage-owned shard-audit, candidate-discovery, and checkpoint worker.
+pub struct StorageShardScavengerSweeper {
+    storage_handle: StorageClusterRouteHandle,
+    stop: Arc<AtomicBool>,
+    wake: Arc<(Mutex<bool>, Condvar)>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl StorageShardScavengerSweeper {
+    pub fn acquire_shared(
+        storage_handle: &StorageClusterRouteHandle,
+    ) -> Result<Arc<Self>, StorageMaintenanceStartError> {
+        let registry = SHARD_SCAVENGER_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(Vec::new()));
+        let mut registry = registry.lock().unwrap_or_else(|error| error.into_inner());
+        registry.retain(|sweeper| sweeper.upgrade().is_some());
+
+        if let Some(existing) = registry.iter().filter_map(Weak::upgrade).find(|sweeper| {
+            sweeper
+                .storage_handle
+                .shares_route_admission_with(storage_handle)
+        }) {
+            return Ok(existing);
+        }
+
+        let sweeper = Self::spawn(storage_handle.clone())?;
+        registry.push(Arc::downgrade(&sweeper));
+        Ok(sweeper)
+    }
+
+    fn spawn(
+        storage_handle: StorageClusterRouteHandle,
+    ) -> Result<Arc<Self>, StorageMaintenanceStartError> {
+        let admission = StorageMaintenanceAdmission::acquire_shared(&storage_handle);
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        let sweeper = Arc::new(Self {
+            storage_handle: storage_handle.clone(),
+            stop: Arc::clone(&stop),
+            wake: Arc::clone(&wake),
+            handle: Mutex::new(None),
+        });
+        let handle = std::thread::Builder::new()
+            .name("argmin-shard-scavenger".to_string())
+            .spawn(move || {
+                let sweep_interval = shard_scavenger_sweep_interval();
+                let mut next_sweep = Instant::now();
+                let candidate_scanner =
+                    StorageBackfillCandidateScanner::new(storage_handle.clone());
+                while !stop.load(Ordering::SeqCst) {
+                    admission.observe_pressure();
+                    let now = Instant::now();
+                    if now >= next_sweep {
+                        run_shard_scavenger_sweep(&storage_handle, &admission, &candidate_scanner);
+                        next_sweep = Instant::now() + sweep_interval;
+                    }
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let stop_guard = wake.0.lock().unwrap_or_else(|error| error.into_inner());
+                    if *stop_guard {
+                        break;
+                    }
+                    let wait_for = next_sweep
+                        .checked_duration_since(Instant::now())
+                        .unwrap_or_default()
+                        .min(BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL);
+                    let _ = wake
+                        .1
+                        .wait_timeout_while(stop_guard, wait_for, |stop_requested| !*stop_requested)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+            })
+            .map_err(|error| {
+                StorageMaintenanceStartError::worker_spawn("shard scavenger", error)
+            })?;
+        *sweeper
+            .handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(handle);
+        Ok(sweeper)
+    }
+
+    #[must_use]
+    pub fn disabled(storage_handle: StorageClusterRouteHandle) -> Arc<Self> {
+        Arc::new(Self {
+            storage_handle,
+            stop: Arc::new(AtomicBool::new(true)),
+            wake: Arc::new((Mutex::new(true), Condvar::new())),
+            handle: Mutex::new(None),
+        })
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_is_enabled(&self) -> bool {
+        !self.stop.load(Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn test_routes_to(&self, expected: &Arc<crate::StorageCluster>) -> bool {
+        Arc::ptr_eq(&self.storage_handle.current(), expected)
+    }
+}
+
+impl Drop for StorageShardScavengerSweeper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        *self
+            .wake
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        self.wake.1.notify_all();
+        if let Some(handle) = self
+            .handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn shard_scavenger_sweep_interval() -> Duration {
+    match std::env::var("ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(0) | Err(_) => SHARD_SCAVENGER_SWEEP_INTERVAL,
+            Ok(ms) => Duration::from_millis(ms),
+        },
+        Err(_) => SHARD_SCAVENGER_SWEEP_INTERVAL,
+    }
+}
+
+fn run_shard_scavenger_sweep(
+    storage_handle: &StorageClusterRouteHandle,
+    admission: &Arc<StorageMaintenanceAdmission>,
+    candidate_scanner: &StorageBackfillCandidateScanner,
+) {
+    let storage_cluster = storage_handle.current();
+    if let Some(_permit) = admission.try_opportunistic_scan() {
+        if let Err(error) = storage_cluster.audit_shard_storage_for_scavenger() {
+            let _ = observability::event(
+                TRACE_TARGET,
+                "shard_scavenger_audit_error",
+                Some(format_args!("error={error}")),
+            );
+        }
+    }
+    if let Some(_permit) = admission.try_backfill_candidate_scan() {
+        candidate_scanner.scan();
+    }
+    if let Some(_permit) = admission.try_routine_metadata_checkpoint() {
+        match storage_cluster.record_routine_metadata_command_checkpoints() {
+            Ok(summary) => {
+                let _ = observability::emit_metadata_command_checkpoint_record_scan(
+                    TRACE_TARGET,
+                    observability::MetadataCommandCheckpointRecordSummary {
+                        scanned: summary.scanned,
+                        recorded: summary.recorded,
+                        already_current: summary.already_current,
+                        skipped_cadence: summary.skipped_cadence,
+                        skipped_inactive: summary.skipped_inactive,
+                        skipped_empty: summary.skipped_empty,
+                        skipped_stale_epoch: summary.skipped_stale_epoch,
+                        compacted: summary.compacted,
+                        compaction_deleted_entries: summary.compaction_deleted_entries,
+                        compaction_noop: summary.compaction_noop,
+                        compaction_no_checkpoint: summary.compaction_no_checkpoint,
+                        compaction_pending: summary.compaction_pending,
+                        compaction_failed: summary.compaction_failed,
+                        failed: summary.failed,
+                        limit_reached: summary.limit_reached,
+                    },
+                );
+            }
+            Err(error) => {
+                let _ = observability::emit_metadata_command_checkpoint_record_scan_error(
+                    TRACE_TARGET,
+                    &error,
+                );
+            }
+        }
+    }
+}
+
 /// Opaque storage-owned abandoned stream-session cleanup worker.
 pub struct StorageStreamSessionSweeper {
     storage_handle: StorageClusterRouteHandle,
@@ -170,25 +782,20 @@ impl StorageStreamSessionSweeper {
         sweep_interval: Duration,
         max_age_ms: u64,
     ) -> Result<Arc<Self>, StorageMaintenanceStartError> {
-        let registry = STREAM_SESSION_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        let registry = STREAM_SESSION_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(Vec::new()));
         let mut registry = registry.lock().unwrap_or_else(|error| error.into_inner());
-        registry.retain(|_, sweeper| sweeper.upgrade().is_some());
+        registry.retain(|sweeper| sweeper.upgrade().is_some());
 
-        let key = storage_handle.current().process_local_registry_key();
-        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
-            return Ok(existing);
-        }
-        if let Some(existing) = registry.values().filter_map(Weak::upgrade).find(|sweeper| {
+        if let Some(existing) = registry.iter().filter_map(Weak::upgrade).find(|sweeper| {
             sweeper
                 .storage_handle
                 .shares_route_admission_with(storage_handle)
         }) {
-            registry.insert(key, Arc::downgrade(&existing));
             return Ok(existing);
         }
 
         let sweeper = Self::spawn(storage_handle.clone(), sweep_interval, max_age_ms)?;
-        registry.insert(key, Arc::downgrade(&sweeper));
+        registry.push(Arc::downgrade(&sweeper));
         Ok(sweeper)
     }
 
@@ -268,6 +875,12 @@ impl StorageStreamSessionSweeper {
     pub fn test_is_enabled(&self) -> bool {
         !self.stop.load(Ordering::SeqCst)
     }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn test_routes_to(&self, expected: &Arc<crate::StorageCluster>) -> bool {
+        Arc::ptr_eq(&self.storage_handle.current(), expected)
+    }
 }
 
 impl Drop for StorageStreamSessionSweeper {
@@ -320,6 +933,207 @@ fn sweep_abandoned_stream_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maintenance_admission_limits_and_releases_each_class() {
+        let admission = Arc::new(StorageMaintenanceAdmission::with_limits(
+            StorageMaintenanceAdmissionLimits {
+                known_damage_repair: 1,
+                backfill_candidate_scan: 1,
+                routine_backfill: 1,
+                reclaim_cleanup: 1,
+                lifecycle_cleanup: 1,
+                opportunistic_scan: 0,
+                routine_metadata_checkpoint: 1,
+            },
+        ));
+
+        let repair = admission
+            .try_known_damage_repair()
+            .expect("first repair permit should fit");
+        assert!(admission.try_known_damage_repair().is_none());
+        let reclaim = admission
+            .try_reclaim_cleanup()
+            .expect("reclaim has an independent permit");
+        assert!(admission.try_reclaim_cleanup().is_none());
+        let lifecycle = admission
+            .try_lifecycle_cleanup()
+            .expect("lifecycle has an independent permit");
+        assert!(admission.try_lifecycle_cleanup().is_none());
+        let checkpoint = admission
+            .try_routine_metadata_checkpoint()
+            .expect("checkpoint has an independent permit");
+        assert!(admission.try_routine_metadata_checkpoint().is_none());
+        assert_eq!(admission.active_total(), 4);
+        assert!(admission.try_opportunistic_scan().is_none());
+
+        drop(repair);
+        let candidate = admission
+            .try_backfill_candidate_scan()
+            .expect("candidate scan should run after repair releases");
+        assert!(admission.try_backfill_candidate_scan().is_none());
+        drop(candidate);
+        let routine = admission
+            .try_routine_backfill()
+            .expect("routine backfill should fit");
+        assert!(admission.try_routine_backfill().is_none());
+        drop(checkpoint);
+        drop(reclaim);
+        drop(lifecycle);
+        drop(routine);
+        assert_eq!(admission.active_total(), 0);
+    }
+
+    #[test]
+    fn maintenance_admission_prioritizes_known_damage_over_backfill() {
+        let admission = Arc::new(StorageMaintenanceAdmission::new());
+        let repair = admission
+            .try_known_damage_repair()
+            .expect("known damage should be admitted");
+        assert!(admission.try_routine_backfill().is_none());
+        assert!(admission.try_backfill_candidate_scan().is_none());
+        drop(repair);
+        assert!(admission.try_backfill_candidate_scan().is_some());
+        assert!(admission.try_routine_backfill().is_some());
+    }
+
+    #[test]
+    fn maintenance_admission_keeps_checkpoints_available_under_backlog() {
+        let admission = StorageMaintenanceAdmission::new();
+        let backlog = StorageMaintenancePressure {
+            foreground: false,
+            durable_backlog: true,
+        };
+
+        assert_eq!(
+            admission.policy_denial_event_for_pressure(
+                StorageMaintenanceClass::OpportunisticScan,
+                backlog,
+            ),
+            Some(observability::BackgroundWorkAdmissionEvent::DeniedBacklogPressure)
+        );
+        assert_eq!(
+            admission.policy_denial_event_for_pressure(
+                StorageMaintenanceClass::RoutineMetadataCheckpoint,
+                backlog,
+            ),
+            None
+        );
+        assert_eq!(
+            admission.policy_denial_event_for_pressure(
+                StorageMaintenanceClass::RoutineMetadataCheckpoint,
+                StorageMaintenancePressure {
+                    foreground: true,
+                    durable_backlog: false,
+                },
+            ),
+            Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
+        );
+    }
+
+    #[test]
+    fn maintenance_pressure_uses_only_recent_foreground_deltas() {
+        let mut state = StorageMaintenancePressureState::default();
+        let now = Instant::now();
+        let mut snapshot = observability::MetricsSnapshot::default();
+        assert_eq!(
+            state.observe(now, snapshot),
+            StorageMaintenancePressure {
+                foreground: false,
+                durable_backlog: false,
+            }
+        );
+
+        snapshot.request_admission_wait_total += 1;
+        let production_sweep_gap = Duration::from_secs(60);
+        assert!(
+            !state
+                .observe(now + production_sweep_gap, snapshot)
+                .foreground
+        );
+
+        snapshot.request_admission_timeout_total += 1;
+        let before_next_scan = now + (production_sweep_gap * 2)
+            - BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL
+            - Duration::from_millis(20);
+        assert!(!state.observe(before_next_scan, snapshot).foreground);
+        snapshot.request_admission_wait_total += 1;
+        let recent = now + (production_sweep_gap * 2);
+        assert!(state.observe(recent, snapshot).foreground);
+        assert!(
+            !state
+                .observe(
+                    recent + BACKGROUND_FOREGROUND_PRESSURE_HOLD + Duration::from_millis(20),
+                    snapshot,
+                )
+                .foreground
+        );
+    }
+
+    #[test]
+    fn maintenance_pressure_ignores_recovery_counters_and_detects_live_work() {
+        let mut state = StorageMaintenancePressureState::default();
+        let now = Instant::now();
+        let mut snapshot = observability::MetricsSnapshot::default();
+        let _ = state.observe(now, snapshot);
+        snapshot.metadata_command_recovery_wait_total += 1;
+        snapshot.metadata_command_recovery_timeout_total += 1;
+        snapshot.metadata_command_budget_exhausted_total += 1;
+        assert!(
+            !state
+                .observe(now + Duration::from_millis(10), snapshot)
+                .foreground
+        );
+
+        snapshot.inflight_requests = 1;
+        snapshot.reclaim_work_queue_depth = 7;
+        assert_eq!(
+            state.observe(now + Duration::from_millis(20), snapshot),
+            StorageMaintenancePressure {
+                foreground: true,
+                durable_backlog: true,
+            }
+        );
+    }
+
+    #[test]
+    fn maintenance_pressure_does_not_treat_background_storage_rpcs_as_foreground() {
+        let mut state = StorageMaintenancePressureState::default();
+        let now = Instant::now();
+        let mut snapshot = observability::MetricsSnapshot::default();
+        assert_eq!(
+            state.observe(now, snapshot),
+            StorageMaintenancePressure {
+                foreground: false,
+                durable_backlog: false,
+            }
+        );
+
+        snapshot.storage_rpc_admission_wait_total = 1;
+        snapshot.storage_rpc_admission_timeout_total = 1;
+        snapshot.storage_rpc_active_total = 4;
+        snapshot.storage_rpc_active_read = 1;
+        snapshot.storage_rpc_active_start_write = 1;
+        snapshot.storage_rpc_active_list = 2;
+        assert_eq!(
+            state.observe(now + Duration::from_millis(10), snapshot),
+            StorageMaintenancePressure {
+                foreground: false,
+                durable_backlog: false,
+            },
+            "unattributed storage RPC activity includes background workflows and must not make background classes deny one another"
+        );
+
+        snapshot.inflight_requests = 1;
+        assert_eq!(
+            state.observe(now + Duration::from_millis(20), snapshot),
+            StorageMaintenancePressure {
+                foreground: true,
+                durable_backlog: false,
+            },
+            "the admitted request lifetime identifies foreground storage activity"
+        );
+    }
 
     #[test]
     fn maintenance_start_error_keeps_worker_diagnostic_opaque() {

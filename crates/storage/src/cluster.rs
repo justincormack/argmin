@@ -1777,6 +1777,19 @@ struct StorageClusterRouteAdmissionGateInner {
     changed: Condvar,
 }
 
+#[derive(Clone)]
+pub(crate) struct StorageClusterRouteAdmissionDomain {
+    gate: Weak<StorageClusterRouteAdmissionGateInner>,
+}
+
+impl StorageClusterRouteAdmissionDomain {
+    pub(crate) fn matches(&self, handle: &StorageClusterRouteHandle) -> bool {
+        self.gate
+            .upgrade()
+            .is_some_and(|gate| Arc::ptr_eq(&gate, &handle.route_admission.inner))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum StorageClusterRouteTransitionState {
     #[default]
@@ -3913,6 +3926,12 @@ impl StorageClusterRouteHandle {
     /// prevents every worker from switching to a replacement runtime map.
     pub fn shares_route_admission_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.route_admission.inner, &other.route_admission.inner)
+    }
+
+    pub(crate) fn route_admission_domain(&self) -> StorageClusterRouteAdmissionDomain {
+        StorageClusterRouteAdmissionDomain {
+            gate: Arc::downgrade(&self.route_admission.inner),
+        }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -9923,7 +9942,7 @@ impl StorageCluster {
         Ok(node.retained_shard_ack_client())
     }
 
-    pub fn record_routine_metadata_command_checkpoints(
+    pub(crate) fn record_routine_metadata_command_checkpoints(
         &self,
     ) -> Result<MetadataCommandCheckpointRecordSummary, StoreError> {
         self.record_routine_metadata_command_checkpoints_with_limit(
@@ -14755,7 +14774,7 @@ impl StorageCluster {
         Ok(())
     }
 
-    pub fn audit_shard_storage_for_scavenger(
+    pub(crate) fn audit_shard_storage_for_scavenger(
         &self,
     ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
         let referenced_scan = self.collect_shard_scavenger_referenced_shards();
@@ -14985,6 +15004,47 @@ impl StorageCluster {
         }
 
         Ok(observations)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn test_shard_scavenger_clean_check(&self, context: &str) -> Result<(), String> {
+        let observations = self.audit_shard_storage_for_scavenger().map_err(|error| {
+            format!("shard scavenger final audit failed for {context}: {error}")
+        })?;
+        let unresolved: Vec<_> = observations
+            .iter()
+            .filter(|observation| observation.resolved_at.is_none())
+            .collect();
+        if unresolved.is_empty() {
+            return Ok(());
+        }
+
+        let mut message = format!(
+            "shard scavenger final audit found {} unresolved observation(s) for {context}",
+            unresolved.len()
+        );
+        for observation in unresolved.iter().take(16) {
+            message.push_str(&format!(
+                "\n  node={} data_pg={} shard_index={} shard_key={} reason={:?} file_exists={} shard_row_exists={} count={} last_error={}",
+                observation.key.node_id,
+                observation.key.data_pg_id,
+                observation.key.shard_index.get(),
+                observation.key.shard_key.hex(),
+                observation.reason,
+                observation.file_exists,
+                observation.shard_row_exists,
+                observation.observation_count,
+                observation.last_error.as_deref().unwrap_or("<none>"),
+            ));
+        }
+        if unresolved.len() > 16 {
+            message.push_str(&format!(
+                "\n  ... {} more unresolved observation(s) omitted",
+                unresolved.len() - 16
+            ));
+        }
+        Err(message)
     }
 
     fn shard_scavenger_scan_incomplete_observation(

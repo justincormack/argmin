@@ -1,6 +1,47 @@
 use super::*;
 
 #[test]
+fn cluster_shard_scavenger_records_file_without_row_observations() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let local_map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0], EcShape { k: 2, m: 1 }).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(local_map)).unwrap();
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id =
+        crate::SessionId::try_from("77777777777777777777777777777777".to_string()).unwrap();
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &[0xe7; 16],
+            b"background shard scavenger audit candidate",
+        )
+        .unwrap();
+
+    let observations = cluster.audit_shard_storage_for_scavenger().unwrap();
+    assert!(
+        written.written_shards.iter().all(|shard| {
+            observations.iter().any(|observation| {
+                observation.reason == crate::ShardScavengerObservationReason::FileWithoutShardRow
+                    && observation.resolved_at.is_none()
+                    && observation.key.data_pg_id == written.data_pg_id
+                    && observation.key.shard_key == shard.key
+            })
+        }),
+        "shard scavenger audit did not record file-without-row observations; observations={observations:?}"
+    );
+}
+
+#[test]
 fn cluster_shard_scavenger_marks_slow_writer_candidate_and_resolves_after_publish() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

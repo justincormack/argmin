@@ -9,8 +9,9 @@ use super::read_core::ReadRuntime;
 use super::request_types::AuthorizePutObjectRequest;
 use super::response_types::{BucketSummary, ModernBucketSummary};
 use super::runtime::{
-    acquire_stream_session_sweeper, LifecycleSweeper, ReclaimSweeper, ShardBackfillSweeper,
-    ShardRepairSweeper, ShardScavengerSweeper, StreamSessionSweeper,
+    acquire_shard_scavenger_sweeper, acquire_stream_session_sweeper, LifecycleSweeper,
+    ReclaimSweeper, ShardBackfillSweeper, ShardRepairSweeper, ShardScavengerSweeper,
+    StreamSessionSweeper,
 };
 #[cfg(test)]
 use super::trusted_bucket_name;
@@ -465,9 +466,9 @@ impl Coordinator {
             };
         let shard_scavenger_sweeper_factory = |storage_handle: &StorageClusterRouteHandle| {
             if background_worker_mode.shard_scavenger {
-                ShardScavengerSweeper::acquire_shared(storage_handle)
+                acquire_shard_scavenger_sweeper(storage_handle)
             } else {
-                Ok(ShardScavengerSweeper::disabled())
+                Ok(ShardScavengerSweeper::disabled(storage_handle.clone()))
             }
         };
         let shard_repair_sweeper_factory = |storage_handle: &StorageClusterRouteHandle| {
@@ -585,7 +586,7 @@ impl Coordinator {
             (
                 BackgroundWorkerMode::all().object_reclaim_and_bucket_finalize,
                 lifecycle_sweeper_factory,
-                ShardScavengerSweeper::acquire_shared,
+                acquire_shard_scavenger_sweeper,
                 ShardRepairSweeper::acquire_shared,
                 ShardBackfillSweeper::acquire_shared,
                 acquire_stream_session_sweeper,
@@ -773,7 +774,7 @@ impl Coordinator {
         BackgroundWorkerMode {
             object_reclaim_and_bucket_finalize: !self._reclaim_sweeper.stop.load(Ordering::SeqCst),
             lifecycle: !self._lifecycle_sweeper.stop.load(Ordering::SeqCst),
-            shard_scavenger: !self._shard_scavenger_sweeper.stop.load(Ordering::SeqCst),
+            shard_scavenger: self._shard_scavenger_sweeper.test_is_enabled(),
             shard_repair: !self._shard_repair_sweeper.stop.load(Ordering::SeqCst),
             shard_backfill: !self._shard_backfill_sweeper.stop.load(Ordering::SeqCst),
             stream_session: self._stream_session_sweeper.test_is_enabled(),

@@ -22,8 +22,8 @@ use storage::{
     install_bucket_scoped_test_hooks, BucketScopedTestHooks, ClusterEpoch, LocalClusterMap,
     LocalNodeStoreConfig, LocalPgRoute, LocalUnixStorageNodeClientConfig,
     MetadataCommandApplyTestKind, NodeId, PgId, PgState, PlacedSegmentShardBackfillWorkItem,
-    RouteMapValidity, SegmentStoredBytesRequest, ShardScavengerObservationReason, StorageCluster,
-    StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
+    RouteMapValidity, SegmentStoredBytesRequest, StorageCluster, StorageClusterRouteHandle,
+    StorageClusterRuntimeMapHandle,
 };
 
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -111,7 +111,7 @@ fn setup_coordinator_with_only_shard_repair_worker(
         (
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
-            |_| Ok(ShardScavengerSweeper::disabled()),
+            |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             ShardRepairSweeper::acquire_shared,
             |_| Ok(ShardBackfillSweeper::disabled()),
             |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
@@ -134,7 +134,7 @@ fn setup_coordinator_with_only_shard_backfill_worker(
         (
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
-            |_| Ok(ShardScavengerSweeper::disabled()),
+            |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
             ShardBackfillSweeper::acquire_shared,
             |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
@@ -157,7 +157,7 @@ fn setup_coordinator_with_only_reclaim_worker(
         (
             true,
             |_, _| Ok(LifecycleSweeper::disabled()),
-            |_| Ok(ShardScavengerSweeper::disabled()),
+            |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
             |_| Ok(ShardBackfillSweeper::disabled()),
             |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
@@ -6708,6 +6708,102 @@ fn stream_session_sweeper_remains_shared_across_storage_identity_replacement() {
         Arc::ptr_eq(&first, &reacquired),
         "one route-publication domain must retain one cleanup worker across storage identities"
     );
+}
+
+#[test]
+fn shard_scavenger_sweeper_remains_shared_across_storage_identity_replacement() {
+    let tmp = test_util::tempdir();
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
+    initial.test_store_route_map_validity(long_lived_test_route_map_validity());
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
+    let first = storage::StorageShardScavengerSweeper::acquire_shared(&handle).unwrap();
+    let first_admission = storage::StorageMaintenanceAdmission::acquire_shared(&handle);
+
+    let replacement = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+    assert_ne!(
+        initial.process_local_registry_key(),
+        replacement.process_local_registry_key(),
+        "the replacement must exercise a distinct process-local storage identity"
+    );
+    runtime_handle.install(Arc::clone(&replacement)).unwrap();
+    assert!(Arc::ptr_eq(&handle.current(), &replacement));
+
+    let reacquired = storage::StorageShardScavengerSweeper::acquire_shared(&handle).unwrap();
+    let reacquired_admission = storage::StorageMaintenanceAdmission::acquire_shared(&handle);
+    assert!(
+        Arc::ptr_eq(&first, &reacquired),
+        "one route-publication domain must retain one shard-scavenger worker across storage identities"
+    );
+    assert!(
+        Arc::ptr_eq(&first_admission, &reacquired_admission),
+        "all maintenance workers in one route-publication domain must retain one admission domain"
+    );
+}
+
+#[test]
+fn maintenance_registries_separate_independent_route_domains_over_same_cluster() {
+    let tmp = test_util::tempdir();
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
+    initial.test_store_route_map_validity(long_lived_test_route_map_validity());
+    let first_runtime = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial)).unwrap();
+    let first_handle = first_runtime.route_handle();
+    let second_runtime = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial)).unwrap();
+    let second_handle = second_runtime.route_handle();
+    assert!(Arc::ptr_eq(
+        &first_handle.current(),
+        &second_handle.current()
+    ));
+    assert!(
+        !first_handle.shares_route_admission_with(&second_handle),
+        "independently constructed runtime handles must have distinct publication domains"
+    );
+
+    let first_admission = storage::StorageMaintenanceAdmission::acquire_shared(&first_handle);
+    let second_admission = storage::StorageMaintenanceAdmission::acquire_shared(&second_handle);
+    let first_shard = storage::StorageShardScavengerSweeper::acquire_shared(&first_handle).unwrap();
+    let second_shard =
+        storage::StorageShardScavengerSweeper::acquire_shared(&second_handle).unwrap();
+    let first_stream = storage::StorageStreamSessionSweeper::acquire_shared(&first_handle).unwrap();
+    let second_stream =
+        storage::StorageStreamSessionSweeper::acquire_shared(&second_handle).unwrap();
+
+    assert!(!Arc::ptr_eq(&first_admission, &second_admission));
+    assert!(!Arc::ptr_eq(&first_shard, &second_shard));
+    assert!(!Arc::ptr_eq(&first_stream, &second_stream));
+
+    let replacement = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+    second_runtime.install(Arc::clone(&replacement)).unwrap();
+    assert!(Arc::ptr_eq(&first_handle.current(), &initial));
+    assert!(Arc::ptr_eq(&second_handle.current(), &replacement));
+    assert!(first_shard.test_routes_to(&initial));
+    assert!(second_shard.test_routes_to(&replacement));
+    assert!(first_stream.test_routes_to(&initial));
+    assert!(second_stream.test_routes_to(&replacement));
+
+    assert!(Arc::ptr_eq(
+        &first_admission,
+        &storage::StorageMaintenanceAdmission::acquire_shared(&first_handle)
+    ));
+    assert!(Arc::ptr_eq(
+        &second_admission,
+        &storage::StorageMaintenanceAdmission::acquire_shared(&second_handle)
+    ));
+    assert!(Arc::ptr_eq(
+        &first_shard,
+        &storage::StorageShardScavengerSweeper::acquire_shared(&first_handle).unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &second_shard,
+        &storage::StorageShardScavengerSweeper::acquire_shared(&second_handle).unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &first_stream,
+        &storage::StorageStreamSessionSweeper::acquire_shared(&first_handle).unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &second_stream,
+        &storage::StorageStreamSessionSweeper::acquire_shared(&second_handle).unwrap()
+    ));
 }
 
 #[test]
@@ -19473,54 +19569,6 @@ fn delete_object_eventually_reclaims_simple_shards() {
 }
 
 #[test]
-fn shard_scavenger_audit_records_file_without_row_observations() {
-    let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
-
-    coord
-        .create_bucket_for_owner("default-owner", "bucket", false)
-        .unwrap();
-    let bucket = trusted_bucket_name("bucket");
-    let key = trusted_object_key("key");
-    let reservation_id = storage::SessionId::try_from("77".repeat(16)).unwrap();
-    let generation_id = coord
-        .storage_node()
-        .reserve_put_object_generation(&bucket, &key, &reservation_id)
-        .unwrap();
-    let written = coord
-        .storage_node()
-        .write_direct_put_segment_payload_shards(
-            &bucket,
-            &key,
-            generation_id,
-            0,
-            &[0xe7; 16],
-            b"background shard scavenger audit candidate",
-        )
-        .unwrap();
-
-    coord
-        .storage_node()
-        .audit_shard_storage_for_scavenger()
-        .unwrap();
-    let observations = coord
-        .storage_node()
-        .test_list_shard_scavenger_observations(written.data_pg_id)
-        .unwrap();
-    assert!(
-        written.written_shards.iter().all(|shard| {
-            observations.iter().any(|observation| {
-                observation.reason == ShardScavengerObservationReason::FileWithoutShardRow
-                    && observation.resolved_at.is_none()
-                    && observation.key.data_pg_id == written.data_pg_id
-                    && observation.key.shard_key == shard.key
-            })
-        }),
-        "shard scavenger audit did not record file-without-row observations; observations={observations:?}"
-    );
-}
-
-#[test]
 fn read_discovered_corrupt_shard_queues_background_repair_without_inline_rewrite() {
     if !backend_supports_parity_recovery() {
         return;
@@ -19902,7 +19950,7 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
         (
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
-            |_| Ok(ShardScavengerSweeper::disabled()),
+            |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
             |_| Ok(ShardBackfillSweeper::disabled()),
             |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
@@ -20038,7 +20086,7 @@ fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
         (
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
-            |_| Ok(ShardScavengerSweeper::disabled()),
+            |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
             |_| Ok(ShardBackfillSweeper::disabled()),
             |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
@@ -20159,7 +20207,7 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
         (
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
-            |_| Ok(ShardScavengerSweeper::disabled()),
+            |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             ShardRepairSweeper::acquire_shared,
             |_| Ok(ShardBackfillSweeper::disabled()),
             |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
