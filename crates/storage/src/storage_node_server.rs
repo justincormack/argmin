@@ -5449,12 +5449,13 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::load_multipart_completion_snapshot(
+        ObjectMutationMetadataNodeClient::open_authorized_multipart_upload_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             authorized_upload,
-            requested_part_numbers,
         )
+        .and_then(|route| route.load_multipart_completion_snapshot(requested_part_numbers))
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5470,11 +5471,13 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::load_multipart_completion_preflight(
+        ObjectMutationMetadataNodeClient::open_authorized_multipart_upload_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             authorized_upload,
         )
+        .and_then(|route| route.load_multipart_completion_preflight())
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5492,13 +5495,13 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::list_multipart_parts_for_authorized_upload(
+        ObjectMutationMetadataNodeClient::open_authorized_multipart_upload_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             authorized_upload,
-            part_number_marker,
-            max_parts,
         )
+        .and_then(|route| route.list_multipart_parts(part_number_marker, max_parts))
         .map_err(StorageNodeObjectRouteError::Object)
     }
 

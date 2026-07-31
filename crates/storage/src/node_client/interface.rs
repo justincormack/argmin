@@ -548,6 +548,13 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         key: &ObjectKey,
     ) -> Result<Box<dyn MultipartUploadLookupMetadataRoute + '_>, ObjectPgActionError>;
 
+    fn open_authorized_multipart_upload_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+    ) -> Result<Box<dyn AuthorizedMultipartUploadMetadataRoute + '_>, ObjectPgActionError>;
+
     fn matching_stream_upload_exists(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -562,27 +569,6 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, ObjectPgActionError>;
-
-    fn load_multipart_completion_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
-        requested_part_numbers: &[u32],
-    ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError>;
-
-    fn load_multipart_completion_preflight(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
-    ) -> Result<MultipartCompletionPreflight, ObjectPgActionError>;
-
-    fn list_multipart_parts_for_authorized_upload(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
-        part_number_marker: Option<u32>,
-        max_parts: u32,
-    ) -> Result<ListedMultipartParts, ObjectPgActionError>;
 
     fn build_create_stream_upload_command(
         &self,
@@ -825,6 +811,23 @@ pub(crate) trait MultipartUploadLookupMetadataRoute: Send {
         &self,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError>;
+}
+
+pub(crate) trait AuthorizedMultipartUploadMetadataRoute: Send {
+    fn load_multipart_completion_snapshot(
+        &self,
+        requested_part_numbers: &[u32],
+    ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError>;
+
+    fn load_multipart_completion_preflight(
+        &self,
+    ) -> Result<MultipartCompletionPreflight, ObjectPgActionError>;
+
+    fn list_multipart_parts(
+        &self,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+    ) -> Result<ListedMultipartParts, ObjectPgActionError>;
 }
 
 /// Cleanup authority for exact object-metadata subjects which may need to

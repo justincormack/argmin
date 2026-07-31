@@ -138,6 +138,13 @@ struct LocalMultipartUploadLookupMetadataRoute<'a> {
     key: ObjectKey,
 }
 
+struct LocalAuthorizedMultipartUploadMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    _route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    authorized_upload: AuthorizedMultipartUploadRecord,
+}
+
 struct LocalObjectListingMetadataRoute {
     storage_node: Arc<SharedStorageNode>,
     _route_cluster_epoch: ClusterEpoch,
@@ -2772,6 +2779,39 @@ impl MultipartUploadLookupMetadataRoute for LocalMultipartUploadLookupMetadataRo
     }
 }
 
+impl AuthorizedMultipartUploadMetadataRoute for LocalAuthorizedMultipartUploadMetadataRoute<'_> {
+    fn load_multipart_completion_snapshot(
+        &self,
+        requested_part_numbers: &[u32],
+    ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
+        self.client.load_multipart_completion_snapshot(
+            self.pg_id,
+            &self.authorized_upload,
+            requested_part_numbers,
+        )
+    }
+
+    fn load_multipart_completion_preflight(
+        &self,
+    ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
+        self.client
+            .load_multipart_completion_preflight(self.pg_id, &self.authorized_upload)
+    }
+
+    fn list_multipart_parts(
+        &self,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+    ) -> Result<ListedMultipartParts, ObjectPgActionError> {
+        self.client.list_multipart_parts_for_authorized_upload(
+            self.pg_id,
+            &self.authorized_upload,
+            part_number_marker,
+            max_parts,
+        )
+    }
+}
+
 impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
     fn open_put_object_metadata_route(
         &self,
@@ -2865,6 +2905,32 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         }))
     }
 
+    fn open_authorized_multipart_upload_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+    ) -> Result<Box<dyn AuthorizedMultipartUploadMetadataRoute + '_>, ObjectPgActionError> {
+        let upload = authorized_upload.record();
+        if self
+            .storage_node
+            .object_metadata_pg_for(&upload.bucket, &upload.key)
+            != pg_id
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open authorized multipart upload metadata route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalAuthorizedMultipartUploadMetadataRoute {
+            client: self,
+            _route_cluster_epoch: route_cluster_epoch,
+            pg_id,
+            authorized_upload: authorized_upload.clone(),
+        }))
+    }
+
     fn matching_stream_upload_exists(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -2882,44 +2948,6 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, ObjectPgActionError> {
         Self::load_stream_upload_session(self, pg_id, bucket, key, session_id)
-    }
-
-    fn load_multipart_completion_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
-        requested_part_numbers: &[u32],
-    ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
-        Self::load_multipart_completion_snapshot(
-            self,
-            pg_id,
-            authorized_upload,
-            requested_part_numbers,
-        )
-    }
-
-    fn load_multipart_completion_preflight(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
-    ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
-        Self::load_multipart_completion_preflight(self, pg_id, authorized_upload)
-    }
-
-    fn list_multipart_parts_for_authorized_upload(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
-        part_number_marker: Option<u32>,
-        max_parts: u32,
-    ) -> Result<ListedMultipartParts, ObjectPgActionError> {
-        Self::list_multipart_parts_for_authorized_upload(
-            self,
-            pg_id,
-            authorized_upload,
-            part_number_marker,
-            max_parts,
-        )
     }
 
     fn build_create_stream_upload_command(

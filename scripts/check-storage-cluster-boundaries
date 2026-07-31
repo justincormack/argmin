@@ -862,6 +862,7 @@ migrated_simple_object_read_bypasses=$(
         pending_retained_object_mutation_receiver = 0
         pending_multipart_creation_route = 0
         pending_multipart_lookup_route = 0
+        pending_authorized_multipart_route = 0
         in_test_hook = 0
         in_test_module = 0
     }
@@ -939,6 +940,10 @@ migrated_simple_object_read_bypasses=$(
             || $0 ~ /multipart_lookup_route[[:space:]]*$/) {
             pending_multipart_lookup_route = 1
         }
+        if ($0 ~ /\.open_authorized_multipart_upload_metadata_route\(/ \
+            || $0 ~ /authorized_multipart_route[[:space:]]*$/) {
+            pending_authorized_multipart_route = 1
+        }
         if ($0 ~ /\.(load_object_read_auth_subject|load_object_read_snapshot_for_subject|get_object_tags_for_subject)\(/) {
             if (pending_object_read_metadata_client \
                 || $0 ~ /\.object_read_metadata_client\(\)/ \
@@ -951,6 +956,10 @@ migrated_simple_object_read_bypasses=$(
             next
         }
         if ($0 ~ /\.(matching_stream_upload_exists|load_stream_upload_session|load_stream_upload_segments|list_all_stream_uploads|list_all_stream_uploads_page|list_stream_uploads_for_bucket_page|list_completed_multipart_upload_records_for_bucket_page|prepare_stream_segment_append|get_payload_reclaim_root|get_object_payload_reclaim|acquire_object_payload_reclaim_claim|release_object_payload_reclaim_claim|build_create_stream_upload_command|load_stream_put_finalize_snapshot|build_stream_put_commit_command|load_stream_part_finalize_snapshot|build_stream_part_commit_command|load_multipart_upload|load_in_progress_multipart_upload|load_in_progress_multipart_upload_for_listing|load_multipart_completion_snapshot|load_multipart_completion_preflight|list_multipart_parts_for_authorized_upload|lookup_multipart_upload_management|load_multipart_completion_stale_payload_source|build_complete_multipart_object_command|load_abort_multipart_upload_cleanup|build_abort_multipart_upload_command|build_authorized_abort_multipart_upload_command)\(/) {
+            if (pending_authorized_multipart_route) {
+                pending_authorized_multipart_route = 0
+                next
+            }
             if (pending_multipart_lookup_route \
                 || $0 ~ /multipart_lookup_route\./) {
                 pending_multipart_lookup_route = 0
@@ -971,6 +980,10 @@ migrated_simple_object_read_bypasses=$(
             next
         }
         if ($0 ~ /\.(load_object_if|load_existing_live_object|load_current_object_delete_snapshot|load_specific_object_delete_snapshot|list_object_versions_for_lifecycle|build_delete_specific_object_version_command|build_delete_current_object_command|build_insert_delete_marker_command|load_object_read_auth_subject|load_object_read_snapshot_for_subject|load_object_read_snapshot_if|load_object_tag_read_auth_subject|get_object_tags_for_subject|load_object_legal_hold_read_subject|load_object_retention_read_subject|payload_reclaim_exists|get_bucket_payload_reclaim_root|get_payload_reclaim_root|get_object_payload_reclaim|acquire_object_payload_reclaim_claim|release_object_payload_reclaim_claim|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if|load_stream_upload_session|load_stream_upload_segments|list_all_stream_uploads|list_stream_uploads_for_bucket_page|list_completed_multipart_upload_records_for_bucket_page|prepare_stream_segment_append|load_stream_put_finalize_snapshot|build_stream_put_commit_command|load_stream_part_finalize_snapshot|build_stream_part_commit_command|load_multipart_upload|load_in_progress_multipart_upload|load_in_progress_multipart_upload_for_listing|load_multipart_completion_snapshot|load_multipart_completion_preflight|list_multipart_parts_for_authorized_upload|lookup_multipart_upload_management|load_multipart_completion_stale_payload_source|build_complete_multipart_object_command|load_abort_multipart_upload_cleanup|build_abort_multipart_upload_command|build_authorized_abort_multipart_upload_command)\(/) {
+            if (pending_authorized_multipart_route) {
+                pending_authorized_multipart_route = 0
+                next
+            }
             if (pending_multipart_lookup_route \
                 || $0 ~ /multipart_lookup_route\./) {
                 pending_multipart_lookup_route = 0
@@ -1013,6 +1026,10 @@ migrated_simple_object_read_bypasses=$(
             next
         }
         if ($0 ~ /\.(load_multipart_upload|load_in_progress_multipart_upload|load_in_progress_multipart_upload_for_listing|load_multipart_completion_snapshot|load_multipart_completion_preflight|list_multipart_parts_for_authorized_upload|lookup_multipart_upload_management)\(/) {
+            if (pending_authorized_multipart_route) {
+                pending_authorized_multipart_route = 0
+                next
+            }
             if (pending_multipart_lookup_route \
                 || $0 ~ /multipart_lookup_route\./) {
                 pending_multipart_lookup_route = 0
@@ -1152,6 +1169,7 @@ migrated_simple_object_read_bypasses=$(
             pending_retained_object_mutation_receiver = 0
             pending_multipart_creation_route = 0
             pending_multipart_lookup_route = 0
+            pending_authorized_multipart_route = 0
         }
     }
     ' crates/storage/src/cluster.rs \
@@ -1341,6 +1359,51 @@ multipart_lookup_metadata_bypasses=$(
 fail_with_matches \
     "Production multipart-upload lookup reads must go through the scoped multipart lookup metadata route" \
     "$multipart_lookup_metadata_bypasses"
+
+authorized_multipart_metadata_bypasses=$(
+    awk '
+    FNR == 1 {
+        pending_test_cfg = 0
+        pending_authorized_multipart_route = 0
+        in_test_module = 0
+    }
+    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*mod tests[[:space:]]*\{/ && pending_test_cfg {
+        in_test_module = 1
+        pending_test_cfg = 0
+        next
+    }
+    in_test_module {
+        next
+    }
+    {
+        if ($0 ~ /\.open_authorized_multipart_upload_metadata_route\(/ \
+            || $0 ~ /authorized_multipart_route[[:space:]]*$/) {
+            pending_authorized_multipart_route = 1
+        }
+        if ($0 ~ /\.(load_multipart_completion_snapshot|load_multipart_completion_preflight|list_multipart_parts|list_multipart_parts_for_authorized_upload)\(/) {
+            if (pending_authorized_multipart_route \
+                || $0 ~ /\.open_authorized_multipart_upload_metadata_route\(/ \
+                || $0 ~ /authorized_multipart_route\./) {
+                pending_authorized_multipart_route = 0
+                next
+            }
+            print FILENAME ":" FNR ":" $0
+        }
+        if ($0 ~ /;/) {
+            pending_authorized_multipart_route = 0
+        }
+    }
+    ' crates/storage/src/cluster.rs \
+      crates/storage/src/cluster/request_ops.rs \
+      crates/storage/src/cluster/local.rs
+)
+fail_with_matches \
+    "Production authorized multipart snapshot, preflight, and parts reads must go through the scoped authorized multipart metadata route" \
+    "$authorized_multipart_metadata_bypasses"
 
 direct_put_snapshot_bypasses=$(
     awk '

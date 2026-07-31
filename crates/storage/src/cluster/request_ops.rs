@@ -13781,7 +13781,12 @@ impl super::StorageCluster {
         }
         require_valid_route().map_err(ObjectPgActionError::Store)?;
         self.object_mutation_metadata_primary_client(bucket, key)?
-            .load_multipart_completion_snapshot(pg_id, authorized_upload, requested_part_numbers)
+            .open_authorized_multipart_upload_metadata_route(
+                self.operation_epoch(),
+                pg_id,
+                authorized_upload,
+            )?
+            .load_multipart_completion_snapshot(requested_part_numbers)
     }
 
     pub fn load_multipart_completion_preflight(
@@ -13792,7 +13797,12 @@ impl super::StorageCluster {
         let key = &authorized_upload.record().key;
         let pg_id = self.object_metadata_pg(bucket, key);
         self.object_mutation_metadata_primary_client(bucket, key)?
-            .load_multipart_completion_preflight(pg_id, authorized_upload)
+            .open_authorized_multipart_upload_metadata_route(
+                self.operation_epoch(),
+                pg_id,
+                authorized_upload,
+            )?
+            .load_multipart_completion_preflight()
     }
 
     fn complete_multipart_outcome_from_command(
@@ -15051,12 +15061,12 @@ impl super::StorageCluster {
         }
         require_valid_route().map_err(ObjectPgActionError::Store)?;
         self.object_mutation_metadata_primary_client(bucket, key)?
-            .list_multipart_parts_for_authorized_upload(
+            .open_authorized_multipart_upload_metadata_route(
+                self.operation_epoch(),
                 pg_id,
                 authorized_upload,
-                part_number_marker,
-                max_parts,
-            )
+            )?
+            .list_multipart_parts(part_number_marker, max_parts)
     }
 
     pub fn lookup_multipart_upload_management(

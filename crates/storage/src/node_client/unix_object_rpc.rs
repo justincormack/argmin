@@ -67,6 +67,13 @@ struct UnixMultipartUploadLookupMetadataRoute<'a> {
     key: ObjectKey,
 }
 
+struct UnixAuthorizedMultipartUploadMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    _route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    authorized_upload: AuthorizedMultipartUploadRecord,
+}
+
 struct UnixObjectListingMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
     pg_id: ObjectMetadataScanPgId,
@@ -2952,6 +2959,195 @@ impl MultipartUploadLookupMetadataRoute for UnixMultipartUploadLookupMetadataRou
     }
 }
 
+impl AuthorizedMultipartUploadMetadataRoute for UnixAuthorizedMultipartUploadMetadataRoute<'_> {
+    fn load_multipart_completion_snapshot(
+        &self,
+        requested_part_numbers: &[u32],
+    ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
+        let upload = self.authorized_upload.record();
+        let request = StorageRpcMultipartCompletionSnapshotRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &upload.bucket, &upload.key),
+            authorized_upload: upload.clone(),
+            requested_part_numbers: requested_part_numbers.to_vec(),
+        };
+        let payload = encode_multipart_completion_snapshot_request(&request).map_err(|error| {
+            ObjectPgActionError::Store(self.client.rpc_payload_error(
+                "encode multipart completion snapshot request",
+                error.to_string(),
+            ))
+        })?;
+        let response = self
+            .client
+            .rpc_request(
+                StorageRpcMessageKind::ObjectMultipartCompletionSnapshotLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_multipart_completion_snapshot_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode multipart completion snapshot response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcMultipartCompletionSnapshotOutcome::Loaded(snapshot) => {
+                self.client
+                    .validate_multipart_completion_snapshot_response(
+                        &snapshot,
+                        &self.authorized_upload,
+                        requested_part_numbers,
+                    )?;
+                Ok(*snapshot)
+            }
+            StorageRpcMultipartCompletionSnapshotOutcome::NoSuchUpload {
+                upload_id: returned_upload_id,
+            } => {
+                if returned_upload_id != upload.upload_id {
+                    return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                        "validate multipart completion snapshot response",
+                        "missing upload id does not match request".to_string(),
+                    )));
+                }
+                Err(MetadataError::NoSuchUpload {
+                    upload_id: upload.upload_id.to_string(),
+                }
+                .into())
+            }
+            StorageRpcMultipartCompletionSnapshotOutcome::PartNotFound {
+                upload_id: returned_upload_id,
+                part_number,
+            } => {
+                if returned_upload_id != upload.upload_id {
+                    return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                        "validate multipart completion snapshot response",
+                        "missing part upload id does not match request".to_string(),
+                    )));
+                }
+                if !requested_part_numbers.contains(&part_number) {
+                    return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                        "validate multipart completion snapshot response",
+                        "missing part number does not match request".to_string(),
+                    )));
+                }
+                Err(MetadataError::PartNotFound {
+                    upload_id: upload.upload_id.to_string(),
+                    part_number,
+                }
+                .into())
+            }
+        }
+    }
+
+    fn load_multipart_completion_preflight(
+        &self,
+    ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
+        let upload = self.authorized_upload.record();
+        let request = StorageRpcMultipartCompletionPreflightRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &upload.bucket, &upload.key),
+            authorized_upload: upload.clone(),
+        };
+        let payload = encode_multipart_completion_preflight_request(&request).map_err(|error| {
+            ObjectPgActionError::Store(self.client.rpc_payload_error(
+                "encode multipart completion preflight request",
+                error.to_string(),
+            ))
+        })?;
+        let response = self
+            .client
+            .rpc_request(
+                StorageRpcMessageKind::ObjectMultipartCompletionPreflightLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_multipart_completion_preflight_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode multipart completion preflight response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcMultipartCompletionPreflightOutcome::Loaded(preflight) => Ok(preflight),
+            StorageRpcMultipartCompletionPreflightOutcome::NoSuchUpload {
+                upload_id: returned_upload_id,
+            } => {
+                if returned_upload_id != upload.upload_id {
+                    return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                        "validate multipart completion preflight response",
+                        "missing upload id does not match request".to_string(),
+                    )));
+                }
+                Err(MetadataError::NoSuchUpload {
+                    upload_id: upload.upload_id.to_string(),
+                }
+                .into())
+            }
+        }
+    }
+
+    fn list_multipart_parts(
+        &self,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+    ) -> Result<ListedMultipartParts, ObjectPgActionError> {
+        let upload = self.authorized_upload.record();
+        let request = StorageRpcMultipartPartsListRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &upload.bucket, &upload.key),
+            authorized_upload: upload.clone(),
+            part_number_marker,
+            max_parts,
+        };
+        let payload = encode_multipart_parts_list_request(&request).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.client
+                    .rpc_payload_error("encode multipart parts list request", error.to_string()),
+            )
+        })?;
+        let response = self
+            .client
+            .rpc_request(StorageRpcMessageKind::ObjectMultipartPartsList, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_multipart_parts_list_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.client
+                    .rpc_payload_error("decode multipart parts list response", error.to_string()),
+            )
+        })?;
+        match response.outcome {
+            StorageRpcMultipartPartsListOutcome::Loaded(listed) => {
+                self.client.validate_listed_multipart_parts_response(
+                    &listed,
+                    &self.authorized_upload,
+                    part_number_marker,
+                    max_parts,
+                )?;
+                Ok(*listed)
+            }
+            StorageRpcMultipartPartsListOutcome::NoSuchUpload {
+                upload_id: returned_upload_id,
+            } => {
+                if returned_upload_id != upload.upload_id {
+                    return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                        "validate multipart parts list response",
+                        "missing upload id does not match request".to_string(),
+                    )));
+                }
+                Err(MetadataError::NoSuchUpload {
+                    upload_id: upload.upload_id.to_string(),
+                }
+                .into())
+            }
+        }
+    }
+}
+
 impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
     fn open_put_object_metadata_route(
         &self,
@@ -3022,6 +3218,28 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             pg_id,
             bucket: bucket.clone(),
             key: key.clone(),
+        }))
+    }
+
+    fn open_authorized_multipart_upload_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+    ) -> Result<Box<dyn AuthorizedMultipartUploadMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixAuthorizedMultipartUploadMetadataRoute {
+            client: self,
+            _route_cluster_epoch: route_cluster_epoch,
+            pg_id,
+            authorized_upload: authorized_upload.clone(),
         }))
     }
 
@@ -3098,193 +3316,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 }
                 Err(MetadataError::StreamSessionNotFound {
                     session_id: session_id.as_str().to_string(),
-                }
-                .into())
-            }
-        }
-    }
-
-    fn load_multipart_completion_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
-        requested_part_numbers: &[u32],
-    ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
-        let bucket = &authorized_upload.record().bucket;
-        let key = &authorized_upload.record().key;
-        let upload_id = &authorized_upload.record().upload_id;
-        let request = StorageRpcMultipartCompletionSnapshotRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
-            authorized_upload: authorized_upload.record().clone(),
-            requested_part_numbers: requested_part_numbers.to_vec(),
-        };
-        let payload = encode_multipart_completion_snapshot_request(&request).map_err(|error| {
-            ObjectPgActionError::Store(self.rpc_payload_error(
-                "encode multipart completion snapshot request",
-                error.to_string(),
-            ))
-        })?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectMultipartCompletionSnapshotLoad,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_multipart_completion_snapshot_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode multipart completion snapshot response",
-                    error.to_string(),
-                ))
-            })?;
-        match response.outcome {
-            StorageRpcMultipartCompletionSnapshotOutcome::Loaded(snapshot) => {
-                self.validate_multipart_completion_snapshot_response(
-                    &snapshot,
-                    authorized_upload,
-                    requested_part_numbers,
-                )?;
-                Ok(*snapshot)
-            }
-            StorageRpcMultipartCompletionSnapshotOutcome::NoSuchUpload {
-                upload_id: returned_upload_id,
-            } => {
-                if returned_upload_id != *upload_id {
-                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                        "validate multipart completion snapshot response",
-                        "missing upload id does not match request".to_string(),
-                    )));
-                }
-                Err(MetadataError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                }
-                .into())
-            }
-            StorageRpcMultipartCompletionSnapshotOutcome::PartNotFound {
-                upload_id: returned_upload_id,
-                part_number,
-            } => {
-                if returned_upload_id != *upload_id {
-                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                        "validate multipart completion snapshot response",
-                        "missing part upload id does not match request".to_string(),
-                    )));
-                }
-                if !requested_part_numbers.contains(&part_number) {
-                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                        "validate multipart completion snapshot response",
-                        "missing part number does not match request".to_string(),
-                    )));
-                }
-                Err(MetadataError::PartNotFound {
-                    upload_id: upload_id.to_string(),
-                    part_number,
-                }
-                .into())
-            }
-        }
-    }
-
-    fn load_multipart_completion_preflight(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
-    ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
-        let bucket = &authorized_upload.record().bucket;
-        let key = &authorized_upload.record().key;
-        let upload_id = &authorized_upload.record().upload_id;
-        let request = StorageRpcMultipartCompletionPreflightRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
-            authorized_upload: authorized_upload.record().clone(),
-        };
-        let payload = encode_multipart_completion_preflight_request(&request).map_err(|error| {
-            ObjectPgActionError::Store(self.rpc_payload_error(
-                "encode multipart completion preflight request",
-                error.to_string(),
-            ))
-        })?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectMultipartCompletionPreflightLoad,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_multipart_completion_preflight_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode multipart completion preflight response",
-                    error.to_string(),
-                ))
-            })?;
-        match response.outcome {
-            StorageRpcMultipartCompletionPreflightOutcome::Loaded(preflight) => Ok(preflight),
-            StorageRpcMultipartCompletionPreflightOutcome::NoSuchUpload {
-                upload_id: returned_upload_id,
-            } => {
-                if returned_upload_id != *upload_id {
-                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                        "validate multipart completion preflight response",
-                        "missing upload id does not match request".to_string(),
-                    )));
-                }
-                Err(MetadataError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                }
-                .into())
-            }
-        }
-    }
-
-    fn list_multipart_parts_for_authorized_upload(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
-        part_number_marker: Option<u32>,
-        max_parts: u32,
-    ) -> Result<ListedMultipartParts, ObjectPgActionError> {
-        let bucket = &authorized_upload.record().bucket;
-        let key = &authorized_upload.record().key;
-        let upload_id = &authorized_upload.record().upload_id;
-        let request = StorageRpcMultipartPartsListRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
-            authorized_upload: authorized_upload.record().clone(),
-            part_number_marker,
-            max_parts,
-        };
-        let payload = encode_multipart_parts_list_request(&request).map_err(|error| {
-            ObjectPgActionError::Store(
-                self.rpc_payload_error("encode multipart parts list request", error.to_string()),
-            )
-        })?;
-        let response = self
-            .rpc_request(StorageRpcMessageKind::ObjectMultipartPartsList, payload)
-            .map_err(ObjectPgActionError::Store)?;
-        let response = decode_multipart_parts_list_response(&response).map_err(|error| {
-            ObjectPgActionError::Store(
-                self.rpc_payload_error("decode multipart parts list response", error.to_string()),
-            )
-        })?;
-        match response.outcome {
-            StorageRpcMultipartPartsListOutcome::Loaded(listed) => {
-                self.validate_listed_multipart_parts_response(
-                    &listed,
-                    authorized_upload,
-                    part_number_marker,
-                    max_parts,
-                )?;
-                Ok(*listed)
-            }
-            StorageRpcMultipartPartsListOutcome::NoSuchUpload {
-                upload_id: returned_upload_id,
-            } => {
-                if returned_upload_id != *upload_id {
-                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                        "validate multipart parts list response",
-                        "missing upload id does not match request".to_string(),
-                    )));
-                }
-                Err(MetadataError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
                 }
                 .into())
             }

@@ -2722,55 +2722,42 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
     );
 
     let authorized_upload = AuthorizedMultipartUploadRecord::assume_authorized(upload.clone());
-    let snapshot = ObjectMutationMetadataNodeClient::load_multipart_completion_snapshot(
-        &client,
-        correct_pg,
-        &authorized_upload,
-        &[1],
-    )
-    .unwrap();
+    let correct_authorized_upload_route =
+        ObjectMutationMetadataNodeClient::open_authorized_multipart_upload_metadata_route(
+            &client,
+            ClusterEpoch::INITIAL,
+            correct_pg,
+            &authorized_upload,
+        )
+        .unwrap();
+    let wrong_authorized_upload_route =
+        ObjectMutationMetadataNodeClient::open_authorized_multipart_upload_metadata_route(
+            &client,
+            ClusterEpoch::INITIAL,
+            wrong_pg,
+            &authorized_upload,
+        )
+        .unwrap();
+    let snapshot = correct_authorized_upload_route
+        .load_multipart_completion_snapshot(&[1])
+        .unwrap();
     assert_eq!(snapshot.part_records, vec![part.clone()]);
     assert_object_payload_decode!(
-        ObjectMutationMetadataNodeClient::load_multipart_completion_snapshot(
-            &client,
-            wrong_pg,
-            &authorized_upload,
-            &[1],
-        )
+        wrong_authorized_upload_route.load_multipart_completion_snapshot(&[1])
     );
 
-    ObjectMutationMetadataNodeClient::load_multipart_completion_preflight(
-        &client,
-        correct_pg,
-        &authorized_upload,
-    )
-    .unwrap();
+    correct_authorized_upload_route
+        .load_multipart_completion_preflight()
+        .unwrap();
     assert_object_payload_decode!(
-        ObjectMutationMetadataNodeClient::load_multipart_completion_preflight(
-            &client,
-            wrong_pg,
-            &authorized_upload,
-        )
+        wrong_authorized_upload_route.load_multipart_completion_preflight()
     );
 
-    let listed = ObjectMutationMetadataNodeClient::list_multipart_parts_for_authorized_upload(
-        &client,
-        correct_pg,
-        &authorized_upload,
-        None,
-        10,
-    )
-    .unwrap();
+    let listed = correct_authorized_upload_route
+        .list_multipart_parts(None, 10)
+        .unwrap();
     assert_eq!(listed.response.parts, vec![part.clone()]);
-    assert_object_payload_decode!(
-        ObjectMutationMetadataNodeClient::list_multipart_parts_for_authorized_upload(
-            &client,
-            wrong_pg,
-            &authorized_upload,
-            None,
-            10,
-        )
-    );
+    assert_object_payload_decode!(wrong_authorized_upload_route.list_multipart_parts(None, 10));
 
     assert!(matches!(
         correct_multipart_lookup_route

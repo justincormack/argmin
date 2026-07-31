@@ -4574,6 +4574,38 @@ One-hundred-and-fourteenth Phase 3 slice:
   workspace-wide strict Clippy, and the full 7,845-test workspace suite also
   pass.
 
+One-hundred-and-fifteenth Phase 3 slice:
+
+- multipart completion snapshots, completion preflight reads, and ListParts
+  now share an `AuthorizedMultipartUploadMetadataRoute`. The route captures
+  one active cluster epoch, exact object-metadata primary PG, and the complete
+  authorized upload record; operation methods accept only part selection and
+  pagination parameters, so callers cannot substitute another upload after
+  route construction.
+- embedded construction validates the upload's exact object placement and an
+  open PG before storage access. Unix construction rejects an epoch differing
+  from the installed client before transport, while every request is derived
+  from the route-owned upload rather than caller-supplied object or upload
+  identity.
+- cluster completion and ListParts paths open the scoped route only after
+  validating their admitted object subject and captured deadline. Storage-node
+  dispatch independently validates active admission, route, placement,
+  primary, deadline, and the authorized upload subject before opening its
+  embedded route.
+- embedded coverage rejects a crossed configured object PG before storage and
+  a no-listener Unix regression rejects a foreign epoch before RPC. The
+  installed equivalent-state Unix matrix exercises snapshot, preflight, and
+  ListParts through correct and wrong PG routes where both PGs contain the
+  same upload and part, requiring exact `PayloadDecode` rejection rather than
+  an incidental missing-state failure.
+- the transitional boundary checker now requires production authorized
+  multipart snapshot, preflight, and part-list reads to use the scoped route.
+  Completion and abort command construction, stream-session mutation, and
+  payload-reclaim families remain open in Phase 3.
+- all 2,528 storage tests pass. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full 7,847-test workspace suite also
+  pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
