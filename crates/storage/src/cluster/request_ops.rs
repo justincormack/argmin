@@ -26,6 +26,7 @@ use crate::metadata_command::{
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+    PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
     UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
@@ -3480,8 +3481,8 @@ impl super::StorageCluster {
             require_valid_route()?;
             let reservation = match self.acquire_durable_bucket_write_reservation_with_effect_fence(
                 bucket,
-                "bucket-write-snapshot",
-                None,
+                PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+                Some(route.key.as_str()),
                 Some(effect_fence),
             ) {
                 Ok(reservation) => reservation,

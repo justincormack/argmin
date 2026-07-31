@@ -2649,7 +2649,11 @@ fn begin_bucket_delete_waits_for_durable_reservation_and_post_drains_visible_wri
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let reservation = cluster
-        .acquire_durable_bucket_write_reservation(&bucket, "test-held-write", Some(key.as_str()))
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        )
         .unwrap();
     let bucket_write_proof =
         crate::metadata_command::BucketWriteReservationProof::from(&reservation.record);

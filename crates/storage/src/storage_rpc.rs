@@ -22362,7 +22362,9 @@ mod tests {
             cluster_epoch: ClusterEpoch::INITIAL,
             bucket_execution_generation: 1,
             bucket_incarnation_generation: 1,
-            operation_kind: "direct-put".to_string(),
+            operation_kind:
+                crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND
+                    .to_string(),
             created_at: 123,
             lease_deadline: 130,
             target_context: Some("key".to_string()),

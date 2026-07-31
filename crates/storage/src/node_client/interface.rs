@@ -468,11 +468,18 @@ pub(crate) trait ObjectVersionMetadataRoute: Send {
 }
 
 pub(crate) trait DirectPutMetadataNodeClient: Send + Sync {
-    fn load_direct_put_commit_snapshot(
+    fn open_direct_put_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
+    ) -> Result<Box<dyn DirectPutMetadataRoute + '_>, ObjectPgActionError>;
+}
+
+pub(crate) trait DirectPutMetadataRoute: Send {
+    fn load_direct_put_commit_snapshot(
+        &self,
         reservation_id: &SessionId,
         generation_id: GenerationId,
     ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError>;
@@ -890,8 +897,6 @@ pub(crate) struct UpdateStreamUploadBucketWriteReservationReq<'a> {
 }
 
 pub(crate) struct BuildDirectPutCommitCommandReq<'a> {
-    pub(crate) pg_id: ObjectMetadataPgId,
-    pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) request: &'a CommitDirectPutObjectReq,
     pub(crate) version_id: VersionId,
     pub(crate) expected_snapshot: &'a DirectPutCommitStorageSnapshot,

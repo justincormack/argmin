@@ -2087,7 +2087,7 @@ fn stale_duplicate_direct_put_commit_index_is_reissued_before_apply() {
     let reservation = cluster
         .acquire_durable_bucket_write_reservation(
             &bucket,
-            "stale-duplicate-direct-put-test",
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
             Some(key.as_str()),
         )
         .unwrap();
@@ -7115,7 +7115,7 @@ fn abandoned_matching_direct_put_commit_cleans_pending_and_current_payload() {
     let reservation = cluster
         .acquire_durable_bucket_write_reservation(
             &bucket,
-            "abandoned-matching-direct-put-test",
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
             Some(key.as_str()),
         )
         .unwrap();

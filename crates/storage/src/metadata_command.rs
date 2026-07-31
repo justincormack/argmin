@@ -1279,6 +1279,8 @@ pub(crate) const ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND: &str =
     "abort-multipart-upload";
 pub(crate) const CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND: &str =
     "create-multipart-upload";
+pub(crate) const PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND: &str =
+    "put-object-direct-commit";
 pub(crate) const PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND: &str =
     "put-object-stream-create";
 pub(crate) const UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND: &str =
@@ -1316,6 +1318,19 @@ impl From<&BucketWriteReservationRecord> for BucketWriteReservationProof {
 }
 
 impl BucketWriteReservationProof {
+    pub(crate) fn matches_exact_mutation_subject(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        bucket: &BucketName,
+        operation_kind: &str,
+        target_context: Option<&str>,
+    ) -> bool {
+        self.bucket == *bucket
+            && self.cluster_epoch == cluster_epoch
+            && self.operation_kind == operation_kind
+            && self.target_context.as_deref() == target_context
+    }
+
     pub(crate) fn has_same_stable_identity(&self, other: &Self) -> bool {
         // lease_deadline is renewable state. Every other field identifies the
         // reservation and its authorized mutation target.

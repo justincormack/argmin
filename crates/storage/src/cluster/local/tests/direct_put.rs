@@ -1,6 +1,127 @@
 use super::*;
 
 #[test]
+fn direct_put_fanout_rejects_live_crossed_reservation_subjects() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let bucket = crate::tests::bucket_name("direct-put-crossed-proof-bucket");
+    let key = crate::tests::object_key("direct-put-crossed-proof-key");
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id = crate::tests::stream_session_id("crossed-proof");
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let operation_reservation = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        )
+        .unwrap();
+    let operation_proof =
+        crate::metadata_command::BucketWriteReservationProof::from(&operation_reservation.record);
+    let target_reservation = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some("direct-put-other-key"),
+        )
+        .unwrap();
+    let target_proof =
+        crate::metadata_command::BucketWriteReservationProof::from(&target_reservation.record);
+
+    let pg_id = PgId::new(0);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let write_sequence = primary
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap()
+        .next_object_write_sequence(bucket.as_str(), key.as_str())
+        .unwrap();
+    let command_with_proof = |proof| {
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(
+                crate::metadata_command::CommitDirectPutObjectCommand {
+                    object: crate::PutLiveObjectReq {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        version_id: crate::VersionId::Null,
+                        owner: crate::OwnerIdentity::from_principal("owner"),
+                        acl_grants: crate::AclGrants::default(),
+                        public_read: false,
+                        generation_id,
+                        size: 0,
+                        etag: crate::ObjectEtag::single_part(checksum::crc64::checksum(&[])),
+                        ec: ec_shape,
+                        layout: crate::ObjectLayout::Standard,
+                        tags: None,
+                        metadata_blob: Some(crate::SerializedMetadataBlob::default()),
+                        system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
+                        object_lock: crate::ObjectLockState::default(),
+                        encryption: crate::ObjectEncryption::None,
+                    },
+                    segments: Vec::new(),
+                    generation_reservation_id: reservation_id.clone(),
+                    write_sequence,
+                    last_modified_millis: 1,
+                    stale_payload: None,
+                    bucket_write_reservation: proof,
+                },
+            )),
+        )
+    };
+
+    for (case, proof) in [
+        ("operation", operation_proof.clone()),
+        ("target", target_proof),
+    ] {
+        let command = command_with_proof(proof);
+        let error = cluster
+            .validate_metadata_command_bucket_write_reservation(&command)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::BucketWriteReservationConflict { .. }
+                )
+            ),
+            "crossed direct PUT proof {case} must fail central fanout validation, got {error:?}"
+        );
+    }
+
+    let command = command_with_proof(operation_proof);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .unwrap();
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+    }
+}
+
+#[test]
 fn direct_put_pending_install_race_reruns_precondition_action() {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
@@ -219,7 +340,7 @@ fn direct_put_pending_install_race_keeps_bucket_write_proof_for_retry() {
     let command_reservation = first_cluster
         .acquire_durable_bucket_write_reservation(
             &bucket,
-            "direct-put-proof-race",
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
             Some(loser_key.as_str()),
         )
         .unwrap();
@@ -926,7 +1047,7 @@ fn direct_put_pre_command_route_error_releases_bucket_write_proof() {
     let command_reservation = cluster
         .acquire_durable_bucket_write_reservation(
             &bucket,
-            "direct-put-route-failure",
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
             Some(key.as_str()),
         )
         .unwrap();
@@ -1027,7 +1148,7 @@ fn non_current_epoch_direct_put_commit_fails_closed_and_cleans_unowned_state() {
     let bucket_write_reservation = current_cluster
         .acquire_durable_bucket_write_reservation(
             &bucket,
-            "stale-epoch-direct-put",
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
             Some(key.as_str()),
         )
         .unwrap();
@@ -1227,7 +1348,7 @@ fn control_plane_peering_direct_put_old_primary_fails_closed_and_cleans_unowned_
     let bucket_write_reservation = source_cluster
         .acquire_durable_bucket_write_reservation(
             &bucket,
-            "control-plane-peering-stale-direct-put",
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
             Some(key.as_str()),
         )
         .unwrap();
@@ -1539,7 +1660,7 @@ fn control_plane_peering_copy_object_destination_old_primary_fails_closed_and_cl
     let bucket_write_reservation = source_cluster
         .acquire_durable_bucket_write_reservation(
             &bucket,
-            "control-plane-peering-stale-copy-object",
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
             Some(dst_key.as_str()),
         )
         .unwrap();

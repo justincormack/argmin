@@ -43,7 +43,8 @@ use crate::metadata_command::{
     MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
     MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimCommand,
     PutObjectMetadataMutation, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
-    ReserveObjectVersionCommand, PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+    ReserveObjectVersionCommand, PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+    PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
@@ -10243,7 +10244,23 @@ impl StorageCluster {
         let Some(proof) = Self::metadata_command_bucket_write_reservation_proof(command) else {
             return Ok(());
         };
-        if proof.cluster_epoch != command.id().cluster_epoch() {
+        let direct_put_subject_matches = match command.payload() {
+            MetadataCommandPayload::CommitDirectPutObject(commit) => [
+                PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+                PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+            ]
+            .into_iter()
+            .any(|operation_kind| {
+                proof.matches_exact_mutation_subject(
+                    command.id().cluster_epoch(),
+                    &commit.object.bucket,
+                    operation_kind,
+                    Some(commit.object.key.as_str()),
+                )
+            }),
+            _ => true,
+        };
+        if proof.cluster_epoch != command.id().cluster_epoch() || !direct_put_subject_matches {
             return Err(MetadataError::BucketWriteReservationConflict {
                 reservation_id: proof.reservation_id.clone(),
             }
@@ -13189,6 +13206,15 @@ impl StorageCluster {
                 return Err(error.into());
             }
         };
+        let direct_put_metadata_route = match direct_put_metadata_client
+            .open_direct_put_metadata_route(self.operation_epoch(), object_pg_id, bucket, key)
+        {
+            Ok(route) => route,
+            Err(error) => {
+                cleanup_direct_put_attempt_before_command_ownership!();
+                return Err(error);
+            }
+        };
 
         let stale_commit_snapshot_deadline = Instant::now() + DIRECT_PUT_STALE_COMMIT_RETRY_BUDGET;
         let (command, new_pending_command) = loop {
@@ -13210,10 +13236,7 @@ impl StorageCluster {
                         }
                     })
                 else {
-                    let snapshot = match direct_put_metadata_client.load_direct_put_commit_snapshot(
-                        object_pg_id,
-                        &req.bucket,
-                        &req.key,
+                    let snapshot = match direct_put_metadata_route.load_direct_put_commit_snapshot(
                         &req.generation_reservation_id,
                         req.generation_id,
                     ) {
@@ -13263,10 +13286,8 @@ impl StorageCluster {
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
-                    let command = match direct_put_metadata_client.build_direct_put_commit_command(
+                    let command = match direct_put_metadata_route.build_direct_put_commit_command(
                         BuildDirectPutCommitCommandReq {
-                            pg_id: object_pg_id,
-                            cluster_epoch: self.operation_epoch(),
                             request: req,
                             version_id,
                             expected_snapshot: &snapshot,

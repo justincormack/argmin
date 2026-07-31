@@ -34,6 +34,7 @@ use crate::metadata_command::{
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+    PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
     UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
@@ -6180,14 +6181,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        DirectPutMetadataNodeClient::load_direct_put_commit_snapshot(
+        DirectPutMetadataNodeClient::open_direct_put_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
-            reservation_id,
-            generation_id,
         )
+        .and_then(|route| route.load_direct_put_commit_snapshot(reservation_id, generation_id))
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -6210,21 +6211,30 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
                 },
             ));
         }
+        self.require_object_mutation_proof(
+            &request.bucket_write_reservation,
+            PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            "direct PUT command build",
+        )?;
         let local_client = LocalStorageNodeClient::new(
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        DirectPutMetadataNodeClient::build_direct_put_commit_command(
+        DirectPutMetadataNodeClient::open_direct_put_metadata_route(
             &local_client,
-            BuildDirectPutCommitCommandReq {
-                pg_id: self.route.pg_id,
-                cluster_epoch: self.route.fence.cluster_epoch,
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+        )
+        .and_then(|route| {
+            route.build_direct_put_commit_command(BuildDirectPutCommitCommandReq {
                 request,
                 version_id,
                 expected_snapshot,
                 bucket_write_reservation: &request.bucket_write_reservation,
-            },
-        )
+            })
+        })
         .map_err(StorageNodeObjectRouteError::Object)
     }
 }
@@ -24531,7 +24541,7 @@ mod tests {
             cluster_epoch: config.cluster_epoch,
             bucket_execution_generation: 1,
             bucket_incarnation_generation: 1,
-            operation_kind: "direct-put".to_string(),
+            operation_kind: PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND.to_string(),
             created_at: 1_000,
             lease_deadline: 4_000,
             target_context: Some(key.as_str().to_string()),
@@ -24808,6 +24818,40 @@ mod tests {
                 assert!(error.message.contains("does not match active object route"));
             }
             other => panic!("mismatched proof must fail at the route capability: {other:?}"),
+        }
+
+        let mut mismatched_operation_proof = proof.clone();
+        mismatched_operation_proof.operation_kind =
+            PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND.to_string();
+        let mut mismatched_target_proof = proof.clone();
+        mismatched_target_proof.target_context = Some("different-proof-key".to_string());
+        let mut mismatched_epoch_proof = proof.clone();
+        mismatched_epoch_proof.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        for (case, mismatched_proof) in [
+            ("operation", mismatched_operation_proof),
+            ("target", mismatched_target_proof),
+            ("epoch", mismatched_epoch_proof),
+        ] {
+            let mut mismatched_proof_request = direct_put_request.clone();
+            mismatched_proof_request.bucket_write_reservation = mismatched_proof;
+            let result = crate::clock::with_time_override(1_000, || {
+                primary_route.build_direct_put_commit_command(
+                    &mismatched_proof_request,
+                    VersionId::Null,
+                    &direct_put_snapshot,
+                )
+            });
+            match result {
+                Err(StorageNodeObjectRouteError::Route(error)) => {
+                    assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                    assert!(error.message.contains(
+                        "bucket write reservation proof does not match the active object route"
+                    ));
+                }
+                other => panic!(
+                    "mismatched direct PUT proof {case} must fail at the route capability: {other:?}"
+                ),
+            }
         }
 
         let mut mismatched_object = request.clone();

@@ -92,6 +92,14 @@ struct LocalObjectVersionMetadataRoute {
     key: ObjectKey,
 }
 
+struct LocalDirectPutMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
 struct LocalObjectListingMetadataRoute {
     storage_node: Arc<SharedStorageNode>,
     _route_cluster_epoch: ClusterEpoch,
@@ -1838,20 +1846,77 @@ impl ObjectVersionMetadataRoute for LocalObjectVersionMetadataRoute {
 }
 
 impl DirectPutMetadataNodeClient for LocalStorageNodeClient {
-    fn load_direct_put_commit_snapshot(
+    fn open_direct_put_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
+    ) -> Result<Box<dyn DirectPutMetadataRoute + '_>, ObjectPgActionError> {
+        if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open direct PUT metadata route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalDirectPutMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
+    }
+}
+
+impl LocalDirectPutMetadataRoute<'_> {
+    fn require_request_subject(
+        &self,
+        request: &BuildDirectPutCommitCommandReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        if request.request.bucket != self.bucket
+            || request.request.key != self.key
+            || !request
+                .request
+                .bucket_write_reservation
+                .matches_exact_mutation_subject(
+                    self.route_cluster_epoch,
+                    &self.bucket,
+                    crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+                    Some(self.key.as_str()),
+                )
+            || !request
+                .bucket_write_reservation
+                .matches_exact_mutation_subject(
+                    self.route_cluster_epoch,
+                    &self.bucket,
+                    crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+                    Some(self.key.as_str()),
+                )
+            || request.request.bucket_write_reservation != *request.bucket_write_reservation
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build direct PUT commit command",
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl DirectPutMetadataRoute for LocalDirectPutMetadataRoute<'_> {
+    fn load_direct_put_commit_snapshot(
+        &self,
         reservation_id: &SessionId,
         generation_id: GenerationId,
     ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         load_direct_put_commit_snapshot_from_pg(
             &pg,
-            self.node_id,
-            bucket,
-            key,
+            self.client.node_id,
+            &self.bucket,
+            &self.key,
             reservation_id,
             generation_id,
         )
@@ -1861,10 +1926,11 @@ impl DirectPutMetadataNodeClient for LocalStorageNodeClient {
         &self,
         request: BuildDirectPutCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        self.require_request_subject(&request)?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         let current = load_direct_put_commit_snapshot_from_pg(
             &pg,
-            self.node_id,
+            self.client.node_id,
             &request.request.bucket,
             &request.request.key,
             &request.request.generation_reservation_id,
@@ -1914,7 +1980,7 @@ impl DirectPutMetadataNodeClient for LocalStorageNodeClient {
             segment_okh: request.request.segment_okh,
             segment_vid: request.request.segment_vid,
             data_pg_id: request.request.data_pg_id,
-            placement_cluster_epoch: request.cluster_epoch,
+            placement_cluster_epoch: self.route_cluster_epoch,
             ec_k: request.request.ec.k,
             ec_m: request.request.ec.m,
         };
@@ -1936,9 +2002,9 @@ impl DirectPutMetadataNodeClient for LocalStorageNodeClient {
             object_lock: request.request.object_lock,
             encryption: request.request.encryption.clone(),
         };
-        let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
+        let command_id = self.client.next_metadata_command_id_from_locked_pg(
+            self.pg_id.pg_id(),
+            self.route_cluster_epoch,
             &pg,
         )?;
         Ok(MetadataCommandEnvelope::new(

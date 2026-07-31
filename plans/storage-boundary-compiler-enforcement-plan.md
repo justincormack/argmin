@@ -652,7 +652,7 @@ Node-client role classification (2026-07-19):
 | `RetainedBucketWriteReservationNodeClient` | bucket metadata | opens a retained cleanup route bound to one bucket metadata PG and exact bucket; the returned interface releases exact reservation proofs, drains, and worker claims without accepting a replacement PG or bucket |
 | `ObjectGenerationMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; reservation lookup and next-generation inspection cannot replace that subject |
 | `ObjectVersionMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; ordinary and completion-priority version inspection retain distinct admission classes within that route |
-| `DirectPutMetadataNodeClient` | object metadata | active object route, with completion-specific admission represented as a narrower operation class |
+| `DirectPutMetadataNodeClient` | object metadata | opens an active primary route bound to one epoch, exact object PG, bucket, and key; commit snapshot and command construction cannot replace route identity |
 | `ObjectListingMetadataNodeClient` | object metadata scan | active object-metadata route for the scanned PG; listing fan-out constructs one capability per routed PG |
 | `ObjectMutationMetadataNodeClient` | object metadata | active object route for object, multipart, stream-session, and payload-reclaim mutation |
 | `RetainedObjectMutationMetadataNodeClient` | object metadata | opens a retained route bound to one epoch, object-metadata PG, bucket, and key; the returned interface prepares stream aborts and releases payload-reclaim claims without accepting replacement route or object arguments |
@@ -4367,6 +4367,53 @@ One-hundred-and-ninth Phase 3 slice:
   operations on a wrong PG.
 - all 2,484 storage tests pass. Formatting, the storage boundary checker,
   workspace-wide strict Clippy, and the full 7,815-test workspace suite also
+  pass.
+
+One-hundred-and-tenth Phase 3 slice:
+
+- direct-PUT metadata access now opens a `DirectPutMetadataRoute` bound to one
+  active cluster epoch, exact object-metadata primary PG, bucket, and key.
+  Commit-snapshot loading accepts only the reservation and generation within
+  that subject, while command construction no longer accepts replaceable PG
+  or epoch fields.
+- the immutable direct-PUT commit description still carries bucket and key
+  because it is also the command payload source. Embedded and Unix routes
+  validate those fields and both carried bucket-write proofs against their
+  captured subject before storage or transport. Unix response validation uses
+  the route-owned epoch, PG, bucket, and key rather than trusting the commit
+  description to define response authority.
+- cluster commit/retry processing opens one route from the selected primary
+  before snapshot retries and reuses it through command construction.
+  Storage-node dispatch retains independent active admission-domain, route,
+  placement, primary, and captured-deadline checks before opening the embedded
+  route. Raw PG and epoch fields are removed from
+  `BuildDirectPutCommitCommandReq`.
+- embedded coverage rejects a configured crossed PG before storage, a
+  no-listener Unix regression rejects a foreign epoch before RPC, the
+  installed equivalent-state matrix retains exact `PayloadDecode` wrong-PG
+  checks, and the Unix build regression rejects a crossed commit description
+  locally without issuing another RPC.
+- the transitional boundary check now recognizes only the scoped direct-PUT
+  route as the permitted receiver for commit-snapshot reads and command
+  builds; its diagnostic no longer directs new code toward the removed raw
+  client methods.
+- reviewer follow-up found that the route initially bound only the proof's
+  bucket and equality, while the production direct path still acquired the
+  generic `bucket-write-snapshot` reservation. Direct buffered PUT now owns
+  the canonical `put-object-direct-commit` operation identity and exact key
+  target. Both embedded and Unix route builders reject crossed operation,
+  target, or epoch proofs before command construction or transport, and the
+  storage-node active-primary route independently enforces the same subject.
+- metadata-command fanout now accepts a `CommitDirectPutObject` reservation
+  only when its bucket, key target, and command epoch match and its operation
+  is either the canonical direct-commit identity or the independently
+  canonical promoted-stream creation identity. A live same-bucket proof for
+  another operation or key therefore cannot authorize publication through a
+  malformed pending/recovery command. Adversarial coverage proves central
+  validation rejects both crossed identities and recovery abandons a malformed
+  pending command without publishing an object.
+- all 2,487 storage tests pass. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full 7,819-test workspace suite also
   pass.
 
 ### Phase 4 — type metadata-command publication

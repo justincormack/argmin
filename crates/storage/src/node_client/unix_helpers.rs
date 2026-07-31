@@ -1733,10 +1733,14 @@ impl UnixStorageNodeClient {
     pub(super) fn validate_direct_put_command_build_response(
         &self,
         command: &MetadataCommandEnvelope,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
         request: &BuildDirectPutCommitCommandReq<'_>,
     ) -> Result<(), ObjectPgActionError> {
-        if command.id().cluster_epoch() != request.cluster_epoch
-            || command.id().pg_id() != request.pg_id.pg_id()
+        if command.id().cluster_epoch() != route_cluster_epoch
+            || command.id().pg_id() != pg_id.pg_id()
         {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 "validate direct PUT commit command build response",
@@ -1750,8 +1754,8 @@ impl UnixStorageNodeClient {
             )));
         };
         if !commit.matches_request(
-            &request.request.bucket,
-            &request.request.key,
+            bucket,
+            key,
             &request.request.generation_reservation_id,
             request.request.generation_id,
         ) || commit.bucket_write_reservation != *request.bucket_write_reservation
@@ -1797,7 +1801,7 @@ impl UnixStorageNodeClient {
             || segment.segment_okh != request.request.segment_okh
             || segment.segment_vid != request.request.segment_vid
             || segment.data_pg_id != request.request.data_pg_id
-            || segment.placement_cluster_epoch != request.cluster_epoch
+            || segment.placement_cluster_epoch != route_cluster_epoch
             || segment.ec_k != request.request.ec.k
             || segment.ec_m != request.request.ec.m
         {

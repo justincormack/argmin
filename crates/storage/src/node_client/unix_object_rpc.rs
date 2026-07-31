@@ -21,6 +21,14 @@ struct UnixObjectVersionMetadataRoute<'a> {
     key: ObjectKey,
 }
 
+struct UnixDirectPutMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
 struct UnixObjectListingMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
     pg_id: ObjectMetadataScanPgId,
@@ -1810,36 +1818,99 @@ impl UnixStorageNodeClient {
 }
 
 impl DirectPutMetadataNodeClient for UnixStorageNodeClient {
-    fn load_direct_put_commit_snapshot(
+    fn open_direct_put_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
+    ) -> Result<Box<dyn DirectPutMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixDirectPutMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
+    }
+}
+
+impl UnixDirectPutMetadataRoute<'_> {
+    fn require_request_subject(
+        &self,
+        request: &BuildDirectPutCommitCommandReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        if request.request.bucket != self.bucket
+            || request.request.key != self.key
+            || !request
+                .request
+                .bucket_write_reservation
+                .matches_exact_mutation_subject(
+                    self.route_cluster_epoch,
+                    &self.bucket,
+                    crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+                    Some(self.key.as_str()),
+                )
+            || !request
+                .bucket_write_reservation
+                .matches_exact_mutation_subject(
+                    self.route_cluster_epoch,
+                    &self.bucket,
+                    crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+                    Some(self.key.as_str()),
+                )
+            || request.request.bucket_write_reservation != *request.bucket_write_reservation
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build direct PUT commit command",
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl DirectPutMetadataRoute for UnixDirectPutMetadataRoute<'_> {
+    fn load_direct_put_commit_snapshot(
+        &self,
         reservation_id: &SessionId,
         generation_id: GenerationId,
     ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError> {
         let request = StorageRpcDirectPutCommitSnapshotRequest {
             object: StorageRpcObjectRequest {
-                node_id: self.node_id,
-                cluster_epoch: self.cluster_epoch,
-                pg_id: pg_id.pg_id(),
-                bucket: bucket.clone(),
-                key: key.clone(),
+                node_id: self.client.node_id,
+                cluster_epoch: self.route_cluster_epoch,
+                pg_id: self.pg_id.pg_id(),
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
             },
             reservation_id: reservation_id.clone(),
             generation_id,
         };
         let payload = encode_direct_put_commit_snapshot_request(&request);
         let response = self
+            .client
             .rpc_request(StorageRpcMessageKind::DirectPutCommitSnapshotLoad, payload)
             .map_err(ObjectPgActionError::Store)?;
         let response = decode_direct_put_commit_snapshot_response(&response).map_err(|error| {
-            ObjectPgActionError::Store(self.rpc_payload_error(
+            ObjectPgActionError::Store(self.client.rpc_payload_error(
                 "decode direct PUT commit snapshot response",
                 error.to_string(),
             ))
         })?;
-        self.validate_direct_put_commit_snapshot_response(&response.snapshot, bucket, key)?;
+        self.client.validate_direct_put_commit_snapshot_response(
+            &response.snapshot,
+            &self.bucket,
+            &self.key,
+        )?;
         Ok(response.snapshot)
     }
 
@@ -1847,13 +1918,14 @@ impl DirectPutMetadataNodeClient for UnixStorageNodeClient {
         &self,
         request: BuildDirectPutCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        self.require_request_subject(&request)?;
         let rpc_request = StorageRpcDirectPutCommandBuildRequest {
             object: StorageRpcObjectRequest {
-                node_id: self.node_id,
-                cluster_epoch: request.cluster_epoch,
-                pg_id: request.pg_id.pg_id(),
-                bucket: request.request.bucket.clone(),
-                key: request.request.key.clone(),
+                node_id: self.client.node_id,
+                cluster_epoch: self.route_cluster_epoch,
+                pg_id: self.pg_id.pg_id(),
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
             },
             request: request.request.clone(),
             version_id: request.version_id,
@@ -1861,23 +1933,31 @@ impl DirectPutMetadataNodeClient for UnixStorageNodeClient {
             bucket_write_reservation: request.bucket_write_reservation.clone(),
         };
         let payload = encode_direct_put_command_build_request(&rpc_request).map_err(|error| {
-            ObjectPgActionError::Store(self.rpc_payload_error(
+            ObjectPgActionError::Store(self.client.rpc_payload_error(
                 "encode direct PUT commit command build request",
                 error.to_string(),
             ))
         })?;
         let response = self
+            .client
             .rpc_request(StorageRpcMessageKind::DirectPutCommitCommandBuild, payload)
             .map_err(ObjectPgActionError::Store)?;
         let response = decode_direct_put_command_build_response(&response).map_err(|error| {
-            ObjectPgActionError::Store(self.rpc_payload_error(
+            ObjectPgActionError::Store(self.client.rpc_payload_error(
                 "decode direct PUT commit command build response",
                 error.to_string(),
             ))
         })?;
         match response.outcome {
             StorageRpcDirectPutCommandBuildOutcome::Command(command) => {
-                self.validate_direct_put_command_build_response(&command, &request)?;
+                self.client.validate_direct_put_command_build_response(
+                    &command,
+                    self.route_cluster_epoch,
+                    self.pg_id,
+                    &self.bucket,
+                    &self.key,
+                    &request,
+                )?;
                 Ok(*command)
             }
             StorageRpcDirectPutCommandBuildOutcome::StaleSnapshot => {
@@ -1889,14 +1969,14 @@ impl DirectPutMetadataNodeClient for UnixStorageNodeClient {
                 cluster_epoch,
                 log_index,
             } => {
-                if cluster_epoch != self.cluster_epoch || conflict_pg_id != request.pg_id.get() {
-                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                if cluster_epoch != self.route_cluster_epoch || conflict_pg_id != self.pg_id.get() {
+                    return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
                         "decode direct PUT commit command build response",
                         "metadata command log conflict route mismatch".to_string(),
                     )));
                 }
                 if MetadataCommandLogIndex::new(log_index).is_none() {
-                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
                         "decode direct PUT commit command build response",
                         "metadata command log conflict index must not be zero".to_string(),
                     )));

@@ -1818,15 +1818,17 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         })
     ));
 
-    let snapshot_error = DirectPutMetadataNodeClient::load_direct_put_commit_snapshot(
+    let wrong_direct_put_route = DirectPutMetadataNodeClient::open_direct_put_metadata_route(
         &client,
+        ClusterEpoch::INITIAL,
         wrong_object_pg,
         &bucket,
         &key,
-        &reservation_id,
-        reserved_generation,
     )
-    .unwrap_err();
+    .unwrap();
+    let snapshot_error = wrong_direct_put_route
+        .load_direct_put_commit_snapshot(&reservation_id, reserved_generation)
+        .unwrap_err();
     assert!(matches!(
         snapshot_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
@@ -1835,15 +1837,17 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         })
     ));
 
-    let snapshot = DirectPutMetadataNodeClient::load_direct_put_commit_snapshot(
+    let correct_direct_put_route = DirectPutMetadataNodeClient::open_direct_put_metadata_route(
         &client,
+        ClusterEpoch::INITIAL,
         correct_object_pg,
         &bucket,
         &key,
-        &reservation_id,
-        reserved_generation,
     )
     .unwrap();
+    let snapshot = correct_direct_put_route
+        .load_direct_put_commit_snapshot(&reservation_id, reserved_generation)
+        .unwrap();
     let bucket_write_reservation = BucketWriteReservationProof {
         bucket: bucket.clone(),
         reservation_id: "wrong-object-pg-proof".to_string(),
@@ -1851,7 +1855,9 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         cluster_epoch: ClusterEpoch::new(1).unwrap(),
         bucket_execution_generation: 1,
         bucket_incarnation_generation: 1,
-        operation_kind: "direct-put".to_string(),
+        operation_kind:
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND
+                .to_string(),
         created_at: 10,
         lease_deadline: 20,
         target_context: Some(key.as_str().to_string()),
@@ -1883,18 +1889,14 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         data_pg_id: 0,
         bucket_write_reservation: bucket_write_reservation.clone(),
     };
-    let command_error = DirectPutMetadataNodeClient::build_direct_put_commit_command(
-        &client,
-        BuildDirectPutCommitCommandReq {
-            pg_id: wrong_object_pg,
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+    let command_error = wrong_direct_put_route
+        .build_direct_put_commit_command(BuildDirectPutCommitCommandReq {
             request: &direct_put_request,
             version_id: VersionId::Null,
             expected_snapshot: &snapshot,
             bucket_write_reservation: &bucket_write_reservation,
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
     assert!(matches!(
         command_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
@@ -4688,15 +4690,17 @@ fn unix_direct_put_metadata_client_loads_commit_snapshot() {
         config.socket_path.clone(),
     );
 
-    let snapshot = DirectPutMetadataNodeClient::load_direct_put_commit_snapshot(
+    let route = DirectPutMetadataNodeClient::open_direct_put_metadata_route(
         &client,
+        ClusterEpoch::INITIAL,
         ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
-        &reservation_id,
-        reserved_generation,
     )
     .unwrap();
+    let snapshot = route
+        .load_direct_put_commit_snapshot(&reservation_id, reserved_generation)
+        .unwrap();
     assert_eq!(snapshot.auth_snapshot.existing_etag, None);
     assert_eq!(snapshot.current, None);
     server_thread.join().unwrap();
@@ -4743,7 +4747,9 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
         cluster_epoch: ClusterEpoch::new(1).unwrap(),
         bucket_execution_generation: 1,
         bucket_incarnation_generation: 1,
-        operation_kind: "direct-put".to_string(),
+        operation_kind:
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND
+                .to_string(),
         created_at: 123,
         lease_deadline: 200,
         target_context: Some(key.as_str().to_string()),
@@ -4775,28 +4781,26 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
         data_pg_id: 0,
         bucket_write_reservation: proof.clone(),
     };
-    let snapshot = DirectPutMetadataNodeClient::load_direct_put_commit_snapshot(
+    let route = DirectPutMetadataNodeClient::open_direct_put_metadata_route(
         &client,
+        ClusterEpoch::INITIAL,
         ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
-        &reservation_id,
-        reserved_generation,
     )
     .unwrap();
+    let snapshot = route
+        .load_direct_put_commit_snapshot(&reservation_id, reserved_generation)
+        .unwrap();
 
-    let command = DirectPutMetadataNodeClient::build_direct_put_commit_command(
-        &client,
-        BuildDirectPutCommitCommandReq {
-            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+    let command = route
+        .build_direct_put_commit_command(BuildDirectPutCommitCommandReq {
             request: &request,
             version_id: VersionId::Null,
             expected_snapshot: &snapshot,
             bucket_write_reservation: &proof,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
 
     assert_eq!(command.id().pg_id(), PgId::new(0));
     let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() else {
@@ -4804,6 +4808,56 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
     };
     assert!(commit.matches_request(&bucket, &key, &reservation_id, reserved_generation));
     assert_eq!(commit.bucket_write_reservation, proof);
+
+    let mut crossed_request = request.clone();
+    crossed_request.key = crate::tests::object_key("direct-put-crossed-route-key");
+    let crossed_error = route
+        .build_direct_put_commit_command(BuildDirectPutCommitCommandReq {
+            request: &crossed_request,
+            version_id: VersionId::Null,
+            expected_snapshot: &snapshot,
+            bucket_write_reservation: &proof,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        crossed_error,
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "build direct PUT commit command",
+        })
+    ));
+
+    let mut crossed_operation_proof = proof.clone();
+    crossed_operation_proof.operation_kind =
+        crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND.to_string();
+    let mut crossed_target_proof = proof.clone();
+    crossed_target_proof.target_context = Some("direct-put-crossed-proof-key".to_string());
+    let mut crossed_epoch_proof = proof.clone();
+    crossed_epoch_proof.cluster_epoch = ClusterEpoch::new(2).unwrap();
+    for (case, crossed_proof) in [
+        ("operation", crossed_operation_proof),
+        ("target", crossed_target_proof),
+        ("epoch", crossed_epoch_proof),
+    ] {
+        let mut crossed_proof_request = request.clone();
+        crossed_proof_request.bucket_write_reservation = crossed_proof.clone();
+        let crossed_error = route
+            .build_direct_put_commit_command(BuildDirectPutCommitCommandReq {
+                request: &crossed_proof_request,
+                version_id: VersionId::Null,
+                expected_snapshot: &snapshot,
+                bucket_write_reservation: &crossed_proof,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                crossed_error,
+                ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "build direct PUT commit command",
+                })
+            ),
+            "crossed direct PUT proof {case} must fail before RPC, got {crossed_error:?}"
+        );
+    }
 
     let mut bad_payload = command.payload().clone();
     let MetadataCommandPayload::CommitDirectPutObject(bad_commit) = &mut bad_payload else {
@@ -4828,9 +4882,11 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
     let err = client
         .validate_direct_put_command_build_response(
             &bad_command,
+            ClusterEpoch::INITIAL,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
             &BuildDirectPutCommitCommandReq {
-                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 request: &request,
                 version_id: VersionId::Null,
                 expected_snapshot: &snapshot,

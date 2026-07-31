@@ -498,7 +498,7 @@ fn write_committed_direct_segment_for_with_versioning(
         bucket_write_reservation: acquire_test_bucket_write_proof(
             cluster,
             bucket,
-            "direct-put-commit-test",
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
             Some(key.as_str()),
         ),
     };
@@ -854,7 +854,7 @@ fn direct_put_commit_req(
     let bucket_write_reservation = acquire_test_bucket_write_proof(
         cluster,
         fixture.bucket,
-        "direct-put-commit-test",
+        crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
         Some(fixture.key.as_str()),
     );
     direct_put_commit_req_with_bucket_write_proof(fixture, bucket_write_reservation)

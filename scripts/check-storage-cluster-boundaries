@@ -1143,7 +1143,7 @@ direct_put_snapshot_bypasses=$(
     awk '
     FNR == 1 {
         pending_test_cfg = 0
-        pending_direct_put_metadata_client = 0
+        pending_direct_put_metadata_route = 0
         in_test_module = 0
     }
     /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {
@@ -1159,21 +1159,21 @@ direct_put_snapshot_bypasses=$(
         next
     }
     {
-        if ($0 ~ /\.direct_put_metadata_client\(\)/ \
-            || $0 ~ /direct_put_metadata_client[[:space:]]*$/) {
-            pending_direct_put_metadata_client = 1
+        if ($0 ~ /\.open_direct_put_metadata_route\(/ \
+            || $0 ~ /direct_put_metadata_route[[:space:]]*$/) {
+            pending_direct_put_metadata_route = 1
         }
         if ($0 ~ /\.(load_direct_put_commit_snapshot|build_direct_put_commit_command)\(/) {
-            if (pending_direct_put_metadata_client \
-                || $0 ~ /\.direct_put_metadata_client\(\)/ \
-                || $0 ~ /direct_put_metadata_client\./) {
-                pending_direct_put_metadata_client = 0
+            if (pending_direct_put_metadata_route \
+                || $0 ~ /\.open_direct_put_metadata_route\(/ \
+                || $0 ~ /direct_put_metadata_route\./) {
+                pending_direct_put_metadata_route = 0
                 next
             }
             print FILENAME ":" FNR ":" $0
         }
         if ($0 ~ /;/) {
-            pending_direct_put_metadata_client = 0
+            pending_direct_put_metadata_route = 0
         }
     }
     ' crates/storage/src/cluster.rs \
@@ -1181,7 +1181,7 @@ direct_put_snapshot_bypasses=$(
       crates/storage/src/cluster/local.rs
 )
 fail_with_matches \
-    "Production direct PUT commit snapshot reads must go through the direct PUT metadata client boundary" \
+    "Production direct PUT commit snapshot reads and command builds must go through the scoped direct PUT metadata route" \
     "$direct_put_snapshot_bypasses"
 
 object_version_allocator_bypasses=$(

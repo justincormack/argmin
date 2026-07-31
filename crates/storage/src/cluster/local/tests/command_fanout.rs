@@ -1610,7 +1610,7 @@ fn direct_put_registers_payload_acks_on_routed_data_pg_primary() {
         bucket_write_reservation: acquire_test_bucket_write_proof(
             &cluster,
             &bucket,
-            "direct-put-commit-test",
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
             Some(key.as_str()),
         ),
     };
