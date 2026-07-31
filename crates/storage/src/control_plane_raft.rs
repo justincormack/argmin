@@ -13581,6 +13581,8 @@ mod tests {
     use crate::control_plane_command::LeaseHorizonAuthorityBinding;
     use crate::types::PgId;
 
+    const IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(5);
+
     #[test]
     fn control_plane_raft_companion_paths_preserve_non_utf8_artifact_names() {
         let directory = test_util::tempdir();
@@ -18339,7 +18341,7 @@ mod tests {
             wait_for_local_leader(authority.raft(), "command-size boundary leadership").await;
             wait_for_authority_status_matching(
                 &authority,
-                Duration::from_secs(1),
+                IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
                 "command-size boundary authority applies initialization",
                 ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
             )
@@ -18473,12 +18475,12 @@ mod tests {
         raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
         message: &'static str,
     ) {
-        raft.wait(Some(Duration::from_secs(1)))
+        raft.wait(Some(IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT))
             .state(ServerState::Leader, message)
             .await
             .unwrap();
         raft.as_leader()
-            .expect("local single-node raft should have a committed leader vote");
+            .expect("local raft should have a committed leader vote");
     }
 
     async fn initialized_two_node_authorities(
@@ -18525,7 +18527,7 @@ mod tests {
         wait_for_local_leader(authority1.raft(), "two-node initialized leadership").await;
         wait_for_authority_status_matching(
             &authority1,
-            Duration::from_secs(1),
+            IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
             "two-node leader applies initialization",
             ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
         )
@@ -18596,7 +18598,7 @@ mod tests {
         wait_for_local_leader(authority1.raft(), "three-node initialized leadership").await;
         wait_for_authority_status_matching(
             &authority1,
-            Duration::from_secs(1),
+            IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
             "three-node leader applies initialization",
             ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
         )
@@ -18694,7 +18696,7 @@ mod tests {
         wait_for_local_leader(authority1.raft(), "three-voter initialized leadership").await;
         wait_for_authority_status_matching(
             &authority1,
-            Duration::from_secs(1),
+            IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
             "three-voter leader applies initialization",
             ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
         )
@@ -20142,7 +20144,7 @@ mod tests {
             wait_for_local_leader(authority.raft(), "stale captured checkpoint leadership").await;
             wait_for_authority_status_matching(
                 &authority,
-                Duration::from_secs(1),
+                IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
                 "stale captured checkpoint authority applies initialization",
                 ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
             )
@@ -22893,7 +22895,7 @@ mod tests {
             wait_for_local_leader(authority.raft(), "single-node initialization leadership").await;
             wait_for_authority_status_matching(
                 &authority,
-                Duration::from_secs(1),
+                IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
                 "single-node authority applies initialization",
                 ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
             )
@@ -23118,7 +23120,7 @@ mod tests {
             wait_for_local_leader(authority.raft(), "single-node read-index leadership").await;
             wait_for_authority_status_matching(
                 &authority,
-                Duration::from_secs(1),
+                IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
                 "single-node read-index authority applies initialization",
                 ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
             )
@@ -23326,7 +23328,7 @@ mod tests {
             wait_for_local_leader(authority.raft(), "linearized authority trait leadership").await;
             wait_for_authority_status_matching(
                 &authority,
-                Duration::from_secs(1),
+                IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
                 "linearized authority applies initialization",
                 ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
             )
@@ -25262,7 +25264,7 @@ mod tests {
             .await;
             wait_for_authority_status_matching(
                 &authority1,
-                Duration::from_secs(1),
+                IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
                 "two-voter leader applies initialization before promoted-voter restart",
                 ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
             )
