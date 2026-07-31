@@ -2414,6 +2414,13 @@ impl PgStore {
                                     .into(),
                             });
                         }
+                        store.validate_object_payload_reclaim_matches_durable_object(
+                            &command.bucket,
+                            &command.key,
+                            &record,
+                            payload,
+                            "delete object version command reclaim subject mismatch",
+                        )?;
                         match payload {
                             ObjectPayloadReclaimCommand::Segments(reclaim) => {
                                 store.put_object_segments_reclaim_in_open_txn(reclaim)?;
@@ -2476,8 +2483,31 @@ impl PgStore {
                     {
                         return Ok(());
                     }
-                    Ok(StoredObject::Live(_)) if command.version_id.is_null() => {}
-                    Ok(StoredObject::DeleteMarker(_)) if command.version_id.is_null() => {}
+                    Ok(StoredObject::Live(record)) if command.version_id.is_null() => {
+                        let Some(stale_payload) = command.stale_payload.as_ref() else {
+                            return Err(MetadataError::InvariantViolation {
+                                context: "insert delete marker command missing stale payload",
+                                reason: "metadata state does not satisfy the operation invariant"
+                                    .into(),
+                            });
+                        };
+                        store.validate_object_payload_reclaim_matches_durable_object(
+                            &command.bucket,
+                            &command.key,
+                            &record,
+                            stale_payload,
+                            "insert delete marker command stale payload subject mismatch",
+                        )?;
+                    }
+                    Ok(StoredObject::DeleteMarker(_)) if command.version_id.is_null() => {
+                        if command.stale_payload.is_some() {
+                            return Err(MetadataError::InvariantViolation {
+                                context: "insert delete marker command unexpected stale payload",
+                                reason: "metadata state does not satisfy the operation invariant"
+                                    .into(),
+                            });
+                        }
+                    }
                     Ok(_) => {
                         return Err(MetadataError::InvariantViolation {
                             context: "insert delete marker command existing object mismatch",
@@ -2485,7 +2515,15 @@ impl PgStore {
                                 .into(),
                         });
                     }
-                    Err(MetadataError::ObjectNotFound) => {}
+                    Err(MetadataError::ObjectNotFound) => {
+                        if command.stale_payload.is_some() {
+                            return Err(MetadataError::InvariantViolation {
+                                context: "insert delete marker command unexpected stale payload",
+                                reason: "metadata state does not satisfy the operation invariant"
+                                    .into(),
+                            });
+                        }
+                    }
                     Err(error) => return Err(error),
                 }
 
@@ -2507,6 +2545,72 @@ impl PgStore {
                 )
             },
         )
+    }
+
+    fn validate_object_payload_reclaim_matches_durable_object(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        record: &LiveObjectRecord,
+        payload: &ObjectPayloadReclaimCommand,
+        context: &'static str,
+    ) -> Result<(), MetadataError> {
+        let created_at = match payload {
+            ObjectPayloadReclaimCommand::Segments(reclaim) => reclaim.created_at,
+            ObjectPayloadReclaimCommand::Multipart(reclaim) => reclaim.created_at,
+        };
+        let expected = match record.layout {
+            ObjectLayout::Standard => {
+                let segments = self.get_object_segments(bucket, key, record.version_id)?;
+                ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    generation_id: record.generation_id,
+                    created_at,
+                    segments: segments
+                        .into_iter()
+                        .map(|segment| ObjectSegmentsReclaimSegmentRecord {
+                            segment_index: segment.segment_index,
+                            segment_okh: segment.segment_okh,
+                            segment_vid: segment.segment_vid,
+                            data_pg_id: segment.data_pg_id,
+                            ec: EcShape {
+                                k: segment.ec_k,
+                                m: segment.ec_m,
+                            },
+                        })
+                        .collect(),
+                })
+            }
+            ObjectLayout::MultipartManifest { .. } => {
+                let parts = self.get_object_parts(bucket, key, record.version_id)?;
+                let mut segments = Vec::new();
+                for part in &parts {
+                    segments.extend(self.get_multipart_part_segments(
+                        bucket,
+                        key,
+                        record.version_id,
+                        part.part_number,
+                    )?);
+                }
+                ObjectPayloadReclaimCommand::Multipart(MultipartReclaimRecord::from_object_parts(
+                    bucket,
+                    key,
+                    record.generation_id,
+                    created_at,
+                    &parts,
+                    &segments,
+                ))
+            }
+        };
+        if expected == *payload {
+            Ok(())
+        } else {
+            Err(MetadataError::InvariantViolation {
+                context,
+                reason: "metadata state does not satisfy the operation invariant".into(),
+            })
+        }
     }
 
     fn apply_put_object_metadata_command(

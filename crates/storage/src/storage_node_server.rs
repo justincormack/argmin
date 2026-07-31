@@ -5961,12 +5961,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::load_current_object_delete_snapshot(
+        ObjectMutationMetadataNodeClient::open_object_delete_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
         )
+        .and_then(|route| route.load_current_object_delete_snapshot())
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5979,13 +5981,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::load_specific_object_delete_snapshot(
+        ObjectMutationMetadataNodeClient::open_object_delete_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
-            version_id,
         )
+        .and_then(|route| route.load_specific_object_delete_snapshot(version_id))
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5997,12 +6000,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::list_object_versions_for_lifecycle(
+        ObjectMutationMetadataNodeClient::open_object_delete_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
         )
+        .and_then(|route| route.list_object_versions_for_lifecycle())
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -6059,20 +6064,24 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::build_delete_specific_object_version_command(
+        ObjectMutationMetadataNodeClient::open_object_delete_metadata_route(
             &local_client,
-            BuildDeleteSpecificObjectVersionCommandReq {
-                pg_id: self.route.pg_id,
-                cluster_epoch: self.route.fence.cluster_epoch,
-                bucket: self.route.bucket,
-                key: self.route.key,
-                version_id,
-                expected_stored,
-                expected_target,
-                expected_version_list,
-                bucket_write_reservation,
-            },
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
         )
+        .and_then(|route| {
+            route.build_delete_specific_object_version_command(
+                BuildDeleteSpecificObjectVersionCommandReq {
+                    version_id,
+                    expected_stored,
+                    expected_target,
+                    expected_version_list,
+                    bucket_write_reservation,
+                },
+            )
+        })
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -6091,18 +6100,20 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::build_delete_current_object_command(
+        ObjectMutationMetadataNodeClient::open_object_delete_metadata_route(
             &local_client,
-            BuildDeleteCurrentObjectCommandReq {
-                pg_id: self.route.pg_id,
-                cluster_epoch: self.route.fence.cluster_epoch,
-                bucket: self.route.bucket,
-                key: self.route.key,
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+        )
+        .and_then(|route| {
+            route.build_delete_current_object_command(BuildDeleteCurrentObjectCommandReq {
                 expected_current,
                 expected_target,
                 bucket_write_reservation,
-            },
-        )
+            })
+        })
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -6156,21 +6167,23 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
+        ObjectMutationMetadataNodeClient::open_object_delete_metadata_route(
             &local_client,
-            BuildInsertDeleteMarkerCommandReq {
-                pg_id: self.route.pg_id,
-                cluster_epoch: self.route.fence.cluster_epoch,
-                bucket: self.route.bucket,
-                key: self.route.key,
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+        )
+        .and_then(|route| {
+            route.build_insert_delete_marker_command(BuildInsertDeleteMarkerCommandReq {
                 expected_current,
                 version_id,
                 owner,
                 stale_payload,
                 expected_stale_payload_source,
                 bucket_write_reservation,
-            },
-        )
+            })
+        })
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -32604,7 +32617,15 @@ mod tests {
                 owner,
                 write_sequence: 3,
                 last_modified_millis: 125,
-                stale_payload: None,
+                stale_payload: Some(ObjectPayloadReclaimCommand::Segments(
+                    crate::ObjectSegmentsReclaimRecord {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        generation_id: GenerationId::MIN,
+                        created_at: 125,
+                        segments: Vec::new(),
+                    },
+                )),
                 bucket_write_reservation: test_bucket_write_reservation_proof(bucket.clone(), &key),
             }),
         );
@@ -32622,6 +32643,7 @@ mod tests {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: VersionId::Null,
+                mode: crate::metadata_command::DeleteObjectVersionMode::Current,
                 target: DeleteObjectVersionTarget::DeleteMarker { write_sequence: 1 },
                 bucket_write_reservation: test_bucket_write_reservation_proof(bucket.clone(), &key),
             })),

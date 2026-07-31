@@ -2514,6 +2514,7 @@ fn unix_storage_node_client_preserves_apply_metadata_command_log_conflict() {
             bucket: object_bucket.clone(),
             key: object_key.clone(),
             version_id: VersionId::Null,
+            mode: crate::metadata_command::DeleteObjectVersionMode::Current,
             target: DeleteObjectVersionTarget::DeleteMarker { write_sequence: 5 },
             bucket_write_reservation: test_bucket_write_reservation_proof(
                 object_bucket.clone(),

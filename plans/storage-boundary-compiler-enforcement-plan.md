@@ -654,7 +654,7 @@ Node-client role classification (2026-07-19):
 | `ObjectVersionMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; ordinary and completion-priority version inspection retain distinct admission classes within that route |
 | `DirectPutMetadataNodeClient` | object metadata | opens an active primary route bound to one epoch, exact object PG, bucket, and key; commit snapshot and command construction cannot replace route identity |
 | `ObjectListingMetadataNodeClient` | object metadata scan | active object-metadata route for the scanned PG; listing fan-out constructs one capability per routed PG |
-| `ObjectMutationMetadataNodeClient` | object metadata | PUT-object metadata snapshots and command builds open an active route bound to one epoch, exact object PG, bucket, and key; the remaining object, multipart, stream-session, and payload-reclaim families still require their corresponding scoped routes |
+| `ObjectMutationMetadataNodeClient` | object metadata | PUT-object metadata and object-delete/lifecycle snapshots and command builds open active routes bound to one epoch, exact object PG, bucket, and key; the remaining multipart, stream-session, and payload-reclaim families still require their corresponding scoped routes |
 | `RetainedObjectMutationMetadataNodeClient` | object metadata | opens a retained route bound to one epoch, object-metadata PG, bucket, and key; the returned interface prepares stream aborts and releases payload-reclaim claims without accepting replacement route or object arguments |
 | `ObjectReadMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; version selection and subject-identity validation remain operations within that fixed route, with payload reads separately retaining their read lease |
 | `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active placed-shard I/O opens an exact route bound to one node, epoch, data PG, shard index, and shard key; shard acknowledgement, current-placement cleanup, and repair/backfill work open an active route bound to one epoch and data PG |
@@ -4445,6 +4445,51 @@ One-hundred-and-eleventh Phase 3 slice:
   builds. Other active object-mutation method families remain open in Phase 3.
 - all 2,499 storage tests pass. Formatting, the storage boundary checker,
   workspace-wide strict Clippy, and the full 7,825-test workspace suite also
+  pass.
+
+One-hundred-and-twelfth Phase 3 slice:
+
+- current/specific delete snapshots, lifecycle version inspection, delete
+  command construction, and delete-marker construction now share an
+  `ObjectDeleteMetadataRoute` bound to one active cluster epoch, exact
+  object-metadata primary PG, bucket, and key. Operation methods can no longer
+  replace those route identities.
+- embedded route construction rejects crossed placement before storage. Unix
+  route construction rejects a foreign epoch before transport, and installed
+  wrong-PG requests continue through server-side placement validation and
+  return `PayloadDecode` rather than failing because equivalent state is
+  absent.
+- each builder validates its canonical reservation operation, exact key
+  target, bucket, and route epoch before storage or transport. Expected
+  objects, lifecycle version lists, delete targets, stale-payload sources, and
+  explicit reclaim descriptions are also constrained to the route subject.
+- lifecycle workers now acquire the same canonical `delete-current-object`,
+  `delete-object-version`, or `insert-delete-marker` reservation identity as
+  the durable command they construct. This closes the former embedded-only
+  gap where lifecycle-specific labels bypassed the Unix/storage-node proof
+  checks.
+- metadata-command fanout and recovery independently validate delete and
+  marker command proof subjects. `DeleteObjectVersionCommand` now preserves
+  whether it was authorized as a current-object or explicit-version deletion,
+  and central validation requires that mode's exact canonical reservation
+  operation. Live current/specific crossed-operation and crossed-target
+  regressions reject proof substitution.
+- command application reconstructs a live delete's expected reclaim record
+  from the durable object segments or multipart part segments and requires
+  full equality, normalizing only the cleanup timestamp. Null delete-marker
+  replacement applies the same exact check and forbids a reclaim when no live
+  payload is replaced. Malformed recovery-envelope regressions cover foreign
+  roots, omitted durable shards, and forged shard identities, proving both
+  delete command shapes fail transactionally without deleting the object or
+  creating an attacker-selected reclaim root.
+- preserving delete authorization mode changes durable command encoding, so
+  metadata-command encoding advances from version 5 to 6 and explicitly
+  rejects version 5 rather than interpreting the old ambiguous layout.
+- the transitional boundary check now requires all production delete
+  snapshots, lifecycle lists, and delete/marker command builds to flow through
+  the scoped route. Remaining object-mutation families stay open in Phase 3.
+- all 2,504 storage tests pass. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full 7,830-test workspace suite also
   pass.
 
 ### Phase 4 — type metadata-command publication

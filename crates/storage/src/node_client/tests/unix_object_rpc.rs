@@ -1116,7 +1116,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..36)
+    let server_threads: Vec<_> = (0..35)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -1322,25 +1322,31 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     let mut stream_proof = metadata_proof.clone();
     stream_proof.operation_kind =
         crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
-    let current_delete_snapshot =
-        ObjectMutationMetadataNodeClient::load_current_object_delete_snapshot(
-            &client,
-            correct_object_pg,
-            &bucket,
-            &key,
-        )
+    let correct_delete_route = ObjectMutationMetadataNodeClient::open_object_delete_metadata_route(
+        &client,
+        ClusterEpoch::INITIAL,
+        correct_object_pg,
+        &bucket,
+        &key,
+    )
+    .unwrap();
+    let wrong_delete_route = ObjectMutationMetadataNodeClient::open_object_delete_metadata_route(
+        &client,
+        ClusterEpoch::INITIAL,
+        wrong_object_pg,
+        &bucket,
+        &key,
+    )
+    .unwrap();
+    let current_delete_snapshot = correct_delete_route
+        .load_current_object_delete_snapshot()
         .unwrap();
     assert_eq!(
         current_delete_snapshot.stored.as_ref(),
         Some(&metadata_stored)
     );
-    let current_delete_error =
-        ObjectMutationMetadataNodeClient::load_current_object_delete_snapshot(
-            &client,
-            wrong_object_pg,
-            &bucket,
-            &key,
-        )
+    let current_delete_error = wrong_delete_route
+        .load_current_object_delete_snapshot()
         .unwrap_err();
     assert!(matches!(
         current_delete_error,
@@ -1350,14 +1356,8 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         })
     ));
 
-    let specific_delete_snapshot =
-        ObjectMutationMetadataNodeClient::load_specific_object_delete_snapshot(
-            &client,
-            correct_object_pg,
-            &bucket,
-            &key,
-            VersionId::Null,
-        )
+    let specific_delete_snapshot = correct_delete_route
+        .load_specific_object_delete_snapshot(VersionId::Null)
         .unwrap();
     assert_eq!(
         specific_delete_snapshot.stored,
@@ -1381,14 +1381,8 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
             }),
         ) if specific_generation == current_generation && specific_layout == current_layout
     ));
-    let specific_delete_error =
-        ObjectMutationMetadataNodeClient::load_specific_object_delete_snapshot(
-            &client,
-            wrong_object_pg,
-            &bucket,
-            &key,
-            VersionId::Null,
-        )
+    let specific_delete_error = wrong_delete_route
+        .load_specific_object_delete_snapshot(VersionId::Null)
         .unwrap_err();
     assert!(matches!(
         specific_delete_error,
@@ -1398,21 +1392,12 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         })
     ));
 
-    let lifecycle_versions = ObjectMutationMetadataNodeClient::list_object_versions_for_lifecycle(
-        &client,
-        correct_object_pg,
-        &bucket,
-        &key,
-    )
-    .unwrap();
+    let lifecycle_versions = correct_delete_route
+        .list_object_versions_for_lifecycle()
+        .unwrap();
     assert_eq!(lifecycle_versions, vec![metadata_stored.clone()]);
-    let lifecycle_list_error =
-        ObjectMutationMetadataNodeClient::list_object_versions_for_lifecycle(
-            &client,
-            wrong_object_pg,
-            &bucket,
-            &key,
-        )
+    let lifecycle_list_error = wrong_delete_route
+        .list_object_versions_for_lifecycle()
         .unwrap_err();
     assert!(matches!(
         lifecycle_list_error,
@@ -1547,19 +1532,12 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         other => panic!("wrong-PG multipart command build must fail placement: {other:?}"),
     }
 
-    let delete_current_command_error =
-        ObjectMutationMetadataNodeClient::build_delete_current_object_command(
-            &client,
-            BuildDeleteCurrentObjectCommandReq {
-                pg_id: wrong_object_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                expected_current: current_delete_snapshot.stored.as_ref(),
-                expected_target: current_delete_snapshot.target.as_ref(),
-                bucket_write_reservation: &delete_current_proof,
-            },
-        )
+    let delete_current_command_error = wrong_delete_route
+        .build_delete_current_object_command(BuildDeleteCurrentObjectCommandReq {
+            expected_current: current_delete_snapshot.stored.as_ref(),
+            expected_target: current_delete_snapshot.target.as_ref(),
+            bucket_write_reservation: &delete_current_proof,
+        })
         .unwrap_err();
     assert!(matches!(
         delete_current_command_error,
@@ -1569,21 +1547,14 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         })
     ));
 
-    let delete_specific_command_error =
-        ObjectMutationMetadataNodeClient::build_delete_specific_object_version_command(
-            &client,
-            BuildDeleteSpecificObjectVersionCommandReq {
-                pg_id: wrong_object_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                version_id: VersionId::Null,
-                expected_stored: specific_delete_snapshot.stored.as_ref(),
-                expected_target: specific_delete_snapshot.target.as_ref(),
-                expected_version_list: None,
-                bucket_write_reservation: &delete_specific_proof,
-            },
-        )
+    let delete_specific_command_error = wrong_delete_route
+        .build_delete_specific_object_version_command(BuildDeleteSpecificObjectVersionCommandReq {
+            version_id: VersionId::Null,
+            expected_stored: specific_delete_snapshot.stored.as_ref(),
+            expected_target: specific_delete_snapshot.target.as_ref(),
+            expected_version_list: None,
+            bucket_write_reservation: &delete_specific_proof,
+        })
         .unwrap_err();
     assert!(matches!(
         delete_specific_command_error,
@@ -1594,22 +1565,15 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     ));
 
     let owner = OwnerIdentity::from_principal("owner");
-    let insert_delete_marker_command_error =
-        ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
-            &client,
-            BuildInsertDeleteMarkerCommandReq {
-                pg_id: wrong_object_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                expected_current: current_delete_snapshot.stored.as_ref(),
-                version_id: VersionId::from_u64(2),
-                owner: &owner,
-                stale_payload: InsertDeleteMarkerStalePayload::Explicit(None),
-                expected_stale_payload_source: None,
-                bucket_write_reservation: &marker_proof,
-            },
-        )
+    let insert_delete_marker_command_error = wrong_delete_route
+        .build_insert_delete_marker_command(BuildInsertDeleteMarkerCommandReq {
+            expected_current: current_delete_snapshot.stored.as_ref(),
+            version_id: VersionId::from_u64(2),
+            owner: &owner,
+            stale_payload: InsertDeleteMarkerStalePayload::Explicit(None),
+            expected_stale_payload_source: None,
+            bucket_write_reservation: &marker_proof,
+        })
         .unwrap_err();
     assert!(matches!(
         insert_delete_marker_command_error,
@@ -1619,55 +1583,40 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         })
     ));
 
-    let mismatched_stale_payload_error =
-        ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
-            &client,
-            BuildInsertDeleteMarkerCommandReq {
-                pg_id: correct_object_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                expected_current: current_delete_snapshot.stored.as_ref(),
-                version_id: VersionId::from_u64(2),
-                owner: &owner,
-                stale_payload: InsertDeleteMarkerStalePayload::Explicit(Some(
-                    ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
-                        bucket: crate::tests::bucket_name("wrong-stale-payload-bucket"),
-                        key: key.clone(),
-                        generation_id: GenerationId::new(9).unwrap(),
-                        created_at: 1_000,
-                        segments: Vec::new(),
-                    }),
-                )),
-                expected_stale_payload_source: None,
-                bucket_write_reservation: &marker_proof,
-            },
-        )
+    let mismatched_stale_payload_error = correct_delete_route
+        .build_insert_delete_marker_command(BuildInsertDeleteMarkerCommandReq {
+            expected_current: current_delete_snapshot.stored.as_ref(),
+            version_id: VersionId::from_u64(2),
+            owner: &owner,
+            stale_payload: InsertDeleteMarkerStalePayload::Explicit(Some(
+                ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
+                    bucket: crate::tests::bucket_name("wrong-stale-payload-bucket"),
+                    key: key.clone(),
+                    generation_id: GenerationId::new(9).unwrap(),
+                    created_at: 1_000,
+                    segments: Vec::new(),
+                }),
+            )),
+            expected_stale_payload_source: None,
+            bucket_write_reservation: &marker_proof,
+        })
         .unwrap_err();
     assert!(matches!(
         mismatched_stale_payload_error,
-        ObjectPgActionError::Store(StoreError::StorageRpc {
-            failure: StorageRpcErrorCode::PayloadDecode,
-            ..
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "build insert-delete-marker command",
         })
     ));
 
-    let null_marker_without_snapshot_error =
-        ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
-            &client,
-            BuildInsertDeleteMarkerCommandReq {
-                pg_id: correct_object_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                expected_current: current_delete_snapshot.stored.as_ref(),
-                version_id: VersionId::Null,
-                owner: &owner,
-                stale_payload: InsertDeleteMarkerStalePayload::Explicit(None),
-                expected_stale_payload_source: None,
-                bucket_write_reservation: &marker_proof,
-            },
-        )
+    let null_marker_without_snapshot_error = correct_delete_route
+        .build_insert_delete_marker_command(BuildInsertDeleteMarkerCommandReq {
+            expected_current: current_delete_snapshot.stored.as_ref(),
+            version_id: VersionId::Null,
+            owner: &owner,
+            stale_payload: InsertDeleteMarkerStalePayload::Explicit(None),
+            expected_stale_payload_source: None,
+            bucket_write_reservation: &marker_proof,
+        })
         .unwrap_err();
     assert!(matches!(
         null_marker_without_snapshot_error,
@@ -1677,24 +1626,17 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         })
     ));
 
-    let numbered_marker_with_snapshot_error =
-        ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
-            &client,
-            BuildInsertDeleteMarkerCommandReq {
-                pg_id: correct_object_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                expected_current: current_delete_snapshot.stored.as_ref(),
-                version_id: VersionId::from_u64(2),
-                owner: &owner,
-                stale_payload: InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive {
-                    created_at: 10,
-                },
-                expected_stale_payload_source: current_delete_snapshot.stored.as_ref(),
-                bucket_write_reservation: &marker_proof,
+    let numbered_marker_with_snapshot_error = correct_delete_route
+        .build_insert_delete_marker_command(BuildInsertDeleteMarkerCommandReq {
+            expected_current: current_delete_snapshot.stored.as_ref(),
+            version_id: VersionId::from_u64(2),
+            owner: &owner,
+            stale_payload: InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive {
+                created_at: 10,
             },
-        )
+            expected_stale_payload_source: current_delete_snapshot.stored.as_ref(),
+            bucket_write_reservation: &marker_proof,
+        })
         .unwrap_err();
     assert!(matches!(
         numbered_marker_with_snapshot_error,
@@ -1704,22 +1646,15 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         })
     ));
 
-    let numbered_marker_with_source_error =
-        ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
-            &client,
-            BuildInsertDeleteMarkerCommandReq {
-                pg_id: correct_object_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                expected_current: current_delete_snapshot.stored.as_ref(),
-                version_id: VersionId::from_u64(2),
-                owner: &owner,
-                stale_payload: InsertDeleteMarkerStalePayload::Explicit(None),
-                expected_stale_payload_source: current_delete_snapshot.stored.as_ref(),
-                bucket_write_reservation: &marker_proof,
-            },
-        )
+    let numbered_marker_with_source_error = correct_delete_route
+        .build_insert_delete_marker_command(BuildInsertDeleteMarkerCommandReq {
+            expected_current: current_delete_snapshot.stored.as_ref(),
+            version_id: VersionId::from_u64(2),
+            owner: &owner,
+            stale_payload: InsertDeleteMarkerStalePayload::Explicit(None),
+            expected_stale_payload_source: current_delete_snapshot.stored.as_ref(),
+            bucket_write_reservation: &marker_proof,
+        })
         .unwrap_err();
     assert!(matches!(
         numbered_marker_with_source_error,
@@ -1734,24 +1669,17 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         panic!("seeded metadata object must be live");
     };
     versioned_stale_record.version_id = VersionId::from_u64(3);
-    let null_marker_with_versioned_source_error =
-        ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
-            &client,
-            BuildInsertDeleteMarkerCommandReq {
-                pg_id: correct_object_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                expected_current: current_delete_snapshot.stored.as_ref(),
-                version_id: VersionId::Null,
-                owner: &owner,
-                stale_payload: InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive {
-                    created_at: 10,
-                },
-                expected_stale_payload_source: Some(&versioned_stale_source),
-                bucket_write_reservation: &marker_proof,
+    let null_marker_with_versioned_source_error = correct_delete_route
+        .build_insert_delete_marker_command(BuildInsertDeleteMarkerCommandReq {
+            expected_current: current_delete_snapshot.stored.as_ref(),
+            version_id: VersionId::Null,
+            owner: &owner,
+            stale_payload: InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive {
+                created_at: 10,
             },
-        )
+            expected_stale_payload_source: Some(&versioned_stale_source),
+            bucket_write_reservation: &marker_proof,
+        })
         .unwrap_err();
     assert!(matches!(
         null_marker_with_versioned_source_error,
@@ -3312,6 +3240,14 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     let stored = metadata_route
         .load_put_object_metadata_snapshot(None)
         .unwrap();
+    let delete_route = ObjectMutationMetadataNodeClient::open_object_delete_metadata_route(
+        &client,
+        ClusterEpoch::INITIAL,
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
+        &bucket,
+        &key,
+    )
+    .unwrap();
     assert_eq!(stored.bucket(), &bucket);
     assert_eq!(stored.key(), &key);
 
@@ -3330,13 +3266,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
             if update.object.bucket == bucket && update.object.key == key
     ));
 
-    let current = ObjectMutationMetadataNodeClient::load_current_object_delete_snapshot(
-        &client,
-        ObjectMetadataPgId::new_for_test(PgId::new(0)),
-        &bucket,
-        &key,
-    )
-    .unwrap();
+    let current = delete_route.load_current_object_delete_snapshot().unwrap();
     assert_eq!(current.stored.as_ref(), Some(&stored));
     let stream_uploads = ObjectMutationMetadataNodeClient::list_stream_uploads_for_bucket_page(
         &client,
@@ -3446,20 +3376,14 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         GenerationId::new(22).unwrap(),
     )
     .unwrap());
-    let delete_command = ObjectMutationMetadataNodeClient::build_delete_current_object_command(
-        &client,
-        BuildDeleteCurrentObjectCommandReq {
-            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
-            bucket: &bucket,
-            key: &key,
+    let delete_command = delete_route
+        .build_delete_current_object_command(BuildDeleteCurrentObjectCommandReq {
             expected_current: current.stored.as_ref(),
             expected_target: current.target.as_ref(),
             bucket_write_reservation: &delete_current_proof,
-        },
-    )
-    .unwrap()
-    .expect("live current object should build delete command");
+        })
+        .unwrap()
+        .expect("live current object should build delete command");
     assert!(matches!(
         delete_command.payload(),
         MetadataCommandPayload::DeleteObjectVersion(delete)

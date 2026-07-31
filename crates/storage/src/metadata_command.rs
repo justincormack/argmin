@@ -26,7 +26,7 @@ use crate::types::{
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
-const METADATA_COMMAND_ENCODING_VERSION: u16 = 5;
+const METADATA_COMMAND_ENCODING_VERSION: u16 = 6;
 const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
 const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 const METADATA_COMMAND_CREATE_BUCKET: u16 = 1;
@@ -1165,12 +1165,19 @@ pub(crate) enum DeleteObjectVersionTarget {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeleteObjectVersionMode {
+    Current,
+    Specific,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeleteObjectVersionCommand {
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
     pub(crate) bucket: BucketName,
     pub(crate) key: ObjectKey,
     pub(crate) version_id: VersionId,
+    pub(crate) mode: DeleteObjectVersionMode,
     pub(crate) target: DeleteObjectVersionTarget,
 }
 
@@ -1886,6 +1893,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.skip_str()?;
                 self.skip_str()?;
                 self.read_u64()?;
+                self.read_valid_u8("delete object mode", 1..=2)?;
                 match self.read_u8()? {
                     1 => self.read_u64().map(|_| ()),
                     2 => {
@@ -2084,6 +2092,11 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                     bucket: self.read_bucket_name()?,
                     key: self.read_object_key()?,
                     version_id: self.read_version_id()?,
+                    mode: match self.read_u8()? {
+                        1 => DeleteObjectVersionMode::Current,
+                        2 => DeleteObjectVersionMode::Specific,
+                        tag => return Err(format!("invalid delete object mode tag {tag}")),
+                    },
                     target: match self.read_u8()? {
                         1 => DeleteObjectVersionTarget::DeleteMarker {
                             write_sequence: self.read_u64()?,
@@ -3609,6 +3622,13 @@ fn encode_delete_object_version(out: &mut Vec<u8>, command: &DeleteObjectVersion
     put_str(out, command.bucket.as_str());
     put_str(out, command.key.as_str());
     encode_version_id(out, command.version_id);
+    put_u8(
+        out,
+        match command.mode {
+            DeleteObjectVersionMode::Current => 1,
+            DeleteObjectVersionMode::Specific => 2,
+        },
+    );
     match &command.target {
         DeleteObjectVersionTarget::DeleteMarker { write_sequence } => {
             put_u8(out, 1);
@@ -4905,6 +4925,7 @@ mod tests {
                 bucket,
                 key,
                 version_id: VersionId::from_u64(7),
+                mode: DeleteObjectVersionMode::Specific,
                 target: DeleteObjectVersionTarget::DeleteMarker { write_sequence: 9 },
             })),
         );
@@ -5013,7 +5034,7 @@ mod tests {
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
-        assert_eq!(envelope.checksum_crc64(), 0x5c18d46d1b44c1b8);
+        assert_eq!(envelope.checksum_crc64(), 0xfe0ef0954a8ee51c);
     }
 
     #[test]
@@ -5054,14 +5075,14 @@ mod tests {
 
         let mut old_version = envelope.command_bytes();
         let version_offset = 4 + METADATA_COMMAND_MAGIC.len();
-        old_version[version_offset..version_offset + 2].copy_from_slice(&4_u16.to_le_bytes());
+        old_version[version_offset..version_offset + 2].copy_from_slice(&5_u16.to_le_bytes());
         assert_eq!(
             decode_metadata_command_envelope(&old_version),
-            Err("unsupported metadata command encoding version 4".to_string())
+            Err("unsupported metadata command encoding version 5".to_string())
         );
         assert_eq!(
             decode_metadata_command_log_entry_header(&old_version),
-            Err("unsupported metadata command encoding version 4".to_string())
+            Err("unsupported metadata command encoding version 5".to_string())
         );
 
         let mut applied_with_trailing_bytes = envelope.command_bytes();
@@ -5125,7 +5146,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xf4b33dad2f2fe7ab);
+        assert_eq!(envelope.checksum_crc64(), 0x56a519557ee5c30f);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5153,7 +5174,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x2ca5dcf89807289b);
+        assert_eq!(envelope.checksum_crc64(), 0x8eb3f800c9cd0c3f);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5218,7 +5239,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x0adc4aef4288df07);
+        assert_eq!(envelope.checksum_crc64(), 0xa8ca6e171342fba3);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5299,13 +5320,13 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x8f6560ed5eb81fe8,
-                0x6b8641242aa0618b,
-                0xa4932ef1f7aa0365,
-                0x782688518a72ff35,
-                0x5f79b2007ffd5746,
-                0xb0dc7140ffb1bb6e,
-                0x342db284e18b4ebd,
+                0x7b062c779cc35006,
+                0x7cbada465b96619a,
+                0x0f9863d317573696,
+                0xda4b165857559529,
+                0xfd142c09a2da3d5a,
+                0x12ca55b8ae7b9fca,
+                0x96402c8d3cac24a1,
             ]
         );
     }
@@ -5376,14 +5397,14 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x2e4f6ebfe974d377,
-                0xbc9268439216fef5,
-                0xd9b85252c7290d11,
-                0xe00914a32bdbdb3a,
-                0xe3469668f851fda5,
-                0x73ceb5edef1712a4,
-                0x47130a2c52ed262c,
-                0x8da8286202abed5a,
+                0x62e99f04c21227c6,
+                0xee6c3baef0be36fd,
+                0x98c3039f248eaf5e,
+                0xb2f7474e49731332,
+                0xd1012688be94cc22,
+                0x2130e6008dbfdaac,
+                0x793e49fd7d524341,
+                0xdf567b8f60032552,
             ]
         );
     }
@@ -5690,6 +5711,7 @@ mod tests {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: VersionId::from_u64(7),
+                mode: DeleteObjectVersionMode::Specific,
                 target: DeleteObjectVersionTarget::DeleteMarker { write_sequence: 49 },
             })),
             MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
@@ -5697,6 +5719,7 @@ mod tests {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: VersionId::Null,
+                mode: DeleteObjectVersionMode::Current,
                 target: DeleteObjectVersionTarget::Live {
                     generation_id,
                     layout: ObjectLayout::Standard,
@@ -5708,6 +5731,7 @@ mod tests {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id: VersionId::from_u64(11),
+                mode: DeleteObjectVersionMode::Specific,
                 target: DeleteObjectVersionTarget::Live {
                     generation_id,
                     layout: ObjectLayout::MultipartManifest {
@@ -5966,36 +5990,36 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0xc14b590a90ce111e,
-                0xde23c28766ddf2c5,
-                0x750e5efbd834e68d,
-                0xb7d35dfaa3070526,
-                0x21d3f25a6e3b9063,
-                0x43ed610ff4c32339,
-                0x91eb7f48ebd52269,
-                0x058f24b811d059a2,
-                0xe08a2efdb0590890,
-                0xa264c0be34b003c1,
-                0x4064ab351da5ec23,
-                0x3a91a3f997d103e7,
-                0xf2b7e5456bd29c36,
-                0xe5b35e4b9f7c4107,
-                0xd6f465d9206340d3,
-                0xfdb144ec475d7bfa,
-                0x23ceaa148dd7d3f7,
-                0x738365ff641798ab,
-                0x425c1b74236a68d4,
-                0xb7b3e1f199758867,
-                0x81ab01dd33c13239,
-                0x51a1b4869d63136a,
-                0xd0c7bd9974fc9c90,
-                0x6593ee7f4757cef9,
-                0xb389243e43e42623,
-                0xd31016e32f5ab5f3,
-                0x8b19b1d4d3975f49,
-                0xd98014e86ada7667,
-                0x76e336df3825e159,
-                0x48bda65fdac5a190,
+                0xa9ad2267ab106845,
+                0xf557f5fad3772da5,
+                0x0c28d93443a864ed,
+                0x1e529dc6f2849cd5,
+                0x8726cbf64412d9b0,
+                0xf934064d0e28cf04,
+                0x0739d9358bbfa51c,
+                0x11d6384fe1b6fb5b,
+                0xc984ee7376ebc2ba,
+                0x2668392d5914ebcb,
+                0xdf2d9709f7b824cc,
+                0x1e0d69f0803f0304,
+                0x4ceeaf61cf5f8308,
+                0xcb7c051935b04c6e,
+                0x09048c1a4f862142,
+                0xd37e1fbeed917693,
+                0x86318d9954d73218,
+                0x57c60c2995960be9,
+                0x4a518d5cc4bb44e4,
+                0xf2bcb33ca42cba80,
+                0xbe50551dcdba58e6,
+                0x18bb5e7ceb4530b4,
+                0xb0ba98114681206b,
+                0x33e434dd8f9c1503,
+                0xe4061706386224ac,
+                0x7415b5f6ceaa27e5,
+                0x7870aa3ee97ee59e,
+                0xf74f4fbac0167b0e,
+                0x500134929cac8fb6,
+                0xa3647bea1d301760,
             ]
         );
     }

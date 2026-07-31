@@ -528,7 +528,7 @@ fn unapplied_object_command_is_abandoned_after_bucket_reservation_expires() {
     let proof = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "expired-unapplied-delete-marker",
+        crate::metadata_command::INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let write_sequence = map
@@ -613,7 +613,7 @@ fn applied_pending_command_converges_after_reservation_was_already_released() {
     let proof = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "applied-released-pending",
+        crate::metadata_command::INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let write_sequence = map

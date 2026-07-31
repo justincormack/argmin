@@ -1184,6 +1184,51 @@ fail_with_matches \
     "Production PUT object metadata snapshots and command builds must go through the scoped PUT object metadata route" \
     "$put_object_metadata_bypasses"
 
+object_delete_metadata_bypasses=$(
+    awk '
+    FNR == 1 {
+        pending_test_cfg = 0
+        in_test_module = 0
+        function_has_delete_route = 0
+    }
+    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {
+        pending_test_cfg = 1
+        next
+    }
+    /^[[:space:]]*mod tests[[:space:]]*\{/ && pending_test_cfg {
+        in_test_module = 1
+        pending_test_cfg = 0
+        next
+    }
+    in_test_module {
+        next
+    }
+    {
+        if ($0 ~ /^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?(super[[:space:]]+)?fn[[:space:]]+/) {
+            function_has_delete_route = 0
+        }
+        if ($0 ~ /\.open_object_delete_metadata_route\(/ \
+            || $0 ~ /object_delete_metadata_primary_route\(/ \
+            || $0 ~ /object_delete_metadata_route[[:space:]]*$/) {
+            function_has_delete_route = 1
+        }
+        if ($0 ~ /\.(load_current_object_delete_snapshot|load_specific_object_delete_snapshot|list_object_versions_for_lifecycle|build_delete_specific_object_version_command|build_delete_current_object_command|build_insert_delete_marker_command)\(/) {
+            if (function_has_delete_route \
+                || $0 ~ /\.open_object_delete_metadata_route\(/ \
+                || $0 ~ /object_delete_metadata_route\./) {
+                next
+            }
+            print FILENAME ":" FNR ":" $0
+        }
+    }
+    ' crates/storage/src/cluster.rs \
+      crates/storage/src/cluster/request_ops.rs \
+      crates/storage/src/cluster/local.rs
+)
+fail_with_matches \
+    "Production object-delete snapshots, lifecycle lists, and command builds must go through the scoped object-delete metadata route" \
+    "$object_delete_metadata_bypasses"
+
 direct_put_snapshot_bypasses=$(
     awk '
     FNR == 1 {

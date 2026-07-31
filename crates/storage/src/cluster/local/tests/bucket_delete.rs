@@ -5393,7 +5393,7 @@ fn begin_bucket_delete_drains_pending_delete_marker_before_emptiness_decision() 
             bucket_write_reservation: acquire_test_bucket_write_proof(
                 &cluster,
                 &bucket,
-                "delete-marker-drain-test",
+                crate::metadata_command::INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
                 Some(key.as_str()),
             ),
             bucket: bucket.clone(),
@@ -5521,12 +5521,13 @@ fn begin_bucket_delete_drains_pending_specific_version_delete_that_empties_bucke
             bucket_write_reservation: acquire_test_bucket_write_proof(
                 &cluster,
                 &bucket,
-                "specific-delete-drain-test",
+                crate::metadata_command::DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
                 Some(key.as_str()),
             ),
             bucket: bucket.clone(),
             key: key.clone(),
             version_id: committed.version_id,
+            mode: crate::metadata_command::DeleteObjectVersionMode::Specific,
             target: DeleteObjectVersionTarget::Live {
                 generation_id: live.generation_id,
                 layout: live.layout,

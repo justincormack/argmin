@@ -5,7 +5,10 @@ use std::os::unix::net::UnixListener;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::metadata_command::ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND;
+use crate::metadata_command::{
+    ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+    PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+};
 use crate::storage_node_server::{StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer};
 use crate::storage_rpc::{
     encode_metadata_command_acceptance_response, encode_metadata_command_applied_hashes_response,
@@ -2011,6 +2014,84 @@ fn unix_put_object_metadata_route_rejects_foreign_epoch_before_rpc() {
             )
             .err()
             .expect("future PUT-object-metadata route must fail before RPC"),
+        ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        }) if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
+}
+
+#[test]
+fn local_object_delete_metadata_route_binds_exact_object_subject() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0, 1],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let bucket = crate::tests::bucket_name("object-delete-route-bucket");
+    let key = crate::tests::object_key("object-delete-route-key");
+    let correct_pg = storage_node.object_metadata_pg_for(&bucket, &key);
+    let wrong_pg = ObjectMetadataPgId::new_for_test(PgId::new(1 - correct_pg.get()));
+
+    assert!(matches!(
+        client
+            .open_object_delete_metadata_route(ClusterEpoch::INITIAL, wrong_pg, &bucket, &key)
+            .err()
+            .expect("crossed object-delete PG must fail before storage"),
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open object delete metadata route",
+        })
+    ));
+
+    let route = client
+        .open_object_delete_metadata_route(ClusterEpoch::INITIAL, correct_pg, &bucket, &key)
+        .unwrap();
+    assert_eq!(
+        route.load_current_object_delete_snapshot().unwrap(),
+        ObjectDeleteStorageSnapshot {
+            stored: None,
+            target: None,
+        }
+    );
+
+    let mut crossed_proof = test_bucket_write_reservation_proof(bucket, &key);
+    crossed_proof.operation_kind = PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND.to_string();
+    assert!(matches!(
+        route
+            .build_delete_current_object_command(BuildDeleteCurrentObjectCommandReq {
+                expected_current: None,
+                expected_target: None,
+                bucket_write_reservation: &crossed_proof,
+            })
+            .unwrap_err(),
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "build delete-current object command",
+        })
+    ));
+}
+
+#[test]
+fn unix_object_delete_metadata_route_rejects_foreign_epoch_before_rpc() {
+    let client = test_unix_storage_node_client();
+    let future_epoch = ClusterEpoch::new(client.cluster_epoch.get() + 1).unwrap();
+    let bucket = crate::tests::bucket_name("unix-object-delete-route-bucket");
+    let key = crate::tests::object_key("unix-object-delete-route-key");
+    assert!(matches!(
+        client
+            .open_object_delete_metadata_route(
+                future_epoch,
+                ObjectMetadataPgId::new_for_test(PgId::new(0)),
+                &bucket,
+                &key,
+            )
+            .err()
+            .expect("future object-delete route must fail before RPC"),
         ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
             operation_epoch,
             current_epoch,

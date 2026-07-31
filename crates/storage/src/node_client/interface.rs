@@ -524,42 +524,13 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         key: &ObjectKey,
     ) -> Result<Box<dyn PutObjectMetadataRoute + '_>, ObjectPgActionError>;
 
-    fn load_current_object_delete_snapshot(
+    fn open_object_delete_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError>;
-
-    fn load_specific_object_delete_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError>;
-
-    fn list_object_versions_for_lifecycle(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<Vec<StoredObject>, ObjectPgActionError>;
-
-    fn build_delete_specific_object_version_command(
-        &self,
-        request: BuildDeleteSpecificObjectVersionCommandReq<'_>,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
-
-    fn build_delete_current_object_command(
-        &self,
-        request: BuildDeleteCurrentObjectCommandReq<'_>,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
-
-    fn build_insert_delete_marker_command(
-        &self,
-        request: BuildInsertDeleteMarkerCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+    ) -> Result<Box<dyn ObjectDeleteMetadataRoute + '_>, ObjectPgActionError>;
 
     fn matching_stream_upload_exists(
         &self,
@@ -821,6 +792,34 @@ pub(crate) trait PutObjectMetadataRoute: Send {
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 }
 
+pub(crate) trait ObjectDeleteMetadataRoute: Send {
+    fn load_current_object_delete_snapshot(
+        &self,
+    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError>;
+
+    fn load_specific_object_delete_snapshot(
+        &self,
+        version_id: VersionId,
+    ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError>;
+
+    fn list_object_versions_for_lifecycle(&self) -> Result<Vec<StoredObject>, ObjectPgActionError>;
+
+    fn build_delete_specific_object_version_command(
+        &self,
+        request: BuildDeleteSpecificObjectVersionCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
+
+    fn build_delete_current_object_command(
+        &self,
+        request: BuildDeleteCurrentObjectCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
+
+    fn build_insert_delete_marker_command(
+        &self,
+        request: BuildInsertDeleteMarkerCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+}
+
 /// Cleanup authority for exact object-metadata subjects which may need to
 /// outlive the active route that created them.
 pub(crate) trait RetainedObjectMutationMetadataNodeClient: Send + Sync {
@@ -1000,10 +999,6 @@ pub(crate) struct BuildPutObjectMetadataCommandReq<'a> {
 }
 
 pub(crate) struct BuildDeleteSpecificObjectVersionCommandReq<'a> {
-    pub(crate) pg_id: ObjectMetadataPgId,
-    pub(crate) cluster_epoch: ClusterEpoch,
-    pub(crate) bucket: &'a BucketName,
-    pub(crate) key: &'a ObjectKey,
     pub(crate) version_id: VersionId,
     pub(crate) expected_stored: Option<&'a StoredObject>,
     pub(crate) expected_target: Option<&'a DeleteObjectVersionTarget>,
@@ -1012,10 +1007,6 @@ pub(crate) struct BuildDeleteSpecificObjectVersionCommandReq<'a> {
 }
 
 pub(crate) struct BuildDeleteCurrentObjectCommandReq<'a> {
-    pub(crate) pg_id: ObjectMetadataPgId,
-    pub(crate) cluster_epoch: ClusterEpoch,
-    pub(crate) bucket: &'a BucketName,
-    pub(crate) key: &'a ObjectKey,
     pub(crate) expected_current: Option<&'a StoredObject>,
     pub(crate) expected_target: Option<&'a DeleteObjectVersionTarget>,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
@@ -1028,10 +1019,6 @@ pub(crate) struct ObjectDeleteStorageSnapshot {
 }
 
 pub(crate) struct BuildInsertDeleteMarkerCommandReq<'a> {
-    pub(crate) pg_id: ObjectMetadataPgId,
-    pub(crate) cluster_epoch: ClusterEpoch,
-    pub(crate) bucket: &'a BucketName,
-    pub(crate) key: &'a ObjectKey,
     pub(crate) expected_current: Option<&'a StoredObject>,
     pub(crate) version_id: VersionId,
     pub(crate) owner: &'a OwnerIdentity,

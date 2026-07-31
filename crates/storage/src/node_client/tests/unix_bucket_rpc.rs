@@ -1162,6 +1162,7 @@ fn unix_delete_specific_command_response_rejects_wrong_reclaim_target() {
             bucket: bucket.clone(),
             key: key.clone(),
             version_id: VersionId::Null,
+            mode: crate::metadata_command::DeleteObjectVersionMode::Specific,
             target: bad_target,
         })),
     );
@@ -1169,11 +1170,11 @@ fn unix_delete_specific_command_response_rejects_wrong_reclaim_target() {
     let err = client
         .validate_delete_specific_object_command_response(
             &command,
+            ClusterEpoch::new(1).unwrap(),
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
             &BuildDeleteSpecificObjectVersionCommandReq {
-                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
                 version_id: VersionId::Null,
                 expected_stored: Some(&stored),
                 expected_target: Some(&expected_target),
@@ -1235,11 +1236,11 @@ fn unix_insert_delete_marker_response_rejects_wrong_snapshot_stale_payload() {
     let err = client
         .validate_insert_delete_marker_command_response(
             &command,
+            ClusterEpoch::new(1).unwrap(),
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
             &BuildInsertDeleteMarkerCommandReq {
-                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
                 expected_current: Some(&stored),
                 version_id: VersionId::Null,
                 owner: &owner,

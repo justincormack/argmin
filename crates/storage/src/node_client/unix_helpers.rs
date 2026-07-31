@@ -1,4 +1,5 @@
 use super::*;
+use crate::metadata_command::DeleteObjectVersionMode;
 
 impl UnixStorageNodeClient {
     pub(super) fn bucket_pg_request(&self, pg_id: PgId) -> StorageRpcBucketPgRequest {
@@ -656,13 +657,44 @@ impl UnixStorageNodeClient {
     pub(super) fn validate_delete_specific_object_command_response(
         &self,
         command: &MetadataCommandEnvelope,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
         request: &BuildDeleteSpecificObjectVersionCommandReq<'_>,
     ) -> Result<(), ObjectPgActionError> {
-        let context = "validate delete-specific object command build response";
+        self.validate_delete_object_command_response(
+            command,
+            route_cluster_epoch,
+            pg_id,
+            (bucket, key),
+            request,
+            DeleteObjectVersionMode::Specific,
+        )
+    }
+
+    fn validate_delete_object_command_response(
+        &self,
+        command: &MetadataCommandEnvelope,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        subject: (&BucketName, &ObjectKey),
+        request: &BuildDeleteSpecificObjectVersionCommandReq<'_>,
+        expected_mode: DeleteObjectVersionMode,
+    ) -> Result<(), ObjectPgActionError> {
+        let (bucket, key) = subject;
+        let context = match expected_mode {
+            DeleteObjectVersionMode::Current => {
+                "validate delete-current object command build response"
+            }
+            DeleteObjectVersionMode::Specific => {
+                "validate delete-specific object command build response"
+            }
+        };
         self.validate_object_metadata_command_route(
             command,
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
+            pg_id.pg_id(),
+            route_cluster_epoch,
             context,
         )?;
         let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() else {
@@ -671,9 +703,10 @@ impl UnixStorageNodeClient {
                 "response command payload is not object version delete".to_string(),
             )));
         };
-        if delete.bucket != *request.bucket
-            || delete.key != *request.key
+        if delete.bucket != *bucket
+            || delete.key != *key
             || delete.version_id != request.version_id
+            || delete.mode != expected_mode
             || delete.bucket_write_reservation != *request.bucket_write_reservation
         {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
@@ -681,7 +714,7 @@ impl UnixStorageNodeClient {
                 "response command identity does not match request".to_string(),
             )));
         }
-        self.validate_delete_target_response(&delete.target, request.bucket, request.key, context)?;
+        self.validate_delete_target_response(&delete.target, bucket, key, context)?;
         if !delete_target_matches_expected(Some(&delete.target), request.expected_target) {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 context,
@@ -694,6 +727,10 @@ impl UnixStorageNodeClient {
     pub(super) fn validate_delete_current_object_command_response(
         &self,
         command: &MetadataCommandEnvelope,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
         request: &BuildDeleteCurrentObjectCommandReq<'_>,
     ) -> Result<(), ObjectPgActionError> {
         let Some(StoredObject::Live(expected)) = request.expected_current else {
@@ -703,29 +740,36 @@ impl UnixStorageNodeClient {
             )));
         };
         let specific = BuildDeleteSpecificObjectVersionCommandReq {
-            pg_id: request.pg_id,
-            cluster_epoch: request.cluster_epoch,
-            bucket: request.bucket,
-            key: request.key,
             version_id: expected.version_id,
             expected_stored: request.expected_current,
             expected_target: request.expected_target,
             expected_version_list: None,
             bucket_write_reservation: request.bucket_write_reservation,
         };
-        self.validate_delete_specific_object_command_response(command, &specific)
+        self.validate_delete_object_command_response(
+            command,
+            route_cluster_epoch,
+            pg_id,
+            (bucket, key),
+            &specific,
+            DeleteObjectVersionMode::Current,
+        )
     }
 
     pub(super) fn validate_insert_delete_marker_command_response(
         &self,
         command: &MetadataCommandEnvelope,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
         request: &BuildInsertDeleteMarkerCommandReq<'_>,
     ) -> Result<(), ObjectPgActionError> {
         let context = "validate insert-delete-marker command build response";
         self.validate_object_metadata_command_route(
             command,
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
+            pg_id.pg_id(),
+            route_cluster_epoch,
             context,
         )?;
         let MetadataCommandPayload::InsertDeleteMarker(marker) = command.payload() else {
@@ -734,8 +778,8 @@ impl UnixStorageNodeClient {
                 "response command payload is not insert delete marker".to_string(),
             )));
         };
-        if marker.bucket != *request.bucket
-            || marker.key != *request.key
+        if marker.bucket != *bucket
+            || marker.key != *key
             || marker.version_id != request.version_id
             || marker.owner != *request.owner
             || marker.bucket_write_reservation != *request.bucket_write_reservation
@@ -758,12 +802,7 @@ impl UnixStorageNodeClient {
             }
             InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive { .. } => {
                 if let Some(payload) = marker.stale_payload.as_ref() {
-                    self.validate_reclaim_payload_response(
-                        payload,
-                        request.bucket,
-                        request.key,
-                        context,
-                    )?;
+                    self.validate_reclaim_payload_response(payload, bucket, key, context)?;
                 }
                 if !reclaim_matches_snapshot_live_object(
                     marker.stale_payload.as_ref(),

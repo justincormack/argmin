@@ -104,6 +104,244 @@ fn put_object_metadata_fanout_rejects_live_crossed_reservation_subjects() {
 }
 
 #[test]
+fn object_delete_central_validation_rejects_live_crossed_reservation_subjects() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let bucket = crate::tests::bucket_name("delete-crossed-proof-bucket");
+    let key = crate::tests::object_key("delete-crossed-proof-key");
+    let version_id = crate::VersionId::Null;
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    for node_id in node_ids {
+        seed_bucket_record(&map, node_id, 0, &bucket, &owner);
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
+        crate::PgMetadataStore::put_object_meta(
+            &*pg,
+            &crate::PutObjectReq::Live(crate::PutLiveObjectReq {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                generation_id: crate::GenerationId::MIN,
+                size: 0,
+                etag: crate::ObjectEtag::single_part(0),
+                ec: EcShape { k: 2, m: 1 },
+                layout: crate::ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: Some(crate::SerializedMetadataBlob::default()),
+                system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            }),
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
+
+    let operation_reservation = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        )
+        .unwrap();
+    let operation_proof =
+        crate::metadata_command::BucketWriteReservationProof::from(&operation_reservation.record);
+    let delete_target_reservation = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
+            Some("delete-crossed-proof-other-key"),
+        )
+        .unwrap();
+    let delete_target_proof = crate::metadata_command::BucketWriteReservationProof::from(
+        &delete_target_reservation.record,
+    );
+    let marker_target_reservation = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+            Some("marker-crossed-proof-other-key"),
+        )
+        .unwrap();
+    let marker_target_proof = crate::metadata_command::BucketWriteReservationProof::from(
+        &marker_target_reservation.record,
+    );
+
+    let pg_id = PgId::new(0);
+    let delete_command_with_proof = |proof, mode| {
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket_write_reservation: proof,
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id,
+                mode,
+                target: DeleteObjectVersionTarget::DeleteMarker { write_sequence: 1 },
+            })),
+        )
+    };
+    let marker_command_with_proof = |proof| {
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+                bucket_write_reservation: proof,
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: crate::VersionId::from_u64(2),
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                write_sequence: 2,
+                last_modified_millis: 2,
+                stale_payload: None,
+            }),
+        )
+    };
+
+    for (case, command) in [
+        (
+            "delete operation",
+            delete_command_with_proof(
+                operation_proof.clone(),
+                crate::metadata_command::DeleteObjectVersionMode::Specific,
+            ),
+        ),
+        (
+            "delete target",
+            delete_command_with_proof(
+                delete_target_proof,
+                crate::metadata_command::DeleteObjectVersionMode::Specific,
+            ),
+        ),
+        (
+            "marker operation",
+            marker_command_with_proof(operation_proof.clone()),
+        ),
+        (
+            "marker target",
+            marker_command_with_proof(marker_target_proof),
+        ),
+    ] {
+        let error = cluster
+            .validate_metadata_command_bucket_write_reservation(&command)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::BucketWriteReservationConflict { .. }
+                )
+            ),
+            "crossed object-delete proof {case} must fail central validation: {error:?}"
+        );
+    }
+
+    for node_id in node_ids {
+        let stored = crate::PgMetadataStore::get_object_meta(
+            &*map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(pg_id.get())
+                .unwrap(),
+            &bucket,
+            &key,
+        )
+        .unwrap();
+        assert_eq!(stored.version_id(), version_id);
+        assert!(stored.as_live().is_some());
+    }
+}
+
+#[test]
+fn object_delete_modes_reject_crossed_live_reservation_operations() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let bucket = crate::tests::bucket_name("delete-mode-crossed-proof-bucket");
+    let key = crate::tests::object_key("delete-mode-crossed-proof-key");
+    create_test_bucket(&cluster, &bucket);
+    let live = write_committed_direct_segment_for(&cluster, &bucket, &key, b"delete subject");
+    let current = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        )
+        .unwrap();
+    let specific = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        )
+        .unwrap();
+    let pg_id = PgId::new(0);
+    let command = |proof, mode| {
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket_write_reservation: proof,
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: live.version_id,
+                mode,
+                target: DeleteObjectVersionTarget::DeleteMarker { write_sequence: 1 },
+            })),
+        )
+    };
+    for (case, command) in [
+        (
+            "current proof for specific deletion",
+            command(
+                crate::metadata_command::BucketWriteReservationProof::from(&current.record),
+                crate::metadata_command::DeleteObjectVersionMode::Specific,
+            ),
+        ),
+        (
+            "specific proof for current deletion",
+            command(
+                crate::metadata_command::BucketWriteReservationProof::from(&specific.record),
+                crate::metadata_command::DeleteObjectVersionMode::Current,
+            ),
+        ),
+    ] {
+        let error = cluster
+            .validate_metadata_command_bucket_write_reservation(&command)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::BucketWriteReservationConflict { .. }
+                )
+            ),
+            "crossed delete mode {case} must fail central validation: {error:?}"
+        );
+    }
+}
+
+#[test]
 fn object_metadata_pending_install_race_drains_winner_and_retries() {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

@@ -39,11 +39,14 @@ use crate::metadata_command::CommitDirectPutObjectCommand;
 use crate::metadata_command::{
     metadata_command_log_hash, AbortStreamUploadCommand, AppendStreamSegmentCommand,
     BucketPropertyMutation, BucketWriteReservationProof, CreateMultipartUploadCommand,
-    CreateStreamUploadCommand, DeleteObjectVersionTarget, MetadataCommandEnvelope,
-    MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
+    CreateStreamUploadCommand, DeleteObjectVersionMode, DeleteObjectVersionTarget,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
     MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimCommand,
     PutObjectMetadataMutation, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
-    ReserveObjectVersionCommand, PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+    ReserveObjectVersionCommand, DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
+    DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
+    INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+    PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
 };
@@ -10331,6 +10334,27 @@ impl StorageCluster {
                     PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
                     Some(update.object.key.as_str()),
                 ),
+            MetadataCommandPayload::DeleteObjectVersion(delete) => proof
+                .matches_exact_mutation_subject(
+                    command.id().cluster_epoch(),
+                    &delete.bucket,
+                    match delete.mode {
+                        DeleteObjectVersionMode::Current => {
+                            DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND
+                        }
+                        DeleteObjectVersionMode::Specific => {
+                            DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND
+                        }
+                    },
+                    Some(delete.key.as_str()),
+                ),
+            MetadataCommandPayload::InsertDeleteMarker(marker) => proof
+                .matches_exact_mutation_subject(
+                    command.id().cluster_epoch(),
+                    &marker.bucket,
+                    INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+                    Some(marker.key.as_str()),
+                ),
             _ => true,
         };
         if proof.cluster_epoch != command.id().cluster_epoch() || !command_subject_matches {
@@ -10493,6 +10517,17 @@ impl StorageCluster {
                 PgId::new(self.object_metadata_pg_id(bucket, key)),
             )
             .map(|node| node.object_mutation_metadata_client())
+    }
+
+    fn object_delete_metadata_primary_route(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn crate::node_client::ObjectDeleteMetadataRoute + '_>, ObjectPgActionError>
+    {
+        let pg_id = self.object_metadata_pg(bucket, key);
+        self.object_mutation_metadata_primary_client(bucket, key)?
+            .open_object_delete_metadata_route(self.operation_epoch(), pg_id, bucket, key)
     }
 
     fn retained_object_mutation_metadata_primary_client(

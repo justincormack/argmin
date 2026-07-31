@@ -7447,6 +7447,7 @@ fn stale_delete_marker_delete_command_cannot_delete_newer_null_marker() {
             bucket: bucket.clone(),
             key: key.clone(),
             version_id: VersionId::Null,
+            mode: crate::metadata_command::DeleteObjectVersionMode::Specific,
             target: DeleteObjectVersionTarget::DeleteMarker { write_sequence: 1 },
         })),
     );
@@ -7506,7 +7507,15 @@ fn stale_delete_marker_delete_command_cannot_delete_newer_null_marker() {
             owner: owner.clone(),
             write_sequence: 3,
             last_modified_millis: 30,
-            stale_payload: None,
+            stale_payload: Some(ObjectPayloadReclaimCommand::Segments(
+                ObjectSegmentsReclaimRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    generation_id: GenerationId::MIN,
+                    created_at: 30,
+                    segments: Vec::new(),
+                },
+            )),
         }),
     );
     store.apply_metadata_command(&newer_marker).unwrap();
@@ -7546,6 +7555,254 @@ fn stale_delete_marker_delete_command_cannot_delete_newer_null_marker() {
         panic!("expected newer delete marker to remain, got {stored:?}");
     };
     assert_eq!(marker.last_modified, 30);
+}
+
+#[test]
+fn recovered_object_delete_commands_reject_mismatched_reclaim_roots_before_mutation() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("recovered-delete-reclaim-subject");
+    let foreign_bucket = trusted_bucket_name("recovered-delete-foreign-bucket");
+    let key = trusted_object_key("object");
+    let foreign_key = trusted_object_key("foreign-object");
+    let owner = test_owner();
+    let generation_id = GenerationId::MIN;
+    let reservation_id = SessionId::try_from("76".repeat(16)).unwrap();
+    let live_segment = test_object_segment(bucket.clone(), key.clone(), VersionId::Null, 0);
+    let expected_reclaim_segment = ObjectSegmentsReclaimSegmentRecord {
+        segment_index: live_segment.segment_index,
+        segment_okh: live_segment.segment_okh,
+        segment_vid: live_segment.segment_vid,
+        data_pg_id: live_segment.data_pg_id,
+        ec: EcShape {
+            k: live_segment.ec_k,
+            m: live_segment.ec_m,
+        },
+    };
+    let live = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(1),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+            object: PutLiveObjectReq {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::Null,
+                owner: owner.clone(),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                generation_id,
+                size: live_segment.size,
+                etag: ObjectEtag::single_part(1),
+                ec: EcShape { k: 2, m: 1 },
+                layout: ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: Some(SerializedMetadataBlob::default()),
+                system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+                object_lock: ObjectLockState::default(),
+                encryption: ObjectEncryption::None,
+            },
+            segments: vec![live_segment],
+            generation_reservation_id: reservation_id.clone(),
+            write_sequence: 1,
+            last_modified_millis: 10,
+            stale_payload: None,
+            bucket_write_reservation: direct_put_terminal_cleanup_proof(&bucket, &key),
+        })),
+    );
+    insert_direct_put_terminal_staging(&store, &bucket, &key, &reservation_id);
+    store.apply_metadata_command(&live).unwrap();
+
+    let foreign_reclaim = ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
+        bucket: bucket.clone(),
+        key: foreign_key.clone(),
+        generation_id,
+        created_at: 11,
+        segments: Vec::new(),
+    });
+    let malformed_delete = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(1),
+            MetadataCommandLogIndex::new(2).unwrap(),
+        ),
+        MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+            bucket_write_reservation: test_bucket_write_reservation_proof(
+                &bucket,
+                &key,
+                "malformed-delete-reclaim",
+            ),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            mode: crate::metadata_command::DeleteObjectVersionMode::Specific,
+            target: DeleteObjectVersionTarget::Live {
+                generation_id,
+                layout: ObjectLayout::Standard,
+                payload: foreign_reclaim.clone(),
+            },
+        })),
+    );
+    let delete_error = store.apply_metadata_command(&malformed_delete).unwrap_err();
+    assert!(matches!(
+        delete_error,
+        MetadataError::InvariantViolation {
+            context: "delete object version command reclaim subject mismatch",
+            ..
+        }
+    ));
+    assert!(matches!(
+        store.get_object_version(&bucket, &key, VersionId::Null),
+        Ok(StoredObject::Live(_))
+    ));
+    assert!(store
+        .get_object_segments_reclaim(&bucket, &foreign_key, generation_id)
+        .unwrap()
+        .is_none());
+
+    let forged_reclaim_segment = ObjectSegmentsReclaimSegmentRecord {
+        segment_okh: [0xfe; 16],
+        segment_vid: GenerationId::new(99).unwrap(),
+        data_pg_id: 99,
+        ..expected_reclaim_segment.clone()
+    };
+    for (case, payload) in [
+        (
+            "foreign bucket",
+            ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
+                bucket: foreign_bucket.clone(),
+                key: key.clone(),
+                generation_id,
+                created_at: 11,
+                segments: Vec::new(),
+            }),
+        ),
+        (
+            "foreign generation",
+            ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                generation_id: GenerationId::new(2).unwrap(),
+                created_at: 11,
+                segments: Vec::new(),
+            }),
+        ),
+        (
+            "omitted durable shard",
+            ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                generation_id,
+                created_at: 11,
+                segments: Vec::new(),
+            }),
+        ),
+        (
+            "forged shard",
+            ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                generation_id,
+                created_at: 11,
+                segments: vec![forged_reclaim_segment.clone()],
+            }),
+        ),
+    ] {
+        let malformed = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::DeleteObjectVersion(Box::new(DeleteObjectVersionCommand {
+                bucket_write_reservation: test_bucket_write_reservation_proof(
+                    &bucket,
+                    &key,
+                    "malformed-delete-reclaim",
+                ),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::Null,
+                mode: crate::metadata_command::DeleteObjectVersionMode::Specific,
+                target: DeleteObjectVersionTarget::Live {
+                    generation_id,
+                    layout: ObjectLayout::Standard,
+                    payload,
+                },
+            })),
+        );
+        let error = store.apply_metadata_command(&malformed).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                MetadataError::InvariantViolation {
+                    context: "delete object version command reclaim subject mismatch",
+                    ..
+                }
+            ),
+            "{case} reclaim must fail closed: {error:?}"
+        );
+        assert!(matches!(
+            store.get_object_version(&bucket, &key, VersionId::Null),
+            Ok(StoredObject::Live(_))
+        ));
+    }
+    assert!(store
+        .get_object_segments_reclaim(&foreign_bucket, &key, generation_id)
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_object_segments_reclaim(&bucket, &key, GenerationId::new(2).unwrap())
+        .unwrap()
+        .is_none());
+
+    let malformed_marker = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(1),
+            MetadataCommandLogIndex::new(3).unwrap(),
+        ),
+        MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+            bucket_write_reservation: test_bucket_write_reservation_proof(
+                &bucket,
+                &key,
+                "malformed-marker-reclaim",
+            ),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            owner,
+            write_sequence: 2,
+            last_modified_millis: 12,
+            stale_payload: Some(ObjectPayloadReclaimCommand::Segments(
+                ObjectSegmentsReclaimRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    generation_id,
+                    created_at: 12,
+                    segments: vec![forged_reclaim_segment],
+                },
+            )),
+        }),
+    );
+    let marker_error = store.apply_metadata_command(&malformed_marker).unwrap_err();
+    assert!(matches!(
+        marker_error,
+        MetadataError::InvariantViolation {
+            context: "insert delete marker command stale payload subject mismatch",
+            ..
+        }
+    ));
+    assert!(matches!(
+        store.get_object_version(&bucket, &key, VersionId::Null),
+        Ok(StoredObject::Live(_))
+    ));
+    assert!(store
+        .get_object_segments_reclaim(&bucket, &key, generation_id)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
