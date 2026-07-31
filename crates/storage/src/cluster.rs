@@ -6997,11 +6997,15 @@ impl StorageCluster {
                 ),
         }?;
         for node in nodes {
-            let Some(hashes) = node
+            let hashes = match node
                 .metadata_command_inspection_client()
-                .applied_metadata_command_log_entry_hashes(pg_id, command)?
-            else {
-                return Ok(false);
+                .applied_metadata_command_log_entry_hashes(pg_id, command)
+            {
+                Ok(Some(hashes)) => hashes,
+                Ok(None) | Err(StoreError::MetadataCommandLogConflict { .. }) => {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error.into()),
             };
             match expected_hashes {
                 None => expected_hashes = Some(hashes),
@@ -12140,18 +12144,23 @@ impl StorageCluster {
                     return Ok(PendingMetadataCommandOutcome::Applied);
                 }
                 Err(error)
-                    if (error.applied_nodes > 0
-                        || route_mode == MetadataCommandRouteMode::Normal)
-                        && Self::metadata_command_log_conflict_matches(&command, &error.source)
-                        && self
-                            .partial_exact_metadata_command_conflict_is_retryable_with_route_mode(
+                    if Self::metadata_command_log_conflict_matches(&command, &error.source)
+                        && ((error.applied_nodes == 0
+                            && self
+                                .metadata_command_is_applied_on_all_acting_nodes_with_route_mode(
+                                    pg_id, &command, route_mode,
+                                )
+                                .map_err(bucket_snapshot_error_to_object_pg_action_error)?)
+                            || (error.applied_nodes > 0
+                                && self
+                                    .partial_exact_metadata_command_conflict_is_retryable_with_route_mode(
                                 pg_id,
                                 &command,
                                 error.applied_nodes,
                                 &error.source,
                                 route_mode,
                             )
-                            .map_err(bucket_snapshot_error_to_object_pg_action_error)? =>
+                                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?)) =>
                 {
                     if self
                         .metadata_command_is_applied_on_all_acting_nodes_with_route_mode(

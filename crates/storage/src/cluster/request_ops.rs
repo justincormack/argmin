@@ -2374,20 +2374,49 @@ impl super::StorageCluster {
                         source,
                     } = error;
                     if retry_partial_exact_conflict
-                        && applied_nodes > 0
                         && super::StorageCluster::metadata_command_log_conflict_matches(
                             &command, &source,
                         )
-                        && self
-                            .partial_exact_metadata_command_conflict_is_retryable_with_route_mode(
-                                pg_id,
-                                &command,
-                                applied_nodes,
-                                &source,
-                                route_mode,
-                            )?
                     {
-                        return Ok(FinishPendingMetadataCommandResult::RetryPartialExactConflict);
+                        let exact_conflict_retryable = applied_nodes == 0
+                            || self
+                                .partial_exact_metadata_command_conflict_is_retryable_with_route_mode(
+                                    pg_id,
+                                    &command,
+                                    applied_nodes,
+                                    &source,
+                                    route_mode,
+                                )?;
+                        if exact_conflict_retryable
+                            && self
+                                .metadata_command_is_applied_on_all_acting_nodes_with_route_mode(
+                                    pg_id, &command, route_mode,
+                                )?
+                        {
+                            self.release_applied_metadata_command_bucket_write_reservations(
+                                &command,
+                            )?;
+                            match route_mode {
+                                MetadataCommandRouteMode::Normal => self
+                                    .remove_pending_metadata_command_for_bucket(
+                                        pg_id,
+                                        command_bucket,
+                                        &command,
+                                    ),
+                                MetadataCommandRouteMode::Recovery => self
+                                    .remove_pending_metadata_command_for_bucket_recovery(
+                                        pg_id,
+                                        command_bucket,
+                                        &command,
+                                    ),
+                            }?;
+                            return Ok(FinishPendingMetadataCommandResult::Applied);
+                        }
+                        if exact_conflict_retryable && applied_nodes > 0 {
+                            return Ok(
+                                FinishPendingMetadataCommandResult::RetryPartialExactConflict,
+                            );
+                        }
                     }
                     if applied_nodes == 0
                         && super::StorageCluster::metadata_command_log_conflict_matches(

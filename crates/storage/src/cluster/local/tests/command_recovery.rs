@@ -574,6 +574,185 @@ impl HistoricalRouteRecoveryFixture {
             )
             .unwrap()
     }
+
+    fn recover_after_zero_apply_exact_conflict(
+        &self,
+        pending: PendingMetadataCommandObservation,
+        command: &MetadataCommandEnvelope,
+    ) -> usize {
+        let pg_runtime_map = self
+            .authority
+            .pg_runtime_map_snapshot(self.pg_id, self.now_ms + 1)
+            .unwrap();
+        let historical_runtime_map = pg_runtime_map
+            .runtime_map_at_epoch(pending.cluster_epoch())
+            .unwrap();
+        let recovery_map = Arc::new(
+            LocalClusterMap::open_runtime_map_with_existing_local_nodes(
+                &self.active_map,
+                &historical_runtime_map,
+            )
+            .unwrap(),
+        );
+        let recovery_cluster =
+            crate::StorageCluster::from_runtime_local_map(recovery_map, &historical_runtime_map)
+                .unwrap();
+
+        let _serial = lock_metadata_command_apply_hook_test();
+        let conflict_injected = Arc::new(AtomicBool::new(false));
+        let conflict_injected_hook = Arc::clone(&conflict_injected);
+        let hook_map = Arc::clone(&self.active_map);
+        let hook_command = command.clone();
+        let node_ids = self.node_ids;
+        let hook_guard = recovery_cluster.test_install_before_metadata_command_apply_hook(
+            Arc::new(move |node_id, candidate| {
+                if node_id != NodeId::new(0) || *candidate != hook_command {
+                    return Ok(());
+                }
+                assert!(!conflict_injected_hook.swap(true, Ordering::SeqCst));
+                for replica_node_id in node_ids {
+                    let pg = hook_map
+                        .node(replica_node_id)
+                        .unwrap()
+                        .storage_node()
+                        .get_pg(candidate.id().pg_id().get())?;
+                    pg.apply_metadata_command_and_record(replica_node_id.as_u32(), candidate)
+                        .map_err(|error| match error {
+                            crate::BucketSnapshotLoadError::Store(error) => error,
+                            crate::BucketSnapshotLoadError::Metadata(error) => {
+                                panic!("manual historical command apply failed: {error}")
+                            }
+                        })?;
+                }
+                Err(StoreError::MetadataCommandLogConflict {
+                    node_id: node_id.as_u32(),
+                    pg_id: candidate.id().pg_id().get(),
+                    cluster_epoch: candidate.id().cluster_epoch(),
+                    log_index: candidate.id().log_index().get(),
+                })
+            }),
+        );
+
+        let outcome = recovery_cluster
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                self.pg_id,
+                command,
+                &self.cluster,
+            )
+            .unwrap();
+        drop(hook_guard);
+        assert!(conflict_injected.load(Ordering::SeqCst));
+        assert_eq!(outcome, PendingMetadataCommandOutcome::Applied);
+        1
+    }
+}
+
+#[test]
+fn refresh_recovery_clears_zero_apply_fully_applied_object_command() {
+    let tmp = test_util::tempdir();
+    let mut fixture =
+        HistoricalRouteRecoveryFixture::open(tmp.path(), "historical-fully-applied-object-command");
+    let bucket = BucketName::new("historical-fully-applied-object-command").unwrap();
+    let key = crate::ObjectKey::new("object").unwrap();
+    create_test_bucket(&fixture.cluster, &bucket);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            fixture.active_epoch,
+            fixture.pg_id,
+            fixture
+                .active_map
+                .test_next_metadata_command_log_index(fixture.pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            key,
+            crate::SessionId::try_from("82".repeat(16)).unwrap(),
+            crate::GenerationId::MIN,
+            fixture.now_ms,
+        )),
+    );
+    force_insert_pending_metadata_command_for_node_for_test(
+        &fixture.active_map,
+        NodeId::new(0),
+        fixture.pg_id,
+        &bucket,
+        &command,
+    );
+    let pending = fixture.authorize_pending_recovery(&command);
+
+    assert_eq!(
+        fixture.recover_after_zero_apply_exact_conflict(pending, &command),
+        1
+    );
+    for node_id in fixture.node_ids {
+        let pg = fixture
+            .active_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(fixture.pg_id.get())
+            .unwrap();
+        assert_eq!(
+            pg.metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index,
+            command.id().log_index().get()
+        );
+        assert!(pg
+            .pending_metadata_command_envelope(node_id.as_u32(), fixture.active_epoch)
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[test]
+fn refresh_recovery_clears_zero_apply_fully_applied_bucket_command() {
+    let tmp = test_util::tempdir();
+    let mut fixture =
+        HistoricalRouteRecoveryFixture::open(tmp.path(), "historical-fully-applied-bucket-command");
+    let bucket = BucketName::new("historical-fully-applied-bucket-command").unwrap();
+    let command = create_bucket_metadata_command_at_epoch(
+        fixture.active_epoch,
+        fixture.pg_id,
+        fixture
+            .active_map
+            .test_next_metadata_command_log_index(fixture.pg_id)
+            .get(),
+        bucket.clone(),
+    );
+    force_insert_pending_metadata_command_for_node_for_test(
+        &fixture.active_map,
+        NodeId::new(0),
+        fixture.pg_id,
+        &bucket,
+        &command,
+    );
+    let pending = fixture.authorize_pending_recovery(&command);
+
+    assert_eq!(
+        fixture.recover_after_zero_apply_exact_conflict(pending, &command),
+        1
+    );
+    for node_id in fixture.node_ids {
+        let pg = fixture
+            .active_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(fixture.pg_id.get())
+            .unwrap();
+        crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
+        assert_eq!(
+            pg.metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index,
+            command.id().log_index().get()
+        );
+        assert!(pg
+            .pending_metadata_command_envelope(node_id.as_u32(), fixture.active_epoch)
+            .unwrap()
+            .is_none());
+    }
 }
 
 #[test]
