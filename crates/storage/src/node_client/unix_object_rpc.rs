@@ -74,6 +74,14 @@ struct UnixAuthorizedMultipartUploadMetadataRoute<'a> {
     authorized_upload: AuthorizedMultipartUploadRecord,
 }
 
+struct UnixMultipartCompletionMutationMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
 struct UnixObjectListingMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
     pg_id: ObjectMetadataScanPgId,
@@ -2818,6 +2826,92 @@ impl MultipartUploadCreationMetadataRoute for UnixMultipartUploadCreationMetadat
     }
 }
 
+impl MultipartCompletionMutationMetadataRoute for UnixMultipartCompletionMutationMetadataRoute<'_> {
+    fn load_stale_payload_source(&self) -> Result<Option<StoredObject>, ObjectPgActionError> {
+        let request = self
+            .client
+            .object_request(self.pg_id.pg_id(), &self.bucket, &self.key);
+        let payload = encode_object_request(&request);
+        let response = self
+            .client
+            .rpc_request(
+                StorageRpcMessageKind::ObjectMultipartCompletionStaleSourceLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_multipart_completion_stale_source_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode multipart completion stale source response",
+                    error.to_string(),
+                ))
+            })?;
+        if let Some(source) = response.source.as_ref() {
+            match source {
+                StoredObject::Live(live)
+                    if live.bucket == self.bucket
+                        && live.key == self.key
+                        && live.version_id.is_null() => {}
+                _ => {
+                    return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                        "validate multipart completion stale source response",
+                        "stale source must be null live object for requested object".to_string(),
+                    )));
+                }
+            }
+        }
+        Ok(response.source)
+    }
+
+    fn build_complete_multipart_object_command(
+        &self,
+        request: BuildCompleteMultipartObjectCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        require_multipart_completion_mutation_subject(
+            self.route_cluster_epoch,
+            &self.bucket,
+            &self.key,
+            &request,
+        )?;
+        let rpc_request = StorageRpcCompleteMultipartCommandBuildRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            request: request.request.clone(),
+            version_id: request.version_id,
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload =
+            encode_complete_multipart_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "encode complete multipart command build request",
+                    error.to_string(),
+                ))
+            })?;
+        match self.client.object_metadata_command_build_request(
+            StorageRpcMessageKind::ObjectMultipartCompleteCommandBuild,
+            self.pg_id.pg_id(),
+            payload,
+            "decode complete multipart command build response",
+            ObjectPgActionError::StaleMultipartCompletionSnapshot,
+            |command| {
+                self.client.validate_complete_multipart_command_response(
+                    command,
+                    self.route_cluster_epoch,
+                    self.pg_id,
+                    &request,
+                )
+            },
+        )? {
+            Some(command) => Ok(command),
+            None => Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                "decode complete multipart command build response",
+                "complete multipart command build cannot return missing".to_string(),
+            ))),
+        }
+    }
+}
+
 impl UnixMultipartUploadLookupMetadataRoute<'_> {
     fn object_request(&self) -> StorageRpcObjectRequest {
         self.client
@@ -3240,6 +3334,30 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             _route_cluster_epoch: route_cluster_epoch,
             pg_id,
             authorized_upload: authorized_upload.clone(),
+        }))
+    }
+
+    fn open_multipart_completion_mutation_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn MultipartCompletionMutationMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixMultipartCompletionMutationMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
         }))
     }
 
@@ -4106,79 +4224,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 cluster_epoch,
                 log_index,
             )),
-        }
-    }
-
-    fn load_multipart_completion_stale_payload_source(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<Option<StoredObject>, ObjectPgActionError> {
-        let request = self.object_request(pg_id.pg_id(), bucket, key);
-        let payload = encode_object_request(&request);
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectMultipartCompletionStaleSourceLoad,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_multipart_completion_stale_source_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode multipart completion stale source response",
-                    error.to_string(),
-                ))
-            })?;
-        if let Some(source) = response.source.as_ref() {
-            match source {
-                StoredObject::Live(live)
-                    if live.bucket == *bucket && live.key == *key && live.version_id.is_null() => {}
-                _ => {
-                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                        "validate multipart completion stale source response",
-                        "stale source must be null live object for requested object".to_string(),
-                    )));
-                }
-            }
-        }
-        Ok(response.source)
-    }
-
-    fn build_complete_multipart_object_command(
-        &self,
-        request: BuildCompleteMultipartObjectCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let rpc_request = StorageRpcCompleteMultipartCommandBuildRequest {
-            object: self.object_request(
-                request.pg_id.pg_id(),
-                &request.request.bucket,
-                &request.request.key,
-            ),
-            request: request.request.clone(),
-            version_id: request.version_id,
-            bucket_write_reservation: request.bucket_write_reservation.clone(),
-        };
-        let payload =
-            encode_complete_multipart_command_build_request(&rpc_request).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "encode complete multipart command build request",
-                    error.to_string(),
-                ))
-            })?;
-        match self.object_metadata_command_build_request(
-            StorageRpcMessageKind::ObjectMultipartCompleteCommandBuild,
-            request.pg_id.pg_id(),
-            payload,
-            "decode complete multipart command build response",
-            ObjectPgActionError::StaleMultipartCompletionSnapshot,
-            |command| self.validate_complete_multipart_command_response(command, &request),
-        )? {
-            Some(command) => Ok(command),
-            None => Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                "decode complete multipart command build response",
-                "complete multipart command build cannot return missing".to_string(),
-            ))),
         }
     }
 

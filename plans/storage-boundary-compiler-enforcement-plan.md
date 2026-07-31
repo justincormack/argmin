@@ -4606,6 +4606,39 @@ One-hundred-and-fifteenth Phase 3 slice:
   workspace-wide strict Clippy, and the full 7,847-test workspace suite also
   pass.
 
+One-hundred-and-sixteenth Phase 3 slice:
+
+- multipart completion stale-null-payload inspection and completion-command
+  construction now share a `MultipartCompletionMutationMetadataRoute` bound
+  to one active cluster epoch, exact object-metadata primary PG, bucket, and
+  key. The command-build request no longer carries independently substitutable
+  PG or epoch fields.
+- the capability validates the complete request subject before storage or
+  transport: selected and omitted parts and segments belong to the bound
+  upload and object, terminal stream cleanup belongs to that upload, any stale
+  payload source is the bound null live object, and the durable bucket-write
+  proof exactly matches the completion operation, epoch, bucket, and target
+  key. Embedded and Unix implementations share this validation.
+- embedded construction validates exact object placement and an open PG
+  before storage access. Unix construction rejects an epoch differing from
+  the installed client before transport, derives both RPC object identity and
+  response validation from route-owned authority, and retains independent
+  storage-node admission, placement, primary, deadline, request-subject, and
+  proof validation.
+- cluster completion opens one scoped route for the initial stale-source read,
+  command construction, and any stale-snapshot retry reload. Embedded and
+  no-listener tests reject crossed PG and epoch authority; the installed Unix
+  equivalent-state matrix requires `PayloadDecode` for the wrong PG even when
+  both PGs contain identical upload and part state. Crossed operation, target,
+  epoch, and request subjects fail before RPC.
+- the transitional boundary checker now requires production completion
+  stale-source reads and command builds to flow through the scoped route.
+  Abort command construction, stream-session mutation, and payload-reclaim
+  families remain open in Phase 3.
+- all 2,535 storage tests pass. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full no-fail-fast 7,853-test workspace
+  suite also pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

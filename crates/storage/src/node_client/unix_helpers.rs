@@ -1169,13 +1169,15 @@ impl UnixStorageNodeClient {
     pub(super) fn validate_complete_multipart_command_response(
         &self,
         command: &MetadataCommandEnvelope,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
         request: &BuildCompleteMultipartObjectCommandReq<'_>,
     ) -> Result<(), ObjectPgActionError> {
         let context = "validate complete multipart command build response";
         self.validate_object_metadata_command_route(
             command,
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
+            pg_id.pg_id(),
+            route_cluster_epoch,
             context,
         )?;
         let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() else {

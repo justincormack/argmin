@@ -145,6 +145,14 @@ struct LocalAuthorizedMultipartUploadMetadataRoute<'a> {
     authorized_upload: AuthorizedMultipartUploadRecord,
 }
 
+struct LocalMultipartCompletionMutationMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
 struct LocalObjectListingMetadataRoute {
     storage_node: Arc<SharedStorageNode>,
     _route_cluster_epoch: ClusterEpoch,
@@ -2812,6 +2820,36 @@ impl AuthorizedMultipartUploadMetadataRoute for LocalAuthorizedMultipartUploadMe
     }
 }
 
+impl MultipartCompletionMutationMetadataRoute
+    for LocalMultipartCompletionMutationMetadataRoute<'_>
+{
+    fn load_stale_payload_source(&self) -> Result<Option<StoredObject>, ObjectPgActionError> {
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        Ok(load_null_live_stale_payload_source_from_pg(
+            &pg,
+            &self.bucket,
+            &self.key,
+        )?)
+    }
+
+    fn build_complete_multipart_object_command(
+        &self,
+        request: BuildCompleteMultipartObjectCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        require_multipart_completion_mutation_subject(
+            self.route_cluster_epoch,
+            &self.bucket,
+            &self.key,
+            &request,
+        )?;
+        self.client.build_complete_multipart_object_command(
+            self.route_cluster_epoch,
+            self.pg_id,
+            request,
+        )
+    }
+}
+
 impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
     fn open_put_object_metadata_route(
         &self,
@@ -2928,6 +2966,29 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
             _route_cluster_epoch: route_cluster_epoch,
             pg_id,
             authorized_upload: authorized_upload.clone(),
+        }))
+    }
+
+    fn open_multipart_completion_mutation_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn MultipartCompletionMutationMetadataRoute + '_>, ObjectPgActionError> {
+        if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open multipart completion mutation metadata route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalMultipartCompletionMutationMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
         }))
     }
 
@@ -3151,25 +3212,6 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         request: BuildStreamPartCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         Self::build_stream_part_commit_command(self, request)
-    }
-
-    fn load_multipart_completion_stale_payload_source(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<Option<StoredObject>, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(load_null_live_stale_payload_source_from_pg(
-            &pg, bucket, key,
-        )?)
-    }
-
-    fn build_complete_multipart_object_command(
-        &self,
-        request: BuildCompleteMultipartObjectCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        Self::build_complete_multipart_object_command(self, request)
     }
 
     fn load_abort_multipart_upload_cleanup(
@@ -4094,9 +4136,11 @@ impl LocalStorageNodeClient {
 
     fn build_complete_multipart_object_command(
         &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
         request: BuildCompleteMultipartObjectCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let pg = self.storage_node.get_pg(pg_id.get())?;
         let complete = request.request;
         let upload = PgMetadataStore::get_multipart_upload(&*pg, &complete.upload_id)?;
         if upload.bucket != complete.bucket
@@ -4227,11 +4271,8 @@ impl LocalStorageNodeClient {
         } else {
             None
         };
-        let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
-            &pg,
-        )?;
+        let command_id =
+            self.next_metadata_command_id_from_locked_pg(pg_id.pg_id(), route_cluster_epoch, &pg)?;
         Ok(MetadataCommandEnvelope::new(
             command_id,
             MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {

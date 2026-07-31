@@ -555,6 +555,14 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         authorized_upload: &AuthorizedMultipartUploadRecord,
     ) -> Result<Box<dyn AuthorizedMultipartUploadMetadataRoute + '_>, ObjectPgActionError>;
 
+    fn open_multipart_completion_mutation_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn MultipartCompletionMutationMetadataRoute + '_>, ObjectPgActionError>;
+
     fn matching_stream_upload_exists(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -707,18 +715,6 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         request: BuildStreamPartCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 
-    fn load_multipart_completion_stale_payload_source(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<Option<StoredObject>, ObjectPgActionError>;
-
-    fn build_complete_multipart_object_command(
-        &self,
-        request: BuildCompleteMultipartObjectCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
-
     fn load_abort_multipart_upload_cleanup(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -747,6 +743,15 @@ pub(crate) trait PutObjectMetadataRoute: Send {
     fn build_put_object_metadata_command(
         &self,
         request: BuildPutObjectMetadataCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+}
+
+pub(crate) trait MultipartCompletionMutationMetadataRoute: Send {
+    fn load_stale_payload_source(&self) -> Result<Option<StoredObject>, ObjectPgActionError>;
+
+    fn build_complete_multipart_object_command(
+        &self,
+        request: BuildCompleteMultipartObjectCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 }
 
@@ -962,12 +967,75 @@ pub(crate) struct BuildStreamPartCommitCommandReq<'a> {
 }
 
 pub(crate) struct BuildCompleteMultipartObjectCommandReq<'a> {
-    pub(crate) pg_id: ObjectMetadataPgId,
-    pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) request: &'a CompleteMultipartCommitRequest,
     pub(crate) version_id: VersionId,
     pub(crate) expected_object_parts: &'a [ObjectPartRecord],
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
+}
+
+pub(crate) fn require_multipart_completion_mutation_subject(
+    route_cluster_epoch: ClusterEpoch,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    build: &BuildCompleteMultipartObjectCommandReq<'_>,
+) -> Result<(), ObjectPgActionError> {
+    let request = build.request;
+    let cleanup = &request.expected_cleanup;
+    let invalid = request.bucket != *bucket
+        || request.key != *key
+        || !build
+            .bucket_write_reservation
+            .matches_exact_mutation_subject(
+                route_cluster_epoch,
+                bucket,
+                crate::metadata_command::COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                Some(key.as_str()),
+            )
+        || request
+            .part_records
+            .iter()
+            .chain(cleanup.omitted_parts.iter())
+            .any(|part| part.upload_id != request.upload_id)
+        || request
+            .selected_streaming_segments
+            .iter()
+            .chain(cleanup.omitted_streaming_segments.iter())
+            .any(|segment| {
+                segment.bucket != *bucket
+                    || segment.key != *key
+                    || segment.upload_id != request.upload_id
+            })
+        || request
+            .expected_stale_payload_source
+            .as_ref()
+            .is_some_and(|stored| {
+                !stored.version_id().is_null()
+                    || stored.as_live().is_none()
+                    || stored.bucket() != bucket
+                    || stored.key() != key
+            })
+        || cleanup.stream_uploads.iter().any(|stream| {
+            stream.bucket != *bucket
+                || stream.key != *key
+                || !matches!(
+                    &stream.target,
+                    StreamUploadTarget::UploadPart { upload_id, .. }
+                        if upload_id == &request.upload_id
+                )
+        })
+        || cleanup.stream_upload_segments.iter().any(|segment| {
+            !cleanup
+                .stream_uploads
+                .iter()
+                .any(|stream| stream.session_id == segment.session_id)
+        });
+    if invalid {
+        return Err(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "build complete multipart object command",
+        }
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) struct AbortMultipartCommandValidation<'a> {

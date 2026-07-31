@@ -14147,6 +14147,13 @@ impl super::StorageCluster {
             &bucket,
             &key,
         )?;
+        let multipart_completion_route = mutation_client
+            .open_multipart_completion_mutation_metadata_route(
+                self.operation_epoch(),
+                object_pg_id,
+                &bucket,
+                &key,
+            )?;
         let mut work_budget = super::RequestWorkBudget::new(
             std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
             None,
@@ -14257,11 +14264,7 @@ impl super::StorageCluster {
                     MultipartCompletionStaleRetryTestEvent::BeforeStalePayloadSourceLoad,
                     &upload_id,
                 );
-                match mutation_client.load_multipart_completion_stale_payload_source(
-                    object_pg_id,
-                    &bucket,
-                    &key,
-                ) {
+                match multipart_completion_route.load_stale_payload_source() {
                     Ok(current_stale_payload_source) => {
                         req.expected_stale_payload_source = current_stale_payload_source;
                     }
@@ -14311,10 +14314,8 @@ impl super::StorageCluster {
                 release_bucket_write_proof!()?;
                 return Err(ObjectPgActionError::Store(error));
             }
-            let command = match mutation_client.build_complete_multipart_object_command(
+            let command = match multipart_completion_route.build_complete_multipart_object_command(
                 BuildCompleteMultipartObjectCommandReq {
-                    pg_id: object_pg_id,
-                    cluster_epoch: self.operation_epoch(),
                     request: &req,
                     version_id,
                     expected_object_parts: &expected_object_parts,
@@ -14353,15 +14354,14 @@ impl super::StorageCluster {
                         MultipartCompletionStaleRetryTestEvent::BeforeStalePayloadSourceLoad,
                         &upload_id,
                     );
-                    let current_stale_payload_source = match mutation_client
-                        .load_multipart_completion_stale_payload_source(object_pg_id, &bucket, &key)
-                    {
-                        Ok(source) => source,
-                        Err(error) => {
-                            release_bucket_write_proof!()?;
-                            return Err(error);
-                        }
-                    };
+                    let current_stale_payload_source =
+                        match multipart_completion_route.load_stale_payload_source() {
+                            Ok(source) => source,
+                            Err(error) => {
+                                release_bucket_write_proof!()?;
+                                return Err(error);
+                            }
+                        };
                     release_bucket_write_proof!()?;
                     if current_stale_payload_source == req.expected_stale_payload_source {
                         return Err(ObjectPgActionError::StaleMultipartCompletionSnapshot);

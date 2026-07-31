@@ -2663,7 +2663,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..27)
+    let server_threads: Vec<_> = (0..26)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -2769,18 +2769,30 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
         wrong_multipart_lookup_route.lookup_multipart_upload_management(&upload_id)
     );
 
-    assert!(
-        ObjectMutationMetadataNodeClient::load_multipart_completion_stale_payload_source(
-            &client, correct_pg, &bucket, &key,
+    let correct_multipart_completion_route =
+        ObjectMutationMetadataNodeClient::open_multipart_completion_mutation_metadata_route(
+            &client,
+            ClusterEpoch::INITIAL,
+            correct_pg,
+            &bucket,
+            &key,
         )
+        .unwrap();
+    let wrong_multipart_completion_route =
+        ObjectMutationMetadataNodeClient::open_multipart_completion_mutation_metadata_route(
+            &client,
+            ClusterEpoch::INITIAL,
+            wrong_pg,
+            &bucket,
+            &key,
+        )
+        .unwrap();
+
+    assert!(correct_multipart_completion_route
+        .load_stale_payload_source()
         .unwrap()
-        .is_none()
-    );
-    assert_object_payload_decode!(
-        ObjectMutationMetadataNodeClient::load_multipart_completion_stale_payload_source(
-            &client, wrong_pg, &bucket, &key,
-        )
-    );
+        .is_none());
+    assert_object_payload_decode!(wrong_multipart_completion_route.load_stale_payload_source());
 
     let cleanup = ObjectMutationMetadataNodeClient::load_abort_multipart_upload_cleanup(
         &client, correct_pg, &bucket, &key, &upload_id,
@@ -2828,50 +2840,64 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
         COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
     let mut abort_proof = complete_proof.clone();
     abort_proof.operation_kind = ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
-    let complete_command =
-        ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
-            &client,
-            BuildCompleteMultipartObjectCommandReq {
-                pg_id: correct_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                request: &complete_request,
-                version_id: VersionId::Null,
-                expected_object_parts: &expected_object_parts,
-                bucket_write_reservation: &complete_proof,
-            },
-        )
+    let complete_command = correct_multipart_completion_route
+        .build_complete_multipart_object_command(BuildCompleteMultipartObjectCommandReq {
+            request: &complete_request,
+            version_id: VersionId::Null,
+            expected_object_parts: &expected_object_parts,
+            bucket_write_reservation: &complete_proof,
+        })
         .unwrap();
     assert!(matches!(
         complete_command.payload(),
         MetadataCommandPayload::CommitMultipartObject(commit)
             if commit.upload_id == upload_id
     ));
-    assert_object_payload_decode!(
-        ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
-            &client,
+    assert_object_payload_decode!(wrong_multipart_completion_route
+        .build_complete_multipart_object_command(BuildCompleteMultipartObjectCommandReq {
+            request: &complete_request,
+            version_id: VersionId::Null,
+            expected_object_parts: &expected_object_parts,
+            bucket_write_reservation: &complete_proof,
+        },));
+    let mut crossed_target_proof = complete_proof.clone();
+    crossed_target_proof.target_context = Some("crossed-completion-key".to_string());
+    let mut crossed_epoch_proof = complete_proof.clone();
+    crossed_epoch_proof.cluster_epoch = ClusterEpoch::new(2).unwrap();
+    for crossed_proof in [&abort_proof, &crossed_target_proof, &crossed_epoch_proof] {
+        assert!(matches!(
+            correct_multipart_completion_route.build_complete_multipart_object_command(
+                BuildCompleteMultipartObjectCommandReq {
+                    request: &complete_request,
+                    version_id: VersionId::Null,
+                    expected_object_parts: &expected_object_parts,
+                    bucket_write_reservation: crossed_proof,
+                },
+            ),
+            Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "build complete multipart object command",
+                }
+            ))
+        ));
+    }
+    let mut crossed_request = complete_request.clone();
+    crossed_request.key = crate::tests::object_key("crossed-completion-request-key");
+    assert!(matches!(
+        correct_multipart_completion_route.build_complete_multipart_object_command(
             BuildCompleteMultipartObjectCommandReq {
-                pg_id: wrong_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                request: &complete_request,
+                request: &crossed_request,
                 version_id: VersionId::Null,
                 expected_object_parts: &expected_object_parts,
                 bucket_write_reservation: &complete_proof,
             },
-        )
-    );
-    assert_object_payload_decode!(
-        ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
-            &client,
-            BuildCompleteMultipartObjectCommandReq {
-                pg_id: correct_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                request: &complete_request,
-                version_id: VersionId::Null,
-                expected_object_parts: &expected_object_parts,
-                bucket_write_reservation: &abort_proof,
-            },
-        )
-    );
+        ),
+        Err(ObjectPgActionError::Store(
+            StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build complete multipart object command",
+            }
+        ))
+    ));
 
     let abort_command = ObjectMutationMetadataNodeClient::build_abort_multipart_upload_command(
         &client,
@@ -5831,20 +5857,25 @@ fn unix_complete_multipart_uses_durable_initiation_identity() {
         selected_streaming_segments: Vec::new(),
         expected_cleanup: CompleteMultipartCommitCleanup::default(),
     };
+    let route =
+        ObjectMutationMetadataNodeClient::open_multipart_completion_mutation_metadata_route(
+            &client,
+            ClusterEpoch::INITIAL,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+        )
+        .unwrap();
     let mut proof = test_bucket_write_reservation_proof(bucket, &key);
     proof.operation_kind = COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
-    let error = ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
-        &client,
-        BuildCompleteMultipartObjectCommandReq {
-            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+    let error = route
+        .build_complete_multipart_object_command(BuildCompleteMultipartObjectCommandReq {
             request: &request,
             version_id: VersionId::Null,
             expected_object_parts: &[],
             bucket_write_reservation: &proof,
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
     assert!(matches!(
         error,
         ObjectPgActionError::MultipartConditionalRequestConflict
@@ -5966,16 +5997,16 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
             stale_payload: None,
         })),
     );
+    let route_epoch = ClusterEpoch::INITIAL;
+    let route_pg = ObjectMetadataPgId::new_for_test(PgId::new(0));
     let build = BuildCompleteMultipartObjectCommandReq {
-        pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-        cluster_epoch: ClusterEpoch::new(1).unwrap(),
         request: &request,
         version_id,
         expected_object_parts: &expected_object_parts,
         bucket_write_reservation: &proof,
     };
     client
-        .validate_complete_multipart_command_response(&command, &build)
+        .validate_complete_multipart_command_response(&command, route_epoch, route_pg, &build)
         .unwrap();
 
     let mut bad_payload = command.payload().clone();
@@ -5985,7 +6016,7 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
     bad_commit.parts[0].key = crate::tests::object_key("wrong-complete-mpu-key");
     let bad_command = MetadataCommandEnvelope::new(command.id(), bad_payload);
     let err = client
-        .validate_complete_multipart_command_response(&bad_command, &build)
+        .validate_complete_multipart_command_response(&bad_command, route_epoch, route_pg, &build)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -6002,7 +6033,7 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
     bad_commit.parts[0].data_pg_id = 424_242;
     let bad_command = MetadataCommandEnvelope::new(command.id(), bad_payload);
     let err = client
-        .validate_complete_multipart_command_response(&bad_command, &build)
+        .validate_complete_multipart_command_response(&bad_command, route_epoch, route_pg, &build)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -6029,15 +6060,18 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
         checksum: None,
     }];
     let missing_cleanup_build = BuildCompleteMultipartObjectCommandReq {
-        pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-        cluster_epoch: ClusterEpoch::new(1).unwrap(),
         request: &missing_cleanup_request,
         version_id,
         expected_object_parts: &expected_object_parts,
         bucket_write_reservation: &proof,
     };
     let err = client
-        .validate_complete_multipart_command_response(&command, &missing_cleanup_build)
+        .validate_complete_multipart_command_response(
+            &command,
+            route_epoch,
+            route_pg,
+            &missing_cleanup_build,
+        )
         .unwrap_err();
     assert!(matches!(
         err,
@@ -6055,7 +6089,12 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
     bad_cleanup.omitted_parts.push(part.clone());
     let bad_cleanup_command = MetadataCommandEnvelope::new(command.id(), bad_cleanup_payload);
     let err = client
-        .validate_complete_multipart_command_response(&bad_cleanup_command, &build)
+        .validate_complete_multipart_command_response(
+            &bad_cleanup_command,
+            route_epoch,
+            route_pg,
+            &build,
+        )
         .unwrap_err();
     assert!(matches!(
         err,
@@ -6079,8 +6118,6 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
         part.version_id = VersionId::Null;
     }
     let null_build = BuildCompleteMultipartObjectCommandReq {
-        pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-        cluster_epoch: ClusterEpoch::new(1).unwrap(),
         request: &null_request,
         version_id: VersionId::Null,
         expected_object_parts: &null_expected_object_parts,
@@ -6101,7 +6138,12 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
     ));
     let stale_command = MetadataCommandEnvelope::new(command.id(), stale_payload);
     let err = client
-        .validate_complete_multipart_command_response(&stale_command, &null_build)
+        .validate_complete_multipart_command_response(
+            &stale_command,
+            route_epoch,
+            route_pg,
+            &null_build,
+        )
         .unwrap_err();
     assert!(matches!(
         err,

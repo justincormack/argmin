@@ -5533,12 +5533,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::load_multipart_completion_stale_payload_source(
+        ObjectMutationMetadataNodeClient::open_multipart_completion_mutation_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
         )
+        .and_then(|route| route.load_stale_payload_source())
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5713,17 +5715,21 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
+        ObjectMutationMetadataNodeClient::open_multipart_completion_mutation_metadata_route(
             &local_client,
-            BuildCompleteMultipartObjectCommandReq {
-                pg_id: self.route.pg_id,
-                cluster_epoch: self.route.fence.cluster_epoch,
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+        )
+        .and_then(|route| {
+            route.build_complete_multipart_object_command(BuildCompleteMultipartObjectCommandReq {
                 request,
                 version_id,
                 expected_object_parts: &expected_object_parts,
                 bucket_write_reservation,
-            },
-        )
+            })
+        })
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
