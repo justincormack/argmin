@@ -4525,6 +4525,14 @@ pub struct ObjectReadSnapshot {
     pub multipart_part_segments: Vec<ObjectPayloadSegment>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ObjectPayloadPlacementDiagnosticError {
+    #[error("current object is a delete marker")]
+    DeleteMarker,
+    #[error("current object has no standard payload segments")]
+    NoStandardPayloadSegments,
+}
+
 impl ObjectReadSnapshot {
     pub(crate) fn from_records(
         stored: StoredObject,
@@ -4593,6 +4601,41 @@ impl ObjectReadSnapshot {
                 })
                 .collect(),
         })
+    }
+
+    /// Render storage-owned physical placement details for the local debug endpoint.
+    ///
+    /// This diagnostic text is not a stable wire or persistence format. Keeping the
+    /// rendering here prevents physical placement coordinates from becoming part of
+    /// the object-read interface used by other crates.
+    pub fn payload_placement_diagnostic(
+        &self,
+    ) -> Result<String, ObjectPayloadPlacementDiagnosticError> {
+        use std::fmt::Write as _;
+
+        let StoredObject::Live(live) = &self.stored else {
+            return Err(ObjectPayloadPlacementDiagnosticError::DeleteMarker);
+        };
+        if self.object_segments.is_empty() {
+            return Err(ObjectPayloadPlacementDiagnosticError::NoStandardPayloadSegments);
+        }
+
+        let mut diagnostic = String::new();
+        writeln!(diagnostic, "generation_id={}", live.generation_id.get())
+            .expect("writing to a String cannot fail");
+        writeln!(diagnostic, "segment_count={}", self.object_segments.len())
+            .expect("writing to a String cannot fail");
+        for segment in &self.object_segments {
+            writeln!(
+                diagnostic,
+                "segment_index={} data_pg_id={} placement_cluster_epoch={}",
+                segment.segment_index(),
+                segment.stored_bytes_request().data_pg_id,
+                segment.placement_cluster_epoch().get()
+            )
+            .expect("writing to a String cannot fail");
+        }
+        Ok(diagnostic)
     }
 }
 
@@ -5444,6 +5487,59 @@ mod tests {
         assert_eq!(
             format!("{segment:?}"),
             "ObjectPayloadSegment { segment_index: 3, size: 9, .. }"
+        );
+    }
+
+    #[test]
+    fn object_payload_placement_diagnostic_is_storage_owned() {
+        let bucket = BucketName::try_from("bucket".to_string()).unwrap();
+        let key = ObjectKey::try_from("key".to_string()).unwrap();
+        let generation_id = GenerationId::new(29).unwrap();
+        let stored = StoredObject::Live(LiveObjectRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id,
+            size: 9,
+            etag: ObjectEtag::single_part(17),
+            last_modified: 0,
+            became_noncurrent_at: None,
+            storage_class: StorageClass::Standard,
+            ec: EcShape { k: 4, m: 2 },
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        });
+        let segment = ObjectSegmentRecord {
+            bucket,
+            key,
+            version_id: VersionId::Null,
+            segment_index: 3,
+            size: 9,
+            segment_crc64: 17,
+            segment_okh: [23; 16],
+            segment_vid: generation_id,
+            data_pg_id: 31,
+            placement_cluster_epoch: ClusterEpoch::new(37).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+        };
+        let snapshot = ObjectReadSnapshot::from_records(stored, vec![segment], vec![], vec![])
+            .expect("matching payload snapshot");
+
+        assert_eq!(
+            snapshot.payload_placement_diagnostic().unwrap(),
+            concat!(
+                "generation_id=29\n",
+                "segment_count=1\n",
+                "segment_index=3 data_pg_id=31 placement_cluster_epoch=37\n",
+            )
         );
     }
 

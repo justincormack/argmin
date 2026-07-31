@@ -39,7 +39,7 @@ use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
 use storage::{BucketName, SessionId};
 #[cfg(any(test, feature = "local-debug-endpoints"))]
-use storage::{ObjectKey, ObjectReadSnapshot, ObjectReadSnapshotMode, PgId, StoredObject};
+use storage::{ObjectKey, ObjectReadSnapshot, ObjectReadSnapshotMode, PgId};
 
 const TRACE_TARGET: &str = "server_http";
 const MAX_STREAMING_POST_PART_HEADER_BYTES: usize = 8 * 1024;
@@ -1459,32 +1459,8 @@ fn local_debug_text_response(status_code: u16, body: String) -> S3Response {
 #[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_object_payload_placement_body(
     snapshot: &ObjectReadSnapshot,
-) -> Result<String, &'static str> {
-    use std::fmt::Write as _;
-
-    let StoredObject::Live(live) = &snapshot.stored else {
-        return Err("current object is a delete marker");
-    };
-    if snapshot.object_segments.is_empty() {
-        return Err("current object has no standard payload segments");
-    }
-
-    let mut body = String::new();
-    writeln!(body, "generation_id={}", live.generation_id.get())
-        .expect("writing to a String cannot fail");
-    writeln!(body, "segment_count={}", snapshot.object_segments.len())
-        .expect("writing to a String cannot fail");
-    for segment in &snapshot.object_segments {
-        writeln!(
-            body,
-            "segment_index={} data_pg_id={} placement_cluster_epoch={}",
-            segment.segment_index,
-            segment.data_pg_id,
-            segment.placement_cluster_epoch.get()
-        )
-        .expect("writing to a String cannot fail");
-    }
-    Ok(body)
+) -> Result<String, storage::ObjectPayloadPlacementDiagnosticError> {
+    snapshot.payload_placement_diagnostic()
 }
 
 #[cfg(any(test, feature = "local-debug-endpoints"))]
@@ -6906,11 +6882,9 @@ Connection: close\r\n\r\n",
             .unwrap()
             .unwrap()
             .snapshot;
-        let StoredObject::Live(expected_live) = expected.stored else {
-            panic!("test object should be live");
-        };
-        assert_eq!(expected.object_segments.len(), 1);
-        let expected_segment = &expected.object_segments[0];
+        let expected_body = expected
+            .payload_placement_diagnostic()
+            .expect("test object should have standard payload placement");
         let config = ServeConfig {
             local_debug_endpoint: true,
             ..ServeConfig::default()
@@ -6932,22 +6906,7 @@ Connection: close\r\n\r\n",
         let response = read_http_response(&mut stream, Duration::from_secs(3));
 
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(
-            response.contains(&format!(
-                "generation_id={}\n",
-                expected_live.generation_id.get()
-            )),
-            "{response}"
-        );
-        assert!(response.contains("segment_count=1\n"), "{response}");
-        assert!(
-            response.contains(&format!(
-                "segment_index=0 data_pg_id={} placement_cluster_epoch={}\n",
-                expected_segment.data_pg_id,
-                expected_segment.placement_cluster_epoch.get()
-            )),
-            "{response}"
-        );
+        assert!(response.ends_with(&expected_body), "{response}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
