@@ -860,13 +860,17 @@ impl UnixStorageNodeClient {
     pub(super) fn validate_create_multipart_upload_command_response(
         &self,
         command: &MetadataCommandEnvelope,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
         request: &BuildCreateMultipartUploadCommandReq<'_>,
     ) -> Result<(), ObjectPgActionError> {
         let context = "validate multipart upload command build response";
         self.validate_object_metadata_command_route(
             command,
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
+            pg_id.pg_id(),
+            route_cluster_epoch,
             context,
         )?;
         let MetadataCommandPayload::CreateMultipartUpload(create) = command.payload() else {
@@ -877,8 +881,8 @@ impl UnixStorageNodeClient {
         };
         let upload = &create.upload;
         if upload.upload_id != request.request.upload_id
-            || upload.bucket != request.request.bucket
-            || upload.key != request.request.key
+            || upload.bucket != *bucket
+            || upload.key != *key
             || upload.state != UploadState::InProgress
             || upload.tags != request.request.tags
             || upload.metadata_blob != request.request.metadata_blob

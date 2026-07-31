@@ -5266,6 +5266,16 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
                     },
                 ));
             }
+            if !command.matches_request(request) {
+                return Err(StorageNodeObjectRouteError::Route(
+                    StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message:
+                            "multipart upload match expected command does not match create request"
+                                .to_string(),
+                    },
+                ));
+            }
             self.require_object_mutation_proof(
                 &command.bucket_write_reservation,
                 CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
@@ -5276,12 +5286,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::matching_multipart_upload_initiated_at(
+        ObjectMutationMetadataNodeClient::open_multipart_upload_creation_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
-            request,
-            expected_command,
+            self.route.bucket,
+            self.route.key,
         )
+        .and_then(|route| route.matching_multipart_upload_initiated_at(request, expected_command))
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5311,16 +5323,20 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::build_create_multipart_upload_command(
+        ObjectMutationMetadataNodeClient::open_multipart_upload_creation_metadata_route(
             &local_client,
-            BuildCreateMultipartUploadCommandReq {
-                pg_id: self.route.pg_id,
-                cluster_epoch: self.route.fence.cluster_epoch,
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+        )
+        .and_then(|route| {
+            route.build_create_multipart_upload_command(BuildCreateMultipartUploadCommandReq {
                 request,
                 expected_current,
                 bucket_write_reservation,
-            },
-        )
+            })
+        })
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -25492,6 +25508,21 @@ mod tests {
             .unwrap(),
             Some(multipart_upload.initiated_at)
         );
+        let mut crossed_multipart_request = existing_multipart_request.clone();
+        crossed_multipart_request.metadata_blob = crate::SerializedMetadataBlob::new(vec![1]);
+        let crossed_expected_match = crate::clock::with_time_override(1_000, || {
+            primary_route.matching_multipart_upload_initiated_at(
+                &crossed_multipart_request,
+                Some(&expected_multipart_command),
+            )
+        });
+        match crossed_expected_match {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("does not match create request"));
+            }
+            other => panic!("crossed multipart creation request must fail: {other:?}"),
+        }
         let mut new_multipart_request = existing_multipart_request.clone();
         new_multipart_request.upload_id =
             crate::tests::multipart_upload_id("active-object-route-new-upload");

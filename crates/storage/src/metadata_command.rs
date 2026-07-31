@@ -1499,6 +1499,29 @@ impl CreateMultipartUploadCommand {
             bucket_write_reservation,
         }
     }
+
+    pub(crate) fn matches_request(&self, request: &CreateMultipartUploadReq) -> bool {
+        let upload = &self.upload;
+        (upload.upload_id == request.upload_id
+            || (crate::MultipartUploadIdKey::listing_position(&request.upload_id) == Some((0, 0))
+                && crate::MultipartUploadIdKey::has_same_issuance_identity(
+                    &upload.upload_id,
+                    &request.upload_id,
+                )))
+            && upload.bucket == request.bucket
+            && upload.key == request.key
+            && upload.state == crate::UploadState::InProgress
+            && upload.tags == request.tags
+            && upload.metadata_blob == request.metadata_blob
+            && upload.system_metadata_blob == request.system_metadata_blob
+            && upload.initiator == request.initiator
+            && upload.owner == request.owner
+            && upload.acl_grants == request.acl_grants
+            && upload.public_read == request.public_read
+            && upload.object_lock == request.object_lock
+            && upload.checksum == request.checksum
+            && upload.encryption == request.encryption
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

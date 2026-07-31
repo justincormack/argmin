@@ -1,6 +1,7 @@
 use super::*;
 use crate::metadata_command::{
     AbortStreamUploadCommand, DeleteObjectVersionMode,
+    CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
@@ -114,6 +115,14 @@ struct LocalPutObjectMetadataRoute<'a> {
 }
 
 struct LocalObjectDeleteMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
+struct LocalMultipartUploadCreationMetadataRoute<'a> {
     client: &'a LocalStorageNodeClient,
     route_cluster_epoch: ClusterEpoch,
     pg_id: ObjectMetadataPgId,
@@ -2575,6 +2584,140 @@ impl ObjectDeleteMetadataRoute for LocalObjectDeleteMetadataRoute<'_> {
     }
 }
 
+impl LocalMultipartUploadCreationMetadataRoute<'_> {
+    fn require_create_subject(
+        &self,
+        create: &CreateMultipartUploadReq,
+        operation: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        if create.bucket != self.bucket || create.key != self.key {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
+    }
+
+    fn require_expected_command_subject(
+        &self,
+        create: &CreateMultipartUploadReq,
+        command: &CreateMultipartUploadCommand,
+        operation: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        if command.upload.bucket != self.bucket
+            || command.upload.key != self.key
+            || !command.matches_request(create)
+            || !command
+                .bucket_write_reservation
+                .matches_exact_mutation_subject(
+                    self.route_cluster_epoch,
+                    &self.bucket,
+                    CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                    Some(self.key.as_str()),
+                )
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
+    }
+}
+
+impl MultipartUploadCreationMetadataRoute for LocalMultipartUploadCreationMetadataRoute<'_> {
+    fn matching_multipart_upload_initiated_at(
+        &self,
+        create: &CreateMultipartUploadReq,
+        expected_command: Option<&CreateMultipartUploadCommand>,
+    ) -> Result<Option<u64>, ObjectPgActionError> {
+        self.require_create_subject(create, "match multipart upload creation")?;
+        if let Some(command) = expected_command {
+            self.require_expected_command_subject(
+                create,
+                command,
+                "match multipart upload creation",
+            )?;
+        }
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        let upload_id =
+            expected_command.map_or(&create.upload_id, |command| &command.upload.upload_id);
+        match pg.get_multipart_upload(upload_id) {
+            Ok(existing)
+                if expected_command.is_some_and(|command| {
+                    multipart_upload_matches_command(&existing, command)
+                }) =>
+            {
+                Ok(Some(existing.initiated_at))
+            }
+            Ok(_) => Err(MetadataError::InvariantViolation {
+                context: "create multipart upload existing upload mismatch",
+                reason: "existing multipart upload does not match the command".into(),
+            }
+            .into()),
+            Err(MetadataError::NoSuchUpload { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn build_create_multipart_upload_command(
+        &self,
+        request: BuildCreateMultipartUploadCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        self.require_create_subject(request.request, "build create multipart upload command")?;
+        if request
+            .expected_current
+            .is_some_and(|stored| stored.bucket() != &self.bucket || stored.key() != &self.key)
+            || !request
+                .bucket_write_reservation
+                .matches_exact_mutation_subject(
+                    self.route_cluster_epoch,
+                    &self.bucket,
+                    CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                    Some(self.key.as_str()),
+                )
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build create multipart upload command",
+            }
+            .into());
+        }
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        let current = load_current_object_optional_from_pg(&pg, &self.bucket, &self.key)?;
+        if current.as_ref() != request.expected_current {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        match pg.get_multipart_upload(&request.request.upload_id) {
+            Ok(_) => {
+                return Err(MetadataError::InvariantViolation {
+                    context: "create multipart upload existing upload mismatch",
+                    reason: "multipart upload already exists".into(),
+                }
+                .into());
+            }
+            Err(MetadataError::NoSuchUpload { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let object_generation_id =
+            PgMetadataStore::next_generation_id(&*pg, &self.bucket, &self.key)?;
+        let command_id = self.client.next_metadata_command_id_from_locked_pg(
+            self.pg_id.pg_id(),
+            self.route_cluster_epoch,
+            &pg,
+        )?;
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::CreateMultipartUpload(Box::new(
+                CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+                    request.request.clone(),
+                    object_generation_id,
+                    current
+                        .as_ref()
+                        .map(|stored| pg.multipart_object_identity(stored))
+                        .transpose()?,
+                    crate::clock::current_time_millis(),
+                    request.bucket_write_reservation.clone(),
+                ),
+            )),
+        ))
+    }
+}
+
 impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
     fn open_put_object_metadata_route(
         &self,
@@ -2622,6 +2765,29 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         }))
     }
 
+    fn open_multipart_upload_creation_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn MultipartUploadCreationMetadataRoute + '_>, ObjectPgActionError> {
+        if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open multipart upload creation metadata route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalMultipartUploadCreationMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
+    }
+
     fn matching_stream_upload_exists(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -2629,15 +2795,6 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         expected_command: Option<&CreateStreamUploadCommand>,
     ) -> Result<bool, ObjectPgActionError> {
         Self::matching_stream_upload_exists(self, pg_id, create, expected_command)
-    }
-
-    fn matching_multipart_upload_initiated_at(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        create: &CreateMultipartUploadReq,
-        expected_command: Option<&CreateMultipartUploadCommand>,
-    ) -> Result<Option<u64>, ObjectPgActionError> {
-        Self::matching_multipart_upload_initiated_at(self, pg_id, create, expected_command)
     }
 
     fn load_stream_upload_session(
@@ -2733,13 +2890,6 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         request: BuildCreateStreamUploadCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         Self::build_create_stream_upload_command(self, request)
-    }
-
-    fn build_create_multipart_upload_command(
-        &self,
-        request: BuildCreateMultipartUploadCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        Self::build_create_multipart_upload_command(self, request)
     }
 
     fn load_stream_upload_segments(
@@ -3432,33 +3582,6 @@ impl LocalStorageNodeClient {
         }
     }
 
-    fn matching_multipart_upload_initiated_at(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        create: &CreateMultipartUploadReq,
-        expected_command: Option<&CreateMultipartUploadCommand>,
-    ) -> Result<Option<u64>, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let upload_id =
-            expected_command.map_or(&create.upload_id, |command| &command.upload.upload_id);
-        match pg.get_multipart_upload(upload_id) {
-            Ok(existing)
-                if expected_command.is_some_and(|command| {
-                    multipart_upload_matches_command(&existing, command)
-                }) =>
-            {
-                Ok(Some(existing.initiated_at))
-            }
-            Ok(_) => Err(MetadataError::InvariantViolation {
-                context: "create multipart upload existing upload mismatch",
-                reason: "existing multipart upload does not match the command".into(),
-            }
-            .into()),
-            Err(MetadataError::NoSuchUpload { .. }) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    }
-
     fn build_create_stream_upload_command(
         &self,
         request: BuildCreateStreamUploadCommandReq<'_>,
@@ -3550,57 +3673,6 @@ impl LocalStorageNodeClient {
                     request.request.clone(),
                     crate::clock::current_time_millis(),
                     request.cleanup_after,
-                    request.bucket_write_reservation.clone(),
-                ),
-            )),
-        ))
-    }
-
-    fn build_create_multipart_upload_command(
-        &self,
-        request: BuildCreateMultipartUploadCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(request.pg_id.get())?;
-        let current = load_current_object_optional_from_pg(
-            &pg,
-            &request.request.bucket,
-            &request.request.key,
-        )?;
-        if current.as_ref() != request.expected_current {
-            return Err(ObjectPgActionError::StaleObjectReadSubject);
-        }
-        match pg.get_multipart_upload(&request.request.upload_id) {
-            Ok(_) => {
-                return Err(MetadataError::InvariantViolation {
-                    context: "create multipart upload existing upload mismatch",
-                    reason: "multipart upload already exists".into(),
-                }
-                .into());
-            }
-            Err(MetadataError::NoSuchUpload { .. }) => {}
-            Err(error) => return Err(error.into()),
-        }
-        let object_generation_id = PgMetadataStore::next_generation_id(
-            &*pg,
-            &request.request.bucket,
-            &request.request.key,
-        )?;
-        let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
-            &pg,
-        )?;
-        Ok(MetadataCommandEnvelope::new(
-            command_id,
-            MetadataCommandPayload::CreateMultipartUpload(Box::new(
-                CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
-                    request.request.clone(),
-                    object_generation_id,
-                    current
-                        .as_ref()
-                        .map(|stored| pg.multipart_object_identity(stored))
-                        .transpose()?,
-                    crate::clock::current_time_millis(),
                     request.bucket_write_reservation.clone(),
                 ),
             )),

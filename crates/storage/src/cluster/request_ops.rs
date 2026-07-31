@@ -13058,6 +13058,14 @@ impl super::StorageCluster {
                 )?;
 
                 let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+                let multipart_creation_route = mutation_client
+                    .open_multipart_upload_creation_metadata_route(
+                        self.operation_epoch(),
+                        object_pg_id,
+                        bucket,
+                        key,
+                    )
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
                 require_valid_route()?;
                 let current_object = mutation_client
                     .open_object_delete_metadata_route(
@@ -13088,8 +13096,8 @@ impl super::StorageCluster {
                 require_valid_route()?;
                 let applied_create =
                     super::applied_multipart_create_command(&applied_commands, &create);
-                if let Some(initiated_at) = mutation_client
-                    .matching_multipart_upload_initiated_at(object_pg_id, &create, applied_create)
+                if let Some(initiated_at) = multipart_creation_route
+                    .matching_multipart_upload_initiated_at(&create, applied_create)
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
                 {
                     return Ok(Ok(Attempt::Complete(CreateMultipartUploadOutcome {
@@ -13102,15 +13110,12 @@ impl super::StorageCluster {
                     })));
                 }
 
-                let mut command = match mutation_client.build_create_multipart_upload_command(
-                    BuildCreateMultipartUploadCommandReq {
-                        pg_id: object_pg_id,
-                        cluster_epoch: self.operation_epoch(),
+                let mut command = match multipart_creation_route
+                    .build_create_multipart_upload_command(BuildCreateMultipartUploadCommandReq {
                         request: &create,
                         expected_current: current_object.stored.as_ref(),
                         bucket_write_reservation: &proof,
-                    },
-                ) {
+                    }) {
                     Ok(command) => command,
                     Err(ObjectPgActionError::StaleObjectReadSubject) => {
                         return Ok(Ok(Attempt::Retry));

@@ -532,19 +532,20 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         key: &ObjectKey,
     ) -> Result<Box<dyn ObjectDeleteMetadataRoute + '_>, ObjectPgActionError>;
 
+    fn open_multipart_upload_creation_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn MultipartUploadCreationMetadataRoute + '_>, ObjectPgActionError>;
+
     fn matching_stream_upload_exists(
         &self,
         pg_id: ObjectMetadataPgId,
         create: &CreateStreamUploadReq,
         expected_command: Option<&CreateStreamUploadCommand>,
     ) -> Result<bool, ObjectPgActionError>;
-
-    fn matching_multipart_upload_initiated_at(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        create: &CreateMultipartUploadReq,
-        expected_command: Option<&CreateMultipartUploadCommand>,
-    ) -> Result<Option<u64>, ObjectPgActionError>;
 
     fn load_stream_upload_session(
         &self,
@@ -610,11 +611,6 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
     fn build_create_stream_upload_command(
         &self,
         request: BuildCreateStreamUploadCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
-
-    fn build_create_multipart_upload_command(
-        &self,
-        request: BuildCreateMultipartUploadCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 
     fn load_stream_upload_segments(
@@ -820,6 +816,19 @@ pub(crate) trait ObjectDeleteMetadataRoute: Send {
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 }
 
+pub(crate) trait MultipartUploadCreationMetadataRoute: Send {
+    fn matching_multipart_upload_initiated_at(
+        &self,
+        create: &CreateMultipartUploadReq,
+        expected_command: Option<&CreateMultipartUploadCommand>,
+    ) -> Result<Option<u64>, ObjectPgActionError>;
+
+    fn build_create_multipart_upload_command(
+        &self,
+        request: BuildCreateMultipartUploadCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+}
+
 /// Cleanup authority for exact object-metadata subjects which may need to
 /// outlive the active route that created them.
 pub(crate) trait RetainedObjectMutationMetadataNodeClient: Send + Sync {
@@ -932,8 +941,6 @@ pub(crate) struct BuildCreateStreamUploadCommandReq<'a> {
 }
 
 pub(crate) struct BuildCreateMultipartUploadCommandReq<'a> {
-    pub(crate) pg_id: ObjectMetadataPgId,
-    pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) request: &'a CreateMultipartUploadReq,
     pub(crate) expected_current: Option<&'a StoredObject>,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,

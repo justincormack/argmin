@@ -2459,26 +2459,6 @@ fn create_stream_upload_command_matches_request(
         && command.initial_next_segment_vid == GenerationId::MIN
 }
 
-fn create_multipart_upload_command_matches_request(
-    command: &CreateMultipartUploadCommand,
-    request: &CreateMultipartUploadReq,
-) -> bool {
-    command.upload.upload_id == request.upload_id
-        && command.upload.bucket == request.bucket
-        && command.upload.key == request.key
-        && command.upload.state == UploadState::InProgress
-        && command.upload.tags == request.tags
-        && command.upload.metadata_blob == request.metadata_blob
-        && command.upload.system_metadata_blob == request.system_metadata_blob
-        && command.upload.initiator == request.initiator
-        && command.upload.owner == request.owner
-        && command.upload.acl_grants == request.acl_grants
-        && command.upload.public_read == request.public_read
-        && command.upload.object_lock == request.object_lock
-        && command.upload.checksum == request.checksum
-        && command.upload.encryption == request.encryption
-}
-
 fn validate_stream_put_finalize_snapshot_identity(
     object: &StorageRpcObjectRequest,
     session_id: &SessionId,
@@ -5768,9 +5748,11 @@ pub(crate) fn encode_multipart_upload_match_request(
     request: &StorageRpcMultipartUploadMatchRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
     validate_create_multipart_upload_request_identity(&request.object, &request.request)?;
-    if request.expected_command.as_ref().is_some_and(|command| {
-        !create_multipart_upload_command_matches_request(command, &request.request)
-    }) {
+    if request
+        .expected_command
+        .as_ref()
+        .is_some_and(|command| !command.matches_request(&request.request))
+    {
         return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
             "multipart upload match expected command identity mismatch",
         ));
@@ -5792,7 +5774,7 @@ pub(crate) fn decode_multipart_upload_match_request(
     validate_create_multipart_upload_request_identity(&object, &request)?;
     if expected_command
         .as_ref()
-        .is_some_and(|command| !create_multipart_upload_command_matches_request(command, &request))
+        .is_some_and(|command| !command.matches_request(&request))
     {
         return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
             "multipart upload match expected command identity mismatch",
@@ -22043,6 +22025,77 @@ mod tests {
         let bytes = encode_object_generation_reservation_response(&response);
         let decoded = decode_object_generation_reservation_response(&bytes).unwrap();
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn multipart_upload_match_request_round_trips_ordered_command_for_provisional_id() {
+        let bucket = BucketName::try_from("ordered-multipart-match-bucket").unwrap();
+        let key = ObjectKey::try_from("ordered-multipart-match-key").unwrap();
+        let upload_id_key = MultipartUploadIdKey::from_bytes([0x5a; 32]);
+        let provisional_upload_id = upload_id_key.issue(&bucket, &key, "owner").unwrap();
+        let ordered_upload_id = upload_id_key.with_listing_position(
+            &bucket,
+            &key,
+            &provisional_upload_id,
+            ClusterEpoch::INITIAL.get(),
+            17,
+        );
+        let request = CreateMultipartUploadReq {
+            upload_id: provisional_upload_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            initiator: OwnerIdentity::from_principal("owner"),
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_lock: ObjectLockState::default(),
+            checksum: None,
+            encryption: ObjectEncryption::None,
+        };
+        let mut ordered_request = request.clone();
+        ordered_request.upload_id = ordered_upload_id;
+        let expected_command =
+            CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+                ordered_request,
+                GenerationId::new(9).unwrap(),
+                None,
+                123,
+                BucketWriteReservationProof {
+                    bucket: bucket.clone(),
+                    reservation_id: "reservation-1".to_string(),
+                    owner_token: "owner-token".to_string(),
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    bucket_execution_generation: 1,
+                    bucket_incarnation_generation: 1,
+                    operation_kind:
+                        crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND
+                            .to_string(),
+                    created_at: 100,
+                    lease_deadline: 200,
+                    target_context: Some(key.as_str().to_string()),
+                },
+            );
+        assert!(expected_command.matches_request(&request));
+        let rpc_request = StorageRpcMultipartUploadMatchRequest {
+            object: StorageRpcObjectRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                pg_id: PgId::new(3),
+                bucket,
+                key,
+            },
+            request,
+            expected_command: Some(expected_command),
+        };
+
+        let bytes = encode_multipart_upload_match_request(&rpc_request).unwrap();
+        assert_eq!(
+            decode_multipart_upload_match_request(&bytes).unwrap(),
+            rpc_request
+        );
     }
 
     #[test]

@@ -166,6 +166,131 @@ fn unix_retained_object_mutation_route_rejects_foreign_claim_before_rpc() {
 }
 
 #[test]
+fn unix_multipart_creation_route_rejects_foreign_authority_before_rpc() {
+    let client = test_unix_storage_node_client();
+    let bucket = crate::tests::bucket_name("unix-multipart-create-route-bucket");
+    let key = crate::tests::object_key("unix-multipart-create-route-key");
+    let pg_id = ObjectMetadataPgId::new_for_test(PgId::new(0));
+    let foreign_epoch = ClusterEpoch::new(client.cluster_epoch.get() + 1).unwrap();
+    let epoch_error =
+        ObjectMutationMetadataNodeClient::open_multipart_upload_creation_metadata_route(
+            &client,
+            foreign_epoch,
+            pg_id,
+            &bucket,
+            &key,
+        )
+        .err()
+        .expect("foreign multipart creation route epoch must be rejected before RPC");
+    assert!(matches!(
+        epoch_error,
+        ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+            pg_id: 0,
+            operation_epoch,
+            current_epoch,
+        }) if operation_epoch == foreign_epoch && current_epoch == client.cluster_epoch
+    ));
+
+    let route = ObjectMutationMetadataNodeClient::open_multipart_upload_creation_metadata_route(
+        &client,
+        client.cluster_epoch,
+        pg_id,
+        &bucket,
+        &key,
+    )
+    .unwrap();
+    let request = CreateMultipartUploadReq {
+        upload_id: crate::tests::multipart_upload_id("unix-multipart-create-route"),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: SerializedMetadataBlob::default(),
+        system_metadata_blob: SerializedSystemMetadataBlob::default(),
+        initiator: OwnerIdentity::from_principal("owner"),
+        owner: OwnerIdentity::from_principal("owner"),
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        object_lock: ObjectLockState::default(),
+        checksum: None,
+        encryption: ObjectEncryption::None,
+    };
+    let mut proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+    proof.operation_kind =
+        crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
+    let expected_command = CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+        request.clone(),
+        GenerationId::MIN,
+        None,
+        1,
+        proof.clone(),
+    );
+    let mut crossed_id = request.clone();
+    crossed_id.upload_id = crate::tests::multipart_upload_id("unix-multipart-create-crossed-id");
+    let mut crossed_metadata = request.clone();
+    crossed_metadata.metadata_blob = SerializedMetadataBlob::new(vec![1]);
+    for (case, crossed_request) in [("upload ID", crossed_id), ("metadata", crossed_metadata)] {
+        let error = route
+            .matching_multipart_upload_initiated_at(&crossed_request, Some(&expected_command))
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "match multipart upload creation",
+                })
+            ),
+            "crossed multipart creation {case} must fail before RPC: {error:?}"
+        );
+    }
+
+    let mut foreign_request = request.clone();
+    foreign_request.key = crate::tests::object_key("unix-multipart-create-route-foreign-key");
+    let subject_error = route
+        .build_create_multipart_upload_command(BuildCreateMultipartUploadCommandReq {
+            request: &foreign_request,
+            expected_current: None,
+            bucket_write_reservation: &proof,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        subject_error,
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "build create multipart upload command",
+        })
+    ));
+
+    let mut crossed_operation = proof.clone();
+    crossed_operation.operation_kind =
+        crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND.to_string();
+    let mut crossed_target = proof.clone();
+    crossed_target.target_context = Some("unix-multipart-create-crossed-key".to_string());
+    let mut crossed_epoch = proof.clone();
+    crossed_epoch.cluster_epoch = foreign_epoch;
+    for (case, crossed_proof) in [
+        ("operation", crossed_operation),
+        ("target", crossed_target),
+        ("epoch", crossed_epoch),
+    ] {
+        let error = route
+            .build_create_multipart_upload_command(BuildCreateMultipartUploadCommandReq {
+                request: &request,
+                expected_current: None,
+                bucket_write_reservation: &crossed_proof,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "build create multipart upload command",
+                })
+            ),
+            "crossed multipart creation proof {case} must fail before RPC: {error:?}"
+        );
+    }
+}
+
+#[test]
 fn unix_object_payload_reclaim_claim_release_survives_expired_route() {
     let tmp = test_util::tempdir();
     let mut config = test_config(&tmp);
@@ -1477,24 +1602,33 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         checksum: None,
         encryption: ObjectEncryption::None,
     };
-    assert_eq!(
-        ObjectMutationMetadataNodeClient::matching_multipart_upload_initiated_at(
+    let correct_multipart_creation_route =
+        ObjectMutationMetadataNodeClient::open_multipart_upload_creation_metadata_route(
             &client,
+            ClusterEpoch::INITIAL,
             correct_object_pg,
-            &multipart_request,
-            None,
+            &bucket,
+            &key,
         )
-        .unwrap(),
+        .unwrap();
+    let wrong_multipart_creation_route =
+        ObjectMutationMetadataNodeClient::open_multipart_upload_creation_metadata_route(
+            &client,
+            ClusterEpoch::INITIAL,
+            wrong_object_pg,
+            &bucket,
+            &key,
+        )
+        .unwrap();
+    assert_eq!(
+        correct_multipart_creation_route
+            .matching_multipart_upload_initiated_at(&multipart_request, None)
+            .unwrap(),
         None,
         "correctly routed absent multipart upload must be a positive request canary"
     );
-    let multipart_match_error =
-        ObjectMutationMetadataNodeClient::matching_multipart_upload_initiated_at(
-            &client,
-            wrong_object_pg,
-            &multipart_request,
-            None,
-        )
+    let multipart_match_error = wrong_multipart_creation_route
+        .matching_multipart_upload_initiated_at(&multipart_request, None)
         .unwrap_err();
     assert!(matches!(
         multipart_match_error,
@@ -1506,17 +1640,12 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     let mut create_multipart_proof = metadata_proof.clone();
     create_multipart_proof.operation_kind =
         crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
-    let multipart_command_error =
-        ObjectMutationMetadataNodeClient::build_create_multipart_upload_command(
-            &client,
-            BuildCreateMultipartUploadCommandReq {
-                pg_id: wrong_object_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                request: &multipart_request,
-                expected_current: current_delete_snapshot.stored.as_ref(),
-                bucket_write_reservation: &create_multipart_proof,
-            },
-        )
+    let multipart_command_error = wrong_multipart_creation_route
+        .build_create_multipart_upload_command(BuildCreateMultipartUploadCommandReq {
+            request: &multipart_request,
+            expected_current: current_delete_snapshot.stored.as_ref(),
+            bucket_write_reservation: &create_multipart_proof,
+        })
         .unwrap_err();
     match multipart_command_error {
         ObjectPgActionError::Store(StoreError::StorageRpc {
@@ -3560,27 +3689,27 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     let mut multipart_proof = proof.clone();
     multipart_proof.operation_kind =
         crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
-    assert_eq!(
-        ObjectMutationMetadataNodeClient::matching_multipart_upload_initiated_at(
+    let multipart_creation_route =
+        ObjectMutationMetadataNodeClient::open_multipart_upload_creation_metadata_route(
             &client,
+            ClusterEpoch::INITIAL,
             ObjectMetadataPgId::new_for_test(PgId::new(0)),
-            &multipart_request,
-            None,
+            &bucket,
+            &key,
         )
-        .unwrap(),
+        .unwrap();
+    assert_eq!(
+        multipart_creation_route
+            .matching_multipart_upload_initiated_at(&multipart_request, None)
+            .unwrap(),
         None
     );
-    let multipart_command =
-        ObjectMutationMetadataNodeClient::build_create_multipart_upload_command(
-            &client,
-            BuildCreateMultipartUploadCommandReq {
-                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                request: &multipart_request,
-                expected_current: Some(&stored),
-                bucket_write_reservation: &multipart_proof,
-            },
-        )
+    let multipart_command = multipart_creation_route
+        .build_create_multipart_upload_command(BuildCreateMultipartUploadCommandReq {
+            request: &multipart_request,
+            expected_current: Some(&stored),
+            bucket_write_reservation: &multipart_proof,
+        })
         .unwrap();
     let MetadataCommandPayload::CreateMultipartUpload(multipart_create) =
         multipart_command.payload()
@@ -3632,12 +3761,14 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     let err = client
         .validate_create_multipart_upload_command_response(
             &bad_multipart_command,
+            ClusterEpoch::INITIAL,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
             &BuildCreateMultipartUploadCommandReq {
-                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 request: &multipart_request,
                 expected_current: Some(&stored),
-                bucket_write_reservation: &proof,
+                bucket_write_reservation: &multipart_proof,
             },
         )
         .unwrap_err();
@@ -4569,6 +4700,113 @@ fn unix_object_mutation_client_loads_multipart_upload_over_rpc() {
     assert_eq!(upload.key, key);
     assert_eq!(upload.upload_id, upload_id);
     assert_eq!(upload.state, UploadState::InProgress);
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn unix_multipart_creation_match_accepts_ordered_command_for_provisional_id() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    let bucket = crate::tests::bucket_name("ordered-multipart-match-rpc-bucket");
+    let key = crate::tests::object_key("ordered-multipart-match-rpc-key");
+    let upload_id_key = crate::MultipartUploadIdKey::from_bytes([0x5a; 32]);
+    let provisional_upload_id = upload_id_key.issue(&bucket, &key, "owner").unwrap();
+    let ordered_upload_id = upload_id_key.with_listing_position(
+        &bucket,
+        &key,
+        &provisional_upload_id,
+        ClusterEpoch::INITIAL.get(),
+        1,
+    );
+    let request = CreateMultipartUploadReq {
+        upload_id: provisional_upload_id,
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: SerializedMetadataBlob::default(),
+        system_metadata_blob: SerializedSystemMetadataBlob::default(),
+        initiator: OwnerIdentity::from_principal("owner"),
+        owner: OwnerIdentity::from_principal("owner"),
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        object_lock: ObjectLockState::default(),
+        checksum: None,
+        encryption: ObjectEncryption::None,
+    };
+    let mut ordered_request = request.clone();
+    ordered_request.upload_id = ordered_upload_id;
+    let expected_command = CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+        ordered_request,
+        GenerationId::new(1).unwrap(),
+        None,
+        123,
+        BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "reservation-1".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind:
+                crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND
+                    .to_string(),
+            created_at: 100,
+            lease_deadline: 200,
+            target_context: Some(key.as_str().to_string()),
+        },
+    );
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &crate::CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateMultipartUpload(Box::new(expected_command.clone())),
+        );
+        pg.apply_metadata_command_and_record(7, &command).unwrap();
+    }
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let client = UnixStorageNodeClient::new(
+        NodeId::new(7),
+        ClusterEpoch::INITIAL,
+        config.socket_path.clone(),
+    );
+    let route = ObjectMutationMetadataNodeClient::open_multipart_upload_creation_metadata_route(
+        &client,
+        ClusterEpoch::INITIAL,
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
+        &bucket,
+        &key,
+    )
+    .unwrap();
+
+    assert_eq!(
+        route
+            .matching_multipart_upload_initiated_at(&request, Some(&expected_command))
+            .unwrap(),
+        Some(123)
+    );
     server_thread.join().unwrap();
 }
 

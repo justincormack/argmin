@@ -1,5 +1,6 @@
 use super::*;
 use crate::metadata_command::{
+    CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
@@ -43,6 +44,14 @@ struct UnixPutObjectMetadataRoute<'a> {
 }
 
 struct UnixObjectDeleteMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
+struct UnixMultipartUploadCreationMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
     route_cluster_epoch: ClusterEpoch,
     pg_id: ObjectMetadataPgId,
@@ -2651,6 +2660,149 @@ impl ObjectDeleteMetadataRoute for UnixObjectDeleteMetadataRoute<'_> {
     }
 }
 
+impl UnixMultipartUploadCreationMetadataRoute<'_> {
+    fn require_create_subject(
+        &self,
+        create: &CreateMultipartUploadReq,
+        operation: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        if create.bucket != self.bucket || create.key != self.key {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
+    }
+
+    fn require_expected_command_subject(
+        &self,
+        create: &CreateMultipartUploadReq,
+        command: &CreateMultipartUploadCommand,
+        operation: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        if command.upload.bucket != self.bucket
+            || command.upload.key != self.key
+            || !command.matches_request(create)
+            || !command
+                .bucket_write_reservation
+                .matches_exact_mutation_subject(
+                    self.route_cluster_epoch,
+                    &self.bucket,
+                    CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                    Some(self.key.as_str()),
+                )
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
+    }
+}
+
+impl MultipartUploadCreationMetadataRoute for UnixMultipartUploadCreationMetadataRoute<'_> {
+    fn matching_multipart_upload_initiated_at(
+        &self,
+        create: &CreateMultipartUploadReq,
+        expected_command: Option<&CreateMultipartUploadCommand>,
+    ) -> Result<Option<u64>, ObjectPgActionError> {
+        self.require_create_subject(create, "match multipart upload creation")?;
+        if let Some(command) = expected_command {
+            self.require_expected_command_subject(
+                create,
+                command,
+                "match multipart upload creation",
+            )?;
+        }
+        let request = StorageRpcMultipartUploadMatchRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            request: create.clone(),
+            expected_command: expected_command.cloned(),
+        };
+        let payload = encode_multipart_upload_match_request(&request).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.client
+                    .rpc_payload_error("encode multipart upload match request", error.to_string()),
+            )
+        })?;
+        let response = self
+            .client
+            .rpc_request(StorageRpcMessageKind::ObjectMultipartUploadMatch, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_multipart_upload_match_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.client
+                    .rpc_payload_error("decode multipart upload match response", error.to_string()),
+            )
+        })?;
+        self.client
+            .validate_multipart_upload_match_response(response.initiated_at, expected_command)?;
+        Ok(response.initiated_at)
+    }
+
+    fn build_create_multipart_upload_command(
+        &self,
+        request: BuildCreateMultipartUploadCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        self.require_create_subject(request.request, "build create multipart upload command")?;
+        if request
+            .expected_current
+            .is_some_and(|stored| stored.bucket() != &self.bucket || stored.key() != &self.key)
+            || !request
+                .bucket_write_reservation
+                .matches_exact_mutation_subject(
+                    self.route_cluster_epoch,
+                    &self.bucket,
+                    CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                    Some(self.key.as_str()),
+                )
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build create multipart upload command",
+            }
+            .into());
+        }
+        let rpc_request = StorageRpcCreateMultipartUploadCommandBuildRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            request: request.request.clone(),
+            expected_current: request.expected_current.cloned(),
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload = encode_create_multipart_upload_command_build_request(&rpc_request).map_err(
+            |error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "encode multipart upload command build request",
+                    error.to_string(),
+                ))
+            },
+        )?;
+        match self.client.object_metadata_command_build_request(
+            StorageRpcMessageKind::ObjectMultipartUploadCommandBuild,
+            self.pg_id.pg_id(),
+            payload,
+            "decode multipart upload command build response",
+            ObjectPgActionError::StaleObjectReadSubject,
+            |command| {
+                self.client
+                    .validate_create_multipart_upload_command_response(
+                        command,
+                        self.route_cluster_epoch,
+                        self.pg_id,
+                        &self.bucket,
+                        &self.key,
+                        &request,
+                    )
+            },
+        )? {
+            Some(command) => Ok(command),
+            None => Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                "decode multipart upload command build response",
+                "multipart upload command build cannot return missing".to_string(),
+            ))),
+        }
+    }
+}
+
 impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
     fn open_put_object_metadata_route(
         &self,
@@ -2668,6 +2820,30 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             .into());
         }
         Ok(Box::new(UnixPutObjectMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
+    }
+
+    fn open_multipart_upload_creation_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn MultipartUploadCreationMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixMultipartUploadCreationMetadataRoute {
             client: self,
             route_cluster_epoch,
             pg_id,
@@ -2702,34 +2878,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         })?;
         self.validate_stream_upload_match_response(response.exists, expected_command)?;
         Ok(response.exists)
-    }
-
-    fn matching_multipart_upload_initiated_at(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        create: &CreateMultipartUploadReq,
-        expected_command: Option<&CreateMultipartUploadCommand>,
-    ) -> Result<Option<u64>, ObjectPgActionError> {
-        let request = StorageRpcMultipartUploadMatchRequest {
-            object: self.object_request(pg_id.pg_id(), &create.bucket, &create.key),
-            request: create.clone(),
-            expected_command: expected_command.cloned(),
-        };
-        let payload = encode_multipart_upload_match_request(&request).map_err(|error| {
-            ObjectPgActionError::Store(
-                self.rpc_payload_error("encode multipart upload match request", error.to_string()),
-            )
-        })?;
-        let response = self
-            .rpc_request(StorageRpcMessageKind::ObjectMultipartUploadMatch, payload)
-            .map_err(ObjectPgActionError::Store)?;
-        let response = decode_multipart_upload_match_response(&response).map_err(|error| {
-            ObjectPgActionError::Store(
-                self.rpc_payload_error("decode multipart upload match response", error.to_string()),
-            )
-        })?;
-        self.validate_multipart_upload_match_response(response.initiated_at, expected_command)?;
-        Ok(response.initiated_at)
     }
 
     fn load_stream_upload_session(
@@ -3240,44 +3388,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             None => Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 "decode stream upload command build response",
                 "stream upload command build cannot return missing".to_string(),
-            ))),
-        }
-    }
-
-    fn build_create_multipart_upload_command(
-        &self,
-        request: BuildCreateMultipartUploadCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let rpc_request = StorageRpcCreateMultipartUploadCommandBuildRequest {
-            object: self.object_request(
-                request.pg_id.pg_id(),
-                &request.request.bucket,
-                &request.request.key,
-            ),
-            request: request.request.clone(),
-            expected_current: request.expected_current.cloned(),
-            bucket_write_reservation: request.bucket_write_reservation.clone(),
-        };
-        let payload = encode_create_multipart_upload_command_build_request(&rpc_request).map_err(
-            |error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "encode multipart upload command build request",
-                    error.to_string(),
-                ))
-            },
-        )?;
-        match self.object_metadata_command_build_request(
-            StorageRpcMessageKind::ObjectMultipartUploadCommandBuild,
-            request.pg_id.pg_id(),
-            payload,
-            "decode multipart upload command build response",
-            ObjectPgActionError::StaleObjectReadSubject,
-            |command| self.validate_create_multipart_upload_command_response(command, &request),
-        )? {
-            Some(command) => Ok(command),
-            None => Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                "decode multipart upload command build response",
-                "multipart upload command build cannot return missing".to_string(),
             ))),
         }
     }

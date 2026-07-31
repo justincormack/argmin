@@ -734,31 +734,6 @@ fn applied_stream_create_command<'a>(
     })
 }
 
-fn multipart_create_request_matches_upload(
-    upload: &MultipartUploadRecord,
-    create: &crate::CreateMultipartUploadReq,
-) -> bool {
-    (upload.upload_id == create.upload_id
-        || (crate::MultipartUploadIdKey::listing_position(&create.upload_id) == Some((0, 0))
-            && crate::MultipartUploadIdKey::has_same_issuance_identity(
-                &upload.upload_id,
-                &create.upload_id,
-            )))
-        && upload.bucket == create.bucket
-        && upload.key == create.key
-        && upload.state == crate::UploadState::InProgress
-        && upload.tags == create.tags
-        && upload.metadata_blob == create.metadata_blob
-        && upload.system_metadata_blob == create.system_metadata_blob
-        && upload.initiator == create.initiator
-        && upload.owner == create.owner
-        && upload.acl_grants == create.acl_grants
-        && upload.public_read == create.public_read
-        && upload.object_lock == create.object_lock
-        && upload.checksum == create.checksum
-        && upload.encryption == create.encryption
-}
-
 fn applied_multipart_create_command<'a>(
     applied_commands: &'a [MetadataCommandEnvelope],
     create: &crate::CreateMultipartUploadReq,
@@ -768,7 +743,8 @@ fn applied_multipart_create_command<'a>(
         else {
             return None;
         };
-        multipart_create_request_matches_upload(&create_command.upload, create)
+        create_command
+            .matches_request(create)
             .then_some(create_command.as_ref())
     })
 }
@@ -10405,6 +10381,13 @@ impl StorageCluster {
                     &marker.bucket,
                     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
                     Some(marker.key.as_str()),
+                ),
+            MetadataCommandPayload::CreateMultipartUpload(create) => proof
+                .matches_exact_mutation_subject(
+                    command.id().cluster_epoch(),
+                    &create.upload.bucket,
+                    crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                    Some(create.upload.key.as_str()),
                 ),
             _ => true,
         };

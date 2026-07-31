@@ -342,6 +342,125 @@ fn object_delete_modes_reject_crossed_live_reservation_operations() {
 }
 
 #[test]
+fn multipart_creation_fanout_rejects_live_crossed_reservation_subjects() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let bucket = crate::tests::bucket_name("multipart-create-crossed-proof-bucket");
+    let key = crate::tests::object_key("multipart-create-crossed-proof-key");
+    create_test_bucket(&cluster, &bucket);
+
+    let correct = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        )
+        .unwrap();
+    let operation = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        )
+        .unwrap();
+    let target = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+            Some("multipart-create-crossed-proof-other-key"),
+        )
+        .unwrap();
+    let request = crate::CreateMultipartUploadReq {
+        upload_id: crate::tests::multipart_upload_id("multipart-create-crossed-proof"),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("owner"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    let pg_id = PgId::new(0);
+    let command = |proof| {
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::CreateMultipartUpload(Box::new(
+                crate::metadata_command::CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+                    request.clone(),
+                    crate::GenerationId::MIN,
+                    None,
+                    1,
+                    proof,
+                ),
+            )),
+        )
+    };
+
+    cluster
+        .validate_metadata_command_bucket_write_reservation(&command(
+            crate::metadata_command::BucketWriteReservationProof::from(&correct.record),
+        ))
+        .unwrap();
+    for (case, proof) in [
+        (
+            "operation",
+            crate::metadata_command::BucketWriteReservationProof::from(&operation.record),
+        ),
+        (
+            "target",
+            crate::metadata_command::BucketWriteReservationProof::from(&target.record),
+        ),
+    ] {
+        let error = cluster
+            .validate_metadata_command_bucket_write_reservation(&command(proof))
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::BucketWriteReservationConflict { .. }
+                )
+            ),
+            "crossed multipart creation proof {case} must fail central validation: {error:?}"
+        );
+    }
+
+    let malformed = command(crate::metadata_command::BucketWriteReservationProof::from(
+        &operation.record,
+    ));
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &malformed);
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .unwrap();
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_multipart_upload(&*pg, &request.upload_id),
+            Err(crate::MetadataError::NoSuchUpload { .. })
+        ));
+    }
+}
+
+#[test]
 fn object_metadata_pending_install_race_drains_winner_and_retries() {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
