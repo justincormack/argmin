@@ -12071,7 +12071,8 @@ impl StorageCluster {
                     return Ok(PendingMetadataCommandOutcome::Applied);
                 }
                 Err(error)
-                    if error.applied_nodes > 0
+                    if (error.applied_nodes > 0
+                        || route_mode == MetadataCommandRouteMode::Normal)
                         && Self::metadata_command_log_conflict_matches(&command, &error.source)
                         && self
                             .partial_exact_metadata_command_conflict_is_retryable_with_route_mode(

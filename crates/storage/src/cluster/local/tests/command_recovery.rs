@@ -6546,6 +6546,87 @@ fn partial_abandoned_create_bucket_retry_rebuilds_command_before_reporting_creat
 }
 
 #[test]
+fn fully_applied_primary_pending_reservation_drain_clears_exact_slot() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let pg_id = PgId::new(object_pg);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            key,
+            crate::SessionId::try_from("59".repeat(16)).unwrap(),
+            crate::GenerationId::MIN,
+            123,
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let conflict_injected = Arc::new(AtomicBool::new(false));
+    let hook_map = Arc::clone(&map);
+    let hook_command = command.clone();
+    let conflict_injected_hook = Arc::clone(&conflict_injected);
+    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, candidate| {
+            if node_id != NodeId::new(1) || *candidate != hook_command {
+                return Ok(());
+            }
+            assert!(!conflict_injected_hook.swap(true, Ordering::SeqCst));
+            for replica_node_id in node_ids {
+                let pg = hook_map
+                    .node(replica_node_id)
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(candidate.id().pg_id().get())?;
+                pg.apply_metadata_command_and_record(replica_node_id.as_u32(), candidate)
+                    .map_err(|error| match error {
+                        crate::BucketSnapshotLoadError::Store(error) => error,
+                        crate::BucketSnapshotLoadError::Metadata(error) => {
+                            panic!("manual reservation apply failed: {error}")
+                        }
+                    })?;
+            }
+            Err(StoreError::MetadataCommandLogConflict {
+                node_id: node_id.as_u32(),
+                pg_id: candidate.id().pg_id().get(),
+                cluster_epoch: candidate.id().cluster_epoch(),
+                log_index: candidate.id().log_index().get(),
+            })
+        },
+    ));
+
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_recovery_gate(pg_id, &command)
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    drop(hook_guard);
+    assert!(conflict_injected.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    assert_eq!(map.test_next_metadata_command_log_index(pg_id).get(), 2);
+}
+
+#[test]
 fn partial_abandoned_reservation_retry_does_not_report_skipped_command_success() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
