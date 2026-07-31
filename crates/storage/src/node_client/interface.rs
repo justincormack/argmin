@@ -1501,6 +1501,33 @@ pub(crate) trait MetadataCommandRecoveryNodeClient: Send + Sync {
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
     ) -> Result<Box<dyn MetadataCommandRecoveryCriticalSection>, StoreError>;
+
+    /// Apply one authorized recovery command on a historical replica.
+    ///
+    /// The server serializes this single mutation internally. Unlike the
+    /// primary critical section, this capability does not authorize pending
+    /// slot inspection or replacement on the replica.
+    fn apply_metadata_command_and_record_on_recovery_replica(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
+
+    /// Record one certificate-bound recovery tombstone on a historical replica.
+    ///
+    /// The server serializes only this mutation internally, without granting
+    /// the reporting-primary inspection and replacement capability.
+    fn record_metadata_command_abandoned_on_recovery_replica(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
 }
 
 /// Pending-command convergence and explicitly authorized recovery mutation
@@ -1703,6 +1730,14 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
+
+    /// Record one tombstone on a current-route replica without granting the
+    /// primary-only metadata-command critical-section capability.
+    fn record_metadata_command_abandoned_on_replica(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
 }
 
 /// Active publisher authority serialized for one metadata PG and epoch.

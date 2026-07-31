@@ -612,6 +612,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::MetadataCommandRetainedAbortApply
         | StorageRpcMessageKind::MetadataCommandRetainedAbortFinish
         | StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord
+        | StorageRpcMessageKind::MetadataCommandRecoveryRecordAbandoned
         | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord
         | StorageRpcMessageKind::MetadataCommandPgLockAcquire
         | StorageRpcMessageKind::MetadataCommandPgLockRelease

@@ -9027,6 +9027,17 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::MetadataCommandRecoveryRecordAbandoned => {
+                match decode_metadata_command_recovery_request(&frame.payload) {
+                    Ok(request) => {
+                        self.metadata_command_recovery_record_abandoned_response(session, request)
+                    }
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord => {
                 match decode_metadata_command_request(&frame.payload) {
                     Ok(request) => self.metadata_command_peering_replay_apply_and_record_response(
@@ -14697,14 +14708,55 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_metadata_command_recovery(
-            request.node_id,
-            request.cluster_epoch,
-            request.pg_id,
+        if let Err(error) = validate_metadata_command_request_epoch(&request) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let mutation_fence = if request.cluster_epoch == self.config.cluster_epoch {
+            if let Err(error) =
+                self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+            {
+                return encode_storage_rpc_error_response(&error);
+            }
+            StorageNodeRouteFence::current(&self.config, self.current_route_map_lease())
+        } else {
+            let required_binding = StorageNodeMetadataCommandLockBinding {
+                pg_id: request.pg_id,
+                cluster_epoch: request.cluster_epoch,
+                authority: StorageNodeMetadataCommandLockAuthority::HistoricalRecoveryPrimary,
+            };
+            if !session.holds_metadata_command_pg_lock_with_binding(required_binding) {
+                return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::StaleShardLocation,
+                    message: format!(
+                        "historical metadata command abandonment for PG {} epoch {} requires the exact held recovery-primary lock binding",
+                        request.pg_id.get(),
+                        request.cluster_epoch.get(),
+                    ),
+                });
+            }
+            if let Err(error) = self
+                .validate_historical_active_pg_route_for_metadata_command_recovery(
+                    request.node_id,
+                    request.cluster_epoch,
+                    request.pg_id,
+                )
+            {
+                return encode_storage_rpc_error_response(&error);
+            }
+            match self
+                .bounded_historical_metadata_command_fence(request.cluster_epoch, request.pg_id)
+            {
+                Ok(fence) => fence,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            }
+        };
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
+        if let Err(error) = mutation_fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.record_metadata_command_abandoned(self.config.node_id.as_u32(), &request.command)
         }) {
@@ -14864,6 +14916,65 @@ impl StorageNodeConnectionHandler {
             },
             mutation_fence,
         )
+    }
+
+    fn metadata_command_recovery_record_abandoned_response(
+        &self,
+        session: &StorageNodeSession,
+        request: StorageRpcMetadataCommandRecoveryRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let mutation_fence = match self.validate_reissued_metadata_command_recovery(
+            request.node_id,
+            request.pg_id,
+            &request.authorized_source,
+            request.abandoned_source.as_ref(),
+            &request.command,
+        ) {
+            Ok(fence) => fence,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
+        if let Err(error) = mutation_fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+            pg.record_metadata_command_abandoned(self.config.node_id.as_u32(), &request.command)
+        }) {
+            Ok(state) => encode_metadata_command_state_outcome_response(
+                &StorageRpcMetadataCommandStateOutcomeResponse {
+                    outcome: StorageRpcMetadataCommandStateOutcome::State(state),
+                },
+            ),
+            Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            }) => {
+                emit_storage_node_metadata_command_log_conflict(
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                    Some(request.command.payload().kind_name()),
+                );
+                encode_metadata_command_state_outcome_response(
+                    &StorageRpcMetadataCommandStateOutcomeResponse {
+                        outcome: StorageRpcMetadataCommandStateOutcome::LogConflict {
+                            node_id,
+                            pg_id,
+                            cluster_epoch,
+                            log_index,
+                        },
+                    },
+                )
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(encode_storage_rpc_success_response(&response))
     }
 
     fn metadata_command_peering_replay_apply_and_record_response(
@@ -15661,17 +15772,23 @@ impl StorageNodeConnectionHandler {
         session: &mut StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route_validation = if request.cluster_epoch < self.config.cluster_epoch {
-            self.validate_metadata_command_recovery_primary_lock(
-                request.node_id,
-                request.cluster_epoch,
-                request.pg_id,
+        let (route_validation, authority) = if request.cluster_epoch < self.config.cluster_epoch {
+            (
+                self.validate_metadata_command_recovery_primary_lock(
+                    request.node_id,
+                    request.cluster_epoch,
+                    request.pg_id,
+                ),
+                StorageNodeMetadataCommandLockAuthority::HistoricalRecoveryPrimary,
             )
         } else {
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-                .and_then(|()| {
-                    self.validate_primary_pg(request.pg_id, "metadata command critical section")
-                })
+            (
+                self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+                    .and_then(|()| {
+                        self.validate_primary_pg(request.pg_id, "metadata command critical section")
+                    }),
+                StorageNodeMetadataCommandLockAuthority::CurrentPrimary,
+            )
         };
         if let Err(error) = route_validation {
             return encode_storage_rpc_error_response(&error);
@@ -15679,7 +15796,11 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = session.acquire_metadata_command_pg_lock(
             &self.metadata_command_locks,
             self.config.node_id,
-            request.pg_id,
+            StorageNodeMetadataCommandLockBinding {
+                pg_id: request.pg_id,
+                cluster_epoch: request.cluster_epoch,
+                authority,
+            },
             session.current_rpc_context(),
         ) {
             return encode_storage_rpc_error_response(&error);
@@ -15956,6 +16077,14 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
+        self.bounded_historical_metadata_command_fence(cluster_epoch, pg_id)
+    }
+
+    fn bounded_historical_metadata_command_fence(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<StorageNodeRouteFence, StorageRpcErrorResponse> {
         let valid_until_ms = self.config.route_map_valid_until_ms().ok_or_else(|| {
             StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::StaleShardLocation,
@@ -18242,8 +18371,26 @@ struct StorageNodeSession {
     node: Arc<SharedStorageNode>,
     read_operations: BTreeMap<String, SessionReadHandle>,
     object_payload_lease: Option<SessionObjectPayloadLease>,
-    metadata_command_guards: BTreeMap<PgId, StorageNodeMetadataCommandGuard>,
+    metadata_command_guards: BTreeMap<PgId, StorageNodeSessionMetadataCommandGuard>,
     current_rpc_context: Option<StorageNodeMetadataCommandLockContext>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StorageNodeMetadataCommandLockAuthority {
+    CurrentPrimary,
+    HistoricalRecoveryPrimary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StorageNodeMetadataCommandLockBinding {
+    pg_id: PgId,
+    cluster_epoch: ClusterEpoch,
+    authority: StorageNodeMetadataCommandLockAuthority,
+}
+
+struct StorageNodeSessionMetadataCommandGuard {
+    binding: StorageNodeMetadataCommandLockBinding,
+    _guard: StorageNodeMetadataCommandGuard,
 }
 
 struct ValidatedReadHandleAcquireRequest {
@@ -18278,6 +18425,15 @@ impl StorageNodeSession {
         self.metadata_command_guards.contains_key(&pg_id)
     }
 
+    fn holds_metadata_command_pg_lock_with_binding(
+        &self,
+        binding: StorageNodeMetadataCommandLockBinding,
+    ) -> bool {
+        self.metadata_command_guards
+            .get(&binding.pg_id)
+            .is_some_and(|held| held.binding == binding)
+    }
+
     fn has_metadata_command_pg_locks(&self) -> bool {
         !self.metadata_command_guards.is_empty()
     }
@@ -18300,14 +18456,33 @@ impl StorageNodeSession {
         &mut self,
         locks: &StorageNodeMetadataCommandLocks,
         node_id: NodeId,
-        pg_id: PgId,
+        binding: StorageNodeMetadataCommandLockBinding,
         context: Option<StorageNodeMetadataCommandLockContext>,
     ) -> Result<(), StorageRpcErrorResponse> {
-        if self.metadata_command_guards.contains_key(&pg_id) {
-            return Ok(());
+        if let Some(held) = self.metadata_command_guards.get(&binding.pg_id) {
+            if held.binding == binding {
+                return Ok(());
+            }
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "metadata command lock for PG {} is bound to epoch {} {:?}, not epoch {} {:?}",
+                    binding.pg_id.get(),
+                    held.binding.cluster_epoch.get(),
+                    held.binding.authority,
+                    binding.cluster_epoch.get(),
+                    binding.authority,
+                ),
+            });
         }
-        let guard = locks.acquire(node_id, pg_id, context)?;
-        self.metadata_command_guards.insert(pg_id, guard);
+        let guard = locks.acquire(node_id, binding.pg_id, context)?;
+        self.metadata_command_guards.insert(
+            binding.pg_id,
+            StorageNodeSessionMetadataCommandGuard {
+                binding,
+                _guard: guard,
+            },
+        );
         Ok(())
     }
 
@@ -20363,7 +20538,11 @@ mod tests {
             .acquire_metadata_command_pg_lock(
                 &server.metadata_command_locks,
                 config.node_id,
-                PgId::new(0),
+                StorageNodeMetadataCommandLockBinding {
+                    pg_id: PgId::new(0),
+                    cluster_epoch: config.cluster_epoch,
+                    authority: StorageNodeMetadataCommandLockAuthority::CurrentPrimary,
+                },
                 None,
             )
             .unwrap();
@@ -23923,6 +24102,126 @@ mod tests {
 
         drop(client);
         join.join().unwrap();
+    }
+
+    #[test]
+    fn storage_node_session_rejects_current_primary_lock_for_historical_abandonment() {
+        let tmp = test_util::tempdir();
+        let source_epoch = ClusterEpoch::INITIAL;
+        let current_epoch = ClusterEpoch::new(2).unwrap();
+        let config = bounded_runtime_refresh_config(test_config(&tmp));
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let command = test_metadata_command(0, 1);
+        let source_route = config.pg_routes[0].clone();
+        let local_node_id = config.node_id;
+        let socket_path = config.socket_path.clone();
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let serving = Arc::clone(&server);
+        let join = thread::spawn(move || serving.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let current_lock_response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: local_node_id,
+                cluster_epoch: source_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        decode_storage_rpc_response_payload(&current_lock_response.payload)
+            .unwrap()
+            .unwrap();
+
+        let mut next_config = bounded_runtime_refresh_config(config);
+        next_config.cluster_epoch = current_epoch;
+        next_config.pg_routes[0].cluster_epoch = current_epoch;
+        next_config.pg_routes[0].state = PgState::Peering;
+        next_config.historical_pg_routes.push(source_route);
+        next_config.pending_metadata_command_recoveries.push((
+            PgId::new(0),
+            PendingMetadataCommandRecovery::new(
+                local_node_id,
+                PendingMetadataCommandObservation::new(
+                    source_epoch,
+                    std::num::NonZeroU64::MIN,
+                    command.checksum_crc64(),
+                ),
+            ),
+        ));
+        server
+            .install_control_plane_runtime_config(next_config)
+            .unwrap();
+
+        let historical_lock_response = send_frame(
+            &mut client,
+            2,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: local_node_id,
+                cluster_epoch: source_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        let historical_lock_error =
+            decode_storage_rpc_response_payload(&historical_lock_response.payload)
+                .unwrap()
+                .unwrap_err();
+        assert_eq!(
+            historical_lock_error.code,
+            StorageRpcErrorCode::StaleShardLocation
+        );
+        assert!(historical_lock_error.message.contains("CurrentPrimary"));
+        assert!(historical_lock_error
+            .message
+            .contains("HistoricalRecoveryPrimary"));
+
+        let abandonment_response = send_frame(
+            &mut client,
+            3,
+            StorageRpcMessageKind::MetadataCommandRecordAbandoned,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: local_node_id,
+                cluster_epoch: source_epoch,
+                pg_id: PgId::new(0),
+                command: command.clone(),
+            })
+            .unwrap(),
+        );
+        let abandonment_error = decode_storage_rpc_response_payload(&abandonment_response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            abandonment_error.code,
+            StorageRpcErrorCode::StaleShardLocation
+        );
+        assert!(abandonment_error
+            .message
+            .contains("exact held recovery-primary lock binding"));
+
+        let release_response = send_frame(
+            &mut client,
+            4,
+            StorageRpcMessageKind::MetadataCommandPgLockRelease,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: local_node_id,
+                cluster_epoch: source_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        decode_storage_rpc_response_payload(&release_response.payload)
+            .unwrap()
+            .unwrap();
+        drop(client);
+        join.join().unwrap();
+
+        assert!(!server
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .metadata_command_abandoned(local_node_id.as_u32(), &command)
+            .unwrap());
     }
 
     #[test]
@@ -31629,6 +31928,18 @@ mod tests {
         let join = thread::spawn(move || serving.accept_one().unwrap());
 
         let mut client = UnixStream::connect(socket_path).unwrap();
+        let lockless_historical_abandon_response = send_frame(
+            &mut client,
+            100,
+            StorageRpcMessageKind::MetadataCommandRecordAbandoned,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: source_route_epoch,
+                pg_id: PgId::new(0),
+                command: source.clone(),
+            })
+            .unwrap(),
+        );
         let lock_response = send_frame(
             &mut client,
             1,
@@ -31760,6 +32071,17 @@ mod tests {
             cleanup_before_tombstone_error.code,
             StorageRpcErrorCode::PayloadDecode
         );
+        let lockless_historical_abandon_error =
+            decode_storage_rpc_response_payload(&lockless_historical_abandon_response.payload)
+                .unwrap()
+                .unwrap_err();
+        assert_eq!(
+            lockless_historical_abandon_error.code,
+            StorageRpcErrorCode::StaleShardLocation
+        );
+        assert!(lockless_historical_abandon_error
+            .message
+            .contains("held recovery-primary lock"));
         for response in [
             &lock_response,
             &abandoned_response,
@@ -32811,6 +33133,86 @@ mod tests {
             .pending_metadata_command_slot(7, ClusterEpoch::new(1).unwrap())
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn current_replica_abandonment_rechecks_route_fence_after_pg_lock_wait() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let pg_id = PgId::new(0);
+        let command = test_metadata_command(pg_id.get(), 1);
+        let holder = server
+            .metadata_command_locks
+            .acquire(config.node_id, pg_id, None)
+            .unwrap();
+        let valid_until_ms = crate::clock::current_time_millis().saturating_add(1_500);
+        config.route_map_validity = RouteMapValidity::until_ms_saturating(valid_until_ms);
+        server.install_control_plane_runtime_config(config).unwrap();
+        let handler = server.connection_handler();
+
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let wait_count = Arc::new(AtomicU64::new(0));
+        let release_wait = Arc::new(Barrier::new(2));
+        let wait_count_hook = Arc::clone(&wait_count);
+        let release_wait_hook = Arc::clone(&release_wait);
+        server
+            .metadata_command_locks
+            .set_before_wait_hook(Arc::new(move |actual_pg_id| {
+                assert_eq!(actual_pg_id, pg_id);
+                if wait_count_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                    waiting_tx.send(()).unwrap();
+                    release_wait_hook.wait();
+                }
+            }));
+
+        let (response_tx, response_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let session = StorageNodeSession::new(
+                Arc::clone(&handler.read_handles),
+                Arc::clone(&handler.node),
+            );
+            let response = handler
+                .metadata_command_record_abandoned_response(
+                    &session,
+                    StorageRpcMetadataCommandRequest {
+                        node_id: NodeId::new(7),
+                        cluster_epoch: ClusterEpoch::INITIAL,
+                        pg_id,
+                        command,
+                    },
+                )
+                .unwrap();
+            response_tx.send(response).unwrap();
+        });
+
+        if let Err(wait_error) = waiting_rx.recv_timeout(Duration::from_secs(2)) {
+            drop(holder);
+            let response = response_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            join.join().unwrap();
+            panic!(
+                "replica abandonment did not wait for the held PG lock: {wait_error:?}; response={:?}",
+                decode_storage_rpc_response_payload(&response)
+            );
+        }
+        let remaining_ms = valid_until_ms.saturating_sub(crate::clock::current_time_millis());
+        thread::sleep(Duration::from_millis(remaining_ms.saturating_add(20)));
+        drop(holder);
+        release_wait.wait();
+
+        let response = response_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        join.join().unwrap();
+        let error = decode_storage_rpc_response_payload(&response)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+        assert!(!server
+            ._node
+            .get_pg(pg_id.get())
+            .unwrap()
+            .metadata_command_abandoned(NodeId::new(7).as_u32(), &test_metadata_command(0, 1))
+            .unwrap());
     }
 
     #[test]

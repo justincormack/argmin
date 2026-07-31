@@ -4850,6 +4850,45 @@ impl MetadataCommandRecoveryNodeClient for LocalStorageNodeClient {
             cluster_epoch,
         }))
     }
+
+    fn apply_metadata_command_and_record_on_recovery_replica(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        let route = LocalMetadataCommandRecoveryCriticalSection {
+            client: self.clone(),
+            pg_id,
+            cluster_epoch,
+        };
+        route.apply_metadata_command_and_record_for_recovery(
+            authorized_source,
+            abandoned_source,
+            command,
+        )
+    }
+
+    fn record_metadata_command_abandoned_on_recovery_replica(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let route = LocalMetadataCommandRecoveryCriticalSection {
+            client: self.clone(),
+            pg_id,
+            cluster_epoch,
+        };
+        route.validate_command_route(authorized_source)?;
+        route.validate_optional_command_route(abandoned_source)?;
+        route.validate_command_route(command)?;
+        route.record_metadata_command_abandoned(command)
+    }
 }
 
 impl MetadataCommandRecoveryCriticalSection for LocalMetadataCommandRecoveryCriticalSection {
@@ -5262,5 +5301,14 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
         self.apply_metadata_command_and_record_inner(pg_id, command)
+    }
+
+    fn record_metadata_command_abandoned_on_replica(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.record_metadata_command_abandoned(self.node_id.as_u32(), command)
     }
 }

@@ -1613,6 +1613,20 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
             "decode metadata command apply and record response",
         )
     }
+
+    fn record_metadata_command_abandoned_on_replica(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let held_pg_id = self.metadata_command_pg_id();
+        if pg_id != held_pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "record metadata command abandoned on bound replica",
+            });
+        }
+        MetadataCommandRecoveryCriticalSection::record_metadata_command_abandoned(self, command)
+    }
 }
 impl ShardReadHandleNodeClient for UnixStorageNodeClient {
     fn open_shard_read_handle_route(

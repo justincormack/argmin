@@ -12171,9 +12171,12 @@ impl StorageCluster {
                     MetadataCommandRouteMode::Normal => {
                         self.record_abandoned_metadata_command_to_acting_set(&command)
                     }
-                    MetadataCommandRouteMode::Recovery => {
-                        self.record_abandoned_metadata_command_to_acting_set_for_recovery(&command)
-                    }
+                    MetadataCommandRouteMode::Recovery => self
+                        .record_abandoned_metadata_command_to_acting_set_for_recovery(
+                            &command,
+                            recovery_authorized_source.as_ref(),
+                            recovery_abandoned_source.as_ref(),
+                        ),
                 };
                 record_result.map_err(|error| {
                     bucket_snapshot_error_to_object_pg_action_error(error.source)
@@ -12322,7 +12325,11 @@ impl StorageCluster {
                             self.record_abandoned_metadata_command_to_acting_set(&command)
                         }
                         MetadataCommandRouteMode::Recovery => self
-                            .record_abandoned_metadata_command_to_acting_set_for_recovery(&command),
+                            .record_abandoned_metadata_command_to_acting_set_for_recovery(
+                                &command,
+                                recovery_authorized_source.as_ref(),
+                                recovery_abandoned_source.as_ref(),
+                            ),
                     }
                     .map_err(|error| {
                         bucket_snapshot_error_to_object_pg_action_error(error.source)

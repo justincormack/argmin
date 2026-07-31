@@ -552,6 +552,7 @@ fn assert_historical_pending_command_recovery_over_unix(
     pre_applied_node_count: usize,
     current_epoch_delta: u64,
     bucket_pg_command: bool,
+    abandon_on_primary: bool,
 ) {
     let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1)];
@@ -564,15 +565,21 @@ fn assert_historical_pending_command_recovery_over_unix(
         "unix-pending-recovery-{pre_applied_node_count}-{current_epoch_delta}"
     ))
     .unwrap();
+    let precursor_bucket = BucketName::new(format!(
+        "unix-pending-recovery-precursor-{pre_applied_node_count}-{current_epoch_delta}"
+    ))
+    .unwrap();
     let key = ObjectKey::new("key").unwrap();
+    let precursor =
+        create_bucket_metadata_command_with_epoch(pg_id, 1, precursor_bucket, command_epoch);
     let command = if bucket_pg_command {
-        create_bucket_metadata_command_with_epoch(pg_id, 1, bucket.clone(), command_epoch)
+        create_bucket_metadata_command_with_epoch(pg_id, 2, bucket.clone(), command_epoch)
     } else {
         MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 command_epoch,
                 pg_id,
-                MetadataCommandLogIndex::new(1).unwrap(),
+                MetadataCommandLogIndex::new(2).unwrap(),
             ),
             MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
                 bucket.clone(),
@@ -583,7 +590,7 @@ fn assert_historical_pending_command_recovery_over_unix(
     };
     let pending = crate::control_plane::PendingMetadataCommandObservation::new(
         command_epoch,
-        std::num::NonZeroU64::MIN,
+        std::num::NonZeroU64::new(2).unwrap(),
         command.checksum_crc64(),
     );
     let recovery =
@@ -621,6 +628,8 @@ fn assert_historical_pending_command_recovery_over_unix(
                 SharedStorageNode::open_with_default_ec_shape(&data_dir, &[pg_id.get()], ec_shape)
                     .unwrap();
             let pg = node.get_pg(pg_id.get()).unwrap();
+            pg.apply_metadata_command_and_record(NodeId::new(0).as_u32(), &precursor)
+                .unwrap();
             if node_id == NodeId::new(0) {
                 pg.try_insert_pending_metadata_command_slot(
                     NodeId::new(0).as_u32(),
@@ -628,8 +637,12 @@ fn assert_historical_pending_command_recovery_over_unix(
                     Some(&bucket),
                 )
                 .unwrap();
+                if abandon_on_primary {
+                    pg.record_metadata_command_abandoned(NodeId::new(0).as_u32(), &command)
+                        .unwrap();
+                }
             }
-            if (node_id.as_u32() as usize) < pre_applied_node_count {
+            if !abandon_on_primary && (node_id.as_u32() as usize) < pre_applied_node_count {
                 pg.apply_metadata_command_and_record(NodeId::new(0).as_u32(), &command)
                     .unwrap();
             }
@@ -680,11 +693,16 @@ fn assert_historical_pending_command_recovery_over_unix(
         .unwrap();
     let cluster = StorageCluster::from_static_local_map(Arc::new(historical_map)).unwrap();
 
+    let outcome = cluster
+        .drain_pending_metadata_command_with_authorized_recovery_route(pg_id, &command, &cluster)
+        .unwrap();
     assert_eq!(
-        cluster
-            .drain_pending_metadata_command_with_recovery_gate(pg_id, &command)
-            .unwrap(),
-        PendingMetadataCommandOutcome::Applied
+        outcome,
+        if abandon_on_primary {
+            PendingMetadataCommandOutcome::Abandoned
+        } else {
+            PendingMetadataCommandOutcome::Applied
+        }
     );
     drop(cluster);
     drop(server_guards);
@@ -701,7 +719,7 @@ fn assert_historical_pending_command_recovery_over_unix(
         let replica_state = pg.metadata_command_replica_state().unwrap();
         assert_eq!(
             replica_state.applied_log_index,
-            1,
+            2,
             "node {} did not converge the historical command",
             config.node_id.as_u32()
         );
@@ -715,16 +733,25 @@ fn assert_historical_pending_command_recovery_over_unix(
         } else {
             expected_replica_state = Some(replica_state);
         }
-        if bucket_pg_command {
+        assert_eq!(
+            pg.metadata_command_abandoned(config.node_id.as_u32(), &command)
+                .unwrap(),
+            abandon_on_primary,
+            "node {} retained the wrong abandonment state",
+            config.node_id.as_u32()
+        );
+        if bucket_pg_command && !abandon_on_primary {
             let bucket_info = crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
             assert_eq!(bucket_info.name, bucket);
-        } else {
+        } else if !bucket_pg_command {
             assert_eq!(
                 crate::PgMetadataStore::next_version_id(&*pg, &bucket, &key).unwrap(),
-                crate::VersionId::from_u64(2),
+                crate::VersionId::from_u64(if abandon_on_primary { 1 } else { 2 }),
                 "node {} did not apply the object-version reservation",
                 config.node_id.as_u32()
             );
+        } else {
+            assert!(crate::PgMetadataStore::head_bucket(&*pg, &bucket).is_err());
         }
         if config.node_id == NodeId::new(0) {
             assert!(
@@ -737,14 +764,165 @@ fn assert_historical_pending_command_recovery_over_unix(
     }
 }
 
+fn assert_current_pending_command_abandonment_fans_out_over_unix() {
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1)];
+    let pg_id = PgId::new(0);
+    let ec_shape = EcShape { k: 1, m: 0 };
+    let cluster_epoch = ClusterEpoch::INITIAL;
+    let bucket = BucketName::new("unix-current-abandonment").unwrap();
+    let precursor = create_bucket_metadata_command_with_epoch(
+        pg_id,
+        1,
+        BucketName::new("unix-current-abandonment-precursor").unwrap(),
+        cluster_epoch,
+    );
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster_epoch,
+            pg_id,
+            MetadataCommandLogIndex::new(2).unwrap(),
+        ),
+        MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+            bucket.clone(),
+            ObjectKey::new("key").unwrap(),
+            crate::VersionId::from_u64(1),
+        )),
+    );
+    let route = StorageNodePgRoute {
+        pg_id: pg_id.get(),
+        cluster_epoch,
+        state: PgState::Active,
+        primary_node_id: NodeId::new(0),
+        metadata_transfer_destination_epoch: None,
+        acting_set: node_ids.to_vec(),
+    };
+
+    let mut client_configs = Vec::new();
+    let mut server_configs = Vec::new();
+    for node_id in node_ids {
+        let data_dir = tmp
+            .path()
+            .join(format!("current-abandonment-node-{}", node_id.as_u32()));
+        let socket_path = tmp.path().join("sockets").join(format!(
+            "current-abandonment-node-{}.sock",
+            node_id.as_u32()
+        ));
+        private_socket_dir(socket_path.parent().unwrap());
+        {
+            let node =
+                SharedStorageNode::open_with_default_ec_shape(&data_dir, &[pg_id.get()], ec_shape)
+                    .unwrap();
+            let pg = node.get_pg(pg_id.get()).unwrap();
+            pg.apply_metadata_command_and_record(NodeId::new(0).as_u32(), &precursor)
+                .unwrap();
+            if node_id == NodeId::new(0) {
+                pg.try_insert_pending_metadata_command_slot(
+                    node_id.as_u32(),
+                    &command,
+                    Some(&bucket),
+                )
+                .unwrap();
+                pg.record_metadata_command_abandoned(node_id.as_u32(), &command)
+                    .unwrap();
+            }
+        }
+        client_configs.push(LocalUnixStorageNodeClientConfig::new(
+            node_id,
+            socket_path.clone(),
+        ));
+        server_configs.push(StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch,
+            route_map_validity: RouteMapValidity::until_ms_saturating(
+                crate::clock::current_time_millis().saturating_add(60_000),
+            ),
+            data_dir,
+            default_ec_shape: ec_shape,
+            pg_ids: vec![pg_id.get()],
+            socket_path,
+            pg_routes: vec![route.clone()],
+            historical_pg_routes: Vec::new(),
+            pending_metadata_command_recoveries: Vec::new(),
+        });
+    }
+
+    let server_guards = server_configs
+        .iter()
+        .cloned()
+        .map(|config| spawn_storage_node_server(StorageNodeServer::bind(config).unwrap()))
+        .collect::<Vec<_>>();
+    let mut map = LocalClusterMap::open_frontend_topology_only_with_pg_routes(
+        NodeId::new(0),
+        node_ids,
+        &[pg_id.get()],
+        ec_shape,
+        cluster_epoch,
+        [LocalPgRoute::from(&PgRouteSnapshot::reconstructed(
+            cluster_epoch,
+            pg_id,
+            NodeId::new(0),
+            node_ids.to_vec(),
+            PgState::Active,
+        ))],
+    )
+    .unwrap();
+    map.install_unix_storage_node_clients(client_configs)
+        .unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
+
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_recovery_gate(pg_id, &command)
+            .unwrap(),
+        PendingMetadataCommandOutcome::Abandoned
+    );
+    drop(cluster);
+    drop(server_guards);
+
+    for config in server_configs {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &[pg_id.get()],
+            ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(pg_id.get()).unwrap();
+        assert!(
+            pg.metadata_command_abandoned(config.node_id.as_u32(), &command)
+                .unwrap(),
+            "node {} did not retain the current-route tombstone",
+            config.node_id.as_u32()
+        );
+        if config.node_id == NodeId::new(0) {
+            assert!(
+                pg.pending_metadata_command_envelope(config.node_id.as_u32(), cluster_epoch)
+                    .unwrap()
+                    .is_none(),
+                "current primary retained the terminal pending slot"
+            );
+        }
+    }
+}
+
 #[test]
 fn unix_historical_recovery_clears_fully_applied_pending_command() {
-    assert_historical_pending_command_recovery_over_unix(2, 1, true);
+    assert_historical_pending_command_recovery_over_unix(2, 1, true, false);
 }
 
 #[test]
 fn unix_historical_recovery_converges_partial_pending_command() {
-    assert_historical_pending_command_recovery_over_unix(1, 1, false);
+    assert_historical_pending_command_recovery_over_unix(1, 1, false, false);
+}
+
+#[test]
+fn unix_historical_recovery_fans_out_primary_abandonment_to_replica() {
+    assert_historical_pending_command_recovery_over_unix(0, 1, false, true);
+}
+
+#[test]
+fn unix_current_route_fans_out_primary_abandonment_to_replica() {
+    assert_current_pending_command_abandonment_fans_out_over_unix();
 }
 
 #[test]
@@ -1040,6 +1218,7 @@ proptest! {
             pre_applied_node_count,
             current_epoch_delta,
             bucket_pg_command,
+            false,
         );
     }
 }

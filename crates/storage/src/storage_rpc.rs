@@ -674,6 +674,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandApplyAndRecord = 31,
     MetadataCommandRecoveryApplyAndRecord = 162,
     MetadataCommandRecoveryPendingSlotReplace = 163,
+    MetadataCommandRecoveryRecordAbandoned = 168,
     MetadataCommandRetainedAbortApply = 165,
     MetadataCommandRetainedAbortFinish = 166,
     BucketDeleteReplicaHead = 167,
@@ -1008,6 +1009,9 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandRecoveryPendingSlotReplace => {
                 "metadata command recovery pending slot replace"
             }
+            Self::MetadataCommandRecoveryRecordAbandoned => {
+                "metadata command recovery record abandoned"
+            }
             Self::MetadataCommandRetainedAbortApply => {
                 "metadata command retained stream abort apply"
             }
@@ -1203,6 +1207,7 @@ impl StorageRpcMessageKind {
             31 => Ok(Self::MetadataCommandApplyAndRecord),
             162 => Ok(Self::MetadataCommandRecoveryApplyAndRecord),
             163 => Ok(Self::MetadataCommandRecoveryPendingSlotReplace),
+            168 => Ok(Self::MetadataCommandRecoveryRecordAbandoned),
             165 => Ok(Self::MetadataCommandRetainedAbortApply),
             166 => Ok(Self::MetadataCommandRetainedAbortFinish),
             167 => Ok(Self::BucketDeleteReplicaHead),
@@ -3783,7 +3788,8 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord => {
             STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN
         }
-        StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord => {
+        StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord
+        | StorageRpcMessageKind::MetadataCommandRecoveryRecordAbandoned => {
             STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandPendingSlotInsert
@@ -18438,6 +18444,11 @@ mod tests {
         for (kind, payload, limit) in [
             (
                 StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord,
+                apply_payload.clone(),
+                STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandRecoveryRecordAbandoned,
                 apply_payload,
                 STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN,
             ),
@@ -20420,6 +20431,11 @@ mod tests {
             ),
             (
                 StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord,
+                STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandRecoveryRecordAbandoned,
                 STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN,
             ),

@@ -1196,6 +1196,7 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         | StorageRpcMessageKind::ShardAckValidate => StorageRpcAuthorizedRoles::FRONTEND_STORAGE,
 
         StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord
+        | StorageRpcMessageKind::MetadataCommandRecoveryRecordAbandoned
         | StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace
         | StorageRpcMessageKind::MetadataCommandRetainedAbortApply
         | StorageRpcMessageKind::MetadataCommandRetainedAbortFinish
@@ -2105,7 +2106,7 @@ mod tests {
         };
         let kinds = recognized_storage_rpc_message_kinds();
 
-        assert_eq!(kinds.len(), 166, "every wire kind must be classified");
+        assert_eq!(kinds.len(), 167, "every wire kind must be classified");
         for kind in kinds {
             assert!(
                 [&frontend, &storage, &admin, &maintenance,]
