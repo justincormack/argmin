@@ -1,5 +1,608 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+struct DirectPayloadTestIdentity {
+    data_pg_id: u32,
+    ec: EcShape,
+    segment_okh: [u8; 16],
+    segment_vid: GenerationId,
+}
+
+fn direct_payload_test_identity(
+    payload: &crate::DirectPutPayloadWrite<'_>,
+) -> DirectPayloadTestIdentity {
+    DirectPayloadTestIdentity {
+        data_pg_id: payload.written.data_pg_id,
+        ec: payload.written.ec,
+        segment_okh: payload.segment_okh,
+        segment_vid: payload.segment_vid,
+    }
+}
+
+fn assert_direct_payload_shards_exist(
+    cluster: &crate::StorageCluster,
+    identity: DirectPayloadTestIdentity,
+) {
+    for shard_index in 0..identity.ec.k + identity.ec.m {
+        assert!(cluster
+            .test_payload_shard_file_exists(
+                identity.data_pg_id,
+                identity.ec,
+                &identity.segment_okh,
+                identity.segment_vid,
+                shard_index,
+            )
+            .unwrap());
+    }
+}
+
+fn assert_direct_payload_staging_cleaned(
+    map: &LocalClusterMap,
+    cluster: &crate::StorageCluster,
+    bucket: &crate::BucketName,
+    key: &crate::ObjectKey,
+    reservation_id: &crate::SessionId,
+    identity: DirectPayloadTestIdentity,
+) {
+    for shard_index in 0..identity.ec.k + identity.ec.m {
+        assert!(!cluster
+            .test_payload_shard_file_exists(
+                identity.data_pg_id,
+                identity.ec,
+                &identity.segment_okh,
+                identity.segment_vid,
+                shard_index,
+            )
+            .unwrap());
+    }
+    let object_pg_id = cluster.object_metadata_pg(bucket, key).pg_id().get();
+    for node_id in trace_node_ids() {
+        let node = map.node(node_id).unwrap().storage_node();
+        let pg = node.get_pg(object_pg_id).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                bucket,
+                key,
+                reservation_id,
+            ),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+    }
+}
+
+#[test]
+fn opaque_direct_put_payload_rejects_crossed_object_routes() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("direct-put-handle-bucket");
+    let other_bucket = crate::tests::bucket_name("direct-put-handle-other-bucket");
+    let key = crate::tests::object_key("direct-put-handle-key");
+    let other_key = crate::tests::object_key("direct-put-handle-other-key");
+    create_test_bucket(&cluster, &bucket);
+    create_test_bucket(&cluster, &other_bucket);
+
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let commit_reservation_id = crate::tests::stream_session_id("opaque-commit");
+    let commit_generation_id = route.reserve_generation(&commit_reservation_id).unwrap();
+    let commit_payload = route
+        .write_direct_object_payload(
+            &commit_reservation_id,
+            commit_generation_id,
+            21,
+            b"opaque direct payload",
+        )
+        .unwrap();
+    let commit_identity = direct_payload_test_identity(&commit_payload);
+    assert_direct_payload_shards_exist(&cluster, commit_identity);
+    let prepared = crate::PreparedDirectPutObjectCommit {
+        versioning: crate::BucketVersioningState::Disabled,
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        etag_crc64: checksum::crc64::checksum(b"opaque direct payload"),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        object_lock: crate::ObjectLockState::default(),
+        encryption: crate::ObjectEncryption::None,
+        bucket_write_reservation: acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        ),
+    };
+
+    let crossed_key_route = admission
+        .active_put_object_route(&bucket, &other_key)
+        .unwrap();
+    let error = crossed_key_route
+        .commit_direct_object(commit_payload, &prepared, |_| Ok::<(), ()>(()))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::InvalidRequest { ref reason }
+            if reason == "direct PUT payload does not match admitted object route"
+    ));
+    assert_direct_payload_staging_cleaned(
+        &map,
+        &cluster,
+        &bucket,
+        &key,
+        &commit_reservation_id,
+        commit_identity,
+    );
+
+    let discard_reservation_id = crate::tests::stream_session_id("opaque-discard");
+    let discard_generation_id = route.reserve_generation(&discard_reservation_id).unwrap();
+    let discard_payload = route
+        .write_direct_object_payload(
+            &discard_reservation_id,
+            discard_generation_id,
+            21,
+            b"opaque direct payload",
+        )
+        .unwrap();
+    let discard_identity = direct_payload_test_identity(&discard_payload);
+    assert_direct_payload_shards_exist(&cluster, discard_identity);
+    let crossed_bucket_route = admission
+        .active_put_object_route(&other_bucket, &key)
+        .unwrap();
+    let error = crossed_bucket_route
+        .discard_direct_object_payload(discard_payload)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::InvalidRequest { ref reason }
+            if reason == "direct PUT payload does not match admitted object route"
+    ));
+    assert_direct_payload_staging_cleaned(
+        &map,
+        &cluster,
+        &bucket,
+        &key,
+        &discard_reservation_id,
+        discard_identity,
+    );
+}
+
+#[test]
+fn opaque_direct_put_payload_rejects_same_epoch_cross_cluster_commit_and_cleans_owner() {
+    let issuer_tmp = test_util::tempdir();
+    let receiver_tmp = test_util::tempdir();
+    let issuer_map = Arc::new(
+        LocalClusterMap::open(
+            issuer_tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let receiver_map = Arc::new(
+        LocalClusterMap::open(
+            receiver_tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let issuer = current_cluster(&issuer_map);
+    let receiver = current_cluster(&receiver_map);
+    assert_eq!(issuer.cluster_epoch(), receiver.cluster_epoch());
+    let bucket = crate::tests::bucket_name("cross-cluster-direct-put");
+    let key = crate::tests::object_key("same-subject");
+    create_test_bucket(&issuer, &bucket);
+    create_test_bucket(&receiver, &bucket);
+
+    let issuer_handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&issuer));
+    let receiver_handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&receiver));
+    let issuer_admission = issuer_handle.admit_current_route().unwrap();
+    let receiver_admission = receiver_handle.admit_current_route().unwrap();
+    let issuer_route = issuer_admission
+        .active_put_object_route(&bucket, &key)
+        .unwrap();
+    let receiver_route = receiver_admission
+        .active_put_object_route(&bucket, &key)
+        .unwrap();
+    let reservation_id = crate::tests::stream_session_id("cross-cluster");
+    let generation_id = issuer_route.reserve_generation(&reservation_id).unwrap();
+    let payload = issuer_route
+        .write_direct_object_payload(
+            &reservation_id,
+            generation_id,
+            26,
+            b"same epoch issuer payload",
+        )
+        .unwrap();
+    let payload_identity = direct_payload_test_identity(&payload);
+    assert_direct_payload_shards_exist(&issuer, payload_identity);
+    let prepared = crate::PreparedDirectPutObjectCommit {
+        versioning: crate::BucketVersioningState::Disabled,
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        etag_crc64: checksum::crc64::checksum(b"same epoch issuer payload"),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        object_lock: crate::ObjectLockState::default(),
+        encryption: crate::ObjectEncryption::None,
+        bucket_write_reservation: acquire_test_bucket_write_proof(
+            &receiver,
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        ),
+    };
+
+    let error = receiver_route
+        .commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::InvalidRequest { ref reason }
+            if reason == "direct PUT payload does not match admitted object route"
+    ));
+    assert_direct_payload_staging_cleaned(
+        &issuer_map,
+        &issuer,
+        &bucket,
+        &key,
+        &reservation_id,
+        payload_identity,
+    );
+    let receiver_pg_id = receiver.object_metadata_pg(&bucket, &key).pg_id().get();
+    for node_id in trace_node_ids() {
+        let pg = receiver_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(receiver_pg_id)
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+    }
+}
+
+#[test]
+fn dropping_armed_direct_put_payload_cleans_issuer_staging() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("dropped-direct-put");
+    let key = crate::tests::object_key("uncommitted");
+    create_test_bucket(&cluster, &bucket);
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let reservation_id = crate::tests::stream_session_id("drop-direct");
+    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let payload = route
+        .write_direct_object_payload(&reservation_id, generation_id, 20, b"drop cleans payload")
+        .unwrap();
+    let payload_identity = direct_payload_test_identity(&payload);
+    assert_direct_payload_shards_exist(&cluster, payload_identity);
+
+    drop(payload);
+
+    assert_direct_payload_staging_cleaned(
+        &map,
+        &cluster,
+        &bucket,
+        &key,
+        &reservation_id,
+        payload_identity,
+    );
+}
+
+#[test]
+fn matching_pending_direct_put_preserves_payload_when_abandoned_log_inspection_fails() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("direct-put-inspection-failure");
+    let key = crate::tests::object_key("pending-command");
+    create_test_bucket(&cluster, &bucket);
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let reservation_id = crate::tests::stream_session_id("inspect-failure");
+    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let data = b"payload owned by a matching pending command";
+    let payload = route
+        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .unwrap();
+    let payload_identity = direct_payload_test_identity(&payload);
+    let prepared = crate::PreparedDirectPutObjectCommit {
+        versioning: crate::BucketVersioningState::Disabled,
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        etag_crc64: checksum::crc64::checksum(data),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        object_lock: crate::ObjectLockState::default(),
+        encryption: crate::ObjectEncryption::None,
+        bucket_write_reservation: acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        ),
+    };
+    let request = direct_put_commit_req_with_bucket_write_proof(
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id: reservation_id.clone(),
+            generation_id,
+            payload: data,
+            segment_okh: payload.segment_okh,
+            written: &payload.written,
+        },
+        prepared.bucket_write_reservation.clone(),
+    );
+    let shard_batch: Vec<(&ShardKey, WriteAck)> = payload
+        .written
+        .written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect();
+    cluster
+        .register_payload_shard_acks(request.data_pg_id, &shard_batch)
+        .unwrap();
+    let pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id();
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    let command = cluster
+        .prepare_commit_direct_put_object_command(
+            pg_id,
+            &pg,
+            &request,
+            crate::VersionId::Null,
+            request.bucket_write_reservation.clone(),
+        )
+        .unwrap();
+    drop(pg);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let hook_guard =
+        cluster.test_install_before_direct_put_abandoned_log_inspection_hook(Arc::new(|command| {
+            assert!(matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(_)
+            ));
+            Err(StoreError::MetadataCommandContention {
+                context: "injected abandoned-log inspection failure",
+            }
+            .into())
+        }));
+    let error = route
+        .commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+            context: "injected abandoned-log inspection failure"
+        })
+    ));
+
+    let retained = pending_metadata_command_for_test(&map, pg_id, &bucket)
+        .expect("matching durable command must remain pending");
+    assert_eq!(retained.id(), command.id());
+    assert_direct_payload_shards_exist(&cluster, payload_identity);
+    for node_id in trace_node_ids() {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &reservation_id,
+            )
+            .unwrap(),
+            generation_id,
+            "durable pending ownership must retain the generation reservation"
+        );
+    }
+
+    drop(hook_guard);
+}
+
+#[test]
+fn physically_mismatched_pending_direct_put_partitions_mixed_overlap_cleanup() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("direct-put-physical-mismatch");
+    let key = crate::tests::object_key("pending-command");
+    create_test_bucket(&cluster, &bucket);
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let reservation_id = crate::tests::stream_session_id("phys-mismatch");
+    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let data = b"payload whose staging keys overlap the pending command";
+    let pending_payload = route
+        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .unwrap();
+    let payload_identity = direct_payload_test_identity(&pending_payload);
+    let prepared = crate::PreparedDirectPutObjectCommit {
+        versioning: crate::BucketVersioningState::Disabled,
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        etag_crc64: checksum::crc64::checksum(data),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        object_lock: crate::ObjectLockState::default(),
+        encryption: crate::ObjectEncryption::None,
+        bucket_write_reservation: acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        ),
+    };
+    let mut pending_request = direct_put_commit_req_with_bucket_write_proof(
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id: reservation_id.clone(),
+            generation_id,
+            payload: data,
+            segment_okh: pending_payload.segment_okh,
+            written: &pending_payload.written,
+        },
+        prepared.bucket_write_reservation.clone(),
+    );
+    pending_request.ec = EcShape { k: 1, m: 1 };
+    let command_shard_count = pending_request.ec.k + pending_request.ec.m;
+    assert!(
+        command_shard_count < payload_identity.ec.k + payload_identity.ec.m,
+        "the regression requires caller shards beyond the command's overlapping prefix"
+    );
+    let shard_batch: Vec<(&ShardKey, WriteAck)> = pending_payload
+        .written
+        .written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect();
+    cluster
+        .register_payload_shard_acks(pending_request.data_pg_id, &shard_batch)
+        .unwrap();
+    let pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id();
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    let command = cluster
+        .prepare_commit_direct_put_object_command(
+            pg_id,
+            &pg,
+            &pending_request,
+            crate::VersionId::Null,
+            pending_request.bucket_write_reservation.clone(),
+        )
+        .unwrap();
+    drop(pg);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    pending_payload.disarm();
+
+    let mismatched_payload = route
+        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .unwrap();
+    assert_eq!(
+        direct_payload_test_identity(&mismatched_payload).segment_okh,
+        payload_identity.segment_okh,
+        "the regression must exercise overlapping command staging keys"
+    );
+    let error = route
+        .commit_direct_object(mismatched_payload, &prepared, |_| -> Result<(), ()> {
+            panic!("a physically mismatched pending command must not enter recovery")
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+            context: "pending direct PUT command payload differs from request"
+        })
+    ));
+
+    let retained = pending_metadata_command_for_test(&map, pg_id, &bucket)
+        .expect("physically mismatched command must remain pending");
+    assert_eq!(retained.id(), command.id());
+    for shard_index in 0..payload_identity.ec.k + payload_identity.ec.m {
+        assert_eq!(
+            cluster
+                .test_payload_shard_file_exists(
+                    payload_identity.data_pg_id,
+                    payload_identity.ec,
+                    &payload_identity.segment_okh,
+                    payload_identity.segment_vid,
+                    shard_index,
+                )
+                .unwrap(),
+            shard_index < command_shard_count,
+            "command-owned overlap must survive while caller-only shards are cleaned"
+        );
+    }
+    for node_id in trace_node_ids() {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &reservation_id,
+            )
+            .unwrap(),
+            generation_id,
+            "the pending command must retain its generation reservation"
+        );
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+    }
+}
+
 #[test]
 fn direct_put_fanout_rejects_live_crossed_reservation_subjects() {
     let tmp = test_util::tempdir();

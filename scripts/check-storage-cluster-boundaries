@@ -2116,6 +2116,27 @@ fail_with_matches \
     "Server-core payload reads must use opaque storage-owned segments rather than placement, EC, shard, or historical-route representations" \
     "$server_core_payload_read_placement_leaks"
 
+server_core_direct_put_placement_leaks=$(
+    rg -n --color=never \
+        '\b(CommitDirectPutObjectReq|DirectPutWrittenSegment|direct_put_segment_key_hash)\b|write_direct_(put_)?segment_payload_shards|delete_direct_(put_)?segment_payload_shards|\.(data_pg_id|written_shards|segment_okh|segment_vid)\b' \
+        crates/server-core/src/coordinator/put.rs \
+        || true
+)
+fail_with_matches \
+    "Server-core direct PutObject must use the opaque storage-owned payload write rather than placement, shard acknowledgements, hashes, or the durable commit request" \
+    "$server_core_direct_put_placement_leaks"
+
+public_direct_put_representation_surfaces=$(
+    rg -n --color=never \
+        '^[[:space:]]*pub[[:space:]].*\b(CommitDirectPutObjectReq|DirectPutWrittenSegment|direct_put_segment_key_hash|write_direct_put_segment_payload_shards|commit_direct_put_object_from_payload_shards|delete_direct_put_segment_payload_shards)\b' \
+        crates/storage/src \
+        --glob '*.rs' \
+        || true
+)
+fail_with_matches \
+    "Direct PutObject placement results, hashes, durable requests, and physical mutation entry points must remain private to storage" \
+    "$public_direct_put_representation_surfaces"
+
 coarse_payload_lease_callers=$(
     awk '
     FNR == 1 {

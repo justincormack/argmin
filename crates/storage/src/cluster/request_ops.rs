@@ -2156,6 +2156,11 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         route_mode: MetadataCommandRouteMode,
     ) -> Result<bool, MetadataCommandApplyFailure> {
+        self.maybe_run_before_direct_put_abandoned_log_inspection_hook(command)
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                source,
+            })?;
         let pg_id = command.id().pg_id();
         let nodes = match route_mode {
             MetadataCommandRouteMode::Normal => self

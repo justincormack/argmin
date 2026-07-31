@@ -4386,14 +4386,66 @@ pub struct WrittenShardAck {
 }
 
 #[derive(Debug, Clone)]
-pub struct DirectPutWrittenSegment {
+pub(crate) struct DirectPutWrittenSegment {
     pub data_pg_id: u32,
     pub ec: EcShape,
     pub written_shards: Vec<WrittenShardAck>,
 }
 
+/// Opaque authority over one direct PutObject payload written through an
+/// admitted object route.
+///
+/// Its lifetime is tied to the exact non-cloneable route admission which
+/// issued it. Storage retains that owner together with the subject, placement,
+/// integrity, and cleanup identity, so callers cannot cross publication
+/// domains or combine a payload write with independently constructed physical
+/// metadata. An armed handle cleans issuer-owned staging when dropped.
+pub struct DirectPutPayloadWrite<'admission> {
+    pub(crate) owner: &'admission crate::cluster::StorageClusterRouteAdmission,
+    pub(crate) armed: std::cell::Cell<bool>,
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+    pub(crate) generation_reservation_id: SessionId,
+    pub(crate) generation_id: GenerationId,
+    pub(crate) logical_size: u64,
+    pub(crate) segment_index: u32,
+    pub(crate) segment_crc64: u64,
+    pub(crate) segment_okh: [u8; 16],
+    pub(crate) segment_vid: GenerationId,
+    pub(crate) placement_cluster_epoch: ClusterEpoch,
+    pub(crate) written: DirectPutWrittenSegment,
+}
+
+impl std::fmt::Debug for DirectPutPayloadWrite<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DirectPutPayloadWrite")
+            .finish_non_exhaustive()
+    }
+}
+
+/// S3-visible metadata prepared by server-core for a direct PutObject commit.
+///
+/// The payload subject, generation, layout, placement, and integrity fields
+/// are supplied exclusively by [`DirectPutPayloadWrite`].
 #[derive(Debug, Clone)]
-pub struct CommitDirectPutObjectReq {
+pub struct PreparedDirectPutObjectCommit {
+    pub versioning: BucketVersioningState,
+    pub owner: OwnerIdentity,
+    pub acl_grants: AclGrants,
+    pub public_read: bool,
+    /// CRC64-NVME of the user-visible object data.
+    pub etag_crc64: u64,
+    pub tags: Option<SerializedTagSet>,
+    pub metadata_blob: SerializedMetadataBlob,
+    pub system_metadata_blob: SerializedSystemMetadataBlob,
+    pub object_lock: ObjectLockState,
+    pub encryption: ObjectEncryption,
+    pub bucket_write_reservation: crate::BucketWriteReservationProof,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CommitDirectPutObjectReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub generation_reservation_id: SessionId,

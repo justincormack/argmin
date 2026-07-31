@@ -7370,7 +7370,7 @@ fn zero_apply_direct_put_commit_records_tombstone_and_cleans_new_payload() {
 }
 
 #[test]
-fn abandoned_matching_direct_put_commit_cleans_pending_and_current_payload() {
+fn abandoned_physically_mismatched_direct_put_fails_before_recovery() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -7526,25 +7526,29 @@ fn abandoned_matching_direct_put_commit_cleans_pending_and_current_payload() {
         matches!(
             err,
             crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
-                context: "abandoned pending command for direct put commit",
+                context: "pending direct PUT command payload differs from request",
             })
         ),
-        "expected abandoned direct PUT conflict, got {err:?}"
+        "expected physical direct PUT mismatch conflict, got {err:?}"
     );
 
-    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    let retained = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
+        .expect("physical mismatch must not recover even an abandoned command");
+    assert_eq!(retained.id(), command.id());
     for node_id in node_ids {
         let node = map.node(node_id).unwrap().storage_node();
         let pg = node.get_pg(object_pg).unwrap();
-        assert!(matches!(
+        assert_eq!(
             crate::PgMetadataStore::get_object_generation_reservation(
                 &*pg,
                 &bucket,
                 &key,
                 &reservation_id
-            ),
-            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
-        ));
+            )
+            .unwrap(),
+            generation_id,
+            "the pending command must retain its generation reservation"
+        );
         assert!(matches!(
             crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
             Err(crate::MetadataError::ObjectNotFound)
@@ -7552,7 +7556,7 @@ fn abandoned_matching_direct_put_commit_cleans_pending_and_current_payload() {
     }
 
     for shard_index in 0..abandoned_written.ec.k + abandoned_written.ec.m {
-        assert!(!cluster
+        assert!(cluster
             .test_payload_shard_file_exists(
                 abandoned_written.data_pg_id,
                 abandoned_written.ec,
@@ -7571,11 +7575,12 @@ fn abandoned_matching_direct_put_commit_cleans_pending_and_current_payload() {
             )
             .unwrap());
     }
-    for written in abandoned_written
-        .written_shards
-        .iter()
-        .chain(current_written.written_shards.iter())
-    {
+    for written in &abandoned_written.written_shards {
+        assert!(data_primary
+            .test_shard_exists(data_pg, &written.key)
+            .unwrap());
+    }
+    for written in &current_written.written_shards {
         assert!(!data_primary
             .test_shard_exists(data_pg, &written.key)
             .unwrap());

@@ -5352,7 +5352,7 @@ fn shard_backfill_worker_uses_refreshed_runtime_map_handle() {
     let segment_vid = GenerationId::MIN;
     let payload = b"backfill worker must use refreshed runtime map";
     let written_segment = initial
-        .write_direct_put_segment_payload_shards(
+        .test_write_direct_put_segment_payload_shards(
             &bucket,
             &key,
             segment_vid,
@@ -5681,7 +5681,7 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
     let segment_vid = GenerationId::MIN;
     let payload = b"remote storage-node shard backfill worker";
     let written_segment = source_cluster
-        .write_direct_put_segment_payload_shards(
+        .test_write_direct_put_segment_payload_shards(
             &bucket,
             &key,
             segment_vid,

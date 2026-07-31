@@ -975,6 +975,36 @@ object-state, infrastructure/runtime, read/copy, payload-transformation, and res
 checker also rejects inventory drift when another production module begins participating in the
 read seam.
 
+The ninth bounded slice continues implementation-order item 3 with buffered/direct PutObject.
+`server-core` supplies only the encrypted payload bytes, their logical size, the reserved logical
+generation, S3-visible object metadata, and the conditional-write callback. Storage derives the
+direct-staging segment hash, integrity checksum, data PG, EC placement, shard acknowledgements,
+placement epoch, and durable segment record, retaining them in an opaque subject-bound
+`DirectPutPayloadWrite`. The armed RAII handle retains and is lifetime-bound to the exact issuing
+cluster admission and publication domain; ordinary drop, explicit discard, and crossed-route
+failure clean shards and the generation reservation through that issuer rather than the receiving
+route. Commit disarms it only after finding an already durable result, adopting the exact matching
+pending command, or installing the new pending command. Cleanup authority therefore cannot
+survive a successful commit and delete live payload. The lower commit state machine separately
+tracks caller-owned and durable-command-owned payload. A matching pending command adopts the
+current payload only when its complete physical segment identity also matches; a reused logical
+reservation cannot claim a different staged body. A logical match with different physical
+identity fails before command recovery. Storage disarms the generic caller guard without
+releasing the command-owned generation or write proof, deletes only demonstrably disjoint caller
+staging on a per-shard-key basis, and preserves overlapping shard keys that may belong to the
+pending command even when the remainder of the caller batch is removed. After
+adoption, ambiguous abandoned-log
+inspection failures and retryable partial-command outcomes preserve the shards and generation
+reservation for recovery; cleanup occurs only while ownership is still caller-held or after the
+command has been conclusively abandoned and removed. Commit and
+explicit discard consume the linear handle, reject a handle crossed to another admission, bucket,
+or key, and commit also binds it to the bucket-write reservation epoch. The raw
+written-shard result, durable direct-commit request, direct hash helper, and physical mutation
+entry points are private to storage; cross-crate maintenance composition uses an explicitly
+test-only DTO. The boundary checker rejects their reintroduction into the production direct-PUT
+seam or as public storage APIs. Streaming append/finalization and multipart physical write/commit
+fields remain pending, so implementation-order item 3 is not yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

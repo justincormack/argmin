@@ -26,7 +26,7 @@ pub fn stream_segment_key_hash(session_id: &SessionId, segment_index: u32) -> [u
 /// Compute the 16-byte segment key hash for direct PUT staging shard keys.
 ///
 /// `segment_okh = SHA-256("direct-put-segment/" + session_id + "/" + segment_index)[:16]`
-pub fn direct_put_segment_key_hash(session_id: &SessionId, segment_index: u32) -> [u8; 16] {
+pub(crate) fn direct_put_segment_key_hash(session_id: &SessionId, segment_index: u32) -> [u8; 16] {
     sha256_truncated_16(
         format!("direct-put-segment/{}/{segment_index}", session_id.as_str()).as_bytes(),
     )

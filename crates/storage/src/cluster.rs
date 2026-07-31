@@ -33,16 +33,15 @@ use crate::control_plane::{
 };
 use crate::control_plane_lease::BoundRouteMapLease;
 use crate::error::{ClusterBuildError, PgMetadataTransferError, ShardIoError, StoreError};
-#[cfg(test)]
-use crate::metadata_command::CommitDirectPutObjectCommand;
 use crate::metadata_command::{
     metadata_command_log_hash, AbortStreamUploadCommand, AppendStreamSegmentCommand,
-    BucketPropertyMutation, BucketWriteReservationProof, CreateMultipartUploadCommand,
-    CreateStreamUploadCommand, DeleteObjectVersionMode, DeleteObjectVersionTarget,
-    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
-    MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimCommand,
-    PutObjectMetadataMutation, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
-    ReserveObjectVersionCommand, DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
+    BucketPropertyMutation, BucketWriteReservationProof, CommitDirectPutObjectCommand,
+    CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionMode,
+    DeleteObjectVersionTarget, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+    MetadataCommandPayload, MetadataCommandReplicaState, MetadataTransferCommand,
+    ObjectPayloadReclaimCommand, PutObjectMetadataMutation, ReleaseObjectGenerationCommand,
+    ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+    DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
@@ -86,18 +85,19 @@ use crate::types::{
     BucketWriteReservationRecord, CanonicalUserId, ClusterEpoch, CommitDirectPutObjectReq,
     CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest, CreateStreamUploadReq,
     DeleteCurrentObjectOutcome, DeleteSpecificObjectVersionOutcome, DirectPutCommitSnapshot,
-    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, FinalizeStreamPartOutcome,
-    FinalizeStreamPutOutcome, GenerationId, InsertCurrentDeleteMarkerOutcome,
-    ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
-    ListedMultipartParts, MultipartCompletionSnapshot, MultipartUploadManagementLookup,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectPayloadSegment,
-    ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention,
-    ObjectSegmentRecord, OwnerIdentity, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
-    PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
-    PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
-    PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,
-    PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
-    PrepareStreamUploadSegmentAppendReq, PreparedStreamPartCommit, PreparedStreamPutCommit,
+    DirectPutPayloadWrite, DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome,
+    FinalizeStreamPartOutcome, FinalizeStreamPutOutcome, GenerationId,
+    InsertCurrentDeleteMarkerOutcome, ListedBucketMultipartUploads, ListedBucketObjectVersions,
+    ListedBucketObjects, ListedMultipartParts, MultipartCompletionSnapshot,
+    MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEncryption, ObjectKey,
+    ObjectLayout, ObjectPayloadSegment, ObjectReadSnapshot, ObjectReadSnapshotMode,
+    ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord, OwnerIdentity, PgId, PgState,
+    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
+    PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillWorkItem,
+    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,
+    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
+    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
+    PreparedDirectPutObjectCommit, PreparedStreamPartCommit, PreparedStreamPutCommit,
     PublicAccessBlockConfig, RouteMapValidity, SegmentStoredBytesRequest, SerializedBucketTagSet,
     SerializedTagSet, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
     ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
@@ -249,6 +249,15 @@ pub struct StorageShardBackfillTestWorkItem {
     pub request: SegmentStoredBytesRequest,
     pub source_cluster_epoch: ClusterEpoch,
     pub desired_cluster_epoch: ClusterEpoch,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct TestDirectPutWrittenSegment {
+    pub data_pg_id: u32,
+    pub ec: EcShape,
+    pub written_shards: Vec<WrittenShardAck>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -830,6 +839,10 @@ type StreamAppendCommandIdAllocatedHook = Arc<dyn Fn(MetadataCommandId) + Send +
 type ObjectMetadataReservationAcquiredHook =
     Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
 
+#[cfg(test)]
+type DirectPutAbandonedLogInspectionHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> Result<(), BucketSnapshotLoadError> + Send + Sync>;
+
 #[cfg(any(test, feature = "test-hooks"))]
 type MetadataListingPgCompleteHook = Arc<dyn Fn(u32) + Send + Sync>;
 
@@ -860,6 +873,8 @@ struct StorageClusterTestHooks {
     before_retained_stream_abort: Option<RetainedStreamAbortHook>,
     before_metadata_command_pending_install: Option<MetadataCommandPendingInstallHook>,
     before_direct_put_command_id: Option<DirectPutCommandIdHook>,
+    #[cfg(test)]
+    before_direct_put_abandoned_log_inspection: Option<DirectPutAbandonedLogInspectionHook>,
     before_object_generation_command_id: Option<ObjectGenerationCommandIdHook>,
     before_object_version_command_id: Option<ObjectVersionCommandIdHook>,
     before_stream_append_command_id: Option<StreamAppendCommandIdHook>,
@@ -904,6 +919,11 @@ pub struct MetadataCommandPendingInstallHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct DirectPutCommandIdHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(test)]
+pub struct DirectPutAbandonedLogInspectionHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -1023,6 +1043,16 @@ impl Drop for MetadataCommandPendingInstallHookGuard {
 impl Drop for DirectPutCommandIdHookGuard {
     fn drop(&mut self) {
         self.hooks.lock().unwrap().before_direct_put_command_id = None;
+    }
+}
+
+#[cfg(test)]
+impl Drop for DirectPutAbandonedLogInspectionHookGuard {
+    fn drop(&mut self) {
+        self.hooks
+            .lock()
+            .unwrap()
+            .before_direct_put_abandoned_log_inspection = None;
     }
 }
 
@@ -2890,6 +2920,43 @@ impl ActiveObjectMetadataMutationRoute<'_> {
     }
 }
 
+impl DirectPutPayloadWrite<'_> {
+    fn issued_by(&self, admission: &StorageClusterRouteAdmission) -> bool {
+        std::ptr::eq(self.owner, admission)
+    }
+
+    fn disarm(&self) {
+        self.armed.set(false);
+    }
+
+    fn cleanup_on_owner(&self) {
+        if !self.armed.replace(false) {
+            return;
+        }
+        self.owner
+            .cluster
+            .delete_direct_put_segment_payload_shards_at_epoch(
+                self.placement_cluster_epoch,
+                self.written.data_pg_id,
+                self.written.ec,
+                &self.segment_okh,
+                self.segment_vid,
+                &self.written.written_shards,
+            );
+        let _ = self.owner.cluster.release_object_generation_reservation(
+            &self.bucket,
+            &self.key,
+            &self.generation_reservation_id,
+        );
+    }
+}
+
+impl Drop for DirectPutPayloadWrite<'_> {
+    fn drop(&mut self) {
+        self.cleanup_on_owner();
+    }
+}
+
 impl ActivePutObjectRoute<'_> {
     fn effect_route(&self) -> PutObjectMutationEffectRoute<'_> {
         PutObjectMutationEffectRoute {
@@ -3102,37 +3169,104 @@ impl ActivePutObjectRoute<'_> {
             )
     }
 
-    pub fn write_direct_segment_payload_shards(
+    pub fn write_direct_object_payload(
         &self,
+        generation_reservation_id: &SessionId,
         generation_id: GenerationId,
-        segment_index: u32,
-        segment_okh: &[u8; 16],
+        logical_size: u64,
         data: &[u8],
-    ) -> Result<DirectPutWrittenSegment, StoreError> {
-        self.admission
+    ) -> Result<DirectPutPayloadWrite<'_>, StoreError> {
+        let segment_index = 0;
+        let segment_okh =
+            crate::direct_put_segment_key_hash(generation_reservation_id, segment_index);
+        let written = self
+            .admission
             .cluster
             .write_direct_put_segment_payload_shards_with_route_validation(
                 self.effect_route(),
                 generation_id,
                 segment_index,
-                segment_okh,
+                &segment_okh,
                 data,
                 || self.admission.require_valid_now(),
-            )
+            )?;
+        Ok(DirectPutPayloadWrite {
+            owner: self.admission,
+            armed: std::cell::Cell::new(true),
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            generation_reservation_id: generation_reservation_id.clone(),
+            generation_id,
+            logical_size,
+            segment_index,
+            segment_crc64: checksum::crc64::checksum(data),
+            segment_okh,
+            segment_vid: generation_id,
+            placement_cluster_epoch: self.admission.cluster.operation_epoch(),
+            written,
+        })
     }
 
     pub fn commit_direct_object<E>(
         &self,
-        req: &CommitDirectPutObjectReq,
-        written_shards: &[WrittenShardAck],
+        payload: DirectPutPayloadWrite<'_>,
+        prepared: &PreparedDirectPutObjectCommit,
         action: impl FnMut(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
+        if !payload.issued_by(self.admission)
+            || payload.bucket != self.bucket
+            || payload.key != self.key
+            || payload.placement_cluster_epoch != self.admission.cluster.operation_epoch()
+        {
+            self.admission
+                .cluster
+                .release_bucket_write_reservation_proof(&prepared.bucket_write_reservation)
+                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "direct PUT payload does not match admitted object route".to_string(),
+            });
+        }
+        if payload.placement_cluster_epoch != prepared.bucket_write_reservation.cluster_epoch {
+            self.admission
+                .cluster
+                .release_bucket_write_reservation_proof(&prepared.bucket_write_reservation)
+                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "direct PUT payload does not match bucket write reservation epoch"
+                    .to_string(),
+            });
+        }
+        let request = CommitDirectPutObjectReq {
+            bucket: payload.bucket.clone(),
+            key: payload.key.clone(),
+            generation_reservation_id: payload.generation_reservation_id.clone(),
+            versioning: prepared.versioning,
+            owner: prepared.owner.clone(),
+            acl_grants: prepared.acl_grants.clone(),
+            public_read: prepared.public_read,
+            generation_id: payload.generation_id,
+            size: payload.logical_size,
+            etag_crc64: prepared.etag_crc64,
+            ec: payload.written.ec,
+            tags: prepared.tags.clone(),
+            metadata_blob: prepared.metadata_blob.clone(),
+            system_metadata_blob: prepared.system_metadata_blob.clone(),
+            object_lock: prepared.object_lock,
+            encryption: prepared.encryption.clone(),
+            segment_index: payload.segment_index,
+            segment_crc64: payload.segment_crc64,
+            segment_okh: payload.segment_okh,
+            segment_vid: payload.segment_vid,
+            data_pg_id: payload.written.data_pg_id,
+            bucket_write_reservation: prepared.bucket_write_reservation.clone(),
+        };
         self.admission
             .cluster
             .commit_direct_put_object_from_payload_shards_with_route_validation(
                 self.effect_route(),
-                req,
-                written_shards,
+                &request,
+                &payload.written.written_shards,
+                || payload.disarm(),
                 || self.admission.require_valid_now(),
                 action,
             )
@@ -3145,21 +3279,20 @@ impl ActivePutObjectRoute<'_> {
             .release_object_generation_reservation(&self.bucket, &self.key, reservation_id);
     }
 
-    pub fn delete_direct_segment_payload_shards(
+    pub fn discard_direct_object_payload(
         &self,
-        written: &DirectPutWrittenSegment,
-        segment_okh: &[u8; 16],
-        segment_vid: GenerationId,
-    ) {
-        self.admission
-            .cluster
-            .delete_direct_put_segment_payload_shards(
-                written.data_pg_id,
-                written.ec,
-                segment_okh,
-                segment_vid,
-                &written.written_shards,
-            );
+        payload: DirectPutPayloadWrite<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        let subject_matches = payload.issued_by(self.admission)
+            && payload.bucket == self.bucket
+            && payload.key == self.key;
+        payload.cleanup_on_owner();
+        if !subject_matches {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "direct PUT payload does not match admitted object route".to_string(),
+            });
+        }
+        Ok(())
     }
 
     pub fn enqueue_object_payload_reclaim(&self, generation_id: GenerationId) {
@@ -8710,6 +8843,28 @@ impl StorageCluster {
     #[cfg(not(any(test, feature = "test-hooks")))]
     fn maybe_run_before_direct_put_command_id_hook(&self) {}
 
+    #[cfg(test)]
+    fn maybe_run_before_direct_put_abandoned_log_inspection_hook(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_direct_put_abandoned_log_inspection
+            .clone();
+        hook.map_or(Ok(()), |hook| hook(command))
+    }
+
+    #[cfg(not(test))]
+    fn maybe_run_before_direct_put_abandoned_log_inspection_hook(
+        &self,
+        _command: &MetadataCommandEnvelope,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        Ok(())
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn maybe_run_before_object_generation_command_id_hook(&self) {
         let hook = self
@@ -10825,6 +10980,20 @@ impl StorageCluster {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_install_before_direct_put_abandoned_log_inspection_hook(
+        &self,
+        hook: DirectPutAbandonedLogInspectionHook,
+    ) -> DirectPutAbandonedLogInspectionHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .before_direct_put_abandoned_log_inspection = Some(hook);
+        DirectPutAbandonedLogInspectionHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_install_before_object_generation_command_id_hook(
         &self,
@@ -11137,7 +11306,8 @@ impl StorageCluster {
             .delete_payload_shard(self.operation_epoch(), location, key)
     }
 
-    pub fn write_direct_put_segment_payload_shards(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn write_direct_put_segment_payload_shards(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -11160,6 +11330,32 @@ impl StorageCluster {
             data,
             || Ok(()),
         )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_write_direct_put_segment_payload_shards(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        segment_index: u32,
+        segment_okh: &[u8; 16],
+        data: &[u8],
+    ) -> Result<TestDirectPutWrittenSegment, StoreError> {
+        let written = self.write_direct_put_segment_payload_shards(
+            bucket,
+            key,
+            generation_id,
+            segment_index,
+            segment_okh,
+            data,
+        )?;
+        Ok(TestDirectPutWrittenSegment {
+            data_pg_id: written.data_pg_id,
+            ec: written.ec,
+            written_shards: written.written_shards,
+        })
     }
 
     fn write_direct_put_segment_payload_shards_with_route_validation(
@@ -13336,7 +13532,8 @@ impl StorageCluster {
         }
     }
 
-    pub fn commit_direct_put_object_from_payload_shards<E>(
+    #[cfg(test)]
+    pub(crate) fn commit_direct_put_object_from_payload_shards<E>(
         &self,
         req: &CommitDirectPutObjectReq,
         written_shards: &[WrittenShardAck],
@@ -13352,6 +13549,7 @@ impl StorageCluster {
             },
             req,
             written_shards,
+            || {},
             || Ok(()),
             action,
         )
@@ -13362,6 +13560,7 @@ impl StorageCluster {
         route: PutObjectMutationEffectRoute<'_>,
         req: &CommitDirectPutObjectReq,
         written_shards: &[WrittenShardAck],
+        mut disarm_payload_cleanup: impl FnMut(),
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut action: impl FnMut(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
@@ -13383,6 +13582,12 @@ impl StorageCluster {
         let pg_id = object_pg_id.pg_id();
         let effective_bucket_write_reservation = req.bucket_write_reservation.clone();
         let mut bucket_write_proof_command_owned = false;
+        #[derive(Clone, Copy)]
+        enum DirectPutPayloadOwnership {
+            Caller,
+            DurableCommand,
+        }
+        let mut payload_ownership = DirectPutPayloadOwnership::Caller;
         macro_rules! release_caller_bucket_write_proof_if_unowned {
             () => {{
                 if !bucket_write_proof_command_owned {
@@ -13396,20 +13601,25 @@ impl StorageCluster {
         macro_rules! cleanup_direct_put_attempt_before_command_ownership {
             () => {{
                 let release_result = release_caller_bucket_write_proof_if_unowned!();
-                self.release_object_generation_reservation_after_pending_drain_best_effort(
-                    pg_id,
-                    &req.bucket,
-                    &req.key,
-                    &req.generation_reservation_id,
-                );
-                self.delete_direct_put_segment_payload_shards_at_epoch(
-                    effective_bucket_write_reservation.cluster_epoch,
-                    req.data_pg_id,
-                    req.ec,
-                    &req.segment_okh,
-                    req.segment_vid,
-                    written_shards,
-                );
+                match payload_ownership {
+                    DirectPutPayloadOwnership::Caller => {
+                        self.release_object_generation_reservation_after_pending_drain_best_effort(
+                            pg_id,
+                            &req.bucket,
+                            &req.key,
+                            &req.generation_reservation_id,
+                        );
+                        self.delete_direct_put_segment_payload_shards_at_epoch(
+                            effective_bucket_write_reservation.cluster_epoch,
+                            req.data_pg_id,
+                            req.ec,
+                            &req.segment_okh,
+                            req.segment_vid,
+                            written_shards,
+                        );
+                    }
+                    DirectPutPayloadOwnership::DurableCommand => {}
+                }
                 release_result?;
             }};
         }
@@ -13493,6 +13703,13 @@ impl StorageCluster {
                             return Err(error);
                         }
                     };
+                    if snapshot.committed_segments.is_some() {
+                        // A durable object may already own these exact staging keys even if
+                        // corruption makes the retry snapshot fail validation below. Preserve
+                        // payload in that ambiguous durable state and fail closed at metadata.
+                        payload_ownership = DirectPutPayloadOwnership::DurableCommand;
+                        disarm_payload_cleanup();
+                    }
                     if let Some(outcome) = Self::committed_direct_put_retry_outcome(req, &snapshot)?
                     {
                         return Ok(Ok(outcome));
@@ -13590,19 +13807,54 @@ impl StorageCluster {
                     break (command, true, true);
                 };
 
-                let is_matching_direct_put = matches!(
-                    command.payload(),
+                let matching_direct_put = match command.payload() {
                     MetadataCommandPayload::CommitDirectPutObject(commit)
                         if commit.matches_request(
                             &req.bucket,
                             &req.key,
                             &req.generation_reservation_id,
                             req.generation_id,
-                        )
-                        && commit.bucket_write_reservation == effective_bucket_write_reservation
-                );
-                if is_matching_direct_put {
+                        ) && commit.bucket_write_reservation
+                            == effective_bucket_write_reservation =>
+                    {
+                        Some(commit.as_ref())
+                    }
+                    _ => None,
+                };
+                let is_matching_direct_put = matching_direct_put.is_some();
+                if let Some(commit) = matching_direct_put {
                     bucket_write_proof_command_owned = true;
+                    if Self::direct_put_command_owns_request_payload(commit, req) {
+                        payload_ownership = DirectPutPayloadOwnership::DurableCommand;
+                        disarm_payload_cleanup();
+                    } else {
+                        // The pending command owns the logical reservation and write proof, but
+                        // it does not authorize recovery with a different physical payload. Take
+                        // responsibility away from the RAII guard before returning: its generic
+                        // cleanup would release command-owned state. Disjoint caller staging can
+                        // be removed; overlapping keys may be the command's live recovery input
+                        // and must remain untouched.
+                        disarm_payload_cleanup();
+                        let caller_owned_shards =
+                            Self::direct_put_written_shards_not_owned_by_command(
+                                commit,
+                                req.data_pg_id,
+                                written_shards,
+                            );
+                        if !caller_owned_shards.is_empty() {
+                            self.delete_direct_put_segment_payload_shards_at_epoch(
+                                effective_bucket_write_reservation.cluster_epoch,
+                                req.data_pg_id,
+                                req.ec,
+                                &req.segment_okh,
+                                req.segment_vid,
+                                &caller_owned_shards,
+                            );
+                        }
+                        return Err(conflicting_pending_object_metadata_command(
+                            "pending direct PUT command payload differs from request",
+                        ));
+                    }
                 }
                 let has_abandoned_log = match self
                     .metadata_command_has_abandoned_log_on_acting_set(&command)
@@ -13626,9 +13878,10 @@ impl StorageCluster {
                                     )
                                 }
                                 Ok(PendingMetadataCommandOutcome::Abandoned) => {
-                                    conflicting_pending_object_metadata_command(
+                                    cleanup_direct_put_attempt_before_command_ownership!();
+                                    return Err(conflicting_pending_object_metadata_command(
                                         "abandoned pending command for direct put commit",
-                                    )
+                                    ));
                                 }
                                 Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {
                                     conflicting_pending_object_metadata_command(
@@ -13637,13 +13890,7 @@ impl StorageCluster {
                                 }
                                 Err(error) => error,
                             };
-                        self.delete_direct_put_segment_payload_shards(
-                            req.data_pg_id,
-                            req.ec,
-                            &req.segment_okh,
-                            req.segment_vid,
-                            written_shards,
-                        );
+                        cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
                     if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command)
@@ -13750,6 +13997,8 @@ impl StorageCluster {
                     );
                     continue;
                 }
+                payload_ownership = DirectPutPayloadOwnership::DurableCommand;
+                disarm_payload_cleanup();
             }
             break (command, new_pending_command);
         };
@@ -13969,6 +14218,11 @@ impl StorageCluster {
             break command;
         };
 
+        debug_assert!(matches!(
+            payload_ownership,
+            DirectPutPayloadOwnership::DurableCommand
+        ));
+
         #[cfg(any(test, feature = "test-hooks"))]
         crate::node::maybe_run_after_direct_put_metadata_publish_hook(
             self.metadata_primary_test_hook_node().test_hook_scope_id(),
@@ -14073,6 +14327,53 @@ impl StorageCluster {
             live_last_modified: live.last_modified,
             stale_generation_id: snapshot.committed_stale_generation_id,
         }))
+    }
+
+    fn direct_put_command_owns_request_payload(
+        command: &CommitDirectPutObjectCommand,
+        req: &CommitDirectPutObjectReq,
+    ) -> bool {
+        let [segment] = command.segments.as_slice() else {
+            return false;
+        };
+        segment.bucket == req.bucket
+            && segment.key == req.key
+            && segment.segment_index == req.segment_index
+            && segment.size == req.size
+            && segment.segment_crc64 == req.segment_crc64
+            && segment.segment_okh == req.segment_okh
+            && segment.segment_vid == req.segment_vid
+            && segment.data_pg_id == req.data_pg_id
+            && segment.placement_cluster_epoch == req.bucket_write_reservation.cluster_epoch
+            && segment.ec_k == req.ec.k
+            && segment.ec_m == req.ec.m
+    }
+
+    fn direct_put_written_shards_not_owned_by_command(
+        command: &CommitDirectPutObjectCommand,
+        request_data_pg_id: u32,
+        written_shards: &[WrittenShardAck],
+    ) -> Vec<WrittenShardAck> {
+        let command_owned_keys: HashSet<ShardKey> = command
+            .segments
+            .iter()
+            .filter(|segment| segment.data_pg_id == request_data_pg_id)
+            .flat_map(|segment| {
+                Self::payload_shard_set_keys(
+                    &segment.segment_okh,
+                    segment.segment_vid,
+                    EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                )
+            })
+            .collect();
+        written_shards
+            .iter()
+            .filter(|written| !command_owned_keys.contains(&written.key))
+            .cloned()
+            .collect()
     }
 
     #[cfg(test)]
@@ -14244,7 +14545,7 @@ impl StorageCluster {
         }
     }
 
-    pub fn delete_direct_put_segment_payload_shards(
+    pub(crate) fn delete_direct_put_segment_payload_shards(
         &self,
         data_pg_id: u32,
         ec: EcShape,

@@ -1,6 +1,6 @@
 use storage::{
-    direct_put_segment_key_hash, BucketName, CommitDirectPutObjectReq, CreateStreamUploadReq,
-    ObjectKey, SessionId, StreamPutFinalizeSnapshot, StreamUploadTarget,
+    BucketName, CreateStreamUploadReq, ObjectKey, PreparedDirectPutObjectCommit, SessionId,
+    StreamPutFinalizeSnapshot, StreamUploadTarget,
 };
 
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest, LoadedBucketHandle};
@@ -315,20 +315,16 @@ impl Coordinator {
                         let transient_segment_id =
                             Self::random_session_id("failed to generate direct put segment ID")?;
 
-                        let segment_index = 0;
                         let storage_bytes =
-                            write_encryption.encrypt_segment(segment_index, req.data)?;
+                            write_encryption.encrypt_segment(0, req.data)?;
                         let generation_id = put_route
                             .reserve_generation(&transient_segment_id)
                             .map_err(Coordinator::map_object_pg_action_error)?;
-                        let segment_okh =
-                            direct_put_segment_key_hash(&transient_segment_id, segment_index);
-                        let segment_vid = generation_id;
 
-                        let written_segment = match put_route.write_direct_segment_payload_shards(
+                        let written_payload = match put_route.write_direct_object_payload(
+                            &transient_segment_id,
                             generation_id,
-                            segment_index,
-                            &segment_okh,
+                            req.data.len() as u64,
                             &storage_bytes,
                         ) {
                             Ok(written_segment) => written_segment,
@@ -337,28 +333,17 @@ impl Coordinator {
                                 return Err(super::map_store_error(error));
                             }
                         };
-                        let commit_req = CommitDirectPutObjectReq {
-                            bucket: authorized.bucket_typed().clone(),
-                            key: authorized.key_typed().clone(),
-                            generation_reservation_id: transient_segment_id,
+                        let prepared_commit = PreparedDirectPutObjectCommit {
                             versioning: bucket_info.versioning,
                             owner,
                             acl_grants,
                             public_read,
-                            generation_id,
-                            size: req.data.len() as u64,
                             etag_crc64: object_crc64,
-                            ec: written_segment.ec,
                             object_lock: resolved_object_lock,
                             encryption,
                             tags: Self::stored_object_tags(authorized.tags())?,
                             metadata_blob,
                             system_metadata_blob,
-                            segment_index,
-                            segment_crc64: checksum::crc64::checksum(&storage_bytes),
-                            segment_okh,
-                            segment_vid,
-                            data_pg_id: written_segment.data_pg_id,
                             bucket_write_reservation: proof,
                         };
                         #[cfg(test)]
@@ -369,26 +354,16 @@ impl Coordinator {
                             {
                                 Ok(object_pg_ready) => object_pg_ready,
                                 Err(error) => {
-                                    put_route.delete_direct_segment_payload_shards(
-                                        &written_segment,
-                                        &segment_okh,
-                                        segment_vid,
-                                    );
-                                    put_route.release_generation_reservation(
-                                        &commit_req.generation_reservation_id,
-                                    );
+                                    put_route
+                                        .discard_direct_object_payload(written_payload)
+                                        .map_err(Coordinator::map_object_pg_action_error)?;
                                     return Err(error);
                                 }
                             };
                             if !object_pg_ready {
-                                put_route.delete_direct_segment_payload_shards(
-                                    &written_segment,
-                                    &segment_okh,
-                                    segment_vid,
-                                );
-                                put_route.release_generation_reservation(
-                                    &commit_req.generation_reservation_id,
-                                );
+                                put_route
+                                    .discard_direct_object_payload(written_payload)
+                                    .map_err(Coordinator::map_object_pg_action_error)?;
                                 return Err(ServerError::InternalError {
                                     reason: "test probe: object pg still locked before direct put commit"
                                         .to_string(),
@@ -398,8 +373,8 @@ impl Coordinator {
                         proof_transferred_to_command = true;
                         let outcome = put_route
                             .commit_direct_object(
-                                &commit_req,
-                                &written_segment.written_shards,
+                                written_payload,
+                                &prepared_commit,
                                 |snapshot| {
                                     if matches!(
                                         req.cond,

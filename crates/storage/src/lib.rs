@@ -92,7 +92,7 @@ pub use cluster::{
 #[cfg(feature = "test-hooks")]
 pub use cluster::{
     MetadataCommandApplyContextTestHook, MetadataCommandApplyContextTestHookGuard,
-    MetadataCommandApplyTestContext, MetadataCommandApplyTestKind,
+    MetadataCommandApplyTestContext, MetadataCommandApplyTestKind, TestDirectPutWrittenSegment,
 };
 pub use error::{
     BucketSnapshotLoadError, BucketWriteDrainError, ClusterBuildError, MetadataError,
@@ -423,9 +423,9 @@ pub use pg_store::{
 };
 pub use pg_topology::PgTopology;
 pub use placement::NodeId;
+pub(crate) use shard_key_hash::direct_put_segment_key_hash;
 pub use shard_key_hash::{
-    direct_put_segment_key_hash, multipart_part_segment_key_hash, object_key_hash,
-    segment_key_hash, stream_segment_key_hash,
+    multipart_part_segment_key_hash, object_key_hash, segment_key_hash, stream_segment_key_hash,
 };
 pub use standalone::{
     StandaloneRouteIdentity, StandaloneRouteIdentityError, StandaloneRouteIdentityLock,
@@ -442,6 +442,9 @@ pub use storage_rpc_auth::{
 pub(crate) use traits::PgMetadataStore;
 #[cfg(test)]
 pub(crate) use types::BucketSubresourceAux;
+pub(crate) use types::CommitDirectPutObjectReq;
+#[cfg(test)]
+pub(crate) use types::DirectPutWrittenSegment;
 pub use types::{
     key_prefix_upper_bound, object_key_common_prefix, object_key_prefix_upper_bound,
     AbortMultipartUploadCleanup, AclGrants, AuthorizedMultipartUploadRecord,
@@ -451,21 +454,20 @@ pub use types::{
     BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketVersioningState,
     BucketWriteDrainRecord, BucketWriteDrainState, BucketWriteReservationRecord, CanonicalUserId,
-    ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CommitDirectPutObjectReq,
-    CommitMultipartReq, CompleteMultipartCommitCleanup, CompleteMultipartCommitOutcome,
-    CompleteMultipartCommitRequest, CompletedMultipartStalePayload, CreateBucketConfig,
-    CreateMultipartUploadOutcome, CreateMultipartUploadReq, CreateStreamUploadReq, DataLayout,
-    DeleteCurrentObjectOutcome, DeleteMarkerRecord, DeleteSpecificObjectVersionOutcome,
-    DeletedCurrentObject, DeletedSpecificObjectVersion, DirectPutCommitSnapshot,
-    DirectPutCommitStorageSnapshot, DirectPutWrittenSegment, EcShape,
-    EffectiveBucketEncryptionConfig, EtagKind, ExpireCurrentObjectOutcome,
-    FinalizeDirectPutObjectOutcome, FinalizeStreamPartCleanup, FinalizeStreamPartOutcome,
-    FinalizeStreamPutOutcome, GenerationId, InsertCurrentDeleteMarkerOutcome,
-    InvalidChecksumConfig, LegalHoldStatus, LifecycleSweepBuckets, LifecycleSweepClaimRecord,
-    LifecycleSweepRoot, LifecycleSweepRootSource, ListMultipartUploadsPageStart,
-    ListMultipartUploadsReq, ListMultipartUploadsResp, ListObjectVersionsReq,
-    ListObjectVersionsResp, ListObjectsReq, ListObjectsResp, ListPartsReq, ListPartsResp,
-    ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
+    ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CommitMultipartReq,
+    CompleteMultipartCommitCleanup, CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest,
+    CompletedMultipartStalePayload, CreateBucketConfig, CreateMultipartUploadOutcome,
+    CreateMultipartUploadReq, CreateStreamUploadReq, DataLayout, DeleteCurrentObjectOutcome,
+    DeleteMarkerRecord, DeleteSpecificObjectVersionOutcome, DeletedCurrentObject,
+    DeletedSpecificObjectVersion, DirectPutCommitSnapshot, DirectPutCommitStorageSnapshot,
+    DirectPutPayloadWrite, EcShape, EffectiveBucketEncryptionConfig, EtagKind,
+    ExpireCurrentObjectOutcome, FinalizeDirectPutObjectOutcome, FinalizeStreamPartCleanup,
+    FinalizeStreamPartOutcome, FinalizeStreamPutOutcome, GenerationId,
+    InsertCurrentDeleteMarkerOutcome, InvalidChecksumConfig, LegalHoldStatus,
+    LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot, LifecycleSweepRootSource,
+    ListMultipartUploadsPageStart, ListMultipartUploadsReq, ListMultipartUploadsResp,
+    ListObjectVersionsReq, ListObjectVersionsResp, ListObjectsReq, ListObjectsResp, ListPartsReq,
+    ListPartsResp, ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
     ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource, ManagedEncryptionAlgorithm,
     MultipartChecksumConfig, MultipartCompletionFingerprint, MultipartCompletionPreflight,
     MultipartCompletionReplay, MultipartCompletionSnapshot, MultipartObjectIdentity,
@@ -477,10 +479,10 @@ pub use types::{
     ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode,
     ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord, ObjectState,
     OpaqueBucketSubresourceKind, OwnerIdentity, PgId, PgState, PrepareStreamUploadSegmentAppendReq,
-    PreparedStreamPartCommit, PreparedStreamPutCommit, PublicAccessBlockConfig,
-    PutBucketSubresource, PutDeleteMarkerReq, PutLiveObjectReq, PutLiveObjectValidationError,
-    PutObjectReq, RawChecksum, RetentionPeriod, RouteMapValidUntilMs, RouteMapValidity,
-    SegmentStoredBytesRequest, SerializedBucketTagSet, SerializedMetadataBlob,
+    PreparedDirectPutObjectCommit, PreparedStreamPartCommit, PreparedStreamPutCommit,
+    PublicAccessBlockConfig, PutBucketSubresource, PutDeleteMarkerReq, PutLiveObjectReq,
+    PutLiveObjectValidationError, PutObjectReq, RawChecksum, RetentionPeriod, RouteMapValidUntilMs,
+    RouteMapValidity, SegmentStoredBytesRequest, SerializedBucketTagSet, SerializedMetadataBlob,
     SerializedSystemMetadataBlob, SerializedTagSet, SessionId, SessionIdError, ShardData,
     ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
     ShardScavengerObservationReason, ShardScavengerObservationRecord, ShardStat, ShardStatus,
