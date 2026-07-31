@@ -1,0 +1,249 @@
+Unauthenticated slow body can starve background work
+Link: https://chatgpt.com/codex/cloud/security/findings/9bad4d482060819180bd2fc7cdec6e32?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Resolution
+Fixed in commit [`0ab1ebc25ed62297541417691e6a35635de5dace`](https://github.com/justincormack/argmin/commit/0ab1ebc25ed62297541417691e6a35635de5dace) (`Bound unauthenticated HTTP request pressure`).
+
+The finding was valid. The fix adds two independent availability controls:
+
+- Pre-authentication request-body reads now have a 60-second absolute deadline in addition to the existing per-frame idle timeout. The bound covers complete buffered request bodies and multipart POST fields read before authentication establishes the streaming context; authenticated object streaming remains governed by route validity and idle timeouts. Frame reads use a timer-first biased `select!` and recheck the absolute deadline before returning a successful frame, so a queued frame cannot win an expiry race or move multipart processing beyond the pre-authentication boundary.
+- Foreground maintenance pressure is now capacity-relative rather than true for every nonzero request count. Each HTTP server registers its admission capacity process-wide, and maintenance suppression starts only at the 75% admission high-water mark. One slow request therefore cannot suppress backfill candidate scans, routine backfill, opportunistic scans, or routine metadata checkpoints while request capacity remains available.
+
+The admitted request permit and inflight metric guard are also represented by one `HttpRequestAdmission` owner and transferred into the response body. Response conversion no longer creates a second guard, avoiding transient false pressure at the quantitative threshold. The threat model and multihost plan now document the absolute pre-authentication deadline and reserved maintenance capacity.
+
+Regression coverage verifies steady slow chunks hit the absolute deadline, expiry wins over an already-ready frame without consuming it, response handoff does not double-count inflight work, one request out of 32 does not signal foreground pressure, and 24 out of 32 does. Verification completed with 3,324 affected tests, the full 7,833-test workspace suite, and `cargo clippy --all-targets --all-features -- -D warnings` all passing.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: d873b59
+Author: justin@specialbusservice.com
+Created: 30/07/2026, 22:27:41
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced. The newly added inflight_requests guard in server-http starts before body collection/authentication, and server-core uses that metric as the sole active foreground-pressure signal for denying several background work classes.
+After acquiring the request semaphore, the HTTP handler now immediately creates an inflight_requests guard. This happens before routing completes for normal buffered requests, before the full request body is collected, and before the S3 request is authenticated/authorized by the frontend. The body collection helper uses only a per-frame idle timeout that resets on every received chunk, so a client can send a valid non-streaming request with a large Content-Length or chunked body and drip small chunks just below the idle timeout. While that unauthenticated request is being collected, MetricsSnapshot.inflight_requests remains greater than zero. BackgroundWorkAdmission then reports foreground pressure whenever inflight_requests is nonzero and denies BackfillCandidateScan, RoutineBackfill, OpportunisticScan, and RoutineMetadataCheckpoint. This lets a low-bandwidth unauthenticated network client suppress important maintenance/backfill/checkpoint work without filling all request slots.
+
+# Validation
+## Rubric
+- [x] Confirm the HTTP inflight request guard starts before buffered body collection and before S3 authentication/authorization.
+- [x] Confirm buffered non-streaming requests collect the complete body before constructing/handling the authenticated S3Request.
+- [x] Dynamically confirm the body idle timeout is per-frame and resets for slow steady chunks.
+- [x] Confirm server-core treats `inflight_requests > 0` as active foreground pressure and uses it to deny BackfillCandidateScan, RoutineBackfill, OpportunisticScan, and RoutineMetadataCheckpoint.
+- [x] Confirm the denial can be triggered by a single inflight request metric, i.e. without exhausting all request semaphore slots.
+## Report
+Validated the finding as a logic/availability issue, not a memory-safety crash. Crash reproduction is not expected for this bug class; the direct PoC tests complete successfully while demonstrating the vulnerable state. Valgrind was unavailable in the container, and an ASan attempt failed because stable Rust rejected `-Z sanitizer=address`. I then used LLDB against the debug test binary and stopped in the real admission path.
+
+Key code evidence: in `crates/server-http/src/http/serve.rs:898-948`, the handler acquires the request semaphore and immediately creates `observability::inflight_requests_guard()` before routing/body buffering completes. For the non-streaming buffered path, `crates/server-http/src/http/serve.rs:1164-1193` calls `collect_body_with_limit(...).await` before constructing `S3Request`; authentication is later inside `HttpFrontend::handle_service_request`, where routing/authentication occurs at `crates/server-http/src/http/mod.rs:1006-1113`. The collector wraps each individual `limited.frame()` in `tokio::time::timeout` at `crates/server-http/src/http/serve.rs:5267-5282`, so the timeout resets for every chunk. In server-core, suppressible background classes return `DeniedForegroundPressure` when `pressure.foreground` is true at `crates/server-core/src/coordinator/runtime.rs:274-303`; active foreground pressure is solely `snapshot.inflight_requests > 0` at `crates/server-core/src/coordinator/runtime.rs:409-411`.
+
+Dynamic PoCs added as a temporary patch: `cargo test -p server-http collect_body_idle_timeout_resets_for_slow_steady_chunks -- --nocapture` passed. This starts a local Hyper HTTP/1 service that calls `collect_body_with_limit` directly, then sends chunked body bytes every 70ms under a 120ms idle timeout; total upload time exceeds one idle timeout but returns `ok:abc`, proving slow steady unauthenticated body collection can persist. `cargo test -p server-core foreground_inflight_request_guard_denies_suppressible_background_classes -- --nocapture` passed and exercises the actual `observability::inflight_requests_guard()` plus `BackgroundWorkAdmission::try_acquire` path, proving one inflight request denies BackfillCandidateScan, RoutineBackfill, OpportunisticScan, and RoutineMetadataCheckpoint while non-suppressed classes remain admissible.
+
+Debugger evidence from `lldb-policy-trace.log`: LLDB stopped at `BackgroundWorkAdmission::policy_denial_event_for_pressure` with `class=BackfillCandidateScan` and `pressure=(foreground = true, durable_backlog = false)`. The backtrace shows the path `policy_denial_event_for_pressure` <- `policy_denial_event` <- `foreground_inflight_request_guard_denies_suppressible_background_classes`, confirming the denial is caused by foreground pressure derived from the inflight request metric, not durable backlog or limits.
+
+Relevant command outputs: server-core PoC: `running 1 test ... foreground_inflight_request_guard_denies_suppressible_background_classes ... ok`. server-http PoC: `running 1 test ... collect_body_idle_timeout_resets_for_slow_steady_chunks ... ok`. ASan attempt: `error: the option Z is only accepted on the nightly compiler`. Valgrind attempt: `valgrind not installed in container`.
+
+# Evidence
+crates/server-core/src/coordinator/runtime.rs (L274 to 303)
+  Note: Foreground pressure causes denial of backfill candidate scans, routine backfill, opportunistic scans, and routine metadata checkpoints.
+```
+        match class {
+            BackgroundWorkClass::KnownDamageRepair
+            | BackgroundWorkClass::ReclaimCleanup
+            | BackgroundWorkClass::LifecycleCleanup
+            | BackgroundWorkClass::StreamSessionCleanup => None,
+            BackgroundWorkClass::BackfillCandidateScan | BackgroundWorkClass::RoutineBackfill => {
+                if pressure.foreground {
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
+                } else if self.known_damage_repair_active.load(Ordering::Acquire) > 0 {
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedKnownDamageActive)
+                } else {
+                    None
+                }
+            }
+            BackgroundWorkClass::OpportunisticScan => {
+                if pressure.foreground {
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
+                } else if pressure.durable_backlog {
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedBacklogPressure)
+                } else {
+                    None
+                }
+            }
+            BackgroundWorkClass::RoutineMetadataCheckpoint => {
+                if pressure.foreground {
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
+                } else {
+                    None
+                }
+            }
+```
+
+crates/server-core/src/coordinator/runtime.rs (L401 to 411)
+  Note: After the commit, active foreground pressure is determined solely by request admission counters and inflight_requests, so the unauthenticated slow request's guard directly suppresses background work.
+```
+fn background_work_foreground_pressure_delta(
+    last: observability::MetricsSnapshot,
+    current: observability::MetricsSnapshot,
+) -> bool {
+    current.request_admission_wait_total > last.request_admission_wait_total
+        || current.request_admission_timeout_total > last.request_admission_timeout_total
+}
+
+fn background_work_foreground_pressure_active(snapshot: observability::MetricsSnapshot) -> bool {
+    snapshot.inflight_requests > 0
+}
+```
+
+crates/server-http/src/http/serve.rs (L1164 to 1193)
+  Note: The buffered request path collects the full body before constructing the S3Request that is later handled/authenticated, so the inflight foreground signal can be held during unauthenticated body upload.
+```
+    // Non-streaming path: collect the full body for buffered control-plane
+    // style requests (mostly XML payloads).
+    let body_limit = buffered_body_limit_for_request_parts(state.endpoint_kind, &parts);
+    let body_bytes = match collect_body_with_limit(
+        &mut body,
+        state.config.body_idle_timeout,
+        body_limit,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return Ok(response_to_hyper_with_request_body(
+                &state,
+                S3Response::error_with_ids(&err, "", &wire_ids),
+                body,
+                Some(req_permit),
+                response_trace,
+            ));
+        }
+    };
+
+    let s3req = match S3Request::from_hyper_with_source_ip(
+        parts,
+        body_bytes,
+        transport_security,
+        source_ip,
+        request_epoch_seconds,
+    )
+    .map(|req| req.with_tls_version(tls_version))
+```
+
+crates/server-http/src/http/serve.rs (L5267 to 5271)
+  Note: Body collection uses a per-frame idle timeout that resets on every chunk; a client sending data steadily but very slowly will not time out.
+```
+/// Collect a request body with size limiting and per-frame idle timeout.
+///
+/// Each call to `frame()` is individually wrapped in a timeout that resets on
+/// every chunk. A client sending data steadily (even slowly) will never be
+/// timed out; only truly stalled connections are killed.
+```
+
+crates/server-http/src/http/serve.rs (L898 to 948)
+  Note: The new inflight_requests guard is created immediately after request admission, before body collection and before normal S3 authentication/authorization.
+```
+    // Acquire request permit before body collection to bound memory.
+    let admission_started_at = Instant::now();
+    let req_permit = match tokio::time::timeout(
+        state.config.request_wait_timeout,
+        Arc::clone(&state.request_semaphore).acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => {
+            let wait_us = admission_started_at.elapsed().as_micros();
+            if wait_us >= REQUEST_ADMISSION_WAIT_EVENT_THRESHOLD_US {
+                let _ = observability::emit_request_admission_wait(
+                    &response_trace.context,
+                    TRACE_TARGET,
+                    observability::RequestAdmissionWaitSummary {
+                        method: response_trace.method.as_str(),
+                        path: response_trace.path.as_str(),
+                        query: response_trace.query,
+                        wait_us,
+                    },
+                );
+            }
+            permit
+        }
+        _ => {
+            let wait_us = admission_started_at.elapsed().as_micros();
+            let _ = observability::emit_request_admission_timeout(
+                &response_trace.context,
+                TRACE_TARGET,
+                observability::RequestAdmissionTimeoutSummary {
+                    method: response_trace.method.as_str(),
+                    path: response_trace.path.as_str(),
+                    query: response_trace.query,
+                    wait_us,
+                    timeout_us: state.config.request_wait_timeout.as_micros(),
+                },
+            );
+            let resp = S3Response::error_with_ids(&ServerError::SlowDown, "", &wire_ids);
+            return Ok(response_to_hyper_with_request_body(
+                &state,
+                resp,
+                body,
+                None,
+                response_trace,
+            ));
+        }
+    };
+    // Keep the foreground-pressure signal active for the complete admitted
+    // request, including body collection and storage RPCs. The response body
+    // takes over this signal when the handler returns.
+    let _inflight_request_guard = observability::inflight_requests_guard();
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Severity remains medium. The code evidence confirms the vulnerable sequence: pre-auth inflight_requests_guard at serve.rs:898-948, full buffered body collection before S3Request/authentication at serve.rs:1164-1192 and mod.rs:1006-1113, per-frame-only body timeout at serve.rs:5267-5304, and server-core background denial when inflight_requests > 0 at runtime.rs:274-303 and 409-411. The attack is reachable through the main HTTP runtime and requires no credentials, supporting security relevance. However, impact is limited to availability degradation of selected background maintenance work rather than direct data compromise or full service outage, and static repository evidence does not establish public internet exposure because ARGMIN_LISTEN_ADDR defaults to 127.0.0.1:9000 with no IaC/LB artifacts found.
+## Likelihood
+high - If the HTTP frontend is reachable, exploitation is unauthenticated, low complexity, and requires only a slow request body sending chunks before the 30s default per-frame timeout. Likelihood is not rated high because the repository contains no deployment manifest or public load balancer evidence, and the default listen address is loopback; real exposure depends on operator configuration. | Remote network vector
+## Impact
+medium - A successful attack can suppress routine backfill, candidate scans, opportunistic scans, and routine metadata checkpoints for as long as slow pre-auth requests are maintained. This can degrade durability maintenance and operational health, but the evidence does not show object confidentiality/integrity compromise, privilege escalation, RCE, or immediate total service unavailability. Some maintenance classes such as KnownDamageRepair, ReclaimCleanup, LifecycleCleanup, and StreamSessionCleanup are not denied by this foreground-pressure policy.
+## Assumptions
+- The argmin-s3 frontend HTTP listener is reachable by an attacker, either directly or through a proxy.
+- No external reverse proxy or network control enforces a stricter absolute request-body deadline, minimum upload rate, or per-source slow-client limit.
+- Background backfill, scan, and checkpoint work materially contributes to service durability/maintenance in the target deployment.
+- argmin-s3 running with a frontend-capable process role
+- HTTP S3 endpoint reachable over TCP
+- attacker can send a non-streaming buffered request body slowly but with each frame arriving before body_idle_timeout
+- background maintenance classes are scheduled while the slow request is inflight
+## Path
+Unauth client
+  -> HTTP listener/request admission
+  -> inflight_requests_guard before auth/body completion
+  -> slow chunked or large body under per-frame timeout
+  -> inflight_requests > 0
+  -> BackgroundWorkAdmission foreground pressure
+  -> backfill/scans/checkpoints denied
+## Path evidence
+- `crates/server-http/src/http/serve.rs:898-948` - The handler acquires the request semaphore and creates observability::inflight_requests_guard() immediately after admission, before routing/body buffering/authentication is complete.
+- `crates/server-http/src/http/serve.rs:1164-1192` - The non-streaming buffered path collects the full request body before constructing the S3Request passed to later routing and authentication.
+- `crates/server-http/src/http/serve.rs:5267-5304` - collect_body_with_limit documents and implements a per-frame idle timeout; the timeout resets on each chunk and only fails when no frame arrives within the idle timeout.
+- `crates/server-http/src/http/mod.rs:1006-1113` - Service routing and authenticate_for_service occur after an S3Request exists, which for the buffered path is after full body collection.
+- `crates/server-core/src/coordinator/runtime.rs:274-303` - BackgroundWorkAdmission denies BackfillCandidateScan, RoutineBackfill, OpportunisticScan, and RoutineMetadataCheckpoint when foreground pressure is true.
+- `crates/server-core/src/coordinator/runtime.rs:409-411` - Active foreground pressure is determined by snapshot.inflight_requests > 0.
+- `crates/server-http/src/http/request.rs:8-19` - Buffered control-plane bodies are size-limited to 2,621,440 bytes, but this cap still allows long-lived low-bandwidth drips because there is no absolute body deadline.
+- `crates/argmin-s3/src/config.rs:517-563` - Main product configuration exposes ARGMIN_LISTEN_ADDR, optional TLS, credentials, and HTTP limits for the argmin-s3 server.
+- `crates/argmin-s3/src/main.rs:7159-7236` - The production frontend binds the configured TCP listener and starts server_http::http::serve or serve_tls with max connection and inflight limits.
+## Narrative
+The finding is a real in-scope availability vulnerability. The main HTTP handler acquires a request permit and immediately creates an inflight_requests guard before buffered body collection and before HttpFrontend authentication. The buffered path then reads the full body with collect_body_with_limit; authentication only occurs later in HttpFrontend::handle_s3_request. The collector wraps each frame read in tokio::time::timeout, so a client that steadily sends tiny chunks before the 30s default body_idle_timeout can keep the request inflight for a very long time. Server-core treats any nonzero inflight_requests value as active foreground pressure and denies multiple background maintenance classes. This is unauthenticated and low complexity when the HTTP endpoint is reachable, but the direct impact is degradation of maintenance/backfill/checkpoint availability rather than data disclosure, data modification, RCE, or full service outage.
+## Controls
+- ARGMIN_LISTEN_ADDR defaults to 127.0.0.1:9000 but can be configured for reachable network addresses.
+- ARGMIN_MAX_CONNECTIONS defaults to 512.
+- ARGMIN_MAX_INFLIGHT_REQUESTS defaults to 32.
+- ServeConfig request_wait_timeout defaults to 5 seconds.
+- ServeConfig body_idle_timeout defaults to 30 seconds but is per-frame rather than an absolute body deadline.
+- Buffered control-plane request bodies are capped at MAX_BUFFERED_CONTROL_BODY_SIZE.
+- SigV4 authentication and authorization exist for S3 operations but occur after buffered body collection on this path.
+- TLS is optional via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH.
+## Blindspots
+- Static repository review found no Kubernetes, Terraform, Docker Compose, or load-balancer manifests, so actual public/internal exposure cannot be proven from repo artifacts.
+- The practical duration and operational severity depend on deployment-specific reverse proxies, network timeouts, maintenance scheduling, and whether the endpoint is externally reachable.
+- Earlier validation PoCs were temporary test artifacts; this attack-path review relied on repository code and the provided validation summary rather than re-running dynamic tests.
