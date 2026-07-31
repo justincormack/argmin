@@ -2209,14 +2209,14 @@ pub(crate) const PLACED_SEGMENT_SHARD_REPAIR_CLAIM_ID_MAX_LEN: usize = 128;
 pub(crate) const PLACED_SEGMENT_SHARD_REPAIR_OWNER_TOKEN_MAX_LEN: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PlacedSegmentShardBackfillWorkItem {
+pub(crate) struct PlacedSegmentShardBackfillWorkItem {
     pub request: SegmentStoredBytesRequest,
     pub source_cluster_epoch: ClusterEpoch,
     pub desired_cluster_epoch: ClusterEpoch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedSegmentShardBackfillRecord {
+pub(crate) struct PlacedSegmentShardBackfillRecord {
     pub work_item: PlacedSegmentShardBackfillWorkItem,
     pub remaining_tolerance: u8,
     pub first_seen_at: u64,
@@ -2226,7 +2226,7 @@ pub struct PlacedSegmentShardBackfillRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedSegmentShardBackfillClaimRecord {
+pub(crate) struct PlacedSegmentShardBackfillClaimRecord {
     pub work_item: PlacedSegmentShardBackfillWorkItem,
     pub remaining_tolerance: u8,
     pub claim_id: String,
@@ -2239,7 +2239,7 @@ pub struct PlacedSegmentShardBackfillClaimRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedSegmentShardBackfillClaimAcquireParams {
+pub(crate) struct PlacedSegmentShardBackfillClaimAcquireParams {
     pub claim_id: String,
     pub owner_token: String,
     pub claimed_at: u64,
@@ -2248,7 +2248,7 @@ pub struct PlacedSegmentShardBackfillClaimAcquireParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedSegmentShardBackfillClaimAcquire {
+pub(crate) struct PlacedSegmentShardBackfillClaimAcquire {
     pub claim_id: String,
     pub owner_token: String,
     pub cluster_epoch: ClusterEpoch,
@@ -2257,10 +2257,10 @@ pub struct PlacedSegmentShardBackfillClaimAcquire {
     pub now: u64,
 }
 
-pub const PLACED_SEGMENT_SHARD_BACKFILL_LIST_LIMIT: usize = 1024;
-pub const PLACED_SEGMENT_SHARD_BACKFILL_LAST_ERROR_MAX_LEN: usize = 4096;
-pub const PLACED_SEGMENT_SHARD_BACKFILL_CLAIM_ID_MAX_LEN: usize = 128;
-pub const PLACED_SEGMENT_SHARD_BACKFILL_OWNER_TOKEN_MAX_LEN: usize = 128;
+pub(crate) const PLACED_SEGMENT_SHARD_BACKFILL_LIST_LIMIT: usize = 1024;
+pub(crate) const PLACED_SEGMENT_SHARD_BACKFILL_LAST_ERROR_MAX_LEN: usize = 4096;
+pub(crate) const PLACED_SEGMENT_SHARD_BACKFILL_CLAIM_ID_MAX_LEN: usize = 128;
+pub(crate) const PLACED_SEGMENT_SHARD_BACKFILL_OWNER_TOKEN_MAX_LEN: usize = 128;
 
 /// Object-level ETag — either a single-part CRC64-NVME or a multipart composite.
 ///

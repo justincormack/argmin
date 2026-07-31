@@ -9,9 +9,9 @@ use super::read_core::ReadRuntime;
 use super::request_types::AuthorizePutObjectRequest;
 use super::response_types::{BucketSummary, ModernBucketSummary};
 use super::runtime::{
-    acquire_shard_repair_sweeper, acquire_shard_scavenger_sweeper, acquire_stream_session_sweeper,
-    LifecycleSweeper, ReclaimSweeper, ShardBackfillSweeper, ShardRepairSweeper,
-    ShardScavengerSweeper, StreamSessionSweeper,
+    acquire_shard_backfill_sweeper, acquire_shard_repair_sweeper, acquire_shard_scavenger_sweeper,
+    acquire_stream_session_sweeper, LifecycleSweeper, ReclaimSweeper, ShardBackfillSweeper,
+    ShardRepairSweeper, ShardScavengerSweeper, StreamSessionSweeper,
 };
 #[cfg(test)]
 use super::trusted_bucket_name;
@@ -480,9 +480,9 @@ impl Coordinator {
         };
         let shard_backfill_sweeper_factory = |storage_handle: &StorageClusterRouteHandle| {
             if background_worker_mode.shard_backfill {
-                ShardBackfillSweeper::acquire_shared(storage_handle)
+                acquire_shard_backfill_sweeper(storage_handle)
             } else {
-                Ok(ShardBackfillSweeper::disabled())
+                Ok(ShardBackfillSweeper::disabled(storage_handle.clone()))
             }
         };
         let stream_session_sweeper_factory = |storage_handle: &StorageClusterRouteHandle| {
@@ -588,7 +588,7 @@ impl Coordinator {
                 lifecycle_sweeper_factory,
                 acquire_shard_scavenger_sweeper,
                 acquire_shard_repair_sweeper,
-                ShardBackfillSweeper::acquire_shared,
+                acquire_shard_backfill_sweeper,
                 acquire_stream_session_sweeper,
             ),
         )
@@ -776,7 +776,7 @@ impl Coordinator {
             lifecycle: !self._lifecycle_sweeper.stop.load(Ordering::SeqCst),
             shard_scavenger: self._shard_scavenger_sweeper.test_is_enabled(),
             shard_repair: self._shard_repair_sweeper.test_is_enabled(),
-            shard_backfill: !self._shard_backfill_sweeper.stop.load(Ordering::SeqCst),
+            shard_backfill: self._shard_backfill_sweeper.test_is_enabled(),
             stream_session: self._stream_session_sweeper.test_is_enabled(),
         }
     }

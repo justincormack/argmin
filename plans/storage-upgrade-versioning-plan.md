@@ -923,6 +923,19 @@ single-step state machine as production and use a pinned clock for retry eligibi
 polling worker timing. Backfill execution and reclaim/finalization remain pending, so item 1 is not
 yet complete.
 
+The fifth bounded slice moves durable shard-backfill claim scanning and its fairness cursor, claim
+identity and leases, risk-based admission, physical copy/reconstruction, obsolete-source
+resolution, stale-route retry classification, durable error/completion transitions, worker
+registration, lifecycle, diagnostics, and telemetry into `StorageShardBackfillSweeper`.
+`server-core` retains only the opaque worker and sanitized startup-error translation. The worker
+registry is keyed by route-publication domain, remains shared across storage-identity replacement,
+and remains distinct for independent publication domains over the same initial cluster. Raw
+backfill records, claims, plans, queue transitions, source-reference inspection, and physical
+mutation entry points are crate-private; owner-local tests may use the raw transitions while
+cross-crate composition tests receive dedicated test-only DTOs and a deterministic single-step
+worker facility. Reclaim and asynchronous bucket cleanup/finalization remain pending, so item 1 is
+not yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

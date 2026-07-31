@@ -77,6 +77,8 @@ use crate::storage_rpc::{
 };
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::types::PlacedSegmentShardBackfillRecord;
 use crate::types::{
     AclGrants, AdmittedRouteEffectFence, AuthorizedMultipartUploadRecord, BucketAclSummary,
     BucketEncryptionConfig, BucketInfo, BucketName, BucketObjectLockConfig,
@@ -93,14 +95,13 @@ use crate::types::{
     ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord,
     OwnerIdentity, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
     PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
-    PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
-    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,
-    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
-    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
-    PreparedStreamPartCommit, PreparedStreamPutCommit, PublicAccessBlockConfig, RouteMapValidity,
-    SegmentStoredBytesRequest, SerializedBucketTagSet, SerializedTagSet, SessionId, ShardIndex,
-    ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
-    ShardScavengerObservationReason, ShardScavengerObservationRecord,
+    PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
+    PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,
+    PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
+    PrepareStreamUploadSegmentAppendReq, PreparedStreamPartCommit, PreparedStreamPutCommit,
+    PublicAccessBlockConfig, RouteMapValidity, SegmentStoredBytesRequest, SerializedBucketTagSet,
+    SerializedTagSet, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
+    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
     ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus,
     StoredObject, StreamPutFinalizeSnapshot, StreamUploadCommandRecord, StreamUploadPartSnapshot,
     StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
@@ -233,6 +234,56 @@ impl From<PlacedSegmentShardRepairRecord> for StorageShardRepairTestRecord {
     fn from(record: PlacedSegmentShardRepairRecord) -> Self {
         Self {
             work_item: record.work_item.into(),
+            first_seen_at: record.first_seen_at,
+            last_seen_at: record.last_seen_at,
+            observation_count: record.observation_count,
+            last_error: record.last_error,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageShardBackfillTestWorkItem {
+    pub request: SegmentStoredBytesRequest,
+    pub source_cluster_epoch: ClusterEpoch,
+    pub desired_cluster_epoch: ClusterEpoch,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl StorageShardBackfillTestWorkItem {
+    fn into_internal(self) -> PlacedSegmentShardBackfillWorkItem {
+        PlacedSegmentShardBackfillWorkItem {
+            request: self.request,
+            source_cluster_epoch: self.source_cluster_epoch,
+            desired_cluster_epoch: self.desired_cluster_epoch,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageShardBackfillTestRecord {
+    pub work_item: StorageShardBackfillTestWorkItem,
+    pub remaining_tolerance: u8,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
+    pub observation_count: u64,
+    pub last_error: Option<String>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<PlacedSegmentShardBackfillRecord> for StorageShardBackfillTestRecord {
+    fn from(record: PlacedSegmentShardBackfillRecord) -> Self {
+        Self {
+            work_item: StorageShardBackfillTestWorkItem {
+                request: record.work_item.request,
+                source_cluster_epoch: record.work_item.source_cluster_epoch,
+                desired_cluster_epoch: record.work_item.desired_cluster_epoch,
+            },
+            remaining_tolerance: record.remaining_tolerance,
             first_seen_at: record.first_seen_at,
             last_seen_at: record.last_seen_at,
             observation_count: record.observation_count,
@@ -1172,7 +1223,7 @@ impl PlacedSegmentShardSetHealth {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedSegmentShardBackfillCopyTarget {
+pub(crate) struct PlacedSegmentShardBackfillCopyTarget {
     pub shard_index: ShardIndex,
     pub shard_key: ShardKey,
     pub source: ShardLocation,
@@ -1180,7 +1231,7 @@ pub struct PlacedSegmentShardBackfillCopyTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedSegmentShardBackfillPlan {
+pub(crate) struct PlacedSegmentShardBackfillPlan {
     pub source_health: PlacedSegmentShardSetHealth,
     pub desired_health: PlacedSegmentShardSetHealth,
     pub already_present: Vec<ShardIndex>,
@@ -15778,7 +15829,52 @@ impl StorageCluster {
             .record_placed_segment_shard_repair_claim_error(claim, last_error, next_attempt_after)
     }
 
-    pub fn record_placed_segment_shard_backfill(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_record_placed_segment_shard_backfill(
+        &self,
+        work_item: StorageShardBackfillTestWorkItem,
+        remaining_tolerance: Option<u8>,
+        last_error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let work_item = work_item.into_internal();
+        self.record_placed_segment_shard_backfill_with_remaining_tolerance(
+            &work_item,
+            remaining_tolerance.unwrap_or(work_item.request.ec.m),
+            last_error,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_list_placed_segment_shard_backfills(
+        &self,
+        data_pg_id: u32,
+    ) -> Result<Vec<StorageShardBackfillTestRecord>, StoreError> {
+        self.list_placed_segment_shard_backfills(data_pg_id)
+            .map(|records| records.into_iter().map(Into::into).collect())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_backfill_placed_segment_payload_shards_for_work_item(
+        &self,
+        work_item: StorageShardBackfillTestWorkItem,
+    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        self.backfill_placed_segment_payload_shards_for_work_item(&work_item.into_internal())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_placed_segment_shard_backfill_source_is_referenced(
+        &self,
+        work_item: StorageShardBackfillTestWorkItem,
+    ) -> Result<bool, StoreError> {
+        self.placed_segment_shard_backfill_source_is_referenced(&work_item.into_internal())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_placed_segment_shard_backfill(
         &self,
         work_item: &PlacedSegmentShardBackfillWorkItem,
         last_error: Option<&str>,
@@ -15790,7 +15886,7 @@ impl StorageCluster {
         )
     }
 
-    pub fn record_placed_segment_shard_backfill_with_remaining_tolerance(
+    pub(crate) fn record_placed_segment_shard_backfill_with_remaining_tolerance(
         &self,
         work_item: &PlacedSegmentShardBackfillWorkItem,
         remaining_tolerance: u8,
@@ -15801,7 +15897,8 @@ impl StorageCluster {
             .record_placed_segment_shard_backfill(work_item, remaining_tolerance, last_error)
     }
 
-    pub fn list_placed_segment_shard_backfills(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn list_placed_segment_shard_backfills(
         &self,
         data_pg_id: u32,
     ) -> Result<Vec<PlacedSegmentShardBackfillRecord>, StoreError> {
@@ -15810,7 +15907,7 @@ impl StorageCluster {
             .list_placed_segment_shard_backfills()
     }
 
-    pub fn placed_segment_shard_backfill_exists(
+    pub(crate) fn placed_segment_shard_backfill_exists(
         &self,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<bool, StoreError> {
@@ -15819,7 +15916,7 @@ impl StorageCluster {
             .placed_segment_shard_backfill_exists(work_item)
     }
 
-    pub fn placed_segment_shard_backfill_backlog_depth(&self) -> Result<usize, StoreError> {
+    pub(crate) fn placed_segment_shard_backfill_backlog_depth(&self) -> Result<usize, StoreError> {
         let mut depth = 0usize;
         for route in self.local_pg_routes() {
             if route.state() != PgState::Active {
@@ -16064,7 +16161,7 @@ impl StorageCluster {
         }
     }
 
-    pub fn placed_segment_shard_backfill_source_is_referenced(
+    pub(crate) fn placed_segment_shard_backfill_source_is_referenced(
         &self,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<bool, StoreError> {
@@ -16098,7 +16195,7 @@ impl StorageCluster {
         Ok(false)
     }
 
-    pub fn acquire_placed_segment_shard_backfill_claim(
+    pub(crate) fn acquire_placed_segment_shard_backfill_claim(
         &self,
         data_pg_id: u32,
         params: &PlacedSegmentShardBackfillClaimAcquireParams,
@@ -16116,14 +16213,15 @@ impl StorageCluster {
         route.acquire_placed_segment_shard_backfill_claim(&request)
     }
 
-    pub fn acquire_next_placed_segment_shard_backfill_claim(
+    #[cfg(test)]
+    pub(crate) fn acquire_next_placed_segment_shard_backfill_claim(
         &self,
         params: &PlacedSegmentShardBackfillClaimAcquireParams,
     ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
         self.acquire_next_placed_segment_shard_backfill_claim_with_cursor(params, &mut None)
     }
 
-    pub fn acquire_next_placed_segment_shard_backfill_claim_with_cursor(
+    pub(crate) fn acquire_next_placed_segment_shard_backfill_claim_with_cursor(
         &self,
         params: &PlacedSegmentShardBackfillClaimAcquireParams,
         last_claimed_pg_id: &mut Option<PgId>,
@@ -16148,7 +16246,7 @@ impl StorageCluster {
         Ok(None)
     }
 
-    pub fn complete_placed_segment_shard_backfill_claim(
+    pub(crate) fn complete_placed_segment_shard_backfill_claim(
         &self,
         claim: &PlacedSegmentShardBackfillClaimRecord,
     ) -> Result<bool, StoreError> {
@@ -16164,7 +16262,7 @@ impl StorageCluster {
             .complete_placed_segment_shard_backfill_claim(claim)
     }
 
-    pub fn record_placed_segment_shard_backfill_claim_error(
+    pub(crate) fn record_placed_segment_shard_backfill_claim_error(
         &self,
         claim: &PlacedSegmentShardBackfillClaimRecord,
         last_error: &str,
@@ -16182,7 +16280,8 @@ impl StorageCluster {
             .record_placed_segment_shard_backfill_claim_error(claim, last_error, next_attempt_after)
     }
 
-    pub fn resolve_placed_segment_shard_backfill(
+    #[cfg(test)]
+    pub(crate) fn resolve_placed_segment_shard_backfill(
         &self,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<(), StoreError> {
@@ -16254,7 +16353,7 @@ impl StorageCluster {
         )
     }
 
-    pub fn placed_segment_payload_shard_backfill_plan(
+    pub(crate) fn placed_segment_payload_shard_backfill_plan(
         &self,
         source_route: &PgRouteSnapshot,
         desired_route: &PgRouteSnapshot,
@@ -16267,7 +16366,8 @@ impl StorageCluster {
         build_placed_segment_shard_backfill_plan(source_health, desired_health)
     }
 
-    pub fn record_placed_segment_shard_backfill_for_plan(
+    #[cfg(test)]
+    pub(crate) fn record_placed_segment_shard_backfill_for_plan(
         &self,
         source_route: &PgRouteSnapshot,
         desired_route: &PgRouteSnapshot,
@@ -16300,7 +16400,8 @@ impl StorageCluster {
         Ok(plan)
     }
 
-    pub fn backfill_placed_segment_payload_shard_direct_copies(
+    #[cfg(test)]
+    pub(crate) fn backfill_placed_segment_payload_shard_direct_copies(
         &self,
         source_route: &PgRouteSnapshot,
         desired_route: &PgRouteSnapshot,
@@ -16385,7 +16486,7 @@ impl StorageCluster {
         Ok(copied)
     }
 
-    pub fn backfill_placed_segment_payload_shards(
+    pub(crate) fn backfill_placed_segment_payload_shards(
         &self,
         source_route: &PgRouteSnapshot,
         desired_route: &PgRouteSnapshot,
@@ -16511,7 +16612,7 @@ impl StorageCluster {
         Ok(backfilled)
     }
 
-    pub fn backfill_placed_segment_payload_shards_for_work_item(
+    pub(crate) fn backfill_placed_segment_payload_shards_for_work_item(
         &self,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<Vec<WrittenShardAck>, StoreError> {

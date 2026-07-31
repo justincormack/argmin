@@ -79,14 +79,14 @@ pub use cluster::{
     LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
     LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
     LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PgMetadataTransferArtifact,
-    PlacedSegmentShardBackfillCopyTarget, PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth,
-    PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk, PlacedSegmentShardValidation,
-    PreparedStandaloneEmbeddedTopology, ProcessLocalRegistryKey, ReleasedObjectPayloadLease,
-    RetainedObjectPayloadRead, RetainedStreamUploadCleanup, ShardLocation, StorageCluster,
-    StorageClusterRouteAdmission, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
-    StorageClusterRuntimeMapRefreshError, StorageClusterRuntimeMapRefreshLoop,
-    StorageClusterRuntimeMapRefreshLoopFailure, StorageClusterRuntimeMapRefreshLoopStatus,
-    StorageClusterRuntimeMapRefreshLoopStatusHandle, StorageClusterRuntimeMapRefreshLoopSuccess,
+    PlacedSegmentShardHealth, PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk,
+    PlacedSegmentShardValidation, PreparedStandaloneEmbeddedTopology, ProcessLocalRegistryKey,
+    ReleasedObjectPayloadLease, RetainedObjectPayloadRead, RetainedStreamUploadCleanup,
+    ShardLocation, StorageCluster, StorageClusterRouteAdmission, StorageClusterRouteHandle,
+    StorageClusterRuntimeMapHandle, StorageClusterRuntimeMapRefreshError,
+    StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopFailure,
+    StorageClusterRuntimeMapRefreshLoopStatus, StorageClusterRuntimeMapRefreshLoopStatusHandle,
+    StorageClusterRuntimeMapRefreshLoopSuccess,
 };
 #[cfg(feature = "test-hooks")]
 pub use cluster::{
@@ -103,7 +103,8 @@ pub use error::{
 pub use maintenance::StorageStreamSessionSweepTestSummary;
 pub use maintenance::{
     StorageMaintenanceAdmission, StorageMaintenancePermit, StorageMaintenanceStartError,
-    StorageShardRepairSweeper, StorageShardScavengerSweeper, StorageStreamSessionSweeper,
+    StorageShardBackfillSweeper, StorageShardRepairSweeper, StorageShardScavengerSweeper,
+    StorageStreamSessionSweeper,
 };
 pub use metadata_command::BucketWriteReservationProof;
 #[cfg(test)]
@@ -192,13 +193,10 @@ pub use types::{
     ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention,
     ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
     ObjectState, OpaqueBucketSubresourceKind, OwnerIdentity, PayloadReclaimRoot, PgId, PgState,
-    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
-    PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
-    PlacedSegmentShardBackfillWorkItem, PrepareStreamUploadSegmentAppendReq,
-    PreparedStreamPartCommit, PreparedStreamPutCommit, PublicAccessBlockConfig,
-    PutBucketSubresource, PutDeleteMarkerReq, PutLiveObjectReq, PutLiveObjectValidationError,
-    PutObjectReq, RawChecksum, RetentionPeriod, RouteMapValidUntilMs, RouteMapValidity,
-    SegmentStoredBytesRequest, SerializedBucketTagSet, SerializedMetadataBlob,
+    PrepareStreamUploadSegmentAppendReq, PreparedStreamPartCommit, PreparedStreamPutCommit,
+    PublicAccessBlockConfig, PutBucketSubresource, PutDeleteMarkerReq, PutLiveObjectReq,
+    PutLiveObjectValidationError, PutObjectReq, RawChecksum, RetentionPeriod, RouteMapValidUntilMs,
+    RouteMapValidity, SegmentStoredBytesRequest, SerializedBucketTagSet, SerializedMetadataBlob,
     SerializedSystemMetadataBlob, SerializedTagSet, SessionId, SessionIdError, ShardData,
     ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
     ShardScavengerObservationReason, ShardScavengerObservationRecord, ShardStat, ShardStatus,
@@ -212,14 +210,18 @@ pub use types::{
     MULTIPART_UPLOAD_ID_KEY_LEN, OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN,
     OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN, OBJECT_ENCRYPTION_SEGMENT_NONCE_SCOPE_LEN,
     OBJECT_ENCRYPTION_SEGMENT_TAG_LEN, OBJECT_ENCRYPTION_WRAPPED_DEK_LEN,
-    OBJECT_ENCRYPTION_WRAP_NONCE_LEN, PLACED_SEGMENT_SHARD_BACKFILL_CLAIM_ID_MAX_LEN,
-    PLACED_SEGMENT_SHARD_BACKFILL_LAST_ERROR_MAX_LEN, PLACED_SEGMENT_SHARD_BACKFILL_LIST_LIMIT,
-    PLACED_SEGMENT_SHARD_BACKFILL_OWNER_TOKEN_MAX_LEN, SESSION_ID_LEN, SHARD_KEY_HEX_LEN,
-    SHARD_KEY_HEX_PREFIX_LEN, SHARD_KEY_LEN, SSE_C_CHECKSUM_NONCE_LEN,
-    SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN,
-    SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
-    SSE_S3_CHECKSUM_NONCE_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN,
-    SSE_S3_WRAP_NONCE_LEN, UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
+    OBJECT_ENCRYPTION_WRAP_NONCE_LEN, SESSION_ID_LEN, SHARD_KEY_HEX_LEN, SHARD_KEY_HEX_PREFIX_LEN,
+    SHARD_KEY_LEN, SSE_C_CHECKSUM_NONCE_LEN, SSE_C_SEGMENT_NONCE_PREFIX_LEN,
+    SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN, SSE_C_VALIDATOR_SALT_LEN,
+    SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN, SSE_S3_CHECKSUM_NONCE_LEN,
+    SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN, SSE_S3_WRAP_NONCE_LEN,
+    UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
+};
+#[cfg(test)]
+pub(crate) use types::{
+    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
+    PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
+    PlacedSegmentShardBackfillWorkItem,
 };
 
 #[cfg(test)]

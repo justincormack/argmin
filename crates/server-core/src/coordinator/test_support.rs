@@ -165,7 +165,7 @@ pub(crate) fn setup_coordinator_with_pg_count_without_background_sweepers(
             |_, _| Ok(LifecycleSweeper::disabled()),
             |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
-            |_| Ok(ShardBackfillSweeper::disabled()),
+            |storage_handle| Ok(ShardBackfillSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
         ),
     )
@@ -249,7 +249,7 @@ pub(crate) fn setup_same_process_coordinator_with_storage_cluster_without_backgr
             |_, _| Ok(LifecycleSweeper::disabled()),
             |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
-            |_| Ok(ShardBackfillSweeper::disabled()),
+            |storage_handle| Ok(ShardBackfillSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
         ),
     )

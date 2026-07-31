@@ -1,19 +1,17 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ring::rand::SecureRandom;
 use s3_types::BucketLifecycleConfiguration;
 #[cfg(test)]
 use storage::PgTopology;
 use storage::{
     BucketDeleteBeginRoot, BucketDeleteFinalizeRoot, BucketInfo, BucketName, EcShape, GenerationId,
-    ObjectEncryption, ObjectKey, PgId, PlacedSegmentShardBackfillClaimAcquireParams,
-    ProcessLocalRegistryKey, ReclaimWorkItem, SegmentStoredBytesRequest, StorageCluster,
-    StorageClusterRouteHandle, StorageMaintenanceAdmission, StoreError, UploadId, UploadState,
-    VersionId,
+    ObjectEncryption, ObjectKey, ProcessLocalRegistryKey, ReclaimWorkItem,
+    SegmentStoredBytesRequest, StorageCluster, StorageClusterRouteHandle,
+    StorageMaintenanceAdmission, UploadId, UploadState, VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -39,10 +37,6 @@ static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<
 static RECLAIM_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<ProcessLocalRegistryKey, Weak<ReclaimSweeper>>>,
 > = OnceLock::new();
-static SHARD_BACKFILL_SWEEPER_REGISTRY: OnceLock<
-    Mutex<HashMap<ProcessLocalRegistryKey, Weak<ShardBackfillSweeper>>>,
-> = OnceLock::new();
-static SHARD_BACKFILL_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
 const BUCKET_DELETE_BEGIN_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
@@ -52,31 +46,10 @@ const RECLAIM_DURABLE_SCAN_BATCH_PGS: usize = 8;
 const RECLAIM_DURABLE_SCAN_SAFETY_INTERVAL: Duration = Duration::from_secs(60);
 const RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF: Duration = Duration::from_secs(1);
 const RECLAIM_DURABLE_SCAN_INCOMPLETE_RETRY: Duration = Duration::from_secs(1);
-const SHARD_BACKFILL_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
-const SHARD_BACKFILL_CLAIM_LEASE_MILLIS: u64 = 30_000;
-const SHARD_BACKFILL_ERROR_BACKOFF_MILLIS: u64 = 1_000;
 const LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS: usize = 256;
 const LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS: usize = 1024;
 
 type ObjectPayloadReclaimRoot = (BucketName, ObjectKey, GenerationId);
-
-fn random_background_worker_identity(context: &'static str) -> Result<String, ServerError> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let mut bytes = [0u8; 16];
-    ring::rand::SystemRandom::new()
-        .fill(&mut bytes)
-        .map_err(|_| ServerError::InternalError {
-            reason: format!("failed to generate opaque {context} identity"),
-        })?;
-
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    Ok(encoded)
-}
 
 fn earliest_object_payload_reclaim_retry_sleep(
     storage_node: &StorageCluster,
@@ -387,12 +360,7 @@ pub(super) struct LifecycleSweeper {
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
 
-pub(super) struct ShardBackfillSweeper {
-    pub(super) stop: Arc<AtomicBool>,
-    pub(super) wake: Arc<(Mutex<bool>, Condvar)>,
-    pub(super) handle: Mutex<Option<JoinHandle<()>>>,
-}
-
+pub(super) use storage::StorageShardBackfillSweeper as ShardBackfillSweeper;
 pub(super) use storage::StorageShardRepairSweeper as ShardRepairSweeper;
 pub(super) use storage::StorageShardScavengerSweeper as ShardScavengerSweeper;
 pub(super) use storage::StorageStreamSessionSweeper as StreamSessionSweeper;
@@ -866,17 +834,6 @@ impl Drop for LifecycleSweeper {
     }
 }
 
-impl Drop for ShardBackfillSweeper {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        *lock_mutex_unpoisoned(&self.wake.0) = true;
-        self.wake.1.notify_all();
-        if let Some(handle) = lock_mutex_unpoisoned(&self.handle).take() {
-            let _ = handle.join();
-        }
-    }
-}
-
 impl LifecycleSweeper {
     pub(super) fn acquire_shared(
         storage_handle: &StorageClusterRouteHandle,
@@ -962,483 +919,6 @@ pub(super) fn lifecycle_runtime_for_sweep(
     runtime.with_storage_node(storage_handle.current())
 }
 
-impl ShardBackfillSweeper {
-    pub(super) fn acquire_shared(
-        storage_handle: &StorageClusterRouteHandle,
-    ) -> Result<Arc<Self>, ServerError> {
-        let registry = SHARD_BACKFILL_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut registry: std::sync::MutexGuard<
-            '_,
-            HashMap<ProcessLocalRegistryKey, Weak<ShardBackfillSweeper>>,
-        > = lock_mutex_unpoisoned(registry);
-        registry.retain(|_, sweeper| sweeper.upgrade().is_some());
-
-        let storage_cluster = storage_handle.current();
-        let key = storage_cluster.process_local_registry_key();
-        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
-            return Ok(existing);
-        }
-
-        let sweeper = Self::spawn(storage_handle.clone())?;
-        registry.insert(key, Arc::downgrade(&sweeper));
-        Ok(sweeper)
-    }
-
-    fn spawn(storage_handle: StorageClusterRouteHandle) -> Result<Arc<Self>, ServerError> {
-        let admission = StorageMaintenanceAdmission::acquire_shared(&storage_handle);
-        let worker_identity = random_background_worker_identity("shard-backfill worker")?;
-        let owner_token = format!("shard-backfill-worker-{worker_identity}");
-        let stop = Arc::new(AtomicBool::new(false));
-        let wake = Arc::new((Mutex::new(false), Condvar::new()));
-        let sweeper = Arc::new(Self {
-            stop: Arc::clone(&stop),
-            wake: Arc::clone(&wake),
-            handle: Mutex::new(None),
-        });
-        let handle = std::thread::Builder::new()
-            .name("argmin-shard-backfill".to_string())
-            .spawn(move || {
-                let mut last_claimed_pg_id = None;
-                while !stop.load(Ordering::SeqCst) {
-                    let storage_cluster = storage_handle.current();
-                    admission.observe_pressure();
-                    run_one_placed_segment_shard_backfill(
-                        &storage_cluster,
-                        &worker_identity,
-                        &owner_token,
-                        &admission,
-                        &mut last_claimed_pg_id,
-                    );
-
-                    let stop_guard = lock_mutex_unpoisoned(&wake.0);
-                    if stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let _ = wake
-                        .1
-                        .wait_timeout_while(
-                            stop_guard,
-                            SHARD_BACKFILL_DURABLE_SCAN_INTERVAL,
-                            |stop_requested| !*stop_requested,
-                        )
-                        .unwrap_or_else(|e| e.into_inner());
-                }
-            })
-            .map_err(|e| ServerError::InternalError {
-                reason: format!("failed to start shard backfill worker: {e}"),
-            })?;
-        *lock_mutex_unpoisoned(&sweeper.handle) = Some(handle);
-        Ok(sweeper)
-    }
-
-    pub(super) fn disabled() -> Arc<Self> {
-        Arc::new(Self {
-            stop: Arc::new(AtomicBool::new(true)),
-            wake: Arc::new((Mutex::new(true), Condvar::new())),
-            handle: Mutex::new(None),
-        })
-    }
-}
-
-fn run_one_placed_segment_shard_backfill(
-    storage_cluster: &StorageCluster,
-    worker_identity: &str,
-    owner_token: &str,
-    admission: &Arc<StorageMaintenanceAdmission>,
-    last_claimed_pg_id: &mut Option<PgId>,
-) {
-    let now_ms = Coordinator::now_millis();
-    let claim_id = format!(
-        "shard-backfill-{}-{}",
-        worker_identity,
-        SHARD_BACKFILL_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
-    );
-    let queue_depth = shard_backfill_queue_depth(storage_cluster);
-    let claim_acquire = PlacedSegmentShardBackfillClaimAcquireParams {
-        claim_id,
-        owner_token: owner_token.to_string(),
-        claimed_at: now_ms,
-        lease_deadline: now_ms.saturating_add(SHARD_BACKFILL_CLAIM_LEASE_MILLIS),
-        now: now_ms,
-    };
-    let claim = match storage_cluster.acquire_next_placed_segment_shard_backfill_claim_with_cursor(
-        &claim_acquire,
-        last_claimed_pg_id,
-    ) {
-        Ok(Some(claim)) => {
-            emit_shard_backfill_event(
-                Some(claim.work_item.request.data_pg_id),
-                "claim_started",
-                queue_depth,
-                None,
-            );
-            claim
-        }
-        Ok(None) => {
-            emit_shard_backfill_event(None, "durable_scan_no_claim", queue_depth, None);
-            return;
-        }
-        Err(error) => {
-            emit_shard_backfill_event(None, "claim_failed", queue_depth, None);
-            observability::record_shard_backfill_error(
-                None,
-                "claim_failed",
-                error.diagnostic_kind(),
-            );
-            let _ = observability::event(
-                TRACE_TARGET,
-                "shard_backfill_claim_error",
-                Some(format_args!("error={error}")),
-            );
-            return;
-        }
-    };
-
-    let admission_class =
-        shard_backfill_admission_class(claim.remaining_tolerance, claim.work_item.request.ec.m);
-    let permit = match admission_class {
-        ShardBackfillAdmission::KnownDamageRepair => admission.try_known_damage_repair(),
-        ShardBackfillAdmission::RoutineBackfill => admission.try_routine_backfill(),
-    };
-    let Some(_permit) = permit else {
-        emit_shard_backfill_event(
-            Some(claim.work_item.request.data_pg_id),
-            "admission_denied",
-            shard_backfill_queue_depth(storage_cluster),
-            None,
-        );
-        let next_attempt_after =
-            Coordinator::now_millis().saturating_add(SHARD_BACKFILL_ERROR_BACKOFF_MILLIS);
-        if let Err(record_error) = storage_cluster.record_placed_segment_shard_backfill_claim_error(
-            &claim,
-            "background shard backfill admission denied",
-            next_attempt_after,
-        ) {
-            let event = shard_backfill_record_error_event(&record_error);
-            observability::record_shard_backfill_error(
-                Some(claim.work_item.request.data_pg_id),
-                event,
-                record_error.diagnostic_kind(),
-            );
-            emit_shard_backfill_event(
-                Some(claim.work_item.request.data_pg_id),
-                event,
-                shard_backfill_queue_depth(storage_cluster),
-                None,
-            );
-            let _ = observability::event(
-                TRACE_TARGET,
-                "shard_backfill_record_error",
-                Some(format_args!("record_error={record_error}")),
-            );
-        }
-        return;
-    };
-
-    emit_shard_backfill_event(
-        Some(claim.work_item.request.data_pg_id),
-        "started",
-        None,
-        None,
-    );
-    match storage_cluster.backfill_placed_segment_payload_shards_for_work_item(&claim.work_item) {
-        Ok(backfilled_acks) => {
-            let event = if backfilled_acks.is_empty() {
-                "resolved_clean"
-            } else {
-                "backfilled"
-            };
-            emit_shard_backfill_event(
-                Some(claim.work_item.request.data_pg_id),
-                event,
-                None,
-                Some(backfilled_acks.len()),
-            );
-            match storage_cluster.complete_placed_segment_shard_backfill_claim(&claim) {
-                Ok(true) => {
-                    emit_shard_backfill_event(
-                        Some(claim.work_item.request.data_pg_id),
-                        "complete_succeeded",
-                        shard_backfill_queue_depth(storage_cluster),
-                        None,
-                    );
-                }
-                Ok(false) => {
-                    emit_shard_backfill_event(
-                        Some(claim.work_item.request.data_pg_id),
-                        "complete_stale",
-                        shard_backfill_queue_depth(storage_cluster),
-                        None,
-                    );
-                }
-                Err(error) => {
-                    observability::record_shard_backfill_error(
-                        Some(claim.work_item.request.data_pg_id),
-                        shard_backfill_completion_error_event(&error),
-                        error.diagnostic_kind(),
-                    );
-                    emit_shard_backfill_event(
-                        Some(claim.work_item.request.data_pg_id),
-                        shard_backfill_completion_error_event(&error),
-                        shard_backfill_queue_depth(storage_cluster),
-                        None,
-                    );
-                    let _ = observability::event(
-                        TRACE_TARGET,
-                        "shard_backfill_complete_error",
-                        Some(format_args!("error={error}")),
-                    );
-                }
-            }
-        }
-        Err(error) => {
-            if shard_backfill_error_may_mean_source_is_obsolete(&error) {
-                // Metadata deletion and candidate discovery are not one
-                // transaction. A candidate may therefore outlive its final
-                // payload reference and fail because cleanup has removed its
-                // source shards. Only source-loss failures justify this
-                // cluster-wide authoritative check; transport and route
-                // failures return directly to bounded backoff.
-                match storage_cluster
-                    .placed_segment_shard_backfill_source_is_referenced(&claim.work_item)
-                {
-                    Ok(false) => {
-                        complete_obsolete_placed_segment_shard_backfill(storage_cluster, &claim);
-                        return;
-                    }
-                    Ok(true) => {}
-                    Err(reference_error) => {
-                        let _ = observability::event(
-                            TRACE_TARGET,
-                            "shard_backfill_source_reference_check_error",
-                            Some(format_args!("error={reference_error}")),
-                        );
-                    }
-                }
-            }
-            let event = if shard_backfill_error_is_stale_retry(&error) {
-                "stale_retry"
-            } else {
-                "failed"
-            };
-            observability::record_shard_backfill_error(
-                Some(claim.work_item.request.data_pg_id),
-                event,
-                error.diagnostic_kind(),
-            );
-            emit_shard_backfill_event(Some(claim.work_item.request.data_pg_id), event, None, None);
-            let _ = observability::event(
-                TRACE_TARGET,
-                "shard_backfill_error",
-                Some(format_args!(
-                    "pg_id={} source_epoch={} desired_epoch={} error={error}",
-                    claim.work_item.request.data_pg_id,
-                    claim.work_item.source_cluster_epoch,
-                    claim.work_item.desired_cluster_epoch,
-                )),
-            );
-            let next_attempt_after =
-                Coordinator::now_millis().saturating_add(SHARD_BACKFILL_ERROR_BACKOFF_MILLIS);
-            if let Err(record_error) = storage_cluster
-                .record_placed_segment_shard_backfill_claim_error(
-                    &claim,
-                    &error.to_string(),
-                    next_attempt_after,
-                )
-            {
-                let record_event = shard_backfill_record_error_event(&record_error);
-                observability::record_shard_backfill_error(
-                    Some(claim.work_item.request.data_pg_id),
-                    record_event,
-                    record_error.diagnostic_kind(),
-                );
-                emit_shard_backfill_event(
-                    Some(claim.work_item.request.data_pg_id),
-                    record_event,
-                    shard_backfill_queue_depth(storage_cluster),
-                    None,
-                );
-                let _ = observability::event(
-                    TRACE_TARGET,
-                    "shard_backfill_record_error",
-                    Some(format_args!(
-                        "backfill_error={error} record_error={record_error}"
-                    )),
-                );
-            }
-        }
-    }
-}
-
-fn shard_backfill_error_may_mean_source_is_obsolete(error: &StoreError) -> bool {
-    if error.is_payload_not_found() {
-        return true;
-    }
-    match error {
-        StoreError::ShardStore { source, .. } => {
-            shard_backfill_error_may_mean_source_is_obsolete(source)
-        }
-        StoreError::HistoricalPgRouteNotRetained { .. }
-        | StoreError::PlacedSegmentBackfillSourceUnavailable => true,
-        _ => false,
-    }
-}
-
-fn complete_obsolete_placed_segment_shard_backfill(
-    storage_cluster: &StorageCluster,
-    claim: &storage::PlacedSegmentShardBackfillClaimRecord,
-) {
-    match storage_cluster.complete_placed_segment_shard_backfill_claim(claim) {
-        Ok(true) => emit_shard_backfill_event(
-            Some(claim.work_item.request.data_pg_id),
-            "obsolete_source_complete_succeeded",
-            shard_backfill_queue_depth(storage_cluster),
-            None,
-        ),
-        Ok(false) => emit_shard_backfill_event(
-            Some(claim.work_item.request.data_pg_id),
-            "obsolete_source_complete_stale",
-            shard_backfill_queue_depth(storage_cluster),
-            None,
-        ),
-        Err(error) => {
-            observability::record_shard_backfill_error(
-                Some(claim.work_item.request.data_pg_id),
-                "obsolete_source_complete_failed",
-                error.diagnostic_kind(),
-            );
-            emit_shard_backfill_event(
-                Some(claim.work_item.request.data_pg_id),
-                "obsolete_source_complete_failed",
-                shard_backfill_queue_depth(storage_cluster),
-                None,
-            );
-            let _ = observability::event(
-                TRACE_TARGET,
-                "shard_backfill_obsolete_source_complete_error",
-                Some(format_args!("error={error}")),
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-pub(super) fn run_one_placed_segment_shard_backfill_for_test(
-    storage_cluster: &Arc<StorageCluster>,
-    owner_token: &str,
-) {
-    let storage_handle =
-        StorageClusterRouteHandle::from_static_cluster(Arc::clone(storage_cluster))
-            .expect("test cluster should admit a static maintenance route");
-    let admission = StorageMaintenanceAdmission::acquire_shared(&storage_handle);
-    run_one_placed_segment_shard_backfill(
-        storage_cluster,
-        "test-worker",
-        owner_token,
-        &admission,
-        &mut None,
-    );
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShardBackfillAdmission {
-    KnownDamageRepair,
-    RoutineBackfill,
-}
-
-fn shard_backfill_admission_class(remaining_tolerance: u8, ec_m: u8) -> ShardBackfillAdmission {
-    if remaining_tolerance < ec_m {
-        ShardBackfillAdmission::KnownDamageRepair
-    } else {
-        ShardBackfillAdmission::RoutineBackfill
-    }
-}
-
-fn shard_backfill_error_is_stale_retry(error: &StoreError) -> bool {
-    if error
-        .storage_node_failure_class()
-        .is_some_and(storage_node_failure_is_shard_backfill_stale_retry)
-    {
-        return true;
-    }
-    match error {
-        StoreError::ShardStore { source, .. } => shard_backfill_error_is_stale_retry(source),
-        StoreError::StalePayloadOperation { .. }
-        | StoreError::StaleMetadataPrimaryBridge { .. }
-        | StoreError::StaleMetadataOperation { .. }
-        | StoreError::StaleMetadataRoute { .. }
-        | StoreError::RouteMapExpired { .. }
-        | StoreError::StaleShardOperation { .. }
-        | StoreError::StaleShardLocation { .. }
-        | StoreError::StorageRpcResourceExhausted { .. } => true,
-        _ => false,
-    }
-}
-
-fn storage_node_failure_is_shard_backfill_stale_retry(
-    failure: storage::StorageNodeFailureClass,
-) -> bool {
-    match failure {
-        storage::StorageNodeFailureClass::ShardLocationStale
-        | storage::StorageNodeFailureClass::PgRouteUnavailable
-        | storage::StorageNodeFailureClass::TransportInterrupted => true,
-        storage::StorageNodeFailureClass::MetadataCommandContention
-        | storage::StorageNodeFailureClass::MetadataTransferHistoricalRouteActive => false,
-    }
-}
-
-fn shard_backfill_completion_error_event(error: &StoreError) -> &'static str {
-    if shard_backfill_error_is_stale_retry(error) {
-        "complete_stale"
-    } else {
-        "complete_failed"
-    }
-}
-
-fn shard_backfill_record_error_event(error: &StoreError) -> &'static str {
-    if shard_backfill_error_is_stale_retry(error) {
-        "record_retry"
-    } else {
-        "record_error_failed"
-    }
-}
-
-fn shard_backfill_queue_depth(storage_cluster: &StorageCluster) -> Option<usize> {
-    match storage_cluster.placed_segment_shard_backfill_backlog_depth() {
-        Ok(depth) => Some(depth),
-        Err(error) => {
-            observability::record_shard_backfill_error(
-                None,
-                "backlog_depth_failed",
-                error.diagnostic_kind(),
-            );
-            let _ = observability::event(
-                TRACE_TARGET,
-                "shard_backfill_backlog_depth_error",
-                Some(format_args!("error={error}")),
-            );
-            None
-        }
-    }
-}
-
-fn emit_shard_backfill_event(
-    pg_id: Option<u32>,
-    event: &'static str,
-    queue_depth: Option<usize>,
-    shards_written: Option<usize>,
-) {
-    let _ = observability::emit_shard_backfill_event(
-        TRACE_TARGET,
-        observability::ShardBackfillEventSummary {
-            pg_id,
-            event,
-            queue_depth,
-            shards_written,
-        },
-    );
-}
-
 pub(super) fn acquire_stream_session_sweeper(
     storage_handle: &StorageClusterRouteHandle,
 ) -> Result<Arc<StreamSessionSweeper>, ServerError> {
@@ -1464,6 +944,16 @@ pub(super) fn acquire_shard_repair_sweeper(
 ) -> Result<Arc<ShardRepairSweeper>, ServerError> {
     ShardRepairSweeper::acquire_shared(storage_handle).map_err(|error| ServerError::InternalError {
         reason: error.to_string(),
+    })
+}
+
+pub(super) fn acquire_shard_backfill_sweeper(
+    storage_handle: &StorageClusterRouteHandle,
+) -> Result<Arc<ShardBackfillSweeper>, ServerError> {
+    ShardBackfillSweeper::acquire_shared(storage_handle).map_err(|error| {
+        ServerError::InternalError {
+            reason: error.to_string(),
+        }
     })
 }
 
@@ -2509,21 +1999,11 @@ mod tests {
 
     use storage::{
         ClusterEpoch, EcShape, GenerationId, LocalClusterMap, NodeId, ObjectEncryption, PgTopology,
-        StorageCluster, StoreError,
+        StorageCluster,
     };
 
     use super::super::payload::PayloadBufferPool;
     use super::*;
-
-    #[test]
-    fn background_worker_identity_is_opaque_fixed_width_hex() {
-        let identity = random_background_worker_identity("test worker").unwrap();
-
-        assert_eq!(identity.len(), 32);
-        assert!(identity
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
-    }
 
     #[test]
     fn reclaim_durable_scan_schedule_preserves_cursor_and_uses_bounded_delays() {
@@ -2676,142 +2156,6 @@ mod tests {
         assert!(
             !object_payload_reclaim_worker_should_defer(&result),
             "a stale hint for an already-removed root must release its outstanding queue slot"
-        );
-    }
-
-    #[test]
-    fn shard_backfill_admission_class_uses_ec_risk_tolerance() {
-        assert_eq!(
-            shard_backfill_admission_class(2, 2),
-            ShardBackfillAdmission::RoutineBackfill
-        );
-        assert_eq!(
-            shard_backfill_admission_class(1, 2),
-            ShardBackfillAdmission::KnownDamageRepair
-        );
-        assert_eq!(
-            shard_backfill_admission_class(0, 2),
-            ShardBackfillAdmission::KnownDamageRepair
-        );
-        assert_eq!(
-            shard_backfill_admission_class(0, 0),
-            ShardBackfillAdmission::RoutineBackfill
-        );
-    }
-
-    #[test]
-    fn shard_backfill_error_classifies_stale_retries() {
-        assert!(shard_backfill_error_is_stale_retry(
-            &StoreError::StalePayloadOperation {
-                pg_id: 7,
-                operation_epoch: storage::ClusterEpoch::INITIAL,
-                current_epoch: storage::ClusterEpoch::new(2).unwrap(),
-            }
-        ));
-        assert!(shard_backfill_error_is_stale_retry(
-            &StoreError::ShardStore {
-                node_id: 2,
-                pg_id: 7,
-                cluster_epoch: storage::ClusterEpoch::INITIAL,
-                source: Box::new(StoreError::StaleShardLocation {
-                    node_id: 2,
-                    pg_id: 7,
-                    location_epoch: storage::ClusterEpoch::INITIAL,
-                    current_epoch: storage::ClusterEpoch::new(2).unwrap(),
-                }),
-            }
-        ));
-        assert!(!shard_backfill_error_is_stale_retry(&StoreError::NotFound));
-    }
-
-    #[test]
-    fn shard_backfill_source_reference_check_is_limited_to_source_loss() {
-        assert!(shard_backfill_error_may_mean_source_is_obsolete(
-            &StoreError::NotFound
-        ));
-        assert!(shard_backfill_error_may_mean_source_is_obsolete(
-            &StoreError::HistoricalPgRouteNotRetained {
-                pg_id: 7,
-                cluster_epoch: storage::ClusterEpoch::INITIAL,
-            }
-        ));
-        assert!(shard_backfill_error_may_mean_source_is_obsolete(
-            &StoreError::PlacedSegmentBackfillSourceUnavailable
-        ));
-
-        for error in [
-            StoreError::PayloadShardSetMismatch {
-                reason: "target verification failed".to_string(),
-            },
-            StoreError::Io {
-                context: "contact source node",
-                source: std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "source node unavailable",
-                ),
-            },
-            StoreError::StalePayloadOperation {
-                pg_id: 7,
-                operation_epoch: storage::ClusterEpoch::INITIAL,
-                current_epoch: storage::ClusterEpoch::new(2).unwrap(),
-            },
-            StoreError::RouteMapExpired {
-                cluster_epoch: storage::ClusterEpoch::INITIAL,
-                valid_until_ms: 1,
-                now_ms: 2,
-            },
-        ] {
-            assert!(!shard_backfill_error_may_mean_source_is_obsolete(&error));
-        }
-    }
-
-    #[test]
-    fn shard_backfill_retry_selects_storage_node_failure_classes() {
-        for failure in [
-            storage::StorageNodeFailureClass::ShardLocationStale,
-            storage::StorageNodeFailureClass::PgRouteUnavailable,
-            storage::StorageNodeFailureClass::TransportInterrupted,
-        ] {
-            assert!(storage_node_failure_is_shard_backfill_stale_retry(failure));
-        }
-        for failure in [
-            storage::StorageNodeFailureClass::MetadataCommandContention,
-            storage::StorageNodeFailureClass::MetadataTransferHistoricalRouteActive,
-        ] {
-            assert!(!storage_node_failure_is_shard_backfill_stale_retry(failure));
-        }
-    }
-
-    #[test]
-    fn shard_backfill_completion_error_classifies_stale_as_non_hard() {
-        assert_eq!(
-            shard_backfill_completion_error_event(&StoreError::StalePayloadOperation {
-                pg_id: 7,
-                operation_epoch: storage::ClusterEpoch::INITIAL,
-                current_epoch: storage::ClusterEpoch::new(2).unwrap(),
-            }),
-            "complete_stale"
-        );
-        assert_eq!(
-            shard_backfill_completion_error_event(&StoreError::NotFound),
-            "complete_failed"
-        );
-    }
-
-    #[test]
-    fn shard_backfill_record_error_classifies_stale_as_retry() {
-        assert_eq!(
-            shard_backfill_record_error_event(&StoreError::StaleShardLocation {
-                node_id: 2,
-                pg_id: 7,
-                location_epoch: storage::ClusterEpoch::INITIAL,
-                current_epoch: storage::ClusterEpoch::new(2).unwrap(),
-            }),
-            "record_retry"
-        );
-        assert_eq!(
-            shard_backfill_record_error_event(&StoreError::NotFound),
-            "record_error_failed"
         );
     }
 

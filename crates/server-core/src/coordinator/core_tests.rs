@@ -15,14 +15,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use storage::cluster::StorageShardBackfillTestWorkItem;
 use storage::storage_node_server::{
     StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeProcessConfigParts, StorageNodeServer,
 };
 use storage::{
     install_bucket_scoped_test_hooks, BucketScopedTestHooks, ClusterEpoch, LocalClusterMap,
     LocalNodeStoreConfig, LocalPgRoute, LocalUnixStorageNodeClientConfig,
-    MetadataCommandApplyTestKind, NodeId, PgId, PgState, PlacedSegmentShardBackfillWorkItem,
-    RouteMapValidity, SegmentStoredBytesRequest, StorageCluster, StorageClusterRouteHandle,
+    MetadataCommandApplyTestKind, NodeId, PgId, PgState, RouteMapValidity,
+    SegmentStoredBytesRequest, StorageCluster, StorageClusterRouteHandle,
     StorageClusterRuntimeMapHandle,
 };
 
@@ -100,29 +101,6 @@ fn setup_direct_coordinator_with_storage_cluster(
     .unwrap()
 }
 
-fn setup_coordinator_with_only_shard_backfill_worker(
-    storage_handle: StorageClusterRouteHandle,
-    storage_cluster: Arc<StorageCluster>,
-) -> Coordinator {
-    Coordinator::new_with_shared_caches_and_background_sweeper_factories(
-        storage_handle,
-        Arc::clone(&storage_cluster),
-        shared_caches_for_storage_cluster(&storage_cluster),
-        "us-east-1".to_string(),
-        None,
-        Some(test_sse_s3_provider()),
-        (
-            false,
-            |_, _| Ok(LifecycleSweeper::disabled()),
-            |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
-            |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
-            ShardBackfillSweeper::acquire_shared,
-            |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
-        ),
-    )
-    .unwrap()
-}
-
 fn setup_coordinator_with_only_reclaim_worker(
     storage_handle: StorageClusterRouteHandle,
     storage_cluster: Arc<StorageCluster>,
@@ -139,7 +117,7 @@ fn setup_coordinator_with_only_reclaim_worker(
             |_, _| Ok(LifecycleSweeper::disabled()),
             |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
-            |_| Ok(ShardBackfillSweeper::disabled()),
+            |storage_handle| Ok(ShardBackfillSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
         ),
     )
@@ -5367,8 +5345,7 @@ fn shard_backfill_worker_uses_refreshed_runtime_map_handle() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
-    let _coord =
-        setup_coordinator_with_only_shard_backfill_worker(handle.clone(), Arc::clone(&initial));
+    let sweeper = ShardBackfillSweeper::disabled(handle.clone());
 
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
@@ -5429,7 +5406,7 @@ fn shard_backfill_worker_uses_refreshed_runtime_map_handle() {
             .unwrap();
     runtime_handle.install(Arc::clone(&refreshed)).unwrap();
 
-    let work_item = PlacedSegmentShardBackfillWorkItem {
+    let work_item = StorageShardBackfillTestWorkItem {
         request: SegmentStoredBytesRequest {
             data_pg_id: written_segment.data_pg_id,
             segment_okh,
@@ -5443,28 +5420,19 @@ fn shard_backfill_worker_uses_refreshed_runtime_map_handle() {
     };
     assert!(
         initial
-            .backfill_placed_segment_payload_shards_for_work_item(&work_item)
+            .test_backfill_placed_segment_payload_shards_for_work_item(work_item)
             .is_err(),
         "the stale initial cluster must not be able to reconstruct the desired epoch"
     );
     refreshed
-        .record_placed_segment_shard_backfill(&work_item, None)
+        .test_record_placed_segment_shard_backfill(work_item, None, None)
         .unwrap();
-
-    let start = std::time::Instant::now();
-    loop {
-        let rows = refreshed
-            .list_placed_segment_shard_backfills(written_segment.data_pg_id)
-            .unwrap();
-        if rows.is_empty() {
-            break;
-        }
-        assert!(
-            start.elapsed() < TEST_EVENT_TIMEOUT,
-            "shard backfill worker did not complete durable row after runtime-map refresh: {rows:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    assert!(sweeper.test_routes_to(&refreshed));
+    sweeper.test_backfill_one_pending("runtime-map-refresh-test");
+    let rows = refreshed
+        .test_list_placed_segment_shard_backfills(written_segment.data_pg_id)
+        .unwrap();
+    assert!(rows.is_empty(), "backfill row should complete: {rows:?}");
 }
 
 #[test]
@@ -5484,7 +5452,7 @@ fn shard_backfill_worker_resolves_missing_history_after_source_metadata_is_gone(
     let current = initial
         .test_clone_with_pg_routes(desired_epoch, [current_route], [])
         .unwrap();
-    let work_item = PlacedSegmentShardBackfillWorkItem {
+    let work_item = StorageShardBackfillTestWorkItem {
         request: SegmentStoredBytesRequest {
             data_pg_id: 0,
             segment_okh: [0xA5; 16],
@@ -5497,26 +5465,24 @@ fn shard_backfill_worker_resolves_missing_history_after_source_metadata_is_gone(
         desired_cluster_epoch: desired_epoch,
     };
     assert!(matches!(
-        current.backfill_placed_segment_payload_shards_for_work_item(&work_item),
+        current.test_backfill_placed_segment_payload_shards_for_work_item(work_item),
         Err(storage::StoreError::HistoricalPgRouteNotRetained {
             pg_id: 0,
             cluster_epoch,
         }) if cluster_epoch == source_epoch
     ));
     assert!(!current
-        .placed_segment_shard_backfill_source_is_referenced(&work_item)
+        .test_placed_segment_shard_backfill_source_is_referenced(work_item)
         .unwrap());
     current
-        .record_placed_segment_shard_backfill(&work_item, None)
+        .test_record_placed_segment_shard_backfill(work_item, None, None)
         .unwrap();
 
-    super::runtime::run_one_placed_segment_shard_backfill_for_test(
-        &current,
-        "obsolete-source-test",
-    );
+    ShardBackfillSweeper::disabled(test_storage_route_handle(Arc::clone(&current)))
+        .test_backfill_one_pending("obsolete-source-test");
 
     assert!(current
-        .list_placed_segment_shard_backfills(0)
+        .test_list_placed_segment_shard_backfills(0)
         .unwrap()
         .is_empty());
 }
@@ -5569,7 +5535,7 @@ fn shard_backfill_worker_resolves_missing_payload_after_source_metadata_is_gone(
     .unwrap();
     map.test_install_historical_pg_routes([source_route]);
     let cluster = StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
-    let work_item = PlacedSegmentShardBackfillWorkItem {
+    let work_item = StorageShardBackfillTestWorkItem {
         request: SegmentStoredBytesRequest {
             data_pg_id: pg_id.get(),
             segment_okh: [0xA6; 16],
@@ -5582,22 +5548,20 @@ fn shard_backfill_worker_resolves_missing_payload_after_source_metadata_is_gone(
         desired_cluster_epoch: desired_epoch,
     };
     assert!(cluster
-        .backfill_placed_segment_payload_shards_for_work_item(&work_item)
+        .test_backfill_placed_segment_payload_shards_for_work_item(work_item)
         .is_err());
     assert!(!cluster
-        .placed_segment_shard_backfill_source_is_referenced(&work_item)
+        .test_placed_segment_shard_backfill_source_is_referenced(work_item)
         .unwrap());
     cluster
-        .record_placed_segment_shard_backfill(&work_item, None)
+        .test_record_placed_segment_shard_backfill(work_item, None, None)
         .unwrap();
 
-    super::runtime::run_one_placed_segment_shard_backfill_for_test(
-        &cluster,
-        "obsolete-payload-test",
-    );
+    ShardBackfillSweeper::disabled(test_storage_route_handle(Arc::clone(&cluster)))
+        .test_backfill_one_pending("obsolete-payload-test");
 
     assert!(cluster
-        .list_placed_segment_shard_backfills(pg_id.get())
+        .test_list_placed_segment_shard_backfills(pg_id.get())
         .unwrap()
         .is_empty());
 }
@@ -5733,7 +5697,7 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
             &written_segment.written_shards,
         )
         .unwrap();
-    let work_item = PlacedSegmentShardBackfillWorkItem {
+    let work_item = StorageShardBackfillTestWorkItem {
         request: SegmentStoredBytesRequest {
             data_pg_id: written_segment.data_pg_id,
             segment_okh,
@@ -5823,15 +5787,13 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
         .any(|shard| shard.location.node_id() == NodeId::new(6) && !shard.validation.is_valid()));
 
     desired_cluster
-        .record_placed_segment_shard_backfill(&work_item, None)
+        .test_record_placed_segment_shard_backfill(work_item, None, None)
         .unwrap();
-    super::runtime::run_one_placed_segment_shard_backfill_for_test(
-        &desired_cluster,
-        "remote-backfill-test",
-    );
+    ShardBackfillSweeper::disabled(test_storage_route_handle(Arc::clone(&desired_cluster)))
+        .test_backfill_one_pending("remote-backfill-test");
 
     let rows = desired_cluster
-        .list_placed_segment_shard_backfills(written_segment.data_pg_id)
+        .test_list_placed_segment_shard_backfills(written_segment.data_pg_id)
         .unwrap();
     assert!(rows.is_empty(), "backfill row should complete: {rows:?}");
     let after = desired_cluster
@@ -6698,6 +6660,7 @@ fn shard_scavenger_sweeper_remains_shared_across_storage_identity_replacement() 
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let first = storage::StorageShardScavengerSweeper::acquire_shared(&handle).unwrap();
     let first_repair = storage::StorageShardRepairSweeper::acquire_shared(&handle).unwrap();
+    let first_backfill = storage::StorageShardBackfillSweeper::acquire_shared(&handle).unwrap();
     let first_admission = storage::StorageMaintenanceAdmission::acquire_shared(&handle);
 
     let replacement = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
@@ -6711,6 +6674,8 @@ fn shard_scavenger_sweeper_remains_shared_across_storage_identity_replacement() 
 
     let reacquired = storage::StorageShardScavengerSweeper::acquire_shared(&handle).unwrap();
     let reacquired_repair = storage::StorageShardRepairSweeper::acquire_shared(&handle).unwrap();
+    let reacquired_backfill =
+        storage::StorageShardBackfillSweeper::acquire_shared(&handle).unwrap();
     let reacquired_admission = storage::StorageMaintenanceAdmission::acquire_shared(&handle);
     assert!(
         Arc::ptr_eq(&first, &reacquired),
@@ -6723,6 +6688,10 @@ fn shard_scavenger_sweeper_remains_shared_across_storage_identity_replacement() 
     assert!(
         Arc::ptr_eq(&first_repair, &reacquired_repair),
         "one route-publication domain must retain one shard-repair worker across storage identities"
+    );
+    assert!(
+        Arc::ptr_eq(&first_backfill, &reacquired_backfill),
+        "one route-publication domain must retain one shard-backfill worker across storage identities"
     );
 }
 
@@ -6754,11 +6723,16 @@ fn maintenance_registries_separate_independent_route_domains_over_same_cluster()
         storage::StorageStreamSessionSweeper::acquire_shared(&second_handle).unwrap();
     let first_repair = storage::StorageShardRepairSweeper::acquire_shared(&first_handle).unwrap();
     let second_repair = storage::StorageShardRepairSweeper::acquire_shared(&second_handle).unwrap();
+    let first_backfill =
+        storage::StorageShardBackfillSweeper::acquire_shared(&first_handle).unwrap();
+    let second_backfill =
+        storage::StorageShardBackfillSweeper::acquire_shared(&second_handle).unwrap();
 
     assert!(!Arc::ptr_eq(&first_admission, &second_admission));
     assert!(!Arc::ptr_eq(&first_shard, &second_shard));
     assert!(!Arc::ptr_eq(&first_stream, &second_stream));
     assert!(!Arc::ptr_eq(&first_repair, &second_repair));
+    assert!(!Arc::ptr_eq(&first_backfill, &second_backfill));
 
     let replacement = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     second_runtime.install(Arc::clone(&replacement)).unwrap();
@@ -6770,6 +6744,8 @@ fn maintenance_registries_separate_independent_route_domains_over_same_cluster()
     assert!(second_stream.test_routes_to(&replacement));
     assert!(first_repair.test_routes_to(&initial));
     assert!(second_repair.test_routes_to(&replacement));
+    assert!(first_backfill.test_routes_to(&initial));
+    assert!(second_backfill.test_routes_to(&replacement));
 
     assert!(Arc::ptr_eq(
         &first_admission,
@@ -6802,6 +6778,14 @@ fn maintenance_registries_separate_independent_route_domains_over_same_cluster()
     assert!(Arc::ptr_eq(
         &second_repair,
         &storage::StorageShardRepairSweeper::acquire_shared(&second_handle).unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &first_backfill,
+        &storage::StorageShardBackfillSweeper::acquire_shared(&first_handle).unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &second_backfill,
+        &storage::StorageShardBackfillSweeper::acquire_shared(&second_handle).unwrap()
     ));
 }
 
@@ -19952,7 +19936,7 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
             |_, _| Ok(LifecycleSweeper::disabled()),
             |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
-            |_| Ok(ShardBackfillSweeper::disabled()),
+            |storage_handle| Ok(ShardBackfillSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
         ),
     )
@@ -20072,7 +20056,7 @@ fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
             |_, _| Ok(LifecycleSweeper::disabled()),
             |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
-            |_| Ok(ShardBackfillSweeper::disabled()),
+            |storage_handle| Ok(ShardBackfillSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
         ),
     )
@@ -20171,7 +20155,7 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
             |_, _| Ok(LifecycleSweeper::disabled()),
             |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
-            |_| Ok(ShardBackfillSweeper::disabled()),
+            |storage_handle| Ok(ShardBackfillSweeper::disabled(storage_handle.clone())),
             |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
         ),
     )

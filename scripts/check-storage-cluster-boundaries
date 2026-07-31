@@ -2097,6 +2097,7 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:install_snapshot_sensitive_metadata_command_or_drain:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:metadata_command_conflict:metadata-command-log-conflict
+1 crates/storage/src/cluster.rs:metadata_command_is_applied_on_all_acting_nodes_with_route_mode:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:metadata_command_log_conflict_matches:exact-command-match
 1 crates/storage/src/cluster.rs:metadata_command_log_conflict_matches:metadata-command-log-conflict
 2 crates/storage/src/cluster.rs:next_metadata_command_id_from_locked_pg_at_least:metadata-command-log-conflict
@@ -2988,8 +2989,7 @@ backfill_candidate_scan_state_leaks=$(
             || true
         rg -n --color=never \
             'pub[[:space:]]+(struct[[:space:]]+PlacedSegmentShardBackfillCandidate(ScanCursor|EnqueueSummary)|fn[[:space:]]+enqueue_placed_segment_shard_backfills_from_scavenger_references(_with_cursor_and_limit)?)\b' \
-            crates/storage/src \
-            -g '*.rs' \
+            crates/storage/src/cluster.rs \
             || true
     }
 )
@@ -3036,6 +3036,34 @@ shard_repair_maintenance_leaks=$(
 fail_with_matches \
     "Shard-repair discovery, queueing, claims, retry policy, execution, scheduling, and telemetry are storage-owned; retain only the opaque StorageShardRepairSweeper outside storage" \
     "$shard_repair_maintenance_leaks"
+
+shard_backfill_maintenance_leaks=$(
+    {
+        rg -n --color=never \
+            '\b(PlacedSegmentShardBackfill(ClaimAcquireParams|ClaimAcquire|ClaimRecord|Record|WorkItem|CopyTarget|Plan)|record_placed_segment_shard_backfill|list_placed_segment_shard_backfills|placed_segment_shard_backfill_(exists|backlog_depth|source_is_referenced)|acquire_(next_)?placed_segment_shard_backfill_claim(_with_cursor)?|complete_placed_segment_shard_backfill_claim|record_placed_segment_shard_backfill_claim_error|resolve_placed_segment_shard_backfill|backfill_placed_segment_payload_shard_(direct_copies|for_work_item)|backfill_placed_segment_payload_shards)\b' \
+            crates \
+            -g '*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            'pub[[:space:]]+fn[[:space:]]+(record_placed_segment_shard_backfill|list_placed_segment_shard_backfills|placed_segment_shard_backfill_(exists|backlog_depth|source_is_referenced)|acquire_(next_)?placed_segment_shard_backfill_claim(_with_cursor)?|complete_placed_segment_shard_backfill_claim|record_placed_segment_shard_backfill_claim_error|resolve_placed_segment_shard_backfill|backfill_placed_segment_payload_shard_(direct_copies|for_work_item)|backfill_placed_segment_payload_shards)\b' \
+            crates/storage/src/cluster.rs \
+            || true
+        rg -n --color=never \
+            'pub[[:space:]]+(struct[[:space:]]+PlacedSegmentShardBackfill(ClaimAcquireParams|ClaimAcquire|ClaimRecord|Record|WorkItem|CopyTarget|Plan)|const[[:space:]]+PLACED_SEGMENT_SHARD_BACKFILL_)' \
+            crates/storage/src \
+            -g '*.rs' \
+            || true
+        rg -n --color=never \
+            'struct[[:space:]]+ShardBackfillSweeper\b|\bSHARD_BACKFILL_(DURABLE_SCAN_INTERVAL|CLAIM_LEASE_MILLIS|ERROR_BACKOFF_MILLIS|CLAIM_COUNTER|SWEEPER_REGISTRY)\b' \
+            crates/server-core crates/server-http crates/argmin-s3 crates/s3-tests \
+            -g '*.rs' \
+            || true
+    }
+)
+fail_with_matches \
+    "Shard-backfill claims, fairness state, admission, retry policy, physical execution, scheduling, and telemetry are storage-owned; retain only the opaque StorageShardBackfillSweeper and logical test facilities outside storage" \
+    "$shard_backfill_maintenance_leaks"
 
 stream_session_maintenance_leaks=$(
     {

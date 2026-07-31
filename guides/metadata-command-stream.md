@@ -124,6 +124,13 @@ and remove the primary pending slot before returning the cluster map; read-only
 paths must never serve stale primary materialized rows while relying on the
 advanced replicas' command log state.
 
+Normal and recovery convergence inspection treats a missing log entry or a
+`MetadataCommandLogConflict` from any acting-set member as “not applied on all
+acting nodes.” It must not accept that command as converged or classify a
+same-index conflict as proof of application; the owning finish/recovery path
+must retain the pending command and perform the exact-command checks described
+below.
+
 ## Publisher Classification
 
 Command safety is classified at the publisher path, not just by command kind.
