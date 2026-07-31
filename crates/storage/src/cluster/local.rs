@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::Barrier;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -1070,6 +1072,8 @@ pub(crate) struct LocalClusterRuntimeState {
     metadata_command_pg_locks: Mutex<HashMap<PgId, Arc<Mutex<()>>>>,
     metadata_command_recovery_flights:
         Arc<Mutex<HashMap<MetadataCommandRecoveryKey, Arc<MetadataCommandRecoveryFlight>>>>,
+    #[cfg(test)]
+    metadata_command_recovery_wait_hook: Mutex<Option<MetadataCommandRecoveryWaitTestHook>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1093,6 +1097,22 @@ impl MetadataCommandRecoveryKey {
 struct MetadataCommandRecoveryFlight {
     in_progress: Mutex<bool>,
     done: Condvar,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct MetadataCommandRecoveryWaitTestHook {
+    key: MetadataCommandRecoveryKey,
+    existing_flight_selections: usize,
+    forced_timeouts_remaining: usize,
+    timeout_selected: Arc<Barrier>,
+    retry_selected: Arc<Barrier>,
+}
+
+#[cfg(test)]
+enum MetadataCommandRecoveryWaitTestAction {
+    ForceTimeout(Arc<Barrier>),
+    WaitForOwner(Arc<Barrier>),
 }
 
 #[derive(Debug)]
@@ -1174,7 +1194,50 @@ impl LocalClusterRuntimeState {
             ),
             metadata_command_pg_locks: Mutex::new(HashMap::new()),
             metadata_command_recovery_flights: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            metadata_command_recovery_wait_hook: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_metadata_command_recovery_wait_hook(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        timeout_selected: Arc<Barrier>,
+        retry_selected: Arc<Barrier>,
+    ) {
+        let mut hook = self
+            .metadata_command_recovery_wait_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(
+            hook.is_none(),
+            "metadata command recovery wait hook already installed"
+        );
+        *hook = Some(MetadataCommandRecoveryWaitTestHook {
+            key: MetadataCommandRecoveryKey::new(pg_id, command),
+            existing_flight_selections: 0,
+            forced_timeouts_remaining: 1,
+            timeout_selected,
+            retry_selected,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_take_metadata_command_recovery_wait_hook_observation(
+        &self,
+    ) -> (usize, usize) {
+        let hook = self
+            .metadata_command_recovery_wait_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("metadata command recovery wait hook must be installed");
+        (
+            hook.existing_flight_selections,
+            hook.forced_timeouts_remaining,
+        )
     }
 
     pub(crate) fn metadata_command_pg_lock(&self, pg_id: PgId) -> Arc<Mutex<()>> {
@@ -1228,6 +1291,44 @@ impl LocalClusterRuntimeState {
                 flight,
                 flights,
             });
+        }
+
+        #[cfg(test)]
+        {
+            let action = {
+                let mut hook = self
+                    .metadata_command_recovery_wait_hook
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                hook.as_mut().and_then(|hook| {
+                    if hook.key != key {
+                        return None;
+                    }
+                    hook.existing_flight_selections += 1;
+                    if hook.forced_timeouts_remaining > 0 {
+                        hook.forced_timeouts_remaining -= 1;
+                        Some(MetadataCommandRecoveryWaitTestAction::ForceTimeout(
+                            Arc::clone(&hook.timeout_selected),
+                        ))
+                    } else if hook.existing_flight_selections == 2 {
+                        Some(MetadataCommandRecoveryWaitTestAction::WaitForOwner(
+                            Arc::clone(&hook.retry_selected),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+            };
+            match action {
+                Some(MetadataCommandRecoveryWaitTestAction::ForceTimeout(barrier)) => {
+                    barrier.wait();
+                    return MetadataCommandRecoveryAdmission::TimedOut { wait_us: 0 };
+                }
+                Some(MetadataCommandRecoveryWaitTestAction::WaitForOwner(barrier)) => {
+                    barrier.wait();
+                }
+                None => {}
+            }
         }
 
         let wait_started = Instant::now();

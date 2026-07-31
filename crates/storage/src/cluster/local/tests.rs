@@ -18,7 +18,7 @@ use proptest::test_runner::{TestCaseError, TestCaseResult};
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 

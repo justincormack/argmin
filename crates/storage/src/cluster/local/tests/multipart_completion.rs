@@ -303,15 +303,62 @@ fn direct_put_metadata_command_retry_reuses_pending_partial_replica_command() {
         assert_eq!(stored.as_live().unwrap().generation_id, generation_id);
     }
 
-    let outcome = cluster
-        .commit_direct_put_object_from_payload_shards(
-            &commit_req,
-            &written.written_shards,
-            |_| -> Result<(), ()> { panic!("retry must reuse the pending direct PUT command") },
-        )
-        .unwrap()
-        .unwrap();
-
+    let pg_id = PgId::new(object_pg);
+    let pending_command = pending_metadata_command_for_test(&map, pg_id, &bucket)
+        .expect("partial direct PUT metadata command must remain pending");
+    let timeout_selected = Arc::new(Barrier::new(2));
+    let retry_selected = Arc::new(Barrier::new(2));
+    cluster.test_install_metadata_command_recovery_wait_hook(
+        pg_id,
+        &pending_command,
+        Arc::clone(&timeout_selected),
+        Arc::clone(&retry_selected),
+    );
+    let owner_ready = Arc::new(Barrier::new(2));
+    let owner_release = Arc::new(Barrier::new(2));
+    let owner_ready_hook = Arc::clone(&owner_ready);
+    let owner_release_hook = Arc::clone(&owner_release);
+    let owner_command = pending_command.clone();
+    let block_owner_once = Arc::new(AtomicBool::new(true));
+    let block_owner_once_hook = Arc::clone(&block_owner_once);
+    let owner_hook = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |_node_id, command| {
+            if *command == owner_command && block_owner_once_hook.swap(false, Ordering::SeqCst) {
+                owner_ready_hook.wait();
+                owner_release_hook.wait();
+            }
+            Ok(())
+        },
+    ));
+    let outcome = thread::scope(|scope| {
+        let owner = scope.spawn(|| {
+            cluster.drain_pending_metadata_command_with_recovery_gate(pg_id, &pending_command)
+        });
+        owner_ready.wait();
+        let waiter = scope.spawn(|| {
+            cluster.commit_direct_put_object_from_payload_shards(
+                &commit_req,
+                &written.written_shards,
+                |_| -> Result<(), ()> { panic!("retry must reuse the pending direct PUT command") },
+            )
+        });
+        timeout_selected.wait();
+        retry_selected.wait();
+        owner_release.wait();
+        assert_eq!(
+            owner.join().unwrap().unwrap(),
+            PendingMetadataCommandOutcome::Applied,
+            "recovery owner must apply the pending direct PUT command"
+        );
+        waiter.join().unwrap().unwrap().unwrap()
+    });
+    drop(owner_hook);
+    assert!(!block_owner_once.load(Ordering::SeqCst));
+    assert_eq!(
+        cluster.test_take_metadata_command_recovery_wait_hook_observation(),
+        (2, 0),
+        "direct PUT waiter must time out once, rejoin the active owner, and observe completion"
+    );
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
     {
         let bucket_primary = map

@@ -10214,6 +10214,33 @@ impl StorageCluster {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_install_metadata_command_recovery_wait_hook(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        timeout_selected: Arc<std::sync::Barrier>,
+        retry_selected: Arc<std::sync::Barrier>,
+    ) {
+        self.local_map
+            .runtime_state()
+            .test_install_metadata_command_recovery_wait_hook(
+                pg_id,
+                command,
+                timeout_selected,
+                retry_selected,
+            );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_take_metadata_command_recovery_wait_hook_observation(
+        &self,
+    ) -> (usize, usize) {
+        self.local_map
+            .runtime_state()
+            .test_take_metadata_command_recovery_wait_hook_observation()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_begin_metadata_command_recovery_leader(
         &self,
         pg_id: PgId,
@@ -12149,15 +12176,20 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
-        mut work_budget: Option<&mut RequestWorkBudget>,
+        work_budget: Option<&mut RequestWorkBudget>,
         reservation_authority: &StorageCluster,
         route_mode: MetadataCommandRouteMode,
         recovery_authorized_source: Option<&MetadataCommandEnvelope>,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        let mut default_work_budget = RequestWorkBudget::new(BUCKET_WRITE_DRAIN_RETRY_BUDGET, None)
+            .for_operation("metadata_command_recovery")
+            .for_pg(pg_id);
+        let work_budget = match work_budget {
+            Some(work_budget) => work_budget,
+            None => &mut default_work_budget,
+        };
         loop {
-            if let Some(work_budget) = work_budget.as_deref_mut() {
-                work_budget.check("pending command recovery gate budget exhausted")?;
-            }
+            work_budget.check("pending command recovery gate budget exhausted")?;
             let recovery = self
                 .local_map
                 .runtime_state()
@@ -12213,29 +12245,20 @@ impl StorageCluster {
                         "timed_out",
                     );
                     self.emit_pending_slot_action_for_command(pg_id, command, "drain_timeout");
-                    return Err(conflicting_pending_object_metadata_command(
-                        "pending command recovery timed out",
-                    ));
+                    work_budget
+                        .sleep_after_contention("pending command recovery retry budget exhausted")
+                        .map_err(ObjectPgActionError::Store)?;
+                    continue;
                 }
             };
-            let outcome = match work_budget.as_deref_mut() {
-                Some(work_budget) => self
-                    .finish_pending_metadata_command_recovery_with_work_budget(
-                        pg_id,
-                        command,
-                        work_budget,
-                        reservation_authority,
-                        route_mode,
-                        recovery_authorized_source,
-                    )?,
-                None => self.finish_pending_metadata_command_recovery(
-                    pg_id,
-                    command,
-                    reservation_authority,
-                    route_mode,
-                    recovery_authorized_source,
-                )?,
-            };
+            let outcome = self.finish_pending_metadata_command_recovery_with_work_budget(
+                pg_id,
+                command,
+                work_budget,
+                reservation_authority,
+                route_mode,
+                recovery_authorized_source,
+            )?;
             self.emit_metadata_command_recovery_outcome_for_command(
                 pg_id,
                 command,
@@ -12285,24 +12308,6 @@ impl StorageCluster {
         } else {
             Ok(MetadataCommandRecoveryWaiterOutcome::MissingNotApplied)
         }
-    }
-
-    fn finish_pending_metadata_command_recovery(
-        &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
-        reservation_authority: &StorageCluster,
-        route_mode: MetadataCommandRouteMode,
-        recovery_authorized_source: Option<&MetadataCommandEnvelope>,
-    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
-        self.finish_pending_metadata_command_recovery_inner(
-            pg_id,
-            command,
-            None,
-            reservation_authority,
-            route_mode,
-            recovery_authorized_source,
-        )
     }
 
     fn finish_pending_metadata_command_recovery_with_work_budget(
@@ -14107,9 +14112,12 @@ impl StorageCluster {
                         "timed_out",
                     );
                     self.emit_pending_slot_action_for_command(pg_id, &command, "drain_timeout");
-                    return Err(conflicting_pending_object_metadata_command(
-                        "pending direct PUT command recovery timed out",
-                    ));
+                    work_budget
+                        .sleep_after_contention(
+                            "direct PUT pending recovery retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
+                    continue;
                 }
             };
 

@@ -2192,7 +2192,6 @@ fn stream_abort_matching_pending_install_race_returns_success() {
             }
             insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &hook_command);
         }));
-
     cluster
         .abort_stream_upload_session(&bucket, &key, &session_id)
         .unwrap();
@@ -2227,6 +2226,16 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
     };
     set_route_primary(&mut map, object_pg, NodeId::new(1));
     set_route_primary(&mut map, data_pg, NodeId::new(2));
+    let waiter_key = key_for_object_pg(
+        map.nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        &bucket,
+        object_pg,
+        "stream-finalize-recovery-waiter-",
+    );
 
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
@@ -2238,6 +2247,15 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
             &bucket,
             &key,
             &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let waiter_session_id = crate::SessionId::try_from("4a".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &waiter_key,
+            &waiter_session_id,
             crate::ObjectEncryption::None,
         )
         .unwrap();
@@ -2344,15 +2362,79 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
             crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg_store, &bucket,)
                 .unwrap()
                 .len(),
-            1
+            2
         );
     }
     assert_stream_next_segment_vid(&map, NodeId::new(2), object_pg, &session_id, 2);
 
-    let next_reservation_id = crate::SessionId::try_from("4a".repeat(16)).unwrap();
-    cluster
-        .reserve_put_object_generation(&bucket, &key, &next_reservation_id)
-        .unwrap();
+    let pg_id = PgId::new(object_pg);
+    let pending_command = pending_metadata_command_for_test(&map, pg_id, &bucket)
+        .expect("partial stream PUT finalize command must remain pending");
+    let timeout_selected = Arc::new(Barrier::new(2));
+    let retry_selected = Arc::new(Barrier::new(2));
+    cluster.test_install_metadata_command_recovery_wait_hook(
+        pg_id,
+        &pending_command,
+        Arc::clone(&timeout_selected),
+        Arc::clone(&retry_selected),
+    );
+    let owner_ready = Arc::new(Barrier::new(2));
+    let owner_release = Arc::new(Barrier::new(2));
+    let owner_ready_hook = Arc::clone(&owner_ready);
+    let owner_release_hook = Arc::clone(&owner_release);
+    let owner_command = pending_command.clone();
+    let block_owner_once = Arc::new(AtomicBool::new(true));
+    let block_owner_once_hook = Arc::clone(&block_owner_once);
+    let owner_hook = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |_node_id, command| {
+            if *command == owner_command && block_owner_once_hook.swap(false, Ordering::SeqCst) {
+                owner_ready_hook.wait();
+                owner_release_hook.wait();
+            }
+            Ok(())
+        },
+    ));
+    let waiter_outcome = thread::scope(|scope| {
+        let owner = scope.spawn(|| {
+            cluster.drain_pending_metadata_command_with_recovery_gate(pg_id, &pending_command)
+        });
+        owner_ready.wait();
+        let waiter = scope.spawn(|| {
+            cluster.finalize_put_object_stream(&bucket, &waiter_key, &waiter_session_id, 0, |_| {
+                Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                    value: "waiter",
+                    versioning: crate::BucketVersioningState::Disabled,
+                    owner: crate::OwnerIdentity::from_principal("owner"),
+                    acl_grants: crate::AclGrants::default(),
+                    public_read: false,
+                    size: 0,
+                    etag_crc64: checksum::crc64::checksum(&[]),
+                    tags: None,
+                    metadata_blob: crate::SerializedMetadataBlob::default(),
+                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                    object_lock: crate::ObjectLockState::default(),
+                    encryption: crate::ObjectEncryption::None,
+                })
+            })
+        });
+        timeout_selected.wait();
+        retry_selected.wait();
+        owner_release.wait();
+        assert_eq!(
+            owner.join().unwrap().unwrap(),
+            PendingMetadataCommandOutcome::Applied,
+            "recovery owner must apply the pending stream PUT command"
+        );
+        waiter.join().unwrap().unwrap().unwrap()
+    });
+    drop(owner_hook);
+    assert!(!block_owner_once.load(Ordering::SeqCst));
+    assert_eq!(waiter_outcome.value, "waiter");
+    assert_eq!(
+        cluster.test_take_metadata_command_recovery_wait_hook_observation(),
+        (2, 0),
+        "stream PUT waiter must time out once, rejoin the active owner, and observe completion"
+    );
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
     for node_id in node_ids {
         let node = map.node(node_id).unwrap().storage_node();
