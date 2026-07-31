@@ -540,6 +540,14 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         key: &ObjectKey,
     ) -> Result<Box<dyn MultipartUploadCreationMetadataRoute + '_>, ObjectPgActionError>;
 
+    fn open_multipart_upload_lookup_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn MultipartUploadLookupMetadataRoute + '_>, ObjectPgActionError>;
+
     fn matching_stream_upload_exists(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -554,30 +562,6 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, ObjectPgActionError>;
-
-    fn load_multipart_upload(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError>;
-
-    fn load_in_progress_multipart_upload(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadRecord, ObjectPgActionError>;
-
-    fn load_in_progress_multipart_upload_for_listing(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadRecord, ObjectPgActionError>;
 
     fn load_multipart_completion_snapshot(
         &self,
@@ -599,14 +583,6 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         part_number_marker: Option<u32>,
         max_parts: u32,
     ) -> Result<ListedMultipartParts, ObjectPgActionError>;
-
-    fn lookup_multipart_upload_management(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError>;
 
     fn build_create_stream_upload_command(
         &self,
@@ -827,6 +803,28 @@ pub(crate) trait MultipartUploadCreationMetadataRoute: Send {
         &self,
         request: BuildCreateMultipartUploadCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+}
+
+pub(crate) trait MultipartUploadLookupMetadataRoute: Send {
+    fn load_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError>;
+
+    fn load_in_progress_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError>;
+
+    fn load_in_progress_multipart_upload_for_listing(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError>;
+
+    fn lookup_multipart_upload_management(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError>;
 }
 
 /// Cleanup authority for exact object-metadata subjects which may need to

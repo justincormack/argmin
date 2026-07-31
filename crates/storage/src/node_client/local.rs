@@ -130,6 +130,14 @@ struct LocalMultipartUploadCreationMetadataRoute<'a> {
     key: ObjectKey,
 }
 
+struct LocalMultipartUploadLookupMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    _route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
 struct LocalObjectListingMetadataRoute {
     storage_node: Arc<SharedStorageNode>,
     _route_cluster_epoch: ClusterEpoch,
@@ -2718,6 +2726,52 @@ impl MultipartUploadCreationMetadataRoute for LocalMultipartUploadCreationMetada
     }
 }
 
+impl MultipartUploadLookupMetadataRoute for LocalMultipartUploadLookupMetadataRoute<'_> {
+    fn load_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
+        self.client
+            .load_multipart_upload(self.pg_id, &self.bucket, &self.key, upload_id)
+    }
+
+    fn load_in_progress_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        self.client.load_in_progress_multipart_upload(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            upload_id,
+        )
+    }
+
+    fn load_in_progress_multipart_upload_for_listing(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        self.client.load_in_progress_multipart_upload_for_listing(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            upload_id,
+        )
+    }
+
+    fn lookup_multipart_upload_management(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
+        self.client.lookup_multipart_upload_management(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            upload_id,
+        )
+    }
+}
+
 impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
     fn open_put_object_metadata_route(
         &self,
@@ -2788,6 +2842,29 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         }))
     }
 
+    fn open_multipart_upload_lookup_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn MultipartUploadLookupMetadataRoute + '_>, ObjectPgActionError> {
+        if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open multipart upload lookup metadata route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalMultipartUploadLookupMetadataRoute {
+            client: self,
+            _route_cluster_epoch: route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
+    }
+
     fn matching_stream_upload_exists(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -2805,36 +2882,6 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, ObjectPgActionError> {
         Self::load_stream_upload_session(self, pg_id, bucket, key, session_id)
-    }
-
-    fn load_multipart_upload(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
-        Self::load_multipart_upload(self, pg_id, bucket, key, upload_id)
-    }
-
-    fn load_in_progress_multipart_upload(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        Self::load_in_progress_multipart_upload(self, pg_id, bucket, key, upload_id)
-    }
-
-    fn load_in_progress_multipart_upload_for_listing(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        Self::load_in_progress_multipart_upload_for_listing(self, pg_id, bucket, key, upload_id)
     }
 
     fn load_multipart_completion_snapshot(
@@ -2873,16 +2920,6 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
             part_number_marker,
             max_parts,
         )
-    }
-
-    fn lookup_multipart_upload_management(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
-        Self::lookup_multipart_upload_management(self, pg_id, bucket, key, upload_id)
     }
 
     fn build_create_stream_upload_command(

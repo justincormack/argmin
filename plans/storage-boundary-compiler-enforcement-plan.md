@@ -4542,6 +4542,38 @@ One-hundred-and-thirteenth Phase 3 review correction:
   valid idempotence-recovery case where a provisional `(0, 0)` request carries
   the authenticated command and stored upload ID ordered by command position.
 
+One-hundred-and-fourteenth Phase 3 slice:
+
+- ordinary multipart-upload loading, in-progress loading, listing-oriented
+  loading, and terminal-management/replay lookup now share a
+  `MultipartUploadLookupMetadataRoute` bound to one active cluster epoch,
+  exact object-metadata primary PG, bucket, and key. Operations may select an
+  upload ID within that fixed object subject but cannot replace routing or
+  placement authority.
+- embedded construction validates exact object placement and an open PG before
+  storage access. Unix construction rejects an epoch differing from the
+  installed client before transport and owns the wire object subject. Common
+  Unix loading preserves operation-specific decode and response-validation
+  diagnostics while validating every returned upload against the route and
+  requested upload ID.
+- cluster UploadPart creation, conditional completion, lifecycle abort,
+  ordinary lookup, and listing paths open the scoped route before reading an
+  upload. Storage-node dispatch retains independent active admission-domain,
+  route, placement, primary, and captured-deadline validation before opening
+  the embedded route.
+- embedded coverage rejects a configured crossed object PG before storage, and
+  a no-listener Unix regression rejects a foreign epoch before RPC. The
+  installed equivalent-state matrix exercises all four operations through
+  correct and wrong PG routes, preserving exact `PayloadDecode` rejection even
+  when the crossed PG contains an identical upload and parts.
+- the transitional boundary checker now requires production multipart lookup
+  reads to flow through the scoped route. Completion snapshot/parts access,
+  completion and abort command construction, stream-session mutation, and
+  payload-reclaim families remain open in Phase 3.
+- all 2,526 storage tests pass. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full 7,845-test workspace suite also
+  pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

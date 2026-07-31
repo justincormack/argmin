@@ -59,6 +59,14 @@ struct UnixMultipartUploadCreationMetadataRoute<'a> {
     key: ObjectKey,
 }
 
+struct UnixMultipartUploadLookupMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    _route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
 struct UnixObjectListingMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
     pg_id: ObjectMetadataScanPgId,
@@ -2803,6 +2811,147 @@ impl MultipartUploadCreationMetadataRoute for UnixMultipartUploadCreationMetadat
     }
 }
 
+impl UnixMultipartUploadLookupMetadataRoute<'_> {
+    fn object_request(&self) -> StorageRpcObjectRequest {
+        self.client
+            .object_request(self.pg_id.pg_id(), &self.bucket, &self.key)
+    }
+
+    fn load_multipart_upload_with_kind(
+        &self,
+        upload_id: &UploadId,
+        kind: StorageRpcMessageKind,
+        expected_state: Option<UploadState>,
+        decode_operation: &'static str,
+        validate_operation: &'static str,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        let request = StorageRpcMultipartUploadLoadRequest {
+            object: self.object_request(),
+            upload_id: upload_id.clone(),
+        };
+        let payload = encode_multipart_upload_load_request(&request);
+        let response = self
+            .client
+            .rpc_request(kind, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_multipart_upload_load_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.client
+                    .rpc_payload_error(decode_operation, error.to_string()),
+            )
+        })?;
+        match response.outcome {
+            StorageRpcMultipartUploadLoadOutcome::Loaded(upload) => {
+                self.client.validate_multipart_upload_response(
+                    &upload,
+                    &self.bucket,
+                    &self.key,
+                    upload_id,
+                    expected_state,
+                    validate_operation,
+                )?;
+                Ok(*upload)
+            }
+            StorageRpcMultipartUploadLoadOutcome::NoSuchUpload {
+                upload_id: returned_upload_id,
+            } => {
+                if returned_upload_id != *upload_id {
+                    return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                        validate_operation,
+                        "missing upload id does not match request".to_string(),
+                    )));
+                }
+                Err(MetadataError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                }
+                .into())
+            }
+        }
+    }
+}
+
+impl MultipartUploadLookupMetadataRoute for UnixMultipartUploadLookupMetadataRoute<'_> {
+    fn load_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
+        self.load_multipart_upload_with_kind(
+            upload_id,
+            StorageRpcMessageKind::ObjectMultipartUploadLoad,
+            None,
+            "decode multipart upload load response",
+            "validate multipart upload load response",
+        )
+        .map_err(|error| match error {
+            ObjectPgActionError::Store(store) => BucketSnapshotLoadError::Store(store),
+            ObjectPgActionError::Metadata(metadata) => BucketSnapshotLoadError::Metadata(metadata),
+            other => {
+                BucketSnapshotLoadError::Store(self.client.rpc_payload_error(
+                    "validate multipart upload load response",
+                    other.to_string(),
+                ))
+            }
+        })
+    }
+
+    fn load_in_progress_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        self.load_multipart_upload_with_kind(
+            upload_id,
+            StorageRpcMessageKind::ObjectMultipartInProgressUploadLoad,
+            Some(UploadState::InProgress),
+            "decode in-progress multipart upload load response",
+            "validate in-progress multipart upload load response",
+        )
+    }
+
+    fn load_in_progress_multipart_upload_for_listing(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        self.load_multipart_upload_with_kind(
+            upload_id,
+            StorageRpcMessageKind::ObjectMultipartInProgressUploadForListingLoad,
+            Some(UploadState::InProgress),
+            "decode in-progress multipart upload listing response",
+            "validate in-progress multipart upload listing response",
+        )
+    }
+
+    fn lookup_multipart_upload_management(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
+        let request = StorageRpcMultipartUploadLoadRequest {
+            object: self.object_request(),
+            upload_id: upload_id.clone(),
+        };
+        let payload = encode_multipart_upload_load_request(&request);
+        let response = self
+            .client
+            .rpc_request(
+                StorageRpcMessageKind::ObjectMultipartManagementLookup,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_multipart_management_lookup_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(self.client.rpc_payload_error(
+                "decode multipart management lookup response",
+                error.to_string(),
+            ))
+        })?;
+        self.client.validate_multipart_management_lookup_response(
+            &response.lookup,
+            &self.bucket,
+            &self.key,
+            upload_id,
+        )?;
+        Ok(response.lookup)
+    }
+}
+
 impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
     fn open_put_object_metadata_route(
         &self,
@@ -2846,6 +2995,30 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         Ok(Box::new(UnixMultipartUploadCreationMetadataRoute {
             client: self,
             route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
+    }
+
+    fn open_multipart_upload_lookup_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn MultipartUploadLookupMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixMultipartUploadLookupMetadataRoute {
+            client: self,
+            _route_cluster_epoch: route_cluster_epoch,
             pg_id,
             bucket: bucket.clone(),
             key: key.clone(),
@@ -2925,172 +3098,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 }
                 Err(MetadataError::StreamSessionNotFound {
                     session_id: session_id.as_str().to_string(),
-                }
-                .into())
-            }
-        }
-    }
-
-    fn load_multipart_upload(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
-        let request = StorageRpcMultipartUploadLoadRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
-            upload_id: upload_id.clone(),
-        };
-        let payload = encode_multipart_upload_load_request(&request);
-        let response = self
-            .rpc_request(StorageRpcMessageKind::ObjectMultipartUploadLoad, payload)
-            .map_err(BucketSnapshotLoadError::from)?;
-        let response = decode_multipart_upload_load_response(&response).map_err(|error| {
-            BucketSnapshotLoadError::from(
-                self.rpc_payload_error("decode multipart upload load response", error.to_string()),
-            )
-        })?;
-        match response.outcome {
-            StorageRpcMultipartUploadLoadOutcome::Loaded(upload) => {
-                self.validate_multipart_upload_response(
-                    &upload,
-                    bucket,
-                    key,
-                    upload_id,
-                    None,
-                    "validate multipart upload load response",
-                )
-                .map_err(|error| match error {
-                    ObjectPgActionError::Store(store) => BucketSnapshotLoadError::Store(store),
-                    ObjectPgActionError::Metadata(metadata) => {
-                        BucketSnapshotLoadError::Metadata(metadata)
-                    }
-                    other => BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                        "validate multipart upload load response",
-                        other.to_string(),
-                    )),
-                })?;
-                Ok(*upload)
-            }
-            StorageRpcMultipartUploadLoadOutcome::NoSuchUpload {
-                upload_id: returned_upload_id,
-            } => {
-                if returned_upload_id != *upload_id {
-                    return Err(BucketSnapshotLoadError::from(self.rpc_payload_error(
-                        "validate multipart upload load response",
-                        "missing upload id does not match request".to_string(),
-                    )));
-                }
-                Err(BucketSnapshotLoadError::Metadata(
-                    MetadataError::NoSuchUpload {
-                        upload_id: upload_id.to_string(),
-                    },
-                ))
-            }
-        }
-    }
-
-    fn load_in_progress_multipart_upload(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        let request = StorageRpcMultipartUploadLoadRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
-            upload_id: upload_id.clone(),
-        };
-        let payload = encode_multipart_upload_load_request(&request);
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectMultipartInProgressUploadLoad,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response = decode_multipart_upload_load_response(&response).map_err(|error| {
-            ObjectPgActionError::Store(self.rpc_payload_error(
-                "decode in-progress multipart upload load response",
-                error.to_string(),
-            ))
-        })?;
-        match response.outcome {
-            StorageRpcMultipartUploadLoadOutcome::Loaded(upload) => {
-                self.validate_multipart_upload_response(
-                    &upload,
-                    bucket,
-                    key,
-                    upload_id,
-                    Some(UploadState::InProgress),
-                    "validate in-progress multipart upload load response",
-                )?;
-                Ok(*upload)
-            }
-            StorageRpcMultipartUploadLoadOutcome::NoSuchUpload {
-                upload_id: returned_upload_id,
-            } => {
-                if returned_upload_id != *upload_id {
-                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                        "validate in-progress multipart upload load response",
-                        "missing upload id does not match request".to_string(),
-                    )));
-                }
-                Err(MetadataError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                }
-                .into())
-            }
-        }
-    }
-
-    fn load_in_progress_multipart_upload_for_listing(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        let request = StorageRpcMultipartUploadLoadRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
-            upload_id: upload_id.clone(),
-        };
-        let payload = encode_multipart_upload_load_request(&request);
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectMultipartInProgressUploadForListingLoad,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response = decode_multipart_upload_load_response(&response).map_err(|error| {
-            ObjectPgActionError::Store(self.rpc_payload_error(
-                "decode in-progress multipart upload listing response",
-                error.to_string(),
-            ))
-        })?;
-        match response.outcome {
-            StorageRpcMultipartUploadLoadOutcome::Loaded(upload) => {
-                self.validate_multipart_upload_response(
-                    &upload,
-                    bucket,
-                    key,
-                    upload_id,
-                    Some(UploadState::InProgress),
-                    "validate in-progress multipart upload listing response",
-                )?;
-                Ok(*upload)
-            }
-            StorageRpcMultipartUploadLoadOutcome::NoSuchUpload {
-                upload_id: returned_upload_id,
-            } => {
-                if returned_upload_id != *upload_id {
-                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                        "validate in-progress multipart upload listing response",
-                        "missing upload id does not match request".to_string(),
-                    )));
-                }
-                Err(MetadataError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
                 }
                 .into())
             }
@@ -3282,39 +3289,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 .into())
             }
         }
-    }
-
-    fn lookup_multipart_upload_management(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
-        let request = StorageRpcMultipartUploadLoadRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
-            upload_id: upload_id.clone(),
-        };
-        let payload = encode_multipart_upload_load_request(&request);
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectMultipartManagementLookup,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response = decode_multipart_management_lookup_response(&response).map_err(|error| {
-            ObjectPgActionError::Store(self.rpc_payload_error(
-                "decode multipart management lookup response",
-                error.to_string(),
-            ))
-        })?;
-        self.validate_multipart_management_lookup_response(
-            &response.lookup,
-            bucket,
-            key,
-            upload_id,
-        )?;
-        Ok(response.lookup)
     }
 
     fn build_create_stream_upload_command(

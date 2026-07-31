@@ -2676,40 +2676,49 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
     );
     let correct_pg = ObjectMetadataPgId::new_for_test(PgId::new(correct_pg_id));
     let wrong_pg = ObjectMetadataPgId::new_for_test(PgId::new(wrong_pg_id));
+    let correct_multipart_lookup_route =
+        ObjectMutationMetadataNodeClient::open_multipart_upload_lookup_metadata_route(
+            &client,
+            ClusterEpoch::INITIAL,
+            correct_pg,
+            &bucket,
+            &key,
+        )
+        .unwrap();
+    let wrong_multipart_lookup_route =
+        ObjectMutationMetadataNodeClient::open_multipart_upload_lookup_metadata_route(
+            &client,
+            ClusterEpoch::INITIAL,
+            wrong_pg,
+            &bucket,
+            &key,
+        )
+        .unwrap();
 
-    let upload = ObjectMutationMetadataNodeClient::load_multipart_upload(
-        &client, correct_pg, &bucket, &key, &upload_id,
-    )
-    .unwrap();
+    let upload = correct_multipart_lookup_route
+        .load_multipart_upload(&upload_id)
+        .unwrap();
     assert_eq!(upload, expected_upload.unwrap());
-    assert_bucket_payload_decode!(ObjectMutationMetadataNodeClient::load_multipart_upload(
-        &client, wrong_pg, &bucket, &key, &upload_id,
-    ));
+    assert_bucket_payload_decode!(wrong_multipart_lookup_route.load_multipart_upload(&upload_id));
 
     assert_eq!(
-        ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload(
-            &client, correct_pg, &bucket, &key, &upload_id,
-        )
-        .unwrap(),
+        correct_multipart_lookup_route
+            .load_in_progress_multipart_upload(&upload_id)
+            .unwrap(),
         upload
     );
     assert_object_payload_decode!(
-        ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload(
-            &client, wrong_pg, &bucket, &key, &upload_id,
-        )
+        wrong_multipart_lookup_route.load_in_progress_multipart_upload(&upload_id)
     );
 
     assert_eq!(
-        ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload_for_listing(
-            &client, correct_pg, &bucket, &key, &upload_id,
-        )
-        .unwrap(),
+        correct_multipart_lookup_route
+            .load_in_progress_multipart_upload_for_listing(&upload_id)
+            .unwrap(),
         upload
     );
     assert_object_payload_decode!(
-        ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload_for_listing(
-            &client, wrong_pg, &bucket, &key, &upload_id,
-        )
+        wrong_multipart_lookup_route.load_in_progress_multipart_upload_for_listing(&upload_id)
     );
 
     let authorized_upload = AuthorizedMultipartUploadRecord::assume_authorized(upload.clone());
@@ -2764,20 +2773,13 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
     );
 
     assert!(matches!(
-        ObjectMutationMetadataNodeClient::lookup_multipart_upload_management(
-            &client,
-            correct_pg,
-            &bucket,
-            &key,
-            &upload_id,
-        )
-        .unwrap(),
+        correct_multipart_lookup_route
+            .lookup_multipart_upload_management(&upload_id)
+            .unwrap(),
         MultipartUploadManagementLookup::InProgress(current) if *current == upload
     ));
     assert_object_payload_decode!(
-        ObjectMutationMetadataNodeClient::lookup_multipart_upload_management(
-            &client, wrong_pg, &bucket, &key, &upload_id,
-        )
+        wrong_multipart_lookup_route.lookup_multipart_upload_management(&upload_id)
     );
 
     assert!(
@@ -4688,14 +4690,15 @@ fn unix_object_mutation_client_loads_multipart_upload_over_rpc() {
         config.socket_path.clone(),
     );
 
-    let upload = ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload(
+    let route = ObjectMutationMetadataNodeClient::open_multipart_upload_lookup_metadata_route(
         &client,
+        ClusterEpoch::INITIAL,
         ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
-        &upload_id,
     )
     .unwrap();
+    let upload = route.load_in_progress_multipart_upload(&upload_id).unwrap();
     assert_eq!(upload.bucket, bucket);
     assert_eq!(upload.key, key);
     assert_eq!(upload.upload_id, upload_id);

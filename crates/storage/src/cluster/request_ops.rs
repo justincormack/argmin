@@ -13296,8 +13296,11 @@ impl super::StorageCluster {
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
         let pg_id = self.object_metadata_pg(bucket, key);
-        self.object_mutation_metadata_primary_client(bucket, key)?
-            .load_multipart_upload(pg_id, bucket, key, upload_id)
+        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+        mutation_client
+            .open_multipart_upload_lookup_metadata_route(self.operation_epoch(), pg_id, bucket, key)
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
+            .load_multipart_upload(upload_id)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -13330,6 +13333,14 @@ impl super::StorageCluster {
         let object_pg_id = self.object_metadata_pg(&bucket, &key);
         let pg_id = object_pg_id.pg_id();
         let mutation_client = self.object_mutation_metadata_primary_client(&bucket, &key)?;
+        let multipart_lookup_route = mutation_client
+            .open_multipart_upload_lookup_metadata_route(
+                self.operation_epoch(),
+                object_pg_id,
+                &bucket,
+                &key,
+            )
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
         macro_rules! release_caller_bucket_write_proof {
             () => {{
                 self.release_bucket_write_reservation_proof(&bucket_write_reservation)
@@ -13347,12 +13358,8 @@ impl super::StorageCluster {
                     ));
                 }
             };
-            let upload = match mutation_client.load_in_progress_multipart_upload(
-                object_pg_id,
-                &bucket,
-                &key,
-                &upload_id,
-            ) {
+            let upload = match multipart_lookup_route.load_in_progress_multipart_upload(&upload_id)
+            {
                 Ok(upload) => upload,
                 Err(error) => {
                     release_caller_bucket_write_proof!()?;
@@ -13505,6 +13512,12 @@ impl super::StorageCluster {
         let upload_id = &authorized_upload.record().upload_id;
         let pg_id = object_pg_id.pg_id();
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+        let multipart_lookup_route = mutation_client.open_multipart_upload_lookup_metadata_route(
+            self.operation_epoch(),
+            object_pg_id,
+            bucket,
+            key,
+        )?;
         loop {
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             let reservation = match self.acquire_durable_bucket_write_reservation_with_effect_fence(
@@ -13549,12 +13562,7 @@ impl super::StorageCluster {
                 release_caller_bucket_write_proof!()?;
                 return Err(ObjectPgActionError::Store(error));
             }
-            let upload = match mutation_client.load_in_progress_multipart_upload(
-                object_pg_id,
-                bucket,
-                key,
-                upload_id,
-            ) {
+            let upload = match multipart_lookup_route.load_in_progress_multipart_upload(upload_id) {
                 Ok(upload) => upload,
                 Err(error) => {
                     release_caller_bucket_write_proof!()?;
@@ -13687,8 +13695,15 @@ impl super::StorageCluster {
             effect_fence: _,
         } = route;
         require_valid_route().map_err(ObjectPgActionError::Store)?;
-        self.object_mutation_metadata_primary_client(bucket, key)?
-            .load_in_progress_multipart_upload(pg_id, bucket, key, upload_id)
+        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+        mutation_client
+            .open_multipart_upload_lookup_metadata_route(
+                self.operation_epoch(),
+                pg_id,
+                bucket,
+                key,
+            )?
+            .load_in_progress_multipart_upload(upload_id)
     }
 
     #[cfg(feature = "test-hooks")]
@@ -13712,8 +13727,15 @@ impl super::StorageCluster {
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
         let pg_id = self.object_metadata_pg(bucket, key);
-        self.object_mutation_metadata_primary_client(bucket, key)?
-            .load_in_progress_multipart_upload_for_listing(pg_id, bucket, key, upload_id)
+        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+        mutation_client
+            .open_multipart_upload_lookup_metadata_route(
+                self.operation_epoch(),
+                pg_id,
+                bucket,
+                key,
+            )?
+            .load_in_progress_multipart_upload_for_listing(upload_id)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -14109,6 +14131,12 @@ impl super::StorageCluster {
         let generation_id = req.generation_id;
         let pg_id = object_pg_id.pg_id();
         let mutation_client = self.object_mutation_metadata_primary_client(&bucket, &key)?;
+        let multipart_lookup_route = mutation_client.open_multipart_upload_lookup_metadata_route(
+            self.operation_epoch(),
+            object_pg_id,
+            &bucket,
+            &key,
+        )?;
         let mut work_budget = super::RequestWorkBudget::new(
             std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
             None,
@@ -14194,18 +14222,14 @@ impl super::StorageCluster {
                     release_bucket_write_proof!()?;
                     return Err(ObjectPgActionError::Store(error));
                 }
-                let upload = match mutation_client.load_in_progress_multipart_upload(
-                    object_pg_id,
-                    &bucket,
-                    &key,
-                    &upload_id,
-                ) {
-                    Ok(upload) => upload,
-                    Err(error) => {
-                        release_bucket_write_proof!()?;
-                        return Err(error);
-                    }
-                };
+                let upload =
+                    match multipart_lookup_route.load_in_progress_multipart_upload(&upload_id) {
+                        Ok(upload) => upload,
+                        Err(error) => {
+                            release_bucket_write_proof!()?;
+                            return Err(error);
+                        }
+                    };
                 if req.expected_current_object_identity != upload.initiated_object_identity {
                     release_bucket_write_proof!()?;
                     return Err(ObjectPgActionError::MultipartConditionalRequestConflict);
@@ -15073,8 +15097,15 @@ impl super::StorageCluster {
         // the upload for CompleteMultipartUpload or AbortMultipartUpload.
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
         require_valid_route().map_err(ObjectPgActionError::Store)?;
-        self.object_mutation_metadata_primary_client(bucket, key)?
-            .lookup_multipart_upload_management(object_pg_id, bucket, key, upload_id)
+        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+        mutation_client
+            .open_multipart_upload_lookup_metadata_route(
+                self.operation_epoch(),
+                object_pg_id,
+                bucket,
+                key,
+            )?
+            .lookup_multipart_upload_management(upload_id)
     }
 
     pub fn abort_multipart_upload(
@@ -15502,10 +15533,14 @@ impl super::StorageCluster {
             self.drain_pending_object_metadata_command(pg_id, &command)?;
         }
 
-        let upload = match self
-            .object_mutation_metadata_primary_client(bucket, key)?
-            .load_multipart_upload(object_pg_id, bucket, key, upload_id)
-        {
+        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+        let multipart_lookup_route = mutation_client.open_multipart_upload_lookup_metadata_route(
+            self.operation_epoch(),
+            object_pg_id,
+            bucket,
+            key,
+        )?;
+        let upload = match multipart_lookup_route.load_multipart_upload(upload_id) {
             Ok(upload) => upload,
             Err(BucketSnapshotLoadError::Metadata(MetadataError::NoSuchUpload { .. })) => {
                 return Ok(Ok(false));

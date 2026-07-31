@@ -5372,14 +5372,28 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::load_multipart_upload(
-            &local_client,
-            self.route.pg_id,
-            self.route.bucket,
-            self.route.key,
-            upload_id,
-        )
-        .map_err(StorageNodeMultipartUploadRouteError::Upload)
+        let lookup_route =
+            ObjectMutationMetadataNodeClient::open_multipart_upload_lookup_metadata_route(
+                &local_client,
+                self.route.fence.cluster_epoch,
+                self.route.pg_id,
+                self.route.bucket,
+                self.route.key,
+            )
+            .map_err(|error| match error {
+                ObjectPgActionError::Store(store) => BucketSnapshotLoadError::Store(store),
+                ObjectPgActionError::Metadata(metadata) => {
+                    BucketSnapshotLoadError::Metadata(metadata)
+                }
+                other => BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "open multipart upload lookup metadata route",
+                    source: std::io::Error::other(other.to_string()),
+                }),
+            })
+            .map_err(StorageNodeMultipartUploadRouteError::Upload)?;
+        lookup_route
+            .load_multipart_upload(upload_id)
+            .map_err(StorageNodeMultipartUploadRouteError::Upload)
     }
 
     fn load_in_progress_multipart_upload(
@@ -5391,13 +5405,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload(
+        ObjectMutationMetadataNodeClient::open_multipart_upload_lookup_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
-            upload_id,
         )
+        .and_then(|route| route.load_in_progress_multipart_upload(upload_id))
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5410,13 +5425,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload_for_listing(
+        ObjectMutationMetadataNodeClient::open_multipart_upload_lookup_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
-            upload_id,
         )
+        .and_then(|route| route.load_in_progress_multipart_upload_for_listing(upload_id))
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5495,13 +5511,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::lookup_multipart_upload_management(
+        ObjectMutationMetadataNodeClient::open_multipart_upload_lookup_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
-            upload_id,
         )
+        .and_then(|route| route.lookup_multipart_upload_management(upload_id))
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
