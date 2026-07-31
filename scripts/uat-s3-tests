@@ -260,7 +260,7 @@ if [[ "$smoke" == "pg-backfill-migration" ]]; then
     export ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS="${ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS:-100}"
     export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
     export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-10000}"
-    export ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS="${ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS:-200}"
+    export ARGMIN_SHARD_BACKFILL_CANDIDATE_SCAN_INTERVAL_MS="${ARGMIN_SHARD_BACKFILL_CANDIDATE_SCAN_INTERVAL_MS:-200}"
     pg_backfill_required_pg_count=$((repeat_count + pg_backfill_metadata_pg_slack))
     if ((pg_backfill_required_pg_count > ARGMIN_PG_COUNT)); then
         die "pg-backfill-migration --repeat requires ARGMIN_PG_COUNT >= $pg_backfill_required_pg_count"
@@ -285,7 +285,7 @@ if [[ "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-
     export ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS="${ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS:-100}"
     export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
     export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-10000}"
-    export ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS="${ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS:-200}"
+    export ARGMIN_METADATA_COMMAND_CHECKPOINT_SCAN_INTERVAL_MS="${ARGMIN_METADATA_COMMAND_CHECKPOINT_SCAN_INTERVAL_MS:-200}"
     if ((repeat_count > ARGMIN_PG_COUNT)); then
         die "$smoke --repeat requires ARGMIN_PG_COUNT >= repeat count"
     fi
@@ -300,7 +300,6 @@ if [[ "$smoke" == "cleanup-versioned-stress" ]]; then
     export ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS="${ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS:-100}"
     export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
     export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-10000}"
-    export ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS="${ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS:-200}"
 fi
 if [[ "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-full-restart" || "$smoke" == "pg-backfill-migration" ]]; then
     control_plane_storage_auth_credentials=""

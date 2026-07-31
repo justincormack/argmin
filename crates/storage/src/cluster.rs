@@ -159,7 +159,8 @@ const STREAM_SEGMENT_APPEND_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const METADATA_CONTENTION_BACKOFF_INITIAL: Duration = Duration::from_millis(1);
 const METADATA_CONTENTION_BACKOFF_MAX: Duration = Duration::from_millis(25);
 const PLACED_SEGMENT_SHARD_BACKFILL_CANDIDATE_SCAN_LIMIT: usize = 256;
-const METADATA_COMMAND_CHECKPOINT_RECORD_LIMIT: usize = 4;
+const PLACED_SEGMENT_SHARD_BACKFILL_PG_SCAN_LIMIT: usize = 8;
+pub(crate) const METADATA_COMMAND_CHECKPOINT_RECORD_LIMIT: usize = 4;
 const METADATA_COMMAND_CHECKPOINT_MIN_LOG_DISTANCE: u64 = 64;
 const METADATA_COMMAND_CHECKPOINT_FRAME_RISK_BYTES: usize = STORAGE_RPC_MAX_PAYLOAD_LEN * 3 / 4;
 
@@ -308,6 +309,12 @@ pub struct MetadataCommandCheckpointRecordSummary {
     pub compaction_failed: usize,
     pub failed: usize,
     pub limit_reached: bool,
+}
+
+/// Resume position for bounded routine metadata-command checkpoint scans.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MetadataCommandCheckpointScanCursor {
+    after_pg_id: Option<PgId>,
 }
 
 impl MetadataCommandCheckpointRecordSummary {
@@ -1277,6 +1284,8 @@ impl PlacedSegmentShardBackfillCandidateKey {
 /// Resume position for bounded placed-segment backfill candidate verification.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PlacedSegmentShardBackfillCandidateScanCursor {
+    after_pg_id: Option<PgId>,
+    active_pg_id: Option<PgId>,
     after: Option<PlacedSegmentShardBackfillCandidateKey>,
 }
 
@@ -10057,11 +10066,15 @@ impl StorageCluster {
         Ok(node.retained_shard_ack_client())
     }
 
+    #[cfg(test)]
     pub(crate) fn record_routine_metadata_command_checkpoints(
         &self,
     ) -> Result<MetadataCommandCheckpointRecordSummary, StoreError> {
+        let mut cursor = MetadataCommandCheckpointScanCursor::default();
         self.record_routine_metadata_command_checkpoints_with_limit(
+            &mut cursor,
             METADATA_COMMAND_CHECKPOINT_RECORD_LIMIT,
+            usize::MAX,
         )
     }
 
@@ -10119,20 +10132,40 @@ impl StorageCluster {
         Ok(summary)
     }
 
-    fn record_routine_metadata_command_checkpoints_with_limit(
+    pub(crate) fn record_routine_metadata_command_checkpoints_with_limit(
         &self,
-        limit: usize,
+        cursor: &mut MetadataCommandCheckpointScanCursor,
+        mutation_limit: usize,
+        pg_scan_limit: usize,
     ) -> Result<MetadataCommandCheckpointRecordSummary, StoreError> {
         let mut summary = MetadataCommandCheckpointRecordSummary::default();
-        if limit == 0 {
+        if mutation_limit == 0 || pg_scan_limit == 0 {
             return Ok(summary);
         }
 
-        for route in self.local_pg_routes() {
-            if summary.mutations() >= limit {
+        let mut routes: Vec<_> = self.local_pg_routes().collect();
+        routes.sort_by_key(|route| route.pg_id());
+        if routes.is_empty() {
+            cursor.after_pg_id = None;
+            return Ok(summary);
+        }
+        let start = cursor.after_pg_id.map_or(0, |after_pg_id| {
+            let next = routes.partition_point(|route| route.pg_id() <= after_pg_id);
+            if next == routes.len() {
+                0
+            } else {
+                next
+            }
+        });
+        let routes_to_scan = routes.len().min(pg_scan_limit);
+
+        for offset in 0..routes_to_scan {
+            if summary.mutations() >= mutation_limit {
                 summary.limit_reached = true;
                 break;
             }
+            let route = routes[(start + offset) % routes.len()];
+            cursor.after_pg_id = Some(route.pg_id());
             summary.scanned += 1;
             if route.state() != PgState::Active {
                 summary.skipped_inactive += 1;
@@ -10264,6 +10297,10 @@ impl StorageCluster {
                     }
                 }
             }
+        }
+
+        if routes_to_scan < routes.len() {
+            summary.limit_reached = true;
         }
 
         Ok(summary)
@@ -15946,6 +15983,7 @@ impl StorageCluster {
         self.enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
             cursor,
             PLACED_SEGMENT_SHARD_BACKFILL_CANDIDATE_SCAN_LIMIT,
+            PLACED_SEGMENT_SHARD_BACKFILL_PG_SCAN_LIMIT,
         )
     }
 
@@ -15958,6 +15996,7 @@ impl StorageCluster {
         self.enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
             &mut cursor,
             scan_limit,
+            usize::MAX,
         )
     }
 
@@ -15965,11 +16004,48 @@ impl StorageCluster {
         &self,
         cursor: &mut PlacedSegmentShardBackfillCandidateScanCursor,
         scan_limit: usize,
+        pg_scan_limit: usize,
     ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
         let mut summary = PlacedSegmentShardBackfillCandidateEnqueueSummary::default();
+        if scan_limit == 0 || pg_scan_limit == 0 {
+            return Ok(summary);
+        }
+
         let desired_epoch = self.operation_epoch();
+        let mut routes: Vec<_> = self.local_pg_routes().collect();
+        routes.sort_by_key(|route| route.pg_id());
+        if routes.is_empty() {
+            *cursor = PlacedSegmentShardBackfillCandidateScanCursor::default();
+            return Ok(summary);
+        }
+        let start = cursor
+            .active_pg_id
+            .and_then(|active_pg_id| {
+                routes
+                    .iter()
+                    .position(|route| route.pg_id() == active_pg_id)
+            })
+            .unwrap_or_else(|| {
+                cursor.after = None;
+                cursor.active_pg_id = None;
+                cursor.after_pg_id.map_or(0, |after_pg_id| {
+                    let next = routes.partition_point(|route| route.pg_id() <= after_pg_id);
+                    if next == routes.len() {
+                        0
+                    } else {
+                        next
+                    }
+                })
+            });
+        let routes_to_scan = routes.len().min(pg_scan_limit);
+        let batch_start_pg_id = routes[start].pg_id();
+        let mut verified_candidates = 0usize;
         let mut candidates = BTreeMap::new();
-        for route in self.local_pg_routes() {
+        let mut last_scanned_pg_id = None;
+
+        for offset in 0..routes_to_scan {
+            let route = routes[(start + offset) % routes.len()];
+            last_scanned_pg_id = Some(route.pg_id());
             if route.state() != PgState::Active {
                 continue;
             }
@@ -16015,15 +16091,19 @@ impl StorageCluster {
         }
 
         let candidates: Vec<_> = candidates.into_iter().collect();
-        let start = cursor.after.as_ref().map_or(0, |after| {
-            candidates.partition_point(|(candidate, _)| candidate <= after)
-        });
-        let mut verified_candidates = 0usize;
-        for offset in 0..candidates.len() {
-            let (candidate_key, (request, source_epoch)) =
-                candidates[(start + offset) % candidates.len()];
+        let candidate_start = if cursor.active_pg_id == Some(batch_start_pg_id) {
+            cursor.after.as_ref().map_or(0, |after| {
+                candidates.partition_point(|(candidate, _)| candidate <= after)
+            })
+        } else {
+            0
+        };
+        for (candidate_key, (request, source_epoch)) in candidates.into_iter().skip(candidate_start)
+        {
             summary.scanned += 1;
             if source_epoch == desired_epoch {
+                cursor.active_pg_id = Some(batch_start_pg_id);
+                cursor.after = Some(candidate_key);
                 summary.current_epoch += 1;
                 continue;
             }
@@ -16034,6 +16114,8 @@ impl StorageCluster {
             };
             match self.placed_segment_shard_backfill_exists(&work_item) {
                 Ok(true) => {
+                    cursor.active_pg_id = Some(batch_start_pg_id);
+                    cursor.after = Some(candidate_key);
                     summary.already_queued += 1;
                     continue;
                 }
@@ -16044,10 +16126,12 @@ impl StorageCluster {
                 }
             }
             if verified_candidates >= scan_limit {
+                cursor.active_pg_id = Some(batch_start_pg_id);
                 summary.limit_reached = true;
                 return Ok(summary);
             }
             verified_candidates += 1;
+            cursor.active_pg_id = Some(batch_start_pg_id);
             cursor.after = Some(candidate_key);
             let pg_id = PgId::new(request.data_pg_id);
             let source_route = match self.reconstructed_pg_route_at_epoch(pg_id, source_epoch) {
@@ -16110,6 +16194,13 @@ impl StorageCluster {
                 continue;
             }
             summary.enqueued += 1;
+        }
+
+        cursor.active_pg_id = None;
+        cursor.after = None;
+        cursor.after_pg_id = last_scanned_pg_id;
+        if routes_to_scan < routes.len() {
+            summary.limit_reached = true;
         }
         Ok(summary)
     }

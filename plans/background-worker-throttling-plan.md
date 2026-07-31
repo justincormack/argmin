@@ -19,17 +19,22 @@ so the right near-term action is to track the work as a standalone plan.
 
 ## Status
 
-Deferred.
+Partially implemented.
 
-The current production behavior is acceptable for now because:
+The first availability slice now separates the audit-only shard scan from
+backfill discovery and routine metadata-command checkpoint maintenance:
 
-- the shard scavenger is audit-only
-- the scan no longer holds the per-PG metadata mutex during filesystem
-  enumeration
-- no correctness path depends on completing a scavenger pass within a short
-  deadline
+- audit-only scans retain their conservative production interval and do not run
+  immediately at worker startup
+- backfill discovery and metadata-command checkpoint scans retain canonical PG
+  cursors across runtime-map publication and inspect at most eight PGs per tick
+- the accelerated backfill UAT cadence applies only to bounded candidate
+  discovery, rather than also accelerating full shard audits and checkpoint
+  scans
 
-The remaining issue is resource competition, not S3-visible correctness.
+Full file-tree audit cursors, time/item budgets, static manifest controls, and
+the complete observability model below remain pending. The remaining issue is
+resource competition, not S3-visible correctness.
 
 ## Goals
 
@@ -203,6 +208,11 @@ Keep the scope narrow:
 Teach the shard scavenger to scan incrementally using an in-memory cursor and
 time/item budgets.
 
+Status: in progress. PG-level incremental cursors are implemented for backfill
+candidate discovery and routine metadata-command checkpoint maintenance. The
+full file-tree audit still needs the node/prefix/file cursor and budgets
+described above.
+
 Regression coverage:
 
 - budget-limited scan resumes on a later tick
@@ -237,4 +247,3 @@ Do this worker-by-worker because the correctness and liveness constraints differ
 - Do we need IO priority controls in addition to in-process budgets?
 - What control-plane API should own background worker settings?
 - Should per-worker budgets be global per process, per storage node, or per PG?
-

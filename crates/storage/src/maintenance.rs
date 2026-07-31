@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use ring::rand::SecureRandom as _;
 
 use crate::cluster::{
-    DurablePlacedSegmentShardRepairEnqueueSummary,
+    DurablePlacedSegmentShardRepairEnqueueSummary, MetadataCommandCheckpointScanCursor,
     PlacedSegmentShardBackfillCandidateEnqueueSummary,
     PlacedSegmentShardBackfillCandidateScanCursor, StorageClusterRouteAdmissionDomain,
     StorageClusterRouteHandle, StreamSessionSweepSummary,
@@ -38,6 +38,9 @@ const SHARD_REPAIR_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 const SHARD_REPAIR_CLAIM_LEASE_MILLIS: u64 = 30_000;
 const SHARD_REPAIR_ERROR_BACKOFF_MILLIS: u64 = 1_000;
 const SHARD_BACKFILL_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const SHARD_BACKFILL_CANDIDATE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const METADATA_COMMAND_CHECKPOINT_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+const METADATA_COMMAND_CHECKPOINT_PG_SCAN_LIMIT: usize = 8;
 const SHARD_BACKFILL_CLAIM_LEASE_MILLIS: u64 = 30_000;
 const SHARD_BACKFILL_ERROR_BACKOFF_MILLIS: u64 = 1_000;
 const BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT: usize = 1;
@@ -569,6 +572,7 @@ impl StorageBackfillCandidateScanner {
             .enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
                 &mut cursor,
                 scan_limit,
+                usize::MAX,
             )
     }
 }
@@ -588,6 +592,34 @@ fn emit_scan_summary(summary: PlacedSegmentShardBackfillCandidateEnqueueSummary)
             limit_reached: summary.limit_reached,
         },
     );
+}
+
+struct StorageMetadataCheckpointScanner {
+    storage_handle: StorageClusterRouteHandle,
+    cursor: Mutex<MetadataCommandCheckpointScanCursor>,
+}
+
+impl StorageMetadataCheckpointScanner {
+    fn new(storage_handle: StorageClusterRouteHandle) -> Self {
+        Self {
+            storage_handle,
+            cursor: Mutex::new(MetadataCommandCheckpointScanCursor::default()),
+        }
+    }
+
+    fn scan(&self) -> Result<crate::cluster::MetadataCommandCheckpointRecordSummary, StoreError> {
+        let mut cursor = self
+            .cursor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.storage_handle
+            .current()
+            .record_routine_metadata_command_checkpoints_with_limit(
+                &mut cursor,
+                crate::cluster::METADATA_COMMAND_CHECKPOINT_RECORD_LIMIT,
+                METADATA_COMMAND_CHECKPOINT_PG_SCAN_LIMIT,
+            )
+    }
 }
 
 /// Opaque storage-owned durable shard-backfill execution worker.
@@ -1115,16 +1147,30 @@ impl StorageShardScavengerSweeper {
         let handle = std::thread::Builder::new()
             .name("argmin-shard-scavenger".to_string())
             .spawn(move || {
-                let sweep_interval = shard_scavenger_sweep_interval();
-                let mut next_sweep = Instant::now();
+                let audit_interval = shard_scavenger_sweep_interval();
+                let candidate_interval = shard_backfill_candidate_scan_interval();
+                let checkpoint_interval = metadata_command_checkpoint_scan_interval();
+                let mut next_audit = Instant::now() + audit_interval;
+                let mut next_candidate_scan = Instant::now();
+                let mut next_checkpoint_scan = Instant::now();
                 let candidate_scanner =
                     StorageBackfillCandidateScanner::new(storage_handle.clone());
+                let checkpoint_scanner =
+                    StorageMetadataCheckpointScanner::new(storage_handle.clone());
                 while !stop.load(Ordering::SeqCst) {
                     admission.observe_pressure();
                     let now = Instant::now();
-                    if now >= next_sweep {
-                        run_shard_scavenger_sweep(&storage_handle, &admission, &candidate_scanner);
-                        next_sweep = Instant::now() + sweep_interval;
+                    if now >= next_audit {
+                        run_shard_scavenger_audit(&storage_handle, &admission);
+                        next_audit = Instant::now() + audit_interval;
+                    }
+                    if now >= next_candidate_scan {
+                        run_backfill_candidate_scan(&admission, &candidate_scanner);
+                        next_candidate_scan = Instant::now() + candidate_interval;
+                    }
+                    if now >= next_checkpoint_scan {
+                        run_metadata_checkpoint_scan(&admission, &checkpoint_scanner);
+                        next_checkpoint_scan = Instant::now() + checkpoint_interval;
                     }
                     if stop.load(Ordering::SeqCst) {
                         break;
@@ -1133,7 +1179,10 @@ impl StorageShardScavengerSweeper {
                     if *stop_guard {
                         break;
                     }
-                    let wait_for = next_sweep
+                    let next_work = next_audit
+                        .min(next_candidate_scan)
+                        .min(next_checkpoint_scan);
+                    let wait_for = next_work
                         .checked_duration_since(Instant::now())
                         .unwrap_or_default()
                         .min(BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL);
@@ -1198,19 +1247,39 @@ impl Drop for StorageShardScavengerSweeper {
 }
 
 fn shard_scavenger_sweep_interval() -> Duration {
-    match std::env::var("ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS") {
+    maintenance_interval_from_env(
+        "ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS",
+        SHARD_SCAVENGER_SWEEP_INTERVAL,
+    )
+}
+
+fn shard_backfill_candidate_scan_interval() -> Duration {
+    maintenance_interval_from_env(
+        "ARGMIN_SHARD_BACKFILL_CANDIDATE_SCAN_INTERVAL_MS",
+        SHARD_BACKFILL_CANDIDATE_SCAN_INTERVAL,
+    )
+}
+
+fn metadata_command_checkpoint_scan_interval() -> Duration {
+    maintenance_interval_from_env(
+        "ARGMIN_METADATA_COMMAND_CHECKPOINT_SCAN_INTERVAL_MS",
+        METADATA_COMMAND_CHECKPOINT_SCAN_INTERVAL,
+    )
+}
+
+fn maintenance_interval_from_env(name: &str, default: Duration) -> Duration {
+    match std::env::var(name) {
         Ok(value) => match value.parse::<u64>() {
-            Ok(0) | Err(_) => SHARD_SCAVENGER_SWEEP_INTERVAL,
+            Ok(0) | Err(_) => default,
             Ok(ms) => Duration::from_millis(ms),
         },
-        Err(_) => SHARD_SCAVENGER_SWEEP_INTERVAL,
+        Err(_) => default,
     }
 }
 
-fn run_shard_scavenger_sweep(
+fn run_shard_scavenger_audit(
     storage_handle: &StorageClusterRouteHandle,
     admission: &Arc<StorageMaintenanceAdmission>,
-    candidate_scanner: &StorageBackfillCandidateScanner,
 ) {
     let storage_cluster = storage_handle.current();
     if let Some(_permit) = admission.try_opportunistic_scan() {
@@ -1222,11 +1291,23 @@ fn run_shard_scavenger_sweep(
             );
         }
     }
+}
+
+fn run_backfill_candidate_scan(
+    admission: &Arc<StorageMaintenanceAdmission>,
+    candidate_scanner: &StorageBackfillCandidateScanner,
+) {
     if let Some(_permit) = admission.try_backfill_candidate_scan() {
         candidate_scanner.scan();
     }
+}
+
+fn run_metadata_checkpoint_scan(
+    admission: &Arc<StorageMaintenanceAdmission>,
+    checkpoint_scanner: &StorageMetadataCheckpointScanner,
+) {
     if let Some(_permit) = admission.try_routine_metadata_checkpoint() {
-        match storage_cluster.record_routine_metadata_command_checkpoints() {
+        match checkpoint_scanner.scan() {
             Ok(summary) => {
                 let _ = observability::emit_metadata_command_checkpoint_record_scan(
                     TRACE_TARGET,

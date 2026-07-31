@@ -3325,6 +3325,53 @@ fn shard_scavenger_backfill_candidate_scan_limit_skips_already_queued_candidates
 }
 
 #[test]
+fn shard_scavenger_backfill_candidate_scan_bounds_pg_enumeration() {
+    let fixture = backfill_route_fixture(b"bounded-backfill-pg-scan");
+    let bucket =
+        crate::BucketName::try_from("bounded-backfill-pg-scan-bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("bounded-backfill-pg-scan-key".to_string()).unwrap();
+    record_backfill_scavenger_object_segment_reference_on_pg(
+        &fixture.desired_cluster,
+        PgId::new(1),
+        fixture.source_route.cluster_epoch(),
+        fixture.req,
+        bucket,
+        key,
+    );
+
+    let mut cursor = crate::cluster::PlacedSegmentShardBackfillCandidateScanCursor::default();
+    let first_scan = fixture
+        .desired_cluster
+        .enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
+            &mut cursor,
+            256,
+            1,
+        )
+        .unwrap();
+    assert_eq!(first_scan.scanned, 0);
+    assert!(first_scan.limit_reached);
+    assert_eq!(cursor.after_pg_id, Some(PgId::new(0)));
+
+    let second_scan = fixture
+        .desired_cluster
+        .enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
+            &mut cursor,
+            256,
+            1,
+        )
+        .unwrap();
+    assert_eq!(second_scan.enqueued, 1);
+    assert!(fixture
+        .desired_cluster
+        .placed_segment_shard_backfill_exists(&crate::PlacedSegmentShardBackfillWorkItem {
+            request: fixture.req,
+            source_cluster_epoch: fixture.source_route.cluster_epoch(),
+            desired_cluster_epoch: fixture.desired_route.cluster_epoch(),
+        })
+        .unwrap());
+}
+
+#[test]
 fn shard_scavenger_backfill_candidate_scan_cursor_advances_past_complete_candidates() {
     let fixture = backfill_route_fixture(b"phase-eleven-scanner-backfill-cursor-first");
     fixture
@@ -3392,6 +3439,7 @@ fn shard_scavenger_backfill_candidate_scan_cursor_advances_past_complete_candida
         .enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
             &mut cursor,
             1,
+            usize::MAX,
         )
         .unwrap();
     assert_eq!(first_scan.already_complete, 1);
@@ -3403,6 +3451,7 @@ fn shard_scavenger_backfill_candidate_scan_cursor_advances_past_complete_candida
         .enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
             &mut cursor,
             1,
+            usize::MAX,
         )
         .unwrap();
     assert_eq!(second_scan.enqueued, 1);

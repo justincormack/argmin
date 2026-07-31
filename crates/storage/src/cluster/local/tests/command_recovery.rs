@@ -5397,6 +5397,29 @@ fn routine_metadata_checkpoint_skips_active_empty_pg() {
 }
 
 #[test]
+fn routine_metadata_checkpoint_scan_is_pg_bounded_and_canonical() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[3, 1, 2], ec_shape).unwrap();
+    for pg_id in [1, 2, 3] {
+        set_route_primary(&mut map, pg_id, NodeId::new(0));
+    }
+
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
+    let mut cursor = crate::cluster::MetadataCommandCheckpointScanCursor::default();
+    for expected_pg_id in [1, 2, 3, 1] {
+        let summary = cluster
+            .record_routine_metadata_command_checkpoints_with_limit(&mut cursor, 4, 1)
+            .unwrap();
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.skipped_empty, 1);
+        assert!(summary.limit_reached);
+        assert_eq!(cursor.after_pg_id, Some(PgId::new(expected_pg_id)));
+    }
+}
+
+#[test]
 fn metadata_command_checkpoint_catalogue_retains_newest_candidates_per_epoch() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
