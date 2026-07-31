@@ -37,9 +37,9 @@ use super::{HttpFrontend, HttpRequestAdmission, S3HyperBody};
 use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
-#[cfg(any(test, feature = "local-debug-endpoints"))]
-use storage::PgId;
 use storage::{BucketName, SessionId};
+#[cfg(any(test, feature = "local-debug-endpoints"))]
+use storage::{ObjectKey, ObjectReadSnapshot, ObjectReadSnapshotMode, PgId, StoredObject};
 
 const TRACE_TARGET: &str = "server_http";
 const MAX_STREAMING_POST_PART_HEADER_BYTES: usize = 8 * 1024;
@@ -1322,6 +1322,51 @@ fn local_debug_response(
                 Err(error) => Some(local_debug_text_response(409, format!("{error:?}\n"))),
             }
         }
+        (&http::Method::GET, path)
+            if path.starts_with("/__argmin/debug/object-payload-placement/") =>
+        {
+            let raw_object = path.trim_start_matches("/__argmin/debug/object-payload-placement/");
+            let Some((raw_bucket, raw_key)) = raw_object.split_once('/') else {
+                return Some(local_debug_text_response(
+                    400,
+                    "invalid object path\n".to_string(),
+                ));
+            };
+            let bucket = percent_decode_strict(raw_bucket)
+                .ok()
+                .and_then(|bucket| BucketName::try_from(bucket).ok());
+            let key = percent_decode_strict(raw_key)
+                .ok()
+                .and_then(|key| ObjectKey::try_from(key).ok());
+            let (Some(bucket), Some(key)) = (bucket, key) else {
+                return Some(local_debug_text_response(
+                    400,
+                    "invalid object path\n".to_string(),
+                ));
+            };
+            let storage = state
+                .pool
+                .first()
+                .expect("server has at least one frontend")
+                .coordinator
+                .storage_node_for_request();
+            match storage.load_object_read_snapshot_if(
+                &bucket,
+                &key,
+                None,
+                ObjectReadSnapshotMode::StandardSegments,
+                |_| Ok::<(), Infallible>(()),
+            ) {
+                Ok(Ok(outcome)) => {
+                    match local_debug_object_payload_placement_body(&outcome.snapshot) {
+                        Ok(body) => Some(local_debug_text_response(200, body)),
+                        Err(error) => Some(local_debug_text_response(409, format!("{error}\n"))),
+                    }
+                }
+                Ok(Err(never)) => match never {},
+                Err(error) => Some(local_debug_text_response(409, format!("{error}\n"))),
+            }
+        }
         (&http::Method::POST, path)
             if path.starts_with("/__argmin/debug/metadata-checkpoint/record/") =>
         {
@@ -1409,6 +1454,37 @@ fn local_debug_text_response(status_code: u16, body: String) -> S3Response {
         error_diagnostic: None,
         include_wire_ids: true,
     }
+}
+
+#[cfg(any(test, feature = "local-debug-endpoints"))]
+fn local_debug_object_payload_placement_body(
+    snapshot: &ObjectReadSnapshot,
+) -> Result<String, &'static str> {
+    use std::fmt::Write as _;
+
+    let StoredObject::Live(live) = &snapshot.stored else {
+        return Err("current object is a delete marker");
+    };
+    if snapshot.object_segments.is_empty() {
+        return Err("current object has no standard payload segments");
+    }
+
+    let mut body = String::new();
+    writeln!(body, "generation_id={}", live.generation_id.get())
+        .expect("writing to a String cannot fail");
+    writeln!(body, "segment_count={}", snapshot.object_segments.len())
+        .expect("writing to a String cannot fail");
+    for segment in &snapshot.object_segments {
+        writeln!(
+            body,
+            "segment_index={} data_pg_id={} placement_cluster_epoch={}",
+            segment.segment_index,
+            segment.data_pg_id,
+            segment.placement_cluster_epoch.get()
+        )
+        .expect("writing to a String cannot fail");
+    }
+    Ok(body)
 }
 
 #[cfg(any(test, feature = "local-debug-endpoints"))]
@@ -6802,6 +6878,76 @@ Connection: close\r\n\r\n",
         );
         assert!(response.contains("attempt_outcome=absent"), "{response}");
         assert!(response.contains("pg_id="), "{response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_debug_object_payload_placement_reports_committed_segment() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "debug-placement-bucket");
+        put_test_object(
+            &frontend,
+            "debug-placement-bucket",
+            "nested/key",
+            b"payload",
+        );
+        let bucket = BucketName::try_from("debug-placement-bucket".to_string()).unwrap();
+        let key = ObjectKey::try_from("nested/key".to_string()).unwrap();
+        let expected = frontend
+            .coordinator
+            .storage_node_for_request()
+            .load_object_read_snapshot_if(
+                &bucket,
+                &key,
+                None,
+                ObjectReadSnapshotMode::StandardSegments,
+                |_| Ok::<(), Infallible>(()),
+            )
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        let StoredObject::Live(expected_live) = expected.stored else {
+            panic!("test object should be live");
+        };
+        assert_eq!(expected.object_segments.len(), 1);
+        let expected_segment = &expected.object_segments[0];
+        let config = ServeConfig {
+            local_debug_endpoint: true,
+            ..ServeConfig::default()
+        };
+        let (addr, _guard) = start_test_server_with_config(frontend, config, 0).await;
+
+        let mut stream = StdTcpStream::connect(&addr).unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "GET /__argmin/debug/object-payload-placement/debug-placement-bucket/nested%2Fkey HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let response = read_http_response(&mut stream, Duration::from_secs(3));
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.contains(&format!(
+                "generation_id={}\n",
+                expected_live.generation_id.get()
+            )),
+            "{response}"
+        );
+        assert!(response.contains("segment_count=1\n"), "{response}");
+        assert!(
+            response.contains(&format!(
+                "segment_index=0 data_pg_id={} placement_cluster_epoch={}\n",
+                expected_segment.data_pg_id,
+                expected_segment.placement_cluster_epoch.get()
+            )),
+            "{response}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

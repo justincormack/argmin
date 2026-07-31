@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, io::Write, path::Path};
+use std::{collections::BTreeSet, io::Write, path::Path, time::Duration};
 
 use s3_tests::{
     aws_sdk_s3::{
@@ -8,7 +8,7 @@ use s3_tests::{
     },
     build_client_with_ca, cleanup_versioned_bucket, delete_bucket_retrying_operation_aborted,
     delete_object_retrying_operation_aborted, get_object_body_retrying_operation_aborted,
-    put_object_retrying_operation_aborted, retrying_operation_aborted_result, unique_bucket,
+    put_object_retrying_operation_aborted, retrying_operation_aborted_result, unique_bucket, Agent,
     SendRetryingOperationAborted, RT,
 };
 use storage::{BucketName, GenerationId, ObjectKey, PgTopology};
@@ -68,6 +68,91 @@ fn client_from_env() -> s3_tests::aws_sdk_s3::Client {
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CommittedObjectPlacement {
+    generation_id: u64,
+    data_pg_id: u32,
+}
+
+struct ObjectPlacementInspector {
+    endpoint: String,
+    agent: Agent,
+}
+
+impl ObjectPlacementInspector {
+    fn from_env() -> Self {
+        let endpoint = std::env::var("S3_TEST_ENDPOINT").expect("S3_TEST_ENDPOINT is required");
+        let tls_ca_pem = std::env::var("S3_TEST_TLS_CA_CERT_PATH").ok().map(|path| {
+            std::fs::read(&path).unwrap_or_else(|error| {
+                panic!("read S3_TEST_TLS_CA_CERT_PATH {path}: {error}");
+            })
+        });
+        let agent = Agent::new(&endpoint, tls_ca_pem.as_deref(), Duration::from_secs(15));
+        Self { endpoint, agent }
+    }
+
+    fn committed_object_placement(&self, bucket: &str, key: &str) -> CommittedObjectPlacement {
+        let encoded_bucket = auth::canonical::uri_encode_path(bucket);
+        let encoded_key = auth::canonical::uri_encode_path(key);
+        let uri = format!(
+            "{}/__argmin/debug/object-payload-placement/{encoded_bucket}/{encoded_key}",
+            self.endpoint.trim_end_matches('/')
+        );
+        let mut response = self.agent.get(&uri).call().unwrap_or_else(|error| {
+            panic!("inspect committed placement for {bucket}/{key}: {error}")
+        });
+        let status = response.status();
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .unwrap_or_else(|error| {
+                panic!("read committed placement response for {bucket}/{key}: {error}")
+            });
+        assert_eq!(
+            status.as_u16(),
+            200,
+            "inspect committed placement for {bucket}/{key}: status={status} body={body:?}"
+        );
+        parse_committed_object_placement(&body).unwrap_or_else(|error| {
+            panic!("parse committed placement for {bucket}/{key}: {error}; body={body:?}")
+        })
+    }
+}
+
+fn parse_committed_object_placement(body: &str) -> Result<CommittedObjectPlacement, String> {
+    let generation_id = body
+        .lines()
+        .find_map(|line| line.strip_prefix("generation_id="))
+        .ok_or_else(|| "missing generation_id".to_string())?
+        .parse::<u64>()
+        .map_err(|error| format!("invalid generation_id: {error}"))?;
+    let segment_count = body
+        .lines()
+        .find_map(|line| line.strip_prefix("segment_count="))
+        .ok_or_else(|| "missing segment_count".to_string())?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid segment_count: {error}"))?;
+    if segment_count != 1 {
+        return Err(format!(
+            "UAT placement requires one standard segment, got {segment_count}"
+        ));
+    }
+    let segment = body
+        .lines()
+        .find(|line| line.starts_with("segment_index=0 "))
+        .ok_or_else(|| "missing segment_index=0".to_string())?;
+    let data_pg_id = segment
+        .split_ascii_whitespace()
+        .find_map(|field| field.strip_prefix("data_pg_id="))
+        .ok_or_else(|| "missing segment-0 data_pg_id".to_string())?
+        .parse::<u32>()
+        .map_err(|error| format!("invalid data_pg_id: {error}"))?;
+    Ok(CommittedObjectPlacement {
+        generation_id,
+        data_pg_id,
+    })
+}
+
 async fn create_bucket(client: &s3_tests::aws_sdk_s3::Client, bucket: &str) {
     retrying_operation_aborted_result(|| {
         let request = client.create_bucket().bucket(bucket);
@@ -93,6 +178,79 @@ async fn enable_bucket_versioning(client: &s3_tests::aws_sdk_s3::Client, bucket:
 
 async fn put_object(client: &s3_tests::aws_sdk_s3::Client, bucket: &str, key: &str, body: Vec<u8>) {
     put_object_retrying_operation_aborted(client, bucket, key, body).await;
+}
+
+fn committed_data_pg_satisfies_request(
+    topology: &PgTopology,
+    bucket: &str,
+    key: &str,
+    data_pg_id: u32,
+    target_data_pg: Option<u32>,
+) -> bool {
+    if target_data_pg.is_some_and(|target| target != data_pg_id) {
+        return false;
+    }
+    let bucket = BucketName::try_from(bucket.to_string()).expect("UAT bucket must be valid");
+    let key = ObjectKey::try_from(key.to_string()).expect("UAT key must be valid");
+    data_pg_id != topology.bucket_pg_for(&bucket)
+        && data_pg_id != topology.object_pg_for(&bucket, &key)
+}
+
+async fn put_object_with_committed_data_pg(
+    client: &s3_tests::aws_sdk_s3::Client,
+    placement_inspector: &ObjectPlacementInspector,
+    bucket: &str,
+    key_prefix: &str,
+    body: &[u8],
+    target_data_pg: Option<u32>,
+    excluded_metadata_pgs: &BTreeSet<u32>,
+) -> (String, u32) {
+    const MAX_COMMITTED_PLACEMENT_ATTEMPTS: u32 = 32;
+
+    let topology = pg_topology_from_env();
+    for attempt in 0..MAX_COMMITTED_PLACEMENT_ATTEMPTS {
+        let candidate_prefix = if attempt == 0 {
+            key_prefix.to_string()
+        } else {
+            format!("{key_prefix}-placement-attempt-{attempt}")
+        };
+        let (key, predicted_data_pg) = choose_key_with_distinct_data_pg(
+            bucket,
+            &candidate_prefix,
+            target_data_pg,
+            excluded_metadata_pgs,
+        );
+        put_object(client, bucket, &key, body.to_vec()).await;
+        let committed = tokio::task::block_in_place(|| {
+            placement_inspector.committed_object_placement(bucket, &key)
+        });
+        if committed_data_pg_satisfies_request(
+            &topology,
+            bucket,
+            &key,
+            committed.data_pg_id,
+            target_data_pg,
+        ) {
+            eprintln!(
+                "committed UAT object placement bucket={bucket} key={key} generation={} data_pg={} predicted_data_pg={predicted_data_pg}",
+                committed.generation_id, committed.data_pg_id
+            );
+            return (key, committed.data_pg_id);
+        }
+
+        eprintln!(
+            "discarding UAT placement candidate bucket={bucket} key={key} generation={} committed_data_pg={} predicted_data_pg={} target_data_pg={target_data_pg:?}",
+            committed.generation_id, committed.data_pg_id, predicted_data_pg
+        );
+        delete_object_retrying_operation_aborted(client, bucket, &key)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("delete rejected UAT placement candidate {bucket}/{key}: {error:?}")
+            });
+    }
+    panic!(
+        "could not commit UAT object with requested data PG after {MAX_COMMITTED_PLACEMENT_ATTEMPTS} attempts"
+    );
 }
 
 async fn get_object_body(
@@ -557,8 +715,9 @@ fn main() {
             }
             run(async {
                 let client = client_from_env();
+                let placement_inspector = ObjectPlacementInspector::from_env();
                 let versioned = command == "create-versioned-put-distinct-data-pg";
-                let (bucket, key, data_pg) = if target_data_pg.is_some() {
+                let bucket = if target_data_pg.is_some() {
                     let topology = pg_topology_from_env();
                     let pg_count = topology.pg_count();
                     let eligible_metadata_pg_count = pg_count.saturating_sub(
@@ -573,7 +732,7 @@ fn main() {
                     );
                     let bucket_search_limit =
                         distinct_data_pg_bucket_search_limit(pg_count, eligible_metadata_pg_count);
-                    let (bucket, key, data_pg) = (0..bucket_search_limit)
+                    (0..bucket_search_limit)
                         .find_map(|_| {
                             let bucket = unique_bucket();
                             find_key_with_distinct_data_pg(
@@ -582,34 +741,31 @@ fn main() {
                                 target_data_pg,
                                 &excluded_metadata_pgs,
                             )
-                            .map(|(key, data_pg)| (bucket, key, data_pg))
+                            .map(|_| bucket)
                         })
                         .unwrap_or_else(|| {
                             panic!(
                                 "could not find UAT bucket/key for target data PG {target_data_pg:?}"
                             )
-                        });
-                    create_bucket(&client, &bucket).await;
-                    if versioned {
-                        enable_bucket_versioning(&client, &bucket).await;
-                    }
-                    (bucket, key, data_pg)
+                        })
                 } else {
-                    let bucket = unique_bucket();
-                    create_bucket(&client, &bucket).await;
-                    if versioned {
-                        enable_bucket_versioning(&client, &bucket).await;
-                    }
-                    let (key, data_pg) = choose_key_with_distinct_data_pg(
-                        &bucket,
-                        &key_prefix,
-                        None,
-                        &excluded_metadata_pgs,
-                    );
-                    (bucket, key, data_pg)
+                    unique_bucket()
                 };
+                create_bucket(&client, &bucket).await;
+                if versioned {
+                    enable_bucket_versioning(&client, &bucket).await;
+                }
                 let body = read_body(Path::new(&body_file));
-                put_object(&client, &bucket, &key, body).await;
+                let (key, data_pg) = put_object_with_committed_data_pg(
+                    &client,
+                    &placement_inspector,
+                    &bucket,
+                    &key_prefix,
+                    &body,
+                    target_data_pg,
+                    &excluded_metadata_pgs,
+                )
+                .await;
                 std::fs::write(&bucket_file, format!("{bucket}\n")).unwrap_or_else(|error| {
                     panic!("write bucket file {:?}: {error}", bucket_file);
                 });
@@ -699,16 +855,20 @@ fn main() {
             }
             run(async {
                 let client = client_from_env();
+                let placement_inspector = ObjectPlacementInspector::from_env();
                 let bucket = read_bucket(Path::new(&bucket_file));
-                let (key, actual_data_pg) = choose_key_with_distinct_data_pg(
+                let body = read_body(Path::new(&body_file));
+                let (key, actual_data_pg) = put_object_with_committed_data_pg(
+                    &client,
+                    &placement_inspector,
                     &bucket,
                     &key_prefix,
+                    &body,
                     Some(data_pg),
                     &excluded_metadata_pgs,
-                );
+                )
+                .await;
                 assert_eq!(actual_data_pg, data_pg);
-                let body = read_body(Path::new(&body_file));
-                put_object(&client, &bucket, &key, body).await;
                 std::fs::write(&key_file, format!("{key}\n")).unwrap_or_else(|error| {
                     panic!("write key file {:?}: {error}", key_file);
                 });
@@ -1033,6 +1193,77 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_placement_parser_requires_one_standard_segment() {
+        let parsed = parse_committed_object_placement(
+            "generation_id=2\nsegment_count=1\nsegment_index=0 data_pg_id=12 placement_cluster_epoch=7\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            CommittedObjectPlacement {
+                generation_id: 2,
+                data_pg_id: 12,
+            }
+        );
+        assert!(parse_committed_object_placement(
+            "generation_id=2\nsegment_count=2\nsegment_index=0 data_pg_id=12 placement_cluster_epoch=7\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn committed_placement_rejects_generation_prediction_drift() {
+        let topology = PgTopology::new(&(0..32).collect::<Vec<_>>()).unwrap();
+        let (bucket, key, generation_one_pg, generation_two_pg) = (0..100u32)
+            .find_map(|bucket_suffix| {
+                let bucket = format!("uat-placement-{bucket_suffix}");
+                let bucket_name = BucketName::try_from(bucket.clone()).unwrap();
+                (0..1_000u32).find_map(|key_suffix| {
+                    let key = format!("object-{key_suffix}");
+                    let object_key = ObjectKey::try_from(key.clone()).unwrap();
+                    let object_pg = topology.object_pg_for(&bucket_name, &object_key);
+                    let bucket_pg = topology.bucket_pg_for(&bucket_name);
+                    let generation_one_pg = topology
+                        .object_generation_segment_data_pg(
+                            &bucket_name,
+                            &object_key,
+                            GenerationId::new(1).unwrap(),
+                            0,
+                        )
+                        .get();
+                    let generation_two_pg = topology
+                        .object_generation_segment_data_pg(
+                            &bucket_name,
+                            &object_key,
+                            GenerationId::new(2).unwrap(),
+                            0,
+                        )
+                        .get();
+                    (generation_one_pg != generation_two_pg
+                        && generation_one_pg != bucket_pg
+                        && generation_one_pg != object_pg)
+                        .then_some((bucket.clone(), key, generation_one_pg, generation_two_pg))
+                })
+            })
+            .expect("test topology should contain generation-dependent placement");
+
+        assert!(committed_data_pg_satisfies_request(
+            &topology,
+            &bucket,
+            &key,
+            generation_one_pg,
+            Some(generation_one_pg),
+        ));
+        assert!(!committed_data_pg_satisfies_request(
+            &topology,
+            &bucket,
+            &key,
+            generation_two_pg,
+            Some(generation_one_pg),
+        ));
+    }
 
     #[test]
     fn distinct_data_pg_search_scales_for_large_excluded_metadata_set() {
