@@ -2158,55 +2158,55 @@ pub struct SegmentStoredBytesRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PlacedSegmentShardRepairWorkItem {
-    pub request: SegmentStoredBytesRequest,
-    pub shard_index: ShardIndex,
+pub(crate) struct PlacedSegmentShardRepairWorkItem {
+    pub(crate) request: SegmentStoredBytesRequest,
+    pub(crate) shard_index: ShardIndex,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedSegmentShardRepairRecord {
-    pub work_item: PlacedSegmentShardRepairWorkItem,
-    pub first_seen_at: u64,
-    pub last_seen_at: u64,
-    pub observation_count: u64,
-    pub last_error: Option<String>,
+pub(crate) struct PlacedSegmentShardRepairRecord {
+    pub(crate) work_item: PlacedSegmentShardRepairWorkItem,
+    pub(crate) first_seen_at: u64,
+    pub(crate) last_seen_at: u64,
+    pub(crate) observation_count: u64,
+    pub(crate) last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedSegmentShardRepairClaimRecord {
-    pub work_item: PlacedSegmentShardRepairWorkItem,
-    pub claim_id: String,
-    pub owner_token: String,
-    pub cluster_epoch: ClusterEpoch,
-    pub claimed_at: u64,
-    pub lease_deadline: Option<u64>,
-    pub attempt_count: u64,
-    pub last_error: Option<String>,
+pub(crate) struct PlacedSegmentShardRepairClaimRecord {
+    pub(crate) work_item: PlacedSegmentShardRepairWorkItem,
+    pub(crate) claim_id: String,
+    pub(crate) owner_token: String,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) claimed_at: u64,
+    pub(crate) lease_deadline: Option<u64>,
+    pub(crate) attempt_count: u64,
+    pub(crate) last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedSegmentShardRepairClaimAcquireParams {
-    pub claim_id: String,
-    pub owner_token: String,
-    pub claimed_at: u64,
-    pub lease_deadline: u64,
-    pub now: u64,
+pub(crate) struct PlacedSegmentShardRepairClaimAcquireParams {
+    pub(crate) claim_id: String,
+    pub(crate) owner_token: String,
+    pub(crate) claimed_at: u64,
+    pub(crate) lease_deadline: u64,
+    pub(crate) now: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedSegmentShardRepairClaimAcquire {
-    pub claim_id: String,
-    pub owner_token: String,
-    pub cluster_epoch: ClusterEpoch,
-    pub claimed_at: u64,
-    pub lease_deadline: u64,
-    pub now: u64,
+pub(crate) struct PlacedSegmentShardRepairClaimAcquire {
+    pub(crate) claim_id: String,
+    pub(crate) owner_token: String,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) claimed_at: u64,
+    pub(crate) lease_deadline: u64,
+    pub(crate) now: u64,
 }
 
-pub const PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT: usize = 1024;
-pub const PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN: usize = 4096;
-pub const PLACED_SEGMENT_SHARD_REPAIR_CLAIM_ID_MAX_LEN: usize = 128;
-pub const PLACED_SEGMENT_SHARD_REPAIR_OWNER_TOKEN_MAX_LEN: usize = 128;
+pub(crate) const PLACED_SEGMENT_SHARD_REPAIR_LIST_LIMIT: usize = 1024;
+pub(crate) const PLACED_SEGMENT_SHARD_REPAIR_LAST_ERROR_MAX_LEN: usize = 4096;
+pub(crate) const PLACED_SEGMENT_SHARD_REPAIR_CLAIM_ID_MAX_LEN: usize = 128;
+pub(crate) const PLACED_SEGMENT_SHARD_REPAIR_OWNER_TOKEN_MAX_LEN: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PlacedSegmentShardBackfillWorkItem {

@@ -487,7 +487,7 @@ fn cluster_shard_scavenger_reports_wrong_node_file_and_expected_missing_file() {
         .list_placed_segment_shard_repairs(written.data_pg_id)
         .unwrap();
     assert_eq!(repair_rows.len(), 1);
-    let expected_work = crate::PlacedSegmentShardRepairWorkItem {
+    let expected_work = crate::types::PlacedSegmentShardRepairWorkItem {
         request: crate::SegmentStoredBytesRequest {
             data_pg_id: written.data_pg_id,
             segment_okh,

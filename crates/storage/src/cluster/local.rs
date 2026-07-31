@@ -48,12 +48,11 @@ use crate::node_client::{
 use crate::pg_store::PgClusterMapHistoryReferenceSummary;
 use crate::pg_topology::PgTopology;
 use crate::storage_rpc_transport::{StorageRpcClientEndpoint, StorageRpcEndpointAuthorityIdentity};
-use crate::types::AdmittedRouteEffectFence;
+use crate::types::{AdmittedRouteEffectFence, PlacedSegmentShardRepairWorkItem};
 use crate::{
     BucketDeleteFinalizeRoot, BucketName, BucketPgId, ClusterEpoch, DataPgId, EcShape,
     GenerationId, MetadataError, ObjectKey, ObjectMetadataPgId, ObjectMetadataScanPgId, PgId,
-    PgState, PlacedSegmentShardRepairWorkItem, ReclaimWorkItem, RouteMapValidity, ShardIndex,
-    ShardKey, WriteAck, WrittenShardAck,
+    PgState, ReclaimWorkItem, RouteMapValidity, ShardIndex, ShardKey, WriteAck, WrittenShardAck,
 };
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";

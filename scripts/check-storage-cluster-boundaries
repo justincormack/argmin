@@ -2964,6 +2964,34 @@ fail_with_matches \
     "Shard auditing, candidate discovery, routine checkpoint scheduling, and maintenance admission policy are storage-owned; retain only opaque maintenance admission and sweeper capabilities outside storage" \
     "$shard_scavenger_maintenance_leaks"
 
+shard_repair_maintenance_leaks=$(
+    {
+        rg -n --color=never \
+            '\b(PlacedSegmentShardRepair(ClaimAcquireParams|ClaimAcquire|ClaimRecord|Record|WorkItem)|try_take_placed_segment_shard_repair_work|wait_for_placed_segment_shard_repair_work|wake_placed_segment_shard_repair_workers|enqueue_durable_placed_segment_shard_repair_work|acquire_placed_segment_shard_repair_claim|complete_placed_segment_shard_repair_claim|record_placed_segment_shard_repair_claim_error|repair_placed_segment_payload_shard|repair_placed_segment_payload_shards|repair_placed_segment_payload_shards_if_needed|repair_placed_segment_payload_shards_if_needed_preserving_repair_rows)\b' \
+            crates \
+            -g '*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            'pub[[:space:]]+fn[[:space:]]+(try_take_placed_segment_shard_repair_work|wait_for_placed_segment_shard_repair_work|wake_placed_segment_shard_repair_workers|enqueue_durable_placed_segment_shard_repair_work|list_placed_segment_shard_repairs|acquire_placed_segment_shard_repair_claim|complete_placed_segment_shard_repair_claim|record_placed_segment_shard_repair_claim_error|repair_placed_segment_payload_shard|repair_placed_segment_payload_shards|repair_placed_segment_payload_shards_if_needed|repair_placed_segment_payload_shards_if_needed_preserving_repair_rows)\b' \
+            crates/storage/src \
+            -g '*.rs' \
+            || true
+        rg -n --color=never \
+            'pub[[:space:]]+(struct[[:space:]]+PlacedSegmentShardRepair(ClaimAcquireParams|ClaimAcquire|ClaimRecord|Record|WorkItem)|const[[:space:]]+PLACED_SEGMENT_SHARD_REPAIR_)' \
+            crates/storage/src/types.rs \
+            || true
+        rg -n --color=never \
+            'struct[[:space:]]+ShardRepairSweeper\b|\bSHARD_REPAIR_(DURABLE_SCAN_INTERVAL|CLAIM_LEASE_MILLIS|ERROR_BACKOFF_MILLIS|CLAIM_COUNTER|SWEEPER_REGISTRY)\b' \
+            crates/server-core crates/server-http crates/argmin-s3 crates/s3-tests \
+            -g '*.rs' \
+            || true
+    }
+)
+fail_with_matches \
+    "Shard-repair discovery, queueing, claims, retry policy, execution, scheduling, and telemetry are storage-owned; retain only the opaque StorageShardRepairSweeper outside storage" \
+    "$shard_repair_maintenance_leaks"
+
 stream_session_maintenance_leaks=$(
     {
         rg -n --color=never \

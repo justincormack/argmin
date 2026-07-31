@@ -100,26 +100,6 @@ fn setup_direct_coordinator_with_storage_cluster(
     .unwrap()
 }
 
-fn setup_coordinator_with_only_shard_repair_worker(
-    storage_cluster: Arc<StorageCluster>,
-) -> Coordinator {
-    Coordinator::new_with_background_sweeper_factories_for_storage_cluster(
-        storage_cluster,
-        "us-east-1".to_string(),
-        None,
-        Some(test_sse_s3_provider()),
-        (
-            false,
-            |_, _| Ok(LifecycleSweeper::disabled()),
-            |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
-            ShardRepairSweeper::acquire_shared,
-            |_| Ok(ShardBackfillSweeper::disabled()),
-            |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
-        ),
-    )
-    .unwrap()
-}
-
 fn setup_coordinator_with_only_shard_backfill_worker(
     storage_handle: StorageClusterRouteHandle,
     storage_cluster: Arc<StorageCluster>,
@@ -5378,8 +5358,8 @@ fn maintenance_worker_operations_sample_epoch_refreshed_runtime_map() {
         super::runtime::lifecycle_runtime_for_sweep(&handle, &stale_lifecycle_runtime);
     assert!(Arc::ptr_eq(lifecycle_runtime.storage_node(), &refreshed));
 
-    let repair_cluster = super::runtime::shard_repair_cluster_for_work(&handle);
-    assert!(Arc::ptr_eq(&repair_cluster, &refreshed));
+    let repair = storage::StorageShardRepairSweeper::disabled(handle.clone());
+    assert!(repair.test_routes_to(&refreshed));
 }
 
 #[test]
@@ -6717,6 +6697,7 @@ fn shard_scavenger_sweeper_remains_shared_across_storage_identity_replacement() 
     initial.test_store_route_map_validity(long_lived_test_route_map_validity());
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let first = storage::StorageShardScavengerSweeper::acquire_shared(&handle).unwrap();
+    let first_repair = storage::StorageShardRepairSweeper::acquire_shared(&handle).unwrap();
     let first_admission = storage::StorageMaintenanceAdmission::acquire_shared(&handle);
 
     let replacement = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
@@ -6729,6 +6710,7 @@ fn shard_scavenger_sweeper_remains_shared_across_storage_identity_replacement() 
     assert!(Arc::ptr_eq(&handle.current(), &replacement));
 
     let reacquired = storage::StorageShardScavengerSweeper::acquire_shared(&handle).unwrap();
+    let reacquired_repair = storage::StorageShardRepairSweeper::acquire_shared(&handle).unwrap();
     let reacquired_admission = storage::StorageMaintenanceAdmission::acquire_shared(&handle);
     assert!(
         Arc::ptr_eq(&first, &reacquired),
@@ -6737,6 +6719,10 @@ fn shard_scavenger_sweeper_remains_shared_across_storage_identity_replacement() 
     assert!(
         Arc::ptr_eq(&first_admission, &reacquired_admission),
         "all maintenance workers in one route-publication domain must retain one admission domain"
+    );
+    assert!(
+        Arc::ptr_eq(&first_repair, &reacquired_repair),
+        "one route-publication domain must retain one shard-repair worker across storage identities"
     );
 }
 
@@ -6766,10 +6752,13 @@ fn maintenance_registries_separate_independent_route_domains_over_same_cluster()
     let first_stream = storage::StorageStreamSessionSweeper::acquire_shared(&first_handle).unwrap();
     let second_stream =
         storage::StorageStreamSessionSweeper::acquire_shared(&second_handle).unwrap();
+    let first_repair = storage::StorageShardRepairSweeper::acquire_shared(&first_handle).unwrap();
+    let second_repair = storage::StorageShardRepairSweeper::acquire_shared(&second_handle).unwrap();
 
     assert!(!Arc::ptr_eq(&first_admission, &second_admission));
     assert!(!Arc::ptr_eq(&first_shard, &second_shard));
     assert!(!Arc::ptr_eq(&first_stream, &second_stream));
+    assert!(!Arc::ptr_eq(&first_repair, &second_repair));
 
     let replacement = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     second_runtime.install(Arc::clone(&replacement)).unwrap();
@@ -6779,6 +6768,8 @@ fn maintenance_registries_separate_independent_route_domains_over_same_cluster()
     assert!(second_shard.test_routes_to(&replacement));
     assert!(first_stream.test_routes_to(&initial));
     assert!(second_stream.test_routes_to(&replacement));
+    assert!(first_repair.test_routes_to(&initial));
+    assert!(second_repair.test_routes_to(&replacement));
 
     assert!(Arc::ptr_eq(
         &first_admission,
@@ -6803,6 +6794,14 @@ fn maintenance_registries_separate_independent_route_domains_over_same_cluster()
     assert!(Arc::ptr_eq(
         &second_stream,
         &storage::StorageStreamSessionSweeper::acquire_shared(&second_handle).unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &first_repair,
+        &storage::StorageShardRepairSweeper::acquire_shared(&first_handle).unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &second_repair,
+        &storage::StorageShardRepairSweeper::acquire_shared(&second_handle).unwrap()
     ));
 }
 
@@ -19634,7 +19633,7 @@ fn read_discovered_corrupt_shard_queues_background_repair_without_inline_rewrite
     );
     let repairs = coord
         .storage_node()
-        .list_placed_segment_shard_repairs(segment.data_pg_id)
+        .test_list_placed_segment_shard_repairs(segment.data_pg_id)
         .unwrap();
     assert_eq!(repairs.len(), 1);
     let repair = &repairs[0].work_item;
@@ -19646,7 +19645,7 @@ fn read_discovered_corrupt_shard_queues_background_repair_without_inline_rewrite
     assert_eq!(
         coord
             .storage_node()
-            .try_take_placed_segment_shard_repair_work(),
+            .test_take_placed_segment_shard_repair_work(),
         Some(*repair),
         "successful read recovery should leave a background repair wake hint"
     );
@@ -19729,7 +19728,7 @@ fn copy_object_discovered_corrupt_source_shard_queues_background_repair() {
 
     let repairs = coord
         .storage_node()
-        .list_placed_segment_shard_repairs(segment.data_pg_id)
+        .test_list_placed_segment_shard_repairs(segment.data_pg_id)
         .unwrap();
     assert_eq!(repairs.len(), 1);
     let repair = &repairs[0].work_item;
@@ -19848,7 +19847,7 @@ fn upload_part_copy_discovered_corrupt_source_shard_queues_background_repair() {
 
     let repairs = coord
         .storage_node()
-        .list_placed_segment_shard_repairs(segment.data_pg_id)
+        .test_list_placed_segment_shard_repairs(segment.data_pg_id)
         .unwrap();
     assert_eq!(repairs.len(), 1);
     let repair = &repairs[0].work_item;
@@ -19928,7 +19927,7 @@ fn retained_read_skips_repair_record_after_admitted_route_expiry_without_publica
     assert_eq!(result.body.read_all().unwrap(), data);
     assert!(
         cluster
-            .list_placed_segment_shard_repairs(segment.data_pg_id)
+            .test_list_placed_segment_shard_repairs(segment.data_pg_id)
             .unwrap()
             .is_empty(),
         "expired admitted authority must not record repair through the renewed raw route"
@@ -19941,6 +19940,7 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
         return;
     }
     let tmp = test_util::tempdir();
+    let time = storage::clock::test_time_override_guard(1_000);
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = Coordinator::new_with_background_sweeper_factories_for_storage_cluster(
         Arc::clone(&storage_cluster),
@@ -20023,52 +20023,36 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
             Ok(())
         }),
     );
-    let _worker = setup_coordinator_with_only_shard_repair_worker(Arc::clone(&storage_cluster));
-
-    let start = std::time::Instant::now();
-    loop {
-        let repairs = coord
-            .storage_node()
-            .list_placed_segment_shard_repairs(segment.data_pg_id)
-            .unwrap();
-        if repairs.iter().any(|repair| {
-            repair.last_error.as_deref().is_some_and(|error| {
-                error.contains(
-                    "storage-node repair read payload shard on node 0 exhausted resources: \
-                     storage-node diagnostic redacted",
-                )
-            })
-        }) {
-            break;
-        }
-        assert!(
-            start.elapsed() < TEST_EVENT_TIMEOUT,
-            "shard repair worker did not record transient failure; repairs={repairs:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let repair = storage::StorageShardRepairSweeper::disabled(test_storage_route_handle(
+        Arc::clone(&storage_cluster),
+    ));
+    assert!(repair.test_repair_one_pending());
+    let repairs = coord
+        .storage_node()
+        .test_list_placed_segment_shard_repairs(segment.data_pg_id)
+        .unwrap();
+    assert!(repairs.iter().any(|repair| {
+        repair.last_error.as_deref().is_some_and(|error| {
+            error.contains(
+                "storage-node repair read payload shard on node 0 exhausted resources: \
+                 storage-node diagnostic redacted",
+            )
+        })
+    }));
     assert!(failure_injected.load(Ordering::SeqCst));
 
-    let start = std::time::Instant::now();
-    loop {
-        let repairs = coord
-            .storage_node()
-            .list_placed_segment_shard_repairs(segment.data_pg_id)
-            .unwrap();
-        if repairs.is_empty() {
-            let repaired_bytes = std::fs::read(&corrupt_path).unwrap();
-            assert_ne!(
-                repaired_bytes, corrupt_bytes,
-                "retry should rewrite the corrupt shard after transient failure"
-            );
-            return;
-        }
-        assert!(
-            start.elapsed() < TEST_EVENT_TIMEOUT + Duration::from_secs(2),
-            "shard repair worker did not retry and drain row; repairs={repairs:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    time.set(2_001);
+    assert!(repair.test_repair_one_pending());
+    assert!(coord
+        .storage_node()
+        .test_list_placed_segment_shard_repairs(segment.data_pg_id)
+        .unwrap()
+        .is_empty());
+    let repaired_bytes = std::fs::read(&corrupt_path).unwrap();
+    assert_ne!(
+        repaired_bytes, corrupt_bytes,
+        "retry should rewrite the corrupt shard after transient failure"
+    );
 }
 
 #[test]
@@ -20150,33 +20134,23 @@ fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
         std::fs::remove_file(path).unwrap();
     }
 
-    let _worker = setup_coordinator_with_only_shard_repair_worker(Arc::clone(&storage_cluster));
-    let start = std::time::Instant::now();
-    loop {
-        let repairs = coord
-            .storage_node()
-            .list_placed_segment_shard_repairs(segment.data_pg_id)
-            .unwrap();
-        if repairs
-            .iter()
-            .any(|repair| repair.last_error.as_deref().is_some())
-        {
-            assert_eq!(repairs.len(), 1);
-            assert_eq!(repairs[0].work_item.shard_index.get(), 0);
-            assert_eq!(std::fs::read(&corrupt_path).unwrap(), corrupt_bytes);
-            for path in &missing_paths {
-                assert!(
-                    !path.exists(),
-                    "unrecoverable repair should not recreate any shard from an insufficient EC set"
-                );
-            }
-            return;
-        }
+    let repair = storage::StorageShardRepairSweeper::disabled(test_storage_route_handle(
+        Arc::clone(&storage_cluster),
+    ));
+    assert!(repair.test_repair_one_pending());
+    let repairs = coord
+        .storage_node()
+        .test_list_placed_segment_shard_repairs(segment.data_pg_id)
+        .unwrap();
+    assert_eq!(repairs.len(), 1);
+    assert!(repairs[0].last_error.is_some());
+    assert_eq!(repairs[0].work_item.shard_index.get(), 0);
+    assert_eq!(std::fs::read(&corrupt_path).unwrap(), corrupt_bytes);
+    for path in &missing_paths {
         assert!(
-            start.elapsed() < TEST_EVENT_TIMEOUT,
-            "shard repair worker did not record unrecoverable repair failure; repairs={repairs:?}"
+            !path.exists(),
+            "unrecoverable repair should not recreate any shard from an insufficient EC set"
         );
-        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -20185,20 +20159,8 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
     if !backend_supports_parity_recovery() {
         return;
     }
-    let _hook_serial = SHARD_REPAIR_WORKER_TEST_SERIAL
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap();
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
-    let target_registry_key = storage_cluster.process_local_registry_key();
-    let (idle_tx, idle_rx) = mpsc::channel();
-    let _hook_guard = install_shard_repair_worker_test_hooks(ShardRepairWorkerTestHooks {
-        target_registry_key: Some(target_registry_key),
-        after_idle_timeout: Some(Arc::new(move || {
-            let _ = idle_tx.send(());
-        })),
-    });
     let coord = Coordinator::new_with_background_sweeper_factories_for_storage_cluster(
         storage_cluster,
         "us-east-1".to_string(),
@@ -20208,15 +20170,12 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |storage_handle| Ok(ShardScavengerSweeper::disabled(storage_handle.clone())),
-            ShardRepairSweeper::acquire_shared,
+            |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
             |_| Ok(ShardBackfillSweeper::disabled()),
             |storage_handle| Ok(StreamSessionSweeper::disabled(storage_handle.clone())),
         ),
     )
     .unwrap();
-    idle_rx
-        .recv_timeout(TEST_EVENT_TIMEOUT)
-        .expect("shard repair worker did not reach the idle timeout path");
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
@@ -20267,40 +20226,31 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
         .unwrap();
     assert_eq!(result.body.read_all().unwrap(), data);
 
-    let start = std::time::Instant::now();
-    loop {
-        let repairs = coord
-            .storage_node()
-            .list_placed_segment_shard_repairs(segment.data_pg_id)
-            .unwrap();
-        if repairs.is_empty() {
-            let repaired = coord
-                .get_object(&GetObjectRequest {
-                    sse_customer: None,
-                    object: object_version_request_with_expected_owner(
-                        "bucket",
-                        "key",
-                        None,
-                        test_requester(),
-                        None,
-                    ),
-                    cond: NO_READ,
-                })
-                .unwrap();
-            assert_eq!(repaired.body.read_all().unwrap(), data);
-            let repaired_bytes = std::fs::read(&corrupt_path).unwrap();
-            assert_ne!(
-                repaired_bytes, corrupt_bytes,
-                "repair should rewrite the corrupt shard file"
-            );
-            return;
-        }
-        assert!(
-            start.elapsed() < TEST_EVENT_TIMEOUT,
-            "shard repair worker did not repair and drain row; repairs={repairs:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    assert!(coord._shard_repair_sweeper.test_repair_one_pending());
+    assert!(coord
+        .storage_node()
+        .test_list_placed_segment_shard_repairs(segment.data_pg_id)
+        .unwrap()
+        .is_empty());
+    let repaired = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(repaired.body.read_all().unwrap(), data);
+    let repaired_bytes = std::fs::read(&corrupt_path).unwrap();
+    assert_ne!(
+        repaired_bytes, corrupt_bytes,
+        "repair should rewrite the corrupt shard file"
+    );
 }
 
 #[test]

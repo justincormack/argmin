@@ -23445,6 +23445,7 @@ mod tests {
     };
     use crate::pg_store::PgStore;
     use crate::traits::PgMetadataStore;
+    use crate::types::PlacedSegmentShardRepairWorkItem;
     use proptest::prelude::*;
     use std::cell::Cell;
     use std::sync::{
@@ -25453,10 +25454,10 @@ mod tests {
 
     fn placed_segment_shard_repair_work_item_for_runtime_refresh(
         seed: u8,
-    ) -> crate::PlacedSegmentShardRepairWorkItem {
+    ) -> PlacedSegmentShardRepairWorkItem {
         let mut segment_okh = [0; 16];
         segment_okh[0] = seed;
-        crate::PlacedSegmentShardRepairWorkItem {
+        PlacedSegmentShardRepairWorkItem {
             request: crate::SegmentStoredBytesRequest {
                 data_pg_id: 31,
                 segment_okh,

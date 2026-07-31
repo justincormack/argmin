@@ -905,8 +905,23 @@ operations are now crate-private, the integration harness receives only an owner
 diagnostic, and the file-without-row impossible-state regression is owner-local. Admission,
 shard-scavenger, and stream-session registries are keyed by route-publication domain rather than
 process-local storage identity, so independent domains over one initial cluster cannot share a
-worker and refreshing one domain cannot strand the other. The remaining repair/backfill execution
-and reclaim/finalization workers are still pending; these slices do not mark item 1 complete.
+worker and refreshing one domain cannot strand the other. Repair/backfill execution and
+reclaim/finalization remained pending after that slice, so it did not mark item 1 complete.
+
+Progress on item 1 (2026-07-31): the fourth bounded slice moved durable shard-repair scanning,
+wake-queue consumption, claim identity and lease creation, known-damage admission, physical repair,
+retry recording, completion, worker registration, thread lifecycle, diagnostics, and telemetry into
+`StorageShardRepairSweeper`. `server-core` retains only the opaque worker and startup-error
+translation. The repair registry uses route-publication-domain identity, remains shared across
+storage-identity replacement, and stays distinct for independent publication domains over the same
+initial cluster. Raw repair queue, claim, retry, completion, and preserving-repair-row execution
+operations and repair work/claim representations are now crate-private. Physical single-shard,
+selected-shard, and repair-if-needed mutation helpers are compiled only for owner-local storage
+tests. Cross-crate integration tests receive dedicated test-only DTOs rather than the production
+repair records. Worker regressions call the same storage-owned
+single-step state machine as production and use a pinned clock for retry eligibility instead of
+polling worker timing. Backfill execution and reclaim/finalization remain pending, so item 1 is not
+yet complete.
 
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a

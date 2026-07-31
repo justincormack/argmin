@@ -4,11 +4,14 @@ use crate::node_client::{
     RetainedShardAckRoute, ShardAckRoute,
 };
 use crate::storage_rpc::StorageRpcErrorCode;
+use crate::types::{
+    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
+    PlacedSegmentShardRepairRecord,
+};
 use crate::{
     ObjectPayloadReclaimKind, PlacedSegmentShardBackfillClaimAcquire,
     PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
-    PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
-    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
+    PlacedSegmentShardBackfillWorkItem,
 };
 
 fn object_payload_lease_route<'a>(

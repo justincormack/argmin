@@ -1,13 +1,19 @@
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use ring::rand::SecureRandom as _;
+
 use crate::cluster::{
+    DurablePlacedSegmentShardRepairEnqueueSummary,
     PlacedSegmentShardBackfillCandidateEnqueueSummary,
     PlacedSegmentShardBackfillCandidateScanCursor, StorageClusterRouteAdmissionDomain,
     StorageClusterRouteHandle, StreamSessionSweepSummary,
+};
+use crate::types::{
+    PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,
 };
 use crate::StoreError;
 
@@ -18,6 +24,9 @@ const SHARD_SCAVENGER_SWEEP_INTERVAL: Duration = Duration::from_millis(50);
 const SHARD_SCAVENGER_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const STREAM_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 const STREAM_SESSION_SCAVENGE_MAX_AGE_MILLIS: u64 = 60_000;
+const SHARD_REPAIR_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const SHARD_REPAIR_CLAIM_LEASE_MILLIS: u64 = 30_000;
+const SHARD_REPAIR_ERROR_BACKOFF_MILLIS: u64 = 1_000;
 const BACKGROUND_KNOWN_DAMAGE_REPAIR_LIMIT: usize = 1;
 const BACKGROUND_BACKFILL_CANDIDATE_SCAN_LIMIT: usize = 1;
 const BACKGROUND_ROUTINE_BACKFILL_LIMIT: usize = 1;
@@ -34,6 +43,9 @@ static MAINTENANCE_ADMISSION_REGISTRY: OnceLock<
 > = OnceLock::new();
 static SHARD_SCAVENGER_SWEEPER_REGISTRY: OnceLock<Mutex<Vec<Weak<StorageShardScavengerSweeper>>>> =
     OnceLock::new();
+static SHARD_REPAIR_SWEEPER_REGISTRY: OnceLock<Mutex<Vec<Weak<StorageShardRepairSweeper>>>> =
+    OnceLock::new();
+static SHARD_REPAIR_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 static STREAM_SESSION_SWEEPER_REGISTRY: OnceLock<Mutex<Vec<Weak<StorageStreamSessionSweeper>>>> =
     OnceLock::new();
@@ -742,6 +754,388 @@ fn run_shard_scavenger_sweep(
                 );
             }
         }
+    }
+}
+
+/// Opaque storage-owned durable shard-repair execution worker.
+pub struct StorageShardRepairSweeper {
+    storage_handle: StorageClusterRouteHandle,
+    stop: Arc<AtomicBool>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl StorageShardRepairSweeper {
+    pub fn acquire_shared(
+        storage_handle: &StorageClusterRouteHandle,
+    ) -> Result<Arc<Self>, StorageMaintenanceStartError> {
+        let registry = SHARD_REPAIR_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(Vec::new()));
+        let mut registry = registry.lock().unwrap_or_else(|error| error.into_inner());
+        registry.retain(|sweeper| sweeper.upgrade().is_some());
+
+        if let Some(existing) = registry.iter().filter_map(Weak::upgrade).find(|sweeper| {
+            sweeper
+                .storage_handle
+                .shares_route_admission_with(storage_handle)
+        }) {
+            return Ok(existing);
+        }
+
+        let sweeper = Self::spawn(storage_handle.clone())?;
+        registry.push(Arc::downgrade(&sweeper));
+        Ok(sweeper)
+    }
+
+    fn spawn(
+        storage_handle: StorageClusterRouteHandle,
+    ) -> Result<Arc<Self>, StorageMaintenanceStartError> {
+        let worker_identity = random_storage_worker_identity().map_err(|error| {
+            StorageMaintenanceStartError::worker_spawn("shard repair identity", error)
+        })?;
+        let owner_token = format!("shard-repair-worker-{worker_identity}");
+        let admission = StorageMaintenanceAdmission::acquire_shared(&storage_handle);
+        let stop = Arc::new(AtomicBool::new(false));
+        let sweeper = Arc::new(Self {
+            storage_handle: storage_handle.clone(),
+            stop: Arc::clone(&stop),
+            handle: Mutex::new(None),
+        });
+        let handle = std::thread::Builder::new()
+            .name("argmin-shard-repair".to_string())
+            .spawn(move || {
+                run_shard_repair_worker(
+                    &storage_handle,
+                    &stop,
+                    &admission,
+                    &worker_identity,
+                    &owner_token,
+                );
+            })
+            .map_err(|error| StorageMaintenanceStartError::worker_spawn("shard repair", error))?;
+        *sweeper
+            .handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(handle);
+        Ok(sweeper)
+    }
+
+    #[must_use]
+    pub fn disabled(storage_handle: StorageClusterRouteHandle) -> Arc<Self> {
+        Arc::new(Self {
+            storage_handle,
+            stop: Arc::new(AtomicBool::new(true)),
+            handle: Mutex::new(None),
+        })
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_is_enabled(&self) -> bool {
+        !self.stop.load(Ordering::SeqCst)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn test_routes_to(&self, expected: &Arc<crate::StorageCluster>) -> bool {
+        Arc::ptr_eq(&self.storage_handle.current(), expected)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn test_repair_one_pending(&self) -> bool {
+        let storage_cluster = self.storage_handle.current();
+        emit_shard_repair_durable_scan(
+            storage_cluster.enqueue_durable_placed_segment_shard_repair_work(),
+        );
+        let Some(work_item) = storage_cluster.try_take_placed_segment_shard_repair_work() else {
+            return false;
+        };
+        let admission = StorageMaintenanceAdmission::acquire_shared(&self.storage_handle);
+        process_shard_repair_work_item(
+            &storage_cluster,
+            &admission,
+            "deterministic-test-worker",
+            "shard-repair-deterministic-test-worker",
+            work_item,
+        );
+        true
+    }
+}
+
+impl Drop for StorageShardRepairSweeper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.storage_handle
+            .current()
+            .wake_placed_segment_shard_repair_workers();
+        if let Some(handle) = self
+            .handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn random_storage_worker_identity() -> Result<String, std::io::Error> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut bytes = [0u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| std::io::Error::other("secure random generation failed"))?;
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(encoded)
+}
+
+fn run_shard_repair_worker(
+    storage_handle: &StorageClusterRouteHandle,
+    stop: &AtomicBool,
+    admission: &Arc<StorageMaintenanceAdmission>,
+    worker_identity: &str,
+    owner_token: &str,
+) {
+    let mut next_durable_scan_at = Instant::now();
+    while !stop.load(Ordering::SeqCst) {
+        let storage_cluster = storage_handle.current();
+        let now = Instant::now();
+        if now >= next_durable_scan_at {
+            emit_shard_repair_durable_scan(
+                storage_cluster.enqueue_durable_placed_segment_shard_repair_work(),
+            );
+            next_durable_scan_at = now + SHARD_REPAIR_DURABLE_SCAN_INTERVAL;
+        }
+
+        let Some(work_item) = storage_cluster
+            .try_take_placed_segment_shard_repair_work()
+            .or_else(|| storage_cluster.wait_for_placed_segment_shard_repair_work(stop))
+        else {
+            continue;
+        };
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+
+        process_shard_repair_work_item(
+            &storage_cluster,
+            admission,
+            worker_identity,
+            owner_token,
+            work_item,
+        );
+    }
+}
+
+fn process_shard_repair_work_item(
+    storage_cluster: &crate::StorageCluster,
+    admission: &Arc<StorageMaintenanceAdmission>,
+    worker_identity: &str,
+    owner_token: &str,
+    work_item: crate::types::PlacedSegmentShardRepairWorkItem,
+) {
+    let now_ms = crate::clock::current_time_millis();
+    let claim_id = format!(
+        "shard-repair-{}-{}-{}-{}",
+        worker_identity,
+        work_item.request.data_pg_id,
+        work_item.shard_index.get(),
+        SHARD_REPAIR_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let claim_acquire = PlacedSegmentShardRepairClaimAcquireParams {
+        claim_id,
+        owner_token: owner_token.to_string(),
+        claimed_at: now_ms,
+        lease_deadline: now_ms.saturating_add(SHARD_REPAIR_CLAIM_LEASE_MILLIS),
+        now: now_ms,
+    };
+    let claim = match storage_cluster
+        .acquire_placed_segment_shard_repair_claim(work_item.request.data_pg_id, &claim_acquire)
+    {
+        Ok(Some(claim)) => {
+            emit_shard_repair_event(Some(work_item.request.data_pg_id), "claim_started", None);
+            claim
+        }
+        Ok(None) => {
+            emit_shard_repair_event(Some(work_item.request.data_pg_id), "claim_empty", None);
+            return;
+        }
+        Err(error) => {
+            record_shard_repair_failure(
+                Some(work_item.request.data_pg_id),
+                "claim_failed",
+                "shard_repair_claim_error",
+                &error,
+            );
+            return;
+        }
+    };
+
+    let Some(_repair_permit) = admission.try_known_damage_repair() else {
+        emit_shard_repair_event(
+            Some(claim.work_item.request.data_pg_id),
+            "admission_denied",
+            None,
+        );
+        let next_attempt_after =
+            crate::clock::current_time_millis().saturating_add(SHARD_REPAIR_ERROR_BACKOFF_MILLIS);
+        record_shard_repair_claim_error(
+            storage_cluster,
+            &claim,
+            "background known-damage repair admission denied",
+            next_attempt_after,
+            None,
+        );
+        return;
+    };
+
+    emit_shard_repair_event(Some(claim.work_item.request.data_pg_id), "started", None);
+    match storage_cluster.repair_placed_segment_payload_shards_if_needed_preserving_repair_rows(
+        claim.work_item.request,
+    ) {
+        Ok(repaired_acks) => {
+            let event = if repaired_acks.is_empty() {
+                "resolved_clean"
+            } else {
+                "repaired"
+            };
+            emit_shard_repair_event(
+                Some(claim.work_item.request.data_pg_id),
+                event,
+                Some(repaired_acks.len()),
+            );
+            match storage_cluster.complete_placed_segment_shard_repair_claim(&claim) {
+                Ok(true) => emit_shard_repair_event(
+                    Some(claim.work_item.request.data_pg_id),
+                    "complete_succeeded",
+                    None,
+                ),
+                Ok(false) => emit_shard_repair_event(
+                    Some(claim.work_item.request.data_pg_id),
+                    "complete_stale",
+                    None,
+                ),
+                Err(error) => record_shard_repair_failure(
+                    Some(claim.work_item.request.data_pg_id),
+                    "complete_failed",
+                    "shard_repair_complete_error",
+                    &error,
+                ),
+            }
+        }
+        Err(error) => {
+            let event = if matches!(error, StoreError::NotFound) {
+                "unrecoverable"
+            } else {
+                "failed"
+            };
+            record_shard_repair_failure(
+                Some(claim.work_item.request.data_pg_id),
+                event,
+                "shard_repair_error",
+                &error,
+            );
+            let next_attempt_after = crate::clock::current_time_millis()
+                .saturating_add(SHARD_REPAIR_ERROR_BACKOFF_MILLIS);
+            record_shard_repair_claim_error(
+                storage_cluster,
+                &claim,
+                &error.to_string(),
+                next_attempt_after,
+                Some(&error),
+            );
+        }
+    }
+}
+
+fn emit_shard_repair_durable_scan(
+    result: Result<DurablePlacedSegmentShardRepairEnqueueSummary, StoreError>,
+) {
+    match result {
+        Ok(summary) if summary.scanned == 0 => {
+            emit_shard_repair_event(None, "durable_scan_empty", None);
+        }
+        Ok(summary) if summary.enqueued > 0 => {
+            emit_shard_repair_event(None, "durable_scan_queued", None);
+        }
+        Ok(_) => emit_shard_repair_event(None, "durable_scan_no_new_enqueue", None),
+        Err(error) => {
+            record_shard_repair_failure(
+                None,
+                "durable_scan_failed",
+                "shard_repair_durable_scan_error",
+                &error,
+            );
+        }
+    }
+}
+
+fn emit_shard_repair_event(
+    pg_id: Option<u32>,
+    event: &'static str,
+    shards_rewritten: Option<usize>,
+) {
+    let _ = observability::emit_shard_repair_event(
+        TRACE_TARGET,
+        observability::ShardRepairEventSummary {
+            pg_id,
+            event,
+            queue_depth: None,
+            shards_rewritten,
+        },
+    );
+}
+
+fn record_shard_repair_failure(
+    pg_id: Option<u32>,
+    event: &'static str,
+    trace_event: &'static str,
+    error: &StoreError,
+) {
+    observability::record_shard_repair_error(pg_id, event, error.diagnostic_kind());
+    emit_shard_repair_event(pg_id, event, None);
+    let _ = observability::event(
+        TRACE_TARGET,
+        trace_event,
+        Some(format_args!("error={error}")),
+    );
+}
+
+fn record_shard_repair_claim_error(
+    storage_cluster: &crate::StorageCluster,
+    claim: &PlacedSegmentShardRepairClaimRecord,
+    last_error: &str,
+    next_attempt_after: u64,
+    repair_error: Option<&StoreError>,
+) {
+    if let Err(record_error) = storage_cluster.record_placed_segment_shard_repair_claim_error(
+        claim,
+        last_error,
+        next_attempt_after,
+    ) {
+        observability::record_shard_repair_error(
+            Some(claim.work_item.request.data_pg_id),
+            "record_error_failed",
+            record_error.diagnostic_kind(),
+        );
+        emit_shard_repair_event(
+            Some(claim.work_item.request.data_pg_id),
+            "record_error_failed",
+            None,
+        );
+        let _ = observability::event(
+            TRACE_TARGET,
+            "shard_repair_record_error_failed",
+            Some(format_args!(
+                "repair_error={} record_error={record_error}",
+                repair_error.map_or("<admission denied>".to_string(), ToString::to_string)
+            )),
+        );
     }
 }
 

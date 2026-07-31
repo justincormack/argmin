@@ -11,9 +11,9 @@ use storage::PgTopology;
 use storage::{
     BucketDeleteBeginRoot, BucketDeleteFinalizeRoot, BucketInfo, BucketName, EcShape, GenerationId,
     ObjectEncryption, ObjectKey, PgId, PlacedSegmentShardBackfillClaimAcquireParams,
-    PlacedSegmentShardRepairClaimAcquireParams, ProcessLocalRegistryKey, ReclaimWorkItem,
-    SegmentStoredBytesRequest, StorageCluster, StorageClusterRouteHandle,
-    StorageMaintenanceAdmission, StoreError, UploadId, UploadState, VersionId,
+    ProcessLocalRegistryKey, ReclaimWorkItem, SegmentStoredBytesRequest, StorageCluster,
+    StorageClusterRouteHandle, StorageMaintenanceAdmission, StoreError, UploadId, UploadState,
+    VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -21,8 +21,7 @@ use super::read_core::{PayloadLease, ReadRuntime, ReadStorage, SegmentPayloadRec
 #[cfg(test)]
 use super::test_hooks::{
     maybe_run_after_reclaim_work_dequeued_hook, maybe_run_before_reclaim_work_execute_hook,
-    maybe_run_reclaim_worker_idle_return_hook, maybe_run_shard_repair_worker_idle_timeout_hook,
-    reclaim_worker_durable_scan_delay_override,
+    maybe_run_reclaim_worker_idle_return_hook, reclaim_worker_durable_scan_delay_override,
 };
 use super::TRACE_TARGET;
 use super::{lock_mutex_unpoisoned, Coordinator, LIFECYCLE_SWEEP_INTERVAL_MILLIS};
@@ -40,13 +39,9 @@ static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<
 static RECLAIM_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<ProcessLocalRegistryKey, Weak<ReclaimSweeper>>>,
 > = OnceLock::new();
-static SHARD_REPAIR_SWEEPER_REGISTRY: OnceLock<
-    Mutex<HashMap<ProcessLocalRegistryKey, Weak<ShardRepairSweeper>>>,
-> = OnceLock::new();
 static SHARD_BACKFILL_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<ProcessLocalRegistryKey, Weak<ShardBackfillSweeper>>>,
 > = OnceLock::new();
-static SHARD_REPAIR_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SHARD_BACKFILL_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
@@ -57,9 +52,6 @@ const RECLAIM_DURABLE_SCAN_BATCH_PGS: usize = 8;
 const RECLAIM_DURABLE_SCAN_SAFETY_INTERVAL: Duration = Duration::from_secs(60);
 const RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF: Duration = Duration::from_secs(1);
 const RECLAIM_DURABLE_SCAN_INCOMPLETE_RETRY: Duration = Duration::from_secs(1);
-const SHARD_REPAIR_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
-const SHARD_REPAIR_CLAIM_LEASE_MILLIS: u64 = 30_000;
-const SHARD_REPAIR_ERROR_BACKOFF_MILLIS: u64 = 1_000;
 const SHARD_BACKFILL_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 const SHARD_BACKFILL_CLAIM_LEASE_MILLIS: u64 = 30_000;
 const SHARD_BACKFILL_ERROR_BACKOFF_MILLIS: u64 = 1_000;
@@ -395,18 +387,13 @@ pub(super) struct LifecycleSweeper {
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
 
-pub(super) struct ShardRepairSweeper {
-    pub(super) storage_handle: StorageClusterRouteHandle,
-    pub(super) stop: Arc<AtomicBool>,
-    pub(super) handle: Mutex<Option<JoinHandle<()>>>,
-}
-
 pub(super) struct ShardBackfillSweeper {
     pub(super) stop: Arc<AtomicBool>,
     pub(super) wake: Arc<(Mutex<bool>, Condvar)>,
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
 
+pub(super) use storage::StorageShardRepairSweeper as ShardRepairSweeper;
 pub(super) use storage::StorageShardScavengerSweeper as ShardScavengerSweeper;
 pub(super) use storage::StorageStreamSessionSweeper as StreamSessionSweeper;
 
@@ -879,18 +866,6 @@ impl Drop for LifecycleSweeper {
     }
 }
 
-impl Drop for ShardRepairSweeper {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        self.storage_handle
-            .current()
-            .wake_placed_segment_shard_repair_workers();
-        if let Some(handle) = lock_mutex_unpoisoned(&self.handle).take() {
-            let _ = handle.join();
-        }
-    }
-}
-
 impl Drop for ShardBackfillSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -985,387 +960,6 @@ pub(super) fn lifecycle_runtime_for_sweep(
     runtime: &ReadRuntime,
 ) -> ReadRuntime {
     runtime.with_storage_node(storage_handle.current())
-}
-
-impl ShardRepairSweeper {
-    pub(super) fn acquire_shared(
-        storage_handle: &StorageClusterRouteHandle,
-    ) -> Result<Arc<Self>, ServerError> {
-        let registry = SHARD_REPAIR_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut registry: std::sync::MutexGuard<
-            '_,
-            HashMap<ProcessLocalRegistryKey, Weak<ShardRepairSweeper>>,
-        > = lock_mutex_unpoisoned(registry);
-        registry.retain(|_, sweeper| sweeper.upgrade().is_some());
-
-        let storage_cluster = storage_handle.current();
-        let key = storage_cluster.process_local_registry_key();
-        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
-            return Ok(existing);
-        }
-
-        let admission = StorageMaintenanceAdmission::acquire_shared(storage_handle);
-        let sweeper = Self::spawn(storage_handle.clone(), key, admission)?;
-        registry.insert(key, Arc::downgrade(&sweeper));
-        Ok(sweeper)
-    }
-
-    fn spawn(
-        storage_handle: StorageClusterRouteHandle,
-        _registry_key: ProcessLocalRegistryKey,
-        admission: Arc<StorageMaintenanceAdmission>,
-    ) -> Result<Arc<Self>, ServerError> {
-        let worker_identity = random_background_worker_identity("shard-repair worker")?;
-        let owner_token = format!("shard-repair-worker-{worker_identity}");
-        let stop = Arc::new(AtomicBool::new(false));
-        let sweeper = Arc::new(Self {
-            storage_handle: storage_handle.clone(),
-            stop: Arc::clone(&stop),
-            handle: Mutex::new(None),
-        });
-        let handle = std::thread::Builder::new()
-            .name("argmin-shard-repair".to_string())
-            .spawn(move || {
-                let mut next_durable_scan_at = Instant::now();
-                while !stop.load(Ordering::SeqCst) {
-                    let storage_cluster = shard_repair_cluster_for_work(&storage_handle);
-                    let now = Instant::now();
-                    if now >= next_durable_scan_at {
-                        match storage_cluster.enqueue_durable_placed_segment_shard_repair_work() {
-                            Ok(summary) if summary.scanned == 0 => {
-                                let _ = observability::emit_shard_repair_event(
-                                    TRACE_TARGET,
-                                    observability::ShardRepairEventSummary {
-                                        pg_id: None,
-                                        event: "durable_scan_empty",
-                                        queue_depth: None,
-                                        shards_rewritten: None,
-                                    },
-                                );
-                            }
-                            Ok(summary) if summary.enqueued > 0 => {
-                                let _ = observability::emit_shard_repair_event(
-                                    TRACE_TARGET,
-                                    observability::ShardRepairEventSummary {
-                                        pg_id: None,
-                                        event: "durable_scan_queued",
-                                        queue_depth: None,
-                                        shards_rewritten: None,
-                                    },
-                                );
-                            }
-                            Ok(_) => {
-                                let _ = observability::emit_shard_repair_event(
-                                    TRACE_TARGET,
-                                    observability::ShardRepairEventSummary {
-                                        pg_id: None,
-                                        event: "durable_scan_no_new_enqueue",
-                                        queue_depth: None,
-                                        shards_rewritten: None,
-                                    },
-                                );
-                            }
-                            Err(error) => {
-                                let _ = observability::emit_shard_repair_event(
-                                    TRACE_TARGET,
-                                    observability::ShardRepairEventSummary {
-                                        pg_id: None,
-                                        event: "durable_scan_failed",
-                                        queue_depth: None,
-                                        shards_rewritten: None,
-                                    },
-                                );
-                                observability::record_shard_repair_error(
-                                    None,
-                                    "durable_scan_failed",
-                                    error.diagnostic_kind(),
-                                );
-                                let _ = observability::event(
-                                    TRACE_TARGET,
-                                    "shard_repair_durable_scan_error",
-                                    Some(format_args!("error={error}")),
-                                );
-                            }
-                        }
-                        next_durable_scan_at = now + SHARD_REPAIR_DURABLE_SCAN_INTERVAL;
-                    }
-
-                    let Some(work_item) = storage_cluster
-                        .try_take_placed_segment_shard_repair_work()
-                        .or_else(|| {
-                            storage_cluster.wait_for_placed_segment_shard_repair_work(&stop)
-                        })
-                    else {
-                        if stop.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        #[cfg(test)]
-                        maybe_run_shard_repair_worker_idle_timeout_hook(_registry_key);
-                        continue;
-                    };
-                    if stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    let now_ms = Coordinator::now_millis();
-                    let claim_id = format!(
-                        "shard-repair-{}-{}-{}-{}",
-                        worker_identity,
-                        work_item.request.data_pg_id,
-                        work_item.shard_index.get(),
-                        SHARD_REPAIR_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
-                    );
-                    let claim_acquire = PlacedSegmentShardRepairClaimAcquireParams {
-                        claim_id,
-                        owner_token: owner_token.clone(),
-                        claimed_at: now_ms,
-                        lease_deadline: now_ms.saturating_add(SHARD_REPAIR_CLAIM_LEASE_MILLIS),
-                        now: now_ms,
-                    };
-                    let claim = match storage_cluster.acquire_placed_segment_shard_repair_claim(
-                        work_item.request.data_pg_id,
-                        &claim_acquire,
-                    ) {
-                        Ok(Some(claim)) => {
-                            let _ = observability::emit_shard_repair_event(
-                                TRACE_TARGET,
-                                observability::ShardRepairEventSummary {
-                                    pg_id: Some(work_item.request.data_pg_id),
-                                    event: "claim_started",
-                                    queue_depth: None,
-                                    shards_rewritten: None,
-                                },
-                            );
-                            claim
-                        }
-                        Ok(None) => {
-                            let _ = observability::emit_shard_repair_event(
-                                TRACE_TARGET,
-                                observability::ShardRepairEventSummary {
-                                    pg_id: Some(work_item.request.data_pg_id),
-                                    event: "claim_empty",
-                                    queue_depth: None,
-                                    shards_rewritten: None,
-                                },
-                            );
-                            continue;
-                        }
-                        Err(error) => {
-                            let _ = observability::emit_shard_repair_event(
-                                TRACE_TARGET,
-                                observability::ShardRepairEventSummary {
-                                    pg_id: Some(work_item.request.data_pg_id),
-                                    event: "claim_failed",
-                                    queue_depth: None,
-                                    shards_rewritten: None,
-                                },
-                            );
-                            observability::record_shard_repair_error(
-                                Some(work_item.request.data_pg_id),
-                                "claim_failed",
-                                error.diagnostic_kind(),
-                            );
-                            let _ = observability::event(
-                                TRACE_TARGET,
-                                "shard_repair_claim_error",
-                                Some(format_args!("error={error}")),
-                            );
-                            continue;
-                        }
-                    };
-
-                    let Some(_repair_permit) = admission.try_known_damage_repair() else {
-                        let _ = observability::emit_shard_repair_event(
-                            TRACE_TARGET,
-                            observability::ShardRepairEventSummary {
-                                pg_id: Some(claim.work_item.request.data_pg_id),
-                                event: "admission_denied",
-                                queue_depth: None,
-                                shards_rewritten: None,
-                            },
-                        );
-                        let next_attempt_after = Coordinator::now_millis()
-                            .saturating_add(SHARD_REPAIR_ERROR_BACKOFF_MILLIS);
-                        if let Err(record_error) = storage_cluster
-                            .record_placed_segment_shard_repair_claim_error(
-                                &claim,
-                                "background known-damage repair admission denied",
-                                next_attempt_after,
-                            )
-                        {
-                            observability::record_shard_repair_error(
-                                Some(claim.work_item.request.data_pg_id),
-                                "record_error_failed",
-                                record_error.diagnostic_kind(),
-                            );
-                            let _ = observability::emit_shard_repair_event(
-                                TRACE_TARGET,
-                                observability::ShardRepairEventSummary {
-                                    pg_id: Some(claim.work_item.request.data_pg_id),
-                                    event: "record_error_failed",
-                                    queue_depth: None,
-                                    shards_rewritten: None,
-                                },
-                            );
-                            let _ = observability::event(
-                                TRACE_TARGET,
-                                "shard_repair_record_error_failed",
-                                Some(format_args!("record_error={record_error}")),
-                            );
-                        }
-                        continue;
-                    };
-
-                    let _ = observability::emit_shard_repair_event(
-                        TRACE_TARGET,
-                        observability::ShardRepairEventSummary {
-                            pg_id: Some(claim.work_item.request.data_pg_id),
-                            event: "started",
-                            queue_depth: None,
-                            shards_rewritten: None,
-                        },
-                    );
-                    match storage_cluster
-                        .repair_placed_segment_payload_shards_if_needed_preserving_repair_rows(
-                            claim.work_item.request,
-                        ) {
-                        Ok(repaired_acks) => {
-                            let event = if repaired_acks.is_empty() {
-                                "resolved_clean"
-                            } else {
-                                "repaired"
-                            };
-                            let _ = observability::emit_shard_repair_event(
-                                TRACE_TARGET,
-                                observability::ShardRepairEventSummary {
-                                    pg_id: Some(claim.work_item.request.data_pg_id),
-                                    event,
-                                    queue_depth: None,
-                                    shards_rewritten: Some(repaired_acks.len()),
-                                },
-                            );
-                            match storage_cluster.complete_placed_segment_shard_repair_claim(&claim)
-                            {
-                                Ok(true) => {
-                                    let _ = observability::emit_shard_repair_event(
-                                        TRACE_TARGET,
-                                        observability::ShardRepairEventSummary {
-                                            pg_id: Some(claim.work_item.request.data_pg_id),
-                                            event: "complete_succeeded",
-                                            queue_depth: None,
-                                            shards_rewritten: None,
-                                        },
-                                    );
-                                }
-                                Ok(false) => {
-                                    let _ = observability::emit_shard_repair_event(
-                                        TRACE_TARGET,
-                                        observability::ShardRepairEventSummary {
-                                            pg_id: Some(claim.work_item.request.data_pg_id),
-                                            event: "complete_stale",
-                                            queue_depth: None,
-                                            shards_rewritten: None,
-                                        },
-                                    );
-                                }
-                                Err(error) => {
-                                    observability::record_shard_repair_error(
-                                        Some(claim.work_item.request.data_pg_id),
-                                        "complete_failed",
-                                        error.diagnostic_kind(),
-                                    );
-                                    let _ = observability::emit_shard_repair_event(
-                                        TRACE_TARGET,
-                                        observability::ShardRepairEventSummary {
-                                            pg_id: Some(claim.work_item.request.data_pg_id),
-                                            event: "complete_failed",
-                                            queue_depth: None,
-                                            shards_rewritten: None,
-                                        },
-                                    );
-                                    let _ = observability::event(
-                                        TRACE_TARGET,
-                                        "shard_repair_complete_error",
-                                        Some(format_args!("error={error}")),
-                                    );
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            let event = if matches!(error, StoreError::NotFound) {
-                                "unrecoverable"
-                            } else {
-                                "failed"
-                            };
-                            observability::record_shard_repair_error(
-                                Some(claim.work_item.request.data_pg_id),
-                                event,
-                                error.diagnostic_kind(),
-                            );
-                            let _ = observability::emit_shard_repair_event(
-                                TRACE_TARGET,
-                                observability::ShardRepairEventSummary {
-                                    pg_id: Some(claim.work_item.request.data_pg_id),
-                                    event,
-                                    queue_depth: None,
-                                    shards_rewritten: None,
-                                },
-                            );
-                            let next_attempt_after = Coordinator::now_millis()
-                                .saturating_add(SHARD_REPAIR_ERROR_BACKOFF_MILLIS);
-                            if let Err(record_error) = storage_cluster
-                                .record_placed_segment_shard_repair_claim_error(
-                                    &claim,
-                                    &error.to_string(),
-                                    next_attempt_after,
-                                )
-                            {
-                                observability::record_shard_repair_error(
-                                    Some(claim.work_item.request.data_pg_id),
-                                    "record_error_failed",
-                                    record_error.diagnostic_kind(),
-                                );
-                                let _ = observability::emit_shard_repair_event(
-                                    TRACE_TARGET,
-                                    observability::ShardRepairEventSummary {
-                                        pg_id: Some(claim.work_item.request.data_pg_id),
-                                        event: "record_error_failed",
-                                        queue_depth: None,
-                                        shards_rewritten: None,
-                                    },
-                                );
-                                let _ = observability::event(
-                                    TRACE_TARGET,
-                                    "shard_repair_record_error_failed",
-                                    Some(format_args!(
-                                        "repair_error={error} record_error={record_error}"
-                                    )),
-                                );
-                            }
-                        }
-                    }
-                }
-            })
-            .map_err(|e| ServerError::InternalError {
-                reason: format!("failed to start shard repair worker: {e}"),
-            })?;
-        *lock_mutex_unpoisoned(&sweeper.handle) = Some(handle);
-        Ok(sweeper)
-    }
-
-    pub(super) fn disabled(storage_handle: StorageClusterRouteHandle) -> Arc<Self> {
-        Arc::new(Self {
-            storage_handle,
-            stop: Arc::new(AtomicBool::new(true)),
-            handle: Mutex::new(None),
-        })
-    }
-}
-
-pub(super) fn shard_repair_cluster_for_work(
-    storage_handle: &StorageClusterRouteHandle,
-) -> Arc<StorageCluster> {
-    storage_handle.current()
 }
 
 impl ShardBackfillSweeper {
@@ -1862,6 +1456,14 @@ pub(super) fn acquire_shard_scavenger_sweeper(
         ServerError::InternalError {
             reason: error.to_string(),
         }
+    })
+}
+
+pub(super) fn acquire_shard_repair_sweeper(
+    storage_handle: &StorageClusterRouteHandle,
+) -> Result<Arc<ShardRepairSweeper>, ServerError> {
+    ShardRepairSweeper::acquire_shared(storage_handle).map_err(|error| ServerError::InternalError {
+        reason: error.to_string(),
     })
 }
 

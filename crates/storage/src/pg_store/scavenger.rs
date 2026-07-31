@@ -98,7 +98,7 @@ impl PgStore {
         Ok(())
     }
 
-    pub fn list_placed_segment_shard_repairs(
+    pub(crate) fn list_placed_segment_shard_repairs(
         &self,
     ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
         let mut stmt = self
@@ -609,7 +609,7 @@ impl PgStore {
         Ok(updated > 0)
     }
 
-    pub fn acquire_placed_segment_shard_repair_claim(
+    pub(crate) fn acquire_placed_segment_shard_repair_claim(
         &self,
         request: &PlacedSegmentShardRepairClaimAcquire,
     ) -> Result<Option<PlacedSegmentShardRepairClaimRecord>, StoreError> {
@@ -731,7 +731,7 @@ impl PgStore {
         )
     }
 
-    pub fn complete_placed_segment_shard_repair_claim(
+    pub(crate) fn complete_placed_segment_shard_repair_claim(
         &self,
         claim: &PlacedSegmentShardRepairClaimRecord,
     ) -> Result<bool, StoreError> {
@@ -792,7 +792,7 @@ impl PgStore {
         }
     }
 
-    pub fn record_placed_segment_shard_repair_claim_error(
+    pub(crate) fn record_placed_segment_shard_repair_claim_error(
         &self,
         claim: &PlacedSegmentShardRepairClaimRecord,
         last_error: &str,
