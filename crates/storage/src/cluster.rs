@@ -44,6 +44,7 @@ use crate::metadata_command::{
     MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimCommand,
     PutObjectMetadataMutation, ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand,
     ReserveObjectVersionCommand, PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+    PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
 };
 #[cfg(any(test, feature = "test-hooks"))]
@@ -10244,7 +10245,7 @@ impl StorageCluster {
         let Some(proof) = Self::metadata_command_bucket_write_reservation_proof(command) else {
             return Ok(());
         };
-        let direct_put_subject_matches = match command.payload() {
+        let command_subject_matches = match command.payload() {
             MetadataCommandPayload::CommitDirectPutObject(commit) => [
                 PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
                 PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
@@ -10258,9 +10259,16 @@ impl StorageCluster {
                     Some(commit.object.key.as_str()),
                 )
             }),
+            MetadataCommandPayload::PutObjectMetadata(update) => proof
+                .matches_exact_mutation_subject(
+                    command.id().cluster_epoch(),
+                    &update.object.bucket,
+                    PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+                    Some(update.object.key.as_str()),
+                ),
             _ => true,
         };
-        if proof.cluster_epoch != command.id().cluster_epoch() || !direct_put_subject_matches {
+        if proof.cluster_epoch != command.id().cluster_epoch() || !command_subject_matches {
             return Err(MetadataError::BucketWriteReservationConflict {
                 reservation_id: proof.reservation_id.clone(),
             }

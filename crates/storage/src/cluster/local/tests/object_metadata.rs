@@ -1,6 +1,109 @@
 use super::*;
 
 #[test]
+fn put_object_metadata_fanout_rejects_live_crossed_reservation_subjects() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let bucket = crate::tests::bucket_name("metadata-crossed-proof-bucket");
+    let key = crate::tests::object_key("metadata-crossed-proof-key");
+    create_test_bucket(&cluster, &bucket);
+    write_committed_direct_segment_for(&cluster, &bucket, &key, b"metadata subject");
+
+    let operation_reservation = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        )
+        .unwrap();
+    let operation_proof =
+        crate::metadata_command::BucketWriteReservationProof::from(&operation_reservation.record);
+    let target_reservation = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+            Some("metadata-crossed-proof-other-key"),
+        )
+        .unwrap();
+    let target_proof =
+        crate::metadata_command::BucketWriteReservationProof::from(&target_reservation.record);
+
+    let pg_id = PgId::new(0);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let live = crate::PgMetadataStore::get_object_meta(
+        &*primary.storage_node().get_pg(pg_id.get()).unwrap(),
+        &bucket,
+        &key,
+    )
+    .unwrap()
+    .into_live()
+    .unwrap();
+    let command_with_proof = |proof| {
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::PutObjectMetadata(Box::new(
+                PutObjectMetadataCommand::from_live_object_and_mutation(
+                    live.clone(),
+                    PutObjectMetadataMutation::PutTags(crate::tests::object_tags(
+                        "<Tagging><TagSet><Tag><Key>crossed</Key><Value>proof</Value></Tag></TagSet></Tagging>",
+                    )),
+                    proof,
+                ),
+            )),
+        )
+    };
+
+    for (case, proof) in [
+        ("operation", operation_proof.clone()),
+        ("target", target_proof),
+    ] {
+        let error = cluster
+            .validate_metadata_command_bucket_write_reservation(&command_with_proof(proof))
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::BucketWriteReservationConflict { .. }
+                )
+            ),
+            "crossed PUT object metadata proof {case} must fail central validation: {error:?}"
+        );
+    }
+
+    let command = command_with_proof(operation_proof);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .unwrap();
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let stored = crate::PgMetadataStore::get_object_meta(
+            &*map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(pg_id.get())
+                .unwrap(),
+            &bucket,
+            &key,
+        )
+        .unwrap();
+        assert_eq!(stored.as_live().unwrap().tags, None);
+    }
+}
+
+#[test]
 fn object_metadata_pending_install_race_drains_winner_and_retries() {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
@@ -55,7 +158,7 @@ fn object_metadata_pending_install_race_drains_winner_and_retries() {
     let hook_proof = acquire_test_bucket_write_proof(
         &first_cluster,
         &bucket,
-        "test-put-object-metadata-race",
+        crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
         Some(second_key.as_str()),
     );
     let _hook_guard = first_cluster.test_install_before_metadata_command_pending_install_hook(
@@ -180,7 +283,7 @@ fn object_metadata_pending_install_race_reruns_precondition_action() {
     let hook_proof = acquire_test_bucket_write_proof(
         &first_cluster,
         &bucket,
-        "test-put-object-metadata-race",
+        crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let _hook_guard = first_cluster.test_install_before_metadata_command_pending_install_hook(

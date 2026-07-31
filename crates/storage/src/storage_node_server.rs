@@ -5942,13 +5942,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::load_put_object_metadata_snapshot(
+        ObjectMutationMetadataNodeClient::open_put_object_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
-            version_id,
         )
+        .and_then(|route| route.load_put_object_metadata_snapshot(version_id))
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -6022,20 +6023,22 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::build_put_object_metadata_command(
+        ObjectMutationMetadataNodeClient::open_put_object_metadata_route(
             &local_client,
-            BuildPutObjectMetadataCommandReq {
-                pg_id: self.route.pg_id,
-                cluster_epoch: self.route.fence.cluster_epoch,
-                bucket: self.route.bucket,
-                key: self.route.key,
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+        )
+        .and_then(|route| {
+            route.build_put_object_metadata_command(BuildPutObjectMetadataCommandReq {
                 requested_version_id,
                 expected_stored,
                 version_id,
                 mutation,
                 bucket_write_reservation,
-            },
-        )
+            })
+        })
         .map_err(StorageNodeObjectRouteError::Object)
     }
 

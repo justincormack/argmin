@@ -29,6 +29,14 @@ struct UnixDirectPutMetadataRoute<'a> {
     key: ObjectKey,
 }
 
+struct UnixPutObjectMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
 struct UnixObjectListingMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
     pg_id: ObjectMetadataScanPgId,
@@ -2196,7 +2204,179 @@ impl RetainedObjectMutationMetadataRoute for UnixRetainedObjectMutationMetadataR
     }
 }
 
+impl UnixPutObjectMetadataRoute<'_> {
+    fn require_request_subject(
+        &self,
+        request: &BuildPutObjectMetadataCommandReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        if request.expected_stored.bucket() != &self.bucket
+            || request.expected_stored.key() != &self.key
+            || !request
+                .bucket_write_reservation
+                .matches_exact_mutation_subject(
+                    self.route_cluster_epoch,
+                    &self.bucket,
+                    crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+                    Some(self.key.as_str()),
+                )
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build PUT object metadata command",
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl PutObjectMetadataRoute for UnixPutObjectMetadataRoute<'_> {
+    fn load_put_object_metadata_snapshot(
+        &self,
+        version_id: Option<VersionId>,
+    ) -> Result<StoredObject, ObjectPgActionError> {
+        let request = StorageRpcPutObjectMetadataSnapshotRequest {
+            object: StorageRpcObjectRequest {
+                node_id: self.client.node_id,
+                cluster_epoch: self.route_cluster_epoch,
+                pg_id: self.pg_id.pg_id(),
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+            },
+            version_id,
+        };
+        let payload = encode_put_object_metadata_snapshot_request(&request);
+        let response = self
+            .client
+            .rpc_request(
+                StorageRpcMessageKind::ObjectMetadataPutSnapshotLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_put_object_metadata_snapshot_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode object metadata PUT snapshot response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcPutObjectMetadataSnapshotOutcome::Loaded(stored) => {
+                self.client.validate_stored_object_response(
+                    &stored,
+                    &self.bucket,
+                    &self.key,
+                    version_id,
+                    "validate object metadata PUT snapshot response",
+                )?;
+                Ok(*stored)
+            }
+            StorageRpcPutObjectMetadataSnapshotOutcome::ObjectNotFound => {
+                Err(ObjectPgActionError::Metadata(MetadataError::ObjectNotFound))
+            }
+        }
+    }
+
+    fn build_put_object_metadata_command(
+        &self,
+        request: BuildPutObjectMetadataCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        self.require_request_subject(&request)?;
+        let rpc_request = StorageRpcPutObjectMetadataCommandBuildRequest {
+            object: StorageRpcObjectRequest {
+                node_id: self.client.node_id,
+                cluster_epoch: self.route_cluster_epoch,
+                pg_id: self.pg_id.pg_id(),
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+            },
+            requested_version_id: request.requested_version_id,
+            expected_stored: request.expected_stored.clone(),
+            version_id: request.version_id,
+            mutation: request.mutation.clone(),
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload =
+            encode_put_object_metadata_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "encode object metadata PUT command build request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .client
+            .rpc_request(
+                StorageRpcMessageKind::ObjectMetadataPutCommandBuild,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_object_metadata_command_build_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode object metadata PUT command build response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
+                self.client.validate_put_object_metadata_command_response(
+                    &command,
+                    self.route_cluster_epoch,
+                    self.pg_id,
+                    &request,
+                )?;
+                Ok(*command)
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => {
+                Err(ObjectPgActionError::StaleObjectReadSubject)
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::Missing => {
+                Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode object metadata PUT command build response",
+                    "PUT metadata command build cannot return missing".to_string(),
+                )))
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(self.client.metadata_command_log_conflict_error(
+                self.pg_id.pg_id(),
+                "decode object metadata PUT command build response",
+                node_id,
+                conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            )),
+        }
+    }
+}
+
 impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
+    fn open_put_object_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn PutObjectMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixPutObjectMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
+    }
+
     fn matching_stream_upload_exists(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -3703,110 +3883,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             self.validate_abort_cleanup_snapshot_response(cleanup, bucket, key, upload_id)?;
         }
         Ok(response.cleanup)
-    }
-
-    fn load_put_object_metadata_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-    ) -> Result<StoredObject, ObjectPgActionError> {
-        let request = StorageRpcPutObjectMetadataSnapshotRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
-            version_id,
-        };
-        let payload = encode_put_object_metadata_snapshot_request(&request);
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectMetadataPutSnapshotLoad,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_put_object_metadata_snapshot_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode object metadata PUT snapshot response",
-                    error.to_string(),
-                ))
-            })?;
-        match response.outcome {
-            StorageRpcPutObjectMetadataSnapshotOutcome::Loaded(stored) => {
-                self.validate_stored_object_response(
-                    &stored,
-                    bucket,
-                    key,
-                    version_id,
-                    "validate object metadata PUT snapshot response",
-                )?;
-                Ok(*stored)
-            }
-            StorageRpcPutObjectMetadataSnapshotOutcome::ObjectNotFound => {
-                Err(ObjectPgActionError::Metadata(MetadataError::ObjectNotFound))
-            }
-        }
-    }
-
-    fn build_put_object_metadata_command(
-        &self,
-        request: BuildPutObjectMetadataCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let rpc_request = StorageRpcPutObjectMetadataCommandBuildRequest {
-            object: self.object_request(request.pg_id.pg_id(), request.bucket, request.key),
-            requested_version_id: request.requested_version_id,
-            expected_stored: request.expected_stored.clone(),
-            version_id: request.version_id,
-            mutation: request.mutation.clone(),
-            bucket_write_reservation: request.bucket_write_reservation.clone(),
-        };
-        let payload =
-            encode_put_object_metadata_command_build_request(&rpc_request).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "encode object metadata PUT command build request",
-                    error.to_string(),
-                ))
-            })?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectMetadataPutCommandBuild,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_object_metadata_command_build_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode object metadata PUT command build response",
-                    error.to_string(),
-                ))
-            })?;
-        match response.outcome {
-            StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
-                self.validate_put_object_metadata_command_response(&command, &request)?;
-                Ok(*command)
-            }
-            StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => {
-                Err(ObjectPgActionError::StaleObjectReadSubject)
-            }
-            StorageRpcObjectMetadataCommandBuildOutcome::Missing => {
-                Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode object metadata PUT command build response",
-                    "PUT metadata command build cannot return missing".to_string(),
-                )))
-            }
-            StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
-                node_id,
-                pg_id: conflict_pg_id,
-                cluster_epoch,
-                log_index,
-            } => Err(self.metadata_command_log_conflict_error(
-                request.pg_id.pg_id(),
-                "decode object metadata PUT command build response",
-                node_id,
-                conflict_pg_id,
-                cluster_epoch,
-                log_index,
-            )),
-        }
     }
 
     fn load_current_object_delete_snapshot(

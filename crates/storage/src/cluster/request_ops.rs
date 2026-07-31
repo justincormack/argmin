@@ -9387,6 +9387,12 @@ impl super::StorageCluster {
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
                 .object_mutation_metadata_client();
+            let put_object_metadata_route = storage_client.open_put_object_metadata_route(
+                self.operation_epoch(),
+                object_pg_id,
+                bucket,
+                key,
+            )?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if let MetadataCommandPayload::PutObjectMetadata(update) = command.payload() {
                     if update.object.bucket == *bucket && update.object.key == *key {
@@ -9400,12 +9406,8 @@ impl super::StorageCluster {
                             }
                             None => None,
                         };
-                        let stored = storage_client.load_put_object_metadata_snapshot(
-                            object_pg_id,
-                            bucket,
-                            key,
-                            snapshot_version_id,
-                        )?;
+                        let stored = put_object_metadata_route
+                            .load_put_object_metadata_snapshot(snapshot_version_id)?;
                         if stored.version_id() != update.object.version_id {
                             self.drain_pending_object_metadata_command(pg_id, &command)?;
                             continue;
@@ -9477,12 +9479,9 @@ impl super::StorageCluster {
                 release_bucket_write_proof!()?;
                 return Err(ObjectPgActionError::Store(error));
             }
-            let stored = match storage_client.load_put_object_metadata_snapshot(
-                object_pg_id,
-                bucket,
-                key,
-                requested_version_id,
-            ) {
+            let stored = match put_object_metadata_route
+                .load_put_object_metadata_snapshot(requested_version_id)
+            {
                 Ok(stored) => stored,
                 Err(error) => {
                     release_bucket_write_proof!()?;
@@ -9500,12 +9499,8 @@ impl super::StorageCluster {
                 release_bucket_write_proof!()?;
                 return Err(ObjectPgActionError::Store(error));
             }
-            let command = match storage_client.build_put_object_metadata_command(
+            let command = match put_object_metadata_route.build_put_object_metadata_command(
                 BuildPutObjectMetadataCommandReq {
-                    pg_id: object_pg_id,
-                    cluster_epoch: self.operation_epoch(),
-                    bucket,
-                    key,
                     requested_version_id,
                     expected_stored: &stored,
                     version_id,

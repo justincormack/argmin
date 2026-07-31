@@ -654,7 +654,7 @@ Node-client role classification (2026-07-19):
 | `ObjectVersionMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; ordinary and completion-priority version inspection retain distinct admission classes within that route |
 | `DirectPutMetadataNodeClient` | object metadata | opens an active primary route bound to one epoch, exact object PG, bucket, and key; commit snapshot and command construction cannot replace route identity |
 | `ObjectListingMetadataNodeClient` | object metadata scan | active object-metadata route for the scanned PG; listing fan-out constructs one capability per routed PG |
-| `ObjectMutationMetadataNodeClient` | object metadata | active object route for object, multipart, stream-session, and payload-reclaim mutation |
+| `ObjectMutationMetadataNodeClient` | object metadata | PUT-object metadata snapshots and command builds open an active route bound to one epoch, exact object PG, bucket, and key; the remaining object, multipart, stream-session, and payload-reclaim families still require their corresponding scoped routes |
 | `RetainedObjectMutationMetadataNodeClient` | object metadata | opens a retained route bound to one epoch, object-metadata PG, bucket, and key; the returned interface prepares stream aborts and releases payload-reclaim claims without accepting replacement route or object arguments |
 | `ObjectReadMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; version selection and subject-identity validation remain operations within that fixed route, with payload reads separately retaining their read lease |
 | `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active placed-shard I/O opens an exact route bound to one node, epoch, data PG, shard index, and shard key; shard acknowledgement, current-placement cleanup, and repair/backfill work open an active route bound to one epoch and data PG |
@@ -4414,6 +4414,37 @@ One-hundred-and-tenth Phase 3 slice:
   pending command without publishing an object.
 - all 2,487 storage tests pass. Formatting, the storage boundary checker,
   workspace-wide strict Clippy, and the full 7,819-test workspace suite also
+  pass.
+
+One-hundred-and-eleventh Phase 3 slice:
+
+- ordinary PUT-object metadata mutation now opens a `PutObjectMetadataRoute`
+  bound to one active cluster epoch, exact object-metadata primary PG, bucket,
+  and key. Snapshot loading accepts only version selection within that subject;
+  command construction no longer accepts replaceable PG, epoch, bucket, or key
+  fields.
+- embedded route construction validates exact object placement and an open PG
+  before storage access. Unix construction rejects a foreign epoch before
+  transport and owns the wire object subject. Storage-node dispatch retains
+  independent active admission-domain, route, placement, primary, and captured
+  deadline checks before opening the embedded route.
+- command construction requires the carried reservation proof to match the
+  canonical `put-object-metadata` operation, exact key target, bucket, and route
+  epoch before storage or transport access. Metadata-command fanout and
+  recovery independently enforce the same stable subject, so a malformed
+  pending command cannot bypass the scoped builder.
+- embedded coverage rejects a configured crossed PG before storage, a
+  no-listener Unix regression rejects a foreign epoch before RPC, and the
+  installed equivalent-state matrix continues to require `PayloadDecode` for
+  wrong-PG snapshot and command operations. Crossed operation, target, and
+  epoch proofs fail locally before another RPC. A recovery regression uses
+  live same-bucket crossed reservations and proves malformed pending work is
+  abandoned without changing the object on any acting-set node.
+- the transitional boundary check now recognizes only the scoped PUT-object
+  metadata route as the permitted receiver for snapshot reads and command
+  builds. Other active object-mutation method families remain open in Phase 3.
+- all 2,499 storage tests pass. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full 7,825-test workspace suite also
   pass.
 
 ### Phase 4 — type metadata-command publication

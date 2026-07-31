@@ -100,6 +100,14 @@ struct LocalDirectPutMetadataRoute<'a> {
     key: ObjectKey,
 }
 
+struct LocalPutObjectMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
 struct LocalObjectListingMetadataRoute {
     storage_node: Arc<SharedStorageNode>,
     _route_cluster_epoch: ClusterEpoch,
@@ -2170,20 +2178,49 @@ impl RetainedObjectMutationMetadataRoute for LocalRetainedObjectMutationMetadata
     }
 }
 
-impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
+impl LocalPutObjectMetadataRoute<'_> {
+    fn require_request_subject(
+        &self,
+        request: &BuildPutObjectMetadataCommandReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        if request.expected_stored.bucket() != &self.bucket
+            || request.expected_stored.key() != &self.key
+            || !request
+                .bucket_write_reservation
+                .matches_exact_mutation_subject(
+                    self.route_cluster_epoch,
+                    &self.bucket,
+                    crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+                    Some(self.key.as_str()),
+                )
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build PUT object metadata command",
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl PutObjectMetadataRoute for LocalPutObjectMetadataRoute<'_> {
     fn load_put_object_metadata_snapshot(
         &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
         version_id: Option<VersionId>,
     ) -> Result<StoredObject, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         match version_id {
             Some(version_id) => Ok(PgMetadataStore::get_object_version(
-                &*pg, bucket, key, version_id,
+                &*pg,
+                &self.bucket,
+                &self.key,
+                version_id,
             )?),
-            None => Ok(PgMetadataStore::get_object_meta(&*pg, bucket, key)?),
+            None => Ok(PgMetadataStore::get_object_meta(
+                &*pg,
+                &self.bucket,
+                &self.key,
+            )?),
         }
     }
 
@@ -2191,12 +2228,13 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         &self,
         request: BuildPutObjectMetadataCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        self.require_request_subject(&request)?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         let current = match request.requested_version_id {
             Some(version_id) => {
-                PgMetadataStore::get_object_version(&*pg, request.bucket, request.key, version_id)
+                PgMetadataStore::get_object_version(&*pg, &self.bucket, &self.key, version_id)
             }
-            None => PgMetadataStore::get_object_meta(&*pg, request.bucket, request.key),
+            None => PgMetadataStore::get_object_meta(&*pg, &self.bucket, &self.key),
         };
         let current = match current {
             Ok(current) => current,
@@ -2220,9 +2258,9 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         let live = current
             .as_live()
             .ok_or(MetadataError::MethodNotAllowedOnDeleteMarker)?;
-        let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
+        let command_id = self.client.next_metadata_command_id_from_locked_pg(
+            self.pg_id.pg_id(),
+            self.route_cluster_epoch,
             &pg,
         )?;
         Ok(MetadataCommandEnvelope::new(
@@ -2235,6 +2273,31 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
                 ),
             )),
         ))
+    }
+}
+
+impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
+    fn open_put_object_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn PutObjectMetadataRoute + '_>, ObjectPgActionError> {
+        if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open PUT object metadata route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalPutObjectMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
     }
 
     fn load_current_object_delete_snapshot(

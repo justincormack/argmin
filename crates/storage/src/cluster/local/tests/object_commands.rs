@@ -1774,7 +1774,7 @@ fn object_metadata_retry_rejects_same_mutation_with_mismatched_post_image() {
     let proof = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "test-put-object-metadata",
+        crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let command = MetadataCommandEnvelope::new(
@@ -1847,7 +1847,7 @@ fn object_metadata_command_rejects_non_metadata_post_image_mismatch() {
     let proof = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "test-put-object-metadata",
+        crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let command = MetadataCommandEnvelope::new(
@@ -2656,7 +2656,7 @@ fn lifecycle_noncurrent_pending_install_race_reruns_selector() {
     let hook_proof = acquire_test_bucket_write_proof(
         &first_cluster,
         &bucket,
-        "test-put-object-metadata-race",
+        crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let _hook_guard = first_cluster.test_install_before_metadata_command_pending_install_hook(
@@ -2822,7 +2822,7 @@ fn lifecycle_noncurrent_command_id_race_drains_winner_and_reruns_selector() {
     let install_proof = acquire_test_bucket_write_proof(
         &first_cluster,
         &bucket,
-        "test-put-object-metadata-race",
+        crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let reclaimed = first_cluster

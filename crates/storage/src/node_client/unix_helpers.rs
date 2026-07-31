@@ -618,13 +618,15 @@ impl UnixStorageNodeClient {
     pub(super) fn validate_put_object_metadata_command_response(
         &self,
         command: &MetadataCommandEnvelope,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
         request: &BuildPutObjectMetadataCommandReq<'_>,
     ) -> Result<(), ObjectPgActionError> {
         let context = "validate object metadata PUT command build response";
         self.validate_object_metadata_command_route(
             command,
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
+            pg_id.pg_id(),
+            route_cluster_epoch,
             context,
         )?;
         let MetadataCommandPayload::PutObjectMetadata(update) = command.payload() else {

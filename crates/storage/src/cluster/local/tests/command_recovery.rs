@@ -7614,7 +7614,7 @@ fn direct_put_commit_returns_contention_after_unrelated_partial_exact_pending_co
     let proof = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "test-put-object-metadata",
+        crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
         Some(pending_key.as_str()),
     );
     let pending_command = MetadataCommandEnvelope::new(

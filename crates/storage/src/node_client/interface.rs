@@ -516,18 +516,13 @@ pub(crate) trait ObjectListingMetadataRoute: Send {
 }
 
 pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
-    fn load_put_object_metadata_snapshot(
+    fn open_put_object_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
-        version_id: Option<VersionId>,
-    ) -> Result<StoredObject, ObjectPgActionError>;
-
-    fn build_put_object_metadata_command(
-        &self,
-        request: BuildPutObjectMetadataCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+    ) -> Result<Box<dyn PutObjectMetadataRoute + '_>, ObjectPgActionError>;
 
     fn load_current_object_delete_snapshot(
         &self,
@@ -814,6 +809,18 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
 }
 
+pub(crate) trait PutObjectMetadataRoute: Send {
+    fn load_put_object_metadata_snapshot(
+        &self,
+        version_id: Option<VersionId>,
+    ) -> Result<StoredObject, ObjectPgActionError>;
+
+    fn build_put_object_metadata_command(
+        &self,
+        request: BuildPutObjectMetadataCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+}
+
 /// Cleanup authority for exact object-metadata subjects which may need to
 /// outlive the active route that created them.
 pub(crate) trait RetainedObjectMutationMetadataNodeClient: Send + Sync {
@@ -985,10 +992,6 @@ pub(crate) struct BuildAuthorizedAbortMultipartUploadCommandReq<'a> {
 }
 
 pub(crate) struct BuildPutObjectMetadataCommandReq<'a> {
-    pub(crate) pg_id: ObjectMetadataPgId,
-    pub(crate) cluster_epoch: ClusterEpoch,
-    pub(crate) bucket: &'a BucketName,
-    pub(crate) key: &'a ObjectKey,
     pub(crate) requested_version_id: Option<VersionId>,
     pub(crate) expected_stored: &'a StoredObject,
     pub(crate) version_id: VersionId,

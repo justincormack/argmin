@@ -1116,7 +1116,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..39)
+    let server_threads: Vec<_> = (0..36)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -1129,6 +1129,22 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     );
     let wrong_object_pg = ObjectMetadataPgId::new_for_test(PgId::new(wrong_pg_id));
     let correct_object_pg = ObjectMetadataPgId::new_for_test(PgId::new(correct_pg_id));
+    let metadata_route = ObjectMutationMetadataNodeClient::open_put_object_metadata_route(
+        &client,
+        ClusterEpoch::INITIAL,
+        correct_object_pg,
+        &bucket,
+        &key,
+    )
+    .unwrap();
+    let wrong_metadata_route = ObjectMutationMetadataNodeClient::open_put_object_metadata_route(
+        &client,
+        ClusterEpoch::INITIAL,
+        wrong_object_pg,
+        &bucket,
+        &key,
+    )
+    .unwrap();
 
     let wrong_generation_route =
         ObjectGenerationMetadataNodeClient::open_object_generation_metadata_route(
@@ -1272,22 +1288,11 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         })
     ));
 
-    let metadata_stored = ObjectMutationMetadataNodeClient::load_put_object_metadata_snapshot(
-        &client,
-        correct_object_pg,
-        &bucket,
-        &key,
-        None,
-    )
-    .unwrap();
-    let metadata_snapshot_error =
-        ObjectMutationMetadataNodeClient::load_put_object_metadata_snapshot(
-            &client,
-            wrong_object_pg,
-            &bucket,
-            &key,
-            None,
-        )
+    let metadata_stored = metadata_route
+        .load_put_object_metadata_snapshot(None)
+        .unwrap();
+    let metadata_snapshot_error = wrong_metadata_route
+        .load_put_object_metadata_snapshot(None)
         .unwrap_err();
     assert!(matches!(
         metadata_snapshot_error,
@@ -1767,48 +1772,34 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         ("target", wrong_target_proof),
         ("epoch", wrong_epoch_proof),
     ] {
-        let error = ObjectMutationMetadataNodeClient::build_put_object_metadata_command(
-            &client,
-            BuildPutObjectMetadataCommandReq {
-                pg_id: correct_object_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
+        let error = metadata_route
+            .build_put_object_metadata_command(BuildPutObjectMetadataCommandReq {
                 requested_version_id: None,
                 expected_stored: &metadata_stored,
                 version_id: VersionId::Null,
                 mutation: PutObjectMetadataMutation::PutTags(SerializedTagSet::default()),
                 bucket_write_reservation: &proof,
-            },
-        )
-        .unwrap_err();
+            })
+            .unwrap_err();
         assert!(
             matches!(
                 error,
-                ObjectPgActionError::Store(StoreError::StorageRpc {
-                    failure: StorageRpcErrorCode::PayloadDecode,
-                    ..
+                ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "build PUT object metadata command",
                 })
             ),
-            "same-bucket proof with mismatched {mismatch} must fail as PayloadDecode: {error:?}"
+            "same-bucket proof with mismatched {mismatch} must fail before RPC: {error:?}"
         );
     }
 
-    let metadata_command_error =
-        ObjectMutationMetadataNodeClient::build_put_object_metadata_command(
-            &client,
-            BuildPutObjectMetadataCommandReq {
-                pg_id: wrong_object_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                requested_version_id: None,
-                expected_stored: &metadata_stored,
-                version_id: VersionId::Null,
-                mutation: PutObjectMetadataMutation::PutTags(SerializedTagSet::default()),
-                bucket_write_reservation: &metadata_proof,
-            },
-        )
+    let metadata_command_error = wrong_metadata_route
+        .build_put_object_metadata_command(BuildPutObjectMetadataCommandReq {
+            requested_version_id: None,
+            expected_stored: &metadata_stored,
+            version_id: VersionId::Null,
+            mutation: PutObjectMetadataMutation::PutTags(SerializedTagSet::default()),
+            bucket_write_reservation: &metadata_proof,
+        })
         .unwrap_err();
     assert!(matches!(
         metadata_command_error,
@@ -3310,32 +3301,29 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     upload_part_stream_proof.operation_kind =
         crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
 
-    let stored = ObjectMutationMetadataNodeClient::load_put_object_metadata_snapshot(
+    let metadata_route = ObjectMutationMetadataNodeClient::open_put_object_metadata_route(
         &client,
+        ClusterEpoch::INITIAL,
         ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
-        None,
     )
     .unwrap();
+    let stored = metadata_route
+        .load_put_object_metadata_snapshot(None)
+        .unwrap();
     assert_eq!(stored.bucket(), &bucket);
     assert_eq!(stored.key(), &key);
 
-    let put_command = ObjectMutationMetadataNodeClient::build_put_object_metadata_command(
-        &client,
-        BuildPutObjectMetadataCommandReq {
-            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
-            bucket: &bucket,
-            key: &key,
+    let put_command = metadata_route
+        .build_put_object_metadata_command(BuildPutObjectMetadataCommandReq {
             requested_version_id: None,
             expected_stored: &stored,
             version_id: VersionId::Null,
             mutation: PutObjectMetadataMutation::PutTags(SerializedTagSet::default()),
             bucket_write_reservation: &metadata_proof,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert!(matches!(
         put_command.payload(),
         MetadataCommandPayload::PutObjectMetadata(update)
