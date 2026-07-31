@@ -127,6 +127,384 @@ fn multipart_abort_route_rejects_a_crossed_object_subject_before_mutation() {
 }
 
 #[test]
+fn multipart_abort_fanout_rejects_live_crossed_reservation_subjects() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let bucket = crate::tests::bucket_name("abort-crossed-proof-bucket");
+    let crossed_bucket = crate::tests::bucket_name("abort-crossed-proof-other-bucket");
+    let key = crate::tests::object_key("abort-crossed-proof-key");
+    let upload_id = upload_id_from_label("abortcrossedproof");
+    create_test_bucket(&cluster, &bucket);
+    create_test_bucket(&cluster, &crossed_bucket);
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    cluster
+        .create_multipart_upload(
+            &bucket,
+            &key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing_object| {
+                assert!(existing_object.is_none());
+                Ok::<_, ()>(((), create.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+    let pg_id = PgId::new(0);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let cleanup = primary
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap()
+        .prepare_abort_multipart_upload_cleanup(&bucket, &key, &upload_id)
+        .unwrap()
+        .expect("seeded upload must be abortable");
+    let correct_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let crossed_operation_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let crossed_target_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+        Some("abort-crossed-proof-other-key"),
+    );
+    let crossed_bucket_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &crossed_bucket,
+        crate::metadata_command::ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let command = |proof| {
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                upload_id: upload_id.clone(),
+                cleanup: cleanup.clone(),
+                bucket_write_reservation: proof,
+            })),
+        )
+    };
+
+    cluster
+        .validate_metadata_command_bucket_write_reservation(&command(correct_proof))
+        .unwrap();
+    for (case, proof) in [
+        ("operation", crossed_operation_proof.clone()),
+        ("target", crossed_target_proof),
+        ("bucket", crossed_bucket_proof),
+    ] {
+        let error = cluster
+            .validate_metadata_command_bucket_write_reservation(&command(proof))
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::BucketWriteReservationConflict { .. }
+                )
+            ),
+            "crossed multipart abort proof {case} must fail central validation: {error:?}"
+        );
+    }
+
+    let reservations_before = node_ids.map(|node_id| {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*pg, &bucket).unwrap()
+    });
+    assert!(reservations_before.iter().flatten().any(|reservation| {
+        reservation.reservation_id == crossed_operation_proof.reservation_id
+    }));
+    let malformed = command(crossed_operation_proof.clone());
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &malformed);
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .unwrap();
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for (node_id, expected_reservations) in node_ids.into_iter().zip(reservations_before) {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap(),
+            cleanup.upload,
+            "crossed abort recovery must preserve the upload on node {node_id:?}"
+        );
+        assert_eq!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*pg, &bucket).unwrap(),
+            expected_reservations,
+            "crossed abort recovery must not release the unrelated reservation on node {node_id:?}"
+        );
+    }
+
+    let co_crossed_key = crate::tests::object_key("abort-co-crossed-proof-key");
+    let co_crossed_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &crossed_bucket,
+        crate::metadata_command::ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+        Some(co_crossed_key.as_str()),
+    );
+    let co_crossed_command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
+            bucket: crossed_bucket.clone(),
+            key: co_crossed_key,
+            upload_id: upload_id.clone(),
+            cleanup: cleanup.clone(),
+            bucket_write_reservation: co_crossed_proof.clone(),
+        })),
+    );
+    let error = cluster
+        .validate_metadata_command_bucket_write_reservation(&co_crossed_command)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::BucketSnapshotLoadError::Metadata(
+            crate::MetadataError::BucketWriteReservationConflict { .. }
+        )
+    ));
+    let co_crossed_reservations_before = node_ids.map(|node_id| {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*pg, &crossed_bucket).unwrap()
+    });
+    assert!(co_crossed_reservations_before
+        .iter()
+        .flatten()
+        .any(|reservation| reservation.reservation_id == co_crossed_proof.reservation_id));
+    insert_pending_metadata_command_for_test(&map, pg_id, &crossed_bucket, &co_crossed_command);
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &crossed_bucket)
+        .unwrap();
+    assert!(pending_metadata_command_for_test(&map, pg_id, &crossed_bucket).is_none());
+    for (node_id, expected_reservations) in node_ids.into_iter().zip(co_crossed_reservations_before)
+    {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap(),
+            cleanup.upload,
+            "co-crossed abort recovery must preserve the upload on node {node_id:?}"
+        );
+        assert_eq!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(
+                &*pg,
+                &crossed_bucket,
+            )
+            .unwrap(),
+            expected_reservations,
+            "co-crossed abort recovery must not release the unrelated reservation on node {node_id:?}"
+        );
+    }
+}
+
+#[test]
+fn multipart_abort_recovery_rejects_forged_part_segment_cleanup() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let bucket = crate::tests::bucket_name("abort-forged-cleanup-bucket");
+    let target_key = crate::tests::object_key("abort-forged-cleanup-target");
+    let source_key = crate::tests::object_key("abort-forged-cleanup-source");
+    let target_upload_id = upload_id_from_label("abortforgedtarget");
+    let source_upload_id = upload_id_from_label("abortforgedsource");
+    create_test_bucket(&cluster, &bucket);
+    for (key, upload_id) in [
+        (&target_key, &target_upload_id),
+        (&source_key, &source_upload_id),
+    ] {
+        let create = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: crate::OwnerIdentity::from_principal("initiator"),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        cluster
+            .create_multipart_upload(
+                &bucket,
+                key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), create.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+    }
+    let (source_shard_keys, source_part, source_segment) = upload_streamed_test_multipart_part(
+        &cluster,
+        &bucket,
+        &source_key,
+        &source_upload_id,
+        1,
+        [0x5a; 16],
+        b"unrelated multipart payload",
+    );
+
+    let pg_id = PgId::new(0);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let mut cleanup = primary
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap()
+        .prepare_abort_multipart_upload_cleanup(&bucket, &target_key, &target_upload_id)
+        .unwrap()
+        .expect("target upload must be abortable");
+    assert!(cleanup.parts.is_empty());
+    assert!(cleanup.streaming_segments.is_empty());
+    let mut forged_segment = source_segment.clone();
+    forged_segment.key = target_key.clone();
+    forged_segment.upload_id = target_upload_id.clone();
+    cleanup.streaming_segments.push(forged_segment);
+    let proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+        Some(target_key.as_str()),
+    );
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
+            bucket: bucket.clone(),
+            key: target_key.clone(),
+            upload_id: target_upload_id.clone(),
+            cleanup: cleanup.clone(),
+            bucket_write_reservation: proof,
+        })),
+    );
+    cluster
+        .validate_metadata_command_bucket_write_reservation(&command)
+        .unwrap();
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let error = cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Metadata(crate::MetadataError::InvariantViolation {
+            context: "abort multipart upload command (part segments mismatch)",
+            ..
+        })
+    ));
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command),
+        "malformed cleanup must remain pending rather than be certified as applied"
+    );
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_multipart_upload(&*pg, &target_upload_id).unwrap(),
+            cleanup.upload
+        );
+        assert!(crate::PgMetadataStore::get_multipart_upload(&*pg, &source_upload_id).is_ok());
+        assert_eq!(
+            crate::PgMetadataStore::get_multipart_part(&*pg, &source_upload_id, 1).unwrap(),
+            source_part
+        );
+        assert_eq!(
+            crate::PgMetadataStore::get_all_multipart_part_segments_for_upload(
+                &*pg,
+                &source_upload_id,
+            )
+            .unwrap(),
+            vec![source_segment.clone()]
+        );
+    }
+    for (shard_index, shard_key) in source_shard_keys.iter().enumerate() {
+        assert!(
+            cluster
+                .test_payload_shard_file_exists(
+                    source_segment.data_pg_id,
+                    ec_shape,
+                    &source_segment.segment_okh,
+                    source_segment.segment_vid,
+                    shard_index as u8,
+                )
+                .unwrap(),
+            "forged abort cleanup must not delete unrelated shard {shard_key:?}"
+        );
+    }
+}
+
+#[test]
 fn multipart_routes_bind_crossed_same_pg_upload_subjects() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

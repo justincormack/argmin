@@ -563,6 +563,15 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         key: &ObjectKey,
     ) -> Result<Box<dyn MultipartCompletionMutationMetadataRoute + '_>, ObjectPgActionError>;
 
+    fn open_multipart_abort_mutation_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<Box<dyn MultipartAbortMutationMetadataRoute + '_>, ObjectPgActionError>;
+
     fn matching_stream_upload_exists(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -714,24 +723,6 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         &self,
         request: BuildStreamPartCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
-
-    fn load_abort_multipart_upload_cleanup(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError>;
-
-    fn build_abort_multipart_upload_command(
-        &self,
-        request: BuildAbortMultipartUploadCommandReq<'_>,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
-
-    fn build_authorized_abort_multipart_upload_command(
-        &self,
-        request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
 }
 
 pub(crate) trait PutObjectMetadataRoute: Send {
@@ -753,6 +744,20 @@ pub(crate) trait MultipartCompletionMutationMetadataRoute: Send {
         &self,
         request: BuildCompleteMultipartObjectCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+}
+
+pub(crate) trait MultipartAbortMutationMetadataRoute: Send {
+    fn load_cleanup(&self) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError>;
+
+    fn build_abort_multipart_upload_command(
+        &self,
+        request: BuildAbortMultipartUploadCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
+
+    fn build_authorized_abort_multipart_upload_command(
+        &self,
+        request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
 }
 
 pub(crate) trait ObjectDeleteMetadataRoute: Send {
@@ -1038,6 +1043,49 @@ pub(crate) fn require_multipart_completion_mutation_subject(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct MultipartAbortMutationSubject<'a> {
+    pub(crate) route_cluster_epoch: ClusterEpoch,
+    pub(crate) bucket: &'a BucketName,
+    pub(crate) key: &'a ObjectKey,
+    pub(crate) upload_id: &'a UploadId,
+}
+
+pub(crate) fn require_multipart_abort_mutation_subject(
+    subject: MultipartAbortMutationSubject<'_>,
+    authorized_upload: Option<&AuthorizedMultipartUploadRecord>,
+    expected_cleanup: Option<&AbortMultipartUploadCleanup>,
+    bucket_write_reservation: &BucketWriteReservationProof,
+    operation: &'static str,
+) -> Result<(), ObjectPgActionError> {
+    let MultipartAbortMutationSubject {
+        route_cluster_epoch,
+        bucket,
+        key,
+        upload_id,
+    } = subject;
+    let authorized_record = authorized_upload.map(AuthorizedMultipartUploadRecord::record);
+    let invalid_authorized_upload = authorized_record.is_some_and(|upload| {
+        upload.bucket != *bucket || upload.key != *key || upload.upload_id != *upload_id
+    });
+    let invalid_cleanup = expected_cleanup.is_some_and(|cleanup| {
+        !cleanup.matches_upload_subject(bucket, key, upload_id)
+            || authorized_record.is_some_and(|upload| cleanup.upload != *upload)
+    });
+    if invalid_authorized_upload
+        || invalid_cleanup
+        || !bucket_write_reservation.matches_exact_mutation_subject(
+            route_cluster_epoch,
+            bucket,
+            crate::metadata_command::ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        )
+    {
+        return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+    }
+    Ok(())
+}
+
 pub(crate) struct AbortMultipartCommandValidation<'a> {
     pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -1049,21 +1097,14 @@ pub(crate) struct AbortMultipartCommandValidation<'a> {
 }
 
 pub(crate) struct BuildAbortMultipartUploadCommandReq<'a> {
-    pub(crate) pg_id: ObjectMetadataPgId,
-    pub(crate) cluster_epoch: ClusterEpoch,
-    pub(crate) bucket: &'a BucketName,
-    pub(crate) key: &'a ObjectKey,
-    pub(crate) upload_id: &'a UploadId,
     pub(crate) expected_cleanup: Option<&'a AbortMultipartUploadCleanup>,
-    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+    pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
 }
 
 pub(crate) struct BuildAuthorizedAbortMultipartUploadCommandReq<'a> {
-    pub(crate) pg_id: ObjectMetadataPgId,
-    pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) authorized_upload: &'a AuthorizedMultipartUploadRecord,
     pub(crate) expected_cleanup: Option<&'a AbortMultipartUploadCleanup>,
-    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+    pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
 }
 
 pub(crate) struct BuildPutObjectMetadataCommandReq<'a> {

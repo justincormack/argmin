@@ -6646,7 +6646,7 @@ fn abort_stream_upload_command_binds_stable_reservation_identity() {
 }
 
 #[test]
-fn abort_multipart_command_accepts_lagging_stream_allocator_floor() {
+fn abort_multipart_command_validates_cleanup_before_accepting_lagging_stream_allocator_floor() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();
     let upload_id = UploadId::new("v".repeat(UPLOAD_ID_LEN)).unwrap();
@@ -6701,6 +6701,75 @@ fn abort_multipart_command_accepts_lagging_stream_allocator_floor() {
         },
         bucket_write_reservation,
     };
+
+    let mut mismatched_parts = command.clone();
+    mismatched_parts.cleanup.parts.push(MultipartPartRecord {
+        upload_id: upload_id.clone(),
+        part_number: 2,
+        generation: 0,
+        size: 1,
+        payload_crc64: 1,
+        etag: vec![1; 8],
+        etag_kind: EtagKind::Crc64,
+        part_vid: GenerationId::MIN,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
+        ec_k: 1,
+        ec_m: 0,
+        last_modified: 1,
+        checksum: None,
+    });
+    assert!(matches!(
+        store.apply_abort_multipart_upload_command(&mismatched_parts),
+        Err(MetadataError::InvariantViolation {
+            context: "abort multipart upload command (parts mismatch)",
+            ..
+        })
+    ));
+    assert_eq!(
+        store.get_multipart_upload(&upload_id).unwrap(),
+        command.cleanup.upload
+    );
+    assert_eq!(
+        store.get_stream_upload(&session.session_id).unwrap(),
+        session
+    );
+
+    let mut mismatched_segments = command.clone();
+    mismatched_segments
+        .cleanup
+        .streaming_segments
+        .push(MultipartPartSegmentRecord {
+            bucket: command.bucket.clone(),
+            key: command.key.clone(),
+            upload_id: upload_id.clone(),
+            version_id: MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
+            part_number: 2,
+            segment_index: 0,
+            size: 1,
+            segment_crc64: 1,
+            segment_okh: [1; 16],
+            segment_vid: GenerationId::MIN,
+            data_pg_id: 0,
+            placement_cluster_epoch: ClusterEpoch::INITIAL,
+            ec_k: 1,
+            ec_m: 0,
+        });
+    assert!(matches!(
+        store.apply_abort_multipart_upload_command(&mismatched_segments),
+        Err(MetadataError::InvariantViolation {
+            context: "abort multipart upload command (part segments mismatch)",
+            ..
+        })
+    ));
+    assert_eq!(
+        store.get_multipart_upload(&upload_id).unwrap(),
+        command.cleanup.upload
+    );
+    assert_eq!(
+        store.get_stream_upload(&session.session_id).unwrap(),
+        session
+    );
+
     store
         .apply_abort_multipart_upload_command(&command)
         .unwrap();

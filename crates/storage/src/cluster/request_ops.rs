@@ -15489,17 +15489,18 @@ impl super::StorageCluster {
         bucket_write_reservation: BucketWriteReservationProof,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        let expected_cleanup =
-            mutation_client.load_abort_multipart_upload_cleanup(pg_id, bucket, key, upload_id)?;
-        mutation_client.build_abort_multipart_upload_command(
+        let multipart_abort_route = mutation_client.open_multipart_abort_mutation_metadata_route(
+            self.operation_epoch(),
+            pg_id,
+            bucket,
+            key,
+            upload_id,
+        )?;
+        let expected_cleanup = multipart_abort_route.load_cleanup()?;
+        multipart_abort_route.build_abort_multipart_upload_command(
             crate::node_client::BuildAbortMultipartUploadCommandReq {
-                pg_id,
-                cluster_epoch: self.operation_epoch(),
-                bucket,
-                key,
-                upload_id,
                 expected_cleanup: expected_cleanup.as_ref(),
-                bucket_write_reservation,
+                bucket_write_reservation: &bucket_write_reservation,
             },
         )
     }
@@ -15514,25 +15515,25 @@ impl super::StorageCluster {
             &authorized_upload.record().bucket,
             &authorized_upload.record().key,
         )?;
-        let expected_cleanup = mutation_client.load_abort_multipart_upload_cleanup(
+        let multipart_abort_route = mutation_client.open_multipart_abort_mutation_metadata_route(
+            self.operation_epoch(),
             pg_id,
             &authorized_upload.record().bucket,
             &authorized_upload.record().key,
             &authorized_upload.record().upload_id,
         )?;
+        let expected_cleanup = multipart_abort_route.load_cleanup()?;
         if expected_cleanup
             .as_ref()
             .is_some_and(|cleanup| cleanup.upload != *authorized_upload.record())
         {
             return Ok(None);
         }
-        mutation_client.build_authorized_abort_multipart_upload_command(
+        multipart_abort_route.build_authorized_abort_multipart_upload_command(
             crate::node_client::BuildAuthorizedAbortMultipartUploadCommandReq {
-                pg_id,
-                cluster_epoch: self.operation_epoch(),
                 authorized_upload,
                 expected_cleanup: expected_cleanup.as_ref(),
-                bucket_write_reservation,
+                bucket_write_reservation: &bucket_write_reservation,
             },
         )
     }

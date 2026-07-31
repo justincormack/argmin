@@ -2388,6 +2388,78 @@ fn unix_multipart_completion_mutation_metadata_route_rejects_foreign_epoch_befor
 }
 
 #[test]
+fn local_multipart_abort_mutation_metadata_route_binds_exact_upload_subject() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0, 1],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let bucket = crate::tests::bucket_name("multipart-abort-route-bucket");
+    let key = crate::tests::object_key("multipart-abort-route-key");
+    let upload_id = crate::tests::multipart_upload_id("multipart-abort-route-upload");
+    let correct_pg = storage_node.object_metadata_pg_for(&bucket, &key);
+    let wrong_pg = ObjectMetadataPgId::new_for_test(PgId::new(1 - correct_pg.get()));
+
+    assert!(matches!(
+        client
+            .open_multipart_abort_mutation_metadata_route(
+                ClusterEpoch::INITIAL,
+                wrong_pg,
+                &bucket,
+                &key,
+                &upload_id,
+            )
+            .err()
+            .expect("crossed multipart abort PG must fail before storage"),
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open multipart abort mutation metadata route",
+        })
+    ));
+
+    let route = client
+        .open_multipart_abort_mutation_metadata_route(
+            ClusterEpoch::INITIAL,
+            correct_pg,
+            &bucket,
+            &key,
+            &upload_id,
+        )
+        .unwrap();
+    assert!(route.load_cleanup().unwrap().is_none());
+}
+
+#[test]
+fn unix_multipart_abort_mutation_metadata_route_rejects_foreign_epoch_before_rpc() {
+    let client = test_unix_storage_node_client();
+    let future_epoch = ClusterEpoch::new(client.cluster_epoch.get() + 1).unwrap();
+    let bucket = crate::tests::bucket_name("unix-multipart-abort-route-bucket");
+    let key = crate::tests::object_key("unix-multipart-abort-route-key");
+    let upload_id = crate::tests::multipart_upload_id("unix-multipart-abort-route-upload");
+    assert!(matches!(
+        client
+            .open_multipart_abort_mutation_metadata_route(
+                future_epoch,
+                ObjectMetadataPgId::new_for_test(PgId::new(0)),
+                &bucket,
+                &key,
+                &upload_id,
+            )
+            .err()
+            .expect("future multipart abort route must fail before RPC"),
+        ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        }) if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
+}
+
+#[test]
 fn local_object_delete_metadata_route_binds_exact_object_subject() {
     let tmp = test_util::tempdir();
     let storage_node = Arc::new(

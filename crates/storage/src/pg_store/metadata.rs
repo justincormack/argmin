@@ -3691,11 +3691,17 @@ impl PgStore {
         &self,
         command: &AbortMultipartUploadCommand,
     ) -> Result<(), MetadataError> {
+        if !command.has_consistent_subject() {
+            return Err(MetadataError::InvariantViolation {
+                context: "abort multipart upload command (subject mismatch)",
+                reason: "metadata state does not satisfy the operation invariant".into(),
+            });
+        }
         self.with_immediate_txn(
             "abort multipart upload command (begin txn)",
             "abort multipart upload command (commit txn)",
             |store| {
-                let upload_present = match store.get_multipart_upload(&command.upload_id) {
+                let upload = match store.get_multipart_upload(&command.upload_id) {
                     Ok(upload) => {
                         if upload.bucket != command.bucket || upload.key != command.key {
                             return Err(MetadataError::InvariantViolation {
@@ -3711,37 +3717,60 @@ impl PgStore {
                                     .into(),
                             });
                         }
-                        true
+                        upload
                     }
-                    Err(MetadataError::NoSuchUpload { .. }) => false,
+                    Err(MetadataError::NoSuchUpload { .. }) => {
+                        return Err(MetadataError::InvariantViolation {
+                            context: "abort multipart upload command (upload missing)",
+                            reason: "metadata state does not satisfy the operation invariant"
+                                .into(),
+                        });
+                    }
                     Err(error) => return Err(error),
                 };
-                if upload_present {
-                    let stream_uploads =
-                        store.list_stream_uploads_for_multipart_upload(&command.upload_id)?;
-                    if !Self::stream_upload_cleanup_records_match(
-                        &stream_uploads,
-                        &command.cleanup.stream_uploads,
-                    ) {
-                        return Err(MetadataError::InvariantViolation {
-                            context: "abort multipart upload command (stream uploads mismatch)",
-                            reason: "metadata state does not satisfy the operation invariant"
-                                .into(),
-                        });
-                    }
-                    let stream_upload_segments =
-                        store.list_stream_segments_for_sessions(&stream_uploads)?;
-                    if stream_upload_segments != command.cleanup.stream_upload_segments {
-                        return Err(MetadataError::InvariantViolation {
-                            context:
-                                "abort multipart upload command (stream upload segments mismatch)",
-                            reason: "metadata state does not satisfy the operation invariant"
-                                .into(),
-                        });
-                    }
-                    for session in &command.cleanup.stream_uploads {
-                        store.delete_stream_upload_in_open_txn(&session.session_id)?;
-                    }
+                debug_assert_eq!(upload, command.cleanup.upload);
+                let parts = store
+                    .list_multipart_parts(&ListPartsReq {
+                        upload_id: command.upload_id.clone(),
+                        part_number_marker: None,
+                        max_parts: u32::MAX,
+                    })?
+                    .parts;
+                if parts != command.cleanup.parts {
+                    return Err(MetadataError::InvariantViolation {
+                        context: "abort multipart upload command (parts mismatch)",
+                        reason: "metadata state does not satisfy the operation invariant".into(),
+                    });
+                }
+                let streaming_segments =
+                    store.get_all_multipart_part_segments_for_upload(&command.upload_id)?;
+                if streaming_segments != command.cleanup.streaming_segments {
+                    return Err(MetadataError::InvariantViolation {
+                        context: "abort multipart upload command (part segments mismatch)",
+                        reason: "metadata state does not satisfy the operation invariant".into(),
+                    });
+                }
+                let stream_uploads =
+                    store.list_stream_uploads_for_multipart_upload(&command.upload_id)?;
+                if !Self::stream_upload_cleanup_records_match(
+                    &stream_uploads,
+                    &command.cleanup.stream_uploads,
+                ) {
+                    return Err(MetadataError::InvariantViolation {
+                        context: "abort multipart upload command (stream uploads mismatch)",
+                        reason: "metadata state does not satisfy the operation invariant".into(),
+                    });
+                }
+                let stream_upload_segments =
+                    store.list_stream_segments_for_sessions(&stream_uploads)?;
+                if stream_upload_segments != command.cleanup.stream_upload_segments {
+                    return Err(MetadataError::InvariantViolation {
+                        context: "abort multipart upload command (stream upload segments mismatch)",
+                        reason: "metadata state does not satisfy the operation invariant".into(),
+                    });
+                }
+                for session in &command.cleanup.stream_uploads {
+                    store.delete_stream_upload_in_open_txn(&session.session_id)?;
                 }
                 store.delete_multipart_part_segments_by_upload_id_direct(&command.upload_id)?;
                 store

@@ -5336,6 +5336,39 @@ pub struct AbortMultipartUploadCleanup {
     pub stream_upload_segments: Vec<StreamUploadSegmentRecord>,
 }
 
+impl AbortMultipartUploadCleanup {
+    pub(crate) fn matches_upload_subject(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> bool {
+        self.upload.bucket == *bucket
+            && self.upload.key == *key
+            && self.upload.upload_id == *upload_id
+            && self.parts.iter().all(|part| part.upload_id == *upload_id)
+            && self.streaming_segments.iter().all(|segment| {
+                segment.bucket == *bucket && segment.key == *key && segment.upload_id == *upload_id
+            })
+            && self.stream_uploads.iter().all(|stream| {
+                stream.bucket == *bucket
+                    && stream.key == *key
+                    && matches!(
+                        &stream.target,
+                        StreamUploadTarget::UploadPart {
+                            upload_id: stream_upload_id,
+                            ..
+                        } if stream_upload_id == upload_id
+                    )
+            })
+            && self.stream_upload_segments.iter().all(|segment| {
+                self.stream_uploads
+                    .iter()
+                    .any(|stream| stream.session_id == segment.session_id)
+            })
+    }
+}
+
 /// Committed segment record for a normal PutObject.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectSegmentRecord {

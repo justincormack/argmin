@@ -41,6 +41,7 @@ use crate::metadata_command::{
     MetadataCommandPayload, MetadataCommandReplicaState, MetadataTransferCommand,
     ObjectPayloadReclaimCommand, PutObjectMetadataMutation, ReleaseObjectGenerationCommand,
     ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+    ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
@@ -10587,7 +10588,30 @@ impl StorageCluster {
         let Some(proof) = Self::metadata_command_bucket_write_reservation_proof(command) else {
             return Ok(());
         };
-        let command_subject_matches = match command.payload() {
+        let command_subject_matches =
+            Self::metadata_command_bucket_write_reservation_subject_matches(command, proof);
+        if proof.cluster_epoch != command.id().cluster_epoch() || !command_subject_matches {
+            return Err(MetadataError::BucketWriteReservationConflict {
+                reservation_id: proof.reservation_id.clone(),
+            }
+            .into());
+        }
+        let pg_id = self.bucket_metadata_pg_id(&proof.bucket);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+        node.bucket_write_reservation_client()
+            .validate_bucket_write_reservation_proof(
+                self.validated_bucket_metadata_pg(PgId::new(pg_id)),
+                proof,
+            )
+    }
+
+    fn metadata_command_bucket_write_reservation_subject_matches(
+        command: &MetadataCommandEnvelope,
+        proof: &BucketWriteReservationProof,
+    ) -> bool {
+        match command.payload() {
             MetadataCommandPayload::CommitDirectPutObject(commit) => [
                 PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
                 PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
@@ -10636,23 +10660,17 @@ impl StorageCluster {
                     crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
                     Some(create.upload.key.as_str()),
                 ),
-            _ => true,
-        };
-        if proof.cluster_epoch != command.id().cluster_epoch() || !command_subject_matches {
-            return Err(MetadataError::BucketWriteReservationConflict {
-                reservation_id: proof.reservation_id.clone(),
+            MetadataCommandPayload::AbortMultipartUpload(abort) => {
+                abort.has_consistent_subject()
+                    && proof.matches_exact_mutation_subject(
+                        command.id().cluster_epoch(),
+                        &abort.bucket,
+                        ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                        Some(abort.key.as_str()),
+                    )
             }
-            .into());
+            _ => true,
         }
-        let pg_id = self.bucket_metadata_pg_id(&proof.bucket);
-        let node = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        node.bucket_write_reservation_client()
-            .validate_bucket_write_reservation_proof(
-                self.validated_bucket_metadata_pg(PgId::new(pg_id)),
-                proof,
-            )
     }
 
     fn release_metadata_command_bucket_write_reservation(
@@ -10662,6 +10680,9 @@ impl StorageCluster {
         let Some(proof) = Self::metadata_command_bucket_write_reservation_proof(command) else {
             return Ok(());
         };
+        if !Self::metadata_command_bucket_write_reservation_subject_matches(command, proof) {
+            return Ok(());
+        }
         self.release_bucket_write_reservation_proof(proof)
     }
 

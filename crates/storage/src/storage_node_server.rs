@@ -5553,13 +5553,15 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::load_abort_multipart_upload_cleanup(
+        ObjectMutationMetadataNodeClient::open_multipart_abort_mutation_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
             upload_id,
         )
+        .and_then(|route| route.load_cleanup())
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5755,18 +5757,20 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::build_abort_multipart_upload_command(
+        ObjectMutationMetadataNodeClient::open_multipart_abort_mutation_metadata_route(
             &local_client,
-            BuildAbortMultipartUploadCommandReq {
-                pg_id: self.route.pg_id,
-                cluster_epoch: self.route.fence.cluster_epoch,
-                bucket: self.route.bucket,
-                key: self.route.key,
-                upload_id,
-                expected_cleanup,
-                bucket_write_reservation: bucket_write_reservation.clone(),
-            },
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            upload_id,
         )
+        .and_then(|route| {
+            route.build_abort_multipart_upload_command(BuildAbortMultipartUploadCommandReq {
+                expected_cleanup,
+                bucket_write_reservation,
+            })
+        })
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5806,16 +5810,23 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::build_authorized_abort_multipart_upload_command(
+        ObjectMutationMetadataNodeClient::open_multipart_abort_mutation_metadata_route(
             &local_client,
-            BuildAuthorizedAbortMultipartUploadCommandReq {
-                pg_id: self.route.pg_id,
-                cluster_epoch: self.route.fence.cluster_epoch,
-                authorized_upload,
-                expected_cleanup,
-                bucket_write_reservation: bucket_write_reservation.clone(),
-            },
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            &authorized_upload.record().upload_id,
         )
+        .and_then(|route| {
+            route.build_authorized_abort_multipart_upload_command(
+                BuildAuthorizedAbortMultipartUploadCommandReq {
+                    authorized_upload,
+                    expected_cleanup,
+                    bucket_write_reservation,
+                },
+            )
+        })
         .map_err(StorageNodeObjectRouteError::Object)
     }
 

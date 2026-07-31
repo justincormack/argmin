@@ -153,6 +153,15 @@ struct LocalMultipartCompletionMutationMetadataRoute<'a> {
     key: ObjectKey,
 }
 
+struct LocalMultipartAbortMutationMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+    upload_id: UploadId,
+}
+
 struct LocalObjectListingMetadataRoute {
     storage_node: Arc<SharedStorageNode>,
     _route_cluster_epoch: ClusterEpoch,
@@ -2850,6 +2859,97 @@ impl MultipartCompletionMutationMetadataRoute
     }
 }
 
+impl MultipartAbortMutationMetadataRoute for LocalMultipartAbortMutationMetadataRoute<'_> {
+    fn load_cleanup(&self) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError> {
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        Ok(pg.prepare_abort_multipart_upload_cleanup(&self.bucket, &self.key, &self.upload_id)?)
+    }
+
+    fn build_abort_multipart_upload_command(
+        &self,
+        request: BuildAbortMultipartUploadCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        require_multipart_abort_mutation_subject(
+            MultipartAbortMutationSubject {
+                route_cluster_epoch: self.route_cluster_epoch,
+                bucket: &self.bucket,
+                key: &self.key,
+                upload_id: &self.upload_id,
+            },
+            None,
+            request.expected_cleanup,
+            request.bucket_write_reservation,
+            "build abort multipart upload command",
+        )?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        let cleanup =
+            pg.prepare_abort_multipart_upload_cleanup(&self.bucket, &self.key, &self.upload_id)?;
+        if cleanup.as_ref() != request.expected_cleanup {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        let Some(cleanup) = cleanup else {
+            return Ok(None);
+        };
+        let command_id = self.client.next_metadata_command_id_from_locked_pg(
+            self.pg_id.pg_id(),
+            self.route_cluster_epoch,
+            &pg,
+        )?;
+        Ok(Some(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+                upload_id: self.upload_id.clone(),
+                cleanup,
+                bucket_write_reservation: request.bucket_write_reservation.clone(),
+            })),
+        )))
+    }
+
+    fn build_authorized_abort_multipart_upload_command(
+        &self,
+        request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        require_multipart_abort_mutation_subject(
+            MultipartAbortMutationSubject {
+                route_cluster_epoch: self.route_cluster_epoch,
+                bucket: &self.bucket,
+                key: &self.key,
+                upload_id: &self.upload_id,
+            },
+            Some(request.authorized_upload),
+            request.expected_cleanup,
+            request.bucket_write_reservation,
+            "build authorized abort multipart upload command",
+        )?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        let cleanup =
+            pg.prepare_authorized_abort_multipart_upload_cleanup(request.authorized_upload)?;
+        if cleanup.as_ref() != request.expected_cleanup {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        let Some(cleanup) = cleanup else {
+            return Ok(None);
+        };
+        let command_id = self.client.next_metadata_command_id_from_locked_pg(
+            self.pg_id.pg_id(),
+            self.route_cluster_epoch,
+            &pg,
+        )?;
+        Ok(Some(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+                upload_id: self.upload_id.clone(),
+                cleanup,
+                bucket_write_reservation: request.bucket_write_reservation.clone(),
+            })),
+        )))
+    }
+}
+
 impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
     fn open_put_object_metadata_route(
         &self,
@@ -2989,6 +3089,31 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
             pg_id,
             bucket: bucket.clone(),
             key: key.clone(),
+        }))
+    }
+
+    fn open_multipart_abort_mutation_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<Box<dyn MultipartAbortMutationMetadataRoute + '_>, ObjectPgActionError> {
+        if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open multipart abort mutation metadata route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalMultipartAbortMutationMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
         }))
     }
 
@@ -3212,30 +3337,6 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         request: BuildStreamPartCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         Self::build_stream_part_commit_command(self, request)
-    }
-
-    fn load_abort_multipart_upload_cleanup(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError> {
-        Self::load_abort_multipart_upload_cleanup(self, pg_id, bucket, key, upload_id)
-    }
-
-    fn build_abort_multipart_upload_command(
-        &self,
-        request: BuildAbortMultipartUploadCommandReq<'_>,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        Self::build_abort_multipart_upload_command(self, request)
-    }
-
-    fn build_authorized_abort_multipart_upload_command(
-        &self,
-        request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        Self::build_authorized_abort_multipart_upload_command(self, request)
     }
 }
 
@@ -3560,80 +3661,6 @@ impl LocalStorageNodeClient {
             return Ok(MultipartUploadManagementLookup::Replay(Box::new(completed)));
         }
         Ok(MultipartUploadManagementLookup::Missing)
-    }
-
-    fn load_abort_multipart_upload_cleanup(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(pg.prepare_abort_multipart_upload_cleanup(bucket, key, upload_id)?)
-    }
-
-    fn build_abort_multipart_upload_command(
-        &self,
-        request: BuildAbortMultipartUploadCommandReq<'_>,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(request.pg_id.get())?;
-        let cleanup = pg.prepare_abort_multipart_upload_cleanup(
-            request.bucket,
-            request.key,
-            request.upload_id,
-        )?;
-        if cleanup.as_ref() != request.expected_cleanup {
-            return Err(ObjectPgActionError::StaleObjectReadSubject);
-        }
-        let Some(cleanup) = cleanup else {
-            return Ok(None);
-        };
-        let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
-            &pg,
-        )?;
-        Ok(Some(MetadataCommandEnvelope::new(
-            command_id,
-            MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
-                bucket: request.bucket.clone(),
-                key: request.key.clone(),
-                upload_id: request.upload_id.clone(),
-                cleanup,
-                bucket_write_reservation: request.bucket_write_reservation,
-            })),
-        )))
-    }
-
-    fn build_authorized_abort_multipart_upload_command(
-        &self,
-        request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(request.pg_id.get())?;
-        let cleanup =
-            pg.prepare_authorized_abort_multipart_upload_cleanup(request.authorized_upload)?;
-        if cleanup.as_ref() != request.expected_cleanup {
-            return Err(ObjectPgActionError::StaleObjectReadSubject);
-        }
-        let Some(cleanup) = cleanup else {
-            return Ok(None);
-        };
-        let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
-            &pg,
-        )?;
-        Ok(Some(MetadataCommandEnvelope::new(
-            command_id,
-            MetadataCommandPayload::AbortMultipartUpload(Box::new(AbortMultipartUploadCommand {
-                bucket: request.authorized_upload.record().bucket.clone(),
-                key: request.authorized_upload.record().key.clone(),
-                upload_id: request.authorized_upload.record().upload_id.clone(),
-                cleanup,
-                bucket_write_reservation: request.bucket_write_reservation,
-            })),
-        )))
     }
 
     fn payload_reclaim_exists(

@@ -82,6 +82,15 @@ struct UnixMultipartCompletionMutationMetadataRoute<'a> {
     key: ObjectKey,
 }
 
+struct UnixMultipartAbortMutationMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+    upload_id: UploadId,
+}
+
 struct UnixObjectListingMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
     pg_id: ObjectMetadataScanPgId,
@@ -2912,6 +2921,149 @@ impl MultipartCompletionMutationMetadataRoute for UnixMultipartCompletionMutatio
     }
 }
 
+impl MultipartAbortMutationMetadataRoute for UnixMultipartAbortMutationMetadataRoute<'_> {
+    fn load_cleanup(&self) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError> {
+        let request = StorageRpcAbortMultipartCleanupRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            upload_id: self.upload_id.clone(),
+        };
+        let payload = encode_abort_multipart_cleanup_request(&request);
+        let response = self
+            .client
+            .rpc_request(
+                StorageRpcMessageKind::ObjectMultipartAbortCleanupLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_abort_multipart_cleanup_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode abort multipart cleanup response",
+                    error.to_string(),
+                ))
+            })?;
+        if let Some(cleanup) = response.cleanup.as_ref() {
+            self.client.validate_abort_cleanup_snapshot_response(
+                cleanup,
+                &self.bucket,
+                &self.key,
+                &self.upload_id,
+            )?;
+        }
+        Ok(response.cleanup)
+    }
+
+    fn build_abort_multipart_upload_command(
+        &self,
+        request: BuildAbortMultipartUploadCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        require_multipart_abort_mutation_subject(
+            MultipartAbortMutationSubject {
+                route_cluster_epoch: self.route_cluster_epoch,
+                bucket: &self.bucket,
+                key: &self.key,
+                upload_id: &self.upload_id,
+            },
+            None,
+            request.expected_cleanup,
+            request.bucket_write_reservation,
+            "build abort multipart upload command",
+        )?;
+        let rpc_request = StorageRpcAbortMultipartCommandBuildRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            upload_id: self.upload_id.clone(),
+            expected_cleanup: request.expected_cleanup.cloned(),
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload =
+            encode_abort_multipart_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "encode abort multipart command build request",
+                    error.to_string(),
+                ))
+            })?;
+        self.client.object_metadata_command_build_request(
+            StorageRpcMessageKind::ObjectMultipartAbortCommandBuild,
+            self.pg_id.pg_id(),
+            payload,
+            "decode abort multipart command build response",
+            ObjectPgActionError::StaleObjectReadSubject,
+            |command| {
+                self.client.validate_abort_multipart_command_response(
+                    command,
+                    &AbortMultipartCommandValidation {
+                        pg_id: self.pg_id,
+                        cluster_epoch: self.route_cluster_epoch,
+                        bucket: &self.bucket,
+                        key: &self.key,
+                        upload_id: &self.upload_id,
+                        expected_cleanup: request.expected_cleanup,
+                        bucket_write_reservation: request.bucket_write_reservation,
+                    },
+                )
+            },
+        )
+    }
+
+    fn build_authorized_abort_multipart_upload_command(
+        &self,
+        request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        require_multipart_abort_mutation_subject(
+            MultipartAbortMutationSubject {
+                route_cluster_epoch: self.route_cluster_epoch,
+                bucket: &self.bucket,
+                key: &self.key,
+                upload_id: &self.upload_id,
+            },
+            Some(request.authorized_upload),
+            request.expected_cleanup,
+            request.bucket_write_reservation,
+            "build authorized abort multipart upload command",
+        )?;
+        let rpc_request = StorageRpcAuthorizedAbortMultipartCommandBuildRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            authorized_upload: request.authorized_upload.record().clone(),
+            expected_cleanup: request.expected_cleanup.cloned(),
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload = encode_authorized_abort_multipart_command_build_request(&rpc_request)
+            .map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "encode authorized abort multipart command build request",
+                    error.to_string(),
+                ))
+            })?;
+        self.client.object_metadata_command_build_request(
+            StorageRpcMessageKind::ObjectMultipartAuthorizedAbortCommandBuild,
+            self.pg_id.pg_id(),
+            payload,
+            "decode authorized abort multipart command build response",
+            ObjectPgActionError::StaleObjectReadSubject,
+            |command| {
+                self.client.validate_abort_multipart_command_response(
+                    command,
+                    &AbortMultipartCommandValidation {
+                        pg_id: self.pg_id,
+                        cluster_epoch: self.route_cluster_epoch,
+                        bucket: &self.bucket,
+                        key: &self.key,
+                        upload_id: &self.upload_id,
+                        expected_cleanup: request.expected_cleanup,
+                        bucket_write_reservation: request.bucket_write_reservation,
+                    },
+                )
+            },
+        )
+    }
+}
+
 impl UnixMultipartUploadLookupMetadataRoute<'_> {
     fn object_request(&self) -> StorageRpcObjectRequest {
         self.client
@@ -3358,6 +3510,32 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             pg_id,
             bucket: bucket.clone(),
             key: key.clone(),
+        }))
+    }
+
+    fn open_multipart_abort_mutation_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<Box<dyn MultipartAbortMutationMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixMultipartAbortMutationMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
         }))
     }
 
@@ -4225,123 +4403,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 log_index,
             )),
         }
-    }
-
-    fn build_abort_multipart_upload_command(
-        &self,
-        request: BuildAbortMultipartUploadCommandReq<'_>,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        let bucket = request.bucket;
-        let key = request.key;
-        let upload_id = request.upload_id;
-        let rpc_request = StorageRpcAbortMultipartCommandBuildRequest {
-            object: self.object_request(request.pg_id.pg_id(), bucket, key),
-            upload_id: upload_id.clone(),
-            expected_cleanup: request.expected_cleanup.cloned(),
-            bucket_write_reservation: request.bucket_write_reservation.clone(),
-        };
-        let payload =
-            encode_abort_multipart_command_build_request(&rpc_request).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "encode abort multipart command build request",
-                    error.to_string(),
-                ))
-            })?;
-        self.object_metadata_command_build_request(
-            StorageRpcMessageKind::ObjectMultipartAbortCommandBuild,
-            request.pg_id.pg_id(),
-            payload,
-            "decode abort multipart command build response",
-            ObjectPgActionError::StaleObjectReadSubject,
-            |command| {
-                self.validate_abort_multipart_command_response(
-                    command,
-                    &AbortMultipartCommandValidation {
-                        pg_id: request.pg_id,
-                        cluster_epoch: request.cluster_epoch,
-                        bucket,
-                        key,
-                        upload_id,
-                        expected_cleanup: request.expected_cleanup,
-                        bucket_write_reservation: &request.bucket_write_reservation,
-                    },
-                )
-            },
-        )
-    }
-
-    fn build_authorized_abort_multipart_upload_command(
-        &self,
-        request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
-    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        let bucket = &request.authorized_upload.record().bucket;
-        let key = &request.authorized_upload.record().key;
-        let upload_id = &request.authorized_upload.record().upload_id;
-        let rpc_request = StorageRpcAuthorizedAbortMultipartCommandBuildRequest {
-            object: self.object_request(request.pg_id.pg_id(), bucket, key),
-            authorized_upload: request.authorized_upload.record().clone(),
-            expected_cleanup: request.expected_cleanup.cloned(),
-            bucket_write_reservation: request.bucket_write_reservation.clone(),
-        };
-        let payload = encode_authorized_abort_multipart_command_build_request(&rpc_request)
-            .map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "encode authorized abort multipart command build request",
-                    error.to_string(),
-                ))
-            })?;
-        self.object_metadata_command_build_request(
-            StorageRpcMessageKind::ObjectMultipartAuthorizedAbortCommandBuild,
-            request.pg_id.pg_id(),
-            payload,
-            "decode authorized abort multipart command build response",
-            ObjectPgActionError::StaleObjectReadSubject,
-            |command| {
-                self.validate_abort_multipart_command_response(
-                    command,
-                    &AbortMultipartCommandValidation {
-                        pg_id: request.pg_id,
-                        cluster_epoch: request.cluster_epoch,
-                        bucket,
-                        key,
-                        upload_id,
-                        expected_cleanup: request.expected_cleanup,
-                        bucket_write_reservation: &request.bucket_write_reservation,
-                    },
-                )
-            },
-        )
-    }
-
-    fn load_abort_multipart_upload_cleanup(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError> {
-        let request = StorageRpcAbortMultipartCleanupRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
-            upload_id: upload_id.clone(),
-        };
-        let payload = encode_abort_multipart_cleanup_request(&request);
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectMultipartAbortCleanupLoad,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_abort_multipart_cleanup_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode abort multipart cleanup response",
-                    error.to_string(),
-                ))
-            })?;
-        if let Some(cleanup) = response.cleanup.as_ref() {
-            self.validate_abort_cleanup_snapshot_response(cleanup, bucket, key, upload_id)?;
-        }
-        Ok(response.cleanup)
     }
 
     fn open_object_delete_metadata_route(

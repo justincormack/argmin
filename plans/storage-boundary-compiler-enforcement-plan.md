@@ -654,7 +654,7 @@ Node-client role classification (2026-07-19):
 | `ObjectVersionMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; ordinary and completion-priority version inspection retain distinct admission classes within that route |
 | `DirectPutMetadataNodeClient` | object metadata | opens an active primary route bound to one epoch, exact object PG, bucket, and key; commit snapshot and command construction cannot replace route identity |
 | `ObjectListingMetadataNodeClient` | object metadata scan | active object-metadata route for the scanned PG; listing fan-out constructs one capability per routed PG |
-| `ObjectMutationMetadataNodeClient` | object metadata | PUT-object metadata, object-delete/lifecycle, and multipart-upload creation snapshots and command builds open active routes bound to one epoch, exact object PG, bucket, and key; the remaining multipart management/completion/abort, stream-session, and payload-reclaim families still require their corresponding scoped routes |
+| `ObjectMutationMetadataNodeClient` | object metadata | PUT-object metadata, object-delete/lifecycle, multipart-upload creation/lookup, authorized completion reads, and completion/abort command construction open active routes bound to one epoch and exact object/upload subjects; stream-session and payload-reclaim families still require their corresponding scoped routes |
 | `RetainedObjectMutationMetadataNodeClient` | object metadata | opens a retained route bound to one epoch, object-metadata PG, bucket, and key; the returned interface prepares stream aborts and releases payload-reclaim claims without accepting replacement route or object arguments |
 | `ObjectReadMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; version selection and subject-identity validation remain operations within that fixed route, with payload reads separately retaining their read lease |
 | `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active placed-shard I/O opens an exact route bound to one node, epoch, data PG, shard index, and shard key; shard acknowledgement, current-placement cleanup, and repair/backfill work open an active route bound to one epoch and data PG |
@@ -4637,6 +4637,48 @@ One-hundred-and-sixteenth Phase 3 slice:
   families remain open in Phase 3.
 - all 2,535 storage tests pass. Formatting, the storage boundary checker,
   workspace-wide strict Clippy, and the full no-fail-fast 7,853-test workspace
+  suite also pass.
+
+One-hundred-and-seventeenth Phase 3 slice:
+
+- multipart abort cleanup inspection and both ordinary and authorized abort
+  command builders now share a `MultipartAbortMutationMetadataRoute` bound to
+  one active cluster epoch, exact object-metadata primary PG, bucket, key, and
+  upload ID. Build requests no longer carry independently substitutable PG,
+  epoch, bucket, key, or upload identity.
+- one shared subject validator binds the durable bucket-write proof to the
+  exact abort operation, epoch, bucket, and target key. It also requires every
+  part, streaming part segment, terminal stream session, and stream segment in
+  the cleanup snapshot to belong to the routed upload; authorized aborts
+  additionally require the authorized record and cleanup upload to match the
+  routed upload exactly.
+- embedded construction rejects incorrect topology placement and closed PGs
+  before storage access. Unix construction rejects foreign epochs before
+  transport and derives RPC and response-validation subjects from the route.
+  Storage-node dispatch retains independent active admission, placement,
+  primary, deadline, request-subject, and proof validation.
+- the installed equivalent-state Unix matrix stores the same upload and part
+  on both PGs, proves the correct route can inspect and build both abort forms,
+  and requires `PayloadDecode` from the wrong PG. Crossed proof operation,
+  target, epoch, and authorized upload ID fail before RPC; embedded and
+  no-listener tests pin placement and epoch rejection at route construction.
+- fanout and recovery now independently bind every persisted abort command's
+  internal upload/cleanup subject and reservation proof to the command epoch,
+  bucket, abort operation, key, and upload ID. Abandoning a malformed crossed
+  or co-crossed subject envelope does not release the valid reservation owned
+  by the unrelated operation. Durable recovery regressions require the upload
+  and every node's exact reservation state to remain unchanged.
+- PgStore requires the command's complete part, multipart-segment,
+  stream-session, and stream-session-segment cleanup snapshot to equal durable
+  state before the first mutation. A forged same-label segment referencing an
+  unrelated shard set leaves both uploads, all part metadata, every shard, and
+  the pending recovery envelope intact; unit coverage independently pins part
+  and multipart-segment mismatch rejection.
+- the transitional boundary checker now requires production abort cleanup
+  reads and command builds to flow through the scoped route. Stream-session
+  mutation and payload-reclaim families remain open in Phase 3.
+- all 2,541 storage tests pass. Formatting, the storage boundary checker,
+  workspace-wide strict Clippy, and the full no-fail-fast 7,862-test workspace
   suite also pass.
 
 ### Phase 4 — type metadata-command publication

@@ -2663,7 +2663,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..26)
+    let server_threads: Vec<_> = (0..24)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -2794,17 +2794,32 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
         .is_none());
     assert_object_payload_decode!(wrong_multipart_completion_route.load_stale_payload_source());
 
-    let cleanup = ObjectMutationMetadataNodeClient::load_abort_multipart_upload_cleanup(
-        &client, correct_pg, &bucket, &key, &upload_id,
-    )
-    .unwrap()
-    .expect("in-progress upload has abort cleanup");
-    assert_eq!(cleanup.upload, upload);
-    assert_object_payload_decode!(
-        ObjectMutationMetadataNodeClient::load_abort_multipart_upload_cleanup(
-            &client, wrong_pg, &bucket, &key, &upload_id,
+    let correct_multipart_abort_route =
+        ObjectMutationMetadataNodeClient::open_multipart_abort_mutation_metadata_route(
+            &client,
+            ClusterEpoch::INITIAL,
+            correct_pg,
+            &bucket,
+            &key,
+            &upload_id,
         )
-    );
+        .unwrap();
+    let wrong_multipart_abort_route =
+        ObjectMutationMetadataNodeClient::open_multipart_abort_mutation_metadata_route(
+            &client,
+            ClusterEpoch::INITIAL,
+            wrong_pg,
+            &bucket,
+            &key,
+            &upload_id,
+        )
+        .unwrap();
+    let cleanup = correct_multipart_abort_route
+        .load_cleanup()
+        .unwrap()
+        .expect("in-progress upload has abort cleanup");
+    assert_eq!(cleanup.upload, upload);
+    assert_object_payload_decode!(wrong_multipart_abort_route.load_cleanup());
 
     let complete_request = CompleteMultipartCommitRequest {
         bucket: bucket.clone(),
@@ -2899,90 +2914,112 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
         ))
     ));
 
-    let abort_command = ObjectMutationMetadataNodeClient::build_abort_multipart_upload_command(
-        &client,
-        BuildAbortMultipartUploadCommandReq {
-            pg_id: correct_pg,
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
-            bucket: &bucket,
-            key: &key,
-            upload_id: &upload_id,
+    let abort_command = correct_multipart_abort_route
+        .build_abort_multipart_upload_command(BuildAbortMultipartUploadCommandReq {
             expected_cleanup: Some(&cleanup),
-            bucket_write_reservation: abort_proof.clone(),
-        },
-    )
-    .unwrap()
-    .expect("in-progress upload produces abort command");
+            bucket_write_reservation: &abort_proof,
+        })
+        .unwrap()
+        .expect("in-progress upload produces abort command");
     assert!(matches!(
         abort_command.payload(),
         MetadataCommandPayload::AbortMultipartUpload(abort)
             if abort.upload_id == upload_id
     ));
-    assert_object_payload_decode!(
-        ObjectMutationMetadataNodeClient::build_abort_multipart_upload_command(
-            &client,
-            BuildAbortMultipartUploadCommandReq {
-                pg_id: wrong_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                upload_id: &upload_id,
-                expected_cleanup: Some(&cleanup),
-                bucket_write_reservation: abort_proof.clone(),
-            },
-        )
-    );
-    assert_object_payload_decode!(
-        ObjectMutationMetadataNodeClient::build_abort_multipart_upload_command(
-            &client,
-            BuildAbortMultipartUploadCommandReq {
-                pg_id: correct_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                upload_id: &upload_id,
-                expected_cleanup: Some(&cleanup),
-                bucket_write_reservation: complete_proof.clone(),
-            },
-        )
-    );
-
-    ObjectMutationMetadataNodeClient::build_authorized_abort_multipart_upload_command(
-        &client,
-        BuildAuthorizedAbortMultipartUploadCommandReq {
-            pg_id: correct_pg,
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
-            authorized_upload: &authorized_upload,
+    assert_object_payload_decode!(wrong_multipart_abort_route
+        .build_abort_multipart_upload_command(BuildAbortMultipartUploadCommandReq {
             expected_cleanup: Some(&cleanup),
-            bucket_write_reservation: abort_proof.clone(),
-        },
-    )
-    .unwrap()
-    .expect("authorized in-progress upload produces abort command");
-    assert_object_payload_decode!(
-        ObjectMutationMetadataNodeClient::build_authorized_abort_multipart_upload_command(
-            &client,
+            bucket_write_reservation: &abort_proof,
+        },));
+    let mut crossed_abort_target_proof = abort_proof.clone();
+    crossed_abort_target_proof.target_context = Some("crossed-abort-key".to_string());
+    let mut crossed_abort_epoch_proof = abort_proof.clone();
+    crossed_abort_epoch_proof.cluster_epoch = ClusterEpoch::new(2).unwrap();
+    for crossed_proof in [
+        &complete_proof,
+        &crossed_abort_target_proof,
+        &crossed_abort_epoch_proof,
+    ] {
+        assert!(matches!(
+            correct_multipart_abort_route.build_abort_multipart_upload_command(
+                BuildAbortMultipartUploadCommandReq {
+                    expected_cleanup: Some(&cleanup),
+                    bucket_write_reservation: crossed_proof,
+                },
+            ),
+            Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "build abort multipart upload command",
+                }
+            ))
+        ));
+    }
+    let mut crossed_abort_cleanup = cleanup.clone();
+    crossed_abort_cleanup.upload.key = crate::tests::object_key("crossed-abort-cleanup-key");
+    assert!(matches!(
+        correct_multipart_abort_route.build_abort_multipart_upload_command(
+            BuildAbortMultipartUploadCommandReq {
+                expected_cleanup: Some(&crossed_abort_cleanup),
+                bucket_write_reservation: &abort_proof,
+            },
+        ),
+        Err(ObjectPgActionError::Store(
+            StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build abort multipart upload command",
+            }
+        ))
+    ));
+
+    correct_multipart_abort_route
+        .build_authorized_abort_multipart_upload_command(
             BuildAuthorizedAbortMultipartUploadCommandReq {
-                pg_id: wrong_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 authorized_upload: &authorized_upload,
                 expected_cleanup: Some(&cleanup),
-                bucket_write_reservation: abort_proof,
+                bucket_write_reservation: &abort_proof,
             },
         )
-    );
-    assert_object_payload_decode!(
-        ObjectMutationMetadataNodeClient::build_authorized_abort_multipart_upload_command(
-            &client,
+        .unwrap()
+        .expect("authorized in-progress upload produces abort command");
+    assert_object_payload_decode!(wrong_multipart_abort_route
+        .build_authorized_abort_multipart_upload_command(
             BuildAuthorizedAbortMultipartUploadCommandReq {
-                pg_id: correct_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 authorized_upload: &authorized_upload,
                 expected_cleanup: Some(&cleanup),
-                bucket_write_reservation: complete_proof,
+                bucket_write_reservation: &abort_proof,
             },
-        )
-    );
+        ));
+    assert!(matches!(
+        correct_multipart_abort_route.build_authorized_abort_multipart_upload_command(
+            BuildAuthorizedAbortMultipartUploadCommandReq {
+                authorized_upload: &authorized_upload,
+                expected_cleanup: Some(&cleanup),
+                bucket_write_reservation: &complete_proof,
+            },
+        ),
+        Err(ObjectPgActionError::Store(
+            StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build authorized abort multipart upload command",
+            }
+        ))
+    ));
+    let mut crossed_authorized_record = authorized_upload.record().clone();
+    crossed_authorized_record.upload_id = crate::tests::multipart_upload_id("crossed-authorized");
+    let crossed_authorized_upload =
+        AuthorizedMultipartUploadRecord::assume_authorized(crossed_authorized_record);
+    assert!(matches!(
+        correct_multipart_abort_route.build_authorized_abort_multipart_upload_command(
+            BuildAuthorizedAbortMultipartUploadCommandReq {
+                authorized_upload: &crossed_authorized_upload,
+                expected_cleanup: Some(&cleanup),
+                bucket_write_reservation: &abort_proof,
+            },
+        ),
+        Err(ObjectPgActionError::Store(
+            StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build authorized abort multipart upload command",
+            }
+        ))
+    ));
 
     for thread in server_threads {
         thread.join().unwrap();

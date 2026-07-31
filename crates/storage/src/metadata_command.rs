@@ -1533,6 +1533,13 @@ pub(crate) struct AbortMultipartUploadCommand {
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
+impl AbortMultipartUploadCommand {
+    pub(crate) fn has_consistent_subject(&self) -> bool {
+        self.cleanup
+            .matches_upload_subject(&self.bucket, &self.key, &self.upload_id)
+    }
+}
+
 /// Bucket-PG barrier authorized by CompleteMultipartUpload's bucket write reservation proof.
 ///
 /// The monotonic sequence makes replicated application idempotent without retaining any
