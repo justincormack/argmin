@@ -15198,12 +15198,13 @@ impl<'a> StorageRpcDecoder<'a> {
         for _ in 0..multipart_part_segment_count {
             multipart_part_segments.push(self.read_multipart_part_segment_record()?);
         }
-        Ok(ObjectReadSnapshot {
+        ObjectReadSnapshot::from_records(
             stored,
             object_segments,
             multipart_parts,
             multipart_part_segments,
-        })
+        )
+        .map_err(StorageRpcPayloadError::InvalidObjectMetadataRequest)
     }
 
     fn read_object_segment_record(
@@ -17264,7 +17265,12 @@ fn put_object_read_snapshot(out: &mut Vec<u8>, snapshot: &ObjectReadSnapshot) {
             .expect("object segment count must fit in u32"),
     );
     for segment in &snapshot.object_segments {
-        put_object_segment_record(out, segment);
+        put_object_segment_record(
+            out,
+            segment
+                .object_record()
+                .expect("object snapshot segment must retain its object record"),
+        );
     }
     put_u32(
         out,
@@ -17279,7 +17285,12 @@ fn put_object_read_snapshot(out: &mut Vec<u8>, snapshot: &ObjectReadSnapshot) {
             .expect("multipart part segment count must fit in u32"),
     );
     for segment in &snapshot.multipart_part_segments {
-        put_multipart_part_segment_record(out, segment);
+        put_multipart_part_segment_record(
+            out,
+            segment
+                .multipart_record()
+                .expect("multipart snapshot segment must retain its multipart record"),
+        );
     }
 }
 
@@ -22279,12 +22290,15 @@ mod tests {
             ec_m: 2,
         };
         let response = StorageRpcObjectReadSnapshotResponse {
-            outcome: StorageRpcObjectReadSnapshotOutcome::Loaded(Box::new(ObjectReadSnapshot {
-                stored,
-                object_segments: vec![object_segment],
-                multipart_parts: vec![part],
-                multipart_part_segments: vec![segment],
-            })),
+            outcome: StorageRpcObjectReadSnapshotOutcome::Loaded(Box::new(
+                ObjectReadSnapshot::from_records(
+                    stored,
+                    vec![object_segment],
+                    vec![part],
+                    vec![segment],
+                )
+                .unwrap(),
+            )),
         };
         let bytes = encode_object_read_snapshot_response(&response);
         let decoded = decode_object_read_snapshot_response(&bytes).unwrap();

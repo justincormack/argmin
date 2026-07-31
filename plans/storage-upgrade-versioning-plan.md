@@ -839,7 +839,7 @@ The follow-up audit found these related live production leaks:
 | Shard scavenger and repair | `server-core` scans candidates, owns claim leases and retry policy, interprets physical failure variants, and records storage queue transitions. | Move physical shard maintenance state machines and their admission/retry classification into `storage`; make claim, cursor, and work-record representations private. |
 | Payload reclaim and bucket finalization | `ReclaimSweeper` in `server-core` owns durable PG scanning, physical payload-reclaim queues, deferred roots, per-PG cooldown, bucket-delete continuation/finalization work, and retry classification. | Storage owns discovery, queueing, adoption, physical reclaim, asynchronous bucket cleanup/finalization, cleanup roots, and retry scheduling after a logical delete has been accepted. `server-core` retains the S3-visible delete request, preconditions, response, and lifecycle-policy decisions and invokes one logical accepted-deletion operation. |
 | Abandoned stream-session cleanup | `StreamSessionSweeper` in `server-core` directly schedules and invokes storage session scavenging. | Storage owns stream-session expiry, discovery, cleanup, admission, and telemetry behind its maintenance runtime; this internal session lifecycle is not an S3-visible policy. |
-| Physical object payload I/O | `server-core` carries data PG IDs, placement epochs, EC `k/m`, builds `SegmentStoredBytesRequest`, and asks storage for shard locations and historical reads. | Storage returns an opaque persisted payload-segment handle and owns placement, leases, reconstruction, historical routing, and physical read/write requests. `server-core` retains S3-visible byte-range, checksum, and encryption semantics. |
+| Physical object payload I/O | The read path now uses an opaque storage-owned payload-segment handle, but write/commit paths still carry data PG IDs, placement epochs, and EC `k/m`; public physical request and record representations remain pending containment. | Storage returns an opaque persisted payload-segment handle and owns placement, leases, reconstruction, historical routing, and physical read/write requests. `server-core` retains S3-visible byte-range, checksum, and encryption semantics. |
 | Process control-plane orchestration | `argmin-s3` constructs `ControlPlaneCommand`, inspects `PgRouteSnapshot`/`PgState`/acting sets, and implements PG fencing plus live metadata-transfer convergence. | A storage-owned control-plane/admin facade owns topology commands and the complete metadata-transfer state machine. The process supplies lifecycle, endpoint, credentials, and operator inputs only. |
 | Static topology configuration | `argmin-s3` parses and stores `Vec<(PgId, Vec<NodeId>)>` and performs storage placement interpretation. | Keep the outer manifest in `argmin-s3`, but hand its storage-topology subdocument or logical configuration inputs to a storage-owned validator/builder without exposing PG types. |
 | Storage failure handling | `server-core` exhaustively matches `StoreError` variants for PG, database, shard, route, command-log, RPC, backfill retry, and diagnostics. | Storage exposes exhaustive semantic operation/maintenance failure classes plus opaque retained diagnostics. Implementation variants and nested causes remain private. |
@@ -955,6 +955,25 @@ golden is owner-local. Cross-crate composition tests use explicitly `Test`-prefi
 and logical progress observations compiled only with test hooks. The boundary checker rejects raw
 maintenance records, claims, roots, outcome records, and debug snapshots outside `storage`, and
 also rejects making those owner representations public again.
+
+The eighth bounded slice begins implementation-order item 3 with the object read path. Storage
+validates persisted object and multipart segment rows against the live object subject and converts
+them into opaque `ObjectPayloadSegment` values before the snapshot crosses the crate boundary;
+`server-core` can inspect only logical segment index, size, and multipart membership. Each handle
+is bound to its bucket, key, and object generation, so logical lease acquisition rejects a handle
+crossed with another subject. Storage owns expansion to physical shard locations,
+deletion-exclusion lease acquisition, placement-epoch and historical-route selection, ciphertext
+size adjustment, and construction of the stored-byte request. Retained streaming read authority
+binds the full ordered opaque layout, including logical segment indices, and rejects changed or
+omitted handles before a response reader is built. S3-visible byte-range assembly, whole-payload
+checksums, and encryption transformation remain in `server-core`. Physical payload write/commit
+fields and operations remain pending, so implementation-order item 3 is not yet complete. The
+boundary checker rejects reintroduction of raw segment records, handle construction, PG,
+placement-epoch, EC, shard-key, raw stored-byte-request, or shard-location lease handling into the
+production coordinator read seam. That seam is an explicit inventory spanning its authorization,
+object-state, infrastructure/runtime, read/copy, payload-transformation, and response modules; the
+checker also rejects inventory drift when another production module begins participating in the
+read seam.
 
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a

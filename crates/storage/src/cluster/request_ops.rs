@@ -11417,6 +11417,40 @@ impl super::StorageCluster {
         ))
     }
 
+    /// Acquires deletion exclusion for exactly the opaque payload segments a
+    /// caller intends to read. Storage owns placement and historical-route
+    /// expansion for those segments.
+    pub fn acquire_object_payload_read_lease<'a>(
+        self: &std::sync::Arc<Self>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        segments: impl IntoIterator<Item = &'a ObjectPayloadSegment>,
+    ) -> Result<ObjectPayloadLease, StoreError> {
+        let mut locations = Vec::new();
+        for segment in segments {
+            if !segment.matches_subject(bucket, key, generation_id) {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: "payload segment does not match lease subject".to_string(),
+                });
+            }
+            let request = segment.stored_bytes_request();
+            if request.stored_size == 0 {
+                continue;
+            }
+            locations.extend(self.segment_payload_shard_locations_at_placement_epoch(
+                segment.placement_cluster_epoch(),
+                &request,
+            )?);
+        }
+        self.acquire_object_payload_lease_for_shard_locations(
+            bucket,
+            key,
+            generation_id,
+            &locations,
+        )
+    }
+
     fn ensure_object_payload_lease_allowed(
         &self,
         bucket: &BucketName,

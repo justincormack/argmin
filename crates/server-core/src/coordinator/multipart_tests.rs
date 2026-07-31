@@ -5128,7 +5128,7 @@ fn copy_multipart_source_zero_byte() {
 }
 
 #[test]
-fn read_multipart_range_detects_incomplete_manifest() {
+fn get_object_rejects_incomplete_manifest_before_body_read() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     coord
@@ -5162,26 +5162,21 @@ fn read_multipart_range_detects_incomplete_manifest() {
         )
         .unwrap();
 
-    let err = coord
-        .get_object(&GetObjectRequest {
-            sse_customer: None,
-            object: object_version_request_with_expected_owner(
-                "bucket",
-                "key",
-                None,
-                test_requester(),
-                None,
-            ),
-            cond: &ReadCondition::default(),
-        })
-        .unwrap()
-        .body
-        .read_all()
-        .unwrap_err();
-    assert!(
-        matches!(err, ServerError::IntegrityError { .. }),
-        "expected IntegrityError for incomplete manifest, got {err:?}"
-    );
+    let err = match coord.get_object(&GetObjectRequest {
+        sse_customer: None,
+        object: object_version_request_with_expected_owner(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            None,
+        ),
+        cond: &ReadCondition::default(),
+    }) {
+        Ok(_) => panic!("incomplete manifest unexpectedly produced an object body"),
+        Err(error) => error,
+    };
+    assert_eq!(err.s3_error_code(), "InternalError", "{err:?}");
 }
 
 #[test]

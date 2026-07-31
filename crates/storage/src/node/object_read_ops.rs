@@ -219,11 +219,14 @@ impl SharedStorageNode {
             },
         };
 
-        Ok(ObjectReadSnapshot {
-            stored: stored.clone(),
+        Ok(ObjectReadSnapshot::from_records(
+            stored.clone(),
             object_segments,
             multipart_parts,
             multipart_part_segments,
-        })
+        )
+        .map_err(|reason| StoreError::PayloadShardSetMismatch {
+            reason: reason.to_string(),
+        })?)
     }
 }

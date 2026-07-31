@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use storage::EcShape;
 
 use super::lock_mutex_unpoisoned;
-use super::read_core::{PayloadLease, ReadChunk, SegmentPayloadRecord};
+use super::read_core::{PayloadLease, ReadChunk};
 use super::INTERNAL_SEGMENT_SIZE;
 use crate::sse::SSE_C_SEGMENT_TAG_LEN;
 
@@ -209,12 +209,6 @@ pub(super) fn max_stored_segment_size() -> usize {
     // Encrypted objects store an authentication tag alongside the largest
     // logical segment.
     INTERNAL_SEGMENT_SIZE.saturating_add(SSE_C_SEGMENT_TAG_LEN)
-}
-
-impl SegmentPayloadRecord {
-    pub(super) fn stored_size(&self) -> usize {
-        self.size as usize + self.encryption.segment_ciphertext_extra_len()
-    }
 }
 
 impl Drop for PayloadLease {

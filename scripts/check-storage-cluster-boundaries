@@ -2067,6 +2067,55 @@ if [[ "$segment_payload_read_callers" != "$expected_segment_payload_read_callers
         "$segment_payload_read_callers"
 fi
 
+server_core_payload_read_files=(
+    crates/server-core/src/coordinator.rs
+    crates/server-core/src/coordinator/authz.rs
+    crates/server-core/src/coordinator/authz/acl.rs
+    crates/server-core/src/coordinator/authz/modern.rs
+    crates/server-core/src/coordinator/authz_results.rs
+    crates/server-core/src/coordinator/copy.rs
+    crates/server-core/src/coordinator/infra.rs
+    crates/server-core/src/coordinator/object_state.rs
+    crates/server-core/src/coordinator/payload.rs
+    crates/server-core/src/coordinator/read.rs
+    crates/server-core/src/coordinator/read_core.rs
+    crates/server-core/src/coordinator/response_types.rs
+    crates/server-core/src/coordinator/runtime.rs
+)
+declared_server_core_payload_read_files=$(
+    printf '%s\n' "${server_core_payload_read_files[@]}" | sort
+)
+discovered_server_core_payload_read_files=$(
+    rg -l --color=never \
+        '\b(ReadChunk|ReadHandle|ReadRuntime|ReadStorage|RetainedObjectPayloadRead|ObjectPayloadSegment|SegmentPayloadRecord|PayloadLease|PayloadBufferPool|LeasedObjectReadSnapshot)\b|payload_handoff|retain_object_payload_read|read_checked_segment_payload' \
+        crates/server-core/src/coordinator.rs \
+        crates/server-core/src/coordinator \
+        --glob '*.rs' \
+        --glob '!**/*_tests.rs' \
+        --glob '!**/tests/**' \
+        --glob '!**/test_support.rs' \
+        | sort
+)
+if [[ "$declared_server_core_payload_read_files" != "$discovered_server_core_payload_read_files" ]]; then
+    fail_with_matches \
+        "The explicit production coordinator payload-read file inventory must cover every read-seam participant" \
+        "declared:
+$declared_server_core_payload_read_files
+
+discovered:
+$discovered_server_core_payload_read_files"
+fi
+
+server_core_payload_read_placement_leaks=$(
+    rg -n --color=never \
+        '\b(SegmentStoredBytesRequest|ObjectSegmentRecord|MultipartPartSegmentRecord)\b|\.payload_segment\b|\.segment_payload_shard_locations\b|\.acquire_object_payload_lease_for_shard_locations\b|\.(data_pg_id|placement_cluster_epoch|ec_k|ec_m|segment_okh|segment_vid)\b' \
+        "${server_core_payload_read_files[@]}" \
+        || true
+)
+fail_with_matches \
+    "Server-core payload reads must use opaque storage-owned segments rather than placement, EC, shard, or historical-route representations" \
+    "$server_core_payload_read_placement_leaks"
+
 coarse_payload_lease_callers=$(
     awk '
     FNR == 1 {

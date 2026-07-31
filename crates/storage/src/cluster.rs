@@ -90,9 +90,9 @@ use crate::types::{
     FinalizeStreamPutOutcome, GenerationId, InsertCurrentDeleteMarkerOutcome,
     ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
     ListedMultipartParts, MultipartCompletionSnapshot, MultipartUploadManagementLookup,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot,
-    ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord,
-    OwnerIdentity, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
+    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectPayloadSegment,
+    ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention,
+    ObjectSegmentRecord, OwnerIdentity, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
     PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
     PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,
@@ -1330,18 +1330,6 @@ pub struct ObjectPayloadLease {
     released: bool,
 }
 
-/// One immutable payload segment selected by an admitted object snapshot.
-///
-/// The fields are private so callers cannot mint payload-read authority from
-/// arbitrary shard coordinates. [`RetainedObjectPayloadRead`] constructs the
-/// set only by consuming the exact [`LeasedObjectReadSnapshot`] returned by a
-/// leased snapshot load.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct RetainedObjectPayloadSegment {
-    placement_cluster_epoch: ClusterEpoch,
-    request: SegmentStoredBytesRequest,
-}
-
 /// Subject-bound payload-read authority retained by a streaming response.
 ///
 /// This capability deliberately does not retain request route admission. It
@@ -1355,13 +1343,13 @@ pub struct RetainedObjectPayloadRead {
     bucket: BucketName,
     key: ObjectKey,
     generation_id: GenerationId,
-    segments: HashSet<RetainedObjectPayloadSegment>,
+    segments: Vec<ObjectPayloadSegment>,
     lease: Mutex<Option<ObjectPayloadLease>>,
     repair_fence: Option<RetainedActiveRouteRepairFence>,
 }
 
 impl RetainedObjectPayloadRead {
-    pub fn matches_subject(
+    fn matches_subject(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1370,32 +1358,51 @@ impl RetainedObjectPayloadRead {
         self.bucket == *bucket && self.key == *key && self.generation_id == generation_id
     }
 
-    pub fn contains_segment(
+    fn contains_segment(&self, segment: &ObjectPayloadSegment) -> bool {
+        self.segments.contains(segment)
+    }
+
+    /// Verifies that a logical read layout is wholly covered by this retained
+    /// subject-bound snapshot authority.
+    pub fn covers_complete_object_payload_layout<'a>(
         &self,
-        placement_cluster_epoch: ClusterEpoch,
-        request: SegmentStoredBytesRequest,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        segments: impl IntoIterator<Item = &'a ObjectPayloadSegment>,
     ) -> bool {
-        self.segments.contains(&RetainedObjectPayloadSegment {
-            placement_cluster_epoch,
-            request,
-        })
+        self.matches_subject(bucket, key, generation_id) && self.segments.iter().eq(segments)
+    }
+
+    /// Verifies that every segment selected for a partial response belongs to
+    /// this retained subject-bound snapshot.
+    pub fn contains_object_payload_segments<'a>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        segments: impl IntoIterator<Item = &'a ObjectPayloadSegment>,
+    ) -> bool {
+        self.matches_subject(bucket, key, generation_id)
+            && segments
+                .into_iter()
+                .all(|segment| self.contains_segment(segment))
     }
 
     pub fn read_segment_payload_stored_bytes_into(
         &self,
-        placement_cluster_epoch: ClusterEpoch,
-        request: SegmentStoredBytesRequest,
+        segment: &ObjectPayloadSegment,
         dst: &mut Vec<u8>,
     ) -> Result<(), StoreError> {
-        if !self.contains_segment(placement_cluster_epoch, request) {
+        if !self.contains_segment(segment) {
             return Err(StoreError::PayloadShardSetMismatch {
                 reason: "payload read is outside the retained object snapshot".to_string(),
             });
         }
         self.cluster
             .read_retained_segment_payload_stored_bytes_at_placement_epoch_into(
-                placement_cluster_epoch,
-                request,
+                segment.placement_cluster_epoch(),
+                segment.stored_bytes_request(),
                 dst,
                 self.repair_fence.as_ref(),
             )
@@ -6558,7 +6565,7 @@ impl StorageCluster {
             bucket,
             key,
             version_id: _,
-            snapshot_mode: _,
+            snapshot_mode,
             pg_id: _,
             snapshot,
             payload_lease,
@@ -6569,67 +6576,97 @@ impl StorageCluster {
                 reason: "leased object snapshot belongs to another storage cluster".to_string(),
             });
         }
+        if snapshot_mode != ObjectReadSnapshotMode::FullPayloadLayout {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "retained payload read requires a complete payload-layout snapshot"
+                    .to_string(),
+            });
+        }
         let Some(live) = snapshot.stored.as_live() else {
             return Ok(None);
         };
 
-        let stored_size_extra = live.encryption.segment_ciphertext_extra_len();
-        let mut segments = HashSet::new();
+        let mut segments = Vec::with_capacity(
+            snapshot.object_segments.len() + snapshot.multipart_part_segments.len(),
+        );
         for segment in &snapshot.object_segments {
-            if segment.bucket != bucket
-                || segment.key != key
-                || segment.version_id != live.version_id
+            let Some(record) = segment.object_record() else {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: "object snapshot contains a multipart segment".to_string(),
+                });
+            };
+            if record.bucket != bucket || record.key != key || record.version_id != live.version_id
             {
                 return Err(StoreError::PayloadShardSetMismatch {
                     reason: "object segment does not match leased snapshot subject".to_string(),
                 });
             }
-            segments.insert(RetainedObjectPayloadSegment {
-                placement_cluster_epoch: segment.placement_cluster_epoch,
-                request: SegmentStoredBytesRequest {
-                    data_pg_id: segment.data_pg_id,
-                    segment_okh: segment.segment_okh,
-                    segment_vid: segment.segment_vid,
-                    stored_size: segment.size as usize + stored_size_extra,
-                    segment_crc64: segment.segment_crc64,
-                    ec: EcShape {
-                        k: segment.ec_k,
-                        m: segment.ec_m,
-                    },
-                },
-            });
+            segments.push(segment.clone());
         }
         for segment in &snapshot.multipart_part_segments {
-            if segment.bucket != bucket || segment.key != key {
+            let Some(record) = segment.multipart_record() else {
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: "multipart snapshot contains an object segment".to_string(),
+                });
+            };
+            if record.bucket != bucket
+                || record.key != key
+                || record.version_id != live.version_id.to_u64()
+            {
                 return Err(StoreError::PayloadShardSetMismatch {
                     reason: "multipart segment does not match leased snapshot subject".to_string(),
                 });
             }
-            segments.insert(RetainedObjectPayloadSegment {
-                placement_cluster_epoch: segment.placement_cluster_epoch,
-                request: SegmentStoredBytesRequest {
-                    data_pg_id: segment.data_pg_id,
-                    segment_okh: segment.segment_okh,
-                    segment_vid: segment.segment_vid,
-                    stored_size: segment.size as usize + stored_size_extra,
-                    segment_crc64: segment.segment_crc64,
-                    ec: EcShape {
-                        k: segment.ec_k,
-                        m: segment.ec_m,
-                    },
-                },
+            segments.push(segment.clone());
+        }
+        let layout_matches = match live.layout {
+            ObjectLayout::Standard => {
+                snapshot.multipart_parts.is_empty()
+                    && snapshot.multipart_part_segments.is_empty()
+                    && (live.size == 0 || !snapshot.object_segments.is_empty())
+            }
+            ObjectLayout::MultipartManifest { parts_count } => {
+                let mut part_sizes = HashMap::new();
+                let unique_parts = snapshot
+                    .multipart_parts
+                    .iter()
+                    .all(|part| part_sizes.insert(part.part_number, part.size).is_none());
+                let mut segment_counts = HashMap::<u32, usize>::new();
+                let segments_have_parts = snapshot.multipart_part_segments.iter().all(|segment| {
+                    let Some(part_number) = segment.part_number() else {
+                        return false;
+                    };
+                    if !part_sizes.contains_key(&part_number) {
+                        return false;
+                    }
+                    *segment_counts.entry(part_number).or_default() += 1;
+                    true
+                });
+                snapshot.object_segments.is_empty()
+                    && unique_parts
+                    && snapshot.multipart_parts.len() == parts_count.get() as usize
+                    && segments_have_parts
+                    && part_sizes.iter().all(|(part_number, size)| {
+                        *size == 0 || segment_counts.contains_key(part_number)
+                    })
+            }
+        };
+        if !layout_matches {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: "payload segments do not match the stored object layout".to_string(),
             });
         }
 
         let mut locations = Vec::new();
         for segment in &segments {
-            if segment.request.stored_size == 0 {
+            let request = segment.stored_bytes_request();
+            if request.stored_size == 0 {
                 continue;
             }
             require_valid_route()?;
             locations.extend(self.segment_payload_shard_locations_at_placement_epoch(
-                segment.placement_cluster_epoch,
-                &segment.request,
+                segment.placement_cluster_epoch(),
+                &request,
             )?);
         }
         require_valid_route()?;
@@ -15668,6 +15705,20 @@ impl StorageCluster {
         self.read_segment_payload_stored_bytes_at_placement_epoch_into(
             self.operation_epoch(),
             req,
+            dst,
+        )
+    }
+
+    /// Reads one opaque persisted payload segment, including historical-route
+    /// selection when its placement predates the current runtime map.
+    pub fn read_object_payload_segment_stored_bytes_into(
+        &self,
+        segment: &ObjectPayloadSegment,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), StoreError> {
+        self.read_segment_payload_stored_bytes_at_placement_epoch_into(
+            segment.placement_cluster_epoch(),
+            segment.stored_bytes_request(),
             dst,
         )
     }

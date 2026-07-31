@@ -728,8 +728,26 @@ impl Coordinator {
     pub(super) fn read_runtime_for_retained_payload_read(
         &self,
         retained_payload_read: storage::RetainedObjectPayloadRead,
-    ) -> ReadRuntime {
-        ReadRuntime {
+        bucket: &storage::BucketName,
+        key: &storage::ObjectKey,
+        generation_id: storage::GenerationId,
+        snapshot: &storage::ObjectReadSnapshot,
+    ) -> Result<ReadRuntime, ServerError> {
+        if !retained_payload_read.covers_complete_object_payload_layout(
+            bucket,
+            key,
+            generation_id,
+            snapshot
+                .object_segments
+                .iter()
+                .chain(snapshot.multipart_part_segments.iter()),
+        ) {
+            return Err(ServerError::InternalError {
+                reason: "retained payload authority does not cover the complete object layout"
+                    .to_string(),
+            });
+        }
+        Ok(ReadRuntime {
             storage: super::read_core::ReadStorage::Retained(Arc::new(retained_payload_read)),
             #[cfg(test)]
             pg_topology: PgTopology::new(self.storage_node().test_pg_ids())
@@ -737,7 +755,7 @@ impl Coordinator {
             payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
             sse_c_validator: self.sse_c_validator.clone(),
             managed_key_provider: self.managed_key_provider.clone(),
-        }
+        })
     }
 
     pub(super) fn storage_node(&self) -> Arc<StorageCluster> {

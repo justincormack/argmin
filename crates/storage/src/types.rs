@@ -2157,6 +2157,156 @@ pub struct SegmentStoredBytesRequest {
     pub ec: EcShape,
 }
 
+/// Opaque storage-owned description of one persisted object payload segment.
+///
+/// Callers may use the logical segment metadata needed to assemble an object
+/// response, but placement coordinates and erasure-coding details remain an
+/// implementation detail of the storage crate.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ObjectPayloadSegment {
+    subject: ObjectPayloadSubject,
+    record: ObjectPayloadSegmentRecord,
+    stored_size_extra: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ObjectPayloadSubject {
+    bucket: BucketName,
+    key: ObjectKey,
+    generation_id: GenerationId,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum ObjectPayloadSegmentRecord {
+    Object(ObjectSegmentRecord),
+    Multipart(MultipartPartSegmentRecord),
+}
+
+impl std::fmt::Debug for ObjectPayloadSegment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectPayloadSegment")
+            .field("segment_index", &self.segment_index())
+            .field("size", &self.size())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ObjectPayloadSegment {
+    fn from_object_record(
+        subject: &ObjectPayloadSubject,
+        record: ObjectSegmentRecord,
+        stored_size_extra: usize,
+    ) -> Self {
+        Self {
+            subject: subject.clone(),
+            record: ObjectPayloadSegmentRecord::Object(record),
+            stored_size_extra,
+        }
+    }
+
+    fn from_multipart_record(
+        subject: &ObjectPayloadSubject,
+        record: MultipartPartSegmentRecord,
+        stored_size_extra: usize,
+    ) -> Self {
+        Self {
+            subject: subject.clone(),
+            record: ObjectPayloadSegmentRecord::Multipart(record),
+            stored_size_extra,
+        }
+    }
+
+    pub fn segment_index(&self) -> u32 {
+        match &self.record {
+            ObjectPayloadSegmentRecord::Object(record) => record.segment_index,
+            ObjectPayloadSegmentRecord::Multipart(record) => record.segment_index,
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        match &self.record {
+            ObjectPayloadSegmentRecord::Object(record) => record.size,
+            ObjectPayloadSegmentRecord::Multipart(record) => record.size,
+        }
+    }
+
+    pub fn part_number(&self) -> Option<u32> {
+        match &self.record {
+            ObjectPayloadSegmentRecord::Object(_) => None,
+            ObjectPayloadSegmentRecord::Multipart(record) => Some(record.part_number),
+        }
+    }
+
+    pub(crate) fn matches_subject(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> bool {
+        self.subject.bucket == *bucket
+            && self.subject.key == *key
+            && self.subject.generation_id == generation_id
+    }
+
+    pub(crate) fn placement_cluster_epoch(&self) -> ClusterEpoch {
+        match &self.record {
+            ObjectPayloadSegmentRecord::Object(record) => record.placement_cluster_epoch,
+            ObjectPayloadSegmentRecord::Multipart(record) => record.placement_cluster_epoch,
+        }
+    }
+
+    pub(crate) fn stored_bytes_request(&self) -> SegmentStoredBytesRequest {
+        match &self.record {
+            ObjectPayloadSegmentRecord::Object(record) => SegmentStoredBytesRequest {
+                data_pg_id: record.data_pg_id,
+                segment_okh: record.segment_okh,
+                segment_vid: record.segment_vid,
+                stored_size: record.size as usize + self.stored_size_extra,
+                segment_crc64: record.segment_crc64,
+                ec: EcShape {
+                    k: record.ec_k,
+                    m: record.ec_m,
+                },
+            },
+            ObjectPayloadSegmentRecord::Multipart(record) => SegmentStoredBytesRequest {
+                data_pg_id: record.data_pg_id,
+                segment_okh: record.segment_okh,
+                segment_vid: record.segment_vid,
+                stored_size: record.size as usize + self.stored_size_extra,
+                segment_crc64: record.segment_crc64,
+                ec: EcShape {
+                    k: record.ec_k,
+                    m: record.ec_m,
+                },
+            },
+        }
+    }
+
+    pub(crate) fn object_record(&self) -> Option<&ObjectSegmentRecord> {
+        match &self.record {
+            ObjectPayloadSegmentRecord::Object(record) => Some(record),
+            ObjectPayloadSegmentRecord::Multipart(_) => None,
+        }
+    }
+
+    pub(crate) fn multipart_record(&self) -> Option<&MultipartPartSegmentRecord> {
+        match &self.record {
+            ObjectPayloadSegmentRecord::Object(_) => None,
+            ObjectPayloadSegmentRecord::Multipart(record) => Some(record),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_segment_index(&self, segment_index: u32) -> Self {
+        let mut changed = self.clone();
+        match &mut changed.record {
+            ObjectPayloadSegmentRecord::Object(record) => record.segment_index = segment_index,
+            ObjectPayloadSegmentRecord::Multipart(record) => record.segment_index = segment_index,
+        }
+        changed
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PlacedSegmentShardRepairWorkItem {
     pub(crate) request: SegmentStoredBytesRequest,
@@ -4318,9 +4468,80 @@ pub struct FinalizeStreamPutOutcome<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectReadSnapshot {
     pub stored: StoredObject,
-    pub object_segments: Vec<ObjectSegmentRecord>,
+    pub object_segments: Vec<ObjectPayloadSegment>,
     pub multipart_parts: Vec<ObjectPartRecord>,
-    pub multipart_part_segments: Vec<MultipartPartSegmentRecord>,
+    pub multipart_part_segments: Vec<ObjectPayloadSegment>,
+}
+
+impl ObjectReadSnapshot {
+    pub(crate) fn from_records(
+        stored: StoredObject,
+        object_segments: Vec<ObjectSegmentRecord>,
+        multipart_parts: Vec<ObjectPartRecord>,
+        multipart_part_segments: Vec<MultipartPartSegmentRecord>,
+    ) -> Result<Self, &'static str> {
+        let live = stored.as_live();
+        if live.is_none()
+            && (!object_segments.is_empty()
+                || !multipart_parts.is_empty()
+                || !multipart_part_segments.is_empty())
+        {
+            return Err("non-live object snapshot contains payload layout");
+        }
+        if let Some(live) = live {
+            if object_segments.iter().any(|record| {
+                record.bucket != live.bucket
+                    || record.key != live.key
+                    || record.version_id != live.version_id
+            }) {
+                return Err("object segment does not match snapshot subject");
+            }
+            if multipart_parts.iter().any(|record| {
+                record.bucket != live.bucket
+                    || record.key != live.key
+                    || record.version_id != live.version_id
+            }) {
+                return Err("multipart part does not match snapshot subject");
+            }
+            if multipart_part_segments.iter().any(|record| {
+                record.bucket != live.bucket
+                    || record.key != live.key
+                    || record.version_id != live.version_id.to_u64()
+            }) {
+                return Err("multipart segment does not match snapshot subject");
+            }
+        }
+        let Some(live) = live else {
+            return Ok(Self {
+                stored,
+                object_segments: Vec::new(),
+                multipart_parts: Vec::new(),
+                multipart_part_segments: Vec::new(),
+            });
+        };
+        let stored_size_extra = live.encryption.segment_ciphertext_extra_len();
+        let subject = ObjectPayloadSubject {
+            bucket: live.bucket.clone(),
+            key: live.key.clone(),
+            generation_id: live.generation_id,
+        };
+        Ok(Self {
+            stored,
+            object_segments: object_segments
+                .into_iter()
+                .map(|record| {
+                    ObjectPayloadSegment::from_object_record(&subject, record, stored_size_extra)
+                })
+                .collect(),
+            multipart_parts,
+            multipart_part_segments: multipart_part_segments
+                .into_iter()
+                .map(|record| {
+                    ObjectPayloadSegment::from_multipart_record(&subject, record, stored_size_extra)
+                })
+                .collect(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5107,6 +5328,39 @@ pub struct MultipartPartSegmentRecord {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn object_payload_segment_debug_exposes_only_logical_layout() {
+        let bucket = BucketName::try_from("bucket".to_string()).unwrap();
+        let key = ObjectKey::try_from("key".to_string()).unwrap();
+        let subject = ObjectPayloadSubject {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id: GenerationId::new(29).unwrap(),
+        };
+        let segment = ObjectSegmentRecord {
+            bucket,
+            key,
+            version_id: VersionId::Null,
+            segment_index: 3,
+            size: 9,
+            segment_crc64: 17,
+            segment_okh: [23; 16],
+            segment_vid: GenerationId::new(29).unwrap(),
+            data_pg_id: 31,
+            placement_cluster_epoch: ClusterEpoch::new(37).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+        };
+        let segment = ObjectPayloadSegment::from_object_record(&subject, segment, 16);
+
+        assert_eq!(segment.segment_index(), 3);
+        assert_eq!(segment.size(), 9);
+        assert_eq!(
+            format!("{segment:?}"),
+            "ObjectPayloadSegment { segment_index: 3, size: 9, .. }"
+        );
+    }
 
     #[test]
     fn cluster_epoch_is_distinct_from_generation_id() {

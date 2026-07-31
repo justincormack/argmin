@@ -443,7 +443,7 @@ fn multipart_upload_lifecycle() {
     assert_eq!(outcome.snapshot().multipart_parts.len(), 2);
     let mut segments = outcome.snapshot().multipart_part_segments.clone();
     assert_eq!(segments.len(), 2);
-    segments.sort_by_key(|segment| (segment.part_number, segment.segment_index));
+    segments.sort_by_key(|segment| (segment.part_number(), segment.segment_index()));
     let (_, _, leased_snapshot) = outcome.into_parts();
     let retained = route
         .retain_object_payload_read(leased_snapshot)
@@ -451,24 +451,12 @@ fn multipart_upload_lifecycle() {
         .expect("multipart object should retain payload authority");
     let mut read_payload = Vec::new();
     for segment in segments {
-        let part_number = segment.part_number;
+        let part_number = segment
+            .part_number()
+            .expect("multipart snapshot must contain multipart segments");
         let mut segment_payload = Vec::new();
         retained
-            .read_segment_payload_stored_bytes_into(
-                segment.placement_cluster_epoch,
-                SegmentStoredBytesRequest {
-                    data_pg_id: segment.data_pg_id,
-                    segment_okh: segment.segment_okh,
-                    segment_vid: segment.segment_vid,
-                    stored_size: segment.size as usize,
-                    segment_crc64: segment.segment_crc64,
-                    ec: EcShape {
-                        k: segment.ec_k,
-                        m: segment.ec_m,
-                    },
-                },
-                &mut segment_payload,
-            )
+            .read_segment_payload_stored_bytes_into(&segment, &mut segment_payload)
             .unwrap_or_else(|error| panic!("read multipart part {part_number}: {error:?}"));
         read_payload.extend_from_slice(&segment_payload);
     }

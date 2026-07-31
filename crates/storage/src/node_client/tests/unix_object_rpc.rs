@@ -3227,7 +3227,8 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
         )
         .unwrap();
     assert_eq!(snapshot.stored, subject.stored);
-    assert_eq!(snapshot.object_segments, vec![segment]);
+    assert_eq!(snapshot.object_segments.len(), 1);
+    assert_eq!(snapshot.object_segments[0].object_record(), Some(&segment));
     assert!(snapshot.multipart_parts.is_empty());
     assert!(snapshot.multipart_part_segments.is_empty());
 

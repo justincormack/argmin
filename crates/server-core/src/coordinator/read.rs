@@ -57,7 +57,13 @@ impl Coordinator {
                 reason: "live object snapshot did not produce retained payload authority"
                     .to_string(),
             })?;
-        Ok(Some(self.read_runtime_for_retained_payload_read(retained)))
+        Ok(Some(self.read_runtime_for_retained_payload_read(
+            retained,
+            object.bucket_name_typed(),
+            object.key_typed(),
+            live.generation_id,
+            snapshot,
+        )?))
     }
 
     fn authorized_tag_count(
@@ -137,7 +143,7 @@ impl Coordinator {
                 multipart_parts,
                 multipart_part_segments,
                 &record.encryption,
-            );
+            )?;
 
             let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
             let system_metadata = self.deserialize_visible_system_metadata(
@@ -342,7 +348,7 @@ impl Coordinator {
                 multipart_parts,
                 multipart_part_segments,
                 &record.encryption,
-            );
+            )?;
 
             let part = obj_parts
                 .iter()
@@ -1075,7 +1081,7 @@ impl Coordinator {
                 multipart_parts,
                 multipart_part_segments,
                 &record.encryption,
-            );
+            )?;
             if !obj_parts.iter().any(|part| {
                 let part_start = part.object_offset_start as u64;
                 let part_end_exclusive = part_start + part.record.size;

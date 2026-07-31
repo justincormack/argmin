@@ -802,14 +802,39 @@ fn unix_object_read_snapshot_response_rejects_missing_multipart_parts() {
             parts_count: std::num::NonZeroU32::new(2).unwrap(),
         },
     );
-    let snapshot = ObjectReadSnapshot {
+    let snapshot = ObjectReadSnapshot::from_records(
         stored,
-        object_segments: Vec::new(),
-        multipart_parts: vec![test_object_read_multipart_part(&bucket, &key, 1)],
-        multipart_part_segments: Vec::new(),
-    };
+        Vec::new(),
+        vec![test_object_read_multipart_part(&bucket, &key, 1)],
+        Vec::new(),
+    )
+    .unwrap();
 
     assert_object_read_snapshot_rejected(&snapshot, ObjectReadSnapshotMode::MultipartParts);
+}
+
+#[test]
+fn object_read_snapshot_construction_rejects_crossed_segment_subject() {
+    let bucket = crate::tests::bucket_name("object-read-crossed-segment");
+    let key = crate::tests::object_key("object-read-crossed-segment-key");
+    let stored = test_live_stored_object(
+        bucket.clone(),
+        key.clone(),
+        GenerationId::new(10).unwrap(),
+        test_multipart_layout(),
+    );
+    let mut segment = test_object_read_multipart_segment(&bucket, &key, 1);
+    segment.key = crate::tests::object_key("other-key");
+
+    let error = ObjectReadSnapshot::from_records(
+        stored,
+        Vec::new(),
+        vec![test_object_read_multipart_part(&bucket, &key, 1)],
+        vec![segment],
+    )
+    .unwrap_err();
+
+    assert_eq!(error, "multipart segment does not match snapshot subject");
 }
 
 #[test]
@@ -822,12 +847,13 @@ fn unix_object_read_snapshot_response_rejects_orphan_multipart_segments() {
         GenerationId::new(10).unwrap(),
         test_multipart_layout(),
     );
-    let snapshot = ObjectReadSnapshot {
+    let snapshot = ObjectReadSnapshot::from_records(
         stored,
-        object_segments: Vec::new(),
-        multipart_parts: vec![test_object_read_multipart_part(&bucket, &key, 1)],
-        multipart_part_segments: vec![test_object_read_multipart_segment(&bucket, &key, 2)],
-    };
+        Vec::new(),
+        vec![test_object_read_multipart_part(&bucket, &key, 1)],
+        vec![test_object_read_multipart_segment(&bucket, &key, 2)],
+    )
+    .unwrap();
 
     assert_object_read_snapshot_rejected(&snapshot, ObjectReadSnapshotMode::FullPayloadLayout);
 }
@@ -852,12 +878,13 @@ fn unix_object_read_snapshot_response_accepts_zero_byte_multipart_part_without_s
     );
     let mut zero_part = test_object_read_multipart_part(&bucket, &key, 2);
     zero_part.size = 0;
-    let snapshot = ObjectReadSnapshot {
+    let snapshot = ObjectReadSnapshot::from_records(
         stored,
-        object_segments: Vec::new(),
-        multipart_parts: vec![test_object_read_multipart_part(&bucket, &key, 1), zero_part],
-        multipart_part_segments: vec![test_object_read_multipart_segment(&bucket, &key, 1)],
-    };
+        Vec::new(),
+        vec![test_object_read_multipart_part(&bucket, &key, 1), zero_part],
+        vec![test_object_read_multipart_segment(&bucket, &key, 1)],
+    )
+    .unwrap();
     let identity = ObjectReadAuthSubjectIdentity::for_stored(&snapshot.stored);
 
     client

@@ -1,8 +1,8 @@
 use super::*;
-use crate::{SegmentStoredBytesRequest, StorageClusterRouteHandle};
+use crate::StorageClusterRouteHandle;
 
 #[test]
-fn retained_object_payload_read_rejects_a_crossed_segment_descriptor() {
+fn retained_object_payload_read_binds_the_complete_logical_segment_layout() {
     let tmp = test_util::tempdir();
     let map = Arc::new(
         LocalClusterMap::open(
@@ -46,44 +46,169 @@ fn retained_object_payload_read_rejects_a_crossed_segment_descriptor() {
         .first()
         .expect("test object should have one segment")
         .clone();
-    let live = outcome.snapshot().stored.as_live().unwrap();
-    let request = SegmentStoredBytesRequest {
-        data_pg_id: segment.data_pg_id,
-        segment_okh: segment.segment_okh,
-        segment_vid: segment.segment_vid,
-        stored_size: segment.size as usize + live.encryption.segment_ciphertext_extra_len(),
-        segment_crc64: segment.segment_crc64,
-        ec: EcShape {
-            k: segment.ec_k,
-            m: segment.ec_m,
-        },
-    };
+    let generation_id = outcome.snapshot().stored.as_live().unwrap().generation_id;
+    let other_bucket = crate::BucketName::try_from("other-bucket".to_string()).unwrap();
+    let other_key = crate::ObjectKey::try_from("other-key".to_string()).unwrap();
+    let other_generation = GenerationId::new(generation_id.get() + 1).unwrap();
+    for (lease_bucket, lease_key, lease_generation) in [
+        (&other_bucket, &key, generation_id),
+        (&bucket, &other_key, generation_id),
+        (&bucket, &key, other_generation),
+    ] {
+        let error = match cluster.acquire_object_payload_read_lease(
+            lease_bucket,
+            lease_key,
+            lease_generation,
+            [&segment],
+        ) {
+            Ok(_) => panic!("crossed payload segment subject unexpectedly acquired a lease"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::PayloadShardSetMismatch { .. }));
+    }
     let (_, snapshot, leased_snapshot) = outcome.into_parts();
     assert!(Arc::ptr_eq(&snapshot, &leased_snapshot.snapshot));
-    let retained = route
+    let mut retained = route
         .retain_object_payload_read(leased_snapshot)
         .unwrap()
         .expect("live object should retain payload authority");
     let mut bytes = Vec::new();
     retained
-        .read_segment_payload_stored_bytes_into(
-            segment.placement_cluster_epoch,
-            request,
-            &mut bytes,
-        )
+        .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
         .unwrap();
     assert_eq!(bytes, b"retained payload");
+    assert!(retained.covers_complete_object_payload_layout(
+        &bucket,
+        &key,
+        generation_id,
+        [&segment]
+    ));
+    let second = segment.with_test_segment_index(segment.segment_index() + 1);
+    retained.segments.push(second.clone());
+    assert!(retained.covers_complete_object_payload_layout(
+        &bucket,
+        &key,
+        generation_id,
+        [&segment, &second]
+    ));
+    assert!(!retained.covers_complete_object_payload_layout(
+        &bucket,
+        &key,
+        generation_id,
+        [&segment]
+    ));
 
-    let mut crossed = request;
-    crossed.segment_okh[0] ^= 0xff;
+    let crossed = segment.with_test_segment_index(segment.segment_index() + 2);
+    assert!(!retained.covers_complete_object_payload_layout(
+        &bucket,
+        &key,
+        generation_id,
+        [&crossed, &second]
+    ));
     let error = retained
-        .read_segment_payload_stored_bytes_into(
-            segment.placement_cluster_epoch,
-            crossed,
-            &mut Vec::new(),
-        )
+        .read_segment_payload_stored_bytes_into(&crossed, &mut Vec::new())
         .unwrap_err();
     assert!(matches!(error, StoreError::PayloadShardSetMismatch { .. }));
+}
+
+#[test]
+fn retained_object_payload_read_rejects_an_omitted_snapshot_segment() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+    write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        [1; 16],
+        [1; 16],
+        b"retained payload",
+    );
+    let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission
+        .active_object_read_route(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+        )
+        .unwrap();
+    let outcome = route
+        .load_leased_object_read_snapshot_if(|_| Ok::<_, ()>(()))
+        .unwrap()
+        .unwrap();
+    let (_, shared_snapshot, mut leased_snapshot) = outcome.into_parts();
+    drop(shared_snapshot);
+    Arc::make_mut(&mut leased_snapshot.snapshot)
+        .object_segments
+        .clear();
+
+    let error = match route.retain_object_payload_read(leased_snapshot) {
+        Ok(_) => panic!("incomplete payload snapshot unexpectedly retained read authority"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, StoreError::PayloadShardSetMismatch { .. }));
+}
+
+#[test]
+fn stale_cluster_rejects_an_opaque_payload_segment_before_reading() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+    write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        [1; 16],
+        [1; 16],
+        b"payload",
+    );
+    let outcome = cluster
+        .load_object_read_snapshot_if(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::StandardSegments,
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap();
+    let segment = outcome.snapshot.object_segments.first().unwrap();
+    let stale_cluster = StorageCluster::test_from_local_map_with_epoch(
+        Arc::clone(&map),
+        ClusterEpoch::new(2).unwrap(),
+    )
+    .unwrap();
+
+    let error = stale_cluster
+        .read_object_payload_segment_stored_bytes_into(segment, &mut Vec::new())
+        .unwrap_err();
+
+    assert!(matches!(error, StoreError::StalePayloadOperation { .. }));
 }
 
 #[test]

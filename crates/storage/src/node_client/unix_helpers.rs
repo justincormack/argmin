@@ -1615,10 +1615,12 @@ impl UnixStorageNodeClient {
 
         let stored_version_id = snapshot.stored.version_id();
         for segment in &snapshot.object_segments {
-            if &segment.bucket != bucket
-                || &segment.key != key
-                || segment.version_id != stored_version_id
-            {
+            let record = segment.object_record();
+            if record.is_none_or(|record| {
+                &record.bucket != bucket
+                    || &record.key != key
+                    || record.version_id != stored_version_id
+            }) {
                 return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                     "validate object read snapshot response",
                     "object segment identity does not match snapshot".to_string(),
@@ -1634,10 +1636,12 @@ impl UnixStorageNodeClient {
             }
         }
         for segment in &snapshot.multipart_part_segments {
-            if &segment.bucket != bucket
-                || &segment.key != key
-                || segment.version_id != stored_version_id.to_u64()
-            {
+            let record = segment.multipart_record();
+            if record.is_none_or(|record| {
+                &record.bucket != bucket
+                    || &record.key != key
+                    || record.version_id != stored_version_id.to_u64()
+            }) {
                 return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                     "validate object read snapshot response",
                     "multipart segment identity does not match snapshot".to_string(),
@@ -1752,15 +1756,19 @@ impl UnixStorageNodeClient {
 
         let mut segment_counts_by_part = BTreeMap::<u32, usize>::new();
         for segment in &snapshot.multipart_part_segments {
-            if !parts_by_number.contains_key(&segment.part_number) {
+            let Some(part_number) = segment.part_number() else {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "validate object read snapshot response",
+                    "multipart snapshot contains an object segment".to_string(),
+                )));
+            };
+            if !parts_by_number.contains_key(&part_number) {
                 return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                     "validate object read snapshot response",
                     "multipart segment has no matching part row".to_string(),
                 )));
             }
-            *segment_counts_by_part
-                .entry(segment.part_number)
-                .or_default() += 1;
+            *segment_counts_by_part.entry(part_number).or_default() += 1;
         }
 
         if require_segment_layout {

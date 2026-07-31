@@ -67,7 +67,7 @@ impl Coordinator {
                         multipart_parts,
                         multipart_part_segments,
                         &src_record.encryption,
-                    );
+                    )?;
                     ReadHandle::from_multipart(
                         read_runtime,
                         bucket,
@@ -133,7 +133,7 @@ impl Coordinator {
                         multipart_parts,
                         multipart_part_segments,
                         &src_record.encryption,
-                    );
+                    )?;
                     let body = ReadHandle::from_multipart_range(
                         read_runtime,
                         bucket,
@@ -297,11 +297,18 @@ impl Coordinator {
                     reason: "live copy source did not produce retained payload authority"
                         .to_string(),
                 })?;
+            let read_runtime = self.read_runtime_for_retained_payload_read(
+                retained,
+                &req.source.bucket,
+                &req.source.key,
+                src_record.generation_id,
+                &source_snapshot,
+            )?;
             let source_snapshot = Self::take_authorized_copy_source_snapshot(source_snapshot)?;
             let body = self.copy_source_snapshot_to_read_handle(
                 &req.source.bucket,
                 &req.source.key,
-                self.read_runtime_for_retained_payload_read(retained),
+                read_runtime,
                 source_snapshot,
                 source_sse_customer,
             )?;
@@ -568,11 +575,18 @@ impl Coordinator {
                     reason: "live copy source did not produce retained payload authority"
                         .to_string(),
                 })?;
+            let read_runtime = self.read_runtime_for_retained_payload_read(
+                retained,
+                &req.source.bucket,
+                &req.source.key,
+                src_record.generation_id,
+                &source,
+            )?;
             let source = Self::take_authorized_copy_source_snapshot(source)?;
             let body = self.copy_source_snapshot_to_range_read_handle(
                 &req.source.bucket,
                 &req.source.key,
-                self.read_runtime_for_retained_payload_read(retained),
+                read_runtime,
                 source,
                 (read_start as usize, read_end as usize),
                 source_sse_customer,

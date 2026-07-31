@@ -10,9 +10,9 @@ use storage::PgTopology;
 #[cfg(test)]
 use storage::TestBucketDeleteFinalizeRoot as BucketDeleteFinalizeRoot;
 use storage::{
-    BucketInfo, BucketName, EcShape, GenerationId, ObjectEncryption, ObjectKey,
-    ProcessLocalRegistryKey, SegmentStoredBytesRequest, StorageCluster, StorageClusterRouteHandle,
-    StorageMaintenanceAdmission, UploadId, UploadState, VersionId,
+    BucketInfo, BucketName, GenerationId, ObjectEncryption, ObjectKey, ProcessLocalRegistryKey,
+    StorageCluster, StorageClusterRouteHandle, StorageMaintenanceAdmission, UploadId, UploadState,
+    VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -978,24 +978,12 @@ impl ReadRuntime {
     ) -> Result<Option<PayloadLease>, ServerError> {
         let segments = segments.into_iter().collect::<Vec<_>>();
         if let ReadStorage::Retained(retained) = &self.storage {
-            if !retained.matches_subject(bucket, key, generation_id)
-                || segments.iter().any(|segment| {
-                    !retained.contains_segment(
-                        segment.placement_cluster_epoch,
-                        SegmentStoredBytesRequest {
-                            data_pg_id: segment.data_pg_id,
-                            segment_okh: segment.segment_okh,
-                            segment_vid: segment.segment_vid,
-                            stored_size: segment.stored_size(),
-                            segment_crc64: segment.segment_crc64,
-                            ec: EcShape {
-                                k: segment.ec_k,
-                                m: segment.ec_m,
-                            },
-                        },
-                    )
-                })
-            {
+            if !retained.contains_object_payload_segments(
+                bucket,
+                key,
+                generation_id,
+                segments.iter().map(|segment| &segment.storage_segment),
+            ) {
                 return Err(ServerError::InternalError {
                     reason: "object body is outside its retained payload-read snapshot".to_string(),
                 });
@@ -1004,26 +992,11 @@ impl ReadRuntime {
         }
 
         let storage_node = self.storage_node();
-        let mut locations = Vec::new();
-        for segment in segments {
-            if segment.stored_size() == 0 {
-                continue;
-            }
-            locations.extend(storage_node.segment_payload_shard_locations(
-                segment.data_pg_id,
-                EcShape {
-                    k: segment.ec_k,
-                    m: segment.ec_m,
-                },
-                &segment.segment_okh,
-                segment.segment_vid,
-            )?);
-        }
-        let lease = storage_node.acquire_object_payload_lease_for_shard_locations(
+        let lease = storage_node.acquire_object_payload_read_lease(
             bucket,
             key,
             generation_id,
-            &locations,
+            segments.iter().map(|segment| &segment.storage_segment),
         )?;
         Ok(Some(PayloadLease { lease: Some(lease) }))
     }
@@ -1127,33 +1100,13 @@ impl ReadRuntime {
         part_number: Option<u32>,
         sse_customer_request: Option<&SseCustomerRequest>,
     ) -> Result<Arc<SharedPayloadBuffer>, ServerError> {
-        let k = segment.ec_k as usize;
-        let padded = segment.stored_size().div_ceil(k) * k;
-
-        let mut buf = self.payload_buffer_pool.checkout(padded);
-        let request = SegmentStoredBytesRequest {
-            data_pg_id: segment.data_pg_id,
-            segment_okh: segment.segment_okh,
-            segment_vid: segment.segment_vid,
-            stored_size: segment.stored_size(),
-            segment_crc64: segment.segment_crc64,
-            ec: EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            },
-        };
+        let mut buf = self.payload_buffer_pool.checkout(0);
         match &self.storage {
-            ReadStorage::Retained(retained) => retained.read_segment_payload_stored_bytes_into(
-                segment.placement_cluster_epoch,
-                request,
-                &mut buf,
-            ),
+            ReadStorage::Retained(retained) => {
+                retained.read_segment_payload_stored_bytes_into(&segment.storage_segment, &mut buf)
+            }
             ReadStorage::Cluster(storage_node) => storage_node
-                .read_segment_payload_stored_bytes_at_placement_epoch_into(
-                    segment.placement_cluster_epoch,
-                    request,
-                    &mut buf,
-                ),
+                .read_object_payload_segment_stored_bytes_into(&segment.storage_segment, &mut buf),
         }
         .map_err(super::map_store_error)?;
         if matches!(segment.encryption, ObjectEncryption::None) {
@@ -1195,9 +1148,9 @@ impl ReadRuntime {
                     state,
                     request,
                     segment_scope,
-                    segment.segment_index,
+                    segment.segment_index(),
                     stored_bytes,
-                    segment.size as usize,
+                    segment.size() as usize,
                 )
             }
             ObjectEncryption::SseS3(state) => {
@@ -1215,9 +1168,9 @@ impl ReadRuntime {
                     provider,
                     state,
                     segment_scope,
-                    segment.segment_index,
+                    segment.segment_index(),
                     stored_bytes,
-                    segment.size as usize,
+                    segment.size() as usize,
                 )
             }
         }
@@ -1233,62 +1186,4 @@ fn lifecycle_sweep_error_context(error: &ServerError) -> String {
     raw.chars()
         .take(LIFECYCLE_SWEEP_ERROR_CONTEXT_MAX_CHARS)
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use storage::{
-        ClusterEpoch, EcShape, GenerationId, LocalClusterMap, NodeId, ObjectEncryption, PgTopology,
-        StorageCluster,
-    };
-
-    use super::super::payload::PayloadBufferPool;
-    use super::*;
-
-    #[test]
-    fn stale_read_runtime_rejects_zero_size_segment_payload() {
-        let tmp = test_util::tempdir();
-        let node_ids = [
-            NodeId::new(0),
-            NodeId::new(1),
-            NodeId::new(2),
-            NodeId::new(3),
-            NodeId::new(4),
-            NodeId::new(5),
-        ];
-        let ec_shape = EcShape { k: 4, m: 2 };
-        let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
-        let stale_cluster = StorageCluster::test_from_local_map_with_epoch(
-            Arc::clone(&map),
-            ClusterEpoch::new(2).unwrap(),
-        )
-        .unwrap();
-        let runtime = ReadRuntime {
-            storage: ReadStorage::Cluster(stale_cluster),
-            pg_topology: PgTopology::new(&[0]).unwrap(),
-            payload_buffer_pool: PayloadBufferPool::new(ec_shape),
-            sse_c_validator: None,
-            managed_key_provider: None,
-        };
-        let segment = SegmentPayloadRecord {
-            segment_index: 0,
-            size: 0,
-            segment_crc64: 0,
-            segment_okh: [61; 16],
-            segment_vid: GenerationId::MIN,
-            data_pg_id: 0,
-            placement_cluster_epoch: ClusterEpoch::INITIAL,
-            ec_k: ec_shape.k,
-            ec_m: ec_shape.m,
-            encryption: ObjectEncryption::None,
-        };
-
-        let err = runtime
-            .read_checked_segment_payload(&segment, None, None)
-            .unwrap_err();
-
-        assert!(matches!(err, ServerError::OperationAborted), "{err:?}");
-    }
 }
