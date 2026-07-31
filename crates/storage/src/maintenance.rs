@@ -18,6 +18,15 @@ use crate::types::{
 };
 use crate::{PgId, StorageNodeFailureClass, StoreError};
 
+mod reclaim;
+pub use reclaim::StorageReclaimSweeper;
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use reclaim::{
+    install_reclaim_worker_test_hooks, StorageReclaimWorkerTestHookGuard,
+    StorageReclaimWorkerTestHooks,
+};
+
 const TRACE_TARGET: &str = "storage";
 #[cfg(test)]
 const SHARD_SCAVENGER_SWEEP_INTERVAL: Duration = Duration::from_millis(50);

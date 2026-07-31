@@ -75,7 +75,7 @@ use crate::sse::SseCustomerRequest;
 pub use storage::BucketObjectOwnership;
 pub use storage::OwnerIdentity;
 #[cfg(test)]
-use storage::ReclaimWorkItem;
+use storage::TestReclaimWorkItem as ReclaimWorkItem;
 
 fn lock_mutex_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())

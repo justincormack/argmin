@@ -396,10 +396,8 @@ pub(super) mod node_facade {
         DirectPutMetadataPublishTestHookGuard, ObjectMetadataCommandPublishTestHookGuard,
         SharedStorageNode,
     };
-    pub use super::engine::{
-        BucketCreateAttemptOutcome, BucketDeleteBeginRoot, BucketDeleteFinalizeOutcome,
-        ReclaimWorkItem,
-    };
+    pub use super::engine::{BucketCreateAttemptOutcome, BucketDeleteFinalizeOutcome};
+    pub(crate) use super::engine::{BucketDeleteBeginRoot, ReclaimWorkItem};
 }
 
 pub(super) mod role_facade {

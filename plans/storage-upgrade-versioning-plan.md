@@ -436,7 +436,7 @@ Initial ownership assessment:
 | Control-plane durable state, RPC, and auth envelope | `storage` | Complete: client and server transport are contained behind typed Unix/TLS endpoints and opaque storage-owned facades. |
 | Raft peer protocol, restart artifact, and WAL | `storage` | Peer wire and durable representations are contained: raw frames, restart artifacts, WAL records/files, and layout helpers are private; process tests use logical clients and opaque semantic recovery inspection. |
 | PG topology, route state, and physical payload placement | `storage` | Incomplete: `server-core` and `argmin-s3` still construct and interpret PG identifiers, route snapshots, acting sets, placement epochs, EC shard requests, and physical shard locations. |
-| Physical storage maintenance workflows | `storage` | Incomplete: `server-core` owns shard scavenger/repair/backfill workers, payload reclaim and bucket-finalization queues, abandoned stream-session cleanup, scan/claim state, retry decisions, and acquire/execute/complete transitions. |
+| Physical storage maintenance workflows | `storage` | Worker containment is complete: shard scavenging, repair, backfill, payload reclaim, accepted bucket-delete continuation/finalization, and abandoned stream-session cleanup run behind opaque storage-owned workers. Residual representation containment is tracked separately below. |
 | Control-plane topology and metadata-transfer workflows | `storage` | Incomplete: `argmin-s3` constructs control-plane commands and implements PG fencing, route inspection, metadata transfer, and topology convergence. |
 | Storage implementation-error taxonomy | `storage` | Incomplete: `server-core` matches PG, database, shard, route, command-log, and RPC `StoreError` variants for diagnostics and retry behavior. |
 | Object user/system metadata blobs | `server-core` | Complete: serialization is crate-private and storage carries only opaque validated blobs. |
@@ -936,6 +936,19 @@ cross-crate composition tests receive dedicated test-only DTOs and a determinist
 worker facility. Reclaim and asynchronous bucket cleanup/finalization remain pending, so item 1 is
 not yet complete.
 
+The sixth bounded slice moved durable reclaim scanning, queue ownership, deferred-root fairness,
+per-PG and per-root cooldowns, physical object-payload reclaim, adopted bucket-delete continuation,
+asynchronous bucket finalization, retry classification, worker registration, lifecycle,
+diagnostics, and telemetry into `StorageReclaimSweeper`. The worker registry is keyed by the opaque
+route-publication domain: it remains shared across storage-identity replacement and distinct for
+independent domains over the same initial cluster. Reclaim scan batches, work items,
+bucket-delete cleanup roots, queue transitions, physical execution methods, and wake/poll methods
+are crate-private. Cross-crate composition tests use explicitly named test-only DTOs and methods;
+the boundary checker rejects production raw representations or transitions outside `storage`.
+With this slice, implementation-order item 1 is complete. Item 2 remains in progress because the
+remaining public reclaim claim/root inspection surfaces must be classified as logical debug/test
+facades or made private in the next containment pass.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1195,16 +1208,17 @@ Raft peer client and server transports are storage-owned and boundary-checked.
    roots, certificate identities, endpoint names, addresses, and bindings; `storage` supplies and
    validates the protocol profile. Make `STORAGE_RPC_TLS_ALPN` owner-private and extend the
    boundary check to prevent raw storage-RPC Rustls profile construction outside `storage`.
-10. **In progress:** move shard scavenger, repair, backfill, payload reclaim, asynchronous bucket
+10. **Complete:** move shard scavenger, repair, backfill, payload reclaim, asynchronous bucket
     cleanup/finalization, and abandoned stream-session workers into a storage-owned maintenance
     runtime. Include scan fairness, durable PG scans, deferred queues, cooldown, claims, retries,
     admission, expiry, completion, and storage-specific telemetry. Keep lifecycle evaluation and
     the S3-visible bucket-delete request path in `server-core`; storage creates and owns cleanup
     roots after one logical accepted-deletion operation. Privatize all maintenance cursor, claim,
     reclaim-work, cleanup-root, session-cleanup, work-record, and transition APIs. The
-    backfill-candidate cursor, shard-audit/checkpoint scheduler, shared maintenance admission, and
-    abandoned stream-session cleanup slices are complete; repair/backfill execution and
-    reclaim/finalization remain pending.
+    backfill-candidate cursor, shard-audit/checkpoint scheduler, shared maintenance admission,
+    abandoned stream-session cleanup, repair, backfill, reclaim, and accepted bucket-delete
+    continuation/finalization slices are complete. Raw reclaim queue and cleanup-root transitions
+    are private; remaining public reclaim inspection representations are tracked by item 2.
 11. **Pending:** replace server-core's data-PG, placement-epoch, EC-placement, shard-location, and
     historical-route handling with opaque storage-owned payload handles and logical I/O/lease
     operations.

@@ -489,7 +489,7 @@ async fn wait_for_shard_scavenger_clean(
     timeout: Duration,
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
-    storage_cluster.wake_reclaim_workers();
+    storage_cluster.test_wake_reclaim_worker();
     let mut last_error = match shard_scavenger_clean_check_message(storage_cluster, context) {
         Ok(()) => return Ok(()),
         Err(message) => message,
@@ -499,7 +499,7 @@ async fn wait_for_shard_scavenger_clean(
             return Err(last_error);
         }
         tokio::time::sleep(SHARD_SCAVENGER_CLEAN_POLL_INTERVAL).await;
-        storage_cluster.wake_reclaim_workers();
+        storage_cluster.test_wake_reclaim_worker();
         match shard_scavenger_clean_check_message(storage_cluster, context) {
             Ok(()) => return Ok(()),
             Err(message) => last_error = message,

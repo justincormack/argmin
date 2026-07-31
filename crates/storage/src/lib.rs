@@ -71,22 +71,23 @@ mod traits {
     pub(crate) use crate::node_runtime::traits_facade::*;
 }
 
+#[cfg(test)]
+pub(crate) use cluster::DurableReclaimScanOutcome;
 pub use cluster::{
     ActiveBucketMetadataScan, ActiveBucketRoute, ActiveBucketRoutePair, ActiveMultipartObjectRoute,
     ActiveObjectMetadataMutationRoute, ActiveObjectMetadataScan, ActiveObjectReadRoute,
-    ActivePutObjectRoute, BucketWriteSnapshotAction, DurableReclaimScanBatch,
-    DurableReclaimScanOutcome, LeasedObjectReadSnapshot, LeasedObjectReadSnapshotOutcome,
-    LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
-    LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
-    LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PgMetadataTransferArtifact,
-    PlacedSegmentShardHealth, PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk,
-    PlacedSegmentShardValidation, PreparedStandaloneEmbeddedTopology, ProcessLocalRegistryKey,
-    ReleasedObjectPayloadLease, RetainedObjectPayloadRead, RetainedStreamUploadCleanup,
-    ShardLocation, StorageCluster, StorageClusterRouteAdmission, StorageClusterRouteHandle,
-    StorageClusterRuntimeMapHandle, StorageClusterRuntimeMapRefreshError,
-    StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopFailure,
-    StorageClusterRuntimeMapRefreshLoopStatus, StorageClusterRuntimeMapRefreshLoopStatusHandle,
-    StorageClusterRuntimeMapRefreshLoopSuccess,
+    ActivePutObjectRoute, BucketWriteSnapshotAction, LeasedObjectReadSnapshot,
+    LeasedObjectReadSnapshotOutcome, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute,
+    LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
+    LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig,
+    ObjectPayloadLease, PgMetadataTransferArtifact, PlacedSegmentShardHealth,
+    PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk, PlacedSegmentShardValidation,
+    PreparedStandaloneEmbeddedTopology, ProcessLocalRegistryKey, ReleasedObjectPayloadLease,
+    RetainedObjectPayloadRead, RetainedStreamUploadCleanup, ShardLocation, StorageCluster,
+    StorageClusterRouteAdmission, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
+    StorageClusterRuntimeMapRefreshError, StorageClusterRuntimeMapRefreshLoop,
+    StorageClusterRuntimeMapRefreshLoopFailure, StorageClusterRuntimeMapRefreshLoopStatus,
+    StorageClusterRuntimeMapRefreshLoopStatusHandle, StorageClusterRuntimeMapRefreshLoopSuccess,
 };
 #[cfg(feature = "test-hooks")]
 pub use cluster::{
@@ -101,11 +102,76 @@ pub use error::{
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use maintenance::StorageStreamSessionSweepTestSummary;
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use maintenance::{
+    install_reclaim_worker_test_hooks, StorageReclaimWorkerTestHookGuard,
+    StorageReclaimWorkerTestHooks,
+};
 pub use maintenance::{
     StorageMaintenanceAdmission, StorageMaintenancePermit, StorageMaintenanceStartError,
-    StorageShardBackfillSweeper, StorageShardRepairSweeper, StorageShardScavengerSweeper,
-    StorageStreamSessionSweeper,
+    StorageReclaimSweeper, StorageShardBackfillSweeper, StorageShardRepairSweeper,
+    StorageShardScavengerSweeper, StorageStreamSessionSweeper,
 };
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestBucketDeleteFinalizeRoot {
+    pub bucket: BucketName,
+    pub bucket_incarnation_generation: u64,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<BucketDeleteFinalizeRoot> for TestBucketDeleteFinalizeRoot {
+    fn from(root: BucketDeleteFinalizeRoot) -> Self {
+        Self {
+            bucket: root.bucket,
+            bucket_incarnation_generation: root.bucket_incarnation_generation,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<&TestBucketDeleteFinalizeRoot> for BucketDeleteFinalizeRoot {
+    fn from(root: &TestBucketDeleteFinalizeRoot) -> Self {
+        Self {
+            bucket: root.bucket.clone(),
+            bucket_incarnation_generation: root.bucket_incarnation_generation,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestBucketDeleteBeginRoot(BucketDeleteBeginRoot);
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl TestBucketDeleteBeginRoot {
+    pub fn bucket(&self) -> &BucketName {
+        self.0.bucket()
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestReclaimWorkItem {
+    ObjectPayload((BucketName, ObjectKey, GenerationId)),
+    BucketDeleteBegin(TestBucketDeleteBeginRoot),
+    BucketDelete(TestBucketDeleteFinalizeRoot),
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<ReclaimWorkItem> for TestReclaimWorkItem {
+    fn from(work: ReclaimWorkItem) -> Self {
+        match work {
+            ReclaimWorkItem::ObjectPayload(root) => Self::ObjectPayload(root),
+            ReclaimWorkItem::BucketDeleteBegin(root) => {
+                Self::BucketDeleteBegin(TestBucketDeleteBeginRoot(root))
+            }
+            ReclaimWorkItem::BucketDelete(root) => Self::BucketDelete(root.into()),
+        }
+    }
+}
 pub use metadata_command::BucketWriteReservationProof;
 #[cfg(test)]
 pub(crate) use node::LocalStorageNode;
@@ -113,9 +179,8 @@ pub(crate) use node::LocalStorageNode;
 pub use node::{
     install_bucket_scoped_test_hooks, BucketScopedTestHookGuard, BucketScopedTestHooks,
 };
-pub use node::{
-    BucketCreateAttemptOutcome, BucketDeleteBeginRoot, BucketDeleteFinalizeOutcome, ReclaimWorkItem,
-};
+pub use node::{BucketCreateAttemptOutcome, BucketDeleteFinalizeOutcome};
+pub(crate) use node::{BucketDeleteBeginRoot, ReclaimWorkItem};
 pub(crate) use node_runtime::role_facade::ObjectMetadataScanPgId;
 pub use node_runtime::role_facade::{BucketPgId, DataPgId, ObjectMetadataPgId};
 #[cfg(any(test, feature = "test-hooks"))]
@@ -149,7 +214,6 @@ pub use storage_rpc_auth::{
 pub(crate) use traits::PgMetadataStore;
 #[cfg(test)]
 pub(crate) use types::BucketSubresourceAux;
-pub(crate) use types::BucketSubresourceKind;
 pub use types::{
     key_prefix_upper_bound, object_key_common_prefix, object_key_prefix_upper_bound,
     AbortMultipartUploadCleanup, AclGrants, AuthorizedMultipartUploadRecord,
@@ -160,18 +224,18 @@ pub use types::{
     BucketDeleteDebugPayloadReclaimClaim, BucketDeleteDebugPayloadReclaimClaimError,
     BucketDeleteDebugPayloadReclaimRoot, BucketDeleteDebugPayloadReclaimRootError,
     BucketDeleteDebugPendingCommand, BucketDeleteDebugSnapshot, BucketDeleteFinalizeClaimRecord,
-    BucketDeleteFinalizeRoot, BucketEncryptionConfig, BucketFastPathIdentity, BucketFastPathInfo,
-    BucketFastPathPolicy, BucketFastPathTags, BucketInfo, BucketName, BucketNameError,
-    BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot,
-    BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
-    BucketVersioningState, BucketWriteDrainRecord, BucketWriteDrainState,
-    BucketWriteReservationRecord, CanonicalUserId, ChecksumAlgorithm, ChecksumBytes, ChecksumType,
-    ClusterEpoch, CommitDirectPutObjectReq, CommitMultipartReq, CompleteMultipartCommitCleanup,
-    CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest, CompletedMultipartStalePayload,
-    CreateBucketConfig, CreateMultipartUploadOutcome, CreateMultipartUploadReq,
-    CreateStreamUploadReq, DataLayout, DeleteCurrentObjectOutcome, DeleteMarkerRecord,
-    DeleteSpecificObjectVersionOutcome, DeletedCurrentObject, DeletedSpecificObjectVersion,
-    DirectPutCommitSnapshot, DirectPutCommitStorageSnapshot, DirectPutWrittenSegment, EcShape,
+    BucketEncryptionConfig, BucketFastPathIdentity, BucketFastPathInfo, BucketFastPathPolicy,
+    BucketFastPathTags, BucketInfo, BucketName, BucketNameError, BucketObjectLockConfig,
+    BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot, BucketSnapshotPair,
+    BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketVersioningState,
+    BucketWriteDrainRecord, BucketWriteDrainState, BucketWriteReservationRecord, CanonicalUserId,
+    ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CommitDirectPutObjectReq,
+    CommitMultipartReq, CompleteMultipartCommitCleanup, CompleteMultipartCommitOutcome,
+    CompleteMultipartCommitRequest, CompletedMultipartStalePayload, CreateBucketConfig,
+    CreateMultipartUploadOutcome, CreateMultipartUploadReq, CreateStreamUploadReq, DataLayout,
+    DeleteCurrentObjectOutcome, DeleteMarkerRecord, DeleteSpecificObjectVersionOutcome,
+    DeletedCurrentObject, DeletedSpecificObjectVersion, DirectPutCommitSnapshot,
+    DirectPutCommitStorageSnapshot, DirectPutWrittenSegment, EcShape,
     EffectiveBucketEncryptionConfig, EtagKind, ExpireCurrentObjectOutcome,
     FinalizeDirectPutObjectOutcome, FinalizeStreamPartCleanup, FinalizeStreamPartOutcome,
     FinalizeStreamPutOutcome, GenerationId, InsertCurrentDeleteMarkerOutcome,
@@ -217,6 +281,7 @@ pub use types::{
     SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN, SSE_S3_WRAP_NONCE_LEN,
     UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
 };
+pub(crate) use types::{BucketDeleteFinalizeRoot, BucketSubresourceKind};
 #[cfg(test)]
 pub(crate) use types::{
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,

@@ -115,14 +115,7 @@ pub(crate) fn setup_coordinator_without_reclaim_sweeper(dir: &Path) -> Coordinat
 }
 
 fn stop_reclaim_sweeper_for_test(coord: &mut Coordinator) {
-    coord
-        ._reclaim_sweeper
-        .stop
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    coord.storage_node().wake_reclaim_workers();
-    if let Some(handle) = lock_mutex_unpoisoned(&coord._reclaim_sweeper.handle).take() {
-        let _ = handle.join();
-    }
+    coord._reclaim_sweeper.test_stop();
 }
 
 pub(crate) fn setup_coordinator_in_region(dir: &Path, region: &str) -> Coordinator {

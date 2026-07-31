@@ -675,7 +675,11 @@ impl Coordinator {
             stream_session_sweeper_factory,
         ) = background_sweepers;
         let reclaim_sweeper = if start_reclaim_worker {
-            ReclaimSweeper::acquire_shared(&background_storage_handle, read_runtime.clone())?
+            ReclaimSweeper::acquire_shared(&background_storage_handle).map_err(|error| {
+                ServerError::InternalError {
+                    reason: error.to_string(),
+                }
+            })?
         } else {
             ReclaimSweeper::disabled(background_storage_handle.clone())
         };
@@ -772,7 +776,7 @@ impl Coordinator {
         use std::sync::atomic::Ordering;
 
         BackgroundWorkerMode {
-            object_reclaim_and_bucket_finalize: !self._reclaim_sweeper.stop.load(Ordering::SeqCst),
+            object_reclaim_and_bucket_finalize: self._reclaim_sweeper.test_is_enabled(),
             lifecycle: !self._lifecycle_sweeper.stop.load(Ordering::SeqCst),
             shard_scavenger: self._shard_scavenger_sweeper.test_is_enabled(),
             shard_repair: self._shard_repair_sweeper.test_is_enabled(),

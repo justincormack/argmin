@@ -101,14 +101,14 @@ pub(crate) struct DurableBucketDeleteBeginScan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
-pub enum DurableReclaimScanOutcome {
+pub(crate) enum DurableReclaimScanOutcome {
     Complete,
     RouteRefreshRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
-pub struct DurableReclaimScanBatch {
+pub(crate) struct DurableReclaimScanBatch {
     pub outcome: DurableReclaimScanOutcome,
     pub next_pg_id: Option<u32>,
     pub scanned_pgs: usize,
@@ -5257,7 +5257,7 @@ impl super::StorageCluster {
     /// This is convergence authority for an already authorized attempt, not a
     /// frontend request entry point. New DeleteBucket requests must use an
     /// admitted [`super::ActiveBucketRoute`].
-    pub fn continue_adopted_bucket_delete(
+    pub(crate) fn continue_adopted_bucket_delete(
         &self,
         root: &crate::BucketDeleteBeginRoot,
     ) -> Result<(), BucketWriteDrainError> {
@@ -6978,7 +6978,15 @@ impl super::StorageCluster {
         })
     }
 
-    pub fn try_finalize_bucket_delete_root(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_try_finalize_bucket_delete_root(
+        &self,
+        root: &crate::TestBucketDeleteFinalizeRoot,
+    ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
+        self.try_finalize_bucket_delete_root(&root.into())
+    }
+
+    pub(crate) fn try_finalize_bucket_delete_root(
         &self,
         root: &BucketDeleteFinalizeRoot,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
@@ -11498,7 +11506,7 @@ impl super::StorageCluster {
         Some(outcome)
     }
 
-    pub fn finish_object_payload_reclaim_work(
+    pub(crate) fn finish_object_payload_reclaim_work(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -11512,7 +11520,7 @@ impl super::StorageCluster {
             .finish_object_payload_reclaim_work(bucket, key, generation_id);
     }
 
-    pub fn enqueue_bucket_delete_finalize(&self, root: BucketDeleteFinalizeRoot) {
+    pub(crate) fn enqueue_bucket_delete_finalize(&self, root: BucketDeleteFinalizeRoot) {
         if self.operation_epoch() != self.cluster_epoch() {
             return;
         }
@@ -11520,6 +11528,11 @@ impl super::StorageCluster {
             .local_map
             .runtime_state()
             .enqueue_bucket_delete_finalize(root);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_enqueue_bucket_delete_finalize(&self, root: &crate::TestBucketDeleteFinalizeRoot) {
+        self.enqueue_bucket_delete_finalize(root.into());
     }
 
     pub(crate) fn enqueue_bucket_delete_begin(
@@ -11556,20 +11569,20 @@ impl super::StorageCluster {
         );
     }
 
-    pub fn finish_bucket_delete_finalize_work(&self, root: &BucketDeleteFinalizeRoot) {
+    pub(crate) fn finish_bucket_delete_finalize_work(&self, root: &BucketDeleteFinalizeRoot) {
         self.local_map
             .runtime_state()
             .finish_bucket_delete_finalize_work(root);
     }
 
-    pub fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
+    pub(crate) fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
         if self.operation_epoch() != self.cluster_epoch() {
             return None;
         }
         self.local_map.runtime_state().try_take_reclaim_work()
     }
 
-    pub fn enqueue_durable_reclaim_work_batch_excluding(
+    pub(crate) fn enqueue_durable_reclaim_work_batch_excluding(
         &self,
         next_pg_id: Option<u32>,
         max_pgs: usize,
@@ -11649,7 +11662,10 @@ impl super::StorageCluster {
     ///
     /// Durable discovery is owned by the caller's explicit scan cadence and is
     /// never performed by this queue wait.
-    pub fn wait_for_queued_reclaim_work_poll(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
+    pub(crate) fn wait_for_queued_reclaim_work_poll(
+        &self,
+        stop: &AtomicBool,
+    ) -> Option<ReclaimWorkItem> {
         if self.operation_epoch() != self.cluster_epoch() {
             return None;
         }
@@ -11658,14 +11674,34 @@ impl super::StorageCluster {
             .wait_for_reclaim_work_poll(stop)
     }
 
-    pub fn wake_reclaim_workers(&self) {
+    pub(crate) fn wake_reclaim_workers(&self) {
         if self.operation_epoch() != self.cluster_epoch() {
             return;
         }
         self.local_map.runtime_state().wake_reclaim_workers();
     }
 
-    pub fn reclaim_object_payload_if_unleased(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_try_take_reclaim_work(&self) -> Option<crate::TestReclaimWorkItem> {
+        self.try_take_reclaim_work().map(Into::into)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_finish_object_payload_reclaim_work(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) {
+        self.finish_object_payload_reclaim_work(bucket, key, generation_id);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_wake_reclaim_worker(&self) {
+        self.wake_reclaim_workers();
+    }
+
+    pub(crate) fn reclaim_object_payload_if_unleased(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -11677,7 +11713,28 @@ impl super::StorageCluster {
         ))
     }
 
-    pub fn reclaim_object_payload_if_unleased_with_outcome(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_reclaim_object_payload_if_unleased(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<bool, ObjectPgActionError> {
+        self.reclaim_object_payload_if_unleased(bucket, key, generation_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_reclaim_object_payload_if_unleased_with_outcome(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<super::TestObjectPayloadReclaimAttempt, ObjectPgActionError> {
+        self.reclaim_object_payload_if_unleased_with_outcome(bucket, key, generation_id)
+            .map(Into::into)
+    }
+
+    pub(crate) fn reclaim_object_payload_if_unleased_with_outcome(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

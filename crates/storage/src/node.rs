@@ -583,7 +583,7 @@ type ReclaimRoot = (BucketName, ObjectKey, GenerationId);
 /// them for scheduling and stale-work detection, but only storage-owned
 /// recovery and enqueue paths can mint this authority.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct BucketDeleteBeginRoot {
+pub(crate) struct BucketDeleteBeginRoot {
     pub(crate) bucket: BucketName,
     pub(crate) bucket_execution_generation: u64,
     pub(crate) bucket_incarnation_generation: u64,
@@ -611,7 +611,7 @@ struct ObjectPayloadLeaseState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReclaimWorkItem {
+pub(crate) enum ReclaimWorkItem {
     ObjectPayload(ReclaimRoot),
     BucketDeleteBegin(BucketDeleteBeginRoot),
     BucketDelete(BucketDeleteFinalizeRoot),

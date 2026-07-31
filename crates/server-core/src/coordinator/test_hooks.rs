@@ -162,7 +162,9 @@ pub(super) struct StreamAppendTestHooks {
 
 pub(super) static STREAM_APPEND_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
-pub(super) struct ReclamationTestHookGuard;
+pub(super) struct ReclamationTestHookGuard {
+    _storage_reclaim_guard: storage::StorageReclaimWorkerTestHookGuard,
+}
 
 impl Drop for ReclamationTestHookGuard {
     fn drop(&mut self) {
@@ -225,9 +227,19 @@ impl Drop for BucketFastPathIdentityLoadErrorTestHookGuard {
 pub(super) fn install_reclamation_test_hooks(
     hooks: ReclamationTestHooks,
 ) -> ReclamationTestHookGuard {
+    let storage_reclaim_guard =
+        storage::install_reclaim_worker_test_hooks(storage::StorageReclaimWorkerTestHooks {
+            target_registry_key: hooks.target_reclaim_worker_registry_key,
+            durable_scan_delay_override: hooks.reclaim_worker_durable_scan_delay_override,
+            after_idle_return: hooks.after_reclaim_worker_idle_return.clone(),
+            after_work_dequeued: hooks.after_reclaim_work_dequeued.clone(),
+            before_work_execute: hooks.before_reclaim_work_execute.clone(),
+        });
     let slot = RECLAMATION_TEST_HOOKS.get_or_init(|| Mutex::new(ReclamationTestHooks::default()));
     *slot.lock().unwrap() = hooks;
-    ReclamationTestHookGuard
+    ReclamationTestHookGuard {
+        _storage_reclaim_guard: storage_reclaim_guard,
+    }
 }
 
 impl Coordinator {
@@ -281,77 +293,6 @@ pub(super) fn install_list_objects_test_hooks(
     let slot = LIST_OBJECTS_TEST_HOOKS.get_or_init(|| Mutex::new(ListObjectsTestHooks::default()));
     *slot.lock().unwrap() = hooks;
     ListObjectsTestHookGuard
-}
-
-pub(super) fn reclaim_worker_durable_scan_delay_override(
-    registry_key: ProcessLocalRegistryKey,
-) -> Option<Duration> {
-    let hooks = RECLAMATION_TEST_HOOKS
-        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks
-        .target_reclaim_worker_registry_key
-        .is_some_and(|target| target != registry_key)
-    {
-        return None;
-    }
-    hooks.reclaim_worker_durable_scan_delay_override
-}
-
-pub(super) fn maybe_run_reclaim_worker_idle_return_hook(registry_key: ProcessLocalRegistryKey) {
-    let hooks = RECLAMATION_TEST_HOOKS
-        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks
-        .target_reclaim_worker_registry_key
-        .is_some_and(|target| target != registry_key)
-    {
-        return;
-    }
-    if let Some(hook) = hooks.after_reclaim_worker_idle_return {
-        hook();
-    }
-}
-
-pub(super) fn maybe_run_after_reclaim_work_dequeued_hook(registry_key: ProcessLocalRegistryKey) {
-    let hooks = RECLAMATION_TEST_HOOKS
-        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks
-        .target_reclaim_worker_registry_key
-        .is_some_and(|target| target != registry_key)
-    {
-        return;
-    }
-    if let Some(hook) = hooks.after_reclaim_work_dequeued {
-        hook();
-    }
-}
-
-pub(super) fn maybe_run_before_reclaim_work_execute_hook(
-    registry_key: ProcessLocalRegistryKey,
-    storage_cluster: Arc<StorageCluster>,
-) {
-    let hooks = RECLAMATION_TEST_HOOKS
-        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks
-        .target_reclaim_worker_registry_key
-        .is_some_and(|target| target != registry_key)
-    {
-        return;
-    }
-    if let Some(hook) = hooks.before_reclaim_work_execute {
-        hook(storage_cluster);
-    }
 }
 
 pub(super) fn maybe_run_multipart_snapshot_hook(bucket: &str, key: &str) {

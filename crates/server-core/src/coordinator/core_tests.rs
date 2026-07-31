@@ -6315,11 +6315,11 @@ fn reclaim_worker_resamples_runtime_map_after_dequeue() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
-    let root = storage::BucketDeleteFinalizeRoot {
+    let root = storage::TestBucketDeleteFinalizeRoot {
         bucket: trusted_bucket_name("reclaim-refresh-after-dequeue"),
         bucket_incarnation_generation: 1,
     };
-    initial.enqueue_bucket_delete_finalize(root);
+    initial.test_enqueue_bucket_delete_finalize(&root);
 
     let gate = DeterministicFaultGate::new(TOKEN);
     let gate_for_hook = Arc::clone(&gate);
@@ -6377,11 +6377,11 @@ fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
         .test_begin_bucket_delete_if_current(&bucket)
         .unwrap();
     let replacement = open_dynamic_test_storage_cluster(tmp.path(), &pg_ids);
-    let root = storage::BucketDeleteFinalizeRoot {
+    let root = storage::TestBucketDeleteFinalizeRoot {
         bucket,
         bucket_incarnation_generation: bucket_info.bucket_incarnation_generation,
     };
-    initial.enqueue_bucket_delete_finalize(root.clone());
+    initial.test_enqueue_bucket_delete_finalize(&root);
 
     assert_ne!(
         initial.process_local_registry_key(),
@@ -6401,7 +6401,7 @@ fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
                 runtime_handle_for_hook
                     .install(Arc::clone(&replacement_for_hook))
                     .unwrap();
-                replacement_for_hook.enqueue_bucket_delete_finalize(duplicate_root.clone());
+                replacement_for_hook.test_enqueue_bucket_delete_finalize(&duplicate_root);
             }
         })),
         ..ReclamationTestHooks::default()
@@ -6659,6 +6659,7 @@ fn shard_scavenger_sweeper_remains_shared_across_storage_identity_replacement() 
     initial.test_store_route_map_validity(long_lived_test_route_map_validity());
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let first = storage::StorageShardScavengerSweeper::acquire_shared(&handle).unwrap();
+    let first_reclaim = storage::StorageReclaimSweeper::acquire_shared(&handle).unwrap();
     let first_repair = storage::StorageShardRepairSweeper::acquire_shared(&handle).unwrap();
     let first_backfill = storage::StorageShardBackfillSweeper::acquire_shared(&handle).unwrap();
     let first_admission = storage::StorageMaintenanceAdmission::acquire_shared(&handle);
@@ -6673,6 +6674,7 @@ fn shard_scavenger_sweeper_remains_shared_across_storage_identity_replacement() 
     assert!(Arc::ptr_eq(&handle.current(), &replacement));
 
     let reacquired = storage::StorageShardScavengerSweeper::acquire_shared(&handle).unwrap();
+    let reacquired_reclaim = storage::StorageReclaimSweeper::acquire_shared(&handle).unwrap();
     let reacquired_repair = storage::StorageShardRepairSweeper::acquire_shared(&handle).unwrap();
     let reacquired_backfill =
         storage::StorageShardBackfillSweeper::acquire_shared(&handle).unwrap();
@@ -6680,6 +6682,10 @@ fn shard_scavenger_sweeper_remains_shared_across_storage_identity_replacement() 
     assert!(
         Arc::ptr_eq(&first, &reacquired),
         "one route-publication domain must retain one shard-scavenger worker across storage identities"
+    );
+    assert!(
+        Arc::ptr_eq(&first_reclaim, &reacquired_reclaim),
+        "one route-publication domain must retain one reclaim worker across storage identities"
     );
     assert!(
         Arc::ptr_eq(&first_admission, &reacquired_admission),
@@ -6715,6 +6721,8 @@ fn maintenance_registries_separate_independent_route_domains_over_same_cluster()
 
     let first_admission = storage::StorageMaintenanceAdmission::acquire_shared(&first_handle);
     let second_admission = storage::StorageMaintenanceAdmission::acquire_shared(&second_handle);
+    let first_reclaim = storage::StorageReclaimSweeper::acquire_shared(&first_handle).unwrap();
+    let second_reclaim = storage::StorageReclaimSweeper::acquire_shared(&second_handle).unwrap();
     let first_shard = storage::StorageShardScavengerSweeper::acquire_shared(&first_handle).unwrap();
     let second_shard =
         storage::StorageShardScavengerSweeper::acquire_shared(&second_handle).unwrap();
@@ -6729,6 +6737,7 @@ fn maintenance_registries_separate_independent_route_domains_over_same_cluster()
         storage::StorageShardBackfillSweeper::acquire_shared(&second_handle).unwrap();
 
     assert!(!Arc::ptr_eq(&first_admission, &second_admission));
+    assert!(!Arc::ptr_eq(&first_reclaim, &second_reclaim));
     assert!(!Arc::ptr_eq(&first_shard, &second_shard));
     assert!(!Arc::ptr_eq(&first_stream, &second_stream));
     assert!(!Arc::ptr_eq(&first_repair, &second_repair));
@@ -6738,6 +6747,8 @@ fn maintenance_registries_separate_independent_route_domains_over_same_cluster()
     second_runtime.install(Arc::clone(&replacement)).unwrap();
     assert!(Arc::ptr_eq(&first_handle.current(), &initial));
     assert!(Arc::ptr_eq(&second_handle.current(), &replacement));
+    assert!(first_reclaim.test_routes_to(&initial));
+    assert!(second_reclaim.test_routes_to(&replacement));
     assert!(first_shard.test_routes_to(&initial));
     assert!(second_shard.test_routes_to(&replacement));
     assert!(first_stream.test_routes_to(&initial));
@@ -6754,6 +6765,14 @@ fn maintenance_registries_separate_independent_route_domains_over_same_cluster()
     assert!(Arc::ptr_eq(
         &second_admission,
         &storage::StorageMaintenanceAdmission::acquire_shared(&second_handle)
+    ));
+    assert!(Arc::ptr_eq(
+        &first_reclaim,
+        &storage::StorageReclaimSweeper::acquire_shared(&first_handle).unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &second_reclaim,
+        &storage::StorageReclaimSweeper::acquire_shared(&second_handle).unwrap()
     ));
     assert!(Arc::ptr_eq(
         &first_shard,
@@ -12268,7 +12287,7 @@ fn frontend_coordinators_share_one_reclaim_sweeper_per_storage_handle() {
     );
     drop(first);
     assert!(
-        !second._reclaim_sweeper.stop.load(Ordering::SeqCst),
+        second._reclaim_sweeper.test_is_enabled(),
         "dropping one coordinator must leave the shared reclaim worker serving its peer"
     );
 }

@@ -23,9 +23,8 @@ pub use local::{
 use local::{
     LocalClusterRuntimeState, LocalRouteMapLeaseSnapshot, MetadataCommandRecoveryAdmission,
 };
-pub use request_ops::{
-    BucketIdentityGenerations, DurableReclaimScanBatch, DurableReclaimScanOutcome,
-};
+pub use request_ops::BucketIdentityGenerations;
+pub(crate) use request_ops::{DurableReclaimScanBatch, DurableReclaimScanOutcome};
 
 use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneRuntimeMapSource,
@@ -497,10 +496,29 @@ pub enum MetadataCommandApplyTestKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectPayloadReclaimAttempt {
+pub(crate) enum ObjectPayloadReclaimAttempt {
     Completed,
     Deferred,
     MissingRoot,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestObjectPayloadReclaimAttempt {
+    Completed,
+    Deferred,
+    MissingRoot,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<ObjectPayloadReclaimAttempt> for TestObjectPayloadReclaimAttempt {
+    fn from(value: ObjectPayloadReclaimAttempt) -> Self {
+        match value {
+            ObjectPayloadReclaimAttempt::Completed => Self::Completed,
+            ObjectPayloadReclaimAttempt::Deferred => Self::Deferred,
+            ObjectPayloadReclaimAttempt::MissingRoot => Self::MissingRoot,
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -10280,7 +10298,7 @@ impl StorageCluster {
             .expect("routed bucket metadata PG must belong to the installed topology")
     }
 
-    pub fn object_payload_reclaim_pg_id(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
+    pub(crate) fn object_payload_reclaim_pg_id(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
         self.object_metadata_pg_id(bucket, key)
     }
 

@@ -1,4 +1,3 @@
-use super::runtime::object_payload_reclaim_worker_should_defer;
 use super::test_support::open_test_storage_cluster;
 use super::*;
 use proptest::prelude::*;
@@ -7,7 +6,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use storage::{
     MultipartReclaimPartRecord, MultipartReclaimRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, PgTopology, ReclaimWorkItem,
+    ObjectSegmentsReclaimSegmentRecord, PgTopology, TestReclaimWorkItem as ReclaimWorkItem,
 };
 
 const TRACE_BUCKET: &str = "bucket";
@@ -99,7 +98,7 @@ fn trace_multipart_reclaim(
     }
 }
 
-fn seed_deleting_bucket(runtime: &ReadRuntime) -> storage::BucketDeleteFinalizeRoot {
+fn seed_deleting_bucket(runtime: &ReadRuntime) -> storage::TestBucketDeleteFinalizeRoot {
     let bucket = trusted_bucket_name(TRACE_BUCKET);
     runtime
         .storage_node()
@@ -109,7 +108,7 @@ fn seed_deleting_bucket(runtime: &ReadRuntime) -> storage::BucketDeleteFinalizeR
         .storage_node()
         .test_head_bucket_raw(&bucket)
         .unwrap();
-    storage::BucketDeleteFinalizeRoot {
+    storage::TestBucketDeleteFinalizeRoot {
         bucket,
         bucket_incarnation_generation: info.bucket_incarnation_generation,
     }
@@ -121,13 +120,17 @@ fn execute_object_payload_reclaim_worker_step(
     generation_id: GenerationId,
 ) -> Result<bool, TestCaseError> {
     let result = runtime.try_reclaim_object_payload_with_outcome(TRACE_BUCKET, key, generation_id);
-    let should_defer = object_payload_reclaim_worker_should_defer(&result);
+    let finished = matches!(
+        result,
+        Ok(storage::cluster::TestObjectPayloadReclaimAttempt::Completed
+            | storage::cluster::TestObjectPayloadReclaimAttempt::MissingRoot)
+    );
     result.map_err(|err| {
         TestCaseError::fail(format!(
             "try_reclaim_object_payload failed unexpectedly: {err:?}"
         ))
     })?;
-    Ok(!should_defer)
+    Ok(finished)
 }
 
 #[derive(Debug, Clone)]
@@ -1107,7 +1110,7 @@ impl ReclaimTraceHarness {
     }
 
     fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
-        Ok(self.runtime.storage_node().try_take_reclaim_work())
+        Ok(self.runtime.storage_node().test_try_take_reclaim_work())
     }
 
     fn expect_trace_object_work(&mut self) -> TestCaseResult {
@@ -1136,7 +1139,7 @@ impl ReclaimTraceHarness {
         if completed {
             self.runtime
                 .storage_node()
-                .finish_object_payload_reclaim_work(
+                .test_finish_object_payload_reclaim_work(
                     &trusted_bucket_name(TRACE_BUCKET),
                     &trusted_object_key(TRACE_KEY),
                     trace_generation_id(),
@@ -1287,7 +1290,7 @@ impl ReclaimKindTraceHarness {
     }
 
     fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
-        Ok(self.runtime.storage_node().try_take_reclaim_work())
+        Ok(self.runtime.storage_node().test_try_take_reclaim_work())
     }
 
     fn expect_trace_object_work(&mut self) -> TestCaseResult {
@@ -1316,7 +1319,7 @@ impl ReclaimKindTraceHarness {
         if completed {
             self.runtime
                 .storage_node()
-                .finish_object_payload_reclaim_work(
+                .test_finish_object_payload_reclaim_work(
                     &trusted_bucket_name(TRACE_BUCKET),
                     &trusted_object_key(TRACE_KEY),
                     trace_generation_id(),
@@ -1359,7 +1362,7 @@ impl TwoGenerationReclaimTraceHarness {
                 let root = seed_deleting_bucket(&self.runtime);
                 self.runtime
                     .storage_node()
-                    .enqueue_bucket_delete_finalize(root);
+                    .test_enqueue_bucket_delete_finalize(&root);
             }
             SeedOldMetadata => self.seed_metadata_for(TraceGeneration::Old)?,
             SeedNewMetadata => self.seed_metadata_for(TraceGeneration::New)?,
@@ -1528,7 +1531,7 @@ impl TwoGenerationReclaimTraceHarness {
         if completed {
             self.runtime
                 .storage_node()
-                .finish_object_payload_reclaim_work(
+                .test_finish_object_payload_reclaim_work(
                     &trusted_bucket_name(TRACE_BUCKET),
                     &trusted_object_key(TRACE_KEY),
                     generation.generation_id(),
@@ -1558,7 +1561,7 @@ impl TwoGenerationReclaimTraceHarness {
     }
 
     fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
-        Ok(self.runtime.storage_node().try_take_reclaim_work())
+        Ok(self.runtime.storage_node().test_try_take_reclaim_work())
     }
 
     fn bucket_exists(&self) -> bool {
@@ -1586,7 +1589,7 @@ impl TwoKeyReclaimTraceHarness {
                 let root = seed_deleting_bucket(&self.runtime);
                 self.runtime
                     .storage_node()
-                    .enqueue_bucket_delete_finalize(root);
+                    .test_enqueue_bucket_delete_finalize(&root);
             }
             SeedKeyAMetadata => self.seed_metadata_for(TraceKey::A)?,
             SeedKeyBMetadata => self.seed_metadata_for(TraceKey::B)?,
@@ -1755,7 +1758,7 @@ impl TwoKeyReclaimTraceHarness {
         if completed {
             self.runtime
                 .storage_node()
-                .finish_object_payload_reclaim_work(
+                .test_finish_object_payload_reclaim_work(
                     &trusted_bucket_name(TRACE_BUCKET),
                     &trusted_object_key(key.key()),
                     trace_generation_id(),
@@ -1785,7 +1788,7 @@ impl TwoKeyReclaimTraceHarness {
     }
 
     fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
-        Ok(self.runtime.storage_node().try_take_reclaim_work())
+        Ok(self.runtime.storage_node().test_try_take_reclaim_work())
     }
 
     fn bucket_exists(&self) -> bool {
