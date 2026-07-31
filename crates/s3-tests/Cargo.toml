@@ -20,7 +20,7 @@ server_http = { package = "server-http", path = "../server-http", default-featur
 server-core = { path = "../server-core", default-features = false }
 auth = { path = "../auth" }
 ec = { path = "../ec", default-features = false }
-storage = { path = "../storage", default-features = false }
+storage = { path = "../storage", default-features = false, features = ["test-hooks"] }
 checksum = { path = "../checksum", default-features = false }
 observability = { path = "../observability" }
 s3-types = { path = "../s3-types" }
