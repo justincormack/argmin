@@ -416,8 +416,6 @@ for index in 0 1 2; do
 
 [[hosts]]
 id = "host-$number"
-zone = "test-zone"
-rack = "rack-$number"
 
 [[disks]]
 id = "disk-$number"

@@ -1336,13 +1336,9 @@ private_key_ref = "file:{key}"
             r#"
 [[hosts]]
 id = "control-host-{number}"
-zone = "zone-a"
-rack = "control-rack-{number}"
 
 [[hosts]]
 id = "storage-host-{number}"
-zone = "zone-a"
-rack = "storage-rack-{number}"
 
 [[disks]]
 id = "control-disk-{number}"

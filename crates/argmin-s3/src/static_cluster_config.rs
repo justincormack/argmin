@@ -247,8 +247,6 @@ struct TransportProfileInput {
 #[serde(deny_unknown_fields)]
 struct HostInput {
     id: String,
-    zone: String,
-    rack: String,
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq)]
@@ -2997,8 +2995,6 @@ fn encode_transport_profile_full(profile: &TransportProfileInput) -> Vec<u8> {
 fn encode_host_topology(host: &HostInput) -> Vec<u8> {
     let mut encoder = CanonicalEncoder::default();
     encoder.string(1, &host.id);
-    encoder.string(2, &host.zone);
-    encoder.string(3, &host.rack);
     encoder.finish()
 }
 
@@ -3915,8 +3911,6 @@ fn validate_hosts(hosts: &[HostInput]) -> Result<BTreeSet<&str>, String> {
     let mut result = BTreeSet::new();
     for host in hosts {
         validate_identifier(&host.id, CLUSTER_MANIFEST_MAX_ID_BYTES, "host id")?;
-        validate_identifier(&host.zone, CLUSTER_MANIFEST_MAX_ID_BYTES, "host zone")?;
-        validate_identifier(&host.rack, CLUSTER_MANIFEST_MAX_ID_BYTES, "host rack")?;
         if !result.insert(host.id.as_str()) {
             return Err(format!("duplicate host id {}", host.id));
         }
@@ -5977,6 +5971,34 @@ mod tests {
         (dir, path)
     }
 
+    fn configuration_guide_toml_example(heading: &str) -> &'static str {
+        let guide = include_str!("../../../guides/configuration.md");
+        let section = guide
+            .split_once(heading)
+            .unwrap_or_else(|| panic!("configuration guide is missing {heading}"))
+            .1;
+        section
+            .split_once("```toml\n")
+            .unwrap_or_else(|| panic!("configuration guide section {heading} has no TOML block"))
+            .1
+            .split_once("\n```")
+            .unwrap_or_else(|| {
+                panic!("configuration guide section {heading} has an unterminated TOML block")
+            })
+            .0
+    }
+
+    #[test]
+    fn configuration_guide_manifest_examples_match_the_current_schema() {
+        for (heading, process_id) in [
+            ("### Standalone manifest example", "all-1"),
+            ("### Replicated manifest example", "control-1"),
+        ] {
+            parse_static_cluster_manifest(configuration_guide_toml_example(heading), process_id)
+                .unwrap_or_else(|error| panic!("configuration guide example {heading}: {error}"));
+        }
+    }
+
     #[test]
     fn static_cluster_manifest_rejects_unsupported_schema_versions() {
         for version in [0, 2] {
@@ -6163,8 +6185,6 @@ io_timeout_ms = 5000
 
 [[hosts]]
 id = "host-1"
-zone = "zone-a"
-rack = "rack-1"
 "#
         );
         for number in 1..=node_count {
@@ -6347,8 +6367,6 @@ io_timeout_ms = 5000
 
 [[hosts]]
 id = "host-1"
-zone = "zone-a"
-rack = "rack-1"
 
 [[disks]]
 id = "disk-1"
@@ -6455,8 +6473,6 @@ ca_bundle_ref = "file:/run/argmin-secrets/cluster-ca.pem"
                 r#"
 [[hosts]]
 id = "host-{host_number}"
-zone = "zone-a"
-rack = "rack-{host_number}"
 
 [[disks]]
 id = "host-{host_number}-control"
@@ -7993,9 +8009,9 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
                 standalone.full_config_fingerprint(),
             ),
             (
-                "c21bc863ef6c10f2efbfde7d53287dd3d0d62fafcbc6324480c0b37d50fc8c19",
-                "5306e4cf52af50954950cb21687ce502c61ea47d2f1e6376237de80874e18d03",
-                "fda782a642f90307c35cae85dd8945f0db7d8278fa280adb14c9a3f273fd467b",
+                "5bf5e1b7577fda247333aa68943c45f8915c0be6ca52d473f8819e3b6e05303f",
+                "99b77cf312149f5c31a21917e64f2cf6a426a6d7b6e56bdd437f8ffdbddb6467",
+                "e13971b1b0a1a5429a5a3c6369c4811e1bbc63af00b9e8f5c5cb5df7c55d4f5b",
             )
         );
 
@@ -8008,9 +8024,9 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
                 replicated.full_config_fingerprint(),
             ),
             (
-                "446edd7681e684beddd088d1876a3c67dacc0f7edc2d218c4955fec99ba0a9a7",
-                "18a78e17086c8c48baa89cf09524ee7f837b9fe667ea90f5fcdf6248a6b50970",
-                "eedd94865bcbfc491ee07d4e55b771154abbc929f062deb68ad5ae22a2ced59b",
+                "d4a09bbe6634ffa1018d2aa9f6fe169e12e63d1fce9420a0e3bd2b69a9a753f9",
+                "5cca855c88bd37ec52e64a57f20edc3210525ab0e3b859c3a82c909309a4fdc9",
+                "745939e18166e912da49965165628a511ec46bdf6a65167cde7119c0a8957bd4",
             )
         );
     }
@@ -8064,7 +8080,6 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
                 "failure_domain = \"disk\"",
             ),
             replace_once(&source, "pg_count = 16", "pg_count = 17"),
-            replace_once(&source, "rack = \"rack-1\"", "rack = \"rack-next\""),
             source.replace("node_id = 101", "node_id = 111"),
             source.replace("control-1-admin", "control-1-admin-next"),
             source.replace("7401", "7491"),
@@ -8251,6 +8266,20 @@ tls_server_name = "control-1.internal""#,
         assert!(parse_static_cluster_manifest(&duplicate, "all-1")
             .unwrap_err()
             .contains("duplicate key"));
+    }
+
+    #[test]
+    fn static_cluster_manifest_rejects_unimplemented_host_topology_labels() {
+        for field in ["zone", "rack"] {
+            let manifest = replace_once(
+                &standalone_manifest(),
+                "[[hosts]]\nid = \"host-1\"",
+                &format!("[[hosts]]\nid = \"host-1\"\n{field} = \"example\""),
+            );
+            assert!(parse_static_cluster_manifest(&manifest, "all-1")
+                .unwrap_err()
+                .contains("unknown field"));
+        }
     }
 
     #[test]

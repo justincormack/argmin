@@ -83,6 +83,23 @@ disabled. This catches release-only `cfg`, overflow, timeout, and
 optimization-sensitive behavior at the same process boundary used by the
 replicated control plane.
 
+### Environment-only Raft process harness
+
+The process and UAT harnesses can configure the pre-manifest experimental Raft
+path directly through environment variables. This is test configuration, not
+the operator interface for a new replicated deployment:
+
+| Variable | Description |
+|---|---|
+| `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` | Enables the environment-only Raft path; default `false` |
+| `ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME` | Test cluster identity |
+| `ARGMIN_CONTROL_PLANE_RAFT_NODE_ID` | Local nonzero Raft node id; defaults to `1` when enabled |
+| `ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH` | Local absolute Raft peer Unix socket |
+| `ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS` | Comma-separated `node_id=/absolute/socket` peer map |
+| `ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS` | `node_id=credential_id:version:secret,...`; required for a multi-node peer map |
+
+Use a static cluster manifest for production-shaped replicated configuration.
+
 ## Storage Cluster Boundary Checks
 
 Run `./scripts/check-storage-cluster-boundaries` as part of broad local

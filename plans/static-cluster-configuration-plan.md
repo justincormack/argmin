@@ -234,18 +234,12 @@ io_timeout_ms = 5000
 
 [[hosts]]
 id = "host-1"
-zone = "zone-a"
-rack = "rack-1"
 
 [[hosts]]
 id = "host-2"
-zone = "zone-a"
-rack = "rack-2"
 
 [[hosts]]
 id = "host-3"
-zone = "zone-b"
-rack = "rack-3"
 
 [[disks]]
 id = "host-1-control"

@@ -358,7 +358,7 @@ First static local cluster config decision:
    - `NodeId`
    - data directory
    - weight
-   - topology key, initially at least rack and machine
+   - host and disk failure-domain identities
 4. if a compact environment format is used for early development, prefer one
    value containing node records over a spread of loosely coupled variables
 5. each local node store must have a distinct directory below or beside
