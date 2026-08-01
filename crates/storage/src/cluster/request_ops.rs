@@ -16490,21 +16490,33 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-    ) -> Result<Vec<ObjectPartRecord>, ObjectPgActionError> {
+    ) -> Result<Vec<crate::TestObjectPartRecord>, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_get_object_parts(bucket, key, version_id)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_replace_object_parts(
+    pub fn test_corrupt_object_part_payload_crc64(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-        parts: &[ObjectPartRecord],
+        part_number: u32,
     ) -> Result<(), ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
-            .test_replace_object_parts(bucket, key, version_id, parts)
+            .test_corrupt_object_part_payload_crc64(bucket, key, version_id, part_number)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_remove_object_part(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        part_number: u32,
+    ) -> Result<(), ObjectPgActionError> {
+        self.metadata_primary_bridge_node()?
+            .test_remove_object_part(bucket, key, version_id, part_number)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

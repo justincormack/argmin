@@ -460,6 +460,33 @@ impl From<types::MultipartPartSegmentRecord> for TestMultipartPartSegmentRecord 
     }
 }
 
+/// Test-only observation of one committed multipart-manifest part.
+///
+/// Production object reads receive `ObjectReadMultipartPart`, which omits all
+/// physical placement details. This projection keeps the few fields needed by
+/// cross-crate placement and manifest-observation regressions behind
+/// `test-hooks`.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestObjectPartRecord {
+    pub part_number: u32,
+    pub size: u64,
+    pub payload_crc64: u64,
+    pub data_pg_id: u32,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<types::ObjectPartRecord> for TestObjectPartRecord {
+    fn from(part: types::ObjectPartRecord) -> Self {
+        Self {
+            part_number: part.part_number,
+            size: part.size,
+            payload_crc64: part.payload_crc64,
+            data_pg_id: part.data_pg_id,
+        }
+    }
+}
+
 /// Test-only logical observation of accepted bucket-deletion progress.
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -625,25 +652,24 @@ pub use types::{
     MultipartUploadListMarker, MultipartUploadListPartsCandidate, MultipartUploadListPartsLookup,
     MultipartUploadPartCandidate, ObjectEncryption, ObjectEncryptionStateError, ObjectEtag,
     ObjectKey, ObjectKeyError, ObjectLayout, ObjectLockDefaultRetention, ObjectLockMode,
-    ObjectLockState, ObjectPartRangeRecord, ObjectPartRecord,
-    ObjectPayloadPlacementDiagnosticError, ObjectPayloadSegment, ObjectReadAuthSubject,
-    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode,
-    ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord, ObjectState,
-    OpaqueBucketSubresourceKind, OwnerIdentity, PgId, PgState, PrepareStreamUploadSegmentAppendReq,
-    PreparedDirectPutObjectCommit, PreparedStreamPartCommit, PreparedStreamPutCommit,
-    PublicAccessBlockConfig, PutBucketSubresource, PutDeleteMarkerReq, PutLiveObjectReq,
-    PutLiveObjectValidationError, PutObjectReq, RawChecksum, RetentionPeriod, RouteMapValidUntilMs,
-    RouteMapValidity, SegmentStoredBytesRequest, SerializedBucketTagSet, SerializedMetadataBlob,
-    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, SessionIdError, ShardData,
-    ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
-    ShardScavengerObservationReason, ShardScavengerObservationRecord, ShardStat, ShardStatus,
-    SseCustomerObjectState, SseS3ObjectState, StorageClass, StoredLegalHoldStatus, StoredObject,
-    StreamPartFinalizeInput, StreamPartFinalizeSnapshot, StreamPutCommitInput,
-    StreamPutFinalizeSnapshot, StreamPutFinalizeStorageSnapshot, StreamSegmentAppendInput,
-    StreamSegmentAppendOutcome, StreamUploadCommandRecord, StreamUploadKind, StreamUploadRecord,
-    StreamUploadRecordPage, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
-    TerminalStreamCleanupRecord, UploadId, UploadIdError, UploadState, VersionId, WriteAck,
-    WrittenShardAck, MULTIPART_PART_SEGMENT_STAGING_VERSION_ID,
+    ObjectLockState, ObjectPayloadPlacementDiagnosticError, ObjectPayloadSegment,
+    ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadMultipartPart,
+    ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention,
+    ObjectSegmentRecord, ObjectState, OpaqueBucketSubresourceKind, OwnerIdentity, PgId, PgState,
+    PrepareStreamUploadSegmentAppendReq, PreparedDirectPutObjectCommit, PreparedStreamPartCommit,
+    PreparedStreamPutCommit, PublicAccessBlockConfig, PutBucketSubresource, PutDeleteMarkerReq,
+    PutLiveObjectReq, PutLiveObjectValidationError, PutObjectReq, RawChecksum, RetentionPeriod,
+    RouteMapValidUntilMs, RouteMapValidity, SegmentStoredBytesRequest, SerializedBucketTagSet,
+    SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId,
+    SessionIdError, ShardData, ShardIndex, ShardKey, ShardScavengerObservation,
+    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
+    ShardStat, ShardStatus, SseCustomerObjectState, SseS3ObjectState, StorageClass,
+    StoredLegalHoldStatus, StoredObject, StreamPartFinalizeInput, StreamPartFinalizeSnapshot,
+    StreamPutCommitInput, StreamPutFinalizeSnapshot, StreamPutFinalizeStorageSnapshot,
+    StreamSegmentAppendInput, StreamSegmentAppendOutcome, StreamUploadCommandRecord,
+    StreamUploadKind, StreamUploadRecord, StreamUploadRecordPage, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadIdError,
+    UploadState, VersionId, WriteAck, WrittenShardAck, MULTIPART_PART_SEGMENT_STAGING_VERSION_ID,
     OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN, OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN,
     OBJECT_ENCRYPTION_SEGMENT_NONCE_SCOPE_LEN, OBJECT_ENCRYPTION_SEGMENT_TAG_LEN,
     OBJECT_ENCRYPTION_WRAPPED_DEK_LEN, OBJECT_ENCRYPTION_WRAP_NONCE_LEN, SESSION_ID_LEN,

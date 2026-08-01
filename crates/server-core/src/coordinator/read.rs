@@ -352,14 +352,14 @@ impl Coordinator {
 
             let part = obj_parts
                 .iter()
-                .find(|p| p.record.part_number == part_number)
+                .find(|part| part.part.part_number() == part_number)
                 .ok_or(ServerError::InvalidPartNumber {
                     part_number,
                     parts_count: obj_parts.len() as u32,
                 })?;
 
             let part_start = part.object_offset_start as u64;
-            let part_end = part_start + part.record.size.saturating_sub(1);
+            let part_end = part_start + part.part.size().saturating_sub(1);
 
             let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
             let system_metadata = self.deserialize_visible_system_metadata(
@@ -368,7 +368,7 @@ impl Coordinator {
                 req.sse_customer,
             )?;
 
-            let checksum = if let Some(raw) = &part.record.checksum {
+            let checksum = if let Some(raw) = part.part.checksum() {
                 match system_metadata.checksum_algorithm() {
                     Some(algo) => Some(RawChecksum::new(algo, raw.as_slice()).map_err(|err| {
                         ServerError::InternalError {
@@ -388,7 +388,7 @@ impl Coordinator {
 
             let mut part_body = part.clone();
             part_body.object_offset_start = 0;
-            let body = if part.record.size == 0 {
+            let body = if part.part.size() == 0 {
                 ReadHandle::from_buffered_bytes(vec![])
             } else {
                 ReadHandle::from_multipart(
@@ -399,7 +399,7 @@ impl Coordinator {
                     req.object.key_typed(),
                     record.generation_id,
                     vec![part_body],
-                    part.record.size as usize,
+                    part.part.size() as usize,
                     req.sse_customer.cloned(),
                 )?
             };
@@ -425,7 +425,7 @@ impl Coordinator {
                 object_lock: attribute_permissions.visible_object_lock(record.object_lock),
                 etag: etag_str,
                 size: record.size,
-                part_size: part.record.size,
+                part_size: part.part.size(),
                 last_modified: record.last_modified,
                 part_start,
                 part_end,
@@ -604,14 +604,17 @@ impl Coordinator {
 
             let part_index = obj_parts
                 .iter()
-                .position(|p| p.part_number == part_number)
+                .position(|part| part.part_number() == part_number)
                 .ok_or(ServerError::InvalidPartNumber {
                     part_number,
                     parts_count: obj_parts.len() as u32,
                 })?;
             let part = &obj_parts[part_index];
-            let part_start = obj_parts[..part_index].iter().map(|p| p.size).sum::<u64>();
-            let part_end = part_start + part.size.saturating_sub(1);
+            let part_start = obj_parts[..part_index]
+                .iter()
+                .map(storage::ObjectReadMultipartPart::size)
+                .sum::<u64>();
+            let part_end = part_start + part.size().saturating_sub(1);
 
             let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
             let system_metadata = self.deserialize_visible_system_metadata(
@@ -620,7 +623,7 @@ impl Coordinator {
                 req.sse_customer,
             )?;
 
-            let checksum = if let Some(raw) = &part.checksum {
+            let checksum = if let Some(raw) = part.checksum() {
                 match system_metadata.checksum_algorithm() {
                     Some(algo) => Some(RawChecksum::new(algo, raw.as_slice()).map_err(|err| {
                         ServerError::InternalError {
@@ -643,7 +646,7 @@ impl Coordinator {
                 system_metadata,
                 object_lock: attribute_permissions.visible_object_lock(record.object_lock),
                 etag: etag_str,
-                part_size: part.size,
+                part_size: part.size(),
                 part_start,
                 part_end,
                 total_size: record.size,
@@ -884,7 +887,7 @@ impl Coordinator {
 
                     let filtered: Vec<_> = all_parts
                         .into_iter()
-                        .filter(|p| p.part_number > marker)
+                        .filter(|part| part.part_number() > marker)
                         .collect();
 
                     let is_truncated = max_parts > 0 && filtered.len() > max_parts as usize;
@@ -894,12 +897,12 @@ impl Coordinator {
                         .take(take_count)
                         .map(|p| {
                             use base64::Engine;
-                            let checksum = p.checksum.as_ref().map(|bytes| {
+                            let checksum = p.checksum().map(|bytes| {
                                 base64::engine::general_purpose::STANDARD.encode(bytes)
                             });
                             ObjectPartEntry {
-                                part_number: p.part_number,
-                                size: p.size,
+                                part_number: p.part_number(),
+                                size: p.size(),
                                 checksum,
                             }
                         })
@@ -1084,7 +1087,7 @@ impl Coordinator {
             )?;
             if !obj_parts.iter().any(|part| {
                 let part_start = part.object_offset_start as u64;
-                let part_end_exclusive = part_start + part.record.size;
+                let part_end_exclusive = part_start + part.part.size();
                 part_end_exclusive > user_start && part_start <= user_end
             }) {
                 return Err(ServerError::InternalError {

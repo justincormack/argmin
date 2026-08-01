@@ -6839,7 +6839,7 @@ impl StorageCluster {
                 let unique_parts = snapshot
                     .multipart_parts
                     .iter()
-                    .all(|part| part_sizes.insert(part.part_number, part.size).is_none());
+                    .all(|part| part_sizes.insert(part.part_number(), part.size()).is_none());
                 let mut segment_counts = HashMap::<u32, usize>::new();
                 let segments_have_parts = snapshot.multipart_part_segments.iter().all(|segment| {
                     let Some(part_number) = segment.part_number() else {

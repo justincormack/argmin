@@ -2960,20 +2960,20 @@ fail_with_matches \
 raw_multipart_storage_representation_leaks=$(
     {
         rg -n --color=never \
-            '\b(MultipartUploadRecord|MultipartPartRecord|MultipartPartSegmentRecord|AuthorizedMultipartUploadRecord|MultipartUploadManagementLookup|CompleteMultipartCommitCleanup|FinalizeStreamPartCleanup|AbortMultipartUploadCleanup|CommitMultipartReq|MultipartObjectIdentity|MultipartCompletionSnapshot|MultipartCompletionPreflight|MultipartCompletionReplay)\b' \
+            '\b(MultipartUploadRecord|MultipartPartRecord|MultipartPartSegmentRecord|ObjectPartRecord|ObjectPartRangeRecord|AuthorizedMultipartUploadRecord|MultipartUploadManagementLookup|CompleteMultipartCommitCleanup|FinalizeStreamPartCleanup|AbortMultipartUploadCleanup|CommitMultipartReq|MultipartObjectIdentity|MultipartCompletionSnapshot|MultipartCompletionPreflight|MultipartCompletionReplay)\b' \
             crates \
             -g '*.rs' \
             -g '!crates/storage/**' \
             || true
         rg -n --color=never \
-            '^[[:space:]]*pub[[:space:]]+(struct|enum)[[:space:]]+(MultipartUploadRecord|MultipartPartRecord|MultipartPartSegmentRecord|AuthorizedMultipartUploadRecord|MultipartUploadManagementLookup|CompleteMultipartCommitCleanup|FinalizeStreamPartCleanup|AbortMultipartUploadCleanup|CommitMultipartReq|MultipartObjectIdentity|MultipartCompletionSnapshot|MultipartCompletionPreflight|MultipartCompletionReplay)\b' \
+            '^[[:space:]]*pub[[:space:]]+(struct|enum)[[:space:]]+(MultipartUploadRecord|MultipartPartRecord|MultipartPartSegmentRecord|ObjectPartRecord|ObjectPartRangeRecord|AuthorizedMultipartUploadRecord|MultipartUploadManagementLookup|CompleteMultipartCommitCleanup|FinalizeStreamPartCleanup|AbortMultipartUploadCleanup|CommitMultipartReq|MultipartObjectIdentity|MultipartCompletionSnapshot|MultipartCompletionPreflight|MultipartCompletionReplay)\b' \
             crates/storage/src/types.rs \
             || true
         awk '
         /^[[:space:]]*pub use types::\{/ {
             in_public_types = 1
         }
-        in_public_types && /(^|[^[:alnum:]_])(MultipartUploadRecord|MultipartPartRecord|MultipartPartSegmentRecord|AuthorizedMultipartUploadRecord|MultipartUploadManagementLookup|CompleteMultipartCommitCleanup|FinalizeStreamPartCleanup|AbortMultipartUploadCleanup|CommitMultipartReq|MultipartObjectIdentity|MultipartCompletionSnapshot|MultipartCompletionPreflight|MultipartCompletionReplay)([^[:alnum:]_]|$)/ {
+        in_public_types && /(^|[^[:alnum:]_])(MultipartUploadRecord|MultipartPartRecord|MultipartPartSegmentRecord|ObjectPartRecord|ObjectPartRangeRecord|AuthorizedMultipartUploadRecord|MultipartUploadManagementLookup|CompleteMultipartCommitCleanup|FinalizeStreamPartCleanup|AbortMultipartUploadCleanup|CommitMultipartReq|MultipartObjectIdentity|MultipartCompletionSnapshot|MultipartCompletionPreflight|MultipartCompletionReplay)([^[:alnum:]_]|$)/ {
             print FILENAME ":" FNR ":" $0
         }
         in_public_types && /^[[:space:]]*};/ {
@@ -2983,8 +2983,73 @@ raw_multipart_storage_representation_leaks=$(
     }
 )
 fail_with_matches \
-    "Raw multipart upload, part, cleanup, management, snapshot, replay, and commit representations must remain private to storage" \
+    "Raw multipart upload, part, manifest, cleanup, management, snapshot, replay, and commit representations must remain private to storage" \
     "$raw_multipart_storage_representation_leaks"
+
+object_read_multipart_part_surface_leaks=$(
+    {
+        rg -n --color=never \
+            '\btest_replace_object_parts\b' \
+            crates \
+            -g '*.rs' \
+            || true
+        awk '
+        /#\[derive\(/ {
+            derive = $0
+            in_derive = ($0 !~ /\)\]/)
+            next
+        }
+        in_derive {
+            derive = derive $0
+            if ($0 ~ /\)\]/) {
+                in_derive = 0
+            }
+            next
+        }
+        /pub struct ObjectReadMultipartPart[[:space:]]*\{/ {
+            if (derive ~ /Debug|PartialEq|Eq/) {
+                print FILENAME ":" FNR ":" derive
+            }
+            in_read_part = 1
+            next
+        }
+        in_read_part && /^[[:space:]]*pub[[:space:]]+[^:]+[[:space:]]*:/ {
+            print FILENAME ":" FNR ":" $0
+        }
+        in_read_part && /^[[:space:]]*}/ {
+            in_read_part = 0
+        }
+        /impl ObjectReadMultipartPart[[:space:]]*\{/ {
+            in_read_part_impl = 1
+            depth = 0
+        }
+        in_read_part_impl {
+            if ($0 ~ /^[[:space:]]*pub[[:space:]]+([^[:space:]]+[[:space:]]+)*fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/) {
+                method = $0
+                sub(/^.*fn[[:space:]]+/, "", method)
+                sub(/\(.*/, "", method)
+                if (method != "part_number" && method != "size" && method != "payload_crc64" && method != "checksum") {
+                    print FILENAME ":" FNR ":" $0
+                }
+            }
+            line = $0
+            depth += gsub(/\{/, "{", line)
+            depth -= gsub(/\}/, "}", line)
+            if (depth == 0 && $0 ~ /\}/) {
+                in_read_part_impl = 0
+            }
+        }
+        {
+            if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^#\[derive\(/ && !in_derive) {
+                derive = ""
+            }
+        }
+        ' crates/storage/src/types.rs
+    }
+)
+fail_with_matches \
+    "Object-read multipart parts must expose only the bounded logical projection and must not derive Debug or equality over hidden durable state" \
+    "$object_read_multipart_part_surface_leaks"
 
 multipart_upload_id_authority_derived_equality=$(
     awk '

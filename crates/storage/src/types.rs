@@ -4665,7 +4665,7 @@ pub struct FinalizeStreamPutOutcome<T> {
 pub struct ObjectReadSnapshot {
     pub stored: StoredObject,
     pub object_segments: Vec<ObjectPayloadSegment>,
-    pub multipart_parts: Vec<ObjectPartRecord>,
+    pub multipart_parts: Vec<ObjectReadMultipartPart>,
     pub multipart_part_segments: Vec<ObjectPayloadSegment>,
 }
 
@@ -4737,7 +4737,10 @@ impl ObjectReadSnapshot {
                     ObjectPayloadSegment::from_object_record(&subject, record, stored_size_extra)
                 })
                 .collect(),
-            multipart_parts,
+            multipart_parts: multipart_parts
+                .into_iter()
+                .map(ObjectReadMultipartPart::from_record)
+                .collect(),
             multipart_part_segments: multipart_part_segments
                 .into_iter()
                 .map(|record| {
@@ -5958,7 +5961,7 @@ impl std::fmt::Debug for CompleteMultipartCommitOutcome {
 
 /// Committed part record in the object manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObjectPartRecord {
+pub(crate) struct ObjectPartRecord {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
@@ -5978,9 +5981,73 @@ pub struct ObjectPartRecord {
     pub checksum: Option<ChecksumBytes>,
 }
 
+/// Logical multipart-manifest part exposed by an object-read snapshot.
+///
+/// Storage retains the complete durable row, including placement and encoding
+/// details, for RPC validation and retained payload authority. Callers can
+/// inspect only the values required to implement S3 read semantics.
+#[derive(Clone)]
+pub struct ObjectReadMultipartPart {
+    record: ObjectPartRecord,
+}
+
+impl ObjectReadMultipartPart {
+    pub(crate) fn from_record(record: ObjectPartRecord) -> Self {
+        Self { record }
+    }
+
+    pub(crate) fn record(&self) -> &ObjectPartRecord {
+        &self.record
+    }
+
+    #[must_use]
+    pub fn part_number(&self) -> u32 {
+        self.record.part_number
+    }
+
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        self.record.size
+    }
+
+    #[must_use]
+    pub fn payload_crc64(&self) -> u64 {
+        self.record.payload_crc64
+    }
+
+    #[must_use]
+    pub fn checksum(&self) -> Option<&ChecksumBytes> {
+        self.record.checksum.as_ref()
+    }
+}
+
+impl std::fmt::Debug for ObjectReadMultipartPart {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectReadMultipartPart")
+            .field("part_number", &self.part_number())
+            .field("size", &self.size())
+            .field("payload_crc64", &self.payload_crc64())
+            .field("has_checksum", &self.checksum().is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for ObjectReadMultipartPart {
+    fn eq(&self, other: &Self) -> bool {
+        self.part_number() == other.part_number()
+            && self.size() == other.size()
+            && self.payload_crc64() == other.payload_crc64()
+            && self.checksum() == other.checksum()
+    }
+}
+
+impl Eq for ObjectReadMultipartPart {}
+
 /// Committed part record annotated with its byte offset in the completed object.
+#[cfg(test)]
 #[derive(Debug, Clone)]
-pub struct ObjectPartRangeRecord {
+pub(crate) struct ObjectPartRangeRecord {
     pub part: ObjectPartRecord,
     pub object_offset_start: u64,
 }
@@ -6715,6 +6782,57 @@ mod tests {
         assert!(!debug.contains("metadata_blob"));
         assert!(!debug.contains("system_metadata_blob"));
         assert!(!debug.contains("encryption"));
+    }
+
+    #[test]
+    fn object_read_multipart_part_exposes_and_compares_only_logical_read_state() {
+        let first_record = ObjectPartRecord {
+            bucket: BucketName::try_from("private-first-bucket").unwrap(),
+            key: ObjectKey::try_from("private-first-key").unwrap(),
+            version_id: VersionId::from_u64(29),
+            part_number: 3,
+            size: 17,
+            payload_crc64: 23,
+            etag: vec![31, 37],
+            etag_kind: EtagKind::MultipartComposite,
+            part_vid: GenerationId::new(41).unwrap(),
+            placement_cluster_epoch: ClusterEpoch::new(43).unwrap(),
+            ec_k: 4,
+            ec_m: 2,
+            data_pg_id: 47,
+            checksum: None,
+        };
+        let mut physically_distinct_record = first_record.clone();
+        physically_distinct_record.bucket = BucketName::try_from("private-second-bucket").unwrap();
+        physically_distinct_record.key = ObjectKey::try_from("private-second-key").unwrap();
+        physically_distinct_record.version_id = VersionId::from_u64(53);
+        physically_distinct_record.etag = vec![59, 61];
+        physically_distinct_record.etag_kind = EtagKind::Crc64;
+        physically_distinct_record.part_vid = GenerationId::new(67).unwrap();
+        physically_distinct_record.placement_cluster_epoch = ClusterEpoch::new(71).unwrap();
+        physically_distinct_record.ec_k = 2;
+        physically_distinct_record.ec_m = 1;
+        physically_distinct_record.data_pg_id = 73;
+
+        let first = ObjectReadMultipartPart::from_record(first_record);
+        let physically_distinct = ObjectReadMultipartPart::from_record(physically_distinct_record);
+
+        assert_eq!(first.part_number(), 3);
+        assert_eq!(first.size(), 17);
+        assert_eq!(first.payload_crc64(), 23);
+        assert_eq!(first.checksum(), None);
+        assert_eq!(first, physically_distinct);
+
+        let debug = format!("{first:?}");
+        assert!(debug.contains("part_number: 3"));
+        assert!(debug.contains("size: 17"));
+        assert!(debug.contains("payload_crc64: 23"));
+        assert!(!debug.contains("private-first-bucket"));
+        assert!(!debug.contains("private-first-key"));
+        assert!(!debug.contains("data_pg_id"));
+        assert!(!debug.contains("placement_cluster_epoch"));
+        assert!(!debug.contains("part_vid"));
+        assert!(!debug.contains("etag"));
     }
 
     #[test]

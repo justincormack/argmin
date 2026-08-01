@@ -138,6 +138,38 @@ impl PgStore {
         require_one_test_mutation(changed)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_corrupt_object_part_payload_crc64(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        part_number: u32,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE object_parts SET payload_crc64 = ~payload_crc64 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND part_number = ?4",
+            params![bucket, key, version_id.to_u64() as i64, part_number],
+            "corrupt object part payload CRC64 for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_remove_object_part(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        part_number: u32,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "DELETE FROM object_parts WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND part_number = ?4",
+            params![bucket, key, version_id.to_u64() as i64, part_number],
+            "remove object part for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_insert_object_segment(
         &self,

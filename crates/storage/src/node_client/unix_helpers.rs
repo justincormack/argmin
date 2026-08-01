@@ -1632,7 +1632,11 @@ impl UnixStorageNodeClient {
             }
         }
         for part in &snapshot.multipart_parts {
-            if &part.bucket != bucket || &part.key != key || part.version_id != stored_version_id {
+            let record = part.record();
+            if &record.bucket != bucket
+                || &record.key != key
+                || record.version_id != stored_version_id
+            {
                 return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                     "validate object read snapshot response",
                     "multipart part identity does not match snapshot".to_string(),
@@ -1750,7 +1754,7 @@ impl UnixStorageNodeClient {
 
         let mut parts_by_number = BTreeMap::new();
         for part in &snapshot.multipart_parts {
-            if parts_by_number.insert(part.part_number, part).is_some() {
+            if parts_by_number.insert(part.part_number(), part).is_some() {
                 return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                     "validate object read snapshot response",
                     "multipart snapshot contains duplicate part numbers".to_string(),
@@ -1777,7 +1781,7 @@ impl UnixStorageNodeClient {
 
         if require_segment_layout {
             for part in &snapshot.multipart_parts {
-                if part.size > 0 && !segment_counts_by_part.contains_key(&part.part_number) {
+                if part.size() > 0 && !segment_counts_by_part.contains_key(&part.part_number()) {
                     return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                         "validate object read snapshot response",
                         "segmented multipart part has no segment rows".to_string(),

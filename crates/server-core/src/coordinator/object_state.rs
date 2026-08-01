@@ -4,7 +4,7 @@ use s3_types::VersionId;
 #[cfg(test)]
 use storage::{BucketName, ObjectKey, StoredObject};
 use storage::{
-    ObjectEncryption, ObjectPartRecord, SerializedMetadataBlob, SerializedSystemMetadataBlob,
+    ObjectEncryption, ObjectReadMultipartPart, SerializedMetadataBlob, SerializedSystemMetadataBlob,
 };
 
 use super::{ActiveWriteEncryption, Coordinator, SegmentPayloadRecord};
@@ -17,7 +17,7 @@ use crate::system_metadata::SystemMetadata;
 
 #[derive(Debug, Clone)]
 pub(super) struct SnapshottedMultipartPart {
-    pub(super) record: ObjectPartRecord,
+    pub(super) part: ObjectReadMultipartPart,
     pub(super) object_offset_start: usize,
     pub(super) segments: Vec<SegmentPayloadRecord>,
 }

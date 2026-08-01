@@ -17566,7 +17566,7 @@ fn put_object_read_snapshot(out: &mut Vec<u8>, snapshot: &ObjectReadSnapshot) {
         u32::try_from(snapshot.multipart_parts.len()).expect("object part count must fit in u32"),
     );
     for part in &snapshot.multipart_parts {
-        put_object_part_record(out, part);
+        put_object_part_record(out, part.record());
     }
     put_u32(
         out,
@@ -22822,6 +22822,7 @@ mod tests {
             data_pg_id: 5,
             checksum: Some(checksum),
         };
+        let expected_part = part.clone();
         let segment = MultipartPartSegmentRecord {
             bucket,
             key,
@@ -22852,6 +22853,15 @@ mod tests {
         let bytes = encode_object_read_snapshot_response(&response);
         let decoded = decode_object_read_snapshot_response(&bytes).unwrap();
         assert_eq!(decoded, response);
+        let StorageRpcObjectReadSnapshotOutcome::Loaded(decoded_snapshot) = &decoded.outcome else {
+            panic!("object-read snapshot response must remain loaded after round-trip");
+        };
+        assert_eq!(decoded_snapshot.multipart_parts.len(), 1);
+        assert_eq!(
+            decoded_snapshot.multipart_parts[0].record(),
+            &expected_part,
+            "storage-owned RPC coverage must compare every hidden durable part field",
+        );
 
         let response = StorageRpcObjectReadSnapshotResponse {
             outcome: StorageRpcObjectReadSnapshotOutcome::StaleSubject,

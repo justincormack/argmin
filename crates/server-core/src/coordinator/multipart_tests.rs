@@ -4517,18 +4517,9 @@ fn corrupt_committed_part_payload_crc64(
 ) {
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
-    let mut parts = coord
-        .storage_node()
-        .test_get_object_parts(&bucket_name, &object_key, version_id)
-        .unwrap();
-    let part = parts
-        .iter_mut()
-        .find(|part| part.part_number == part_number)
-        .expect("committed object part exists");
-    part.payload_crc64 ^= 1;
     coord
         .storage_node()
-        .test_replace_object_parts(&bucket_name, &object_key, version_id, &parts)
+        .test_corrupt_object_part_payload_crc64(&bucket_name, &object_key, version_id, part_number)
         .unwrap();
 }
 
@@ -5136,7 +5127,7 @@ fn get_object_rejects_incomplete_manifest_before_body_read() {
 
     let result = create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
-    // Get the real manifest, then replace with only part 2 (gap: part 1 missing).
+    // Remove part 1 from the real manifest, leaving a gap before part 2.
     let real_parts = coord
         .storage_node()
         .test_get_object_parts(
@@ -5146,14 +5137,13 @@ fn get_object_rejects_incomplete_manifest_before_body_read() {
         )
         .unwrap();
     assert_eq!(real_parts.len(), 2);
-    let part2_record = real_parts[1].clone(); // real part 2 with valid shards
     coord
         .storage_node()
-        .test_replace_object_parts(
+        .test_remove_object_part(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             result.version_id,
-            &[part2_record],
+            1,
         )
         .unwrap();
 

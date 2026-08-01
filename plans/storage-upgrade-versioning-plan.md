@@ -1230,6 +1230,24 @@ definitions, or through the public root export. The production object-read seam 
 `ObjectPartRecord`; containing that remaining physical multipart-manifest representation is the
 next part of implementation-order item 3, so that item is not yet complete.
 
+The twenty-third bounded slice completes the production portion of implementation-order item 3
+by containing the object-read multipart-manifest representation. `ObjectPartRecord` and the
+test-only range row are private to `storage`. Object-read snapshots instead expose an
+`ObjectReadMultipartPart` logical projection containing only the part number, logical size,
+payload CRC, and optional S3 checksum required by read, range, HEAD, and attributes behavior.
+Storage retains the complete durable row internally for subject validation, storage-RPC encoding,
+and retained payload authority; bucket, key, version, ETag encoding, part generation, placement
+epoch, erasure-coding shape, and data PG do not cross the production boundary. Custom `Debug` and
+equality implementations operate only on the logical projection, so hidden physical state cannot
+be observed through formatting or comparison. Existing database rows, metadata commands,
+node-client messages, and storage-RPC bytes are unchanged. Cross-crate tests use a feature-gated
+read-only projection plus narrow `pg_store`-owned corruption and removal operations instead of a
+raw row replacement API. Compiler visibility is the primary boundary, with a repository check
+rejecting raw manifest rows outside `storage`, public raw definitions or exports, broad test row
+replacement, public projection fields, unapproved projection accessors, and derived `Debug` or
+equality over the retained row. Remaining test-only physical observations are bounded facilities
+for placement and manifest assertions rather than production representation seams.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

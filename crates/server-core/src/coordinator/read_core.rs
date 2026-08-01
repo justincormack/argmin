@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use storage::{
-    BucketName, GenerationId, ObjectEncryption, ObjectKey, ObjectPartRecord, ObjectPayloadLease,
-    ObjectPayloadSegment, RetainedObjectPayloadRead, StorageCluster,
+    BucketName, GenerationId, ObjectEncryption, ObjectKey, ObjectPayloadLease,
+    ObjectPayloadSegment, ObjectReadMultipartPart, RetainedObjectPayloadRead, StorageCluster,
 };
 
 use super::object_state::SnapshottedMultipartPart;
@@ -491,23 +491,23 @@ impl ReadHandle {
 
         for (part_order, part) in parts.into_iter().enumerate() {
             let part_start = part.object_offset_start;
-            let part_size = part.record.size as usize;
+            let part_size = part.part.size() as usize;
             let part_end = part_start + part_size;
             if part_start > end {
                 break;
             }
-            if part.record.size != 0 && part_end > start {
+            if part.part.size() != 0 && part_end > start {
                 let start_offset = start.saturating_sub(part_start);
                 let end_offset = (end + 1)
                     .saturating_sub(part_start)
-                    .min(part.record.size as usize);
+                    .min(part.part.size() as usize);
                 let layout = MultipartPartReadLayout {
-                    part_number: part.record.part_number,
+                    part_number: part.part.part_number(),
                     part_order,
                     object_offset_start: part_start,
                     object_offset_end_exclusive: part_end,
                     part_size,
-                    payload_crc64: part.record.payload_crc64,
+                    payload_crc64: part.part.payload_crc64(),
                 };
                 ranges.push(SnapshottedMultipartPartRange {
                     layout: layout.clone(),
@@ -768,7 +768,7 @@ pub(super) fn segment_payloads_from_object_segments(
 }
 
 pub(super) fn snapshotted_multipart_parts_from_storage(
-    parts: Vec<ObjectPartRecord>,
+    parts: Vec<ObjectReadMultipartPart>,
     multipart_part_segments: Vec<ObjectPayloadSegment>,
     encryption: &ObjectEncryption,
 ) -> Result<Vec<SnapshottedMultipartPart>, ServerError> {
@@ -790,9 +790,9 @@ pub(super) fn snapshotted_multipart_parts_from_storage(
     let mut snapshotted = Vec::with_capacity(parts.len());
     let mut object_offset_start = 0usize;
     for part in parts {
-        let part_size = part.size as usize;
+        let part_size = part.size() as usize;
         let segments = segments_by_part
-            .remove(&part.part_number)
+            .remove(&part.part_number())
             .unwrap_or_default()
             .into_iter()
             .map(|segment| SegmentPayloadRecord {
@@ -801,7 +801,7 @@ pub(super) fn snapshotted_multipart_parts_from_storage(
             })
             .collect();
         snapshotted.push(SnapshottedMultipartPart {
-            record: part,
+            part,
             object_offset_start,
             segments,
         });

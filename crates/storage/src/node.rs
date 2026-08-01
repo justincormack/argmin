@@ -68,9 +68,9 @@ use crate::types::{
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
     CreateStreamUploadReq, MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimRecord,
-    MultipartUploadRecord, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    PayloadReclaimRoot, PutLiveObjectReq, SessionId, StreamUploadRecord, StreamUploadSegmentRecord,
-    UploadId, UploadState,
+    MultipartUploadRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord, PayloadReclaimRoot,
+    PutLiveObjectReq, SessionId, StreamUploadRecord, StreamUploadSegmentRecord, UploadId,
+    UploadState,
 };
 #[cfg(test)]
 use crate::types::{StreamUploadState, StreamUploadTarget};
@@ -1138,24 +1138,42 @@ impl SharedStorageNode {
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-    ) -> Result<Vec<ObjectPartRecord>, ObjectPgActionError> {
+    ) -> Result<Vec<crate::TestObjectPartRecord>, ObjectPgActionError> {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
-        Ok(pg.get_object_parts(bucket, key, version_id)?)
+        Ok(pg
+            .get_object_parts(bucket, key, version_id)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_replace_object_parts(
+    pub fn test_corrupt_object_part_payload_crc64(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-        parts: &[ObjectPartRecord],
+        part_number: u32,
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
-        pg.delete_object_parts(bucket, key, version_id)?;
-        Ok(pg.commit_object_parts(parts)?)
+        pg.test_corrupt_object_part_payload_crc64(bucket, key, version_id, part_number)?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_remove_object_part(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        part_number: u32,
+    ) -> Result<(), ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        pg.test_remove_object_part(bucket, key, version_id, part_number)?;
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
