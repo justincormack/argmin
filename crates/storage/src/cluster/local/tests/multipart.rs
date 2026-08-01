@@ -2781,7 +2781,7 @@ fn multipart_abort_drains_pending_completion_before_aborting() {
     expected_segment.version_id = crate::VersionId::Null.to_u64();
     let outcome = crate::CompleteMultipartCommitOutcome {
         version_id: crate::VersionId::Null,
-        stale_payload: None,
+        stale_payload_generation_id: None,
         live_tags: req.tags.clone(),
         live_size: req.size,
         live_last_modified: last_modified_millis,
@@ -3690,7 +3690,7 @@ fn begin_upload_part_stream_drains_pending_completion_before_create() {
     expected_segment.version_id = crate::VersionId::Null.to_u64();
     let outcome = crate::CompleteMultipartCommitOutcome {
         version_id: crate::VersionId::Null,
-        stale_payload: None,
+        stale_payload_generation_id: None,
         live_tags: req.tags.clone(),
         live_size: req.size,
         live_last_modified: last_modified_millis,

@@ -1198,6 +1198,22 @@ the admitted multipart route's raw management lookup is removed while its active
 test-only. Remaining public physical multipart record representations still require the wider
 implementation-order item 3 audit, so that item is not yet complete.
 
+The twenty-first bounded slice continues implementation-order item 3 by containing the
+CompleteMultipartUpload publication result. The former public stale-payload enum exposed standard
+object segments, multipart part records, streaming segment records, and their physical layout even
+though the coordinator consumed only the replaced generation ID. That enum and its always-empty
+physical vectors are removed. The public outcome retains its storage representation privately and
+exposes only the completed version, optional stale generation, logical decoded tags, live size,
+and modification time required for the S3 response, lifecycle evaluation, and reclaim enqueue.
+Its `Debug` implementation renders only that logical projection. Existing reclaim commands,
+metadata commands, database rows, node-client paths, and storage RPC formats remain unchanged and
+continue to distinguish standard and multipart physical cleanup internally. Compiler visibility
+is the primary boundary, with checks rejecting the former physical result type, public result
+fields, or new public outcome methods outside the bounded logical projection. Production
+multipart completion no longer exports a physical record representation; test-only multipart
+fixtures and the public root exports that support them remain for the wider implementation-order
+item 3 relocation audit, so that item is not yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

@@ -5569,7 +5569,7 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
     expected_segment.version_id = crate::VersionId::Null.to_u64();
     let outcome = crate::CompleteMultipartCommitOutcome {
         version_id: crate::VersionId::Null,
-        stale_payload: None,
+        stale_payload_generation_id: None,
         live_tags: req.tags.clone(),
         live_size: req.size,
         live_last_modified: 987_655,

@@ -41,7 +41,6 @@ use super::authz_results::{
     AuthorizedCreateMultipartUpload, AuthorizedListMultipartUploads, AuthorizedListParts,
 };
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
-use super::object_state::StaleObjectPayload;
 use super::request_types::{
     AppendStreamPartRequest, BeginStreamPartRequest, CompleteMultipartUploadRequest, CompletePart,
     CreateMultipartUploadRequest, FinalizeStreamPartRequest, ListMultipartUploadsRequest,
@@ -1049,13 +1048,10 @@ impl Coordinator {
                 }
                 Err(error) => return Err(Coordinator::map_object_pg_action_error(error)),
             };
-            let version_id = completion_outcome.version_id;
-            let stale_payload = completion_outcome
-                .stale_payload
-                .map(StaleObjectPayload::from);
-            let lifecycle_tags = completion_outcome.live_tags;
-            let lifecycle_size = completion_outcome.live_size;
-            let lifecycle_last_modified = completion_outcome.live_last_modified;
+            let version_id = completion_outcome.version_id();
+            let stale_payload_generation_id = completion_outcome.stale_payload_generation_id();
+            let lifecycle_size = completion_outcome.live_size();
+            let lifecycle_last_modified = completion_outcome.live_last_modified();
 
             #[cfg(test)]
             maybe_run_multipart_complete_commit_hook(bucket.as_str(), key.as_str());
@@ -1063,12 +1059,12 @@ impl Coordinator {
             let lifecycle_expiration = Self::current_object_write_lifecycle_expiration_for_config(
                 lifecycle.as_deref(),
                 key.as_str(),
-                lifecycle_tags.as_deref(),
+                completion_outcome.live_tags(),
                 lifecycle_size,
                 lifecycle_last_modified,
             )?;
-            if let Some(ref payload) = stale_payload {
-                multipart_route.enqueue_object_payload_reclaim(payload.generation_id);
+            if let Some(generation_id) = stale_payload_generation_id {
+                multipart_route.enqueue_object_payload_reclaim(generation_id);
             }
 
             return Ok(CompleteMultipartUploadResult {

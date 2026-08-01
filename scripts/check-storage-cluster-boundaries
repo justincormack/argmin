@@ -2809,6 +2809,55 @@ fail_with_matches \
     "Multipart completion commit defaults must be retained by storage rather than reconstructed by the coordinator" \
     "$multipart_completion_caller_supplied_durable_defaults"
 
+multipart_completion_outcome_physical_surfaces=$(
+    {
+        rg -n --color=never \
+            '\bCompletedMultipartStalePayload\b' \
+            crates \
+            -g '*.rs' \
+            || true
+        awk '
+        /pub struct CompleteMultipartCommitOutcome/ {
+            if ($0 !~ /\{/) {
+                print FILENAME ":" FNR ":" $0
+            } else {
+                in_outcome = 1
+            }
+            next
+        }
+        in_outcome && /^[[:space:]]*pub[[:space:]]+[^:]+[[:space:]]*:/ {
+            print FILENAME ":" FNR ":" $0
+        }
+        in_outcome && /^[[:space:]]*}/ {
+            in_outcome = 0
+        }
+        /impl CompleteMultipartCommitOutcome[[:space:]]*\{/ {
+            in_outcome_impl = 1
+            depth = 0
+        }
+        in_outcome_impl {
+            if ($0 ~ /^[[:space:]]*pub[[:space:]]+([^[:space:]]+[[:space:]]+)*fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/) {
+                method = $0
+                sub(/^.*fn[[:space:]]+/, "", method)
+                sub(/\(.*/, "", method)
+                if (method != "version_id" && method != "stale_payload_generation_id" && method != "live_tags" && method != "live_size" && method != "live_last_modified") {
+                    print FILENAME ":" FNR ":" $0
+                }
+            }
+            line = $0
+            depth += gsub(/\{/, "{", line)
+            depth -= gsub(/\}/, "}", line)
+            if (depth == 0 && $0 ~ /\}/) {
+                in_outcome_impl = 0
+            }
+        }
+        ' crates/storage/src/types.rs
+    }
+)
+fail_with_matches \
+    "CompleteMultipartUpload outcomes must expose only logical version, stale-generation, decoded-tag, size, and modification-time state" \
+    "$multipart_completion_outcome_physical_surfaces"
+
 multipart_management_opaque_capability_leaks=$(
     {
         rg -n --color=never \

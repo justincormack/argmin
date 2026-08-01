@@ -5803,19 +5803,6 @@ pub struct MultipartCompletionReplay {
 }
 
 #[derive(Debug, Clone)]
-pub enum CompletedMultipartStalePayload {
-    Segments {
-        generation_id: GenerationId,
-        segments: Vec<ObjectSegmentRecord>,
-    },
-    Multipart {
-        generation_id: GenerationId,
-        parts: Vec<ObjectPartRecord>,
-        streaming_segments: Vec<MultipartPartSegmentRecord>,
-    },
-}
-
-#[derive(Debug, Clone)]
 pub struct CompleteMultipartCommitInput {
     pub completion_fingerprint: MultipartCompletionFingerprint,
     pub versioning: BucketVersioningState,
@@ -5874,13 +5861,57 @@ pub struct CompleteMultipartCommitCleanup {
     pub stream_upload_segments: Vec<StreamUploadSegmentRecord>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CompleteMultipartCommitOutcome {
-    pub version_id: VersionId,
-    pub stale_payload: Option<CompletedMultipartStalePayload>,
-    pub live_tags: Option<SerializedTagSet>,
-    pub live_size: u64,
-    pub live_last_modified: u64,
+    pub(crate) version_id: VersionId,
+    pub(crate) stale_payload_generation_id: Option<GenerationId>,
+    pub(crate) live_tags: Option<SerializedTagSet>,
+    pub(crate) live_size: u64,
+    pub(crate) live_last_modified: u64,
+}
+
+impl CompleteMultipartCommitOutcome {
+    #[must_use]
+    pub fn version_id(&self) -> VersionId {
+        self.version_id
+    }
+
+    #[must_use]
+    pub fn stale_payload_generation_id(&self) -> Option<GenerationId> {
+        self.stale_payload_generation_id
+    }
+
+    #[must_use]
+    pub fn live_tags(&self) -> Option<&s3_types::TagSet> {
+        self.live_tags.as_deref()
+    }
+
+    #[must_use]
+    pub fn live_size(&self) -> u64 {
+        self.live_size
+    }
+
+    #[must_use]
+    pub fn live_last_modified(&self) -> u64 {
+        self.live_last_modified
+    }
+}
+
+impl std::fmt::Debug for CompleteMultipartCommitOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let live_tag_count = self.live_tags.as_ref().map(|tags| tags.len());
+        formatter
+            .debug_struct("CompleteMultipartCommitOutcome")
+            .field("version_id", &self.version_id)
+            .field(
+                "stale_payload_generation_id",
+                &self.stale_payload_generation_id(),
+            )
+            .field("live_tag_count", &live_tag_count)
+            .field("live_size", &self.live_size)
+            .field("live_last_modified", &self.live_last_modified)
+            .finish()
+    }
 }
 
 /// Committed part record in the object manifest.
@@ -6806,6 +6837,43 @@ mod tests {
             ),
             MultipartUploadCompletionLookup::Unavailable
         ));
+    }
+
+    #[test]
+    fn multipart_completion_outcome_exposes_only_logical_publication_state() {
+        let live_tags = s3_types::TagSet::from_pairs(
+            vec![(
+                "customer-secret-key".to_string(),
+                "customer-secret-value".to_string(),
+            )],
+            s3_types::MAX_OBJECT_TAGS,
+        )
+        .unwrap();
+        let outcome = CompleteMultipartCommitOutcome {
+            version_id: VersionId::from_u64(29),
+            stale_payload_generation_id: Some(GenerationId::new(31).unwrap()),
+            live_tags: Some(SerializedTagSet::from_tag_set(live_tags).unwrap()),
+            live_size: 37,
+            live_last_modified: 41,
+        };
+
+        assert_eq!(outcome.version_id(), VersionId::from_u64(29));
+        assert_eq!(
+            outcome.stale_payload_generation_id(),
+            Some(GenerationId::new(31).unwrap())
+        );
+        assert!(outcome.live_tags().is_some());
+        assert_eq!(outcome.live_size(), 37);
+        assert_eq!(outcome.live_last_modified(), 41);
+
+        let debug = format!("{outcome:?}");
+        assert!(debug.contains("stale_payload_generation_id"));
+        assert!(debug.contains("live_tag_count: Some(1)"));
+        assert!(!debug.contains("customer-secret-key"));
+        assert!(!debug.contains("customer-secret-value"));
+        assert!(!debug.contains("segments"));
+        assert!(!debug.contains("parts"));
+        assert!(!debug.contains("streaming_segments"));
     }
 
     #[test]

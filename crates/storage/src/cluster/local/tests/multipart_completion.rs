@@ -1094,12 +1094,9 @@ fn multipart_completion_over_standard_object_reopens_with_valid_digest() {
     let outcome = cluster
         .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap();
-    assert!(
-        matches!(
-            outcome.stale_payload,
-            Some(crate::CompletedMultipartStalePayload::Segments { generation_id, .. })
-                if generation_id == old.generation_id
-        ),
+    assert_eq!(
+        outcome.stale_payload_generation_id(),
+        Some(old.generation_id),
         "multipart overwrite should record stale standard payload"
     );
     assert_streamed_multipart_completion_on_acting_nodes_with_write_sequence(
@@ -2521,7 +2518,7 @@ fn multipart_completion_partial_apply_reopens_and_converges() {
     let live = stored.as_live().unwrap();
     let outcome = crate::CompleteMultipartCommitOutcome {
         version_id: live.version_id,
-        stale_payload: None,
+        stale_payload_generation_id: None,
         live_tags: live.tags.clone(),
         live_size: live.size,
         live_last_modified: live.last_modified,
@@ -2670,12 +2667,9 @@ fn multipart_completion_command_id_race_drains_winner_and_resnapshots_stale_payl
 
     assert!(slot_installed.load(Ordering::SeqCst));
     assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
-    assert!(
-        matches!(
-            outcome.stale_payload,
-            Some(crate::CompletedMultipartStalePayload::Segments { generation_id, .. })
-                if generation_id == winner_generation_id
-        ),
+    assert_eq!(
+        outcome.stale_payload_generation_id(),
+        Some(winner_generation_id),
         "completion must resnapshot stale payload after draining the winning object command"
     );
     assert_streamed_multipart_completion_on_acting_nodes_with_write_sequence(
@@ -2884,7 +2878,7 @@ fn multipart_completion_drains_matching_pending_completion() {
     assert_eq!(outcome.live_tags, req.tags);
     assert_eq!(outcome.live_size, req.size);
     assert_eq!(outcome.live_last_modified, last_modified_millis);
-    assert!(outcome.stale_payload.is_none());
+    assert!(outcome.stale_payload_generation_id().is_none());
     expected_segment.version_id = crate::VersionId::Null.to_u64();
     assert_streamed_multipart_completion_on_acting_nodes_with_write_sequence(
         &map,
@@ -2983,7 +2977,7 @@ fn multipart_completion_pending_install_conflict_with_matching_completion_return
     assert_eq!(outcome.live_tags, req.tags);
     assert_eq!(outcome.live_size, req.size);
     assert_eq!(outcome.live_last_modified, last_modified_millis);
-    assert!(outcome.stale_payload.is_none());
+    assert!(outcome.stale_payload_generation_id().is_none());
     expected_segment.version_id = crate::VersionId::Null.to_u64();
     assert_streamed_multipart_completion_on_acting_nodes_with_write_sequence(
         &map,
@@ -3051,14 +3045,11 @@ fn multipart_completion_drains_other_upload_same_key_and_resnapshots_stale_paylo
         .unwrap();
 
     assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
-    assert!(
-        matches!(
-            second_outcome.stale_payload,
-            Some(crate::CompletedMultipartStalePayload::Multipart { generation_id, .. })
-                if generation_id == first_req.generation_id
-        ),
+    assert_eq!(
+        second_outcome.stale_payload_generation_id(),
+        Some(first_req.generation_id),
         "second completion should reclaim the first completed upload payload, got {:?}",
-        second_outcome.stale_payload
+        second_outcome.stale_payload_generation_id()
     );
     second_segment.version_id = crate::VersionId::Null.to_u64();
     for node_id in node_ids {

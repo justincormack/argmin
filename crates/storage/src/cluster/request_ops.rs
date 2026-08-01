@@ -14121,33 +14121,12 @@ impl super::StorageCluster {
     ) -> CompleteMultipartCommitOutcome {
         CompleteMultipartCommitOutcome {
             version_id: command.object.version_id,
-            stale_payload: command
-                .stale_payload
-                .as_ref()
-                .map(Self::completed_multipart_stale_payload_from_reclaim_command),
+            stale_payload_generation_id: super::object_payload_reclaim_generation(
+                &command.stale_payload,
+            ),
             live_tags: command.object.tags.clone(),
             live_size: command.object.size,
             live_last_modified: command.last_modified_millis,
-        }
-    }
-
-    fn completed_multipart_stale_payload_from_reclaim_command(
-        command: &ObjectPayloadReclaimCommand,
-    ) -> CompletedMultipartStalePayload {
-        match command {
-            ObjectPayloadReclaimCommand::Segments(reclaim) => {
-                CompletedMultipartStalePayload::Segments {
-                    generation_id: reclaim.generation_id,
-                    segments: Vec::new(),
-                }
-            }
-            ObjectPayloadReclaimCommand::Multipart(reclaim) => {
-                CompletedMultipartStalePayload::Multipart {
-                    generation_id: reclaim.generation_id,
-                    parts: Vec::new(),
-                    streaming_segments: Vec::new(),
-                }
-            }
         }
     }
 

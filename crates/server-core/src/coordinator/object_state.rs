@@ -4,8 +4,7 @@ use s3_types::VersionId;
 #[cfg(test)]
 use storage::{BucketName, ObjectKey, StoredObject};
 use storage::{
-    GenerationId, ObjectEncryption, ObjectPartRecord, SerializedMetadataBlob,
-    SerializedSystemMetadataBlob,
+    ObjectEncryption, ObjectPartRecord, SerializedMetadataBlob, SerializedSystemMetadataBlob,
 };
 
 use super::{ActiveWriteEncryption, Coordinator, SegmentPayloadRecord};
@@ -21,22 +20,6 @@ pub(super) struct SnapshottedMultipartPart {
     pub(super) record: ObjectPartRecord,
     pub(super) object_offset_start: usize,
     pub(super) segments: Vec<SegmentPayloadRecord>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct StaleObjectPayload {
-    pub(super) generation_id: GenerationId,
-}
-
-impl From<storage::CompletedMultipartStalePayload> for StaleObjectPayload {
-    fn from(value: storage::CompletedMultipartStalePayload) -> Self {
-        match value {
-            storage::CompletedMultipartStalePayload::Segments { generation_id, .. }
-            | storage::CompletedMultipartStalePayload::Multipart { generation_id, .. } => {
-                Self { generation_id }
-            }
-        }
-    }
 }
 
 impl Coordinator {
