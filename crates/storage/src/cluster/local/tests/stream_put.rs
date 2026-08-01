@@ -1977,7 +1977,9 @@ fn bucket_delete_stream_cleanup_rejects_wrong_pg_stream_row() {
     assert!(
         matches!(
             err,
-            crate::BucketWriteDrainError::Store(StoreError::Io { .. })
+            crate::BucketWriteDrainError::Store(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "list bucket stream uploads",
+            })
         ),
         "wrong-PG stream row should fail closed, got {err:?}"
     );

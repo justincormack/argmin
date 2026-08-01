@@ -217,6 +217,12 @@ struct LocalObjectListingMetadataRoute {
     pg_id: ObjectMetadataScanPgId,
 }
 
+struct LocalObjectMutationScanMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    _route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataScanPgId,
+}
+
 impl ObjectPayloadLeaseNodeLease for LocalObjectPayloadLease {
     fn release(&mut self) -> Result<usize, StoreError> {
         if self.released {
@@ -3303,6 +3309,16 @@ impl MultipartAbortMutationMetadataRoute for LocalMultipartAbortMutationMetadata
 }
 
 impl ObjectPayloadReclaimMetadataRoute for LocalObjectPayloadReclaimMetadataRoute<'_> {
+    fn exists(&self) -> Result<bool, ObjectPgActionError> {
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        Ok(PgMetadataStore::payload_reclaim_exists(
+            &*pg,
+            &self.bucket,
+            &self.key,
+            self.generation_id,
+        )?)
+    }
+
     fn load_payload(&self) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError> {
         let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         if let Some(reclaim) =
@@ -3711,55 +3727,17 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         }))
     }
 
-    fn list_stream_uploads_for_bucket_page(
+    fn open_object_mutation_scan_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataScanPgId,
-        bucket: &BucketName,
-        session_id_marker: Option<&SessionId>,
-        limit: u32,
-    ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
-        Self::list_stream_uploads_for_bucket_page(self, pg_id, bucket, session_id_marker, limit)
-    }
-
-    fn list_all_stream_uploads_page(
-        &self,
-        pg_id: ObjectMetadataScanPgId,
-        session_id_marker: Option<&SessionId>,
-        limit: u32,
-    ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
-        Self::list_all_stream_uploads_page(self, pg_id, session_id_marker, limit)
-    }
-
-    fn payload_reclaim_exists(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<bool, ObjectPgActionError> {
-        Self::payload_reclaim_exists(self, pg_id, bucket, key, generation_id)
-    }
-
-    fn get_bucket_payload_reclaim_root(
-        &self,
-        pg_id: ObjectMetadataScanPgId,
-        bucket: &BucketName,
-    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
-        Self::get_bucket_payload_reclaim_root(self, pg_id, bucket)
-    }
-
-    fn get_payload_reclaim_root(
-        &self,
-        pg_id: ObjectMetadataScanPgId,
-    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
-        Self::get_payload_reclaim_root(self, pg_id)
-    }
-
-    fn object_payload_reclaim_claim(
-        &self,
-        pg_id: ObjectMetadataScanPgId,
-    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
-        Self::object_payload_reclaim_claim(self, pg_id)
+    ) -> Result<Box<dyn ObjectMutationScanMetadataRoute + '_>, ObjectPgActionError> {
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalObjectMutationScanMetadataRoute {
+            client: self,
+            _route_cluster_epoch: route_cluster_epoch,
+            pg_id,
+        }))
     }
 }
 
@@ -3918,6 +3896,123 @@ impl LocalObjectListingMetadataRoute {
             return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
         }
         Ok(())
+    }
+}
+
+impl LocalObjectMutationScanMetadataRoute<'_> {
+    fn require_subject(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        operation: &'static str,
+    ) -> Result<(), StoreError> {
+        if self
+            .client
+            .storage_node
+            .object_metadata_pg_for(bucket, key)
+            .pg_id()
+            != self.pg_id.pg_id()
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation });
+        }
+        Ok(())
+    }
+
+    fn validate_stream_page(
+        &self,
+        page: &StreamUploadRecordPage,
+        expected_bucket: Option<&BucketName>,
+        operation: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        for upload in &page.uploads {
+            if expected_bucket.is_some_and(|bucket| bucket != &upload.bucket) {
+                return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+            }
+            self.require_subject(&upload.bucket, &upload.key, operation)?;
+        }
+        Ok(())
+    }
+
+    fn validate_root(
+        &self,
+        root: &PayloadReclaimRoot,
+        expected_bucket: Option<&BucketName>,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if expected_bucket.is_some_and(|bucket| bucket != &root.bucket) {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        self.require_subject(&root.bucket, &root.key, operation)?;
+        Ok(())
+    }
+}
+
+impl ObjectMutationScanMetadataRoute for LocalObjectMutationScanMetadataRoute<'_> {
+    fn list_stream_uploads_for_bucket_page(
+        &self,
+        bucket: &BucketName,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
+        let page = self.client.list_stream_uploads_for_bucket_page(
+            self.pg_id,
+            bucket,
+            session_id_marker,
+            limit,
+        )?;
+        self.validate_stream_page(&page, Some(bucket), "list bucket stream uploads")?;
+        Ok(page)
+    }
+
+    fn list_all_stream_uploads_page(
+        &self,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
+        let page =
+            self.client
+                .list_all_stream_uploads_page(self.pg_id, session_id_marker, limit)?;
+        self.validate_stream_page(&page, None, "list PG stream uploads")?;
+        Ok(page)
+    }
+
+    fn get_bucket_payload_reclaim_root(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
+        let root = self
+            .client
+            .get_bucket_payload_reclaim_root(self.pg_id, bucket)?;
+        if let Some(root) = &root {
+            self.validate_root(root, Some(bucket), "get bucket payload reclaim root")?;
+        }
+        Ok(root)
+    }
+
+    fn get_payload_reclaim_root(
+        &self,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
+        let root = self.client.get_payload_reclaim_root(self.pg_id)?;
+        if let Some(root) = &root {
+            self.validate_root(root, None, "get PG payload reclaim root")?;
+        }
+        Ok(root)
+    }
+
+    fn object_payload_reclaim_claim(
+        &self,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
+        let claim = self.client.object_payload_reclaim_claim(self.pg_id)?;
+        if let Some(claim) = &claim {
+            if claim.pg_id != self.pg_id.get() {
+                return Err(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "get PG payload reclaim claim",
+                }
+                .into());
+            }
+            self.require_subject(&claim.bucket, &claim.key, "get PG payload reclaim claim")?;
+        }
+        Ok(claim)
     }
 }
 
@@ -4091,22 +4186,6 @@ impl LocalStorageNodeClient {
             return Ok(MultipartUploadManagementLookup::Replay(Box::new(completed)));
         }
         Ok(MultipartUploadManagementLookup::Missing)
-    }
-
-    fn payload_reclaim_exists(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<bool, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::payload_reclaim_exists(
-            &*pg,
-            bucket,
-            key,
-            generation_id,
-        )?)
     }
 
     fn load_stream_upload_session(

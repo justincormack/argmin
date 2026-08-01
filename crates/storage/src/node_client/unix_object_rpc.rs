@@ -8,6 +8,7 @@ use crate::metadata_command::{
     UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
     UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
 };
+use crate::storage_rpc::StorageRpcStreamUploadsListResponse;
 
 struct UnixObjectReadMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
@@ -101,6 +102,13 @@ struct UnixObjectPayloadReclaimMetadataRoute<'a> {
     bucket: BucketName,
     key: ObjectKey,
     generation_id: GenerationId,
+}
+
+struct UnixObjectMutationScanMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataScanPgId,
+    pg_topology: Arc<PgTopology>,
 }
 
 struct UnixStreamUploadCreationMetadataRoute<'a> {
@@ -3230,6 +3238,28 @@ impl MultipartAbortMutationMetadataRoute for UnixMultipartAbortMutationMetadataR
 }
 
 impl ObjectPayloadReclaimMetadataRoute for UnixObjectPayloadReclaimMetadataRoute<'_> {
+    fn exists(&self) -> Result<bool, ObjectPgActionError> {
+        let request = StorageRpcObjectPayloadReclaimExistsRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            generation_id: self.generation_id,
+        };
+        let payload = encode_object_payload_reclaim_exists_request(&request);
+        let response = self
+            .client
+            .rpc_request(StorageRpcMessageKind::ObjectPayloadReclaimExists, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        decode_metadata_command_bool_response(&response)
+            .map(|response| response.value)
+            .map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode object payload reclaim exists response",
+                    error.to_string(),
+                ))
+            })
+    }
+
     fn load_payload(&self) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError> {
         let request = StorageRpcObjectPayloadReclaimExistsRequest {
             object: self
@@ -4605,253 +4635,31 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         }))
     }
 
-    fn list_stream_uploads_for_bucket_page(
+    fn open_object_mutation_scan_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataScanPgId,
-        bucket: &BucketName,
-        session_id_marker: Option<&SessionId>,
-        limit: u32,
-    ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
-        let request = StorageRpcStreamUploadsListRequest {
-            bucket: StorageRpcBucketRequest {
-                node_id: self.node_id,
-                cluster_epoch: self.cluster_epoch,
-                pg_id: pg_id.pg_id(),
-                bucket: bucket.clone(),
-            },
-            session_id_marker: session_id_marker.cloned(),
-            limit,
-        };
-        let payload = encode_stream_uploads_list_request(&request).map_err(|error| {
-            ObjectPgActionError::Store(
-                self.rpc_payload_error("encode stream uploads list request", error.to_string()),
-            )
-        })?;
-        let response = self
-            .rpc_request_with_admission_class(
-                StorageRpcMessageKind::ObjectStreamUploadsList,
-                payload,
-                listing_probe_admission_class(limit),
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response = decode_stream_uploads_list_response(&response).map_err(|error| {
-            ObjectPgActionError::Store(
-                self.rpc_payload_error("decode stream uploads list response", error.to_string()),
-            )
-        })?;
-        if response.uploads.len() > limit as usize {
-            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                "validate stream uploads list response",
-                "response exceeded requested page limit".to_string(),
-            )));
-        }
-        for upload in &response.uploads {
-            if &upload.bucket != bucket {
-                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                    "validate stream uploads list response",
-                    "upload bucket does not match request".to_string(),
-                )));
+    ) -> Result<Box<dyn ObjectMutationScanMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
             }
-            if session_id_marker.is_some_and(|marker| upload.session_id.as_str() <= marker.as_str())
-            {
-                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                    "validate stream uploads list response",
-                    "upload is not after requested marker".to_string(),
-                )));
-            }
+            .into());
         }
-        if response
-            .uploads
-            .windows(2)
-            .any(|pair| pair[0].session_id.as_str() >= pair[1].session_id.as_str())
-        {
-            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                "validate stream uploads list response",
-                "uploads are not strictly ordered by session id".to_string(),
-            )));
-        }
-        if response.next_session_id_marker.as_ref()
-            != response.uploads.last().map(|upload| &upload.session_id)
-            && response.next_session_id_marker.is_some()
-        {
-            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                "validate stream uploads list response",
-                "next marker does not match the last returned upload".to_string(),
-            )));
-        }
-        Ok(StreamUploadRecordPage {
-            uploads: response.uploads,
-            next_session_id_marker: response.next_session_id_marker,
-        })
-    }
-
-    fn list_all_stream_uploads_page(
-        &self,
-        pg_id: ObjectMetadataScanPgId,
-        session_id_marker: Option<&SessionId>,
-        limit: u32,
-    ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
-        let request = StorageRpcStreamUploadsPgListRequest {
-            node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
-            pg_id: pg_id.pg_id(),
-            session_id_marker: session_id_marker.cloned(),
-            limit,
-        };
-        let payload = encode_stream_uploads_pg_list_request(&request).map_err(|error| {
-            ObjectPgActionError::Store(
-                self.rpc_payload_error("encode stream uploads PG list request", error.to_string()),
-            )
-        })?;
-        let response = self
-            .rpc_request(StorageRpcMessageKind::ObjectStreamUploadsPgList, payload)
-            .map_err(ObjectPgActionError::Store)?;
-        let response = decode_stream_uploads_list_response(&response).map_err(|error| {
-            ObjectPgActionError::Store(
-                self.rpc_payload_error("decode stream uploads PG list response", error.to_string()),
-            )
-        })?;
-        if response.uploads.len() > limit as usize {
-            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                "validate stream uploads PG list response",
-                "response exceeded requested page limit".to_string(),
-            )));
-        }
-        if response
-            .uploads
-            .windows(2)
-            .any(|pair| pair[0].session_id.as_str() >= pair[1].session_id.as_str())
-        {
-            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                "validate stream uploads PG list response",
-                "uploads are not strictly ordered by session id".to_string(),
-            )));
-        }
-        if session_id_marker.is_some()
-            && response.uploads.iter().any(|upload| {
-                session_id_marker
-                    .is_some_and(|marker| upload.session_id.as_str() <= marker.as_str())
-            })
-        {
-            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                "validate stream uploads PG list response",
-                "upload is not after requested marker".to_string(),
-            )));
-        }
-        if response.next_session_id_marker.as_ref()
-            != response.uploads.last().map(|upload| &upload.session_id)
-            && response.next_session_id_marker.is_some()
-        {
-            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                "validate stream uploads PG list response",
-                "next marker does not match the last returned upload".to_string(),
-            )));
-        }
-        Ok(StreamUploadRecordPage {
-            uploads: response.uploads,
-            next_session_id_marker: response.next_session_id_marker,
-        })
-    }
-
-    fn payload_reclaim_exists(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<bool, ObjectPgActionError> {
-        let pg_id = pg_id.pg_id();
-        let request = StorageRpcObjectPayloadReclaimExistsRequest {
-            object: self.object_request(pg_id, bucket, key),
-            generation_id,
-        };
-        let payload = encode_object_payload_reclaim_exists_request(&request);
-        let response = self
-            .rpc_request(StorageRpcMessageKind::ObjectPayloadReclaimExists, payload)
-            .map_err(ObjectPgActionError::Store)?;
-        let response = decode_metadata_command_bool_response(&response).map_err(|error| {
+        let pg_topology = self.object_listing_topology.as_ref().ok_or_else(|| {
             ObjectPgActionError::Store(self.rpc_payload_error(
-                "decode object payload reclaim exists response",
-                error.to_string(),
+                "open object mutation scan metadata route",
+                "object mutation scan client has no installed PG topology".to_string(),
             ))
         })?;
-        Ok(response.value)
-    }
-
-    fn get_bucket_payload_reclaim_root(
-        &self,
-        pg_id: ObjectMetadataScanPgId,
-        bucket: &BucketName,
-    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
-        let pg_id = pg_id.pg_id();
-        let request = StorageRpcBucketRequest {
-            node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
+        Ok(Box::new(UnixObjectMutationScanMetadataRoute {
+            client: self,
+            route_cluster_epoch,
             pg_id,
-            bucket: bucket.clone(),
-        };
-        let payload = encode_bucket_request(&request);
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectBucketPayloadReclaimRoot,
-                payload,
-            )
-            .map_err(BucketSnapshotLoadError::Store)?;
-        let response = decode_payload_reclaim_root_response(&response).map_err(|error| {
-            BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                "decode object bucket payload reclaim root response",
-                error.to_string(),
-            ))
-        })?;
-        self.validate_bucket_payload_reclaim_root_response(&response, bucket)?;
-        Ok(response.root)
-    }
-
-    fn get_payload_reclaim_root(
-        &self,
-        pg_id: ObjectMetadataScanPgId,
-    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
-        let pg_id = pg_id.pg_id();
-        let payload = self.encode_metadata_command_state_request(pg_id);
-        let response = self
-            .rpc_request(StorageRpcMessageKind::ObjectPayloadReclaimRoot, payload)
-            .map_err(BucketSnapshotLoadError::Store)?;
-        let response = decode_payload_reclaim_root_response(&response).map_err(|error| {
-            BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                "decode object payload reclaim root response",
-                error.to_string(),
-            ))
-        })?;
-        Ok(response.root)
-    }
-
-    fn object_payload_reclaim_claim(
-        &self,
-        pg_id: ObjectMetadataScanPgId,
-    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
-        let pg_id = pg_id.pg_id();
-        let payload = self.encode_metadata_command_state_request(pg_id);
-        let response = self
-            .rpc_request(StorageRpcMessageKind::ObjectPayloadReclaimClaimGet, payload)
-            .map_err(BucketSnapshotLoadError::Store)?;
-        let response = decode_object_payload_reclaim_claim_optional_record_response(&response)
-            .map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "decode object payload reclaim claim get response",
-                    error.to_string(),
-                ))
-            })?;
-        if response
-            .record
-            .as_ref()
-            .is_some_and(|record| record.pg_id != pg_id.get())
-        {
-            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                "validate object payload reclaim claim get response",
-                "claim response PG does not match request".to_string(),
-            )));
-        }
-        Ok(response.record)
+            pg_topology: Arc::clone(pg_topology),
+        }))
     }
 
     fn open_object_delete_metadata_route(
@@ -4876,6 +4684,270 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             bucket: bucket.clone(),
             key: key.clone(),
         }))
+    }
+}
+
+impl UnixObjectMutationScanMetadataRoute<'_> {
+    fn require_subject(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        operation: &'static str,
+    ) -> Result<(), StoreError> {
+        if self.pg_topology.object_pg_for(bucket, key) != self.pg_id.get() {
+            return Err(self.client.rpc_payload_error(
+                operation,
+                "response subject does not belong to the scoped object scan PG".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_stream_page(
+        &self,
+        response: &StorageRpcStreamUploadsListResponse,
+        expected_bucket: Option<&BucketName>,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+        operation: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        if response.uploads.len() > limit as usize {
+            return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                operation,
+                "response exceeded requested page limit".to_string(),
+            )));
+        }
+        for upload in &response.uploads {
+            if expected_bucket.is_some_and(|bucket| bucket != &upload.bucket) {
+                return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    operation,
+                    "upload bucket does not match request".to_string(),
+                )));
+            }
+            self.require_subject(&upload.bucket, &upload.key, operation)?;
+            if session_id_marker.is_some_and(|marker| upload.session_id.as_str() <= marker.as_str())
+            {
+                return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    operation,
+                    "upload is not after requested marker".to_string(),
+                )));
+            }
+        }
+        if response
+            .uploads
+            .windows(2)
+            .any(|pair| pair[0].session_id.as_str() >= pair[1].session_id.as_str())
+        {
+            return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                operation,
+                "uploads are not strictly ordered by session id".to_string(),
+            )));
+        }
+        if response.next_session_id_marker.as_ref()
+            != response.uploads.last().map(|upload| &upload.session_id)
+            && response.next_session_id_marker.is_some()
+        {
+            return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                operation,
+                "next marker does not match the last returned upload".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_root(
+        &self,
+        root: &PayloadReclaimRoot,
+        expected_bucket: Option<&BucketName>,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if expected_bucket.is_some_and(|bucket| bucket != &root.bucket) {
+            return Err(BucketSnapshotLoadError::Store(
+                self.client
+                    .rpc_payload_error(operation, "root bucket does not match request".to_string()),
+            ));
+        }
+        self.require_subject(&root.bucket, &root.key, operation)?;
+        Ok(())
+    }
+}
+
+impl ObjectMutationScanMetadataRoute for UnixObjectMutationScanMetadataRoute<'_> {
+    fn list_stream_uploads_for_bucket_page(
+        &self,
+        bucket: &BucketName,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
+        let request = StorageRpcStreamUploadsListRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: self.client.node_id,
+                cluster_epoch: self.route_cluster_epoch,
+                pg_id: self.pg_id.pg_id(),
+                bucket: bucket.clone(),
+            },
+            session_id_marker: session_id_marker.cloned(),
+            limit,
+        };
+        let payload = encode_stream_uploads_list_request(&request).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.client
+                    .rpc_payload_error("encode stream uploads list request", error.to_string()),
+            )
+        })?;
+        let response = self
+            .client
+            .rpc_request_with_admission_class(
+                StorageRpcMessageKind::ObjectStreamUploadsList,
+                payload,
+                listing_probe_admission_class(limit),
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_stream_uploads_list_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.client
+                    .rpc_payload_error("decode stream uploads list response", error.to_string()),
+            )
+        })?;
+        self.validate_stream_page(
+            &response,
+            Some(bucket),
+            session_id_marker,
+            limit,
+            "validate stream uploads list response",
+        )?;
+        Ok(StreamUploadRecordPage {
+            uploads: response.uploads,
+            next_session_id_marker: response.next_session_id_marker,
+        })
+    }
+
+    fn list_all_stream_uploads_page(
+        &self,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
+        let request = StorageRpcStreamUploadsPgListRequest {
+            node_id: self.client.node_id,
+            cluster_epoch: self.route_cluster_epoch,
+            pg_id: self.pg_id.pg_id(),
+            session_id_marker: session_id_marker.cloned(),
+            limit,
+        };
+        let payload = encode_stream_uploads_pg_list_request(&request).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.client
+                    .rpc_payload_error("encode stream uploads PG list request", error.to_string()),
+            )
+        })?;
+        let response = self
+            .client
+            .rpc_request(StorageRpcMessageKind::ObjectStreamUploadsPgList, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_stream_uploads_list_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.client
+                    .rpc_payload_error("decode stream uploads PG list response", error.to_string()),
+            )
+        })?;
+        self.validate_stream_page(
+            &response,
+            None,
+            session_id_marker,
+            limit,
+            "validate stream uploads PG list response",
+        )?;
+        Ok(StreamUploadRecordPage {
+            uploads: response.uploads,
+            next_session_id_marker: response.next_session_id_marker,
+        })
+    }
+
+    fn get_bucket_payload_reclaim_root(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketRequest {
+            node_id: self.client.node_id,
+            cluster_epoch: self.route_cluster_epoch,
+            pg_id: self.pg_id.pg_id(),
+            bucket: bucket.clone(),
+        };
+        let payload = encode_bucket_request(&request);
+        let response = self
+            .client
+            .rpc_request(
+                StorageRpcMessageKind::ObjectBucketPayloadReclaimRoot,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_payload_reclaim_root_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.client.rpc_payload_error(
+                "decode object bucket payload reclaim root response",
+                error.to_string(),
+            ))
+        })?;
+        if let Some(root) = &response.root {
+            self.validate_root(root, Some(bucket), "validate bucket payload reclaim root")?;
+        }
+        Ok(response.root)
+    }
+
+    fn get_payload_reclaim_root(
+        &self,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
+        let payload = self
+            .client
+            .encode_metadata_command_state_request(self.pg_id.pg_id());
+        let response = self
+            .client
+            .rpc_request(StorageRpcMessageKind::ObjectPayloadReclaimRoot, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_payload_reclaim_root_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.client.rpc_payload_error(
+                "decode object payload reclaim root response",
+                error.to_string(),
+            ))
+        })?;
+        if let Some(root) = &response.root {
+            self.validate_root(root, None, "validate PG payload reclaim root")?;
+        }
+        Ok(response.root)
+    }
+
+    fn object_payload_reclaim_claim(
+        &self,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
+        let payload = self
+            .client
+            .encode_metadata_command_state_request(self.pg_id.pg_id());
+        let response = self
+            .client
+            .rpc_request(StorageRpcMessageKind::ObjectPayloadReclaimClaimGet, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_object_payload_reclaim_claim_optional_record_response(&response)
+            .map_err(|error| {
+                BucketSnapshotLoadError::Store(self.client.rpc_payload_error(
+                    "decode object payload reclaim claim get response",
+                    error.to_string(),
+                ))
+            })?;
+        if let Some(record) = &response.record {
+            if record.pg_id != self.pg_id.get() {
+                return Err(BucketSnapshotLoadError::Store(
+                    self.client.rpc_payload_error(
+                        "validate object payload reclaim claim get response",
+                        "claim response PG does not match route".to_string(),
+                    ),
+                ));
+            }
+            self.require_subject(
+                &record.bucket,
+                &record.key,
+                "validate object payload reclaim claim get response",
+            )?;
+        }
+        Ok(response.record)
     }
 }
 

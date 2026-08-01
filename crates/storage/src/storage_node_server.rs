@@ -4671,13 +4671,15 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::payload_reclaim_exists(
+        ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
             generation_id,
         )
+        .and_then(|route| route.exists())
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -6493,6 +6495,32 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
         }
     }
 
+    fn map_reclaim_scan_error(
+        error: BucketSnapshotLoadError,
+    ) -> StorageNodeObjectPayloadReclaimRouteError {
+        match error {
+            BucketSnapshotLoadError::Store(
+                error @ StoreError::RouteCapabilitySubjectMismatch { .. },
+            ) => StorageNodeObjectPayloadReclaimRouteError::Route(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: error.to_string(),
+            }),
+            error => StorageNodeObjectPayloadReclaimRouteError::Reclaim(error),
+        }
+    }
+
+    fn map_object_scan_error(error: ObjectPgActionError) -> StorageNodeObjectRouteError {
+        match error {
+            ObjectPgActionError::Store(
+                error @ StoreError::RouteCapabilitySubjectMismatch { .. },
+            ) => StorageNodeObjectRouteError::Route(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: error.to_string(),
+            }),
+            error => StorageNodeObjectRouteError::Object(error),
+        }
+    }
+
     fn validate_root(
         &self,
         root: &PayloadReclaimRoot,
@@ -6522,12 +6550,14 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        let root = ObjectMutationMetadataNodeClient::get_bucket_payload_reclaim_root(
+        let root = ObjectMutationMetadataNodeClient::open_object_mutation_scan_metadata_route(
             &local_client,
+            self.fence.cluster_epoch,
             self.pg_id,
-            bucket,
         )
-        .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)?;
+        .map_err(object_payload_reclaim_route_open_error)?
+        .get_bucket_payload_reclaim_root(bucket)
+        .map_err(Self::map_reclaim_scan_error)?;
         if let Some(root) = &root {
             self.validate_root(root, Some(bucket), "object bucket payload reclaim root")?;
         }
@@ -6543,9 +6573,14 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        let root =
-            ObjectMutationMetadataNodeClient::get_payload_reclaim_root(&local_client, self.pg_id)
-                .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)?;
+        let root = ObjectMutationMetadataNodeClient::open_object_mutation_scan_metadata_route(
+            &local_client,
+            self.fence.cluster_epoch,
+            self.pg_id,
+        )
+        .map_err(object_payload_reclaim_route_open_error)?
+        .get_payload_reclaim_root()
+        .map_err(Self::map_reclaim_scan_error)?;
         if let Some(root) = &root {
             self.validate_root(root, None, "object payload reclaim root")?;
         }
@@ -6562,11 +6597,14 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        let claim = ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(
+        let claim = ObjectMutationMetadataNodeClient::open_object_mutation_scan_metadata_route(
             &local_client,
+            self.fence.cluster_epoch,
             self.pg_id,
         )
-        .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)?;
+        .map_err(object_payload_reclaim_route_open_error)?
+        .object_payload_reclaim_claim()
+        .map_err(Self::map_reclaim_scan_error)?;
         if let Some(claim) = &claim {
             if claim.pg_id != self.pg_id.get() {
                 return Err(StorageNodeObjectPayloadReclaimRouteError::Route(
@@ -6703,14 +6741,15 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        let page = ObjectMutationMetadataNodeClient::list_stream_uploads_for_bucket_page(
+        let page = ObjectMutationMetadataNodeClient::open_object_mutation_scan_metadata_route(
             &local_client,
+            self.fence.cluster_epoch,
             self.pg_id,
-            bucket,
-            session_id_marker,
-            limit,
         )
-        .map_err(StorageNodeObjectRouteError::Object)?;
+        .and_then(|route| {
+            route.list_stream_uploads_for_bucket_page(bucket, session_id_marker, limit)
+        })
+        .map_err(Self::map_object_scan_error)?;
         self.validate_stream_uploads(&page, Some(bucket), "object stream uploads list")?;
         Ok(page)
     }
@@ -6726,13 +6765,13 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        let page = ObjectMutationMetadataNodeClient::list_all_stream_uploads_page(
+        let page = ObjectMutationMetadataNodeClient::open_object_mutation_scan_metadata_route(
             &local_client,
+            self.fence.cluster_epoch,
             self.pg_id,
-            session_id_marker,
-            limit,
         )
-        .map_err(StorageNodeObjectRouteError::Object)?;
+        .and_then(|route| route.list_all_stream_uploads_page(session_id_marker, limit))
+        .map_err(Self::map_object_scan_error)?;
         self.validate_stream_uploads(&page, None, "object stream uploads PG list")?;
         Ok(page)
     }

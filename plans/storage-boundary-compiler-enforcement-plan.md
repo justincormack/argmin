@@ -654,7 +654,7 @@ Node-client role classification (2026-07-19):
 | `ObjectVersionMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; ordinary and completion-priority version inspection retain distinct admission classes within that route |
 | `DirectPutMetadataNodeClient` | object metadata | opens an active primary route bound to one epoch, exact object PG, bucket, and key; commit snapshot and command construction cannot replace route identity |
 | `ObjectListingMetadataNodeClient` | object metadata scan | active object-metadata route for the scanned PG; listing fan-out constructs one capability per routed PG |
-| `ObjectMutationMetadataNodeClient` | object metadata | PUT-object metadata, object-delete/lifecycle, multipart-upload creation/lookup, authorized completion reads, and completion/abort command construction open active routes bound to one epoch and exact object/upload subjects; stream-session and payload-reclaim families still require their corresponding scoped routes |
+| `ObjectMutationMetadataNodeClient` | object metadata and object-metadata scan | exact mutation, stream-session, multipart, and payload-reclaim operations open active routes bound to one epoch and their complete object/upload/generation subjects; maintenance discovery opens a separate active scan route bound to one epoch and one installed object-metadata scan PG |
 | `RetainedObjectMutationMetadataNodeClient` | object metadata | opens a retained route bound to one epoch, object-metadata PG, bucket, and key; the returned interface prepares stream aborts and releases payload-reclaim claims without accepting replacement route or object arguments |
 | `ObjectReadMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; version selection and subject-identity validation remain operations within that fixed route, with payload reads separately retaining their read lease |
 | `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active placed-shard I/O opens an exact route bound to one node, epoch, data PG, shard index, and shard key; shard acknowledgement, current-placement cleanup, and repair/backfill work open an active route bound to one epoch and data PG |
@@ -4917,6 +4917,35 @@ One-hundred-and-twenty-third Phase 3 slice:
   both client-first and storage-route-first expiry, and rejection without
   claim mutation.
 - all 2,576 storage tests and the full 7,898-test workspace suite pass.
+  Workspace-wide strict Clippy and the transitional storage boundary checker
+  also pass.
+
+One-hundred-and-twenty-fourth Phase 3 slice:
+
+- the remaining raw object-mutation scan methods are replaced by an
+  `ObjectMutationScanMetadataRoute` bound to one route epoch and one installed
+  object-metadata scan PG. Bucket-delete discovery/cleanup, durable reclaim
+  adoption, diagnostic scans, and best-effort stream-session inspection open
+  this route before issuing any page/root/claim read and cannot replace its PG
+  on individual calls.
+- per-object reclaim existence is no longer a raw mutation-client method. It
+  is an operation on the existing `ObjectPayloadReclaimMetadataRoute`, whose
+  authority already fixes the object PG, bucket, key, and generation.
+- embedded and Unix scan routes validate every returned stream session,
+  reclaim root, and reclaim claim against the scoped PG; bucket-specific
+  results are also bound to the requested bucket. The storage-node adapter
+  maps a misplaced embedded row to `PayloadDecode` before encoding a response,
+  while the Unix route independently rejects an authenticated peer response
+  carrying a foreign subject.
+- installed Unix regressions retain positive primary canaries and equivalent
+  wrong-PG durable rows for both stream pages, both reclaim-root forms, and
+  reclaim claims. A malicious-response regression covers all five result
+  shapes, and route construction rejects a foreign epoch before transport.
+- the transitional cluster-source checker no longer bans these scan operation
+  names: the removed raw trait methods make an unscoped production call a
+  compiler error, while retaining a receiver-name exception would merely
+  duplicate that stronger boundary textually.
+- all 2,579 storage tests and the full 7,901-test workspace suite pass.
   Workspace-wide strict Clippy and the transitional storage boundary checker
   also pass.
 

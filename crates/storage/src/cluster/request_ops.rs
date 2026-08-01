@@ -4784,10 +4784,13 @@ impl super::StorageCluster {
                 let node = self
                     .local_map
                     .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-                let page = node
+                let scan_route = node
                     .object_mutation_metadata_client()
+                    .open_object_mutation_scan_metadata_route(self.operation_epoch(), scan_pg_id)
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                let page = scan_route
                     .list_stream_uploads_for_bucket_page(
-                        scan_pg_id,
                         bucket,
                         marker.as_ref(),
                         STREAM_UPLOAD_SCAN_PAGE_LIMIT,
@@ -6998,10 +7001,13 @@ impl super::StorageCluster {
                 let node = self
                     .local_map
                     .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-                let page = node
+                let scan_route = node
                     .object_mutation_metadata_client()
+                    .open_object_mutation_scan_metadata_route(self.operation_epoch(), scan_pg_id)
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                let page = scan_route
                     .list_stream_uploads_for_bucket_page(
-                        scan_pg_id,
                         bucket,
                         marker.as_ref(),
                         STREAM_UPLOAD_DELETE_PAGE_LIMIT,
@@ -7536,9 +7542,13 @@ impl super::StorageCluster {
             let node = self
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-            let page = node
+            let scan_route = node
                 .object_mutation_metadata_client()
-                .list_stream_uploads_for_bucket_page(scan_pg_id, bucket, None, 1)
+                .open_object_mutation_scan_metadata_route(self.operation_epoch(), scan_pg_id)
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+            let page = scan_route
+                .list_stream_uploads_for_bucket_page(bucket, None, 1)
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             if !page.uploads.is_empty() {
@@ -7557,9 +7567,13 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let root = node
+        let scan_route = node
             .object_mutation_metadata_client()
-            .get_bucket_payload_reclaim_root(scan_pg_id, bucket)
+            .open_object_mutation_scan_metadata_route(self.operation_epoch(), scan_pg_id)
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        let root = scan_route
+            .get_bucket_payload_reclaim_root(bucket)
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
         if let Some(root) = root.as_ref() {
             self.validate_bucket_payload_reclaim_root_for_pg(pg_id, root, node.node_id())?;
@@ -9448,10 +9462,19 @@ impl super::StorageCluster {
     ) -> Result<bool, ObjectPgActionError> {
         let object_pg_id = self.object_metadata_pg(bucket, key);
         let pg_id = object_pg_id.pg_id();
-        self.local_map
+        let client = self
+            .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_mutation_metadata_client()
-            .payload_reclaim_exists(object_pg_id, bucket, key, generation_id)
+            .object_mutation_metadata_client();
+        client
+            .open_object_payload_reclaim_metadata_route(
+                self.operation_epoch(),
+                object_pg_id,
+                bucket,
+                key,
+                generation_id,
+            )?
+            .exists()
     }
 
     pub fn get_object_tags_if<E>(
@@ -12265,10 +12288,27 @@ impl super::StorageCluster {
                 return scan;
             }
         };
-        let root = match node
+        let scan_route = match node
             .object_mutation_metadata_client()
-            .get_payload_reclaim_root(scan_pg_id)
+            .open_object_mutation_scan_metadata_route(self.operation_epoch(), scan_pg_id)
         {
+            Ok(route) => route,
+            Err(error) => {
+                let error = super::object_pg_action_error_to_bucket_snapshot_error(error);
+                scan.errors += 1;
+                emit_scan("error");
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "object_reclaim_durable_scan_pg_error",
+                    Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
+                );
+                scan.route_refresh_required =
+                    durable_reclaim_bucket_scan_requires_route_refresh(&error);
+                scan.retry_required = !scan.route_refresh_required;
+                return scan;
+            }
+        };
+        let root = match scan_route.get_payload_reclaim_root() {
             Ok(root) => root,
             Err(error) => {
                 scan.errors += 1;
@@ -16134,10 +16174,25 @@ impl super::StorageCluster {
                     });
                 }
             }
-            match node
+            let scan_route = match node
                 .object_mutation_metadata_client()
-                .object_payload_reclaim_claim(scan_pg_id)
+                .open_object_mutation_scan_metadata_route(self.operation_epoch(), scan_pg_id)
             {
+                Ok(route) => route,
+                Err(error) => {
+                    let detail = error.to_string();
+                    payload_reclaim_claim_errors.push(BucketDeleteDebugPayloadReclaimClaimError {
+                        object_pg_id: raw_pg_id,
+                        detail: detail.clone(),
+                    });
+                    payload_reclaim_root_errors.push(BucketDeleteDebugPayloadReclaimRootError {
+                        object_pg_id: raw_pg_id,
+                        detail,
+                    });
+                    continue;
+                }
+            };
+            match scan_route.object_payload_reclaim_claim() {
                 Ok(Some(claim)) => {
                     payload_reclaim_claims.push(BucketDeleteDebugPayloadReclaimClaim {
                         object_pg_id: raw_pg_id,
@@ -16163,10 +16218,7 @@ impl super::StorageCluster {
                     });
                 }
             }
-            let root = match node
-                .object_mutation_metadata_client()
-                .get_bucket_payload_reclaim_root(scan_pg_id, bucket)
-            {
+            let root = match scan_route.get_bucket_payload_reclaim_root(bucket) {
                 Ok(Some(root)) => root,
                 Ok(None) => continue,
                 Err(error) => {

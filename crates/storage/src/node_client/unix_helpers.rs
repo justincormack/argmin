@@ -2216,22 +2216,4 @@ impl UnixStorageNodeClient {
         }
         Ok(())
     }
-
-    pub(super) fn validate_bucket_payload_reclaim_root_response(
-        &self,
-        response: &StorageRpcPayloadReclaimRootResponse,
-        bucket: &BucketName,
-    ) -> Result<(), BucketSnapshotLoadError> {
-        if response
-            .root
-            .as_ref()
-            .is_some_and(|root| &root.bucket != bucket)
-        {
-            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                "validate object bucket payload reclaim root response",
-                "payload reclaim root bucket does not match request".to_string(),
-            )));
-        }
-        Ok(())
-    }
 }

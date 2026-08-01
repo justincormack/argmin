@@ -619,44 +619,11 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         part_number: u32,
     ) -> Result<Box<dyn StreamPartFinalizationMetadataRoute + '_>, ObjectPgActionError>;
 
-    fn list_stream_uploads_for_bucket_page(
+    fn open_object_mutation_scan_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataScanPgId,
-        bucket: &BucketName,
-        session_id_marker: Option<&SessionId>,
-        limit: u32,
-    ) -> Result<StreamUploadRecordPage, ObjectPgActionError>;
-
-    fn list_all_stream_uploads_page(
-        &self,
-        pg_id: ObjectMetadataScanPgId,
-        session_id_marker: Option<&SessionId>,
-        limit: u32,
-    ) -> Result<StreamUploadRecordPage, ObjectPgActionError>;
-
-    fn payload_reclaim_exists(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<bool, ObjectPgActionError>;
-
-    fn get_bucket_payload_reclaim_root(
-        &self,
-        pg_id: ObjectMetadataScanPgId,
-        bucket: &BucketName,
-    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError>;
-
-    fn get_payload_reclaim_root(
-        &self,
-        pg_id: ObjectMetadataScanPgId,
-    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError>;
-
-    fn object_payload_reclaim_claim(
-        &self,
-        pg_id: ObjectMetadataScanPgId,
-    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
+    ) -> Result<Box<dyn ObjectMutationScanMetadataRoute + '_>, ObjectPgActionError>;
 }
 
 pub(crate) trait PutObjectMetadataRoute: Send {
@@ -697,6 +664,8 @@ pub(crate) trait MultipartAbortMutationMetadataRoute: Send {
 }
 
 pub(crate) trait ObjectPayloadReclaimMetadataRoute: Send {
+    fn exists(&self) -> Result<bool, ObjectPgActionError>;
+
     fn load_payload(&self) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError>;
 
     fn acquire_claim(
@@ -710,6 +679,34 @@ pub(crate) trait ObjectPayloadReclaimMetadataRoute: Send {
         request: BuildDeleteObjectPayloadReclaimCommandReq<'_>,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+}
+
+pub(crate) trait ObjectMutationScanMetadataRoute: Send {
+    fn list_stream_uploads_for_bucket_page(
+        &self,
+        bucket: &BucketName,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError>;
+
+    fn list_all_stream_uploads_page(
+        &self,
+        session_id_marker: Option<&SessionId>,
+        limit: u32,
+    ) -> Result<StreamUploadRecordPage, ObjectPgActionError>;
+
+    fn get_bucket_payload_reclaim_root(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError>;
+
+    fn get_payload_reclaim_root(
+        &self,
+    ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError>;
+
+    fn object_payload_reclaim_claim(
+        &self,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
 }
 
 pub(crate) trait StreamUploadCreationMetadataRoute: Send {
