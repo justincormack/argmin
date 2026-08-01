@@ -2688,6 +2688,147 @@ fail_with_matches \
     "The admitted UploadPart route must accept only AuthorizedMultipartUploadPart, not the broad authorized durable upload wrapper" \
     "$public_broad_upload_part_route_surfaces"
 
+server_core_multipart_completion_authorization_durable_leaks=$(
+    awk '
+    /fn authorize_complete_multipart_upload_(boe|non_boe)_on_admitted_route\(/ {
+        in_completion_authorization = 1
+        depth = 0
+    }
+    in_completion_authorization {
+        if ($0 ~ /MultipartUploadManagementLookup|MultipartUploadRecord|AuthorizedMultipartUploadRecord|(^|[^A-Za-z])MultipartCompletionReplay([^A-Za-z]|$)|lookup_multipart_upload_management|try_load_in_progress_multipart_upload|assume_authorized/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_completion_authorization = 0
+        }
+    }
+    ' crates/server-core/src/coordinator/authz/acl.rs crates/server-core/src/coordinator/authz/modern.rs
+)
+fail_with_matches \
+    "CompleteMultipartUpload authorization must use the storage-owned logical lookup, candidates, and one-use capabilities rather than durable upload or replay records" \
+    "$server_core_multipart_completion_authorization_durable_leaks"
+
+server_core_authorized_multipart_completion_result_durable_leaks=$(
+    awk '
+    /enum AuthorizedCompleteMultipartUpload[[:space:]]*\{/ {
+        in_completion_result = 1
+        depth = 0
+    }
+    in_completion_result {
+        if ($0 ~ /MultipartUploadManagementLookup|MultipartUploadRecord|AuthorizedMultipartUploadRecord|(^|[^A-Za-z])MultipartCompletionReplay([^A-Za-z]|$)/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_completion_result = 0
+        }
+    }
+    ' crates/server-core/src/coordinator/authz_results.rs
+)
+fail_with_matches \
+    "Authorized CompleteMultipartUpload results must retain only completion-specific logical state and opaque storage-owned capabilities" \
+    "$server_core_authorized_multipart_completion_result_durable_leaks"
+
+server_core_multipart_completion_execution_durable_leaks=$(
+    awk '
+    /pub fn complete_multipart_upload_on_admitted_route\(/ {
+        in_completion_execution = 1
+        depth = 0
+    }
+    in_completion_execution {
+        if ($0 ~ /MultipartUploadManagementLookup|MultipartUploadRecord|AuthorizedMultipartUploadRecord|(^|[^A-Za-z])MultipartCompletionReplay([^A-Za-z]|$)|lookup_multipart_upload_management|try_load_in_progress_multipart_upload|\.record\(\)/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_completion_execution = 0
+        }
+    }
+    ' crates/server-core/src/coordinator/multipart.rs
+)
+fail_with_matches \
+    "CompleteMultipartUpload execution must pass only the authorized completion capability and logical completion context back through storage" \
+    "$server_core_multipart_completion_execution_durable_leaks"
+
+server_core_multipart_target_validation_durable_leaks=$(
+    awk '
+    /pub fn validate_(complete|in_progress)_multipart_upload_target_on_admitted_route\(/ {
+        in_target_validation = 1
+        depth = 0
+    }
+    in_target_validation {
+        if ($0 ~ /MultipartUploadRecord|load_in_progress_multipart_upload/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_target_validation = 0
+        }
+    }
+    ' crates/server-core/src/coordinator/multipart.rs
+)
+fail_with_matches \
+    "Multipart target validation needs only storage-owned active-upload existence, not the durable upload record" \
+    "$server_core_multipart_target_validation_durable_leaks"
+
+public_active_route_multipart_record_lookups=$(
+    rg -n --color=never \
+        '^[[:space:]]*pub[[:space:]]+fn[[:space:]]+(lookup_multipart_upload_management|load_in_progress_multipart_upload|try_load_in_progress_multipart_upload)\b' \
+        crates/storage/src/cluster.rs \
+        || true
+)
+fail_with_matches \
+    "The admitted multipart route must not publicly expose raw management classifications or durable upload records" \
+    "$public_active_route_multipart_record_lookups"
+
+public_broad_multipart_completion_route_surfaces=$(
+    awk '
+    /pub fn load_multipart_completion_snapshot\(/ {
+        in_completion_route = 1
+        signature = $0
+        next
+    }
+    in_completion_route {
+        signature = signature $0
+        if ($0 ~ /\)[[:space:]]*->[[:space:]]*/) {
+            if (signature ~ /AuthorizedMultipartUploadRecord|(^|[^A-Za-z])MultipartCompletionSnapshot([^A-Za-z]|$)/) {
+                print FILENAME ":" FNR ":" signature
+            }
+            in_completion_route = 0
+        }
+    }
+    ' crates/storage/src/cluster.rs
+)
+fail_with_matches \
+    "The admitted completion route must consume only AuthorizedMultipartUploadCompletion and return only AuthorizedMultipartCompletionSnapshot" \
+    "$public_broad_multipart_completion_route_surfaces"
+
+multipart_completion_caller_supplied_durable_defaults=$(
+    awk '
+    /pub struct CompleteMultipartCommitInput[[:space:]]*\{/ {
+        in_input = 1
+    }
+    in_input && /^[[:space:]]*pub[[:space:]]+(owner|acl_grants|public_read|tags|metadata_blob):/ {
+        print FILENAME ":" FNR ":" $0
+    }
+    in_input && /^[[:space:]]*}/ {
+        in_input = 0
+    }
+    ' crates/storage/src/types.rs
+)
+fail_with_matches \
+    "Multipart completion commit defaults must be retained by storage rather than reconstructed by the coordinator" \
+    "$multipart_completion_caller_supplied_durable_defaults"
+
 multipart_management_opaque_capability_leaks=$(
     {
         rg -n --color=never \
@@ -2769,6 +2910,88 @@ multipart_operation_capability_debug_leaks=$(
 fail_with_matches \
     "ListParts and UploadPart candidate/capability Debug output must not reveal retained durable state, including the upload ID" \
     "$multipart_operation_capability_debug_leaks"
+
+multipart_completion_opaque_surface_leaks=$(
+    {
+        rg -n --color=never \
+            'pub struct (MultipartUploadCompletionContext|MultipartUploadCompletionCandidate|AuthorizedMultipartUploadCompletion|MultipartCompletionReplayCandidate|AuthorizedMultipartCompletionReplay|AuthorizedMultipartCompletionSnapshot)\(pub|impl[[:space:]]+(Clone|PartialEq|Eq)[[:space:]]+for[[:space:]]+(MultipartUploadCompletionContext|MultipartUploadCompletionCandidate|AuthorizedMultipartUploadCompletion|MultipartCompletionReplayCandidate|AuthorizedMultipartCompletionReplay|AuthorizedMultipartCompletionSnapshot)' \
+            crates/storage/src/types.rs \
+            || true
+        awk '
+        /impl (MultipartUploadCompletionContext|MultipartUploadCompletionCandidate|AuthorizedMultipartUploadCompletion|MultipartCompletionReplayCandidate|AuthorizedMultipartCompletionReplay|AuthorizedMultipartCompletionSnapshot)[[:space:]]*\{/ {
+            in_completion_impl = 1
+            completion_impl = $0
+            sub(/^.*impl /, "", completion_impl)
+            sub(/[[:space:]]*\{.*/, "", completion_impl)
+            depth = 0
+        }
+        in_completion_impl {
+            if ($0 ~ /^[[:space:]]*pub[[:space:]]+fn[[:space:]]+/) {
+                method = $0
+                sub(/^.*fn[[:space:]]+/, "", method)
+                sub(/\(.*/, "", method)
+                if ((completion_impl == "MultipartUploadCompletionContext" && method != "checksum_config" && method != "system_metadata_blob" && method != "object_lock") || (completion_impl == "MultipartUploadCompletionCandidate" && method != "key" && method != "owner" && method != "initiator" && method != "encryption" && method != "into_authorized_completion") || completion_impl == "AuthorizedMultipartUploadCompletion" || (completion_impl == "MultipartCompletionReplayCandidate" && method != "encryption" && method != "into_authorized_replay") || (completion_impl == "AuthorizedMultipartCompletionReplay" && method != "upload_id" && method != "fingerprint" && method != "version_id" && method != "etag" && method != "size" && method != "last_modified" && method != "tags" && method != "encryption") || (completion_impl == "AuthorizedMultipartCompletionSnapshot" && method != "existing_etag" && method != "parts" && method != "into_commit_request")) {
+                    print FILENAME ":" FNR ":" $0
+                }
+            }
+            line = $0
+            depth += gsub(/\{/, "{", line)
+            depth -= gsub(/\}/, "}", line)
+            if (depth == 0 && $0 ~ /\}/) {
+                in_completion_impl = 0
+            }
+        }
+        /#\[derive\(/ {
+            derive = $0
+            in_derive = ($0 !~ /\)\]/)
+            next
+        }
+        in_derive {
+            derive = derive $0
+            if ($0 ~ /\)\]/) {
+                in_derive = 0
+            }
+            next
+        }
+        /pub struct (MultipartUploadCompletionContext|MultipartUploadCompletionCandidate|AuthorizedMultipartUploadCompletion|MultipartCompletionReplayCandidate|AuthorizedMultipartCompletionReplay|AuthorizedMultipartCompletionSnapshot)/ {
+            if (derive ~ /Clone|PartialEq|Eq|Debug/) {
+                print FILENAME ":" FNR ":" derive
+            }
+        }
+        {
+            if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^#\[derive\(/) {
+                derive = ""
+            }
+        }
+        ' crates/storage/src/types.rs
+    }
+)
+fail_with_matches \
+    "Multipart completion candidates, contexts, replay projections, and operation capabilities must expose only their bounded logical API and must not clone or compare retained durable state" \
+    "$multipart_completion_opaque_surface_leaks"
+
+multipart_completion_debug_leaks=$(
+    awk '
+    /impl std::fmt::Debug for (MultipartUploadCompletionContext|MultipartUploadCompletionCandidate|AuthorizedMultipartUploadCompletion|MultipartCompletionReplayCandidate|AuthorizedMultipartCompletionReplay|AuthorizedMultipartCompletionSnapshot)[[:space:]]*\{/ {
+        in_completion_debug = 1
+        depth = 0
+    }
+    in_completion_debug {
+        if ($0 ~ /self\.0|self\.system_metadata_blob|self\.defaults/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_completion_debug = 0
+        }
+    }
+    ' crates/storage/src/types.rs
+)
+fail_with_matches \
+    "Multipart completion Debug output must not reveal retained upload, serialized metadata, replay, or commit-default state" \
+    "$multipart_completion_debug_leaks"
 
 multipart_upload_id_authority_derived_equality=$(
     awk '

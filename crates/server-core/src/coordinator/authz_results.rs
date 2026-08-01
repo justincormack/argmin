@@ -15,10 +15,10 @@ use s3_types::{
 };
 use storage::BucketObjectOwnership;
 use storage::{
-    AuthorizedMultipartUploadPart, AuthorizedMultipartUploadRecord, BucketAclSummary,
-    BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
-    EffectiveBucketEncryptionConfig, LeasedObjectReadSnapshot, ObjectKey, ObjectLockState,
-    ObjectReadSnapshot, OwnerIdentity, PublicAccessBlockConfig,
+    AuthorizedMultipartUploadPart, BucketAclSummary, BucketEncryptionConfig, BucketName,
+    BucketObjectLockConfig, BucketOwnershipControls, EffectiveBucketEncryptionConfig,
+    LeasedObjectReadSnapshot, ObjectKey, ObjectLockState, ObjectReadSnapshot, OwnerIdentity,
+    PublicAccessBlockConfig,
 };
 
 #[derive(Debug)]
@@ -304,15 +304,13 @@ pub(super) enum AuthorizedCompleteMultipartUpload {
     InProgress {
         bucket_info: BucketSummary,
         lifecycle: Option<Box<BucketLifecycleConfiguration>>,
-        bucket: BucketName,
-        key: ObjectKey,
-        upload: Box<AuthorizedMultipartUploadRecord>,
+        upload: Box<storage::AuthorizedMultipartUploadCompletion>,
+        completion_context: storage::MultipartUploadCompletionContext,
         multipart_write_encryption: Box<ActiveWriteEncryption>,
     },
     Replay {
         lifecycle: Option<Box<BucketLifecycleConfiguration>>,
-        key: ObjectKey,
-        replay: storage::MultipartCompletionReplay,
+        replay: storage::AuthorizedMultipartCompletionReplay,
     },
 }
 

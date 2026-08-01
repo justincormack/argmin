@@ -3070,7 +3070,7 @@ fn multipart_upload_managed_encryption_policy_context_enables_upload_part_copy_w
     let policy = coord.cached_bucket_policy(&bucket).unwrap();
     let upload = coord
         .storage_node()
-        .test_get_multipart_upload(
+        .test_get_multipart_completion_candidate(
             &trusted_bucket_name("dst"),
             &trusted_object_key("copied"),
             &upload.upload_id,
@@ -3080,7 +3080,7 @@ fn multipart_upload_managed_encryption_policy_context_enables_upload_part_copy_w
     let base_context = PutObjectPolicyContext::new(Some("src/public/foo"), None, None);
 
     assert!(!coord
-        .requester_can_write_multipart_upload_with_bucket_policy(
+        .requester_can_write_multipart_completion_with_bucket_policy(
             &requester,
             &bucket,
             None,
@@ -3090,12 +3090,12 @@ fn multipart_upload_managed_encryption_policy_context_enables_upload_part_copy_w
         )
         .unwrap());
     assert!(coord
-        .requester_can_write_multipart_upload_with_bucket_policy(
+        .requester_can_write_multipart_completion_with_bucket_policy(
             &requester,
             &bucket,
             None,
             &upload,
-            Coordinator::with_multipart_upload_managed_encryption_policy_context(
+            Coordinator::with_multipart_completion_managed_encryption_policy_context(
                 PutObjectPolicyContext::new(Some("src/public/foo"), None, None),
                 &upload,
             ),
@@ -7956,7 +7956,7 @@ fn multipart_upload_managed_encryption_policy_context_enables_complete_multipart
     let policy = coord.cached_bucket_policy(&bucket).unwrap();
     let upload = coord
         .storage_node()
-        .test_get_multipart_upload(
+        .test_get_multipart_completion_candidate(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &upload.upload_id,
@@ -7965,7 +7965,7 @@ fn multipart_upload_managed_encryption_policy_context_enables_complete_multipart
     let requester = test_helpers::requester("other-user");
 
     assert!(!coord
-        .requester_can_write_multipart_upload_with_bucket_policy(
+        .requester_can_write_multipart_completion_with_bucket_policy(
             &requester,
             &bucket,
             None,
@@ -7975,12 +7975,12 @@ fn multipart_upload_managed_encryption_policy_context_enables_complete_multipart
         )
         .unwrap());
     assert!(coord
-        .requester_can_write_multipart_upload_with_bucket_policy(
+        .requester_can_write_multipart_completion_with_bucket_policy(
             &requester,
             &bucket,
             None,
             &upload,
-            Coordinator::with_multipart_upload_managed_encryption_policy_context(
+            Coordinator::with_multipart_completion_managed_encryption_policy_context(
                 PutObjectPolicyContext::default(),
                 &upload,
             ),

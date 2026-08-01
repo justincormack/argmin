@@ -16425,6 +16425,17 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_multipart_completion_candidate(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<crate::MultipartUploadCompletionCandidate, ObjectPgActionError> {
+        self.test_get_multipart_upload(bucket, key, upload_id)
+            .map(crate::MultipartUploadCompletionCandidate::from_record)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_get_multipart_part(
         &self,
         bucket: &BucketName,

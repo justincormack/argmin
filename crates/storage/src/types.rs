@@ -5300,6 +5300,240 @@ impl std::fmt::Debug for AuthorizedMultipartUploadPart {
     }
 }
 
+/// Logical S3 state needed after an in-progress multipart completion is authorized.
+pub struct MultipartUploadCompletionContext {
+    checksum: Option<MultipartChecksumConfig>,
+    system_metadata_blob: SerializedSystemMetadataBlob,
+    object_lock: ObjectLockState,
+}
+
+impl std::fmt::Debug for MultipartUploadCompletionContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MultipartUploadCompletionContext")
+            .field("checksum", &self.checksum)
+            .field("object_lock", &self.object_lock)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MultipartUploadCompletionContext {
+    #[must_use]
+    pub fn checksum_config(&self) -> Option<MultipartChecksumConfig> {
+        self.checksum
+    }
+
+    #[must_use]
+    pub fn system_metadata_blob(&self) -> &SerializedSystemMetadataBlob {
+        &self.system_metadata_blob
+    }
+
+    #[must_use]
+    pub fn object_lock(&self) -> ObjectLockState {
+        self.object_lock
+    }
+}
+
+/// Opaque in-progress upload used while authorizing CompleteMultipartUpload.
+pub struct MultipartUploadCompletionCandidate(MultipartUploadRecord);
+
+impl MultipartUploadCompletionCandidate {
+    pub(crate) fn from_record(upload: MultipartUploadRecord) -> Self {
+        Self(upload)
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &ObjectKey {
+        &self.0.key
+    }
+
+    #[must_use]
+    pub fn owner(&self) -> &OwnerIdentity {
+        &self.0.owner
+    }
+
+    #[must_use]
+    pub fn initiator(&self) -> &OwnerIdentity {
+        &self.0.initiator
+    }
+
+    #[must_use]
+    pub fn encryption(&self) -> &ObjectEncryption {
+        &self.0.encryption
+    }
+
+    #[must_use]
+    pub fn into_authorized_completion(
+        self,
+    ) -> (
+        AuthorizedMultipartUploadCompletion,
+        MultipartUploadCompletionContext,
+    ) {
+        let context = MultipartUploadCompletionContext {
+            checksum: self.0.checksum,
+            system_metadata_blob: self.0.system_metadata_blob.clone(),
+            object_lock: self.0.object_lock,
+        };
+        (
+            AuthorizedMultipartUploadCompletion::assume_authorized(self.0),
+            context,
+        )
+    }
+}
+
+impl std::fmt::Debug for MultipartUploadCompletionCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MultipartUploadCompletionCandidate")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Linear capability authorizing snapshot acquisition for one exact in-progress upload.
+pub struct AuthorizedMultipartUploadCompletion(MultipartUploadRecord);
+
+impl AuthorizedMultipartUploadCompletion {
+    pub(crate) fn assume_authorized(upload: MultipartUploadRecord) -> Self {
+        Self(upload)
+    }
+
+    pub(crate) fn into_record(self) -> MultipartUploadRecord {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for AuthorizedMultipartUploadCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedMultipartUploadCompletion")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque completed-upload replay state used while authorizing terminal replay.
+pub struct MultipartCompletionReplayCandidate(MultipartCompletionReplay);
+
+impl MultipartCompletionReplayCandidate {
+    #[must_use]
+    pub fn encryption(&self) -> &ObjectEncryption {
+        &self.0.encryption
+    }
+
+    #[must_use]
+    pub fn into_authorized_replay(self) -> AuthorizedMultipartCompletionReplay {
+        let replay = self.0;
+        AuthorizedMultipartCompletionReplay {
+            upload_id: replay.upload_id,
+            fingerprint: replay.fingerprint,
+            version_id: replay.version_id,
+            etag: replay.etag,
+            size: replay.size,
+            last_modified: replay.last_modified,
+            tags: replay.tags.map(|tags| (*tags).clone()),
+            encryption: replay.encryption,
+        }
+    }
+}
+
+impl std::fmt::Debug for MultipartCompletionReplayCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MultipartCompletionReplayCandidate")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Logical replay projection returned after CompleteMultipartUpload authorization.
+pub struct AuthorizedMultipartCompletionReplay {
+    upload_id: UploadId,
+    fingerprint: MultipartCompletionFingerprint,
+    version_id: VersionId,
+    etag: ObjectEtag,
+    size: u64,
+    last_modified: u64,
+    tags: Option<s3_types::TagSet>,
+    encryption: ObjectEncryption,
+}
+
+impl AuthorizedMultipartCompletionReplay {
+    #[must_use]
+    pub fn upload_id(&self) -> &UploadId {
+        &self.upload_id
+    }
+
+    #[must_use]
+    pub fn fingerprint(&self) -> MultipartCompletionFingerprint {
+        self.fingerprint
+    }
+
+    #[must_use]
+    pub fn version_id(&self) -> VersionId {
+        self.version_id
+    }
+
+    #[must_use]
+    pub fn etag(&self) -> ObjectEtag {
+        self.etag
+    }
+
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    #[must_use]
+    pub fn last_modified(&self) -> u64 {
+        self.last_modified
+    }
+
+    #[must_use]
+    pub fn tags(&self) -> Option<&s3_types::TagSet> {
+        self.tags.as_ref()
+    }
+
+    #[must_use]
+    pub fn encryption(&self) -> &ObjectEncryption {
+        &self.encryption
+    }
+}
+
+impl std::fmt::Debug for AuthorizedMultipartCompletionReplay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedMultipartCompletionReplay")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Storage-owned logical classification for CompleteMultipartUpload authorization.
+#[derive(Debug)]
+pub enum MultipartUploadCompletionLookup {
+    InProgress(Box<MultipartUploadCompletionCandidate>),
+    Replay(Box<MultipartCompletionReplayCandidate>),
+    Unavailable,
+}
+
+impl MultipartUploadCompletionLookup {
+    pub(crate) fn from_management_lookup(lookup: MultipartUploadManagementLookup) -> Self {
+        match lookup {
+            MultipartUploadManagementLookup::InProgress(upload) => Self::InProgress(Box::new(
+                MultipartUploadCompletionCandidate::from_record(*upload),
+            )),
+            MultipartUploadManagementLookup::Replay(replay) => {
+                Self::Replay(Box::new(MultipartCompletionReplayCandidate(*replay)))
+            }
+            MultipartUploadManagementLookup::NonInProgress(_)
+            | MultipartUploadManagementLookup::Missing => Self::Unavailable,
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn from_in_progress(upload: MultipartUploadCompletionCandidate) -> Self {
+        Self::InProgress(Box::new(upload))
+    }
+}
+
 /// In-progress multipart part record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartPartRecord {
@@ -5441,9 +5675,10 @@ impl MultipartCompletionSnapshot {
     }
 
     #[must_use]
-    pub fn into_commit_request(
+    fn into_commit_request_with_defaults(
         self,
         input: CompleteMultipartCommitInput,
+        defaults: MultipartCompletionCommitDefaults,
     ) -> CompleteMultipartCommitRequest {
         CompleteMultipartCommitRequest {
             bucket: self.subject.bucket,
@@ -5451,14 +5686,14 @@ impl MultipartCompletionSnapshot {
             upload_id: self.subject.upload_id,
             completion_fingerprint: input.completion_fingerprint,
             versioning: input.versioning,
-            owner: input.owner,
-            acl_grants: input.acl_grants,
-            public_read: input.public_read,
+            owner: defaults.owner,
+            acl_grants: defaults.acl_grants,
+            public_read: defaults.public_read,
             generation_id: self.subject.generation_id,
             size: input.size,
             etag_crc64: input.etag_crc64,
-            tags: input.tags,
-            metadata_blob: input.metadata_blob,
+            tags: defaults.tags,
+            metadata_blob: Some(defaults.metadata_blob),
             system_metadata_blob: input.system_metadata_blob,
             object_lock: input.object_lock,
             encryption: input.encryption,
@@ -5469,6 +5704,67 @@ impl MultipartCompletionSnapshot {
             selected_streaming_segments: self.selected_streaming_segments,
             expected_cleanup: self.cleanup,
         }
+    }
+}
+
+struct MultipartCompletionCommitDefaults {
+    owner: OwnerIdentity,
+    acl_grants: AclGrants,
+    public_read: bool,
+    tags: Option<SerializedTagSet>,
+    metadata_blob: SerializedMetadataBlob,
+}
+
+/// Completion snapshot bound to the exact upload authorized by the caller.
+pub struct AuthorizedMultipartCompletionSnapshot {
+    snapshot: MultipartCompletionSnapshot,
+    defaults: MultipartCompletionCommitDefaults,
+}
+
+impl AuthorizedMultipartCompletionSnapshot {
+    pub(crate) fn new(
+        snapshot: MultipartCompletionSnapshot,
+        upload: MultipartUploadRecord,
+    ) -> Self {
+        Self {
+            snapshot,
+            defaults: MultipartCompletionCommitDefaults {
+                owner: upload.owner,
+                acl_grants: upload.acl_grants,
+                public_read: upload.public_read,
+                tags: upload.tags,
+                metadata_blob: upload.metadata_blob,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn existing_etag(&self) -> Option<&str> {
+        self.snapshot.existing_etag()
+    }
+
+    #[must_use]
+    pub fn parts(&self) -> &[MultipartCompletionPart] {
+        self.snapshot.parts()
+    }
+
+    #[must_use]
+    pub fn into_commit_request(
+        self,
+        input: CompleteMultipartCommitInput,
+    ) -> CompleteMultipartCommitRequest {
+        self.snapshot
+            .into_commit_request_with_defaults(input, self.defaults)
+    }
+}
+
+impl std::fmt::Debug for AuthorizedMultipartCompletionSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedMultipartCompletionSnapshot")
+            .field("existing_etag", &self.existing_etag())
+            .field("parts", &self.parts())
+            .finish_non_exhaustive()
     }
 }
 
@@ -5523,13 +5819,8 @@ pub enum CompletedMultipartStalePayload {
 pub struct CompleteMultipartCommitInput {
     pub completion_fingerprint: MultipartCompletionFingerprint,
     pub versioning: BucketVersioningState,
-    pub owner: OwnerIdentity,
-    pub acl_grants: AclGrants,
-    pub public_read: bool,
     pub size: u64,
     pub etag_crc64: [u8; 8],
-    pub tags: Option<SerializedTagSet>,
-    pub metadata_blob: Option<SerializedMetadataBlob>,
     pub system_metadata_blob: Option<SerializedSystemMetadataBlob>,
     pub object_lock: ObjectLockState,
     pub encryption: ObjectEncryption,
@@ -6427,6 +6718,94 @@ mod tests {
             format!("{authorized:?}"),
             "AuthorizedMultipartUploadPart { .. }"
         );
+    }
+
+    #[test]
+    fn multipart_completion_lookup_exposes_only_logical_authorization_state() {
+        let mut upload = management_lookup_test_upload(UploadState::InProgress);
+        upload.checksum = Some(
+            MultipartChecksumConfig::new(ChecksumAlgorithm::Crc32, None)
+                .expect("CRC32 is a valid multipart checksum configuration"),
+        );
+        let upload_id = upload.upload_id.clone();
+        let lookup = MultipartUploadCompletionLookup::from_management_lookup(
+            MultipartUploadManagementLookup::InProgress(Box::new(upload)),
+        );
+        let MultipartUploadCompletionLookup::InProgress(candidate) = lookup else {
+            panic!("in-progress management result must remain completable");
+        };
+        assert_eq!(candidate.key().as_str(), "private-durable-key");
+        assert_eq!(candidate.owner().principal, "lookup-owner");
+        assert_eq!(candidate.initiator().principal, "lookup-initiator");
+        assert!(matches!(candidate.encryption(), ObjectEncryption::None));
+        assert_eq!(
+            format!("{candidate:?}"),
+            "MultipartUploadCompletionCandidate { .. }"
+        );
+
+        let (authorized, context) = candidate.into_authorized_completion();
+        assert_eq!(authorized.0.upload_id, upload_id);
+        assert_eq!(authorized.0.key.as_str(), "private-durable-key");
+        assert_eq!(
+            context.checksum_config().map(|config| config.algorithm()),
+            Some(ChecksumAlgorithm::Crc32)
+        );
+        assert_eq!(
+            format!("{authorized:?}"),
+            "AuthorizedMultipartUploadCompletion { .. }"
+        );
+        assert!(!format!("{context:?}").contains("system_metadata_blob"));
+
+        let replay_upload_id = UploadId::for_test("completion-replay");
+        let replay = MultipartCompletionReplay {
+            upload_id: replay_upload_id.clone(),
+            bucket: BucketName::try_from("private-replay-bucket").unwrap(),
+            key: ObjectKey::try_from("private-replay-key").unwrap(),
+            fingerprint: MultipartCompletionFingerprint::from_bytes([7; 32]),
+            version_id: VersionId::Null,
+            etag: ObjectEtag::SinglePart([11; 8]),
+            size: 13,
+            last_modified: 17,
+            tags: Some(SerializedTagSet::default()),
+            system_metadata_blob: Some(SerializedSystemMetadataBlob::new(vec![19, 23])),
+            encryption: ObjectEncryption::None,
+        };
+        let lookup = MultipartUploadCompletionLookup::from_management_lookup(
+            MultipartUploadManagementLookup::Replay(Box::new(replay)),
+        );
+        let MultipartUploadCompletionLookup::Replay(candidate) = lookup else {
+            panic!("completion replay must remain replayable");
+        };
+        assert_eq!(
+            format!("{candidate:?}"),
+            "MultipartCompletionReplayCandidate { .. }"
+        );
+        let replay = candidate.into_authorized_replay();
+        assert_eq!(replay.upload_id(), &replay_upload_id);
+        assert_eq!(replay.fingerprint().as_bytes(), &[7; 32]);
+        assert_eq!(replay.size(), 13);
+        assert_eq!(replay.last_modified(), 17);
+        assert!(replay.tags().is_some());
+        assert!(matches!(replay.encryption(), ObjectEncryption::None));
+        assert_eq!(
+            format!("{replay:?}"),
+            "AuthorizedMultipartCompletionReplay { .. }"
+        );
+
+        assert!(matches!(
+            MultipartUploadCompletionLookup::from_management_lookup(
+                MultipartUploadManagementLookup::NonInProgress(Box::new(
+                    management_lookup_test_upload(UploadState::Completing),
+                )),
+            ),
+            MultipartUploadCompletionLookup::Unavailable
+        ));
+        assert!(matches!(
+            MultipartUploadCompletionLookup::from_management_lookup(
+                MultipartUploadManagementLookup::Missing,
+            ),
+            MultipartUploadCompletionLookup::Unavailable
+        ));
     }
 
     #[test]

@@ -368,24 +368,24 @@ impl Coordinator {
         #[cfg(test)]
         let lookup = if should_probe_multipart_complete_auth_lookup(bucket.as_str(), key.as_str()) {
             let upload = multipart_route
-                .try_load_in_progress_multipart_upload(upload_id)
+                .try_load_multipart_upload_for_completion(upload_id)
                 .map_err(Self::map_object_pg_action_error)?
                 .ok_or_else(|| ServerError::InternalError {
                     reason: "multipart complete auth lookup would block".to_string(),
                 })?;
-            storage::MultipartUploadManagementLookup::InProgress(Box::new(upload))
+            storage::MultipartUploadCompletionLookup::from_in_progress(upload)
         } else {
             multipart_route
-                .lookup_multipart_upload_management(upload_id)
+                .lookup_multipart_upload_for_completion(upload_id)
                 .map_err(Self::map_object_pg_action_error)?
         };
         #[cfg(not(test))]
         let lookup = multipart_route
-            .lookup_multipart_upload_management(upload_id)
+            .lookup_multipart_upload_for_completion(upload_id)
             .map_err(Self::map_object_pg_action_error)?;
         let upload = match lookup {
-            storage::MultipartUploadManagementLookup::InProgress(upload) => *upload,
-            storage::MultipartUploadManagementLookup::Replay(replay) => {
+            storage::MultipartUploadCompletionLookup::InProgress(upload) => *upload,
+            storage::MultipartUploadCompletionLookup::Replay(replay) => {
                 let replay = *replay;
                 if !bucket_info
                     .multipart_upload_id_authority
@@ -402,7 +402,7 @@ impl Coordinator {
                     .with_if_match(req.cond.if_match_policy_value())
                     .with_if_none_match(req.cond.if_none_match_policy_value())
                     .with_object_creation_operation(true)
-                    .with_managed_encryption(replay.encryption.managed_encryption_algorithm());
+                    .with_managed_encryption(replay.encryption().managed_encryption_algorithm());
                 let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
                 if put_object_authorization_with_bucket_policy(
                     req.upload.requester(),
@@ -418,22 +418,20 @@ impl Coordinator {
                 }
                 Self::ensure_sse_c_allowed(
                     &bucket_info,
-                    replay.encryption.uses_sse_customer_headers(),
+                    replay.encryption().uses_sse_customer_headers(),
                 )?;
                 self.resume_write_encryption(
-                    &replay.encryption,
+                    replay.encryption(),
                     req.sse_customer,
                     SseCustomerSegmentScope::object(),
                     false,
                 )?;
                 return Ok(AuthorizedCompleteMultipartUpload::Replay {
                     lifecycle,
-                    key: key.clone(),
-                    replay,
+                    replay: replay.into_authorized_replay(),
                 });
             }
-            storage::MultipartUploadManagementLookup::NonInProgress(_)
-            | storage::MultipartUploadManagementLookup::Missing => {
+            storage::MultipartUploadCompletionLookup::Unavailable => {
                 if bucket_info
                     .multipart_upload_id_authority
                     .authenticates(bucket, key, upload_id)
@@ -450,7 +448,7 @@ impl Coordinator {
                 });
             }
         };
-        let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
+        let policy_context = Self::with_multipart_completion_managed_encryption_policy_context(
             PutObjectPolicyContext::default()
                 .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm))
                 .with_if_match(req.cond.if_match_policy_value())
@@ -459,7 +457,7 @@ impl Coordinator {
             &upload,
         );
         let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
-        if write_multipart_upload_with_bucket_policy(
+        if write_multipart_completion_with_bucket_policy(
             req.upload.requester(),
             modern_bucket,
             modern_bucket_tags,
@@ -470,22 +468,23 @@ impl Coordinator {
         {
             return Err(ServerError::AccessDenied);
         }
-        Self::ensure_sse_c_allowed(&bucket_info, upload.encryption.uses_sse_customer_headers())?;
+        Self::ensure_sse_c_allowed(
+            &bucket_info,
+            upload.encryption().uses_sse_customer_headers(),
+        )?;
         let multipart_write_encryption = self.resume_write_encryption(
-            &upload.encryption,
+            upload.encryption(),
             req.sse_customer,
             SseCustomerSegmentScope::object(),
             false,
         )?;
 
+        let (upload, completion_context) = upload.into_authorized_completion();
         Ok(AuthorizedCompleteMultipartUpload::InProgress {
             bucket_info: bucket_info.into_inner(),
             lifecycle,
-            bucket: req.upload.bucket_name_typed().clone(),
-            key: req.upload.key_typed().clone(),
-            upload: Box::new(storage::AuthorizedMultipartUploadRecord::assume_authorized(
-                upload,
-            )),
+            upload: Box::new(upload),
+            completion_context,
             multipart_write_encryption: Box::new(multipart_write_encryption),
         })
     }
@@ -993,11 +992,11 @@ fn bucket_policy_decision_for_put_object_action_modern(
     Ok(policy.evaluate(&policy_request))
 }
 
-pub(in crate::coordinator) fn write_multipart_upload_with_bucket_policy(
+pub(in crate::coordinator) fn write_multipart_completion_with_bucket_policy(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
     bucket_tags: PreloadedBucketTags<'_>,
-    upload: &MultipartUploadRecord,
+    upload: &storage::MultipartUploadCompletionCandidate,
     policy_context: &PutObjectPolicyContext<'_>,
     policy: Option<&auth::BucketPolicy>,
 ) -> Result<ModernObjectWriteAuthorization, ServerError> {
@@ -1005,7 +1004,7 @@ pub(in crate::coordinator) fn write_multipart_upload_with_bucket_policy(
         requester,
         bucket,
         bucket_tags,
-        upload.key.as_str(),
+        upload.key().as_str(),
         auth::PolicyAction::PutObject,
         policy_context,
         policy,

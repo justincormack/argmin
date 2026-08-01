@@ -1172,6 +1172,32 @@ arguments, new public capability methods, durable-state `Debug` output, clone, o
 surfaces. Multipart completion authorization still exposes the broad authorized durable upload
 wrapper and remains pending, so implementation-order item 3 is not yet complete.
 
+The twentieth bounded slice continues implementation-order item 3 with
+CompleteMultipartUpload authorization, terminal replay, snapshot acquisition, and commit
+assembly. Storage consumes its broad management lookup into either an in-progress completion
+candidate, a terminal replay candidate, or one unavailable state before the result crosses the
+crate boundary. The in-progress candidate exposes only the object key, owner and initiator
+identities, and encryption state needed for S3 authorization. Successful authorization consumes
+it into a non-cloneable completion capability plus logical checksum, system-metadata, and Object
+Lock context. The coordinator passes the capability back through the same admitted
+multipart-object route; storage expands it to the durable upload only internally, validates the
+snapshot subject, and returns an authorized snapshot that retains the upload's owner, ACL,
+public-read state, tags, and user metadata as storage-owned commit defaults. Callers can supply
+only the newly evaluated completion values when converting that snapshot into the durable commit
+request. Completed-upload replay is reduced before crossing the boundary to the logical upload
+ID, completion fingerprint, version, ETag, size, modification time, decoded tags, and encryption
+state required by established S3 replay behavior; its bucket, key, and serialized system metadata
+remain private. Existing database, metadata-command, local/Unix node-client, storage-RPC, and raw
+snapshot representations are unchanged. Compiler visibility is the primary boundary, with checks
+rejecting durable upload or replay records in authorization, result, and execution seams;
+caller-supplied retained commit defaults; broad admitted-route arguments/results; new public
+capability methods; durable-state `Debug` output; clone; or equality surfaces. The broad multipart
+authorization seams are now contained. The pre-body completion and UploadPart target validators
+use a storage-owned active-upload existence operation rather than receiving a durable record, and
+the admitted multipart route's raw management lookup is removed while its active-record lookup is
+test-only. Remaining public physical multipart record representations still require the wider
+implementation-order item 3 audit, so that item is not yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

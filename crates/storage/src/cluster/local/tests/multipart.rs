@@ -673,10 +673,12 @@ fn multipart_routes_bind_crossed_same_pg_upload_subjects() {
     let upload = cluster
         .load_in_progress_multipart_upload(&bucket, &crossed_key, &upload_id)
         .unwrap();
-    let authorized_upload =
-        crate::AuthorizedMultipartUploadRecord::assume_authorized(upload.clone());
     let authorized_list_parts =
         crate::AuthorizedMultipartUploadListParts::assume_authorized(upload.clone());
+    let authorized_completion =
+        crate::MultipartUploadCompletionCandidate::from_record(upload.clone())
+            .into_authorized_completion()
+            .0;
 
     let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = handle.admit_current_route().unwrap();
@@ -723,7 +725,7 @@ fn multipart_routes_bind_crossed_same_pg_upload_subjects() {
         })
     ));
     let error = route
-        .load_multipart_completion_snapshot(&authorized_upload, &[])
+        .load_multipart_completion_snapshot(authorized_completion, &[])
         .unwrap_err();
     assert!(matches!(
         error,

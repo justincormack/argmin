@@ -26851,19 +26851,18 @@ mod tests {
             assert_eq!(cleanup.upload, multipart_upload);
             (completion_snapshot, cleanup)
         });
+        let completion_snapshot = crate::AuthorizedMultipartCompletionSnapshot::new(
+            completion_snapshot,
+            multipart_upload.clone(),
+        );
         let completion_request =
             completion_snapshot.into_commit_request(crate::CompleteMultipartCommitInput {
                 completion_fingerprint: crate::MultipartCompletionFingerprint::from_bytes(
                     [0x71; 32],
                 ),
                 versioning: BucketVersioningState::Disabled,
-                owner: crate::OwnerIdentity::from_principal("active-object-route-owner"),
-                acl_grants: AclGrants::default(),
-                public_read: false,
                 size: terminal_multipart_part.size,
                 etag_crc64: [0x72; 8],
-                tags: None,
-                metadata_blob: Some(crate::SerializedMetadataBlob::default()),
                 system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
                 object_lock: crate::ObjectLockState::default(),
                 encryption: crate::ObjectEncryption::None,

@@ -652,46 +652,42 @@ impl Coordinator {
         'retry_stale_commit_snapshot: loop {
             let authorized =
                 self.authorize_complete_multipart_upload_on_admitted_route(admission, req)?;
-            let (bucket_info, lifecycle, bucket, key, upload, multipart_write_encryption) =
+            let bucket = req.upload.bucket_name_typed().clone();
+            let key = req.upload.key_typed().clone();
+            let (bucket_info, lifecycle, upload, completion_context, multipart_write_encryption) =
                 match authorized {
                     AuthorizedCompleteMultipartUpload::InProgress {
                         bucket_info,
                         lifecycle,
-                        bucket,
-                        key,
                         upload,
+                        completion_context,
                         multipart_write_encryption,
                         ..
                     } => (
                         bucket_info,
                         lifecycle,
-                        bucket,
-                        key,
                         upload,
+                        completion_context,
                         multipart_write_encryption,
                     ),
-                    AuthorizedCompleteMultipartUpload::Replay {
-                        lifecycle,
-                        key,
-                        replay,
-                    } => {
-                        if replay.fingerprint != multipart_completion_fingerprint(req.parts) {
+                    AuthorizedCompleteMultipartUpload::Replay { lifecycle, replay } => {
+                        if replay.fingerprint() != multipart_completion_fingerprint(req.parts) {
                             return Err(ServerError::NoSuchUpload {
-                                upload_id: replay.upload_id.to_string(),
+                                upload_id: replay.upload_id().to_string(),
                             });
                         }
                         let lifecycle_expiration =
                             Self::current_object_write_lifecycle_expiration_for_config(
                                 lifecycle.as_deref(),
                                 key.as_str(),
-                                replay.tags.as_deref(),
-                                replay.size,
-                                replay.last_modified,
+                                replay.tags(),
+                                replay.size(),
+                                replay.last_modified(),
                             )?;
                         return Ok(CompleteMultipartUploadResult {
-                            etag: replay.etag.format(),
-                            version_id: replay.version_id,
-                            managed_encryption: replay.encryption.managed_encryption_algorithm(),
+                            etag: replay.etag().format(),
+                            version_id: replay.version_id(),
+                            managed_encryption: replay.encryption().managed_encryption_algorithm(),
                             checksum_algorithm: None,
                             checksum_type: None,
                             checksum_value: None,
@@ -718,14 +714,14 @@ impl Coordinator {
 
             let requested_part_numbers: Vec<u32> =
                 parts.iter().map(|part| part.part_number).collect();
-            let checksum_config = upload.checksum;
+            let checksum_config = completion_context.checksum_config();
             #[cfg(test)]
             maybe_run_multipart_complete_snapshot_hook(bucket.as_str(), key.as_str());
             let multipart_route = admission
                 .active_multipart_object_route(&bucket, &key)
                 .map_err(super::map_store_error)?;
             let completion_snapshot = match multipart_route
-                .load_multipart_completion_snapshot(&upload, &requested_part_numbers)
+                .load_multipart_completion_snapshot(*upload, &requested_part_numbers)
             {
                 Ok(snapshot) => snapshot,
                 Err(storage::ObjectPgActionError::Metadata(
@@ -946,7 +942,7 @@ impl Coordinator {
                         "bucket={:?} key={:?} upload_id={:?} parts={} total_size={}",
                         bucket,
                         key,
-                        upload.upload_id,
+                        req.upload.upload_id(),
                         completion_parts.len(),
                         total_size
                     )),
@@ -965,7 +961,7 @@ impl Coordinator {
                         "bucket={:?} key={:?} upload_id={:?} part_order={} part_number={} part_size={} object_offset_start={} object_offset_len={} object_offset_end_exclusive={} etag={}",
                         bucket,
                         key,
-                        upload.upload_id,
+                        req.upload.upload_id(),
                         part_order,
                         requested_part.part_number,
                         stored_part.size,
@@ -980,7 +976,7 @@ impl Coordinator {
             }
 
             let mut system_metadata =
-                SystemMetadata::deserialize(upload.system_metadata_blob.as_slice())?;
+                SystemMetadata::deserialize(completion_context.system_metadata_blob().as_slice())?;
             if let (Some(config), Some(ref val)) = (effective_checksum_config, &checksum_value) {
                 system_metadata.set_checksum(
                     config.algorithm(),
@@ -988,7 +984,6 @@ impl Coordinator {
                     val.clone(),
                 );
             }
-            self.ensure_write_encryption_supported(&upload.encryption)?;
             let (system_metadata_bytes, final_encryption) = Self::prepare_stored_system_metadata(
                 &system_metadata,
                 &multipart_write_encryption,
@@ -1004,17 +999,12 @@ impl Coordinator {
                         storage::CompleteMultipartCommitInput {
                             completion_fingerprint: multipart_completion_fingerprint(req.parts),
                             versioning: bucket_info.versioning,
-                            owner: upload.owner.clone(),
-                            acl_grants: upload.acl_grants.clone(),
-                            public_read: upload.public_read,
                             size: total_size,
                             etag_crc64,
-                            tags: upload.tags.clone(),
-                            metadata_blob: Some(upload.metadata_blob.clone()),
                             system_metadata_blob: Some(system_metadata_bytes),
                             object_lock: Self::resolve_new_object_lock_state(
                                 &bucket_info,
-                                upload.object_lock,
+                                completion_context.object_lock(),
                             )?,
                             encryption: final_encryption,
                             conditional_completion: !req.cond.is_empty(),
@@ -1110,8 +1100,8 @@ impl Coordinator {
         let multipart_route = admission
             .active_multipart_object_route(upload.bucket_name_typed(), upload.key_typed())
             .map_err(super::map_store_error)?;
-        match multipart_route.load_in_progress_multipart_upload(upload.upload_id()) {
-            Ok(_) => Ok(()),
+        match multipart_route.require_in_progress_multipart_upload(upload.upload_id()) {
+            Ok(()) => Ok(()),
             Err(storage::ObjectPgActionError::Metadata(storage::MetadataError::NoSuchUpload {
                 ..
             })) => {
@@ -1158,8 +1148,7 @@ impl Coordinator {
         admission
             .active_multipart_object_route(upload.bucket_name_typed(), upload.key_typed())
             .map_err(super::map_store_error)?
-            .load_in_progress_multipart_upload(upload.upload_id())
-            .map(|_| ())
+            .require_in_progress_multipart_upload(upload.upload_id())
             .map_err(Self::map_object_pg_action_error)
     }
 

@@ -79,6 +79,8 @@ use crate::storage_rpc::{
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
 #[cfg(any(test, feature = "test-hooks"))]
+use crate::types::MultipartUploadRecord;
+#[cfg(any(test, feature = "test-hooks"))]
 use crate::types::PlacedSegmentShardBackfillRecord;
 use crate::types::{
     AclGrants, AdmittedRouteEffectFence, AuthorizedMultipartUploadRecord, BucketAclSummary,
@@ -91,10 +93,9 @@ use crate::types::{
     DirectPutPayloadWrite, DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome,
     FinalizeStreamPartOutcome, FinalizeStreamPutOutcome, GenerationId,
     InsertCurrentDeleteMarkerOutcome, ListedBucketMultipartUploads, ListedBucketObjectVersions,
-    ListedBucketObjects, ListedMultipartParts, MultipartCompletionSnapshot,
-    MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEncryption, ObjectKey,
-    ObjectLayout, ObjectPayloadSegment, ObjectReadSnapshot, ObjectReadSnapshotMode,
-    ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord, OwnerIdentity, PgId, PgState,
+    ListedBucketObjects, ListedMultipartParts, ObjectEncryption, ObjectKey, ObjectLayout,
+    ObjectPayloadSegment, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome,
+    ObjectRetention, ObjectSegmentRecord, OwnerIdentity, PgId, PgState,
     PlacedSegmentBackfillReferenceCursor, PlacedSegmentShardBackfillClaimAcquire,
     PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
@@ -3378,20 +3379,6 @@ impl ActiveMultipartObjectRoute<'_> {
     }
 
     /// Resolve one multipart upload for request authorization on this exact
-    /// admitted object route.
-    pub fn lookup_multipart_upload_management(
-        &self,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
-        self.admission
-            .cluster
-            .lookup_multipart_upload_management_with_route_validation(
-                self.effect_route(),
-                upload_id,
-                || self.admission.require_valid_now(),
-            )
-    }
-
     /// Classify one multipart upload through the logical abort-authorization boundary.
     pub fn lookup_multipart_upload_for_abort(
         &self,
@@ -3422,6 +3409,21 @@ impl ActiveMultipartObjectRoute<'_> {
             .map(crate::MultipartUploadListPartsLookup::from_management_lookup)
     }
 
+    /// Classify one multipart upload through the logical completion-authorization boundary.
+    pub fn lookup_multipart_upload_for_completion(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<crate::MultipartUploadCompletionLookup, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .lookup_multipart_upload_management_with_route_validation(
+                self.effect_route(),
+                upload_id,
+                || self.admission.require_valid_now(),
+            )
+            .map(crate::MultipartUploadCompletionLookup::from_management_lookup)
+    }
+
     /// Load an in-progress upload through the logical UploadPart authorization boundary.
     pub fn load_multipart_upload_for_part(
         &self,
@@ -3437,8 +3439,25 @@ impl ActiveMultipartObjectRoute<'_> {
             .map(crate::MultipartUploadPartCandidate::from_record)
     }
 
-    /// Load an in-progress upload through this exact admitted object route.
-    pub fn load_in_progress_multipart_upload(
+    /// Require an in-progress upload on this exact admitted object route without
+    /// exposing its durable record.
+    pub fn require_in_progress_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<(), ObjectPgActionError> {
+        self.admission
+            .cluster
+            .load_in_progress_multipart_upload_with_route_validation(
+                self.effect_route(),
+                upload_id,
+                || self.admission.require_valid_now(),
+            )
+            .map(drop)
+    }
+
+    /// Load an in-progress upload for storage-owned tests.
+    #[cfg(test)]
+    pub(crate) fn load_in_progress_multipart_upload(
         &self,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
@@ -3537,7 +3556,7 @@ impl ActiveMultipartObjectRoute<'_> {
     }
 
     #[cfg(feature = "test-hooks")]
-    pub fn try_load_in_progress_multipart_upload(
+    fn try_load_in_progress_multipart_upload(
         &self,
         upload_id: &UploadId,
     ) -> Result<Option<MultipartUploadRecord>, ObjectPgActionError> {
@@ -3545,6 +3564,15 @@ impl ActiveMultipartObjectRoute<'_> {
         self.admission
             .cluster
             .try_load_in_progress_multipart_upload(&self.bucket, &self.key, upload_id)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn try_load_multipart_upload_for_completion(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<Option<crate::MultipartUploadCompletionCandidate>, ObjectPgActionError> {
+        self.try_load_in_progress_multipart_upload(upload_id)
+            .map(|upload| upload.map(crate::MultipartUploadCompletionCandidate::from_record))
     }
 
     /// List parts for the exact upload authorized through this admitted
@@ -3570,17 +3598,24 @@ impl ActiveMultipartObjectRoute<'_> {
     /// this admitted object route.
     pub fn load_multipart_completion_snapshot(
         &self,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
+        authorized_upload: crate::AuthorizedMultipartUploadCompletion,
         requested_part_numbers: &[u32],
-    ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
-        self.admission
+    ) -> Result<crate::AuthorizedMultipartCompletionSnapshot, ObjectPgActionError> {
+        let upload = authorized_upload.into_record();
+        let internal_authorized_upload =
+            AuthorizedMultipartUploadRecord::assume_authorized(upload.clone());
+        let snapshot = self
+            .admission
             .cluster
             .load_multipart_completion_snapshot_with_route_validation(
                 self.effect_route(),
-                authorized_upload,
+                &internal_authorized_upload,
                 requested_part_numbers,
                 || self.admission.require_valid_now(),
-            )
+            )?;
+        Ok(crate::AuthorizedMultipartCompletionSnapshot::new(
+            snapshot, upload,
+        ))
     }
 
     /// Publish completion for this exact admitted multipart object route.
