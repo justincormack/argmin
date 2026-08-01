@@ -5035,17 +5035,24 @@ impl std::fmt::Debug for MultipartUploadAbortCandidate {
     }
 }
 
-/// Logical ownership identity for a multipart upload that cannot be aborted.
+/// Logical ownership identity for multipart-upload management authorization.
 ///
-/// This projection supports the same authorization decision as an active upload without
-/// retaining either its durable record or a path to an abort capability.
+/// This projection supports authorization of a terminal upload without retaining either its
+/// durable record or a path to an operation capability.
 #[derive(Debug)]
-pub struct MultipartUploadAbortIdentity {
+pub struct MultipartUploadAuthorizationIdentity {
     owner: OwnerIdentity,
     initiator: OwnerIdentity,
 }
 
-impl MultipartUploadAbortIdentity {
+impl MultipartUploadAuthorizationIdentity {
+    fn from_upload(upload: MultipartUploadRecord) -> Self {
+        Self {
+            owner: upload.owner,
+            initiator: upload.initiator,
+        }
+    }
+
     #[must_use]
     pub fn owner(&self) -> &OwnerIdentity {
         &self.owner
@@ -5088,7 +5095,7 @@ impl std::fmt::Debug for AuthorizedMultipartUploadAbort {
 #[derive(Debug)]
 pub enum MultipartUploadAbortLookup {
     InProgress(Box<MultipartUploadAbortCandidate>),
-    NonInProgress(MultipartUploadAbortIdentity),
+    NonInProgress(MultipartUploadAuthorizationIdentity),
     Replay(UploadId),
     Missing,
 }
@@ -5100,10 +5107,84 @@ impl MultipartUploadAbortLookup {
                 Self::InProgress(Box::new(MultipartUploadAbortCandidate(*upload)))
             }
             MultipartUploadManagementLookup::NonInProgress(upload) => {
-                Self::NonInProgress(MultipartUploadAbortIdentity {
-                    owner: upload.owner,
-                    initiator: upload.initiator,
-                })
+                Self::NonInProgress(MultipartUploadAuthorizationIdentity::from_upload(*upload))
+            }
+            MultipartUploadManagementLookup::Replay(replay) => Self::Replay(replay.upload_id),
+            MultipartUploadManagementLookup::Missing => Self::Missing,
+        }
+    }
+}
+
+/// Opaque active-upload identity used while authorizing ListParts.
+///
+/// Storage retains the complete durable upload record. Higher layers may inspect only the
+/// logical ownership identities needed for authorization, then consume the candidate into the
+/// capability required by the storage-owned listing operation.
+pub struct MultipartUploadListPartsCandidate(MultipartUploadRecord);
+
+impl MultipartUploadListPartsCandidate {
+    #[must_use]
+    pub fn owner(&self) -> &OwnerIdentity {
+        &self.0.owner
+    }
+
+    #[must_use]
+    pub fn initiator(&self) -> &OwnerIdentity {
+        &self.0.initiator
+    }
+
+    #[must_use]
+    pub fn into_authorized_list_parts(self) -> AuthorizedMultipartUploadListParts {
+        AuthorizedMultipartUploadListParts::assume_authorized(self.0)
+    }
+}
+
+impl std::fmt::Debug for MultipartUploadListPartsCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MultipartUploadListPartsCandidate")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque capability authorizing ListParts for one exact in-progress upload.
+pub struct AuthorizedMultipartUploadListParts(MultipartUploadRecord);
+
+impl AuthorizedMultipartUploadListParts {
+    pub(crate) fn assume_authorized(upload: MultipartUploadRecord) -> Self {
+        Self(upload)
+    }
+
+    pub(crate) fn record(&self) -> &MultipartUploadRecord {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AuthorizedMultipartUploadListParts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedMultipartUploadListParts")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Storage-owned logical classification for authorizing ListParts.
+#[derive(Debug)]
+pub enum MultipartUploadListPartsLookup {
+    InProgress(Box<MultipartUploadListPartsCandidate>),
+    NonInProgress(MultipartUploadAuthorizationIdentity),
+    Replay(UploadId),
+    Missing,
+}
+
+impl MultipartUploadListPartsLookup {
+    pub(crate) fn from_management_lookup(lookup: MultipartUploadManagementLookup) -> Self {
+        match lookup {
+            MultipartUploadManagementLookup::InProgress(upload) => {
+                Self::InProgress(Box::new(MultipartUploadListPartsCandidate(*upload)))
+            }
+            MultipartUploadManagementLookup::NonInProgress(upload) => {
+                Self::NonInProgress(MultipartUploadAuthorizationIdentity::from_upload(*upload))
             }
             MultipartUploadManagementLookup::Replay(replay) => Self::Replay(replay.upload_id),
             MultipartUploadManagementLookup::Missing => Self::Missing,
@@ -6114,18 +6195,18 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn abort_lookup_test_upload(state: UploadState) -> MultipartUploadRecord {
+    fn management_lookup_test_upload(state: UploadState) -> MultipartUploadRecord {
         MultipartUploadRecord {
-            upload_id: UploadId::for_test("abort-lookup"),
-            bucket: BucketName::try_from("abort-lookup-bucket").unwrap(),
+            upload_id: UploadId::for_test("management-lookup"),
+            bucket: BucketName::try_from("management-lookup-bucket").unwrap(),
             key: ObjectKey::try_from("private-durable-key").unwrap(),
             initiated_at: 17,
             state,
             tags: None,
             metadata_blob: SerializedMetadataBlob::default(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: OwnerIdentity::from_principal("abort-initiator"),
-            owner: OwnerIdentity::from_principal("abort-owner"),
+            initiator: OwnerIdentity::from_principal("lookup-initiator"),
+            owner: OwnerIdentity::from_principal("lookup-owner"),
             acl_grants: AclGrants::default(),
             public_read: false,
             object_generation_id: GenerationId::new(23).unwrap(),
@@ -6138,7 +6219,7 @@ mod tests {
 
     #[test]
     fn multipart_abort_lookup_exposes_only_logical_authorization_state() {
-        let upload = abort_lookup_test_upload(UploadState::InProgress);
+        let upload = management_lookup_test_upload(UploadState::InProgress);
         let upload_id = upload.upload_id.clone();
         let lookup = MultipartUploadAbortLookup::from_management_lookup(
             MultipartUploadManagementLookup::InProgress(Box::new(upload)),
@@ -6146,8 +6227,8 @@ mod tests {
         let MultipartUploadAbortLookup::InProgress(candidate) = lookup else {
             panic!("in-progress management result must remain abortable");
         };
-        assert_eq!(candidate.owner().principal, "abort-owner");
-        assert_eq!(candidate.initiator().principal, "abort-initiator");
+        assert_eq!(candidate.owner().principal, "lookup-owner");
+        assert_eq!(candidate.initiator().principal, "lookup-initiator");
         assert_eq!(
             format!("{candidate:?}"),
             format!("MultipartUploadAbortCandidate {{ upload_id: {upload_id:?}, .. }}")
@@ -6161,15 +6242,51 @@ mod tests {
             format!("AuthorizedMultipartUploadAbort {{ upload_id: {upload_id:?}, .. }}")
         );
 
-        let terminal = abort_lookup_test_upload(UploadState::Completing);
+        let terminal = management_lookup_test_upload(UploadState::Completing);
         let lookup = MultipartUploadAbortLookup::from_management_lookup(
             MultipartUploadManagementLookup::NonInProgress(Box::new(terminal)),
         );
         let MultipartUploadAbortLookup::NonInProgress(identity) = lookup else {
             panic!("non-in-progress management result must not carry an abort capability");
         };
-        assert_eq!(identity.owner().principal, "abort-owner");
-        assert_eq!(identity.initiator().principal, "abort-initiator");
+        assert_eq!(identity.owner().principal, "lookup-owner");
+        assert_eq!(identity.initiator().principal, "lookup-initiator");
+    }
+
+    #[test]
+    fn multipart_list_parts_lookup_exposes_only_logical_authorization_state() {
+        let upload = management_lookup_test_upload(UploadState::InProgress);
+        let upload_id = upload.upload_id.clone();
+        let lookup = MultipartUploadListPartsLookup::from_management_lookup(
+            MultipartUploadManagementLookup::InProgress(Box::new(upload)),
+        );
+        let MultipartUploadListPartsLookup::InProgress(candidate) = lookup else {
+            panic!("in-progress management result must remain listable");
+        };
+        assert_eq!(candidate.owner().principal, "lookup-owner");
+        assert_eq!(candidate.initiator().principal, "lookup-initiator");
+        assert_eq!(
+            format!("{candidate:?}"),
+            "MultipartUploadListPartsCandidate { .. }"
+        );
+
+        let authorized = candidate.into_authorized_list_parts();
+        assert_eq!(authorized.record().upload_id, upload_id);
+        assert_eq!(authorized.record().key.as_str(), "private-durable-key");
+        assert_eq!(
+            format!("{authorized:?}"),
+            "AuthorizedMultipartUploadListParts { .. }"
+        );
+
+        let terminal = management_lookup_test_upload(UploadState::Completing);
+        let lookup = MultipartUploadListPartsLookup::from_management_lookup(
+            MultipartUploadManagementLookup::NonInProgress(Box::new(terminal)),
+        );
+        let MultipartUploadListPartsLookup::NonInProgress(identity) = lookup else {
+            panic!("non-in-progress management result must not carry a listing capability");
+        };
+        assert_eq!(identity.owner().principal, "lookup-owner");
+        assert_eq!(identity.initiator().principal, "lookup-initiator");
     }
 
     #[test]

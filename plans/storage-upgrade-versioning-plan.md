@@ -1137,6 +1137,23 @@ derived clone/equality over the opaque candidate or capability. Multipart Upload
 and ListParts authorization still expose the broad authorized durable upload wrapper and remain
 pending, so implementation-order item 3 is not yet complete.
 
+The eighteenth bounded slice continues implementation-order item 3 with ListParts authorization.
+Storage consumes the broad management lookup before it crosses the crate boundary. Active uploads
+expose only owner and initiator identities and can be consumed into a non-cloneable,
+non-comparable ListParts-only capability. Terminal uploads share the logical multipart-management
+identity projection introduced by the abort slice but have no path to any operation capability;
+completed replay state is reduced to the logical upload ID needed for the established terminal
+authorization decision. The coordinator passes the opaque capability back through the same
+admitted multipart-object route and cannot inspect even its upload ID. Storage expands it back to
+the complete durable record only inside the owner crate, preserving the existing local/Unix node
+client, database, and storage RPC representations. The already-contained logical ListParts result
+is unchanged. Compiler visibility is the primary boundary, with checks rejecting broad
+management/durable records in ListParts authorization, results, and execution, and rejecting new
+public methods, durable-state Debug output, clone, or equality surfaces on the candidate or
+capability. UploadPart and
+completion authorization still expose the broad authorized durable upload wrapper and remain
+pending, so implementation-order item 3 is not yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

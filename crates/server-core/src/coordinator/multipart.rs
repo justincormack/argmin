@@ -1257,7 +1257,7 @@ impl Coordinator {
         #[cfg(test)]
         super::maybe_run_list_parts_authorized_hook(req.upload.bucket_name(), req.upload.key());
         let listed = multipart_route
-            .list_multipart_parts_for_authorized_upload(
+            .list_parts_for_authorized_upload(
                 &authorized_upload,
                 req.part_number_marker,
                 req.max_parts,

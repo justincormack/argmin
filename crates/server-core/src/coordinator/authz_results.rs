@@ -333,7 +333,7 @@ pub(super) enum AuthorizedAbortMultipartUpload {
 #[derive(Debug)]
 pub(super) struct AuthorizedListParts {
     pub(super) bucket_info: BucketSummary,
-    pub(super) upload: AuthorizedMultipartUploadRecord,
+    pub(super) upload: storage::AuthorizedMultipartUploadListParts,
 }
 
 #[derive(Debug)]

@@ -987,27 +987,29 @@ impl Coordinator {
             req.expected_bucket_owner(),
         )?;
         match multipart_route
-            .lookup_multipart_upload_management(upload_id)
+            .lookup_multipart_upload_for_list_parts(upload_id)
             .map_err(Self::map_object_pg_action_error)?
         {
-            storage::MultipartUploadManagementLookup::InProgress(upload) => {
-                if !Self::requester_can_manage_multipart_upload(
+            storage::MultipartUploadListPartsLookup::InProgress(upload) => {
+                if !Self::requester_can_manage_multipart_upload_identity(
                     req.upload.requester(),
                     &bucket_info,
-                    &upload,
+                    upload.owner(),
+                    upload.initiator(),
                 ) {
                     return Err(ServerError::AccessDenied);
                 }
                 Ok(AuthorizedListParts {
                     bucket_info: bucket_info.into_inner(),
-                    upload: storage::AuthorizedMultipartUploadRecord::assume_authorized(*upload),
+                    upload: upload.into_authorized_list_parts(),
                 })
             }
-            storage::MultipartUploadManagementLookup::NonInProgress(upload) => {
-                if !Self::requester_can_manage_multipart_upload(
+            storage::MultipartUploadListPartsLookup::NonInProgress(upload) => {
+                if !Self::requester_can_manage_multipart_upload_identity(
                     req.upload.requester(),
                     &bucket_info,
-                    &upload,
+                    upload.owner(),
+                    upload.initiator(),
                 ) {
                     return Err(ServerError::AccessDenied);
                 }
@@ -1015,11 +1017,11 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 })
             }
-            storage::MultipartUploadManagementLookup::Replay(upload) => {
+            storage::MultipartUploadListPartsLookup::Replay(replay_upload_id) => {
                 if !Self::requester_can_manage_authenticated_multipart_upload_id(
                     req.upload.requester(),
                     &bucket_info,
-                    &upload.upload_id,
+                    &replay_upload_id,
                 ) {
                     return Err(ServerError::AccessDenied);
                 }
@@ -1027,7 +1029,7 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 })
             }
-            storage::MultipartUploadManagementLookup::Missing => {
+            storage::MultipartUploadListPartsLookup::Missing => {
                 if bucket_info
                     .multipart_upload_id_authority
                     .authenticates(bucket, key, upload_id)

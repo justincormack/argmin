@@ -3407,6 +3407,21 @@ impl ActiveMultipartObjectRoute<'_> {
             .map(crate::MultipartUploadAbortLookup::from_management_lookup)
     }
 
+    /// Classify one multipart upload through the logical ListParts authorization boundary.
+    pub fn lookup_multipart_upload_for_list_parts(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<crate::MultipartUploadListPartsLookup, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .lookup_multipart_upload_management_with_route_validation(
+                self.effect_route(),
+                upload_id,
+                || self.admission.require_valid_now(),
+            )
+            .map(crate::MultipartUploadListPartsLookup::from_management_lookup)
+    }
+
     /// Load an in-progress upload through this exact admitted object route.
     pub fn load_in_progress_multipart_upload(
         &self,
@@ -3518,9 +3533,9 @@ impl ActiveMultipartObjectRoute<'_> {
 
     /// List parts for the exact upload authorized through this admitted
     /// object route.
-    pub fn list_multipart_parts_for_authorized_upload(
+    pub fn list_parts_for_authorized_upload(
         &self,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
+        authorized_upload: &crate::AuthorizedMultipartUploadListParts,
         part_number_marker: Option<u32>,
         max_parts: u32,
     ) -> Result<ListedMultipartParts, ObjectPgActionError> {

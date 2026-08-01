@@ -15338,7 +15338,7 @@ impl super::StorageCluster {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn list_multipart_parts_for_authorized_upload(
         &self,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
+        authorized_upload: &crate::AuthorizedMultipartUploadListParts,
         part_number_marker: Option<u32>,
         max_parts: u32,
     ) -> Result<ListedMultipartParts, ObjectPgActionError> {
@@ -15361,7 +15361,7 @@ impl super::StorageCluster {
     pub(super) fn list_multipart_parts_for_authorized_upload_with_route_validation(
         &self,
         route: super::MultipartObjectMutationEffectRoute<'_>,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
+        authorized_upload: &crate::AuthorizedMultipartUploadListParts,
         part_number_marker: Option<u32>,
         max_parts: u32,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
@@ -15380,11 +15380,13 @@ impl super::StorageCluster {
             ));
         }
         require_valid_route().map_err(ObjectPgActionError::Store)?;
+        let internal_authorized_upload =
+            AuthorizedMultipartUploadRecord::assume_authorized(authorized_upload.record().clone());
         self.object_mutation_metadata_primary_client(bucket, key)?
             .open_authorized_multipart_upload_metadata_route(
                 self.operation_epoch(),
                 pg_id,
-                authorized_upload,
+                &internal_authorized_upload,
             )?
             .list_multipart_parts(part_number_marker, max_parts)
     }
