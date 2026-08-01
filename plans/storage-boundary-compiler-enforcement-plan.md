@@ -4726,6 +4726,40 @@ One-hundred-and-eighteenth Phase 3 slice:
   creation regressions. Workspace-wide strict Clippy and the transitional
   storage boundary checker also pass.
 
+One-hundred-and-nineteenth Phase 3 slice:
+
+- active stream-session reads, staging-segment reads, append preparation, and
+  PutObject reservation renewal now consume a
+  `StreamUploadSessionMetadataRoute` bound to one active cluster epoch, exact
+  object-metadata primary PG, bucket, key, and session ID. The raw variants
+  taking independently substitutable PG/object/session arguments are removed
+  from the aggregate object-mutation node-client interface.
+- embedded and Unix adapters derive every wire or store request from the
+  scoped route. Append preparation rejects a request carrying another session
+  before allocator access, while its portable effect deadline is revalidated
+  immediately before the durable segment-ID allocation. Reservation renewal
+  similarly revalidates at the durable row update and requires the exact
+  PutObject operation, bucket/key target, stable reservation identity, durable
+  session proof, and PutObject target.
+- reservation subject validation intentionally permits a durable proof from a
+  retained older epoch: current active-route authority is carried separately
+  by the effect fence, while both current and renewed proofs must retain one
+  identical stable historical identity. The existing cross-epoch heartbeat
+  regression pins successful bucket-PG renewal followed by the object-PG
+  session-row update.
+- cluster append publication, heartbeat refresh, retry inspection, and stream
+  abort snapshot loading now retain one scoped session route rather than
+  repeatedly rebuilding raw object arguments. Embedded coverage proves a
+  crossed session cannot advance another session's allocator; installed-Unix
+  coverage retains equivalent wrong-PG state and requires `PayloadDecode`,
+  rejects future route epochs and crossed operations before RPC, and rejects
+  PutObject renewal against an UploadPart session without mutation.
+- stream finalization command construction, abort command construction, and
+  payload-reclaim families remain open in Phase 3.
+- all 2,560 storage tests and the full 7,880-test workspace suite pass.
+  Workspace-wide strict Clippy and the transitional storage boundary checker
+  also pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

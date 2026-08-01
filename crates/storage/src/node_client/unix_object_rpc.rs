@@ -101,6 +101,15 @@ struct UnixStreamUploadCreationMetadataRoute<'a> {
     key: ObjectKey,
 }
 
+struct UnixStreamUploadSessionMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+    session_id: SessionId,
+}
+
 struct UnixObjectListingMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
     pg_id: ObjectMetadataScanPgId,
@@ -1799,6 +1808,106 @@ impl ObjectVersionMetadataRoute for UnixObjectVersionMetadataRoute<'_> {
 }
 
 impl UnixStorageNodeClient {
+    fn load_stream_upload_session_rpc(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<StreamUploadRecord, ObjectPgActionError> {
+        let request = StorageRpcStreamUploadSessionRequest {
+            object: self.object_request(pg_id.pg_id(), bucket, key),
+            session_id: session_id.clone(),
+        };
+        let payload = encode_stream_upload_session_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamUploadSessionLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_stream_upload_session_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.rpc_payload_error("decode stream upload session response", error.to_string()),
+            )
+        })?;
+        match response.outcome {
+            StorageRpcStreamUploadSessionOutcome::Loaded(session) => {
+                self.validate_stream_upload_session_response(
+                    &session,
+                    bucket,
+                    key,
+                    session_id,
+                    "validate stream upload session response",
+                )?;
+                Ok(*session)
+            }
+            StorageRpcStreamUploadSessionOutcome::NotFound {
+                session_id: returned_session_id,
+            } => {
+                if returned_session_id != *session_id {
+                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        "validate stream upload session response",
+                        "missing session id does not match request".to_string(),
+                    )));
+                }
+                Err(MetadataError::StreamSessionNotFound {
+                    session_id: session_id.as_str().to_string(),
+                }
+                .into())
+            }
+        }
+    }
+
+    fn load_stream_upload_segments_rpc(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError> {
+        let request = StorageRpcStreamUploadSessionRequest {
+            object: self.object_request(pg_id.pg_id(), bucket, key),
+            session_id: session_id.clone(),
+        };
+        let payload = encode_stream_upload_session_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamUploadSegmentsLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_stream_upload_segments_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.rpc_payload_error("decode stream upload segments response", error.to_string()),
+            )
+        })?;
+        match response.outcome {
+            StorageRpcStreamUploadSegmentsOutcome::Loaded(segments) => {
+                self.validate_stream_upload_segments_response(
+                    &segments,
+                    session_id,
+                    "validate stream upload segments response",
+                )?;
+                Ok(segments)
+            }
+            StorageRpcStreamUploadSegmentsOutcome::NotFound {
+                session_id: returned_session_id,
+            } => {
+                if returned_session_id != *session_id {
+                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        "validate stream upload segments response",
+                        "missing session id does not match request".to_string(),
+                    )));
+                }
+                Err(MetadataError::StreamSessionNotFound {
+                    session_id: session_id.as_str().to_string(),
+                }
+                .into())
+            }
+        }
+    }
+
     fn prepare_stream_segment_append_rpc(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -1808,7 +1917,7 @@ impl UnixStorageNodeClient {
         effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
         let expected_session =
-            self.load_stream_upload_session(pg_id, bucket, key, &request.session_id)?;
+            self.load_stream_upload_session_rpc(pg_id, bucket, key, &request.session_id)?;
         let expected_target = expected_session.target;
         let rpc_request = StorageRpcStreamSegmentAppendPrepareRequest {
             object: self.object_request(pg_id.pg_id(), bucket, key),
@@ -3618,6 +3727,123 @@ impl StreamUploadCreationMetadataRoute for UnixStreamUploadCreationMetadataRoute
     }
 }
 
+impl UnixStreamUploadSessionMetadataRoute<'_> {
+    fn require_put_reservation_subject(
+        &self,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), ObjectPgActionError> {
+        // The active route separately authorizes this RPC at the current
+        // epoch. A durable stream reservation may retain its creation epoch
+        // across route transitions, so validate its stable subject here.
+        if proof.bucket != self.bucket
+            || proof.operation_kind != PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+            || proof.target_context.as_deref() != Some(self.key.as_str())
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "update stream upload bucket write reservation",
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl StreamUploadSessionMetadataRoute for UnixStreamUploadSessionMetadataRoute<'_> {
+    fn load_session(&self) -> Result<StreamUploadRecord, ObjectPgActionError> {
+        self.client.load_stream_upload_session_rpc(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            &self.session_id,
+        )
+    }
+
+    fn load_segments(&self) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError> {
+        self.client.load_stream_upload_segments_rpc(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            &self.session_id,
+        )
+    }
+
+    fn prepare_segment_append(
+        &self,
+        request: &PrepareStreamUploadSegmentAppendReq,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        if request.session_id != self.session_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "prepare stream segment append",
+            }
+            .into());
+        }
+        let effect_deadline =
+            effect_fence
+                .deadline()
+                .map(|deadline| StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                });
+        self.client.prepare_stream_segment_append_rpc(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            request,
+            effect_deadline,
+        )
+    }
+
+    fn update_put_bucket_write_reservation(
+        &self,
+        current: &BucketWriteReservationProof,
+        renewed: &BucketWriteReservationProof,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(), ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        self.require_put_reservation_subject(current)?;
+        self.require_put_reservation_subject(renewed)?;
+        if !current.has_same_stable_identity(renewed) {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "update stream upload bucket write reservation",
+            }
+            .into());
+        }
+        let request = StorageRpcStreamUploadBucketWriteReservationUpdateRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            session_id: self.session_id.clone(),
+            current: current.clone(),
+            renewed: renewed.clone(),
+            effect_deadline: effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
+        };
+        let payload = encode_stream_upload_bucket_write_reservation_update_request(&request);
+        let response = self
+            .client
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamUploadBucketWriteReservationUpdate,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        self.client
+            .validate_empty_bucket_write_reservation_response(
+                "decode fenced stream upload bucket write reservation update response",
+                &response,
+            )
+            .map_err(|error| match error {
+                BucketSnapshotLoadError::Store(error) => ObjectPgActionError::Store(error),
+                BucketSnapshotLoadError::Metadata(error) => ObjectPgActionError::Metadata(error),
+            })
+    }
+}
+
 impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
     fn open_put_object_metadata_route(
         &self,
@@ -3787,104 +4013,30 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         }))
     }
 
-    fn load_stream_upload_session(
+    fn open_stream_upload_session_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
-    ) -> Result<StreamUploadRecord, ObjectPgActionError> {
-        let request = StorageRpcStreamUploadSessionRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
-            session_id: session_id.clone(),
-        };
-        let payload = encode_stream_upload_session_request(&request);
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectStreamUploadSessionLoad,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response = decode_stream_upload_session_response(&response).map_err(|error| {
-            ObjectPgActionError::Store(
-                self.rpc_payload_error("decode stream upload session response", error.to_string()),
-            )
-        })?;
-        match response.outcome {
-            StorageRpcStreamUploadSessionOutcome::Loaded(session) => {
-                self.validate_stream_upload_session_response(
-                    &session,
-                    bucket,
-                    key,
-                    session_id,
-                    "validate stream upload session response",
-                )?;
-                Ok(*session)
+    ) -> Result<Box<dyn StreamUploadSessionMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
             }
-            StorageRpcStreamUploadSessionOutcome::NotFound {
-                session_id: returned_session_id,
-            } => {
-                if returned_session_id != *session_id {
-                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                        "validate stream upload session response",
-                        "missing session id does not match request".to_string(),
-                    )));
-                }
-                Err(MetadataError::StreamSessionNotFound {
-                    session_id: session_id.as_str().to_string(),
-                }
-                .into())
-            }
+            .into());
         }
-    }
-
-    fn load_stream_upload_segments(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError> {
-        let request = StorageRpcStreamUploadSessionRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
+        Ok(Box::new(UnixStreamUploadSessionMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
             session_id: session_id.clone(),
-        };
-        let payload = encode_stream_upload_session_request(&request);
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectStreamUploadSegmentsLoad,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response = decode_stream_upload_segments_response(&response).map_err(|error| {
-            ObjectPgActionError::Store(
-                self.rpc_payload_error("decode stream upload segments response", error.to_string()),
-            )
-        })?;
-        match response.outcome {
-            StorageRpcStreamUploadSegmentsOutcome::Loaded(segments) => {
-                self.validate_stream_upload_segments_response(
-                    &segments,
-                    session_id,
-                    "validate stream upload segments response",
-                )?;
-                Ok(segments)
-            }
-            StorageRpcStreamUploadSegmentsOutcome::NotFound {
-                session_id: returned_session_id,
-            } => {
-                if returned_session_id != *session_id {
-                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                        "validate stream upload segments response",
-                        "missing session id does not match request".to_string(),
-                    )));
-                }
-                Err(MetadataError::StreamSessionNotFound {
-                    session_id: session_id.as_str().to_string(),
-                }
-                .into())
-            }
-        }
+        }))
     }
 
     fn list_stream_uploads_for_bucket_page(
@@ -4245,36 +4397,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         Ok(response.record)
     }
 
-    #[cfg(test)]
-    fn prepare_stream_segment_append(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        request: &PrepareStreamUploadSegmentAppendReq,
-    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        self.prepare_stream_segment_append_rpc(pg_id, bucket, key, request, None)
-    }
-
-    fn prepare_stream_segment_append_with_effect_fence(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        request: &PrepareStreamUploadSegmentAppendReq,
-        effect_fence: AdmittedRouteEffectFence,
-    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        effect_fence.require_valid_for(self.cluster_epoch)?;
-        let effect_deadline =
-            effect_fence
-                .deadline()
-                .map(|deadline| StorageRpcAdmittedRouteEffectDeadline {
-                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
-                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
-                });
-        self.prepare_stream_segment_append_rpc(pg_id, bucket, key, request, effect_deadline)
-    }
-
     fn load_stream_put_finalize_snapshot(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -4307,82 +4429,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             session_id,
         )?;
         Ok(response.snapshot)
-    }
-
-    fn update_stream_upload_bucket_write_reservation(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-        current: &BucketWriteReservationProof,
-        renewed: &BucketWriteReservationProof,
-    ) -> Result<(), ObjectPgActionError> {
-        let request = StorageRpcStreamUploadBucketWriteReservationUpdateRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
-            session_id: session_id.clone(),
-            current: current.clone(),
-            renewed: renewed.clone(),
-            effect_deadline: None,
-        };
-        let payload = encode_stream_upload_bucket_write_reservation_update_request(&request);
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectStreamUploadBucketWriteReservationUpdate,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        self.validate_empty_bucket_write_reservation_response(
-            "decode stream upload bucket write reservation update response",
-            &response,
-        )
-        .map_err(|error| match error {
-            BucketSnapshotLoadError::Store(error) => ObjectPgActionError::Store(error),
-            BucketSnapshotLoadError::Metadata(error) => ObjectPgActionError::Metadata(error),
-        })
-    }
-
-    fn update_stream_upload_bucket_write_reservation_with_effect_fence(
-        &self,
-        update: UpdateStreamUploadBucketWriteReservationReq<'_>,
-    ) -> Result<(), ObjectPgActionError> {
-        let route_cluster_epoch = update.effect_fence.cluster_epoch();
-        update.effect_fence.require_valid_for(route_cluster_epoch)?;
-        if route_cluster_epoch != self.cluster_epoch {
-            return Err(ObjectPgActionError::Store(
-                StoreError::RouteAdmissionClusterMismatch {
-                    admitted_epoch: route_cluster_epoch,
-                    operation_epoch: self.cluster_epoch,
-                },
-            ));
-        }
-        let request = StorageRpcStreamUploadBucketWriteReservationUpdateRequest {
-            object: self.object_request(update.pg_id.pg_id(), update.bucket, update.key),
-            session_id: update.session_id.clone(),
-            current: update.current.clone(),
-            renewed: update.renewed.clone(),
-            effect_deadline: update.effect_fence.deadline().map(|deadline| {
-                StorageRpcAdmittedRouteEffectDeadline {
-                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
-                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
-                }
-            }),
-        };
-        let payload = encode_stream_upload_bucket_write_reservation_update_request(&request);
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectStreamUploadBucketWriteReservationUpdate,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        self.validate_empty_bucket_write_reservation_response(
-            "decode fenced stream upload bucket write reservation update response",
-            &response,
-        )
-        .map_err(|error| match error {
-            BucketSnapshotLoadError::Store(error) => ObjectPgActionError::Store(error),
-            BucketSnapshotLoadError::Metadata(error) => ObjectPgActionError::Metadata(error),
-        })
     }
 
     fn build_stream_put_commit_command(

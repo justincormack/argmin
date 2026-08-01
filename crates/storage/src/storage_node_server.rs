@@ -57,7 +57,7 @@ use crate::node_client::{
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
     RetainedBucketWriteReservationNodeClient, RetainedMetadataCommandNodeClient,
     RetainedObjectMutationMetadataNodeClient, ShardAckNodeClient, ShardScavengerNodeClient,
-    ShardScavengerObservationNodeClient, UpdateStreamUploadBucketWriteReservationReq,
+    ShardScavengerObservationNodeClient,
 };
 use crate::node_runtime::pg_store::{
     initialize_pg_durable_identity, inspect_pg_shard_inventory, sync_initialized_pg_store_layout,
@@ -4769,13 +4769,15 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::load_stream_upload_session(
+        ObjectMutationMetadataNodeClient::open_stream_upload_session_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
             session_id,
         )
+        .and_then(|route| route.load_session())
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5178,19 +5180,31 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::update_stream_upload_bucket_write_reservation_with_effect_fence(
+        let route = ObjectMutationMetadataNodeClient::open_stream_upload_session_metadata_route(
             &local_client,
-            UpdateStreamUploadBucketWriteReservationReq {
-                pg_id: self.route.pg_id,
-                bucket: self.route.bucket,
-                key: self.route.key,
-                session_id,
-                current,
-                renewed,
-                effect_fence,
-            },
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            session_id,
         )
-        .map_err(StorageNodeObjectRouteError::Object)
+        .map_err(StorageNodeObjectRouteError::Object)?;
+        let session = route
+            .load_session()
+            .map_err(StorageNodeObjectRouteError::Object)?;
+        if session.target != StreamUploadTarget::PutObject
+            || session.bucket_write_reservation.as_ref() != Some(current)
+        {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "stream upload bucket write reservation update does not match the durable PutObject session".to_string(),
+                },
+            ));
+        }
+        route
+            .update_put_bucket_write_reservation(current, renewed, effect_fence)
+            .map_err(StorageNodeObjectRouteError::Object)
     }
 
     fn load_stream_upload_segments(
@@ -5202,13 +5216,15 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::load_stream_upload_segments(
+        ObjectMutationMetadataNodeClient::open_stream_upload_session_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
             session_id,
         )
+        .and_then(|route| route.load_segments())
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5223,14 +5239,15 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             Arc::clone(&self.route.handler.node),
         );
         let (target, mut segment) =
-            ObjectMutationMetadataNodeClient::prepare_stream_segment_append_with_effect_fence(
+            ObjectMutationMetadataNodeClient::open_stream_upload_session_metadata_route(
                 &local_client,
+                self.route.fence.cluster_epoch,
                 self.route.pg_id,
                 self.route.bucket,
                 self.route.key,
-                request,
-                effect_fence,
+                &request.session_id,
             )
+            .and_then(|route| route.prepare_segment_append(request, effect_fence))
             .map_err(StorageNodeObjectRouteError::Object)?;
         segment.placement_cluster_epoch = self.route.fence.cluster_epoch;
         Ok((target, segment))

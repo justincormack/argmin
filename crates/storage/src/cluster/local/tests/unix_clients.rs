@@ -5,8 +5,8 @@ use crate::node_client::{
 };
 use crate::storage_rpc::StorageRpcErrorCode;
 use crate::types::{
-    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
-    PlacedSegmentShardRepairRecord,
+    AdmittedRouteEffectFence, PlacedSegmentShardRepairClaimAcquire,
+    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
 };
 use crate::{
     ObjectPayloadReclaimKind, PlacedSegmentShardBackfillClaimAcquire,
@@ -4090,30 +4090,22 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
         Err(crate::MetadataError::StreamSessionNotFound { .. })
     ));
     let mutation_client = Arc::clone(map.node(node_id).unwrap().object_mutation_metadata_client());
-
-    let loaded = mutation_client
-        .load_stream_upload_session(
+    let stream_route = mutation_client
+        .open_stream_upload_session_metadata_route(
+            ClusterEpoch::INITIAL,
             ObjectMetadataPgId::new_for_test(PgId::new(0)),
             &bucket,
             &key,
             &session_id,
         )
         .unwrap();
+
+    let loaded = stream_route.load_session().unwrap();
     assert_eq!(loaded.session_id, session_id);
-    let segments = mutation_client
-        .load_stream_upload_segments(
-            ObjectMetadataPgId::new_for_test(PgId::new(0)),
-            &bucket,
-            &key,
-            &loaded.session_id,
-        )
-        .unwrap();
+    let segments = stream_route.load_segments().unwrap();
     assert!(segments.is_empty());
-    let (target, segment) = mutation_client
-        .prepare_stream_segment_append(
-            ObjectMetadataPgId::new_for_test(PgId::new(0)),
-            &bucket,
-            &key,
+    let (target, segment) = stream_route
+        .prepare_segment_append(
             &crate::PrepareStreamUploadSegmentAppendReq {
                 session_id: loaded.session_id.clone(),
                 segment_index: 0,
@@ -4122,6 +4114,7 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
                 payload_crc64: 123,
                 segment_okh: [7; 16],
             },
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
         )
         .unwrap();
     assert_eq!(target, crate::StreamUploadTarget::PutObject);

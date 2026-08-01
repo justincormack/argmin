@@ -580,21 +580,14 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         key: &ObjectKey,
     ) -> Result<Box<dyn StreamUploadCreationMetadataRoute + '_>, ObjectPgActionError>;
 
-    fn load_stream_upload_session(
+    fn open_stream_upload_session_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
-    ) -> Result<StreamUploadRecord, ObjectPgActionError>;
-
-    fn load_stream_upload_segments(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError>;
+    ) -> Result<Box<dyn StreamUploadSessionMetadataRoute + '_>, ObjectPgActionError>;
 
     fn list_stream_uploads_for_bucket_page(
         &self,
@@ -660,24 +653,6 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         now: u64,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
 
-    #[cfg(test)]
-    fn prepare_stream_segment_append(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        request: &PrepareStreamUploadSegmentAppendReq,
-    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError>;
-
-    fn prepare_stream_segment_append_with_effect_fence(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        request: &PrepareStreamUploadSegmentAppendReq,
-        effect_fence: AdmittedRouteEffectFence,
-    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError>;
-
     fn load_stream_put_finalize_snapshot(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -685,21 +660,6 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError>;
-
-    fn update_stream_upload_bucket_write_reservation(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-        current: &BucketWriteReservationProof,
-        renewed: &BucketWriteReservationProof,
-    ) -> Result<(), ObjectPgActionError>;
-
-    fn update_stream_upload_bucket_write_reservation_with_effect_fence(
-        &self,
-        request: UpdateStreamUploadBucketWriteReservationReq<'_>,
-    ) -> Result<(), ObjectPgActionError>;
 
     fn build_stream_put_commit_command(
         &self,
@@ -768,6 +728,25 @@ pub(crate) trait StreamUploadCreationMetadataRoute: Send {
         &self,
         request: BuildCreateStreamUploadCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+}
+
+pub(crate) trait StreamUploadSessionMetadataRoute: Send {
+    fn load_session(&self) -> Result<StreamUploadRecord, ObjectPgActionError>;
+
+    fn load_segments(&self) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError>;
+
+    fn prepare_segment_append(
+        &self,
+        request: &PrepareStreamUploadSegmentAppendReq,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError>;
+
+    fn update_put_bucket_write_reservation(
+        &self,
+        current: &BucketWriteReservationProof,
+        renewed: &BucketWriteReservationProof,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(), ObjectPgActionError>;
 }
 
 pub(crate) trait ObjectDeleteMetadataRoute: Send {
@@ -920,16 +899,6 @@ pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
     pub(crate) expected_snapshot: &'a StreamPutFinalizeStorageSnapshot,
     pub(crate) commit: &'a StreamPutCommitInput,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
-}
-
-pub(crate) struct UpdateStreamUploadBucketWriteReservationReq<'a> {
-    pub(crate) pg_id: ObjectMetadataPgId,
-    pub(crate) bucket: &'a BucketName,
-    pub(crate) key: &'a ObjectKey,
-    pub(crate) session_id: &'a SessionId,
-    pub(crate) current: &'a BucketWriteReservationProof,
-    pub(crate) renewed: &'a BucketWriteReservationProof,
-    pub(crate) effect_fence: AdmittedRouteEffectFence,
 }
 
 pub(crate) struct BuildDirectPutCommitCommandReq<'a> {

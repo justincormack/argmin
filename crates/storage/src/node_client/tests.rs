@@ -2974,6 +2974,113 @@ fn stream_upload_match_binds_cleanup_deadline_for_put_and_upload_part() {
     }
 }
 
+#[test]
+fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 1, m: 0 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let bucket = crate::tests::bucket_name("scoped-stream-session-bucket");
+    let key = crate::tests::object_key("scoped-stream-session-key");
+    let first_session = crate::tests::stream_session_id("route-first");
+    let second_session = crate::tests::stream_session_id("route-second");
+    let pg_id = ObjectMetadataPgId::new_for_test(PgId::new(0));
+    let pg = storage_node.get_pg(0).unwrap();
+    for session_id in [&first_session, &second_session] {
+        PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, session_id).unwrap();
+        PgMetadataStore::create_stream_upload(
+            &*pg,
+            &CreateStreamUploadReq {
+                session_id: session_id.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                target: StreamUploadTarget::PutObject,
+                encryption: ObjectEncryption::None,
+            },
+        )
+        .unwrap();
+    }
+    drop(pg);
+
+    assert!(matches!(
+        client
+            .open_stream_upload_session_metadata_route(
+                ClusterEpoch::INITIAL,
+                ObjectMetadataPgId::new_for_test(PgId::new(1)),
+                &bucket,
+                &key,
+                &first_session,
+            )
+            .err()
+            .expect("wrong stream-session PG must be rejected at route construction"),
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open stream upload session metadata route",
+        })
+    ));
+
+    let route = client
+        .open_stream_upload_session_metadata_route(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            &bucket,
+            &key,
+            &first_session,
+        )
+        .unwrap();
+    assert_eq!(route.load_session().unwrap().session_id, first_session);
+    assert!(route.load_segments().unwrap().is_empty());
+
+    let append = PrepareStreamUploadSegmentAppendReq {
+        session_id: first_session.clone(),
+        segment_index: 0,
+        size: 12,
+        segment_crc64: 41,
+        payload_crc64: 41,
+        segment_okh: [0x41; 16],
+    };
+    let (_, prepared) = route
+        .prepare_segment_append(
+            &append,
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
+        )
+        .unwrap();
+    assert_eq!(prepared.session_id, first_session);
+
+    let second_before = storage_node
+        .get_pg(0)
+        .unwrap()
+        .get_stream_upload(&second_session)
+        .unwrap();
+    let mut crossed_append = append;
+    crossed_append.session_id = second_session.clone();
+    assert!(matches!(
+        route
+            .prepare_segment_append(
+                &crossed_append,
+                AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
+            )
+            .unwrap_err(),
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "prepare stream segment append",
+        })
+    ));
+    assert_eq!(
+        storage_node
+            .get_pg(0)
+            .unwrap()
+            .get_stream_upload(&second_session)
+            .unwrap(),
+        second_before,
+        "crossed-session append preparation must not advance the foreign allocator"
+    );
+}
+
 fn test_live_stored_object(
     bucket: BucketName,
     key: ObjectKey,

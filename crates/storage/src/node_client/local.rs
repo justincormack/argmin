@@ -172,6 +172,15 @@ struct LocalStreamUploadCreationMetadataRoute<'a> {
     key: ObjectKey,
 }
 
+struct LocalStreamUploadSessionMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+    session_id: SessionId,
+}
+
 struct LocalObjectListingMetadataRoute {
     storage_node: Arc<SharedStorageNode>,
     _route_cluster_epoch: ClusterEpoch,
@@ -2891,6 +2900,93 @@ impl StreamUploadCreationMetadataRoute for LocalStreamUploadCreationMetadataRout
     }
 }
 
+impl StreamUploadSessionMetadataRoute for LocalStreamUploadSessionMetadataRoute<'_> {
+    fn load_session(&self) -> Result<StreamUploadRecord, ObjectPgActionError> {
+        self.client.load_stream_upload_session(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            &self.session_id,
+        )
+    }
+
+    fn load_segments(&self) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError> {
+        self.client.load_stream_upload_segments(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            &self.session_id,
+        )
+    }
+
+    fn prepare_segment_append(
+        &self,
+        request: &PrepareStreamUploadSegmentAppendReq,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        if request.session_id != self.session_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "prepare stream segment append",
+            }
+            .into());
+        }
+        self.client.prepare_stream_segment_append_inner(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            request,
+            Some(effect_fence),
+        )
+    }
+
+    fn update_put_bucket_write_reservation(
+        &self,
+        current: &BucketWriteReservationProof,
+        renewed: &BucketWriteReservationProof,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<(), ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        // The active route authorizes this update at the current epoch. The
+        // durable reservation may have originated in an older retained epoch,
+        // so bind its stable subject without requiring that historical proof
+        // epoch to equal the active route epoch.
+        if current.bucket != self.bucket
+            || current.operation_kind != PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+            || current.target_context.as_deref() != Some(self.key.as_str())
+            || renewed.bucket != self.bucket
+            || renewed.operation_kind != PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+            || renewed.target_context.as_deref() != Some(self.key.as_str())
+            || !current.has_same_stable_identity(renewed)
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "update stream upload bucket write reservation",
+            }
+            .into());
+        }
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        let session = PgMetadataStore::get_stream_upload(&*pg, &self.session_id)?;
+        validate_stream_upload_session_binding(&session, &self.bucket, &self.key)?;
+        if session.target != StreamUploadTarget::PutObject
+            || session.bucket_write_reservation.as_ref() != Some(current)
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "update stream upload bucket write reservation",
+            }
+            .into());
+        }
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        Ok(
+            PgMetadataStore::update_stream_upload_bucket_write_reservation(
+                &*pg,
+                &self.session_id,
+                current,
+                renewed,
+            )?,
+        )
+    }
+}
+
 impl MultipartUploadLookupMetadataRoute for LocalMultipartUploadLookupMetadataRoute<'_> {
     fn load_multipart_upload(
         &self,
@@ -3281,24 +3377,29 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         }))
     }
 
-    fn load_stream_upload_session(
+    fn open_stream_upload_session_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
-    ) -> Result<StreamUploadRecord, ObjectPgActionError> {
-        Self::load_stream_upload_session(self, pg_id, bucket, key, session_id)
-    }
-
-    fn load_stream_upload_segments(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError> {
-        Self::load_stream_upload_segments(self, pg_id, bucket, key, session_id)
+    ) -> Result<Box<dyn StreamUploadSessionMetadataRoute + '_>, ObjectPgActionError> {
+        if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open stream upload session metadata route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalStreamUploadSessionMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            session_id: session_id.clone(),
+        }))
     }
 
     fn list_stream_uploads_for_bucket_page(
@@ -3394,35 +3495,6 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         )
     }
 
-    #[cfg(test)]
-    fn prepare_stream_segment_append(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        request: &PrepareStreamUploadSegmentAppendReq,
-    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        Self::prepare_stream_segment_append(self, pg_id, bucket, key, request)
-    }
-
-    fn prepare_stream_segment_append_with_effect_fence(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        request: &PrepareStreamUploadSegmentAppendReq,
-        effect_fence: AdmittedRouteEffectFence,
-    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        Self::prepare_stream_segment_append_with_effect_fence(
-            self,
-            pg_id,
-            bucket,
-            key,
-            request,
-            effect_fence,
-        )
-    }
-
     fn load_stream_put_finalize_snapshot(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -3431,27 +3503,6 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         session_id: &SessionId,
     ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError> {
         Self::load_stream_put_finalize_snapshot(self, pg_id, bucket, key, session_id)
-    }
-
-    fn update_stream_upload_bucket_write_reservation(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-        current: &BucketWriteReservationProof,
-        renewed: &BucketWriteReservationProof,
-    ) -> Result<(), ObjectPgActionError> {
-        Self::update_stream_upload_bucket_write_reservation(
-            self, pg_id, bucket, key, session_id, current, renewed,
-        )
-    }
-
-    fn update_stream_upload_bucket_write_reservation_with_effect_fence(
-        &self,
-        request: UpdateStreamUploadBucketWriteReservationReq<'_>,
-    ) -> Result<(), ObjectPgActionError> {
-        Self::update_stream_upload_bucket_write_reservation_with_effect_fence(self, request)
     }
 
     fn build_stream_put_commit_command(
@@ -3995,28 +4046,6 @@ impl LocalStorageNodeClient {
         Ok(pg.list_stream_uploads_for_bucket_page(bucket, session_id_marker, limit)?)
     }
 
-    #[cfg(test)]
-    fn prepare_stream_segment_append(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        request: &PrepareStreamUploadSegmentAppendReq,
-    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        self.prepare_stream_segment_append_inner(pg_id, bucket, key, request, None)
-    }
-
-    fn prepare_stream_segment_append_with_effect_fence(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        request: &PrepareStreamUploadSegmentAppendReq,
-        effect_fence: AdmittedRouteEffectFence,
-    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        self.prepare_stream_segment_append_inner(pg_id, bucket, key, request, Some(effect_fence))
-    }
-
     fn load_stream_put_finalize_snapshot(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -4026,55 +4055,6 @@ impl LocalStorageNodeClient {
     ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         load_stream_put_finalize_snapshot_from_pg(&pg, bucket, key, session_id)
-    }
-
-    fn update_stream_upload_bucket_write_reservation(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-        current: &BucketWriteReservationProof,
-        renewed: &BucketWriteReservationProof,
-    ) -> Result<(), ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let session = PgMetadataStore::get_stream_upload(&*pg, session_id)?;
-        if session.bucket != *bucket || session.key != *key {
-            return Err(MetadataError::StreamSessionNotFound {
-                session_id: session_id.as_str().to_string(),
-            }
-            .into());
-        }
-        Ok(
-            PgMetadataStore::update_stream_upload_bucket_write_reservation(
-                &*pg, session_id, current, renewed,
-            )?,
-        )
-    }
-
-    fn update_stream_upload_bucket_write_reservation_with_effect_fence(
-        &self,
-        request: UpdateStreamUploadBucketWriteReservationReq<'_>,
-    ) -> Result<(), ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(request.pg_id.get())?;
-        let session = PgMetadataStore::get_stream_upload(&*pg, request.session_id)?;
-        if session.bucket != *request.bucket || session.key != *request.key {
-            return Err(MetadataError::StreamSessionNotFound {
-                session_id: request.session_id.as_str().to_string(),
-            }
-            .into());
-        }
-        request
-            .effect_fence
-            .require_valid_for(request.effect_fence.cluster_epoch())?;
-        Ok(
-            PgMetadataStore::update_stream_upload_bucket_write_reservation(
-                &*pg,
-                request.session_id,
-                request.current,
-                request.renewed,
-            )?,
-        )
     }
 
     fn build_stream_put_commit_command(

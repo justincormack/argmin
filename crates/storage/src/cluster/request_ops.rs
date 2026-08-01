@@ -41,7 +41,6 @@ use crate::node_client::{
     BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
     BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
     InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
-    UpdateStreamUploadBucketWriteReservationReq,
 };
 use crate::storage_rpc::StorageRpcErrorCode;
 use crate::traits::DurableBucketWriteReservationAcquire;
@@ -3778,9 +3777,16 @@ impl super::StorageCluster {
             effect_fence,
         } = route;
         require_valid_route()?;
-        let upload = self
+        let stream_route = self
             .object_mutation_metadata_primary_client(bucket, key)?
-            .load_stream_upload_session(object_pg_id, bucket, key, session_id)?;
+            .open_stream_upload_session_metadata_route(
+                self.operation_epoch(),
+                object_pg_id,
+                bucket,
+                key,
+                session_id,
+            )?;
+        let upload = stream_route.load_session()?;
         if upload.target != StreamUploadTarget::PutObject {
             return Err(ObjectPgActionError::InvalidRequest {
                 reason: "stream session is not a PutObject session".to_string(),
@@ -3844,18 +3850,7 @@ impl super::StorageCluster {
         };
         let renewed_proof = BucketWriteReservationProof::from(&renewed);
         require_valid_route()?;
-        self.object_mutation_metadata_primary_client(bucket, key)?
-            .update_stream_upload_bucket_write_reservation_with_effect_fence(
-                UpdateStreamUploadBucketWriteReservationReq {
-                    pg_id: object_pg_id,
-                    bucket,
-                    key,
-                    session_id,
-                    current: &proof,
-                    renewed: &renewed_proof,
-                    effect_fence,
-                },
-            )?;
+        stream_route.update_put_bucket_write_reservation(&proof, &renewed_proof, effect_fence)?;
         Ok(())
     }
 
@@ -4590,13 +4585,19 @@ impl super::StorageCluster {
         }
         self.object_mutation_metadata_primary_client(&upload.bucket, &upload.key)
             .map_err(BucketWriteDrainError::Store)?
-            .update_stream_upload_bucket_write_reservation(
+            .open_stream_upload_session_metadata_route(
+                self.operation_epoch(),
                 self.object_metadata_pg(&upload.bucket, &upload.key),
                 &upload.bucket,
                 &upload.key,
                 &upload.session_id,
+            )
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
+            .update_put_bucket_write_reservation(
                 proof,
                 &renewed,
+                AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
             )
             .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
@@ -4644,17 +4645,14 @@ impl super::StorageCluster {
         let renewed = BucketWriteReservationProof::from(&current);
         require_valid_route()?;
         self.object_mutation_metadata_primary_client(bucket, key)?
-            .update_stream_upload_bucket_write_reservation_with_effect_fence(
-                UpdateStreamUploadBucketWriteReservationReq {
-                    pg_id: object_pg_id,
-                    bucket,
-                    key,
-                    session_id: &upload.session_id,
-                    current: proof,
-                    renewed: &renewed,
-                    effect_fence,
-                },
-            )?;
+            .open_stream_upload_session_metadata_route(
+                self.operation_epoch(),
+                object_pg_id,
+                bucket,
+                key,
+                &upload.session_id,
+            )?
+            .update_put_bucket_write_reservation(proof, &renewed, effect_fence)?;
         Ok(Some(renewed))
     }
 

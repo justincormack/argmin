@@ -11,6 +11,24 @@ fn retained_object_mutation_route<'a>(
         .unwrap()
 }
 
+fn stream_upload_session_route<'a>(
+    client: &'a UnixStorageNodeClient,
+    pg_id: ObjectMetadataPgId,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    session_id: &SessionId,
+) -> Box<dyn StreamUploadSessionMetadataRoute + 'a> {
+    client
+        .open_stream_upload_session_metadata_route(
+            client.cluster_epoch,
+            pg_id,
+            bucket,
+            key,
+            session_id,
+        )
+        .unwrap()
+}
+
 fn raw_retained_stream_abort_request_error(
     client: &UnixStorageNodeClient,
     kind: StorageRpcMessageKind,
@@ -538,14 +556,9 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
     let correct_pg = ObjectMetadataPgId::new_for_test(PgId::new(correct_pg_id));
     let wrong_pg = ObjectMetadataPgId::new_for_test(PgId::new(wrong_pg_id));
 
-    let active_error = ObjectMutationMetadataNodeClient::load_stream_upload_session(
-        &client,
-        correct_pg,
-        &bucket,
-        &key,
-        &session_id,
-    )
-    .unwrap_err();
+    let active_error = stream_upload_session_route(&client, correct_pg, &bucket, &key, &session_id)
+        .load_session()
+        .unwrap_err();
     assert!(matches!(
         active_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
@@ -2117,7 +2130,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..23)
+    let server_threads: Vec<_> = (0..24)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -2159,6 +2172,30 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             &key,
         )
         .unwrap();
+    let correct_stream_session_route =
+        stream_upload_session_route(&client, correct_pg, &bucket, &key, &session_id);
+    let wrong_stream_session_route =
+        stream_upload_session_route(&client, wrong_pg, &bucket, &key, &session_id);
+    let part_stream_session_route =
+        stream_upload_session_route(&client, correct_pg, &bucket, &key, &part_session_id);
+    let future_epoch = ClusterEpoch::new(client.cluster_epoch.get() + 1).unwrap();
+    assert!(matches!(
+        client
+            .open_stream_upload_session_metadata_route(
+                future_epoch,
+                correct_pg,
+                &bucket,
+                &key,
+                &session_id,
+            )
+            .err()
+            .expect("future stream route epoch must fail before RPC"),
+        ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        }) if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
     let part_create_command = correct_stream_creation_route
         .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
             request: &new_part_create,
@@ -2209,24 +2246,10 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         })
     ));
 
-    let session = ObjectMutationMetadataNodeClient::load_stream_upload_session(
-        &client,
-        correct_pg,
-        &bucket,
-        &key,
-        &session_id,
-    )
-    .unwrap();
+    let session = correct_stream_session_route.load_session().unwrap();
     assert_eq!(session.session_id, session_id);
     assert_eq!(session.cleanup_after, Some(9_000));
-    let wrong_session_error = ObjectMutationMetadataNodeClient::load_stream_upload_session(
-        &client,
-        wrong_pg,
-        &bucket,
-        &key,
-        &session_id,
-    )
-    .unwrap_err();
+    let wrong_session_error = wrong_stream_session_route.load_session().unwrap_err();
     assert!(matches!(
         wrong_session_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
@@ -2235,25 +2258,11 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         })
     ));
 
-    assert!(
-        ObjectMutationMetadataNodeClient::load_stream_upload_segments(
-            &client,
-            correct_pg,
-            &bucket,
-            &key,
-            &session_id,
-        )
+    assert!(correct_stream_session_route
+        .load_segments()
         .unwrap()
-        .is_empty()
-    );
-    let wrong_segments_error = ObjectMutationMetadataNodeClient::load_stream_upload_segments(
-        &client,
-        wrong_pg,
-        &bucket,
-        &key,
-        &session_id,
-    )
-    .unwrap_err();
+        .is_empty());
+    let wrong_segments_error = wrong_stream_session_route.load_segments().unwrap_err();
     assert!(matches!(
         wrong_segments_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
@@ -2288,32 +2297,11 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     ));
 
     let effect_fence = crate::types::AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL);
-    ObjectMutationMetadataNodeClient::update_stream_upload_bucket_write_reservation_with_effect_fence(
-        &client,
-        UpdateStreamUploadBucketWriteReservationReq {
-            pg_id: correct_pg,
-            bucket: &bucket,
-            key: &key,
-            session_id: &session_id,
-            current: &current_proof,
-            renewed: &renewed_proof,
-            effect_fence,
-        },
-    )
-    .unwrap();
-    let wrong_update_error =
-        ObjectMutationMetadataNodeClient::update_stream_upload_bucket_write_reservation_with_effect_fence(
-            &client,
-            UpdateStreamUploadBucketWriteReservationReq {
-                pg_id: wrong_pg,
-                bucket: &bucket,
-                key: &key,
-                session_id: &session_id,
-                current: &current_proof,
-                renewed: &renewed_proof,
-                effect_fence,
-            },
-        )
+    correct_stream_session_route
+        .update_put_bucket_write_reservation(&current_proof, &renewed_proof, effect_fence)
+        .unwrap();
+    let wrong_update_error = wrong_stream_session_route
+        .update_put_bucket_write_reservation(&current_proof, &renewed_proof, effect_fence)
         .unwrap_err();
     assert!(matches!(
         wrong_update_error,
@@ -2322,6 +2310,28 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             ..
         })
     ));
+    let crossed_update_error = correct_stream_session_route
+        .update_put_bucket_write_reservation(&part_create_proof, &part_create_proof, effect_fence)
+        .unwrap_err();
+    assert!(matches!(
+        crossed_update_error,
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "update stream upload bucket write reservation",
+        })
+    ));
+    let part_target_update_error = part_stream_session_route
+        .update_put_bucket_write_reservation(&renewed_proof, &renewed_proof, effect_fence)
+        .unwrap_err();
+    assert!(
+        matches!(
+            part_target_update_error,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            })
+        ),
+        "{part_target_update_error:?}"
+    );
     let snapshot = ObjectMutationMetadataNodeClient::load_stream_put_finalize_snapshot(
         &client,
         correct_pg,
@@ -2443,11 +2453,20 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         payload_crc64: 99,
         segment_okh: [7; 16],
     };
-    let (target, _) = ObjectMutationMetadataNodeClient::prepare_stream_segment_append(
-        &client, correct_pg, &bucket, &key, &append,
-    )
-    .unwrap();
+    let (target, _) = correct_stream_session_route
+        .prepare_segment_append(&append, effect_fence)
+        .unwrap();
     assert_eq!(target, StreamUploadTarget::PutObject);
+    let mut crossed_append = append.clone();
+    crossed_append.session_id = part_session_id.clone();
+    assert!(matches!(
+        correct_stream_session_route
+            .prepare_segment_append(&crossed_append, effect_fence)
+            .unwrap_err(),
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "prepare stream segment append",
+        })
+    ));
     let append_rpc_request = crate::storage_rpc::StorageRpcStreamSegmentAppendPrepareRequest {
         object: client.object_request(wrong_pg.pg_id(), &bucket, &key),
         request: append,
