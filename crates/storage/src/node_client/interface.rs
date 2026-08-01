@@ -572,12 +572,13 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         upload_id: &UploadId,
     ) -> Result<Box<dyn MultipartAbortMutationMetadataRoute + '_>, ObjectPgActionError>;
 
-    fn matching_stream_upload_exists(
+    fn open_stream_upload_creation_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
-        create: &CreateStreamUploadReq,
-        expected_command: Option<&CreateStreamUploadCommand>,
-    ) -> Result<bool, ObjectPgActionError>;
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn StreamUploadCreationMetadataRoute + '_>, ObjectPgActionError>;
 
     fn load_stream_upload_session(
         &self,
@@ -586,11 +587,6 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, ObjectPgActionError>;
-
-    fn build_create_stream_upload_command(
-        &self,
-        request: BuildCreateStreamUploadCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 
     fn load_stream_upload_segments(
         &self,
@@ -759,6 +755,19 @@ pub(crate) trait MultipartAbortMutationMetadataRoute: Send {
         &self,
         request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
+}
+
+pub(crate) trait StreamUploadCreationMetadataRoute: Send {
+    fn matching_stream_upload_exists(
+        &self,
+        create: &CreateStreamUploadReq,
+        expected_command: Option<&CreateStreamUploadCommand>,
+    ) -> Result<bool, ObjectPgActionError>;
+
+    fn build_create_stream_upload_command(
+        &self,
+        request: BuildCreateStreamUploadCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 }
 
 pub(crate) trait ObjectDeleteMetadataRoute: Send {
@@ -944,8 +953,6 @@ pub(crate) enum CreateStreamUploadPrecondition<'a> {
 }
 
 pub(crate) struct BuildCreateStreamUploadCommandReq<'a> {
-    pub(crate) pg_id: ObjectMetadataPgId,
-    pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) request: &'a CreateStreamUploadReq,
     pub(crate) cleanup_after: Option<u64>,
     pub(crate) precondition: CreateStreamUploadPrecondition<'a>,

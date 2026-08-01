@@ -4681,6 +4681,51 @@ One-hundred-and-seventeenth Phase 3 slice:
   workspace-wide strict Clippy, and the full no-fail-fast 7,862-test workspace
   suite also pass.
 
+One-hundred-and-eighteenth Phase 3 slice:
+
+- stream-upload creation idempotence matching and command construction now
+  share a `StreamUploadCreationMetadataRoute` bound to one active cluster
+  epoch, exact object-metadata primary PG, bucket, and key. Build requests no
+  longer carry independently substitutable PG or epoch values; both embedded
+  and Unix adapters derive routing solely from the scoped route.
+- the route requires every creation request and authenticated expected command
+  to match its exact object subject. Expected commands must also retain the
+  in-progress creation state, initial segment allocator floor, target-specific
+  canonical reservation operation, route epoch, and key target. Command builds
+  independently bind PUT versus UploadPart preconditions and reservation
+  proofs to the route and requested target.
+- the storage-node active-primary route retains independent request,
+  precondition, reservation, and response validation before delegating through
+  the same scoped embedded interface. Existing installed-Unix wrong-PG and
+  stale-epoch regressions continue to prove server-side rejection rather than
+  relying only on the frontend type boundary.
+- command fanout and recovery now independently require a stream-create
+  reservation to use the canonical PUT or UploadPart operation selected by the
+  command target, at the command epoch and exact bucket/key. Malformed
+  same-epoch envelopes cannot publish a session or release an unrelated valid
+  reservation; normal and recovery-route non-mutation regressions pin both
+  boundaries.
+- immutable cleanup authority is part of idempotent creation identity. Durable
+  rows must match the applied creation command's cleanup deadline, and a
+  drained contender is eligible as the caller's command only when its deadline
+  also matches the current request. PUT and UploadPart regressions cover both
+  the row/command and caller/contender comparisons.
+- local regressions require a crossed PG, request subject, expected command,
+  and reservation operation to fail without mutation. A Unix regression uses
+  no listening server and requires future-epoch construction and crossed-key
+  matching to fail before RPC. The transitional boundary checker now permits
+  stream creation matching and command building only through the scoped route.
+  The legacy test-support coordinator adapter now follows the production
+  sequence as well: authorize the loaded upload, then let the target-specific
+  creation route acquire its canonical reservation instead of transferring a
+  generic bucket-write snapshot proof.
+  Stream-session lookup, append, heartbeat/finalization mutation, and
+  payload-reclaim families remain open in Phase 3.
+- all 2,557 storage tests, all 1,263 server-core tests, and the full 7,877-test
+  workspace suite pass, including the multipart model trace and installed-Unix
+  creation regressions. Workspace-wide strict Clippy and the transitional
+  storage boundary checker also pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

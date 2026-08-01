@@ -4723,12 +4723,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
     ) -> Result<bool, StorageNodeObjectRouteError> {
         self.require_create_stream_upload_subject(request, "stream upload match")?;
         if let Some(command) = expected_command {
-            if command.session.bucket != *self.route.bucket
-                || command.session.key != *self.route.key
-                || command.session.session_id != request.session_id
-                || command.session.target != request.target
-                || command.session.encryption != request.encryption
-            {
+            if !command.matches_request(request) {
                 return Err(StorageNodeObjectRouteError::Route(
                     StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
@@ -4754,12 +4749,14 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::matching_stream_upload_exists(
+        ObjectMutationMetadataNodeClient::open_stream_upload_creation_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
-            request,
-            expected_command,
+            self.route.bucket,
+            self.route.key,
         )
+        .and_then(|route| route.matching_stream_upload_exists(request, expected_command))
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5130,17 +5127,21 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
+        ObjectMutationMetadataNodeClient::open_stream_upload_creation_metadata_route(
             &local_client,
-            BuildCreateStreamUploadCommandReq {
-                pg_id: self.route.pg_id,
-                cluster_epoch: self.route.fence.cluster_epoch,
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+        )
+        .and_then(|route| {
+            route.build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
                 request,
                 cleanup_after,
                 precondition,
                 bucket_write_reservation,
-            },
-        )
+            })
+        })
         .map_err(StorageNodeObjectRouteError::Object)
     }
 

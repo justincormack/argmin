@@ -3,6 +3,79 @@ use crate::cluster::{segment_payload_placement_key, StreamAppendCommitRequest};
 use crate::metadata_command::ReleaseObjectGenerationCommand;
 
 #[test]
+fn applied_stream_create_matching_binds_requested_cleanup_deadline_for_both_targets() {
+    let bucket = crate::tests::bucket_name("applied-stream-cleanup-bucket");
+    let key = crate::tests::object_key("applied-stream-cleanup-key");
+    let upload_id = crate::tests::multipart_upload_id("applied-stream-cleanup-upload");
+    for (index, target, operation_kind) in [
+        (
+            1,
+            crate::StreamUploadTarget::PutObject,
+            crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+        ),
+        (
+            2,
+            crate::StreamUploadTarget::UploadPart {
+                upload_id,
+                part_number: 1,
+            },
+            crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+        ),
+    ] {
+        let request = crate::CreateStreamUploadReq {
+            session_id: crate::SessionId::try_from(format!("{index:02x}").repeat(16)).unwrap(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target,
+            encryption: crate::ObjectEncryption::None,
+        };
+        let proof = crate::metadata_command::BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: format!("reservation-{index}"),
+            owner_token: format!("owner-{index}"),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: operation_kind.to_string(),
+            created_at: 10,
+            lease_deadline: 20,
+            target_context: Some(key.as_str().to_string()),
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(index).unwrap(),
+            ),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
+                    request.clone(),
+                    10,
+                    Some(100),
+                    proof,
+                ),
+            )),
+        );
+
+        assert!(super::super::super::applied_stream_create_command(
+            std::slice::from_ref(&command),
+            &request,
+            Some(100),
+        )
+        .is_some());
+        assert!(
+            super::super::super::applied_stream_create_command(
+                std::slice::from_ref(&command),
+                &request,
+                Some(101),
+            )
+            .is_none(),
+            "target {index} must not reuse a contender with a different cleanup deadline"
+        );
+    }
+}
+
+#[test]
 fn stream_put_create_partial_apply_retry_reuses_existing_session() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -425,7 +498,7 @@ fn stream_put_create_retries_after_pending_install_conflict() {
     let proof_for_hook = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "test-stream-put-create-unrelated",
+        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let command_epoch = cluster.operation_epoch();
@@ -524,7 +597,7 @@ fn stream_abort_missing_session_does_not_succeed_after_unrelated_pending_command
     let proof = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "test-stream-abort-unrelated",
+        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let command = MetadataCommandEnvelope::new(

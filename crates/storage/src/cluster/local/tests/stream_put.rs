@@ -1230,15 +1230,20 @@ fn stream_put_heartbeat_then_finalize_converges_across_stale_replica_deadlines()
         target: crate::StreamUploadTarget::PutObject,
         encryption: crate::ObjectEncryption::None,
     };
+    let mutation_client = cluster
+        .object_mutation_metadata_primary_client(&bucket, &key)
+        .unwrap();
+    let stream_creation_route = mutation_client
+        .open_stream_upload_creation_metadata_route(
+            cluster.operation_epoch(),
+            cluster.object_metadata_pg(&bucket, &key),
+            &bucket,
+            &key,
+        )
+        .unwrap();
     assert!(
-        cluster
-            .object_mutation_metadata_primary_client(&bucket, &key)
-            .unwrap()
-            .matching_stream_upload_exists(
-                cluster.object_metadata_pg(&bucket, &key),
-                &create,
-                Some(&original_command),
-            )
+        stream_creation_route
+            .matching_stream_upload_exists(&create, Some(&original_command))
             .unwrap(),
         "stream create idempotency should ignore the mutable proof lease deadline"
     );
@@ -1609,7 +1614,7 @@ fn stream_session_scavenger_does_not_age_abort_upload_part_sessions() {
         let reservation = cluster
             .acquire_durable_bucket_write_reservation(
                 &bucket,
-                "begin-upload-part-scavenge-test",
+                crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
                 Some(key.as_str()),
             )
             .unwrap();

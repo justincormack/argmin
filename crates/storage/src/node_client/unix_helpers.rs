@@ -824,13 +824,15 @@ impl UnixStorageNodeClient {
     pub(super) fn validate_create_stream_upload_command_response(
         &self,
         command: &MetadataCommandEnvelope,
+        pg_id: ObjectMetadataPgId,
+        cluster_epoch: ClusterEpoch,
         request: &BuildCreateStreamUploadCommandReq<'_>,
     ) -> Result<(), ObjectPgActionError> {
         let context = "validate stream upload command build response";
         self.validate_object_metadata_command_route(
             command,
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
+            pg_id.pg_id(),
+            cluster_epoch,
             context,
         )?;
         let MetadataCommandPayload::CreateStreamUpload(create) = command.payload() else {

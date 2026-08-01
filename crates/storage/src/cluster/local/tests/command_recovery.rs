@@ -920,7 +920,7 @@ fn refresh_recovery_abandons_stream_create_with_certified_generation_cleanup() {
         .cluster
         .acquire_durable_bucket_write_reservation(
             &bucket,
-            "historical-stream-abandon",
+            crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
             Some(key.as_str()),
         )
         .unwrap();
@@ -6935,7 +6935,7 @@ fn abandoned_put_object_stream_create_releases_reserved_generation_on_drain() {
     let proof = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "test-put-object-stream-create-abandoned",
+        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let command = MetadataCommandEnvelope::new(
@@ -6995,6 +6995,86 @@ fn abandoned_put_object_stream_create_releases_reserved_generation_on_drain() {
 }
 
 #[test]
+fn stream_create_recovery_rejects_crossed_reservation_authority_without_mutation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "stream-recovery-crossed-");
+    let key = key_for_object_pg(topology, &bucket, 2, "key-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    set_route_primary(&mut map, 2, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let reservation = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        )
+        .unwrap();
+    let session_id = crate::SessionId::try_from("cb".repeat(16)).unwrap();
+    let pg_id = PgId::new(2);
+    let command = MetadataCommandEnvelope::new(
+        cluster.next_object_metadata_command_id(pg_id).unwrap(),
+        MetadataCommandPayload::CreateStreamUpload(Box::new(
+            crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                crate::CreateStreamUploadReq {
+                    session_id: session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: crate::StreamUploadTarget::UploadPart {
+                        upload_id: crate::tests::multipart_upload_id("crossed-recovery-upload"),
+                        part_number: 1,
+                    },
+                    encryption: crate::ObjectEncryption::None,
+                },
+                crate::clock::current_time_millis(),
+                crate::metadata_command::BucketWriteReservationProof::from(&reservation.record),
+            ),
+        )),
+    );
+    let error = cluster
+        .apply_metadata_command_to_acting_set_for_recovery(&command, &cluster)
+        .expect_err("crossed stream-create recovery authority must fail");
+    assert!(
+        matches!(
+            &error.source,
+            crate::BucketSnapshotLoadError::Metadata(
+                crate::MetadataError::BucketWriteReservationConflict { .. }
+            )
+        ),
+        "unexpected crossed stream-create recovery error: {error:?}"
+    );
+    assert_eq!(error.applied_nodes, 0);
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
+            Err(crate::MetadataError::StreamSessionNotFound { .. })
+        ));
+    }
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let reservations =
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket).unwrap();
+    assert!(reservations
+        .iter()
+        .any(|record| record.reservation_id == reservation.record.reservation_id));
+}
+
+#[test]
 fn abandoned_put_object_stream_create_release_failure_retries_to_terminal_cleanup() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -7022,7 +7102,7 @@ fn abandoned_put_object_stream_create_release_failure_retries_to_terminal_cleanu
     let proof = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "test-put-object-stream-create-release-failure",
+        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let command = MetadataCommandEnvelope::new(

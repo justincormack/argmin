@@ -1569,23 +1569,31 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         target: StreamUploadTarget::PutObject,
         encryption: ObjectEncryption::None,
     };
-    assert!(
-        !ObjectMutationMetadataNodeClient::matching_stream_upload_exists(
-            &client,
+    let correct_stream_creation_route = client
+        .open_stream_upload_creation_metadata_route(
+            ClusterEpoch::new(1).unwrap(),
             correct_object_pg,
-            &stream_request,
-            None,
+            &bucket,
+            &key,
         )
-        .unwrap(),
+        .unwrap();
+    let wrong_stream_creation_route = client
+        .open_stream_upload_creation_metadata_route(
+            ClusterEpoch::new(1).unwrap(),
+            wrong_object_pg,
+            &bucket,
+            &key,
+        )
+        .unwrap();
+    assert!(
+        !correct_stream_creation_route
+            .matching_stream_upload_exists(&stream_request, None)
+            .unwrap(),
         "correctly routed absent stream session must be a positive request canary"
     );
-    let stream_match_error = ObjectMutationMetadataNodeClient::matching_stream_upload_exists(
-        &client,
-        wrong_object_pg,
-        &stream_request,
-        None,
-    )
-    .unwrap_err();
+    let stream_match_error = wrong_stream_creation_route
+        .matching_stream_upload_exists(&stream_request, None)
+        .unwrap_err();
     assert!(matches!(
         stream_match_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
@@ -1593,21 +1601,16 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
             ..
         })
     ));
-    let stream_command_error =
-        ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
-            &client,
-            BuildCreateStreamUploadCommandReq {
-                pg_id: wrong_object_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                request: &stream_request,
-                cleanup_after: None,
-                precondition: CreateStreamUploadPrecondition::PutObject {
-                    expected_current: current_delete_snapshot.stored.as_ref(),
-                    require_generation_reservation: false,
-                },
-                bucket_write_reservation: &stream_proof,
+    let stream_command_error = wrong_stream_creation_route
+        .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            request: &stream_request,
+            cleanup_after: None,
+            precondition: CreateStreamUploadPrecondition::PutObject {
+                expected_current: current_delete_snapshot.stored.as_ref(),
+                require_generation_reservation: false,
             },
-        )
+            bucket_write_reservation: &stream_proof,
+        })
         .unwrap_err();
     assert!(matches!(
         stream_command_error,
@@ -2114,7 +2117,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..24)
+    let server_threads: Vec<_> = (0..23)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -2140,40 +2143,47 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     let mut part_create_proof = current_proof.clone();
     part_create_proof.operation_kind =
         crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
-    let part_create_command = ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
-        &client,
-        BuildCreateStreamUploadCommandReq {
-            pg_id: correct_pg,
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+    let correct_stream_creation_route = client
+        .open_stream_upload_creation_metadata_route(
+            ClusterEpoch::new(1).unwrap(),
+            correct_pg,
+            &bucket,
+            &key,
+        )
+        .unwrap();
+    let wrong_stream_creation_route = client
+        .open_stream_upload_creation_metadata_route(
+            ClusterEpoch::new(1).unwrap(),
+            wrong_pg,
+            &bucket,
+            &key,
+        )
+        .unwrap();
+    let part_create_command = correct_stream_creation_route
+        .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
             request: &new_part_create,
             cleanup_after: None,
             precondition: CreateStreamUploadPrecondition::UploadPart {
                 expected_upload: &multipart_upload,
             },
             bucket_write_reservation: &part_create_proof,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert!(matches!(
         part_create_command.payload(),
         MetadataCommandPayload::CreateStreamUpload(command)
             if command.session.session_id == new_part_create.session_id
                 && command.bucket_write_reservation == part_create_proof
     ));
-    let wrong_part_create_error =
-        ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
-            &client,
-            BuildCreateStreamUploadCommandReq {
-                pg_id: wrong_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                request: &new_part_create,
-                cleanup_after: None,
-                precondition: CreateStreamUploadPrecondition::UploadPart {
-                    expected_upload: &multipart_upload,
-                },
-                bucket_write_reservation: &part_create_proof,
+    let wrong_part_create_error = wrong_stream_creation_route
+        .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            request: &new_part_create,
+            cleanup_after: None,
+            precondition: CreateStreamUploadPrecondition::UploadPart {
+                expected_upload: &multipart_upload,
             },
-        )
+            bucket_write_reservation: &part_create_proof,
+        })
         .unwrap_err();
     assert!(matches!(
         wrong_part_create_error,
@@ -2182,26 +2192,20 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             ..
         })
     ));
-    let crossed_part_create_error =
-        ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
-            &client,
-            BuildCreateStreamUploadCommandReq {
-                pg_id: correct_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                request: &new_part_create,
-                cleanup_after: None,
-                precondition: CreateStreamUploadPrecondition::UploadPart {
-                    expected_upload: &multipart_upload,
-                },
-                bucket_write_reservation: &current_proof,
+    let crossed_part_create_error = correct_stream_creation_route
+        .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            request: &new_part_create,
+            cleanup_after: None,
+            precondition: CreateStreamUploadPrecondition::UploadPart {
+                expected_upload: &multipart_upload,
             },
-        )
+            bucket_write_reservation: &current_proof,
+        })
         .unwrap_err();
     assert!(matches!(
         crossed_part_create_error,
-        ObjectPgActionError::Store(StoreError::StorageRpc {
-            failure: StorageRpcErrorCode::PayloadDecode,
-            ..
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "build create stream upload command",
         })
     ));
 
@@ -3609,20 +3613,19 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         target: StreamUploadTarget::PutObject,
         encryption: ObjectEncryption::None,
     };
-    assert!(
-        !ObjectMutationMetadataNodeClient::matching_stream_upload_exists(
-            &client,
+    let stream_creation_route = client
+        .open_stream_upload_creation_metadata_route(
+            ClusterEpoch::new(1).unwrap(),
             ObjectMetadataPgId::new_for_test(PgId::new(0)),
-            &stream_request,
-            None,
+            &bucket,
+            &key,
         )
-        .unwrap()
-    );
-    let stream_command = ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
-        &client,
-        BuildCreateStreamUploadCommandReq {
-            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+        .unwrap();
+    assert!(!stream_creation_route
+        .matching_stream_upload_exists(&stream_request, None)
+        .unwrap());
+    let stream_command = stream_creation_route
+        .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
             request: &stream_request,
             cleanup_after: Some(12_345),
             precondition: CreateStreamUploadPrecondition::PutObject {
@@ -3630,9 +3633,8 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
                 require_generation_reservation: false,
             },
             bucket_write_reservation: &stream_proof,
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     let MetadataCommandPayload::CreateStreamUpload(stream_create) = stream_command.payload() else {
         panic!("expected create stream upload command");
     };
@@ -3664,9 +3666,9 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     let err = client
         .validate_create_stream_upload_command_response(
             &bad_stream_command,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            ClusterEpoch::new(1).unwrap(),
             &BuildCreateStreamUploadCommandReq {
-                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 request: &stream_request,
                 cleanup_after: Some(12_345),
                 precondition: CreateStreamUploadPrecondition::PutObject {
@@ -3696,9 +3698,9 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     let err = client
         .validate_create_stream_upload_command_response(
             &bad_cleanup_command,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            ClusterEpoch::new(1).unwrap(),
             &BuildCreateStreamUploadCommandReq {
-                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 request: &stream_request,
                 cleanup_after: Some(12_345),
                 precondition: CreateStreamUploadPrecondition::PutObject {
@@ -3734,20 +3736,16 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         },
         encryption: ObjectEncryption::None,
     };
-    let err = ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
-        &client,
-        BuildCreateStreamUploadCommandReq {
-            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+    let err = stream_creation_route
+        .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
             request: &missing_upload_part_stream_request,
             cleanup_after: None,
             precondition: CreateStreamUploadPrecondition::UploadPart {
                 expected_upload: &missing_upload,
             },
             bucket_write_reservation: &upload_part_stream_proof,
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
     assert!(matches!(
         err,
         ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { upload_id })
@@ -3896,24 +3894,29 @@ fn unix_object_mutation_client_rejects_stale_upload_part_stream_command_epoch() 
         },
         encryption: ObjectEncryption::None,
     };
-    let mut proof = test_bucket_write_reservation_proof(bucket, &key);
+    let mut proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+    proof.cluster_epoch = stale_epoch;
     proof.operation_kind =
         crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
 
-    let err = ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
-        &client,
-        BuildCreateStreamUploadCommandReq {
-            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-            cluster_epoch: stale_epoch,
+    let stream_creation_route = client
+        .open_stream_upload_creation_metadata_route(
+            stale_epoch,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+        )
+        .unwrap();
+    let err = stream_creation_route
+        .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
             request: &request,
             cleanup_after: None,
             precondition: CreateStreamUploadPrecondition::UploadPart {
                 expected_upload: &upload,
             },
             bucket_write_reservation: &proof,
-        },
-    )
-    .unwrap_err();
+        })
+        .unwrap_err();
 
     assert!(
         matches!(

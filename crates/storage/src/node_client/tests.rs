@@ -9,6 +9,7 @@ use crate::metadata_command::{
     ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+    PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::storage_node_server::{StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer};
 use crate::storage_rpc::{
@@ -2460,6 +2461,162 @@ fn unix_multipart_abort_mutation_metadata_route_rejects_foreign_epoch_before_rpc
 }
 
 #[test]
+fn local_stream_upload_creation_metadata_route_binds_exact_object_and_authority() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0, 1],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let bucket = crate::tests::bucket_name("stream-creation-route-bucket");
+    let key = crate::tests::object_key("stream-creation-route-key");
+    let correct_pg = storage_node.object_metadata_pg_for(&bucket, &key);
+    let wrong_pg = ObjectMetadataPgId::new_for_test(PgId::new(1 - correct_pg.get()));
+
+    assert!(matches!(
+        client
+            .open_stream_upload_creation_metadata_route(
+                ClusterEpoch::INITIAL,
+                wrong_pg,
+                &bucket,
+                &key,
+            )
+            .err()
+            .expect("crossed stream-creation PG must fail before storage"),
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open stream upload creation metadata route",
+        })
+    ));
+
+    let route = client
+        .open_stream_upload_creation_metadata_route(
+            ClusterEpoch::INITIAL,
+            correct_pg,
+            &bucket,
+            &key,
+        )
+        .unwrap();
+    let request = CreateStreamUploadReq {
+        session_id: crate::tests::stream_session_id("create-route"),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        target: StreamUploadTarget::PutObject,
+        encryption: ObjectEncryption::None,
+    };
+    assert!(!route.matching_stream_upload_exists(&request, None).unwrap());
+
+    let mut proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+    proof.operation_kind = PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
+    let command = route
+        .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+            request: &request,
+            cleanup_after: Some(10_000),
+            precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
+                require_generation_reservation: false,
+            },
+            bucket_write_reservation: &proof,
+        })
+        .unwrap();
+    assert!(matches!(
+        command.payload(),
+        MetadataCommandPayload::CreateStreamUpload(create)
+            if create.matches_request(&request)
+                && create.bucket_write_reservation == proof
+    ));
+    let MetadataCommandPayload::CreateStreamUpload(create_command) = command.payload() else {
+        panic!("expected create stream upload command");
+    };
+    assert!(
+        !route
+            .matching_stream_upload_exists(&request, Some(create_command))
+            .unwrap(),
+        "an authenticated matching command must still report an absent durable session"
+    );
+    let mut crossed_command = create_command.as_ref().clone();
+    crossed_command.session.key = crate::tests::object_key("crossed-stream-command-key");
+    assert!(matches!(
+        route
+            .matching_stream_upload_exists(&request, Some(&crossed_command))
+            .unwrap_err(),
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "match stream upload creation",
+        })
+    ));
+
+    let mut crossed_request = request.clone();
+    crossed_request.key = crate::tests::object_key("crossed-stream-creation-route-key");
+    assert!(matches!(
+        route
+            .matching_stream_upload_exists(&crossed_request, None)
+            .unwrap_err(),
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "match stream upload creation",
+        })
+    ));
+
+    let mut crossed_proof = proof;
+    crossed_proof.operation_kind = PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND.to_string();
+    assert!(matches!(
+        route
+            .build_create_stream_upload_command(BuildCreateStreamUploadCommandReq {
+                request: &request,
+                cleanup_after: None,
+                precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
+                    require_generation_reservation: false,
+                },
+                bucket_write_reservation: &crossed_proof,
+            })
+            .unwrap_err(),
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "build create stream upload command",
+        })
+    ));
+}
+
+#[test]
+fn unix_stream_upload_creation_metadata_route_rejects_foreign_subject_before_rpc() {
+    let client = test_unix_storage_node_client();
+    let future_epoch = ClusterEpoch::new(client.cluster_epoch.get() + 1).unwrap();
+    let bucket = crate::tests::bucket_name("unix-stream-creation-route-bucket");
+    let key = crate::tests::object_key("unix-stream-creation-route-key");
+    let pg_id = ObjectMetadataPgId::new_for_test(PgId::new(0));
+    assert!(matches!(
+        client
+            .open_stream_upload_creation_metadata_route(future_epoch, pg_id, &bucket, &key)
+            .err()
+            .expect("future stream-creation route must fail before RPC"),
+        ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        }) if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
+
+    let route = client
+        .open_stream_upload_creation_metadata_route(client.cluster_epoch, pg_id, &bucket, &key)
+        .unwrap();
+    let crossed_request = CreateStreamUploadReq {
+        session_id: crate::tests::stream_session_id("unix-route"),
+        bucket,
+        key: crate::tests::object_key("unix-stream-creation-route-crossed-key"),
+        target: StreamUploadTarget::PutObject,
+        encryption: ObjectEncryption::None,
+    };
+    assert!(matches!(
+        route
+            .matching_stream_upload_exists(&crossed_request, None)
+            .unwrap_err(),
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "match stream upload creation",
+        })
+    ));
+}
+
+#[test]
 fn local_object_delete_metadata_route_binds_exact_object_subject() {
     let tmp = test_util::tempdir();
     let storage_node = Arc::new(
@@ -2742,6 +2899,79 @@ fn upload_part_stream_upload_match_accepts_existing_row_without_create_proof() {
         stream_upload_matches_command(&existing, &command),
         "UploadPart stream-create replay must match the applied row without a stored create proof"
     );
+}
+
+#[test]
+fn stream_upload_match_binds_cleanup_deadline_for_put_and_upload_part() {
+    let bucket = crate::tests::bucket_name("stream-cleanup-match-bucket");
+    let key = crate::tests::object_key("stream-cleanup-match-key");
+    let upload_id = crate::tests::multipart_upload_id("stream-cleanup-match-upload");
+    for (label, target, operation_kind) in [
+        (
+            "c7",
+            StreamUploadTarget::PutObject,
+            PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+        ),
+        (
+            "c8",
+            StreamUploadTarget::UploadPart {
+                upload_id,
+                part_number: 1,
+            },
+            crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+        ),
+    ] {
+        let session_id = SessionId::try_from(label.repeat(16)).unwrap();
+        let request = CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: target.clone(),
+            encryption: ObjectEncryption::None,
+        };
+        let proof = crate::metadata_command::BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: format!("{label}-reservation"),
+            owner_token: format!("{label}-owner"),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: operation_kind.to_string(),
+            created_at: 10,
+            lease_deadline: 20,
+            target_context: Some(key.as_str().to_string()),
+        };
+        let command =
+            CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
+                request,
+                10,
+                Some(100),
+                proof.clone(),
+            );
+        let mut existing = StreamUploadRecord {
+            session_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target,
+            state: StreamUploadState::InProgress,
+            created_at: command.session.created_at,
+            cleanup_after: command.cleanup_after,
+            encryption: ObjectEncryption::None,
+            next_segment_vid: command.initial_next_segment_vid,
+            bucket_write_reservation: matches!(
+                command.session.target,
+                StreamUploadTarget::PutObject
+            )
+            .then_some(proof),
+        };
+
+        assert!(stream_upload_matches_command(&existing, &command));
+        existing.cleanup_after = Some(101);
+        assert!(
+            !stream_upload_matches_command(&existing, &command),
+            "{label} must not treat a different immutable cleanup deadline as idempotent"
+        );
+    }
 }
 
 fn test_live_stored_object(

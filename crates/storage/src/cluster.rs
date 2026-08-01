@@ -48,6 +48,7 @@ use crate::metadata_command::{
     PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+    UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
@@ -763,12 +764,14 @@ fn stream_create_request_matches_session(
 fn applied_stream_create_command<'a>(
     applied_commands: &'a [MetadataCommandEnvelope],
     create: &CreateStreamUploadReq,
+    cleanup_after: Option<u64>,
 ) -> Option<&'a CreateStreamUploadCommand> {
     applied_commands.iter().rev().find_map(|command| {
         let MetadataCommandPayload::CreateStreamUpload(create_command) = command.payload() else {
             return None;
         };
-        stream_create_request_matches_session(&create_command.session, create)
+        (stream_create_request_matches_session(&create_command.session, create)
+            && create_command.cleanup_after == cleanup_after)
             .then_some(create_command.as_ref())
     })
 }
@@ -10647,6 +10650,20 @@ impl StorageCluster {
                     crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
                     Some(create.upload.key.as_str()),
                 ),
+            MetadataCommandPayload::CreateStreamUpload(create) => proof
+                .matches_exact_mutation_subject(
+                    command.id().cluster_epoch(),
+                    &create.session.bucket,
+                    match create.session.target {
+                        StreamUploadTarget::PutObject => {
+                            PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+                        }
+                        StreamUploadTarget::UploadPart { .. } => {
+                            UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+                        }
+                    },
+                    Some(create.session.key.as_str()),
+                ),
             MetadataCommandPayload::AbortMultipartUpload(abort) => {
                 abort.has_consistent_subject()
                     && proof.matches_exact_mutation_subject(
@@ -14718,14 +14735,18 @@ impl StorageCluster {
                 .map_err(ObjectPgActionError::Store)?;
             let applied_commands =
                 self.drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)?;
-            let expected_command = applied_stream_create_command(&applied_commands, &request);
+            let expected_command =
+                applied_stream_create_command(&applied_commands, &request, cleanup_after);
             let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+            let stream_creation_route = mutation_client
+                .open_stream_upload_creation_metadata_route(
+                    self.operation_epoch(),
+                    object_pg_id,
+                    bucket,
+                    key,
+                )?;
             require_valid_route().map_err(ObjectPgActionError::Store)?;
-            if mutation_client.matching_stream_upload_exists(
-                object_pg_id,
-                &request,
-                expected_command,
-            )? {
+            if stream_creation_route.matching_stream_upload_exists(&request, expected_command)? {
                 return Ok(BucketWriteReservationDisposition::ReleaseByCaller);
             }
             self.reserve_put_object_generation_with_route_validation(
@@ -14737,10 +14758,8 @@ impl StorageCluster {
                 let _ = self.release_object_generation_reservation(bucket, key, session_id);
                 return Err(ObjectPgActionError::Store(error));
             }
-            let command = match mutation_client.build_create_stream_upload_command(
+            let command = match stream_creation_route.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
-                    pg_id: object_pg_id,
-                    cluster_epoch: self.operation_epoch(),
                     request: &request,
                     cleanup_after,
                     precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {

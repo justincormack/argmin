@@ -1150,6 +1150,108 @@ fn stream_create_command_rejects_missing_bucket_write_reservation_proof() {
 }
 
 #[test]
+fn stream_create_fanout_rejects_crossed_target_reservation_authority_without_mutation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "stream-proof-crossed-");
+    let key = key_for_object_pg(topology, &bucket, 2, "key-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    set_route_primary(&mut map, 2, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let put_reservation = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        )
+        .unwrap();
+    let upload_part_reservation = cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        )
+        .unwrap();
+    let cases = [
+        (
+            crate::SessionId::try_from("c9".repeat(16)).unwrap(),
+            crate::StreamUploadTarget::PutObject,
+            crate::metadata_command::BucketWriteReservationProof::from(
+                &upload_part_reservation.record,
+            ),
+        ),
+        (
+            crate::SessionId::try_from("ca".repeat(16)).unwrap(),
+            crate::StreamUploadTarget::UploadPart {
+                upload_id: crate::tests::multipart_upload_id("crossed-fanout-upload"),
+                part_number: 1,
+            },
+            crate::metadata_command::BucketWriteReservationProof::from(&put_reservation.record),
+        ),
+    ];
+
+    for (session_id, target, crossed_proof) in &cases {
+        let command = MetadataCommandEnvelope::new(
+            cluster
+                .next_object_metadata_command_id(PgId::new(2))
+                .unwrap(),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                    crate::CreateStreamUploadReq {
+                        session_id: session_id.clone(),
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        target: target.clone(),
+                        encryption: crate::ObjectEncryption::None,
+                    },
+                    crate::clock::current_time_millis(),
+                    crossed_proof.clone(),
+                ),
+            )),
+        );
+
+        assert!(matches!(
+            cluster.test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command),
+            Err(crate::BucketSnapshotLoadError::Metadata(
+                crate::MetadataError::BucketWriteReservationConflict { .. }
+            ))
+        ));
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+            assert!(matches!(
+                crate::PgMetadataStore::get_stream_upload(&*pg, session_id),
+                Err(crate::MetadataError::StreamSessionNotFound { .. })
+            ));
+        }
+    }
+
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let reservation_ids: std::collections::BTreeSet<_> =
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
+            .unwrap()
+            .into_iter()
+            .map(|reservation| reservation.reservation_id)
+            .collect();
+    assert!(reservation_ids.contains(&put_reservation.record.reservation_id));
+    assert!(reservation_ids.contains(&upload_part_reservation.record.reservation_id));
+}
+
+#[test]
 fn stream_create_command_rejects_stale_bucket_incarnation_proof() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

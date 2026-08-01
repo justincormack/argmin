@@ -2064,7 +2064,7 @@ fn multipart_abort_retries_after_pending_install_conflict() {
     let proof_for_hook = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "test-abort-multipart-unrelated-stream-create",
+        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let command_epoch = cluster.operation_epoch();
@@ -2803,7 +2803,7 @@ fn multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_an
     let proof_for_hook = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "test-abort-multipart-raced-stream-create",
+        crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let command_epoch = cluster.operation_epoch();
@@ -3359,7 +3359,7 @@ fn begin_upload_part_stream_pending_install_race_reruns_action() {
     let hook_proof = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "test-upload-part-stream-create-winner",
+        crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let _hook_guard = cluster.test_install_before_metadata_command_pending_install_hook(
@@ -3398,7 +3398,7 @@ fn begin_upload_part_stream_pending_install_race_reruns_action() {
     let reservation = cluster
         .acquire_durable_bucket_write_reservation(
             &bucket,
-            "begin-upload-part-test",
+            crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
             Some(key.as_str()),
         )
         .unwrap();
@@ -3505,7 +3505,7 @@ fn begin_upload_part_stream_drains_pending_completion_before_create() {
     let reservation = cluster
         .acquire_durable_bucket_write_reservation(
             &bucket,
-            "begin-upload-part-complete-test",
+            crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
             Some(key.as_str()),
         )
         .unwrap();
@@ -3655,7 +3655,7 @@ fn begin_upload_part_stream_existing_session_mismatch_releases_bucket_write_proo
     let proof = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "begin-upload-part-mismatch-test",
+        crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let err = cluster
@@ -3867,7 +3867,7 @@ fn upload_part_stream_create_zero_apply_reopens_and_converges() {
                         &cluster
                             .acquire_durable_bucket_write_reservation(
                                 &bucket,
-                                "upload-part-stream-create-reopen",
+                                crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
                                 Some(key.as_str()),
                             )
                             .unwrap()

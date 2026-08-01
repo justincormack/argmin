@@ -4,6 +4,8 @@ use crate::metadata_command::{
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+    PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+    UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
 };
 
 struct UnixObjectReadMetadataRoute<'a> {
@@ -89,6 +91,14 @@ struct UnixMultipartAbortMutationMetadataRoute<'a> {
     bucket: BucketName,
     key: ObjectKey,
     upload_id: UploadId,
+}
+
+struct UnixStreamUploadCreationMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
 }
 
 struct UnixObjectListingMetadataRoute<'a> {
@@ -3394,6 +3404,220 @@ impl AuthorizedMultipartUploadMetadataRoute for UnixAuthorizedMultipartUploadMet
     }
 }
 
+impl UnixStreamUploadCreationMetadataRoute<'_> {
+    fn require_create_subject(
+        &self,
+        create: &CreateStreamUploadReq,
+        operation: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        if create.bucket != self.bucket || create.key != self.key {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
+    }
+
+    fn require_expected_command_subject(
+        &self,
+        create: &CreateStreamUploadReq,
+        command: &CreateStreamUploadCommand,
+        operation: &'static str,
+    ) -> Result<(), ObjectPgActionError> {
+        let expected_operation_kind = match create.target {
+            StreamUploadTarget::PutObject => PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+            StreamUploadTarget::UploadPart { .. } => {
+                UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+            }
+        };
+        if !command.matches_request(create)
+            || !command
+                .bucket_write_reservation
+                .matches_exact_mutation_subject(
+                    self.route_cluster_epoch,
+                    &self.bucket,
+                    expected_operation_kind,
+                    Some(self.key.as_str()),
+                )
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
+    }
+
+    fn require_build_subject(
+        &self,
+        request: &BuildCreateStreamUploadCommandReq<'_>,
+    ) -> Result<(), ObjectPgActionError> {
+        self.require_create_subject(request.request, "build create stream upload command")?;
+        let expected_operation_kind = match (&request.request.target, &request.precondition) {
+            (
+                StreamUploadTarget::PutObject,
+                CreateStreamUploadPrecondition::PutObjectNoCurrentCheck { .. },
+            ) => PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+            (
+                StreamUploadTarget::PutObject,
+                CreateStreamUploadPrecondition::PutObject {
+                    expected_current, ..
+                },
+            ) if expected_current.is_none_or(|stored| {
+                stored.bucket() == &self.bucket && stored.key() == &self.key
+            }) =>
+            {
+                PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+            }
+            (
+                StreamUploadTarget::UploadPart { upload_id, .. },
+                CreateStreamUploadPrecondition::UploadPart { expected_upload },
+            ) if expected_upload.bucket == self.bucket
+                && expected_upload.key == self.key
+                && expected_upload.upload_id == *upload_id =>
+            {
+                UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+            }
+            _ => {
+                return Err(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "build create stream upload command",
+                }
+                .into());
+            }
+        };
+        if !request
+            .bucket_write_reservation
+            .matches_exact_mutation_subject(
+                self.route_cluster_epoch,
+                &self.bucket,
+                expected_operation_kind,
+                Some(self.key.as_str()),
+            )
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build create stream upload command",
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
+impl StreamUploadCreationMetadataRoute for UnixStreamUploadCreationMetadataRoute<'_> {
+    fn matching_stream_upload_exists(
+        &self,
+        create: &CreateStreamUploadReq,
+        expected_command: Option<&CreateStreamUploadCommand>,
+    ) -> Result<bool, ObjectPgActionError> {
+        self.require_create_subject(create, "match stream upload creation")?;
+        if let Some(command) = expected_command {
+            self.require_expected_command_subject(create, command, "match stream upload creation")?;
+        }
+        let request = StorageRpcStreamUploadMatchRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            request: create.clone(),
+            expected_command: expected_command.cloned(),
+        };
+        let payload = encode_stream_upload_match_request(&request).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.client
+                    .rpc_payload_error("encode stream upload match request", error.to_string()),
+            )
+        })?;
+        let response = self
+            .client
+            .rpc_request(StorageRpcMessageKind::ObjectStreamUploadMatch, payload)
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_stream_upload_match_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(
+                self.client
+                    .rpc_payload_error("decode stream upload match response", error.to_string()),
+            )
+        })?;
+        self.client
+            .validate_stream_upload_match_response(response.exists, expected_command)?;
+        Ok(response.exists)
+    }
+
+    fn build_create_stream_upload_command(
+        &self,
+        request: BuildCreateStreamUploadCommandReq<'_>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        self.require_build_subject(&request)?;
+        let precondition = match request.precondition {
+            CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
+                require_generation_reservation,
+            } => StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
+                require_generation_reservation,
+            },
+            CreateStreamUploadPrecondition::PutObject {
+                expected_current,
+                require_generation_reservation,
+            } => StorageRpcCreateStreamUploadPrecondition::PutObject {
+                expected_current: expected_current.cloned(),
+                require_generation_reservation,
+            },
+            CreateStreamUploadPrecondition::UploadPart { expected_upload } => {
+                StorageRpcCreateStreamUploadPrecondition::UploadPart {
+                    expected_upload: expected_upload.clone(),
+                }
+            }
+        };
+        let rpc_request = StorageRpcCreateStreamUploadCommandBuildRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            request: request.request.clone(),
+            cleanup_after: request.cleanup_after,
+            precondition,
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+        };
+        let payload =
+            encode_create_stream_upload_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "encode stream upload command build request",
+                    error.to_string(),
+                ))
+            })?;
+        match self.client.object_metadata_command_build_request(
+            StorageRpcMessageKind::ObjectStreamUploadCommandBuild,
+            self.pg_id.pg_id(),
+            payload,
+            "decode stream upload command build response",
+            ObjectPgActionError::StaleObjectReadSubject,
+            |command| {
+                self.client.validate_create_stream_upload_command_response(
+                    command,
+                    self.pg_id,
+                    self.route_cluster_epoch,
+                    &request,
+                )
+            },
+        )? {
+            Some(command) => Ok(command),
+            None if matches!(
+                request.precondition,
+                CreateStreamUploadPrecondition::UploadPart { .. }
+            ) =>
+            {
+                let StreamUploadTarget::UploadPart { upload_id, .. } = &request.request.target
+                else {
+                    return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                        "decode stream upload command build response",
+                        "stream upload command build missing outcome for non-upload-part target"
+                            .to_string(),
+                    )));
+                };
+                Err(MetadataError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                }
+                .into())
+            }
+            None => Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                "decode stream upload command build response",
+                "stream upload command build cannot return missing".to_string(),
+            ))),
+        }
+    }
+}
+
 impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
     fn open_put_object_metadata_route(
         &self,
@@ -3539,32 +3763,28 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         }))
     }
 
-    fn matching_stream_upload_exists(
+    fn open_stream_upload_creation_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
-        create: &CreateStreamUploadReq,
-        expected_command: Option<&CreateStreamUploadCommand>,
-    ) -> Result<bool, ObjectPgActionError> {
-        let request = StorageRpcStreamUploadMatchRequest {
-            object: self.object_request(pg_id.pg_id(), &create.bucket, &create.key),
-            request: create.clone(),
-            expected_command: expected_command.cloned(),
-        };
-        let payload = encode_stream_upload_match_request(&request).map_err(|error| {
-            ObjectPgActionError::Store(
-                self.rpc_payload_error("encode stream upload match request", error.to_string()),
-            )
-        })?;
-        let response = self
-            .rpc_request(StorageRpcMessageKind::ObjectStreamUploadMatch, payload)
-            .map_err(ObjectPgActionError::Store)?;
-        let response = decode_stream_upload_match_response(&response).map_err(|error| {
-            ObjectPgActionError::Store(
-                self.rpc_payload_error("decode stream upload match response", error.to_string()),
-            )
-        })?;
-        self.validate_stream_upload_match_response(response.exists, expected_command)?;
-        Ok(response.exists)
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Box<dyn StreamUploadCreationMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixStreamUploadCreationMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+        }))
     }
 
     fn load_stream_upload_session(
@@ -3615,81 +3835,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 }
                 .into())
             }
-        }
-    }
-
-    fn build_create_stream_upload_command(
-        &self,
-        request: BuildCreateStreamUploadCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let precondition = match request.precondition {
-            CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                require_generation_reservation,
-            } => StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
-                require_generation_reservation,
-            },
-            CreateStreamUploadPrecondition::PutObject {
-                expected_current,
-                require_generation_reservation,
-            } => StorageRpcCreateStreamUploadPrecondition::PutObject {
-                expected_current: expected_current.cloned(),
-                require_generation_reservation,
-            },
-            CreateStreamUploadPrecondition::UploadPart { expected_upload } => {
-                StorageRpcCreateStreamUploadPrecondition::UploadPart {
-                    expected_upload: expected_upload.clone(),
-                }
-            }
-        };
-        let rpc_request = StorageRpcCreateStreamUploadCommandBuildRequest {
-            object: self.object_request(
-                request.pg_id.pg_id(),
-                &request.request.bucket,
-                &request.request.key,
-            ),
-            request: request.request.clone(),
-            cleanup_after: request.cleanup_after,
-            precondition,
-            bucket_write_reservation: request.bucket_write_reservation.clone(),
-        };
-        let payload =
-            encode_create_stream_upload_command_build_request(&rpc_request).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "encode stream upload command build request",
-                    error.to_string(),
-                ))
-            })?;
-        match self.object_metadata_command_build_request(
-            StorageRpcMessageKind::ObjectStreamUploadCommandBuild,
-            request.pg_id.pg_id(),
-            payload,
-            "decode stream upload command build response",
-            ObjectPgActionError::StaleObjectReadSubject,
-            |command| self.validate_create_stream_upload_command_response(command, &request),
-        )? {
-            Some(command) => Ok(command),
-            None if matches!(
-                request.precondition,
-                CreateStreamUploadPrecondition::UploadPart { .. }
-            ) =>
-            {
-                let StreamUploadTarget::UploadPart { upload_id, .. } = &request.request.target
-                else {
-                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                        "decode stream upload command build response",
-                        "stream upload command build missing outcome for non-upload-part target"
-                            .to_string(),
-                    )));
-                };
-                Err(MetadataError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                }
-                .into())
-            }
-            None => Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                "decode stream upload command build response",
-                "stream upload command build cannot return missing".to_string(),
-            ))),
         }
     }
 

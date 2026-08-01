@@ -2066,45 +2066,6 @@ impl Coordinator {
             .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
     }
 
-    #[cfg(any(test, feature = "test-utils"))]
-    pub(super) fn with_bucket_write_handle_for_command_with_storage_node<R, T>(
-        &self,
-        storage_node: &Arc<StorageCluster>,
-        req: &R,
-        request: BucketHandleRequest,
-        action: impl FnOnce(
-            LoadedBucketHandle,
-            storage::BucketWriteReservationProof,
-        ) -> storage::BucketWriteSnapshotAction<T, ServerError>,
-    ) -> Result<T, ServerError>
-    where
-        R: BucketScopedRequest + ExpectedBucketOwnerRequest + ?Sized,
-    {
-        let expected_bucket_owner = req.expected_bucket_owner();
-        storage_node
-            .with_bucket_write_snapshot_for_command(
-                req.bucket_name_typed(),
-                request.resolve_to_storage_request(),
-                |snapshot, proof| {
-                    let bucket = match self
-                        .bucket_handle_loader()
-                        .load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)
-                    {
-                        Ok(bucket) => bucket,
-                        Err(error) => {
-                            return Ok(storage::BucketWriteSnapshotAction::release(Err(error)));
-                        }
-                    };
-                    #[cfg(test)]
-                    self.maybe_run_bucket_write_handle_loaded_hook(
-                        req.bucket_name_typed().as_str(),
-                    );
-                    Ok(action(bucket, proof))
-                },
-            )
-            .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
-    }
-
     #[cfg(test)]
     fn load_bucket_handle_for_bucket_read(
         &self,

@@ -442,13 +442,11 @@ impl Coordinator {
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
         let session_id = Self::random_session_id("failed to generate session ID")?;
-        self.with_bucket_write_handle_for_command_with_storage_node(
+        self.with_bucket_write_handle_for_storage_node(
             storage_node,
             &req.upload,
             request,
-            |bucket_handle, proof| {
-            let mut proof_transferred_to_command = false;
-            let result = (|| {
+            |bucket_handle| {
                 #[cfg(test)]
                 if self.should_probe_begin_stream_part_session(req.upload.bucket_name()) {
                     let object_pg_ready = storage_node
@@ -465,47 +463,35 @@ impl Coordinator {
                         });
                     }
                 }
-                proof_transferred_to_command = true;
-                storage_node
-                    .begin_upload_part_stream_session_with_cleanup_deadline(
-                        storage::BeginUploadPartStreamSessionReq {
-                            bucket: req.upload.bucket_name_typed().clone(),
-                            key: req.upload.key_typed().clone(),
-                            upload_id: req.upload.upload_id().clone(),
-                            part_number: req.part_number,
-                            session_id: session_id.clone(),
-                            bucket_write_reservation: proof.clone(),
-                        },
-                        cleanup_after,
-                        |upload| {
-                            let authorized =
-                                self.authorize_begin_stream_part_with_upload(
-                                    req,
-                                    &bucket_handle,
-                                    upload,
-                                )?;
-                            let checksum_algorithm = authorized
-                                .upload
-                                .checksum
-                                .map(MultipartChecksumConfig::algorithm);
-                            let authorized_upload = authorized.upload;
-                            Ok::<_, ServerError>((
-                                authorized_upload,
-                                BeginStreamPartResult {
-                                    session_id: session_id.clone(),
-                                    checksum_algorithm,
-                                    sse_customer: authorized.sse_customer,
-                                },
-                            ))
-                        },
+                let upload = storage_node
+                    .load_in_progress_multipart_upload(
+                        req.upload.bucket_name_typed(),
+                        req.upload.key_typed(),
+                        req.upload.upload_id(),
                     )
-                    .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
-            })();
-            if proof_transferred_to_command {
-                storage::BucketWriteSnapshotAction::transferred_to_command(result)
-            } else {
-                storage::BucketWriteSnapshotAction::release(result)
-            }
+                    .map_err(Self::map_object_pg_action_error)?;
+                let authorized =
+                    self.authorize_begin_stream_part_with_upload(req, &bucket_handle, &upload)?;
+                let checksum_algorithm = authorized
+                    .upload
+                    .record()
+                    .checksum
+                    .map(MultipartChecksumConfig::algorithm);
+                let session_id = storage_node
+                    .create_upload_part_stream_session_with_cleanup_deadline(
+                        &authorized.upload,
+                        authorized.part_number,
+                        &session_id,
+                        cleanup_after,
+                    )
+                    .map_err(|error| {
+                        Self::map_upload_part_stream_error(&authorized.upload_id, error)
+                    })?;
+                Ok(BeginStreamPartResult {
+                    session_id,
+                    checksum_algorithm,
+                    sse_customer: authorized.sse_customer,
+                })
             },
         )
     }

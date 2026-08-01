@@ -1377,6 +1377,16 @@ pub(crate) struct CreateStreamUploadCommand {
 }
 
 impl CreateStreamUploadCommand {
+    pub(crate) fn matches_request(&self, request: &CreateStreamUploadReq) -> bool {
+        self.session.session_id == request.session_id
+            && self.session.bucket == request.bucket
+            && self.session.key == request.key
+            && self.session.target == request.target
+            && self.session.state == StreamUploadState::InProgress
+            && self.session.encryption == request.encryption
+            && self.initial_next_segment_vid == GenerationId::MIN
+    }
+
     #[cfg(test)]
     pub(crate) fn from_request_with_bucket_write_reservation(
         request: CreateStreamUploadReq,

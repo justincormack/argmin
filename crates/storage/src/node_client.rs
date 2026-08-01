@@ -592,6 +592,7 @@ fn stream_upload_matches_command(
 ) -> bool {
     StreamUploadCommandRecord::from(existing) == create.session
         && existing.next_segment_vid == create.initial_next_segment_vid
+        && existing.cleanup_after == create.cleanup_after
         && stream_upload_bucket_write_reservation_matches_command(existing, create)
 }
 
