@@ -572,8 +572,8 @@ impl ReadRuntime {
             if index > 0 && index % LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS == 0 {
                 self.heartbeat_lifecycle_sweep_claim(claim)?;
             }
-            if upload.state == UploadState::Aborting {
-                candidates.push((upload.key, upload.upload_id));
+            if upload.state() == UploadState::Aborting {
+                candidates.push(upload.into_key_and_upload_id());
             }
         }
 
@@ -862,18 +862,19 @@ impl ReadRuntime {
             if index > 0 && index % LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS == 0 {
                 self.heartbeat_lifecycle_sweep_claim(claim)?;
             }
-            if upload.state != UploadState::InProgress && upload.state != UploadState::Aborting {
+            if upload.state() != UploadState::InProgress && upload.state() != UploadState::Aborting
+            {
                 continue;
             }
             let Some(headers) = Coordinator::evaluate_multipart_lifecycle_abort_headers(
                 &config,
-                upload.key.as_str(),
-                upload.initiated_at,
+                upload.key().as_str(),
+                upload.initiated_at(),
             ) else {
                 continue;
             };
             if headers.abort_time_millis <= now_millis {
-                candidates.push((upload.key, upload.upload_id));
+                candidates.push(upload.into_key_and_upload_id());
             }
         }
 
@@ -919,7 +920,7 @@ impl ReadRuntime {
                 key,
                 upload_id,
                 expected_bucket_incarnation_generation,
-                |raw_lifecycle, upload| {
+                |raw_lifecycle, initiated_at| {
                     let Some(config) =
                         Self::parse_lifecycle_config(bucket.as_str(), raw_lifecycle)?
                     else {
@@ -929,7 +930,7 @@ impl ReadRuntime {
                     let Some(headers) = Coordinator::evaluate_multipart_lifecycle_abort_headers(
                         &config,
                         key.as_str(),
-                        upload.initiated_at,
+                        initiated_at,
                     ) else {
                         return Ok::<bool, ServerError>(false);
                     };

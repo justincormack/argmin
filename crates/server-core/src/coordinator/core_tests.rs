@@ -1782,7 +1782,7 @@ fn upload_part_copy_expires_inside_destination_append_and_cleans_stream_state() 
         "failed UploadPartCopy must abort its destination stream session"
     );
     cluster
-        .load_in_progress_multipart_upload(
+        .test_load_in_progress_multipart_upload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("late-part-copy-destination"),
             &upload.upload_id,
@@ -1929,7 +1929,7 @@ fn streamed_upload_part_expires_inside_append_and_cleans_staged_payload() {
         .into_iter()
         .all(|session| session.session_id != begin.session_id));
     cluster
-        .load_in_progress_multipart_upload(&bucket, &key, &upload.upload_id)
+        .test_load_in_progress_multipart_upload(&bucket, &key, &upload.upload_id)
         .expect("failed ordinary UploadPart must preserve its multipart upload");
 }
 
@@ -2160,7 +2160,7 @@ fn multipart_abort_expires_at_pending_install_effect_boundary() {
     drop(admission);
     assert_eq!(
         cluster
-            .load_in_progress_multipart_upload(
+            .test_load_in_progress_multipart_upload(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("late-abort"),
                 &upload_id,
@@ -2176,7 +2176,7 @@ fn multipart_abort_expires_at_pending_install_effect_boundary() {
         .abort_multipart_upload_on_admitted_route(&fresh_admission, &request)
         .unwrap();
     assert!(matches!(
-        cluster.load_in_progress_multipart_upload(
+        cluster.test_load_in_progress_multipart_upload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("late-abort"),
             &upload_id,
@@ -2248,7 +2248,7 @@ fn multipart_completion_expires_at_final_pending_install_effect_boundary() {
     drop(admission);
     assert_eq!(
         cluster
-            .load_in_progress_multipart_upload(
+            .test_load_in_progress_multipart_upload(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("late-completion"),
                 &upload_id,
@@ -2439,7 +2439,7 @@ fn list_parts_expires_after_authorization_and_uses_admitted_lifecycle_route() {
     drop(admission);
     assert_eq!(
         cluster
-            .load_in_progress_multipart_upload(
+            .test_load_in_progress_multipart_upload(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("logs/listed"),
                 &upload_id,
@@ -2532,7 +2532,7 @@ fn multipart_upload_target_preflights_reject_an_expired_admission_after_same_epo
     drop(admission);
     assert_eq!(
         cluster
-            .load_in_progress_multipart_upload(
+            .test_load_in_progress_multipart_upload(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("complete-preflight"),
                 &upload_id,
@@ -4592,7 +4592,7 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
     assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
     assert_eq!(
         cluster
-            .load_in_progress_multipart_upload(
+            .test_load_in_progress_multipart_upload(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("foreign-domain-multipart"),
                 &created.upload_id,

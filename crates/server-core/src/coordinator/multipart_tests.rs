@@ -1257,7 +1257,7 @@ fn create_multipart_upload_preserves_metadata() {
         .unwrap();
     assert_eq!(record.bucket, "bucket");
     assert_eq!(record.key, "photo.png");
-    assert_eq!(record.tags.as_deref(), Some(&tags));
+    assert_eq!(record.tags.as_ref(), Some(&tags));
 
     // Deserialize and verify the metadata blob.
     let blob = MetadataBlob::deserialize(record.metadata_blob.as_slice()).unwrap();

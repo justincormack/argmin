@@ -1214,6 +1214,22 @@ multipart completion no longer exports a physical record representation; test-on
 fixtures and the public root exports that support them remain for the wider implementation-order
 item 3 relocation audit, so that item is not yet complete.
 
+The twenty-second bounded slice continues implementation-order item 3 by containing the remaining
+multipart upload, part, cleanup, management, snapshot, replay, and test-observation
+representations. Production multipart upload, in-progress part, streamed-part segment, cleanup,
+management-lookup, completion snapshot/preflight/replay, object-identity, and direct test-commit
+types are now private to `storage`. Lifecycle sweeping receives only a logical upload projection
+containing the object key, upload ID, initiation time, and upload state; its due-decision callback
+receives only the initiation time. Cross-crate behavioral tests use feature-gated, read-only test
+projections rather than production durable records. Their multipart-upload `Debug` output reports
+only logical identity, state, tag count, and generation and redacts tag contents, serialized
+metadata, and encryption state. Existing database rows, metadata-command encodings, node-client
+messages, and storage-RPC encodings are unchanged. Compiler visibility is the primary boundary,
+with a repository check rejecting these raw representations outside `storage`, as public type
+definitions, or through the public root export. The production object-read seam still consumes
+`ObjectPartRecord`; containing that remaining physical multipart-manifest representation is the
+next part of implementation-order item 3, so that item is not yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

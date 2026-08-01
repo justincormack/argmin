@@ -4998,22 +4998,24 @@ fn unix_object_mutation_client_rejects_malformed_multipart_read_responses() {
         .unwrap();
     let err = client
         .validate_multipart_management_lookup_response(
-            &MultipartUploadManagementLookup::Replay(Box::new(crate::MultipartCompletionReplay {
-                upload_id,
-                bucket,
-                key: crate::tests::object_key("wrong-completed-key"),
-                fingerprint: crate::MultipartCompletionFingerprint::from_bytes([0x66; 32]),
-                version_id: VersionId::Null,
-                etag: ObjectEtag::MultipartComposite {
-                    crc64: [0; 8],
-                    parts: std::num::NonZeroU32::new(1).unwrap(),
+            &MultipartUploadManagementLookup::Replay(Box::new(
+                crate::types::MultipartCompletionReplay {
+                    upload_id,
+                    bucket,
+                    key: crate::tests::object_key("wrong-completed-key"),
+                    fingerprint: crate::MultipartCompletionFingerprint::from_bytes([0x66; 32]),
+                    version_id: VersionId::Null,
+                    etag: ObjectEtag::MultipartComposite {
+                        crc64: [0; 8],
+                        parts: std::num::NonZeroU32::new(1).unwrap(),
+                    },
+                    size: 1,
+                    last_modified: 2,
+                    tags: None,
+                    system_metadata_blob: None,
+                    encryption: ObjectEncryption::None,
                 },
-                size: 1,
-                last_modified: 2,
-                tags: None,
-                system_metadata_blob: None,
-                encryption: ObjectEncryption::None,
-            })),
+            )),
             &upload.bucket,
             &upload.key,
             &upload.upload_id,

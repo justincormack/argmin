@@ -8691,7 +8691,7 @@ impl super::StorageCluster {
     pub fn list_all_multipart_uploads_for_bucket(
         &self,
         bucket: &BucketName,
-    ) -> Result<Vec<MultipartUploadRecord>, ObjectPgActionError> {
+    ) -> Result<Vec<crate::MultipartLifecycleUpload>, ObjectPgActionError> {
         let mut uploads = Vec::new();
         for pg_id in self.metadata_pg_ids() {
             let mut key_marker = None;
@@ -8724,7 +8724,10 @@ impl super::StorageCluster {
                 .cmp(&b.key)
                 .then_with(|| a.upload_id.cmp(&b.upload_id))
         });
-        Ok(uploads)
+        Ok(uploads
+            .into_iter()
+            .map(crate::MultipartLifecycleUpload::from_record)
+            .collect())
     }
 
     pub(super) fn list_objects_for_bucket_with_route_validation(
@@ -13538,7 +13541,8 @@ impl super::StorageCluster {
         }
     }
 
-    pub fn load_multipart_upload(
+    #[cfg(test)]
+    pub(crate) fn load_multipart_upload(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -13552,8 +13556,8 @@ impl super::StorageCluster {
             .load_multipart_upload(upload_id)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn begin_upload_part_stream_session<T, E>(
+    #[cfg(test)]
+    pub(crate) fn begin_upload_part_stream_session<T, E>(
         &self,
         req: BeginUploadPartStreamSessionReq,
         action: impl FnMut(&MultipartUploadRecord) -> Result<(AuthorizedMultipartUploadRecord, T), E>,
@@ -13561,8 +13565,8 @@ impl super::StorageCluster {
         self.begin_upload_part_stream_session_with_cleanup_deadline(req, None, action)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn begin_upload_part_stream_session_with_cleanup_deadline<T, E>(
+    #[cfg(test)]
+    pub(crate) fn begin_upload_part_stream_session_with_cleanup_deadline<T, E>(
         &self,
         req: BeginUploadPartStreamSessionReq,
         cleanup_after: Option<u64>,
@@ -13716,8 +13720,8 @@ impl super::StorageCluster {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn create_upload_part_stream_session(
+    #[cfg(test)]
+    pub(crate) fn create_upload_part_stream_session(
         &self,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         part_number: u32,
@@ -13732,7 +13736,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn create_upload_part_stream_session_with_cleanup_deadline(
+    pub(crate) fn create_upload_part_stream_session_with_cleanup_deadline(
         &self,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         part_number: u32,
@@ -13955,7 +13959,9 @@ impl super::StorageCluster {
         }
     }
 
-    pub fn load_in_progress_multipart_upload(
+    /// Owner-local test access to the complete durable multipart record.
+    #[cfg(test)]
+    pub(crate) fn load_in_progress_multipart_upload(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -13971,6 +13977,27 @@ impl super::StorageCluster {
             upload_id,
             || Ok(()),
         )
+    }
+
+    /// Test-only logical observation of one in-progress multipart upload.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_load_in_progress_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<crate::TestMultipartUploadRecord, ObjectPgActionError> {
+        self.load_in_progress_multipart_upload_with_route_validation(
+            super::MultipartObjectMutationEffectRoute {
+                pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            upload_id,
+            || Ok(()),
+        )
+        .map(Into::into)
     }
 
     /// Load an in-progress upload through the logical UploadPart authorization boundary.
@@ -14018,7 +14045,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(feature = "test-hooks")]
-    pub fn try_load_in_progress_multipart_upload(
+    pub(crate) fn try_load_in_progress_multipart_upload(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -14031,26 +14058,8 @@ impl super::StorageCluster {
             .try_load_in_progress_multipart_upload(bucket, key, upload_id)
     }
 
-    pub fn load_in_progress_multipart_upload_for_listing(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        let pg_id = self.object_metadata_pg(bucket, key);
-        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        mutation_client
-            .open_multipart_upload_lookup_metadata_route(
-                self.operation_epoch(),
-                pg_id,
-                bucket,
-                key,
-            )?
-            .load_in_progress_multipart_upload_for_listing(upload_id)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn load_multipart_completion_snapshot(
+    #[cfg(test)]
+    pub(crate) fn load_multipart_completion_snapshot(
         &self,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         requested_part_numbers: &[u32],
@@ -14098,22 +14107,6 @@ impl super::StorageCluster {
                 authorized_upload,
             )?
             .load_multipart_completion_snapshot(requested_part_numbers)
-    }
-
-    pub fn load_multipart_completion_preflight(
-        &self,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
-    ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
-        let bucket = &authorized_upload.record().bucket;
-        let key = &authorized_upload.record().key;
-        let pg_id = self.object_metadata_pg(bucket, key);
-        self.object_mutation_metadata_primary_client(bucket, key)?
-            .open_authorized_multipart_upload_metadata_route(
-                self.operation_epoch(),
-                pg_id,
-                authorized_upload,
-            )?
-            .load_multipart_completion_preflight()
     }
 
     fn complete_multipart_outcome_from_command(
@@ -15454,24 +15447,6 @@ impl super::StorageCluster {
             .list_multipart_parts(part_number_marker, max_parts)
     }
 
-    pub fn lookup_multipart_upload_management(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
-        self.lookup_multipart_upload_management_with_route_validation(
-            super::MultipartObjectMutationEffectRoute {
-                pg_id: self.object_metadata_pg(bucket, key),
-                bucket,
-                key,
-                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
-            },
-            upload_id,
-            || Ok(()),
-        )
-    }
-
     pub(super) fn lookup_multipart_upload_management_with_route_validation(
         &self,
         route: super::MultipartObjectMutationEffectRoute<'_>,
@@ -15896,7 +15871,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
         expected_bucket_incarnation_generation: u64,
-        should_abort: impl FnOnce(Option<&str>, &MultipartUploadRecord) -> Result<bool, E>,
+        should_abort: impl FnOnce(Option<&str>, u64) -> Result<bool, E>,
     ) -> Result<Result<bool, E>, ObjectPgActionError> {
         let Some(lifecycle_context) =
             self.load_bucket_lifecycle_context(bucket, expected_bucket_incarnation_generation)?
@@ -15970,7 +15945,7 @@ impl super::StorageCluster {
             return Ok(Ok(false));
         }
 
-        let should_abort = match should_abort(raw_lifecycle.as_deref(), &upload) {
+        let should_abort = match should_abort(raw_lifecycle.as_deref(), upload.initiated_at) {
             Ok(should_abort) => should_abort,
             Err(error) => return Ok(Err(error)),
         };
@@ -16406,9 +16381,10 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
-    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+    ) -> Result<crate::TestMultipartUploadRecord, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_get_multipart_upload(bucket, key, upload_id)
+            .map(Into::into)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -16418,7 +16394,8 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<crate::MultipartUploadCompletionCandidate, ObjectPgActionError> {
-        self.test_get_multipart_upload(bucket, key, upload_id)
+        self.metadata_primary_bridge_node()?
+            .test_get_multipart_upload(bucket, key, upload_id)
             .map(crate::MultipartUploadCompletionCandidate::from_record)
     }
 
@@ -16429,18 +16406,20 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
         part_number: u16,
-    ) -> Result<MultipartPartRecord, ObjectPgActionError> {
+    ) -> Result<crate::TestMultipartPartRecord, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_get_multipart_part(bucket, key, upload_id, part_number)
+            .map(Into::into)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_list_multipart_uploads_for_bucket(
         &self,
         bucket: &BucketName,
-    ) -> Result<Vec<MultipartUploadRecord>, ObjectPgActionError> {
+    ) -> Result<Vec<crate::TestMultipartUploadRecord>, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_list_multipart_uploads_for_bucket(bucket)
+            .map(|uploads| uploads.into_iter().map(Into::into).collect())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -16663,9 +16642,10 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
-    ) -> Result<Vec<MultipartPartSegmentRecord>, ObjectPgActionError> {
+    ) -> Result<Vec<crate::TestMultipartPartSegmentRecord>, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_get_all_multipart_part_segments_for_upload(bucket, key, upload_id)
+            .map(|segments| segments.into_iter().map(Into::into).collect())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

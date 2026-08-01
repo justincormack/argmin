@@ -312,6 +312,154 @@ pub struct TestPayloadReclaimRoot {
     pub generation_id: GenerationId,
 }
 
+/// Test-only logical observation of one durable multipart upload.
+///
+/// The production record remains storage-private. This projection lets
+/// cross-crate behavioral tests inspect the S3-visible state they established
+/// without depending on the database/RPC record type.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Clone, PartialEq, Eq)]
+pub struct TestMultipartUploadRecord {
+    pub upload_id: UploadId,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub initiated_at: u64,
+    pub state: UploadState,
+    pub tags: Option<s3_types::TagSet>,
+    pub metadata_blob: SerializedMetadataBlob,
+    pub system_metadata_blob: SerializedSystemMetadataBlob,
+    pub initiator: OwnerIdentity,
+    pub owner: OwnerIdentity,
+    pub acl_grants: AclGrants,
+    pub public_read: bool,
+    pub object_generation_id: GenerationId,
+    pub object_lock: ObjectLockState,
+    pub checksum: Option<MultipartChecksumConfig>,
+    pub encryption: ObjectEncryption,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl std::fmt::Debug for TestMultipartUploadRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TestMultipartUploadRecord")
+            .field("upload_id", &self.upload_id)
+            .field("bucket", &self.bucket)
+            .field("key", &self.key)
+            .field("initiated_at", &self.initiated_at)
+            .field("state", &self.state)
+            .field("tag_count", &self.tags.as_ref().map(s3_types::TagSet::len))
+            .field("object_generation_id", &self.object_generation_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<types::MultipartUploadRecord> for TestMultipartUploadRecord {
+    fn from(upload: types::MultipartUploadRecord) -> Self {
+        Self {
+            upload_id: upload.upload_id,
+            bucket: upload.bucket,
+            key: upload.key,
+            initiated_at: upload.initiated_at,
+            state: upload.state,
+            tags: upload.tags.map(|tags| tags.tag_set().clone()),
+            metadata_blob: upload.metadata_blob,
+            system_metadata_blob: upload.system_metadata_blob,
+            initiator: upload.initiator,
+            owner: upload.owner,
+            acl_grants: upload.acl_grants,
+            public_read: upload.public_read,
+            object_generation_id: upload.object_generation_id,
+            object_lock: upload.object_lock,
+            checksum: upload.checksum,
+            encryption: upload.encryption,
+        }
+    }
+}
+
+/// Test-only observation of one in-progress multipart part.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestMultipartPartRecord {
+    pub upload_id: UploadId,
+    pub part_number: u32,
+    pub generation: u32,
+    pub size: u64,
+    pub payload_crc64: u64,
+    pub etag: Vec<u8>,
+    pub etag_kind: EtagKind,
+    pub part_vid: GenerationId,
+    pub placement_cluster_epoch: ClusterEpoch,
+    pub ec_k: u8,
+    pub ec_m: u8,
+    pub last_modified: u64,
+    pub checksum: Option<ChecksumBytes>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<types::MultipartPartRecord> for TestMultipartPartRecord {
+    fn from(part: types::MultipartPartRecord) -> Self {
+        Self {
+            upload_id: part.upload_id,
+            part_number: part.part_number,
+            generation: part.generation,
+            size: part.size,
+            payload_crc64: part.payload_crc64,
+            etag: part.etag,
+            etag_kind: part.etag_kind,
+            part_vid: part.part_vid,
+            placement_cluster_epoch: part.placement_cluster_epoch,
+            ec_k: part.ec_k,
+            ec_m: part.ec_m,
+            last_modified: part.last_modified,
+            checksum: part.checksum,
+        }
+    }
+}
+
+/// Test-only physical observation used to verify streamed UploadPart cleanup.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestMultipartPartSegmentRecord {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub upload_id: UploadId,
+    pub version_id: u64,
+    pub part_number: u32,
+    pub segment_index: u32,
+    pub size: u64,
+    pub segment_crc64: u64,
+    pub segment_okh: [u8; 16],
+    pub segment_vid: GenerationId,
+    pub data_pg_id: u32,
+    pub placement_cluster_epoch: ClusterEpoch,
+    pub ec_k: u8,
+    pub ec_m: u8,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl From<types::MultipartPartSegmentRecord> for TestMultipartPartSegmentRecord {
+    fn from(segment: types::MultipartPartSegmentRecord) -> Self {
+        Self {
+            bucket: segment.bucket,
+            key: segment.key,
+            upload_id: segment.upload_id,
+            version_id: segment.version_id,
+            part_number: segment.part_number,
+            segment_index: segment.segment_index,
+            size: segment.size,
+            segment_crc64: segment.segment_crc64,
+            segment_okh: segment.segment_okh,
+            segment_vid: segment.segment_vid,
+            data_pg_id: segment.data_pg_id,
+            placement_cluster_epoch: segment.placement_cluster_epoch,
+            ec_k: segment.ec_k,
+            ec_m: segment.ec_m,
+        }
+    }
+}
+
 /// Test-only logical observation of accepted bucket-deletion progress.
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,60 +594,56 @@ pub(crate) use types::MultipartUploadIdKey;
 #[cfg(test)]
 pub(crate) use types::UPLOAD_ID_LEN;
 pub use types::{
-    key_prefix_upper_bound, object_key_common_prefix, object_key_prefix_upper_bound,
-    AbortMultipartUploadCleanup, AclGrants, AuthorizedMultipartCompletionReplay,
-    AuthorizedMultipartCompletionSnapshot, AuthorizedMultipartUploadAbort,
-    AuthorizedMultipartUploadCompletion, AuthorizedMultipartUploadListParts,
-    AuthorizedMultipartUploadPart, AuthorizedMultipartUploadRecord,
+    key_prefix_upper_bound, object_key_common_prefix, object_key_prefix_upper_bound, AclGrants,
+    AuthorizedMultipartCompletionReplay, AuthorizedMultipartCompletionSnapshot,
+    AuthorizedMultipartUploadAbort, AuthorizedMultipartUploadCompletion,
+    AuthorizedMultipartUploadListParts, AuthorizedMultipartUploadPart,
     BeginUploadPartStreamSessionReq, BucketAclSummary, BucketDeleteDiagnostic,
     BucketEncryptionConfig, BucketFastPathIdentity, BucketFastPathInfo, BucketFastPathPolicy,
     BucketFastPathTags, BucketInfo, BucketName, BucketNameError, BucketObjectLockConfig,
     BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketVersioningState,
     BucketWriteDrainRecord, BucketWriteDrainState, BucketWriteReservationRecord, CanonicalUserId,
-    ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CommitMultipartReq,
-    CompleteMultipartCommitCleanup, CompleteMultipartCommitInput, CompleteMultipartCommitOutcome,
-    CompleteMultipartCommitRequest, CreateBucketConfig, CreateMultipartUploadInput,
-    CreateMultipartUploadOutcome, CreateStreamUploadReq, DataLayout, DeleteCurrentObjectOutcome,
-    DeleteMarkerRecord, DeleteSpecificObjectVersionOutcome, DeletedCurrentObject,
-    DeletedSpecificObjectVersion, DirectPutCommitSnapshot, DirectPutCommitStorageSnapshot,
-    DirectPutPayloadWrite, EcShape, EffectiveBucketEncryptionConfig, EtagKind,
-    ExpireCurrentObjectOutcome, FinalizeDirectPutObjectOutcome, FinalizeStreamPartCleanup,
-    FinalizeStreamPartOutcome, FinalizeStreamPutOutcome, GenerationId,
-    InsertCurrentDeleteMarkerOutcome, InvalidChecksumConfig, LegalHoldStatus,
+    ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CompleteMultipartCommitInput,
+    CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest, CreateBucketConfig,
+    CreateMultipartUploadInput, CreateMultipartUploadOutcome, CreateStreamUploadReq, DataLayout,
+    DeleteCurrentObjectOutcome, DeleteMarkerRecord, DeleteSpecificObjectVersionOutcome,
+    DeletedCurrentObject, DeletedSpecificObjectVersion, DirectPutCommitSnapshot,
+    DirectPutCommitStorageSnapshot, DirectPutPayloadWrite, EcShape,
+    EffectiveBucketEncryptionConfig, EtagKind, ExpireCurrentObjectOutcome,
+    FinalizeDirectPutObjectOutcome, FinalizeStreamPartOutcome, FinalizeStreamPutOutcome,
+    GenerationId, InsertCurrentDeleteMarkerOutcome, InvalidChecksumConfig, LegalHoldStatus,
     LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot, LifecycleSweepRootSource,
     ListObjectVersionsReq, ListObjectVersionsResp, ListObjectsReq, ListObjectsResp,
     ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
     ListedMultipartPart, ListedMultipartParts, ListedMultipartUpload, LiveObjectRecord,
     LoadedBucketSubresource, ManagedEncryptionAlgorithm, MultipartChecksumConfig,
-    MultipartCompletionFingerprint, MultipartCompletionPart, MultipartCompletionPreflight,
-    MultipartCompletionReplay, MultipartCompletionReplayCandidate, MultipartCompletionSnapshot,
-    MultipartObjectIdentity, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartUploadAbortCandidate, MultipartUploadAbortLookup,
+    MultipartCompletionFingerprint, MultipartCompletionPart, MultipartCompletionReplayCandidate,
+    MultipartLifecycleUpload, MultipartUploadAbortCandidate, MultipartUploadAbortLookup,
     MultipartUploadAuthorizationIdentity, MultipartUploadCompletionCandidate,
     MultipartUploadCompletionContext, MultipartUploadCompletionLookup, MultipartUploadIdAuthority,
     MultipartUploadListMarker, MultipartUploadListPartsCandidate, MultipartUploadListPartsLookup,
-    MultipartUploadManagementLookup, MultipartUploadPartCandidate, MultipartUploadRecord,
-    ObjectEncryption, ObjectEncryptionStateError, ObjectEtag, ObjectKey, ObjectKeyError,
-    ObjectLayout, ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState,
-    ObjectPartRangeRecord, ObjectPartRecord, ObjectPayloadPlacementDiagnosticError,
-    ObjectPayloadSegment, ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot,
-    ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord,
-    ObjectState, OpaqueBucketSubresourceKind, OwnerIdentity, PgId, PgState,
-    PrepareStreamUploadSegmentAppendReq, PreparedDirectPutObjectCommit, PreparedStreamPartCommit,
-    PreparedStreamPutCommit, PublicAccessBlockConfig, PutBucketSubresource, PutDeleteMarkerReq,
-    PutLiveObjectReq, PutLiveObjectValidationError, PutObjectReq, RawChecksum, RetentionPeriod,
-    RouteMapValidUntilMs, RouteMapValidity, SegmentStoredBytesRequest, SerializedBucketTagSet,
-    SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId,
-    SessionIdError, ShardData, ShardIndex, ShardKey, ShardScavengerObservation,
-    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
-    ShardStat, ShardStatus, SseCustomerObjectState, SseS3ObjectState, StorageClass,
-    StoredLegalHoldStatus, StoredObject, StreamPartFinalizeInput, StreamPartFinalizeSnapshot,
-    StreamPutCommitInput, StreamPutFinalizeSnapshot, StreamPutFinalizeStorageSnapshot,
-    StreamSegmentAppendInput, StreamSegmentAppendOutcome, StreamUploadCommandRecord,
-    StreamUploadKind, StreamUploadRecord, StreamUploadRecordPage, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadIdError,
-    UploadState, VersionId, WriteAck, WrittenShardAck, MULTIPART_PART_SEGMENT_STAGING_VERSION_ID,
+    MultipartUploadPartCandidate, ObjectEncryption, ObjectEncryptionStateError, ObjectEtag,
+    ObjectKey, ObjectKeyError, ObjectLayout, ObjectLockDefaultRetention, ObjectLockMode,
+    ObjectLockState, ObjectPartRangeRecord, ObjectPartRecord,
+    ObjectPayloadPlacementDiagnosticError, ObjectPayloadSegment, ObjectReadAuthSubject,
+    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode,
+    ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord, ObjectState,
+    OpaqueBucketSubresourceKind, OwnerIdentity, PgId, PgState, PrepareStreamUploadSegmentAppendReq,
+    PreparedDirectPutObjectCommit, PreparedStreamPartCommit, PreparedStreamPutCommit,
+    PublicAccessBlockConfig, PutBucketSubresource, PutDeleteMarkerReq, PutLiveObjectReq,
+    PutLiveObjectValidationError, PutObjectReq, RawChecksum, RetentionPeriod, RouteMapValidUntilMs,
+    RouteMapValidity, SegmentStoredBytesRequest, SerializedBucketTagSet, SerializedMetadataBlob,
+    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, SessionIdError, ShardData,
+    ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
+    ShardScavengerObservationReason, ShardScavengerObservationRecord, ShardStat, ShardStatus,
+    SseCustomerObjectState, SseS3ObjectState, StorageClass, StoredLegalHoldStatus, StoredObject,
+    StreamPartFinalizeInput, StreamPartFinalizeSnapshot, StreamPutCommitInput,
+    StreamPutFinalizeSnapshot, StreamPutFinalizeStorageSnapshot, StreamSegmentAppendInput,
+    StreamSegmentAppendOutcome, StreamUploadCommandRecord, StreamUploadKind, StreamUploadRecord,
+    StreamUploadRecordPage, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
+    TerminalStreamCleanupRecord, UploadId, UploadIdError, UploadState, VersionId, WriteAck,
+    WrittenShardAck, MULTIPART_PART_SEGMENT_STAGING_VERSION_ID,
     OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN, OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN,
     OBJECT_ENCRYPTION_SEGMENT_NONCE_SCOPE_LEN, OBJECT_ENCRYPTION_SEGMENT_TAG_LEN,
     OBJECT_ENCRYPTION_WRAPPED_DEK_LEN, OBJECT_ENCRYPTION_WRAP_NONCE_LEN, SESSION_ID_LEN,
@@ -510,15 +654,21 @@ pub use types::{
     SSE_S3_WRAP_NONCE_LEN,
 };
 pub(crate) use types::{
+    AbortMultipartUploadCleanup, AuthorizedMultipartUploadRecord, CommitDirectPutObjectReq,
+    CompleteMultipartCommitCleanup, CreateMultipartUploadReq, FinalizeStreamPartCleanup,
+    MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartObjectIdentity,
+    MultipartUploadManagementLookup,
+};
+pub(crate) use types::{
     BucketDeleteAttemptOutcomeKind, BucketDeleteAttemptOutcomeRecord, BucketDeleteAttemptPhase,
     BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketSubresourceKind,
     ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, PayloadReclaimRoot,
     BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN,
 };
-pub(crate) use types::{CommitDirectPutObjectReq, CreateMultipartUploadReq};
 pub(crate) use types::{
     ListMultipartUploadsPageStart, ListMultipartUploadsReq, ListMultipartUploadsResp,
 };
+pub(crate) use types::{MultipartPartRecord, MultipartPartSegmentRecord, MultipartUploadRecord};
 #[cfg(test)]
 pub(crate) use types::{
     ObjectSegmentsReclaimRecord, PlacedSegmentShardBackfillClaimAcquire,

@@ -4453,7 +4453,8 @@ pub struct PutDeleteMarkerReq {
 /// The ETag is the composite CRC64 bytes; the storage layer constructs the
 /// `MultipartComposite` variant using the parts slice length, so the caller
 /// cannot produce a variant mismatch.
-pub struct CommitMultipartReq {
+#[cfg(test)]
+pub(crate) struct CommitMultipartReq {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub version_id: VersionId,
@@ -4939,7 +4940,7 @@ pub enum UploadState {
 /// stable current object from an intervening write even when the current ETag
 /// would otherwise satisfy the request condition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MultipartObjectIdentity {
+pub(crate) enum MultipartObjectIdentity {
     Live {
         version_id: VersionId,
         generation_id: GenerationId,
@@ -4963,7 +4964,7 @@ impl UploadState {
 
 /// In-progress multipart upload record.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MultipartUploadRecord {
+pub(crate) struct MultipartUploadRecord {
     pub upload_id: UploadId,
     pub bucket: BucketName,
     pub key: ObjectKey,
@@ -4991,23 +4992,64 @@ pub struct MultipartUploadRecord {
     pub encryption: ObjectEncryption,
 }
 
+/// Logical multipart-upload state used by lifecycle policy evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartLifecycleUpload {
+    key: ObjectKey,
+    upload_id: UploadId,
+    initiated_at: u64,
+    state: UploadState,
+}
+
+impl MultipartLifecycleUpload {
+    pub(crate) fn from_record(upload: MultipartUploadRecord) -> Self {
+        Self {
+            key: upload.key,
+            upload_id: upload.upload_id,
+            initiated_at: upload.initiated_at,
+            state: upload.state,
+        }
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &ObjectKey {
+        &self.key
+    }
+
+    #[must_use]
+    pub fn upload_id(&self) -> &UploadId {
+        &self.upload_id
+    }
+
+    #[must_use]
+    pub fn initiated_at(&self) -> u64 {
+        self.initiated_at
+    }
+
+    #[must_use]
+    pub fn state(&self) -> UploadState {
+        self.state
+    }
+
+    #[must_use]
+    pub fn into_key_and_upload_id(self) -> (ObjectKey, UploadId) {
+        (self.key, self.upload_id)
+    }
+}
+
 /// Multipart upload record that has already passed caller authorization.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorizedMultipartUploadRecord {
+pub(crate) struct AuthorizedMultipartUploadRecord {
     upload: MultipartUploadRecord,
 }
 
 impl AuthorizedMultipartUploadRecord {
-    pub fn assume_authorized(upload: MultipartUploadRecord) -> Self {
+    pub(crate) fn assume_authorized(upload: MultipartUploadRecord) -> Self {
         Self { upload }
     }
 
-    pub fn record(&self) -> &MultipartUploadRecord {
+    pub(crate) fn record(&self) -> &MultipartUploadRecord {
         &self.upload
-    }
-
-    pub fn into_record(self) -> MultipartUploadRecord {
-        self.upload
     }
 }
 
@@ -5020,7 +5062,7 @@ impl std::ops::Deref for AuthorizedMultipartUploadRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MultipartUploadManagementLookup {
+pub(crate) enum MultipartUploadManagementLookup {
     InProgress(Box<MultipartUploadRecord>),
     NonInProgress(Box<MultipartUploadRecord>),
     Replay(Box<MultipartCompletionReplay>),
@@ -5536,7 +5578,7 @@ impl MultipartUploadCompletionLookup {
 
 /// In-progress multipart part record.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MultipartPartRecord {
+pub(crate) struct MultipartPartRecord {
     pub upload_id: UploadId,
     pub part_number: u32,
     pub generation: u32,
@@ -5591,7 +5633,7 @@ impl MultipartCompletionSubject {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct MultipartCompletionSnapshot {
+pub(crate) struct MultipartCompletionSnapshot {
     subject: MultipartCompletionSubject,
     pub(crate) existing_etag: Option<String>,
     pub(crate) current_object_identity: Option<MultipartObjectIdentity>,
@@ -5769,7 +5811,7 @@ impl std::fmt::Debug for AuthorizedMultipartCompletionSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MultipartCompletionPreflight {
+pub(crate) struct MultipartCompletionPreflight {
     pub existing_etag: Option<String>,
 }
 
@@ -5788,7 +5830,7 @@ impl MultipartCompletionFingerprint {
 
 /// Exact completion replay state whose lifetime is the completed object row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MultipartCompletionReplay {
+pub(crate) struct MultipartCompletionReplay {
     pub upload_id: UploadId,
     pub bucket: BucketName,
     pub key: ObjectKey,
@@ -5854,11 +5896,11 @@ impl std::fmt::Debug for CompleteMultipartCommitRequest {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CompleteMultipartCommitCleanup {
-    pub omitted_parts: Vec<MultipartPartRecord>,
-    pub omitted_streaming_segments: Vec<MultipartPartSegmentRecord>,
-    pub stream_uploads: Vec<TerminalStreamCleanupRecord>,
-    pub stream_upload_segments: Vec<StreamUploadSegmentRecord>,
+pub(crate) struct CompleteMultipartCommitCleanup {
+    pub(crate) omitted_parts: Vec<MultipartPartRecord>,
+    pub(crate) omitted_streaming_segments: Vec<MultipartPartSegmentRecord>,
+    pub(crate) stream_uploads: Vec<TerminalStreamCleanupRecord>,
+    pub(crate) stream_upload_segments: Vec<StreamUploadSegmentRecord>,
 }
 
 #[derive(Clone)]
@@ -6532,19 +6574,17 @@ pub struct FinalizeStreamPartOutcome<T> {
 }
 
 #[derive(Debug, Clone)]
-pub struct FinalizeStreamPartCleanup {
-    pub upload: MultipartUploadRecord,
-    pub existing_part: Option<MultipartPartRecord>,
-    pub displaced_segments: Vec<MultipartPartSegmentRecord>,
+pub(crate) struct FinalizeStreamPartCleanup {
+    pub(crate) displaced_segments: Vec<MultipartPartSegmentRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AbortMultipartUploadCleanup {
-    pub upload: MultipartUploadRecord,
-    pub parts: Vec<MultipartPartRecord>,
-    pub streaming_segments: Vec<MultipartPartSegmentRecord>,
-    pub stream_uploads: Vec<TerminalStreamCleanupRecord>,
-    pub stream_upload_segments: Vec<StreamUploadSegmentRecord>,
+pub(crate) struct AbortMultipartUploadCleanup {
+    pub(crate) upload: MultipartUploadRecord,
+    pub(crate) parts: Vec<MultipartPartRecord>,
+    pub(crate) streaming_segments: Vec<MultipartPartSegmentRecord>,
+    pub(crate) stream_uploads: Vec<TerminalStreamCleanupRecord>,
+    pub(crate) stream_upload_segments: Vec<StreamUploadSegmentRecord>,
 }
 
 impl AbortMultipartUploadCleanup {
@@ -6601,7 +6641,7 @@ pub struct ObjectSegmentRecord {
 
 /// Committed segment record for a multipart part.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MultipartPartSegmentRecord {
+pub(crate) struct MultipartPartSegmentRecord {
     pub bucket: BucketName,
     pub key: ObjectKey,
     pub upload_id: UploadId,
@@ -6645,6 +6685,36 @@ mod tests {
             checksum: None,
             encryption: ObjectEncryption::None,
         }
+    }
+
+    #[test]
+    fn multipart_upload_test_projection_is_logical_and_redacts_customer_state() {
+        let mut upload = management_lookup_test_upload(UploadState::InProgress);
+        let tags = s3_types::TagSet::from_pairs(
+            vec![(
+                "customer-secret-key".to_string(),
+                "customer-secret-value".to_string(),
+            )],
+            s3_types::MAX_OBJECT_TAGS,
+        )
+        .unwrap();
+        upload.tags = Some(SerializedTagSet::from_tag_set(tags.clone()).unwrap());
+        upload.metadata_blob = SerializedMetadataBlob::new(vec![11, 13]);
+        upload.system_metadata_blob = SerializedSystemMetadataBlob::new(vec![17, 19]);
+
+        let projected = crate::TestMultipartUploadRecord::from(upload);
+
+        assert_eq!(projected.tags.as_ref(), Some(&tags));
+        assert_eq!(projected.state, UploadState::InProgress);
+        assert_eq!(projected.key.as_str(), "private-durable-key");
+
+        let debug = format!("{projected:?}");
+        assert!(debug.contains("tag_count: Some(1)"));
+        assert!(!debug.contains("customer-secret-key"));
+        assert!(!debug.contains("customer-secret-value"));
+        assert!(!debug.contains("metadata_blob"));
+        assert!(!debug.contains("system_metadata_blob"));
+        assert!(!debug.contains("encryption"));
     }
 
     #[test]

@@ -3022,6 +3022,35 @@ fail_with_matches \
     "Multipart completion Debug output must not reveal retained upload, serialized metadata, replay, or commit-default state" \
     "$multipart_completion_debug_leaks"
 
+raw_multipart_storage_representation_leaks=$(
+    {
+        rg -n --color=never \
+            '\b(MultipartUploadRecord|MultipartPartRecord|MultipartPartSegmentRecord|AuthorizedMultipartUploadRecord|MultipartUploadManagementLookup|CompleteMultipartCommitCleanup|FinalizeStreamPartCleanup|AbortMultipartUploadCleanup|CommitMultipartReq|MultipartObjectIdentity|MultipartCompletionSnapshot|MultipartCompletionPreflight|MultipartCompletionReplay)\b' \
+            crates \
+            -g '*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            '^[[:space:]]*pub[[:space:]]+(struct|enum)[[:space:]]+(MultipartUploadRecord|MultipartPartRecord|MultipartPartSegmentRecord|AuthorizedMultipartUploadRecord|MultipartUploadManagementLookup|CompleteMultipartCommitCleanup|FinalizeStreamPartCleanup|AbortMultipartUploadCleanup|CommitMultipartReq|MultipartObjectIdentity|MultipartCompletionSnapshot|MultipartCompletionPreflight|MultipartCompletionReplay)\b' \
+            crates/storage/src/types.rs \
+            || true
+        awk '
+        /^[[:space:]]*pub use types::\{/ {
+            in_public_types = 1
+        }
+        in_public_types && /(^|[^[:alnum:]_])(MultipartUploadRecord|MultipartPartRecord|MultipartPartSegmentRecord|AuthorizedMultipartUploadRecord|MultipartUploadManagementLookup|CompleteMultipartCommitCleanup|FinalizeStreamPartCleanup|AbortMultipartUploadCleanup|CommitMultipartReq|MultipartObjectIdentity|MultipartCompletionSnapshot|MultipartCompletionPreflight|MultipartCompletionReplay)([^[:alnum:]_]|$)/ {
+            print FILENAME ":" FNR ":" $0
+        }
+        in_public_types && /^[[:space:]]*};/ {
+            in_public_types = 0
+        }
+        ' crates/storage/src/lib.rs
+    }
+)
+fail_with_matches \
+    "Raw multipart upload, part, cleanup, management, snapshot, replay, and commit representations must remain private to storage" \
+    "$raw_multipart_storage_representation_leaks"
+
 multipart_upload_id_authority_derived_equality=$(
     awk '
     /#\[derive\(/ {

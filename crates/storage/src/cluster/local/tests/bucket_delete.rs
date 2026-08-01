@@ -2417,7 +2417,7 @@ fn composite_multipart_and_lifecycle_scans_fan_out_to_routed_pg_primaries() {
     assert_eq!(
         all_uploads
             .iter()
-            .map(|upload| (&upload.key, &upload.upload_id))
+            .map(|upload| (upload.key(), upload.upload_id()))
             .collect::<Vec<_>>(),
         vec![(&key_a, &upload_a), (&key_b, &upload_b)]
     );

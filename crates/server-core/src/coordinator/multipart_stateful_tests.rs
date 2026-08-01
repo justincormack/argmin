@@ -9,8 +9,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, MutexGuard};
 use storage::{
-    EcShape, MultipartPartSegmentRecord, MultipartUploadRecord, PgTopology, StreamUploadRecord,
-    StreamUploadSegmentRecord, TestObjectSegmentsReclaimRecord,
+    EcShape, PgTopology, StreamUploadRecord, StreamUploadSegmentRecord,
+    TestMultipartPartSegmentRecord, TestMultipartUploadRecord, TestObjectSegmentsReclaimRecord,
     TestObjectSegmentsReclaimSegmentRecord, TestPayloadReclaimRoot,
 };
 
@@ -260,7 +260,11 @@ impl<'a> InvariantHarness<'a> {
             .collect()
     }
 
-    fn pending_multipart_uploads_for(&self, bucket: &str, key: &str) -> Vec<MultipartUploadRecord> {
+    fn pending_multipart_uploads_for(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Vec<TestMultipartUploadRecord> {
         let bucket_name = trusted_bucket_name(bucket);
         let key_name = trusted_object_key(key);
         self.coord
@@ -289,7 +293,7 @@ impl<'a> InvariantHarness<'a> {
         bucket: &str,
         key: &str,
         upload_id: &UploadId,
-    ) -> Vec<MultipartPartSegmentRecord> {
+    ) -> Vec<TestMultipartPartSegmentRecord> {
         self.coord
             .storage_node()
             .test_get_all_multipart_part_segments_for_upload(
@@ -305,7 +309,7 @@ impl<'a> InvariantHarness<'a> {
         bucket: &str,
         key: &str,
         upload_id: &UploadId,
-    ) -> MultipartUploadRecord {
+    ) -> TestMultipartUploadRecord {
         self.coord
             .storage_node()
             .test_get_multipart_upload(

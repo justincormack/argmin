@@ -4346,9 +4346,9 @@ fn lifecycle_multipart_abort_uses_command_and_cleans_uploaded_part_payload() {
             &key,
             &upload_id,
             current_bucket_incarnation(&cluster, &bucket),
-            |raw_lifecycle, upload| {
+            |raw_lifecycle, initiated_at| {
                 assert_eq!(raw_lifecycle, Some("<LifecycleConfiguration/>"));
-                assert_eq!(upload.state, crate::UploadState::InProgress);
+                assert_ne!(initiated_at, 0);
                 Ok::<bool, ()>(true)
             },
         )

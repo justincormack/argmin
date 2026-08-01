@@ -13543,8 +13543,6 @@ impl StorageCluster {
             MetadataCommandPayload::CommitStreamPart(commit) => {
                 self.delete_finalize_upload_part_cleanup_best_effort(
                     &crate::FinalizeStreamPartCleanup {
-                        upload: commit.upload.clone(),
-                        existing_part: commit.existing_part.clone(),
                         displaced_segments: commit.displaced_segments.clone(),
                     },
                 );

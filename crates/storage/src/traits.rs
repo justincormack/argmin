@@ -833,7 +833,6 @@ pub(crate) trait PgMetadataStore {
     /// 6. Delete omitted streamed part segment rows and return omitted payloads for shard cleanup
     /// 7. Delete the `multipart_uploads` + `multipart_parts` rows
     #[cfg(test)]
-    #[cfg(test)]
     fn complete_multipart_commit(
         &self,
         upload_id: &UploadId,
