@@ -1,0 +1,204 @@
+High-frequency backfill scans can exhaust storage CPU
+Link: https://chatgpt.com/codex/cloud/security/findings/83f20fd21b888191a4308259327f60b9?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: d16e7a0
+Author: justin@specialbusservice.com
+Created: 31/07/2026, 19:57:03
+Assignee: Unassigned
+Signals: Security
+
+# Summary
+Introduced: the commit adds a new 250ms production backfill-candidate scan cadence and immediate startup scan without adding per-PG row, byte, or time budgets. The PG limit reduces the number of PGs per tick but does not bound the amount of attacker-controlled metadata loaded from each PG.
+The new scheduling splits backfill candidate scans out of the shard-scavenger sweep and runs them immediately, then every 250ms by default. Although the cluster code caps each tick to 8 PGs, each PG scan calls list_shard_scavenger_payload_references(), which returns a Vec built from unbounded SELECTs over object_segments, stream_upload_segments, multipart_part_segments, and reclaim tables. The scanner then inserts those references into a BTreeMap and iterates current-epoch entries before enforcing scan_limit, so ordinary current-epoch objects created by an authenticated client still consume CPU, SQLite IO, and memory every scan cycle. With the default 16 PGs, the worker can rescan the full object metadata population roughly twice per second, compared with the previous 60-second sweep cadence. This creates a remotely triggerable availability degradation path for any principal able to write many objects or multipart parts.
+
+# Evidence
+crates/storage/src/cluster.rs (L16040 to 16090)
+  Note: The new bound limits only the number of PGs. For each selected PG, the code still loads all shard-scavenger payload references into memory and inserts them into a BTreeMap.
+```
+        let routes_to_scan = routes.len().min(pg_scan_limit);
+        let batch_start_pg_id = routes[start].pg_id();
+        let mut verified_candidates = 0usize;
+        let mut candidates = BTreeMap::new();
+        let mut last_scanned_pg_id = None;
+
+        for offset in 0..routes_to_scan {
+            let route = routes[(start + offset) % routes.len()];
+            last_scanned_pg_id = Some(route.pg_id());
+            if route.state() != PgState::Active {
+                continue;
+            }
+            let node = match self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())
+            {
+                Ok(node) => node,
+                Err(error) if shard_backfill_candidate_error_is_deferred(&error) => {
+                    summary.deferred += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let references = match node
+                .shard_scavenger_client()
+                .open_shard_scavenger_object_scan_route(
+                    self.operation_epoch(),
+                    self.object_metadata_scan_pg(route.pg_id()),
+                )
+                .and_then(|route| route.list_shard_scavenger_payload_references())
+            {
+                Ok(references) => references,
+                Err(error) if shard_backfill_candidate_error_is_deferred(&error) => {
+                    summary.deferred += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for reference in references {
+                let Some((request, source_epoch)) =
+                    self.backfill_candidate_from_scavenger_reference(reference)
+                else {
+                    continue;
+                };
+                candidates
+                    .entry(PlacedSegmentShardBackfillCandidateKey::new(
+                        request,
+                        source_epoch,
+                    ))
+                    .or_insert((request, source_epoch));
+            }
+```
+
+crates/storage/src/cluster.rs (L16101 to 16108)
+  Note: Current-epoch references, which normal newly uploaded objects will produce, are scanned and counted but bypass the scan_limit check, so many attacker-created rows can be processed in a single tick.
+```
+        for (candidate_key, (request, source_epoch)) in candidates.into_iter().skip(candidate_start)
+        {
+            summary.scanned += 1;
+            if source_epoch == desired_epoch {
+                cursor.active_pg_id = Some(batch_start_pg_id);
+                cursor.after = Some(candidate_key);
+                summary.current_epoch += 1;
+                continue;
+```
+
+crates/storage/src/maintenance.rs (L1150 to 1169)
+  Note: The worker schedules candidate scanning immediately at startup and then every candidate_interval, making the unbounded per-PG metadata scan run continuously.
+```
+                let audit_interval = shard_scavenger_sweep_interval();
+                let candidate_interval = shard_backfill_candidate_scan_interval();
+                let checkpoint_interval = metadata_command_checkpoint_scan_interval();
+                let mut next_audit = Instant::now() + audit_interval;
+                let mut next_candidate_scan = Instant::now();
+                let mut next_checkpoint_scan = Instant::now();
+                let candidate_scanner =
+                    StorageBackfillCandidateScanner::new(storage_handle.clone());
+                let checkpoint_scanner =
+                    StorageMetadataCheckpointScanner::new(storage_handle.clone());
+                while !stop.load(Ordering::SeqCst) {
+                    admission.observe_pressure();
+                    let now = Instant::now();
+                    if now >= next_audit {
+                        run_shard_scavenger_audit(&storage_handle, &admission);
+                        next_audit = Instant::now() + audit_interval;
+                    }
+                    if now >= next_candidate_scan {
+                        run_backfill_candidate_scan(&admission, &candidate_scanner);
+                        next_candidate_scan = Instant::now() + candidate_interval;
+```
+
+crates/storage/src/maintenance.rs (L41 to 42)
+  Note: Introduces the new production backfill-candidate scan interval of 250ms, much faster than the existing 60s shard-scavenger sweep interval.
+```
+const SHARD_BACKFILL_CANDIDATE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const METADATA_COMMAND_CHECKPOINT_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+```
+
+crates/storage/src/pg_store/scavenger.rs (L1148 to 1188)
+  Note: list_shard_scavenger_payload_references builds a Vec from unbounded SELECTs over object, stream-upload, multipart, and reclaim metadata tables, with no LIMIT or epoch filter to match the new high-frequency scheduler.
+```
+    pub(crate) fn list_shard_scavenger_payload_references(
+        &self,
+    ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
+        let mut references = Vec::new();
+        self.extend_scavenger_encrypted_placed_references(
+            &mut references,
+            "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
+                    s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type \
+             FROM object_segments s \
+             JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id",
+            "list object segment shard scavenger references",
+        )?;
+        self.extend_scavenger_encrypted_placed_references(
+            &mut references,
+            "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
+                    s.placement_cluster_epoch, s.ec_k, s.ec_m, u.encryption_type \
+             FROM stream_upload_segments s \
+             JOIN stream_uploads u ON u.session_id = s.session_id",
+            "list stream upload segment shard scavenger references",
+        )?;
+        self.extend_scavenger_encrypted_placed_references(
+            &mut references,
+            "SELECT s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
+                    s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type \
+             FROM multipart_part_segments s \
+             JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id",
+            "list multipart part segment shard scavenger references",
+        )?;
+        self.extend_scavenger_reclaim_references(
+            &mut references,
+            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m \
+             FROM object_segment_reclaim_segments",
+            "list object segment reclaim shard scavenger references",
+        )?;
+        self.extend_scavenger_reclaim_references(
+            &mut references,
+            "SELECT data_pg_id, segment_okh, segment_vid, ec_k, ec_m \
+             FROM multipart_reclaim_part_segments",
+            "list multipart reclaim segment shard scavenger references",
+        )?;
+        self.extend_scavenger_pending_command_references(&mut references)?;
+```
+
+# Resolution
+
+Validity: valid. The original implementation bounded only the number of PGs
+visited per scheduler tick. Within each selected PG it still materialized and
+sorted the complete metadata reference set, so authenticated object and
+multipart growth could make the 250 ms discovery path consume unbounded
+SQLite I/O, CPU, and memory.
+
+Fixed in commit `683c80d9` (`Bound placed-segment backfill discovery`).
+
+The fix replaces full-PG materialization with storage-owned, keyset-paginated
+reference discovery:
+
+- object, stream-upload, and multipart-part references are read directly from
+  their indexed native tables through opaque resume cursors;
+- each storage RPC returns at most 64 references, each worker tick consumes at
+  most 256 rows and 256 candidate verifications, and the scanner yields after
+  a 50 ms cooperative time budget;
+- cursors remain attached to the scanner across runtime-map replacement, while
+  route changes and deferred PGs are retried without restarting a full scan;
+- pending metadata commands transactionally publish fixed-width child pages of
+  at most 64 placed references instead of requiring repeated command decoding
+  or SQLite reads of one unbounded BLOB;
+- pending-command cursors bind the command epoch, PG, log index, and checksum;
+  replacing the slot with a different or shorter command restarts traversal at
+  reference zero instead of retaining a permanently invalid offset;
+- the existing full shard-scavenger inventory remains on the low-frequency
+  audit path rather than the 250 ms candidate-discovery cadence.
+
+Regression coverage includes native keyset traversal, RPC page limits,
+candidate and time budgets, cursor retention across runtime-map replacement,
+and a 512-reference pending command. The large-command regression verifies
+that storage creates eight bounded child BLOBs, does not decode the command on
+each page, and restarts correctly after replacement by a shorter command.
+
+Verification for the fixing commit completed with `cargo nextest run`
+(7,860/7,860 tests passed),
+`cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --all
+-- --check`, and `git diff --check`.
