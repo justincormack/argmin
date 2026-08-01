@@ -6812,7 +6812,10 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-retry-after-route-refresh");
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    let direct_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
@@ -6955,7 +6958,10 @@ fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
     let pg_ids: Vec<u32> = (0..32).collect();
     let bucket = trusted_bucket_name("bucket-delete-begin-worker-frontier");
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &pg_ids);
-    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    let direct_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
@@ -7031,7 +7037,10 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_stream_cleanup_phase() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-worker-stream-cleanup");
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1, 2]);
-    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    let direct_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
@@ -7120,7 +7129,10 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_reservation_wait_phase() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-worker-reservation-wait");
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1, 2]);
-    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    let direct_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
@@ -7210,7 +7222,10 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_phase() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-worker-final-visibility");
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1, 2]);
-    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    let direct_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
@@ -7285,7 +7300,10 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_proven_phase(
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-worker-final-visibility-proven");
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1, 2]);
-    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    let direct_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
@@ -7359,7 +7377,10 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-stale-recreate");
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
-    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    let direct_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
     direct_coord
         .create_bucket_for_owner("old-owner", bucket.as_str(), false)
         .unwrap();
