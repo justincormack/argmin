@@ -1114,7 +1114,6 @@ fn unix_object_generation_metadata_client_routes_generation_reads() {
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
     );
-
     let route = client
         .open_object_generation_metadata_route(
             ClusterEpoch::INITIAL,
@@ -2129,18 +2128,14 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
     drop(node);
 
     private_socket_dir(config.socket_path.parent().unwrap());
-    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..22)
-        .map(|_| {
-            let server = Arc::clone(&server);
-            thread::spawn(move || server.accept_one().unwrap())
-        })
-        .collect();
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let _server_guard = spawn_test_storage_node_server(server);
     let client = UnixStorageNodeClient::new(
         NodeId::new(7),
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
     );
+    let rpc_requests_before = rpc_requests_started_for_test(&client);
     let correct_pg = ObjectMetadataPgId::new_for_test(PgId::new(correct_pg_id));
     let wrong_pg = ObjectMetadataPgId::new_for_test(PgId::new(wrong_pg_id));
     let new_part_create = CreateStreamUploadReq {
@@ -2601,10 +2596,11 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             operation: "build stream part commit command",
         })
     ));
-
-    for thread in server_threads {
-        thread.join().unwrap();
-    }
+    assert_eq!(
+        rpc_requests_started_for_test(&client) - rpc_requests_before,
+        22,
+        "route-local subject mismatches must not cross the storage RPC boundary"
+    );
 }
 
 #[test]

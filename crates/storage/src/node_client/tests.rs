@@ -64,6 +64,51 @@ fn private_socket_dir(path: &std::path::Path) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+struct TestStorageNodeServerGuard {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    socket_path: std::path::PathBuf,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for TestStorageNodeServerGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
+        if let Some(thread) = self.thread.take() {
+            if let Err(panic) = thread.join() {
+                if std::thread::panicking() {
+                    return;
+                }
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
+fn spawn_test_storage_node_server(server: StorageNodeServer) -> TestStorageNodeServerGuard {
+    let socket_path = server.socket_path_for_test();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let thread = thread::spawn(move || loop {
+        let result = server.accept_one();
+        if thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        result.unwrap();
+    });
+    TestStorageNodeServerGuard {
+        stop,
+        socket_path,
+        thread: Some(thread),
+    }
+}
+
+fn rpc_requests_started_for_test(client: &UnixStorageNodeClient) -> u64 {
+    client
+        .next_request_id
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn test_shard_scavenger_observation(data_pg_id: u32, seed: u8) -> ShardScavengerObservationRecord {
     let shard_key = ShardKey::new(&[seed; 16], u64::from(seed), 0);
     ShardScavengerObservationRecord {
