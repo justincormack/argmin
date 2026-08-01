@@ -5416,25 +5416,42 @@ pub struct StreamUploadSegmentRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamUploadPartSnapshot {
-    pub session: StreamUploadRecord,
-    pub upload: MultipartUploadRecord,
-    pub existing_part_generation: Option<u32>,
-    pub staging_segments: Vec<StreamUploadSegmentRecord>,
+pub struct StreamPartFinalizeSnapshot {
+    pub upload_checksum: Option<MultipartChecksumConfig>,
+    pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
+    pub staged_size: u64,
+    pub staged_payload_crc64: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StreamPartFinalizeInput<'a> {
+    pub upload_id: &'a UploadId,
+    pub session_id: &'a SessionId,
+    pub part_number: u32,
+    pub total_size: u64,
+    pub payload_crc64: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamUploadPartStorageSnapshot {
-    pub auth_snapshot: StreamUploadPartSnapshot,
-    pub existing_part: Option<MultipartPartRecord>,
-    pub displaced_segments: Vec<MultipartPartSegmentRecord>,
+pub(crate) struct StreamUploadPartSnapshot {
+    pub(crate) session: StreamUploadRecord,
+    pub(crate) upload: MultipartUploadRecord,
+    pub(crate) existing_part_generation: Option<u32>,
+    pub(crate) staging_segments: Vec<StreamUploadSegmentRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamUploadPartStorageSnapshot {
+    pub(crate) auth_snapshot: StreamUploadPartSnapshot,
+    pub(crate) existing_part: Option<MultipartPartRecord>,
+    pub(crate) displaced_segments: Vec<MultipartPartSegmentRecord>,
 }
 
 #[derive(Debug)]
 pub struct PreparedStreamPartCommit<T> {
     pub value: T,
-    pub part: MultipartPartRecord,
-    pub segments: Vec<MultipartPartSegmentRecord>,
+    pub last_modified: u64,
+    pub checksum: Option<ChecksumBytes>,
 }
 
 #[derive(Debug)]

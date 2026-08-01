@@ -2211,6 +2211,44 @@ fail_with_matches \
     "Server-core streaming appends must use the logical storage-owned append operation rather than prepared records, placement, shard acknowledgements, or physical mutation steps" \
     "$server_core_stream_append_placement_leaks"
 
+server_core_stream_part_finalize_placement_leaks=$(
+    rg -n --color=never \
+        '\b(StreamUploadPartSnapshot|StreamUploadPartStorageSnapshot|StreamUploadSegmentRecord|MultipartPartSegmentRecord)\b|default_payload_ec_shape|operation_epoch|\.(data_pg_id|placement_cluster_epoch|ec_k|ec_m|segment_okh|segment_vid|staging_segments|existing_part_generation)\b' \
+        crates/server-core/src/coordinator/multipart.rs \
+        || true
+)
+fail_with_matches \
+    "Server-core streaming UploadPart finalization must use the logical storage-owned finalization snapshot rather than durable segment, placement, EC, or generation representations" \
+    "$server_core_stream_part_finalize_placement_leaks"
+
+public_stream_part_finalize_snapshot_surfaces=$(
+    rg -n --color=never \
+        '^[[:space:]]*pub[[:space:]].*\b(StreamUploadPartSnapshot|StreamUploadPartStorageSnapshot)\b' \
+        crates/storage/src \
+        --glob '*.rs' \
+        || true
+)
+fail_with_matches \
+    "Physical streaming UploadPart finalization snapshots must remain private to storage" \
+    "$public_stream_part_finalize_snapshot_surfaces"
+
+stream_part_finalize_durable_upload_leaks=$(
+    awk '
+    /pub struct StreamPartFinalizeSnapshot[[:space:]]*\{/ {
+        in_snapshot = 1
+    }
+    in_snapshot && /MultipartUploadRecord/ {
+        print FILENAME ":" FNR ":" $0
+    }
+    in_snapshot && /^[[:space:]]*}/ {
+        in_snapshot = 0
+    }
+    ' crates/storage/src/types.rs
+)
+fail_with_matches \
+    "The streaming UploadPart finalization callback snapshot must not expose the complete durable multipart-upload record" \
+    "$stream_part_finalize_durable_upload_leaks"
+
 public_stream_append_hash_surfaces=$(
     rg -n --color=never \
         '^[[:space:]]*pub[[:space:]]+(mod[[:space:]]+shard_key_hash|fn[[:space:]]+stream_segment_key_hash)\b' \

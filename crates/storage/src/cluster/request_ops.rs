@@ -14523,10 +14523,8 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-        upload_id: &UploadId,
-        session_id: &SessionId,
-        part_number: u32,
-        action: impl FnMut(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
+        input: StreamPartFinalizeInput<'_>,
+        action: impl FnMut(StreamPartFinalizeSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
         self.finalize_upload_part_stream_with_route_validation(
             super::MultipartObjectMutationEffectRoute {
@@ -14535,9 +14533,7 @@ impl super::StorageCluster {
                 key,
                 effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
             },
-            upload_id,
-            session_id,
-            part_number,
+            input,
             || Ok(()),
             action,
         )
@@ -14546,11 +14542,9 @@ impl super::StorageCluster {
     pub(super) fn finalize_upload_part_stream_with_route_validation<T, E>(
         &self,
         route: super::MultipartObjectMutationEffectRoute<'_>,
-        upload_id: &UploadId,
-        session_id: &SessionId,
-        part_number: u32,
+        input: StreamPartFinalizeInput<'_>,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
-        mut action: impl FnMut(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
+        mut action: impl FnMut(StreamPartFinalizeSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(FinalizeUploadPartStream);
         let super::MultipartObjectMutationEffectRoute {
@@ -14559,6 +14553,13 @@ impl super::StorageCluster {
             key,
             effect_fence,
         } = route;
+        let StreamPartFinalizeInput {
+            upload_id,
+            session_id,
+            part_number,
+            total_size,
+            payload_crc64,
+        } = input;
         let pg_id = object_pg_id.pg_id();
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
@@ -14646,13 +14647,109 @@ impl super::StorageCluster {
                 }
             };
 
-            let prepared = match action(storage_snapshot.auth_snapshot.clone()) {
+            let staging_segments = &storage_snapshot.auth_snapshot.staging_segments;
+            let Some(staged_size) = staging_segments
+                .iter()
+                .try_fold(0u64, |total, segment| total.checked_add(segment.size))
+            else {
+                release_bucket_write_proof_if_unowned!()?;
+                return Err(ObjectPgActionError::InvalidRequest {
+                    reason: "stream UploadPart staged size exceeds u64".to_string(),
+                });
+            };
+            let staged_payload_crc64 =
+                staging_segments
+                    .iter()
+                    .fold(checksum::crc64::checksum(&[]), |crc64, segment| {
+                        checksum::crc64::combine(crc64, segment.payload_crc64, segment.size)
+                    });
+            let upload = &storage_snapshot.auth_snapshot.upload;
+            let prepared = match action(StreamPartFinalizeSnapshot {
+                upload_checksum: upload.checksum,
+                managed_encryption: upload.encryption.managed_encryption_algorithm(),
+                staged_size,
+                staged_payload_crc64,
+            }) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     release_bucket_write_proof_if_unowned!()?;
                     return Ok(Err(error));
                 }
             };
+            if staged_size != total_size {
+                release_bucket_write_proof_if_unowned!()?;
+                return Err(ObjectPgActionError::InvalidRequest {
+                    reason: format!(
+                        "stream UploadPart size mismatch: caller passed {total_size} but staged segments sum to {staged_size}"
+                    ),
+                });
+            }
+            if staged_payload_crc64 != payload_crc64 {
+                release_bucket_write_proof_if_unowned!()?;
+                return Err(ObjectPgActionError::InvalidRequest {
+                    reason: format!(
+                        "stream UploadPart etag CRC64 mismatch: caller passed {payload_crc64} but staged payload segments combine to {staged_payload_crc64}"
+                    ),
+                });
+            }
+
+            let Some(generation) = storage_snapshot
+                .existing_part
+                .as_ref()
+                .map_or(Some(0), |part| part.generation.checked_add(1))
+            else {
+                release_bucket_write_proof_if_unowned!()?;
+                return Err(ObjectPgActionError::InvalidRequest {
+                    reason: "multipart part generation exhausted".to_string(),
+                });
+            };
+            let ec = staging_segments.first().map_or_else(
+                || self.default_payload_ec_shape(),
+                |segment| EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+            );
+            let placement_cluster_epoch = staging_segments
+                .first()
+                .map_or(self.operation_epoch(), |segment| {
+                    segment.placement_cluster_epoch
+                });
+            let part = MultipartPartRecord {
+                upload_id: upload_id.clone(),
+                part_number,
+                generation,
+                size: total_size,
+                payload_crc64,
+                etag: payload_crc64.to_be_bytes().to_vec(),
+                etag_kind: EtagKind::Crc64,
+                part_vid: GenerationId::new(u64::from(generation) + 1)
+                    .expect("multipart part generation must be nonzero"),
+                placement_cluster_epoch,
+                ec_k: ec.k,
+                ec_m: ec.m,
+                last_modified: prepared.last_modified,
+                checksum: prepared.checksum.clone(),
+            };
+            let segments = staging_segments
+                .iter()
+                .map(|segment| MultipartPartSegmentRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    upload_id: upload_id.clone(),
+                    version_id: MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
+                    part_number,
+                    segment_index: segment.segment_index,
+                    size: segment.size,
+                    segment_crc64: segment.segment_crc64,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    data_pg_id: segment.data_pg_id,
+                    placement_cluster_epoch: segment.placement_cluster_epoch,
+                    ec_k: segment.ec_k,
+                    ec_m: segment.ec_m,
+                })
+                .collect::<Vec<_>>();
 
             let command_bucket_write_reservation = pending_command
                 .as_ref()
@@ -14671,8 +14768,8 @@ impl super::StorageCluster {
                 key: key.clone(),
                 session_id: session_id.clone(),
                 upload: storage_snapshot.auth_snapshot.upload.clone(),
-                part: prepared.part.clone(),
-                segments: prepared.segments.clone(),
+                part: part.clone(),
+                segments: segments.clone(),
                 existing_part: storage_snapshot.existing_part.clone(),
                 displaced_segments: storage_snapshot.displaced_segments.clone(),
                 bucket_write_reservation: command_bucket_write_reservation,
@@ -14704,8 +14801,8 @@ impl super::StorageCluster {
                         session_id,
                         part_number,
                         expected_snapshot: &storage_snapshot,
-                        part: &prepared.part,
-                        segments: &prepared.segments,
+                        part: &part,
+                        segments: &segments,
                         bucket_write_reservation: &expected_command_bucket_write_reservation,
                     },
                 ) {

@@ -2,9 +2,9 @@ use checksum::{ChecksumAlgorithm, ChecksumBytes, ChecksumType, MultipartChecksum
 use std::time::{Duration, Instant};
 use storage::{
     BucketName, CreateMultipartUploadOutcome, CreateMultipartUploadReq, FinalizeStreamPartOutcome,
-    GenerationId, MultipartPartRecord, MultipartPartSegmentRecord, ObjectKey,
-    PreparedStreamPartCommit, SerializedMetadataBlob, SerializedSystemMetadataBlob, SessionId,
-    StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    MultipartPartRecord, ObjectKey, PreparedStreamPartCommit, SerializedMetadataBlob,
+    SerializedSystemMetadataBlob, SessionId, StreamPartFinalizeInput, StreamPartFinalizeSnapshot,
+    UploadId,
 };
 
 fn multipart_completion_fingerprint(
@@ -64,7 +64,7 @@ use super::{
 use crate::checksum_claim::ChecksumClaim;
 use crate::conditional::{check_write_conditions, WriteCondition};
 use crate::error::ServerError;
-use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
+use crate::etag::{compute_multipart_etag, etag_bytes_to_crc64, format_etag};
 use crate::system_metadata::SystemMetadata;
 
 const COMPLETE_MULTIPART_TERMINAL_RACE_RETRIES: usize = 1;
@@ -77,44 +77,19 @@ enum StreamPartFinalizeRoute<'a> {
 }
 
 impl StreamPartFinalizeRoute<'_> {
-    fn default_payload_ec_shape(&self) -> storage::EcShape {
-        match self {
-            #[cfg(any(test, feature = "test-utils"))]
-            Self::Raw(storage_node) => storage_node.default_payload_ec_shape(),
-            Self::Admitted(route) => route.default_payload_ec_shape(),
-        }
-    }
-
-    fn operation_epoch(&self) -> storage::ClusterEpoch {
-        match self {
-            #[cfg(any(test, feature = "test-utils"))]
-            Self::Raw(storage_node) => storage_node.operation_epoch(),
-            Self::Admitted(route) => route.operation_epoch(),
-        }
-    }
-
     fn finalize<T, E>(
         &self,
         _bucket: &BucketName,
         _key: &ObjectKey,
-        upload_id: &UploadId,
-        session_id: &SessionId,
-        part_number: u32,
-        action: impl FnMut(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
+        input: StreamPartFinalizeInput<'_>,
+        action: impl FnMut(StreamPartFinalizeSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, storage::ObjectPgActionError> {
         match self {
             #[cfg(any(test, feature = "test-utils"))]
-            Self::Raw(storage_node) => storage_node.finalize_upload_part_stream(
-                _bucket,
-                _key,
-                upload_id,
-                session_id,
-                part_number,
-                action,
-            ),
-            Self::Admitted(route) => {
-                route.finalize_stream_part(upload_id, session_id, part_number, action)
+            Self::Raw(storage_node) => {
+                storage_node.finalize_upload_part_stream(_bucket, _key, input, action)
             }
+            Self::Admitted(route) => route.finalize_stream_part(input, action),
         }
     }
 }
@@ -1500,8 +1475,6 @@ impl Coordinator {
             req.session_id,
             req.total_size
         );
-        let bucket = req.upload.bucket_name();
-        let key = req.upload.key();
         let session_id = req.session_id;
         let upload_id = req.upload.upload_id();
         let part_number = req.part_number;
@@ -1528,8 +1501,6 @@ impl Coordinator {
                 });
             }
         }
-        let default_payload_ec = storage_route.default_payload_ec_shape();
-        let operation_epoch = storage_route.operation_epoch();
         let FinalizeStreamPartOutcome {
             value: mut result,
             last_modified,
@@ -1537,58 +1508,24 @@ impl Coordinator {
             .finalize(
                 req.upload.bucket_name_typed(),
                 req.upload.key_typed(),
-                upload_id,
-                session_id,
-                part_number,
-                |snapshot: StreamUploadPartSnapshot| {
-                    let StreamUploadPartSnapshot {
-                        session,
-                        upload,
-                        existing_part_generation,
-                        staging_segments,
+                StreamPartFinalizeInput {
+                    upload_id,
+                    session_id,
+                    part_number,
+                    total_size,
+                    payload_crc64: crc64,
+                },
+                |snapshot: StreamPartFinalizeSnapshot| {
+                    let StreamPartFinalizeSnapshot {
+                        upload_checksum,
+                        managed_encryption,
+                        staged_size,
+                        staged_payload_crc64,
                     } = snapshot;
-                    if session.state != StreamUploadState::InProgress {
-                        return Err(ServerError::InvalidRequest {
-                            reason: "stream session is not in progress".to_string(),
-                        });
-                    }
-                    if session.bucket != *req.upload.bucket_name_typed()
-                        || session.key != *req.upload.key_typed()
-                    {
-                        return Err(ServerError::InvalidRequest {
-                            reason: "session bucket/key mismatch".to_string(),
-                        });
-                    }
-                    match &session.target {
-                        StreamUploadTarget::UploadPart {
-                            upload_id: sess_upload_id,
-                            part_number: sess_part_number,
-                        } if sess_upload_id == upload_id && *sess_part_number == part_number => {}
-                        StreamUploadTarget::UploadPart { .. } => {
-                            return Err(ServerError::InvalidRequest {
-                                reason: "session upload_id/part_number mismatch".to_string(),
-                            });
-                        }
-                        StreamUploadTarget::PutObject => {
-                            return Err(ServerError::InvalidRequest {
-                                reason: "session is not an UploadPart session".to_string(),
-                            });
-                        }
-                    }
-
-                    if upload.bucket != bucket || upload.key != key {
-                        return Err(ServerError::NoSuchUpload {
-                            upload_id: upload_id.to_string(),
-                        });
-                    }
-                    if upload.state != UploadState::InProgress {
-                        return Err(ServerError::NoSuchUpload {
-                            upload_id: upload_id.to_string(),
-                        });
-                    }
 
                     let claimed_algo = claimed_checksum.map(ChecksumClaim::algorithm);
-                    let upload_checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
+                    let upload_checksum_algo =
+                        upload_checksum.map(MultipartChecksumConfig::algorithm);
                     let effective_algo = match (upload_checksum_algo, claimed_algo) {
                         (Some(upload_algo), Some(part_algo)) if upload_algo != part_algo => {
                             return Err(ServerError::InvalidRequest {
@@ -1642,84 +1579,29 @@ impl Coordinator {
                         None
                     };
 
-                    let generation = existing_part_generation.map_or(0, |generation| generation + 1);
-                    let segments_total: u64 =
-                        staging_segments.iter().map(|segment| segment.size).sum();
-                    if segments_total != total_size {
+                    if staged_size != total_size {
                         return Err(ServerError::InvalidRequest {
                             reason: format!(
-                                "total_size mismatch: caller passed {total_size} but staged segments sum to {segments_total}"
+                                "total_size mismatch: caller passed {total_size} but staged segments sum to {staged_size}"
                             ),
                         });
                     }
-                    let staged_crc64 = staging_segments.iter().fold(
-                        checksum::crc64::checksum(&[]),
-                        |crc64, segment| {
-                            checksum::crc64::combine(crc64, segment.payload_crc64, segment.size)
-                        },
-                    );
-                    if staged_crc64 != crc64 {
+                    if staged_payload_crc64 != crc64 {
                         return Err(ServerError::InvalidRequest {
                             reason: format!(
-                                "stream UploadPart etag CRC64 mismatch: caller passed {crc64} but staged payload segments combine to {staged_crc64}"
+                                "stream UploadPart etag CRC64 mismatch: caller passed {crc64} but staged payload segments combine to {staged_payload_crc64}"
                             ),
                         });
                     }
-
-                    let committed_segments: Vec<MultipartPartSegmentRecord> = staging_segments
-                        .iter()
-                        .map(|segment| MultipartPartSegmentRecord {
-                            bucket: upload.bucket.clone(),
-                            key: upload.key.clone(),
-                            upload_id: upload_id.clone(),
-                            version_id: u64::MAX,
-                            part_number,
-                            segment_index: segment.segment_index,
-                            size: segment.size,
-                            segment_crc64: segment.segment_crc64,
-                            segment_okh: segment.segment_okh,
-                            segment_vid: segment.segment_vid,
-                            data_pg_id: segment.data_pg_id,
-                            placement_cluster_epoch: segment.placement_cluster_epoch,
-                            ec_k: segment.ec_k,
-                            ec_m: segment.ec_m,
-                        })
-                        .collect();
 
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
-                    let ec = staging_segments.first().map_or(default_payload_ec, |segment| {
-                        storage::EcShape {
-                            k: segment.ec_k,
-                            m: segment.ec_m,
-                        }
-                    });
-
                     let stored_checksum = if upload_checksum_algo.is_some() {
                         checksum.as_ref().map(ChecksumBytes::from)
                     } else {
                         None
-                    };
-
-                    let part_record = MultipartPartRecord {
-                        upload_id: upload_id.clone(),
-                        part_number,
-                        generation,
-                        size: total_size,
-                        payload_crc64: crc64,
-                        etag: crc64_to_etag_bytes(crc64),
-                        etag_kind: storage::EtagKind::Crc64,
-                        part_vid: GenerationId::new(u64::from(generation) + 1)
-                            .expect("multipart part generation must be nonzero"),
-                        placement_cluster_epoch: staging_segments
-                            .first()
-                            .map_or(operation_epoch, |segment| segment.placement_cluster_epoch),
-                        ec_k: ec.k,
-                        ec_m: ec.m,
-                        last_modified: now,
-                        checksum: stored_checksum,
                     };
 
                     Ok::<_, ServerError>(PreparedStreamPartCommit {
@@ -1727,10 +1609,10 @@ impl Coordinator {
                             etag: format_etag(crc64),
                             last_modified: now,
                             checksum,
-                            managed_encryption: upload.encryption.managed_encryption_algorithm(),
+                            managed_encryption,
                         },
-                        part: part_record,
-                        segments: committed_segments,
+                        last_modified: now,
+                        checksum: stored_checksum,
                     })
                 },
             )

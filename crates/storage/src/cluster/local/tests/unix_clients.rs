@@ -7940,9 +7940,13 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
         .finalize_upload_part_stream(
             &bucket,
             &key,
-            &upload_id,
-            &session_id,
-            1,
+            stream_part_finalize_input(
+                &upload_id,
+                &session_id,
+                1,
+                0,
+                checksum::crc64::checksum(&[]),
+            ),
             |_| -> Result<crate::PreparedStreamPartCommit<()>, ()> {
                 panic!(
                     "old-primary UploadPart finalization should fail before preparing commit metadata"
@@ -8865,9 +8869,13 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
         .finalize_upload_part_stream(
             &bucket,
             &key,
-            &upload_id,
-            &session_id,
-            2,
+            stream_part_finalize_input(
+                &upload_id,
+                &session_id,
+                2,
+                0,
+                checksum::crc64::checksum(&[]),
+            ),
             |_| -> Result<crate::PreparedStreamPartCommit<()>, ()> {
                 panic!(
                     "old-primary UploadPartCopy finalization should fail before preparing commit metadata"
@@ -9562,9 +9570,13 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
         .finalize_upload_part_stream(
             &bucket,
             &key,
-            &upload_id,
-            &session_id,
-            1,
+            stream_part_finalize_input(
+                &upload_id,
+                &session_id,
+                1,
+                0,
+                checksum::crc64::checksum(&[]),
+            ),
             |_| -> Result<crate::PreparedStreamPartCommit<()>, ()> {
                 panic!("stale UploadPart finalization should fail before preparing commit metadata")
             },
@@ -9851,9 +9863,13 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
         .finalize_upload_part_stream(
             &bucket,
             &key,
-            &upload_id,
-            &session_id,
-            2,
+            stream_part_finalize_input(
+                &upload_id,
+                &session_id,
+                2,
+                0,
+                checksum::crc64::checksum(&[]),
+            ),
             |_| -> Result<crate::PreparedStreamPartCommit<()>, ()> {
                 panic!("stale UploadPartCopy finalization should fail before preparing commit metadata")
             },

@@ -105,10 +105,10 @@ use crate::types::{
     ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
     ShardScavengerObservationRecord, ShardScavengerPayloadReference,
     ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus, StoredObject,
-    StreamPutFinalizeSnapshot, StreamSegmentAppendInput, StreamSegmentAppendOutcome,
-    StreamUploadCommandRecord, StreamUploadPartSnapshot, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, VersionId,
-    WriteAck, WrittenShardAck, PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT,
+    StreamPartFinalizeInput, StreamPartFinalizeSnapshot, StreamPutFinalizeSnapshot,
+    StreamSegmentAppendInput, StreamSegmentAppendOutcome, StreamUploadCommandRecord,
+    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
+    VersionId, WriteAck, WrittenShardAck, PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT,
 };
 #[cfg(test)]
 use crate::types::{
@@ -3435,29 +3435,17 @@ impl ActiveMultipartObjectRoute<'_> {
 
     pub fn finalize_stream_part<T, E>(
         &self,
-        upload_id: &UploadId,
-        session_id: &SessionId,
-        part_number: u32,
-        action: impl FnMut(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
+        input: StreamPartFinalizeInput<'_>,
+        action: impl FnMut(StreamPartFinalizeSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
         self.admission
             .cluster
             .finalize_upload_part_stream_with_route_validation(
                 self.effect_route(),
-                upload_id,
-                session_id,
-                part_number,
+                input,
                 || self.admission.require_valid_now(),
                 action,
             )
-    }
-
-    pub fn default_payload_ec_shape(&self) -> EcShape {
-        self.admission.cluster.default_payload_ec_shape()
-    }
-
-    pub fn operation_epoch(&self) -> ClusterEpoch {
-        self.admission.cluster.operation_epoch()
     }
 
     #[cfg(feature = "test-hooks")]

@@ -1023,6 +1023,21 @@ production streaming coordinator seam. Stream finalization, multipart completion
 public physical record representations are still pending, so implementation-order item 3 is not
 yet complete.
 
+The eleventh bounded slice continues implementation-order item 3 with streaming UploadPart
+finalization. The coordinator now supplies only the logical upload identity, part number, staged
+byte count, staged plaintext CRC64, S3 checksum result, and response value. Storage reloads and
+validates the exact session/upload/staging snapshot, derives the replacement generation and part
+version, selects the part EC and placement epoch from owner-held staging state, converts staging
+rows into committed multipart-segment rows, constructs the durable part record, and owns pending
+command retry equivalence. The callback sees only the upload checksum configuration, managed
+encryption algorithm, and storage-derived logical staged size and plaintext CRC64, so it can apply
+S3 checksum policy without receiving the durable upload record or constructing or inspecting
+physical records. The complete physical storage/RPC snapshots are crate-private, and
+the boundary checker rejects their re-export or the return of staging, placement, EC, generation,
+or segment fields to the production multipart coordinator. Multipart completion and remaining
+public physical record representations are still pending, so implementation-order item 3 is not
+yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

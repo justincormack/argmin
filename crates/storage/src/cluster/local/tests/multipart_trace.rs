@@ -401,77 +401,33 @@ fn upload_copied_test_multipart_part(
     }
 
     let size = payloads.iter().map(|payload| payload.len() as u64).sum();
+    let payload_crc64 = staged_segments
+        .iter()
+        .fold(checksum::crc64::checksum(&[]), |crc64, segment| {
+            checksum::crc64::combine(crc64, segment.payload_crc64, segment.size)
+        });
+    let first_segment = staged_segments.first().expect("streamed part segment");
+    let expected_part = crate::MultipartPartRecord {
+        upload_id: upload_id.clone(),
+        part_number,
+        generation: 0,
+        size,
+        payload_crc64,
+        etag: payload_crc64.to_be_bytes().to_vec(),
+        etag_kind: crate::EtagKind::Crc64,
+        part_vid: crate::GenerationId::MIN,
+        placement_cluster_epoch: first_segment.placement_cluster_epoch,
+        ec_k: first_segment.ec_k,
+        ec_m: first_segment.ec_m,
+        last_modified: 123,
+        checksum: None,
+    };
     let part = cluster
         .finalize_upload_part_stream(
             bucket,
             key,
-            upload_id,
-            &session_id,
-            part_number,
-            |snapshot| {
-                let generation = snapshot
-                    .existing_part_generation
-                    .map_or(0, |generation| generation + 1);
-                let ec = snapshot
-                    .staging_segments
-                    .first()
-                    .map(|segment| EcShape {
-                        k: segment.ec_k,
-                        m: segment.ec_m,
-                    })
-                    .unwrap_or(EcShape { k: 0, m: 0 });
-                let payload_crc64 = snapshot.staging_segments.iter().fold(
-                    checksum::crc64::checksum(&[]),
-                    |crc64, segment| {
-                        checksum::crc64::combine(crc64, segment.payload_crc64, segment.size)
-                    },
-                );
-                let part = crate::MultipartPartRecord {
-                    upload_id: upload_id.clone(),
-                    part_number,
-                    generation,
-                    size,
-                    payload_crc64,
-                    etag: vec![payload_seed; 8],
-                    etag_kind: crate::EtagKind::Crc64,
-                    part_vid: crate::GenerationId::new(u64::from(generation) + 1).unwrap(),
-                    placement_cluster_epoch: snapshot
-                        .staging_segments
-                        .first()
-                        .map_or(crate::ClusterEpoch::INITIAL, |segment| {
-                            segment.placement_cluster_epoch
-                        }),
-                    ec_k: ec.k,
-                    ec_m: ec.m,
-                    last_modified: 123,
-                    checksum: None,
-                };
-                let segments = snapshot
-                    .staging_segments
-                    .iter()
-                    .map(|staged| crate::MultipartPartSegmentRecord {
-                        bucket: bucket.clone(),
-                        key: key.clone(),
-                        upload_id: upload_id.clone(),
-                        version_id: crate::MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
-                        part_number,
-                        segment_index: staged.segment_index,
-                        size: staged.size,
-                        segment_crc64: staged.segment_crc64,
-                        segment_okh: staged.segment_okh,
-                        segment_vid: staged.segment_vid,
-                        data_pg_id: staged.data_pg_id,
-                        placement_cluster_epoch: staged.placement_cluster_epoch,
-                        ec_k: staged.ec_k,
-                        ec_m: staged.ec_m,
-                    })
-                    .collect::<Vec<_>>();
-                Ok::<_, ()>(crate::PreparedStreamPartCommit {
-                    value: part.clone(),
-                    part,
-                    segments,
-                })
-            },
+            stream_part_finalize_input(upload_id, &session_id, part_number, size, payload_crc64),
+            |_| Ok::<_, ()>(prepared_stream_part(expected_part.clone(), &expected_part)),
         )
         .unwrap()
         .unwrap()
