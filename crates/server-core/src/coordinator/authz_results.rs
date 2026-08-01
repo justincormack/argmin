@@ -315,7 +315,6 @@ pub(super) enum AuthorizedCompleteMultipartUpload {
         lifecycle: Option<Box<BucketLifecycleConfiguration>>,
         bucket: BucketName,
         key: ObjectKey,
-        upload_id: UploadId,
         upload: Box<AuthorizedMultipartUploadRecord>,
         multipart_write_encryption: Box<ActiveWriteEncryption>,
     },

@@ -3884,14 +3884,15 @@ impl LocalStorageNodeClient {
             snapshot_complete_multipart_cleanup_from_pg(&pg, upload_id, &selected_part_numbers)?;
         let (stale_payload_source, _) =
             snapshot_direct_put_stale_payload_for_snapshot(&pg, bucket, key, 0)?;
-        Ok(MultipartCompletionSnapshot {
+        Ok(MultipartCompletionSnapshot::from_storage(
+            crate::types::MultipartCompletionSubject::from_upload(&upload),
             existing_etag,
             current_object_identity,
             stale_payload_source,
             part_records,
             selected_streaming_segments,
             cleanup,
-        })
+        ))
     }
 
     fn load_multipart_completion_preflight(

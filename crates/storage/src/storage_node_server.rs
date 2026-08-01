@@ -26155,30 +26155,31 @@ mod tests {
             assert_eq!(cleanup.upload, multipart_upload);
             (completion_snapshot, cleanup)
         });
-        let completion_request = crate::CompleteMultipartCommitRequest {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            upload_id: upload_id.clone(),
-            completion_fingerprint: crate::MultipartCompletionFingerprint::from_bytes([0x71; 32]),
-            versioning: BucketVersioningState::Disabled,
-            owner: crate::OwnerIdentity::from_principal("active-object-route-owner"),
-            acl_grants: AclGrants::default(),
-            public_read: false,
-            generation_id: multipart_upload.object_generation_id,
-            size: terminal_multipart_part.size,
-            etag_crc64: [0x72; 8],
-            tags: None,
-            metadata_blob: Some(crate::SerializedMetadataBlob::default()),
-            system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
-            object_lock: crate::ObjectLockState::default(),
-            encryption: crate::ObjectEncryption::None,
-            expected_stale_payload_source: completion_snapshot.stale_payload_source,
-            expected_current_object_identity: completion_snapshot.current_object_identity,
-            conditional_completion: false,
-            part_records: completion_snapshot.part_records,
-            selected_streaming_segments: completion_snapshot.selected_streaming_segments,
-            expected_cleanup: completion_snapshot.cleanup,
-        };
+        let completion_request =
+            completion_snapshot.into_commit_request(crate::CompleteMultipartCommitInput {
+                completion_fingerprint: crate::MultipartCompletionFingerprint::from_bytes(
+                    [0x71; 32],
+                ),
+                versioning: BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("active-object-route-owner"),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                size: terminal_multipart_part.size,
+                etag_crc64: [0x72; 8],
+                tags: None,
+                metadata_blob: Some(crate::SerializedMetadataBlob::default()),
+                system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+                conditional_completion: false,
+            });
+        assert_eq!(
+            completion_request.generation_id,
+            multipart_upload.object_generation_id
+        );
+        assert_eq!(completion_request.bucket, bucket);
+        assert_eq!(completion_request.key, key);
+        assert_eq!(completion_request.upload_id, upload_id);
         let complete_multipart_command = crate::clock::with_time_override(1_000, || {
             primary_route
                 .build_complete_multipart_object_command(

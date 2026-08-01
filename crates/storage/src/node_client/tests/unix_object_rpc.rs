@@ -2789,7 +2789,26 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
     let snapshot = correct_authorized_upload_route
         .load_multipart_completion_snapshot(&[1])
         .unwrap();
+    assert_eq!(
+        snapshot.test_subject(),
+        (
+            &upload.bucket,
+            &upload.key,
+            &upload.upload_id,
+            upload.object_generation_id,
+        )
+    );
     assert_eq!(snapshot.part_records, vec![part.clone()]);
+    assert_eq!(
+        snapshot.parts(),
+        &[crate::MultipartCompletionPart {
+            part_number: part.part_number,
+            size: part.size,
+            payload_crc64: part.payload_crc64,
+            etag: part.etag.clone(),
+            checksum: part.checksum.clone(),
+        }]
+    );
     assert_object_payload_decode!(
         wrong_authorized_upload_route.load_multipart_completion_snapshot(&[1])
     );
@@ -4493,17 +4512,33 @@ fn unix_object_mutation_client_rejects_malformed_multipart_read_responses() {
         })
     ));
 
-    let snapshot = MultipartCompletionSnapshot {
-        existing_etag: None,
-        current_object_identity: Some(crate::MultipartObjectIdentity::DeleteMarker {
+    let snapshot = MultipartCompletionSnapshot::from_storage(
+        crate::types::MultipartCompletionSubject::new(
+            crate::tests::bucket_name("malformed-completion-snapshot-bucket"),
+            crate::tests::object_key("malformed-completion-snapshot-key"),
+            part.upload_id.clone(),
+            GenerationId::new(12).unwrap(),
+        ),
+        None,
+        Some(crate::MultipartObjectIdentity::DeleteMarker {
             version_id: VersionId::from_u64(3),
             write_sequence: 11,
         }),
-        stale_payload_source: None,
-        part_records: vec![part.clone()],
-        selected_streaming_segments: Vec::new(),
-        cleanup: CompleteMultipartCommitCleanup::default(),
-    };
+        None,
+        vec![part.clone()],
+        Vec::new(),
+        CompleteMultipartCommitCleanup::default(),
+    );
+    assert_eq!(snapshot.existing_etag(), None);
+    assert_eq!(snapshot.parts()[0].part_number, part.part_number);
+    assert_eq!(snapshot.parts()[0].payload_crc64, part.payload_crc64);
+    let snapshot_debug = format!("{snapshot:?}");
+    assert!(!snapshot_debug.contains("generation_id"));
+    assert!(!snapshot_debug.contains("current_object_identity"));
+    assert!(!snapshot_debug.contains("stale_payload_source"));
+    assert!(!snapshot_debug.contains("part_records"));
+    assert!(!snapshot_debug.contains("selected_streaming_segments"));
+    assert!(!snapshot_debug.contains("cleanup"));
     client
         .validate_multipart_completion_snapshot_response(&snapshot, &authorized_upload, &[1])
         .unwrap();

@@ -495,7 +495,6 @@ impl Coordinator {
             lifecycle,
             bucket: req.upload.bucket_name_typed().clone(),
             key: req.upload.key_typed().clone(),
-            upload_id: upload.upload_id.clone(),
             upload: Box::new(storage::AuthorizedMultipartUploadRecord::assume_authorized(
                 upload,
             )),

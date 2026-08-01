@@ -1038,6 +1038,25 @@ or segment fields to the production multipart coordinator. Multipart completion 
 public physical record representations are still pending, so implementation-order item 3 is not
 yet complete.
 
+The twelfth bounded slice continues implementation-order item 3 with multipart completion. The
+completion snapshot now exposes only the existing logical ETag and an immutable per-part view of
+part number, logical size, ETag, stored S3 checksum, and storage-derived plaintext CRC64. Storage
+retains the durable part records, selected streaming segments, stale-object identity and payload,
+replacement cleanup, generations, EC placement, and historical route state. After applying S3
+part, checksum, size, conditional, metadata, and encryption policy, the coordinator supplies a
+logical completion input; the opaque snapshot consumes that input and transfers its owner-held
+physical state into the storage commit request. The storage RPC representation is unchanged: its
+decoder reconstructs the logical view from the decoded durable part records, and its encoder still
+writes only the existing physical snapshot fields; the client binds the bucket, key, upload ID,
+and reserved final-object generation from the already-authorized upload context. The opaque
+snapshot derives that complete request subject when it constructs the commit request, so none of
+those identity fields can be supplied or crossed by the coordinator. Compiler visibility is the
+primary boundary, the public `Debug` views are redacted to logical fields, and checks reject
+physical multipart-completion types or fields in the production coordinator, publicly exposed
+physical fields, or caller-supplied subject fields. Multipart initiation, listing, abort, and
+remaining public physical record representations are still pending, so implementation-order item
+3 is not yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

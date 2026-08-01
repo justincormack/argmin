@@ -3371,13 +3371,16 @@ impl AuthorizedMultipartUploadMetadataRoute for UnixAuthorizedMultipartUploadMet
                 payload,
             )
             .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_multipart_completion_snapshot_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.client.rpc_payload_error(
-                    "decode multipart completion snapshot response",
-                    error.to_string(),
-                ))
-            })?;
+        let response = decode_multipart_completion_snapshot_response(
+            &response,
+            crate::types::MultipartCompletionSubject::from_upload(upload),
+        )
+        .map_err(|error| {
+            ObjectPgActionError::Store(self.client.rpc_payload_error(
+                "decode multipart completion snapshot response",
+                error.to_string(),
+            ))
+        })?;
         match response.outcome {
             StorageRpcMultipartCompletionSnapshotOutcome::Loaded(snapshot) => {
                 self.client

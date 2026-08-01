@@ -35,11 +35,11 @@ use crate::{
         ListPartsResp, ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
         ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartCompletionFingerprint,
         MultipartCompletionPreflight, MultipartCompletionReplay, MultipartCompletionSnapshot,
-        MultipartObjectIdentity, MultipartPartRecord, MultipartPartSegmentRecord,
-        MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-        MultipartUploadIdKey, MultipartUploadManagementLookup, MultipartUploadRecord,
-        ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout,
-        ObjectLockState, ObjectPartRecord, ObjectPayloadReclaimClaimRecord,
+        MultipartCompletionSubject, MultipartObjectIdentity, MultipartPartRecord,
+        MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
+        MultipartReclaimRecord, MultipartUploadIdKey, MultipartUploadManagementLookup,
+        MultipartUploadRecord, ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey,
+        ObjectLayout, ObjectLockState, ObjectPartRecord, ObjectPayloadReclaimClaimRecord,
         ObjectPayloadReclaimKind, ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity,
         ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention, ObjectSegmentRecord,
         ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
@@ -5143,11 +5143,12 @@ pub(crate) fn encode_multipart_completion_snapshot_response(
 
 pub(crate) fn decode_multipart_completion_snapshot_response(
     bytes: &[u8],
+    subject: MultipartCompletionSubject,
 ) -> Result<StorageRpcMultipartCompletionSnapshotResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let outcome = match decoder.read_u8()? {
         0 => StorageRpcMultipartCompletionSnapshotOutcome::Loaded(Box::new(
-            decoder.read_multipart_completion_snapshot()?,
+            decoder.read_multipart_completion_snapshot(subject)?,
         )),
         1 => StorageRpcMultipartCompletionSnapshotOutcome::NoSuchUpload {
             upload_id: decoder.read_upload_id()?,
@@ -14723,6 +14724,7 @@ impl<'a> StorageRpcDecoder<'a> {
 
     fn read_multipart_completion_snapshot(
         &mut self,
+        subject: MultipartCompletionSubject,
     ) -> Result<MultipartCompletionSnapshot, StorageRpcPayloadError> {
         let existing_etag = self.read_optional_string()?;
         let current_object_identity = self.read_optional_multipart_object_identity()?;
@@ -14744,14 +14746,15 @@ impl<'a> StorageRpcDecoder<'a> {
             selected_streaming_segments.push(self.read_multipart_part_segment_record()?);
         }
         let cleanup = self.read_complete_multipart_commit_cleanup()?;
-        Ok(MultipartCompletionSnapshot {
+        Ok(MultipartCompletionSnapshot::from_storage(
+            subject,
             existing_etag,
             current_object_identity,
             stale_payload_source,
             part_records,
             selected_streaming_segments,
             cleanup,
-        })
+        ))
     }
 
     fn read_list_parts_resp(&mut self) -> Result<ListPartsResp, StorageRpcPayloadError> {
@@ -20077,7 +20080,16 @@ mod tests {
         };
 
         let bytes = encode_multipart_completion_snapshot_response(&response).unwrap();
-        let decoded = decode_multipart_completion_snapshot_response(&bytes).unwrap();
+        let decoded = decode_multipart_completion_snapshot_response(
+            &bytes,
+            MultipartCompletionSubject::new(
+                crate::tests::bucket_name("completion-missing-part-bucket"),
+                crate::tests::object_key("completion-missing-part-key"),
+                upload_id.clone(),
+                GenerationId::new(1).unwrap(),
+            ),
+        )
+        .unwrap();
 
         let StorageRpcMultipartCompletionSnapshotOutcome::PartNotFound {
             upload_id: decoded_upload_id,

@@ -2249,6 +2249,67 @@ fail_with_matches \
     "The streaming UploadPart finalization callback snapshot must not expose the complete durable multipart-upload record" \
     "$stream_part_finalize_durable_upload_leaks"
 
+server_core_multipart_completion_physical_leaks=$(
+    rg -n --color=never \
+        '\b(CompleteMultipartCommitRequest|CompleteMultipartCommitCleanup|MultipartObjectIdentity|MultipartPartRecord|MultipartPartSegmentRecord|StoredObject)\b|completion_snapshot\.(part_records|selected_streaming_segments|cleanup|stale_payload_source|current_object_identity)' \
+        crates/server-core/src/coordinator/multipart.rs \
+        || true
+)
+fail_with_matches \
+    "Server-core multipart completion must use the logical completion-part view and opaque storage-owned commit request rather than physical records, cleanup, or durable object identities" \
+    "$server_core_multipart_completion_physical_leaks"
+
+public_multipart_completion_physical_fields=$(
+    awk '
+    /pub struct (MultipartCompletionSnapshot|CompleteMultipartCommitRequest)[[:space:]]*\{/ {
+        in_physical_type = 1
+    }
+    in_physical_type && /^[[:space:]]*pub[[:space:]]+[A-Za-z0-9_]+:/ {
+        print FILENAME ":" FNR ":" $0
+    }
+    in_physical_type && /^[[:space:]]*}/ {
+        in_physical_type = 0
+    }
+    ' crates/storage/src/types.rs
+)
+fail_with_matches \
+    "Multipart completion snapshots and commit requests must expose no physical fields outside storage" \
+    "$public_multipart_completion_physical_fields"
+
+multipart_completion_physical_debug_leaks=$(
+    awk '
+    /impl std::fmt::Debug for (MultipartCompletionSnapshot|CompleteMultipartCommitRequest)[[:space:]]*\{/ {
+        in_opaque_debug = 1
+    }
+    in_opaque_debug && /self\.(subject|generation_id|current_object_identity|stale_payload_source|part_records|selected_streaming_segments|cleanup|expected_stale_payload_source|expected_current_object_identity|expected_cleanup)/ {
+        print FILENAME ":" FNR ":" $0
+    }
+    in_opaque_debug && /^}/ {
+        in_opaque_debug = 0
+    }
+    ' crates/storage/src/types.rs
+)
+fail_with_matches \
+    "Opaque multipart completion Debug output must not expose physical snapshot or commit state" \
+    "$multipart_completion_physical_debug_leaks"
+
+multipart_completion_caller_supplied_subject_fields=$(
+    awk '
+    /pub struct CompleteMultipartCommitInput[[:space:]]*\{/ {
+        in_logical_input = 1
+    }
+    in_logical_input && /^[[:space:]]*pub[[:space:]]+(bucket|key|upload_id|generation_id):/ {
+        print FILENAME ":" FNR ":" $0
+    }
+    in_logical_input && /^[[:space:]]*}/ {
+        in_logical_input = 0
+    }
+    ' crates/storage/src/types.rs
+)
+fail_with_matches \
+    "Multipart completion subject and generation must come from the opaque snapshot rather than caller-supplied commit input" \
+    "$multipart_completion_caller_supplied_subject_fields"
+
 public_stream_append_hash_surfaces=$(
     rg -n --color=never \
         '^[[:space:]]*pub[[:space:]]+(mod[[:space:]]+shard_key_hash|fn[[:space:]]+stream_segment_key_hash)\b' \

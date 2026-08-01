@@ -4953,14 +4953,153 @@ pub struct MultipartPartRecord {
     pub checksum: Option<ChecksumBytes>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct MultipartCompletionSubject {
+    bucket: BucketName,
+    key: ObjectKey,
+    upload_id: UploadId,
+    generation_id: GenerationId,
+}
+
+impl MultipartCompletionSubject {
+    pub(crate) fn new(
+        bucket: BucketName,
+        key: ObjectKey,
+        upload_id: UploadId,
+        generation_id: GenerationId,
+    ) -> Self {
+        Self {
+            bucket,
+            key,
+            upload_id,
+            generation_id,
+        }
+    }
+
+    pub(crate) fn from_upload(upload: &MultipartUploadRecord) -> Self {
+        Self::new(
+            upload.bucket.clone(),
+            upload.key.clone(),
+            upload.upload_id.clone(),
+            upload.object_generation_id,
+        )
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct MultipartCompletionSnapshot {
-    pub existing_etag: Option<String>,
-    pub current_object_identity: Option<MultipartObjectIdentity>,
-    pub stale_payload_source: Option<StoredObject>,
-    pub part_records: Vec<MultipartPartRecord>,
-    pub selected_streaming_segments: Vec<MultipartPartSegmentRecord>,
-    pub cleanup: CompleteMultipartCommitCleanup,
+    subject: MultipartCompletionSubject,
+    pub(crate) existing_etag: Option<String>,
+    pub(crate) current_object_identity: Option<MultipartObjectIdentity>,
+    pub(crate) stale_payload_source: Option<StoredObject>,
+    pub(crate) part_records: Vec<MultipartPartRecord>,
+    pub(crate) selected_streaming_segments: Vec<MultipartPartSegmentRecord>,
+    pub(crate) cleanup: CompleteMultipartCommitCleanup,
+    logical_parts: Vec<MultipartCompletionPart>,
+}
+
+impl std::fmt::Debug for MultipartCompletionSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MultipartCompletionSnapshot")
+            .field("existing_etag", &self.existing_etag)
+            .field("parts", &self.logical_parts)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartCompletionPart {
+    pub part_number: u32,
+    pub size: u64,
+    /// CRC64-NVME over the logical part bytes.
+    pub payload_crc64: u64,
+    pub etag: Vec<u8>,
+    pub checksum: Option<ChecksumBytes>,
+}
+
+impl MultipartCompletionSnapshot {
+    pub(crate) fn from_storage(
+        subject: MultipartCompletionSubject,
+        existing_etag: Option<String>,
+        current_object_identity: Option<MultipartObjectIdentity>,
+        stale_payload_source: Option<StoredObject>,
+        part_records: Vec<MultipartPartRecord>,
+        selected_streaming_segments: Vec<MultipartPartSegmentRecord>,
+        cleanup: CompleteMultipartCommitCleanup,
+    ) -> Self {
+        let logical_parts = part_records
+            .iter()
+            .map(|part| MultipartCompletionPart {
+                part_number: part.part_number,
+                size: part.size,
+                payload_crc64: part.payload_crc64,
+                etag: part.etag.clone(),
+                checksum: part.checksum.clone(),
+            })
+            .collect();
+        Self {
+            subject,
+            existing_etag,
+            current_object_identity,
+            stale_payload_source,
+            part_records,
+            selected_streaming_segments,
+            cleanup,
+            logical_parts,
+        }
+    }
+
+    #[must_use]
+    pub fn existing_etag(&self) -> Option<&str> {
+        self.existing_etag.as_deref()
+    }
+
+    #[must_use]
+    pub fn parts(&self) -> &[MultipartCompletionPart] {
+        &self.logical_parts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_subject(&self) -> (&BucketName, &ObjectKey, &UploadId, GenerationId) {
+        (
+            &self.subject.bucket,
+            &self.subject.key,
+            &self.subject.upload_id,
+            self.subject.generation_id,
+        )
+    }
+
+    #[must_use]
+    pub fn into_commit_request(
+        self,
+        input: CompleteMultipartCommitInput,
+    ) -> CompleteMultipartCommitRequest {
+        CompleteMultipartCommitRequest {
+            bucket: self.subject.bucket,
+            key: self.subject.key,
+            upload_id: self.subject.upload_id,
+            completion_fingerprint: input.completion_fingerprint,
+            versioning: input.versioning,
+            owner: input.owner,
+            acl_grants: input.acl_grants,
+            public_read: input.public_read,
+            generation_id: self.subject.generation_id,
+            size: input.size,
+            etag_crc64: input.etag_crc64,
+            tags: input.tags,
+            metadata_blob: input.metadata_blob,
+            system_metadata_blob: input.system_metadata_blob,
+            object_lock: input.object_lock,
+            encryption: input.encryption,
+            expected_stale_payload_source: self.stale_payload_source,
+            expected_current_object_identity: self.current_object_identity,
+            conditional_completion: input.conditional_completion,
+            part_records: self.part_records,
+            selected_streaming_segments: self.selected_streaming_segments,
+            expected_cleanup: self.cleanup,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5011,16 +5150,12 @@ pub enum CompletedMultipartStalePayload {
 }
 
 #[derive(Debug, Clone)]
-pub struct CompleteMultipartCommitRequest {
-    pub bucket: BucketName,
-    pub key: ObjectKey,
-    pub upload_id: UploadId,
+pub struct CompleteMultipartCommitInput {
     pub completion_fingerprint: MultipartCompletionFingerprint,
     pub versioning: BucketVersioningState,
     pub owner: OwnerIdentity,
     pub acl_grants: AclGrants,
     pub public_read: bool,
-    pub generation_id: GenerationId,
     pub size: u64,
     pub etag_crc64: [u8; 8],
     pub tags: Option<SerializedTagSet>,
@@ -5028,12 +5163,46 @@ pub struct CompleteMultipartCommitRequest {
     pub system_metadata_blob: Option<SerializedSystemMetadataBlob>,
     pub object_lock: ObjectLockState,
     pub encryption: ObjectEncryption,
-    pub expected_stale_payload_source: Option<StoredObject>,
-    pub expected_current_object_identity: Option<MultipartObjectIdentity>,
     pub conditional_completion: bool,
-    pub part_records: Vec<MultipartPartRecord>,
-    pub selected_streaming_segments: Vec<MultipartPartSegmentRecord>,
-    pub expected_cleanup: CompleteMultipartCommitCleanup,
+}
+
+#[derive(Clone)]
+pub struct CompleteMultipartCommitRequest {
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+    pub(crate) upload_id: UploadId,
+    pub(crate) completion_fingerprint: MultipartCompletionFingerprint,
+    pub(crate) versioning: BucketVersioningState,
+    pub(crate) owner: OwnerIdentity,
+    pub(crate) acl_grants: AclGrants,
+    pub(crate) public_read: bool,
+    pub(crate) generation_id: GenerationId,
+    pub(crate) size: u64,
+    pub(crate) etag_crc64: [u8; 8],
+    pub(crate) tags: Option<SerializedTagSet>,
+    pub(crate) metadata_blob: Option<SerializedMetadataBlob>,
+    pub(crate) system_metadata_blob: Option<SerializedSystemMetadataBlob>,
+    pub(crate) object_lock: ObjectLockState,
+    pub(crate) encryption: ObjectEncryption,
+    pub(crate) expected_stale_payload_source: Option<StoredObject>,
+    pub(crate) expected_current_object_identity: Option<MultipartObjectIdentity>,
+    pub(crate) conditional_completion: bool,
+    pub(crate) part_records: Vec<MultipartPartRecord>,
+    pub(crate) selected_streaming_segments: Vec<MultipartPartSegmentRecord>,
+    pub(crate) expected_cleanup: CompleteMultipartCommitCleanup,
+}
+
+impl std::fmt::Debug for CompleteMultipartCommitRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompleteMultipartCommitRequest")
+            .field("bucket", &self.bucket)
+            .field("key", &self.key)
+            .field("upload_id", &self.upload_id)
+            .field("size", &self.size)
+            .field("conditional_completion", &self.conditional_completion)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

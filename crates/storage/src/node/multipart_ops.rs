@@ -174,19 +174,20 @@ impl SharedStorageNode {
                 | Err(crate::MetadataError::ObjectNotFound) => None,
                 Err(other) => return Err(other.into()),
             };
-        Ok(MultipartCompletionSnapshot {
+        Ok(MultipartCompletionSnapshot::from_storage(
+            crate::types::MultipartCompletionSubject::from_upload(&upload),
             existing_etag,
             current_object_identity,
             stale_payload_source,
             part_records,
             selected_streaming_segments,
-            cleanup: crate::CompleteMultipartCommitCleanup {
+            crate::CompleteMultipartCommitCleanup {
                 omitted_parts,
                 omitted_streaming_segments,
                 stream_uploads,
                 stream_upload_segments,
             },
-        })
+        ))
     }
 
     #[cfg(test)]
