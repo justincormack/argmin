@@ -2420,6 +2420,55 @@ fail_with_matches \
     "Opaque multipart-upload listing results must contain only logical projections and must not derive equality over hidden state" \
     "$multipart_upload_listing_opaque_surface_leaks"
 
+server_core_multipart_create_durable_request_leaks=$(
+    rg -n --color=never \
+        '\bCreateMultipartUploadReq\b' \
+        crates/server-core/src/coordinator/multipart.rs \
+        || true
+)
+fail_with_matches \
+    "Server-core multipart initiation must supply logical authorized input rather than the durable storage command request" \
+    "$server_core_multipart_create_durable_request_leaks"
+
+server_core_multipart_upload_id_issuance_leaks=$(
+    rg -n -U --color=never \
+        'multipart_upload_id_key[[:space:]]*\.[[:space:]]*issue[[:space:]]*\(' \
+        crates/server-core/src \
+        || true
+)
+fail_with_matches \
+    "Multipart upload IDs must be issued by storage rather than from a bucket key exposed to server-core" \
+    "$server_core_multipart_upload_id_issuance_leaks"
+
+public_multipart_create_durable_request_surfaces=$(
+    rg -n --color=never \
+        '^[[:space:]]*pub[[:space:]]+(struct[[:space:]]+CreateMultipartUploadReq|use.*\bCreateMultipartUploadReq\b|fn[[:space:]]+create_multipart_upload(_with_ordered_id)?\b)' \
+        crates/storage/src/types.rs \
+        crates/storage/src/lib.rs \
+        crates/storage/src/cluster/request_ops.rs \
+        || true
+)
+fail_with_matches \
+    "The durable multipart-create request and raw mutation entry points must remain private to storage" \
+    "$public_multipart_create_durable_request_surfaces"
+
+multipart_create_caller_supplied_subject_fields=$(
+    awk '
+    /pub struct CreateMultipartUploadInput[[:space:]]*\{/ {
+        in_input = 1
+    }
+    in_input && /^[[:space:]]*pub[[:space:]]+(upload_id|bucket|key|object_generation_id|initiated_at|state):/ {
+        print FILENAME ":" FNR ":" $0
+    }
+    in_input && /^[[:space:]]*}/ {
+        in_input = 0
+    }
+    ' crates/storage/src/types.rs
+)
+fail_with_matches \
+    "Multipart-create identity, subject, and durable state must be derived by storage rather than supplied in the authorized input" \
+    "$multipart_create_caller_supplied_subject_fields"
+
 public_stream_append_hash_surfaces=$(
     rg -n --color=never \
         '^[[:space:]]*pub[[:space:]]+(mod[[:space:]]+shard_key_hash|fn[[:space:]]+stream_segment_key_hash)\b' \

@@ -270,10 +270,7 @@ pub(super) struct AuthorizedCopyObject {
 
 #[derive(Debug)]
 pub(super) struct AuthorizedCreateMultipartUpload {
-    pub(super) bucket_info: BucketSummary,
     pub(super) lifecycle: Option<BucketLifecycleConfiguration>,
-    pub(super) bucket: BucketName,
-    pub(super) key: ObjectKey,
     pub(super) tags: Option<s3_types::TagSet>,
     pub(super) checksum: Option<MultipartChecksumConfig>,
     pub(super) initiator: OwnerIdentity,

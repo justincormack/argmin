@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn multipart_create_route_rejects_a_crossed_object_subject_before_mutation() {
+fn multipart_create_route_derives_the_object_subject_from_its_capability() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2];
@@ -10,17 +10,10 @@ fn multipart_create_route_rejects_a_crossed_object_subject_before_mutation() {
     let cluster = Arc::new(crate::StorageCluster::from_static_local_map(map).unwrap());
     let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
     let routed_key = crate::ObjectKey::try_from("routed-key".to_string()).unwrap();
-    let crossed_key = crate::ObjectKey::try_from("crossed-key".to_string()).unwrap();
     create_test_bucket(&cluster, &bucket);
 
-    let upload_id_key = crate::MultipartUploadIdKey::from_bytes([0x5a; 32]);
-    let upload_id = upload_id_key
-        .issue(&bucket, &crossed_key, "initiator")
-        .unwrap();
-    let crossed_create = crate::CreateMultipartUploadReq {
-        upload_id,
-        bucket: bucket.clone(),
-        key: crossed_key,
+    let issued_with = Arc::new(Mutex::new(None));
+    let create = crate::CreateMultipartUploadInput {
         tags: None,
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
@@ -37,25 +30,146 @@ fn multipart_create_route_rejects_a_crossed_object_subject_before_mutation() {
     let route = admission
         .active_multipart_object_route(&bucket, &routed_key)
         .unwrap();
-    let error = route
+    let outcome = route
+        .create_multipart_upload_with_ordered_id(crate::BucketSnapshotRequest::default(), {
+            let issued_with = Arc::clone(&issued_with);
+            move |snapshot, existing_object| {
+                assert!(existing_object.is_none());
+                *issued_with.lock().unwrap() =
+                    Some(snapshot.bucket.multipart_upload_id_key.clone());
+                Ok::<_, ()>(((), create.clone()))
+            }
+        })
+        .unwrap()
+        .unwrap();
+    let uploads = cluster
+        .test_list_multipart_uploads_for_bucket(&bucket)
+        .unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].bucket, bucket);
+    assert_eq!(uploads[0].key, routed_key);
+    assert_eq!(uploads[0].upload_id, outcome.upload_id);
+    let issued_with = issued_with.lock().unwrap().clone().unwrap();
+    assert!(issued_with.authenticates(&bucket, &routed_key, &outcome.upload_id));
+    assert!(issued_with.was_issued_for_principal(&outcome.upload_id, "initiator"));
+    assert!(
+        crate::MultipartUploadIdKey::listing_position(&outcome.upload_id)
+            .is_some_and(|position| position != (0, 0))
+    );
+}
+
+#[test]
+fn multipart_create_route_retry_preserves_the_first_provisional_issuance_identity() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap());
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let object_pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id();
+    let unrelated_session_id = crate::SessionId::try_from("7b".repeat(16)).unwrap();
+    let unrelated_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let injected = Arc::new(AtomicBool::new(false));
+    let injected_for_hook = Arc::clone(&injected);
+    let map_for_hook = Arc::clone(&map);
+    let bucket_for_hook = bucket.clone();
+    let key_for_hook = key.clone();
+    let _contention_hook = cluster.test_install_before_multipart_create_command_install_hook(
+        Arc::new(move |attempt| {
+            if injected_for_hook.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let command = MetadataCommandEnvelope::new(
+                attempt.id(),
+                MetadataCommandPayload::CreateStreamUpload(Box::new(
+                    crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                        crate::CreateStreamUploadReq {
+                            session_id: unrelated_session_id.clone(),
+                            bucket: bucket_for_hook.clone(),
+                            key: key_for_hook.clone(),
+                            target: crate::StreamUploadTarget::PutObject,
+                            encryption: crate::ObjectEncryption::None,
+                        },
+                        123,
+                        unrelated_proof.clone(),
+                    ),
+                )),
+            );
+            insert_pending_metadata_command_for_test(
+                &map_for_hook,
+                object_pg_id,
+                &bucket_for_hook,
+                &command,
+            );
+        }),
+    );
+
+    let prepared_ids = Arc::new(Mutex::new(Vec::new()));
+    let prepared_ids_for_hook = Arc::clone(&prepared_ids);
+    let _issuance_hook = cluster.test_install_after_multipart_create_upload_id_prepared_hook(
+        Arc::new(move |upload_id| {
+            prepared_ids_for_hook
+                .lock()
+                .unwrap()
+                .push(upload_id.clone());
+        }),
+    );
+    let action_calls = Arc::new(AtomicUsize::new(0));
+    let action_calls_for_callback = Arc::clone(&action_calls);
+    let create = crate::CreateMultipartUploadInput {
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    let route_handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = route_handle.admit_current_route().unwrap();
+    let route = admission
+        .active_multipart_object_route(&bucket, &key)
+        .unwrap();
+    let outcome = route
         .create_multipart_upload_with_ordered_id(
             crate::BucketSnapshotRequest::default(),
             |_snapshot, existing_object| {
+                action_calls_for_callback.fetch_add(1, Ordering::SeqCst);
                 assert!(existing_object.is_none());
-                Ok::<_, ()>(((), crossed_create.clone(), upload_id_key.clone()))
+                Ok::<_, ()>(((), create.clone()))
             },
         )
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        crate::BucketSnapshotLoadError::Store(StoreError::RouteCapabilitySubjectMismatch {
-            operation: "create multipart upload",
-        })
-    ));
-    assert!(cluster
-        .test_list_multipart_uploads_for_bucket(&bucket)
         .unwrap()
-        .is_empty());
+        .unwrap();
+
+    assert!(injected.load(Ordering::SeqCst));
+    assert_eq!(action_calls.load(Ordering::SeqCst), 2);
+    let prepared_ids = prepared_ids.lock().unwrap();
+    assert_eq!(prepared_ids.len(), 2);
+    assert_eq!(prepared_ids[1], prepared_ids[0]);
+    assert_ne!(outcome.upload_id, prepared_ids[0]);
+    assert!(crate::MultipartUploadIdKey::has_same_issuance_identity(
+        &outcome.upload_id,
+        &prepared_ids[0]
+    ));
+    assert!(
+        crate::MultipartUploadIdKey::listing_position(&outcome.upload_id)
+            .is_some_and(|position| position != (0, 0))
+    );
+    assert!(pending_metadata_command_for_test(&map, object_pg_id, &bucket).is_none());
 }
 
 #[test]

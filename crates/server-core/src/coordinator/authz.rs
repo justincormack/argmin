@@ -624,10 +624,7 @@ impl Coordinator {
         Self::ensure_sse_c_allowed(bucket_info, write_encryption.is_sse_customer())?;
 
         Ok(AuthorizedCreateMultipartUpload {
-            bucket_info: bucket_info.clone().into_inner(),
             lifecycle,
-            bucket: req.object.bucket.name_typed().clone(),
-            key: req.object.key_typed().clone(),
             tags: req.tags.cloned(),
             checksum: req.checksum,
             initiator,

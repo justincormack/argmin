@@ -440,7 +440,6 @@ pub use storage_rpc_auth::{
 pub(crate) use traits::PgMetadataStore;
 #[cfg(test)]
 pub(crate) use types::BucketSubresourceAux;
-pub(crate) use types::CommitDirectPutObjectReq;
 #[cfg(test)]
 pub(crate) use types::DirectPutWrittenSegment;
 pub use types::{
@@ -455,7 +454,7 @@ pub use types::{
     ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CommitMultipartReq,
     CompleteMultipartCommitCleanup, CompleteMultipartCommitInput, CompleteMultipartCommitOutcome,
     CompleteMultipartCommitRequest, CompletedMultipartStalePayload, CreateBucketConfig,
-    CreateMultipartUploadOutcome, CreateMultipartUploadReq, CreateStreamUploadReq, DataLayout,
+    CreateMultipartUploadInput, CreateMultipartUploadOutcome, CreateStreamUploadReq, DataLayout,
     DeleteCurrentObjectOutcome, DeleteMarkerRecord, DeleteSpecificObjectVersionOutcome,
     DeletedCurrentObject, DeletedSpecificObjectVersion, DirectPutCommitSnapshot,
     DirectPutCommitStorageSnapshot, DirectPutPayloadWrite, EcShape,
@@ -507,6 +506,7 @@ pub(crate) use types::{
     ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, PayloadReclaimRoot,
     BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN,
 };
+pub(crate) use types::{CommitDirectPutObjectReq, CreateMultipartUploadReq};
 pub(crate) use types::{
     ListMultipartUploadsPageStart, ListMultipartUploadsReq, ListMultipartUploadsResp,
 };

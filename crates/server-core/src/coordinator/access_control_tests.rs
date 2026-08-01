@@ -2509,8 +2509,6 @@ fn authorize_create_multipart_upload_bucket_policy_request_object_tag_controls_a
             policy_context: PutObjectPolicyContext::default(),
         })
         .unwrap();
-    assert_eq!(authorized.bucket, "bucket");
-    assert_eq!(authorized.key, "public-key");
     assert!(authorized.tags.is_some());
 }
 

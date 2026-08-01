@@ -1193,6 +1193,120 @@ pub(super) enum FinishPendingMetadataCommandResult {
     RetryPartialExactConflict,
 }
 
+enum MultipartUploadCreatePreparation {
+    Authorized(CreateMultipartUploadInput),
+    #[cfg(test)]
+    Durable {
+        request: CreateMultipartUploadReq,
+        ordered_id_key: Option<MultipartUploadIdKey>,
+    },
+}
+
+#[derive(Default)]
+struct AuthorizedMultipartUploadCreateIssuance {
+    issued: Option<(
+        MultipartUploadIdKey,
+        CreateMultipartUploadInput,
+        CreateMultipartUploadReq,
+    )>,
+}
+
+impl AuthorizedMultipartUploadCreateIssuance {
+    fn prepare(
+        &mut self,
+        upload_id_key: &MultipartUploadIdKey,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        input: CreateMultipartUploadInput,
+    ) -> Result<CreateMultipartUploadReq, StoreError> {
+        if let Some((issued_key, issued_input, request)) = &self.issued {
+            if issued_key == upload_id_key
+                && issued_input == &input
+                && request.bucket == *bucket
+                && request.key == *key
+            {
+                return Ok(request.clone());
+            }
+        }
+
+        let upload_id = upload_id_key
+            .issue(bucket, key, &input.initiator.principal)
+            .map_err(|_| StoreError::MultipartUploadIdIssuanceFailed)?;
+        let request = CreateMultipartUploadReq::from_authorized_input(
+            upload_id,
+            bucket.clone(),
+            key.clone(),
+            input.clone(),
+        );
+        self.issued = Some((upload_id_key.clone(), input, request.clone()));
+        Ok(request)
+    }
+}
+
+#[cfg(test)]
+mod authorized_multipart_upload_create_issuance_tests {
+    use super::*;
+
+    fn input() -> CreateMultipartUploadInput {
+        CreateMultipartUploadInput {
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            initiator: OwnerIdentity::from_principal("initiator"),
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_lock: ObjectLockState::default(),
+            checksum: None,
+            encryption: ObjectEncryption::None,
+        }
+    }
+
+    #[test]
+    fn authorized_multipart_create_issuance_is_stable_only_for_the_same_input_and_route() {
+        let upload_id_key = MultipartUploadIdKey::from_bytes([0x5a; 32]);
+        let bucket = BucketName::try_from("bucket".to_string()).unwrap();
+        let key = ObjectKey::try_from("key".to_string()).unwrap();
+        let other_key = ObjectKey::try_from("other-key".to_string()).unwrap();
+        let mut issuance = AuthorizedMultipartUploadCreateIssuance::default();
+
+        let first = issuance
+            .prepare(&upload_id_key, &bucket, &key, input())
+            .unwrap();
+        let retried = issuance
+            .prepare(&upload_id_key, &bucket, &key, input())
+            .unwrap();
+        assert_eq!(retried, first);
+
+        let crossed_route = issuance
+            .prepare(&upload_id_key, &bucket, &other_key, input())
+            .unwrap();
+        assert_eq!(crossed_route.bucket, bucket);
+        assert_eq!(crossed_route.key, other_key);
+        assert!(upload_id_key.authenticates(
+            &crossed_route.bucket,
+            &crossed_route.key,
+            &crossed_route.upload_id
+        ));
+        assert!(!upload_id_key.authenticates(&first.bucket, &first.key, &crossed_route.upload_id));
+
+        let replacement_upload_id_key = MultipartUploadIdKey::from_bytes([0xa5; 32]);
+        let replaced_bucket = issuance
+            .prepare(&replacement_upload_id_key, &bucket, &other_key, input())
+            .unwrap();
+        assert!(replacement_upload_id_key.authenticates(
+            &replaced_bucket.bucket,
+            &replaced_bucket.key,
+            &replaced_bucket.upload_id
+        ));
+        assert!(!upload_id_key.authenticates(
+            &replaced_bucket.bucket,
+            &replaced_bucket.key,
+            &replaced_bucket.upload_id
+        ));
+    }
+}
+
 // Metadata routing moves incrementally in Phase 6. Single-PG bucket/object
 // operations route through the local metadata PG primary; composite scans fan
 // out across routed PG primaries and merge locally.
@@ -13042,8 +13156,8 @@ impl super::StorageCluster {
         }))
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn create_multipart_upload<T, E>(
+    #[cfg(test)]
+    pub(crate) fn create_multipart_upload<T, E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -13063,23 +13177,32 @@ impl super::StorageCluster {
             || Ok(()),
             request,
             |snapshot, existing| {
-                action(snapshot, existing).map(|(value, create)| (value, create, None))
+                action(snapshot, existing).map(|(value, create)| {
+                    (
+                        value,
+                        MultipartUploadCreatePreparation::Durable {
+                            request: create,
+                            ordered_id_key: None,
+                        },
+                    )
+                })
             },
         )
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn create_multipart_upload_with_ordered_id<T, E>(
+    #[cfg(test)]
+    pub(crate) fn create_multipart_upload_with_ordered_id<T, E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         request: BucketSnapshotRequest,
-        action: impl FnMut(
+        mut action: impl FnMut(
             BucketSnapshot,
             Option<StoredObject>,
-        ) -> Result<(T, CreateMultipartUploadReq, MultipartUploadIdKey), E>,
+        )
+            -> Result<(T, CreateMultipartUploadReq, MultipartUploadIdKey), E>,
     ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
-        self.create_multipart_upload_with_ordered_id_with_route_validation(
+        self.create_multipart_upload_inner_with_route_validation(
             super::MultipartObjectMutationEffectRoute {
                 pg_id: self.object_metadata_pg(bucket, key),
                 bucket,
@@ -13088,7 +13211,17 @@ impl super::StorageCluster {
             },
             || Ok(()),
             request,
-            action,
+            |snapshot, existing| {
+                action(snapshot, existing).map(|(value, create, upload_id_key)| {
+                    (
+                        value,
+                        MultipartUploadCreatePreparation::Durable {
+                            request: create,
+                            ordered_id_key: Some(upload_id_key),
+                        },
+                    )
+                })
+            },
         )
     }
 
@@ -13100,16 +13233,16 @@ impl super::StorageCluster {
         mut action: impl FnMut(
             BucketSnapshot,
             Option<StoredObject>,
-        )
-            -> Result<(T, CreateMultipartUploadReq, MultipartUploadIdKey), E>,
+        ) -> Result<(T, CreateMultipartUploadInput), E>,
     ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
         self.create_multipart_upload_inner_with_route_validation(
             route,
             require_valid_route,
             request,
             |snapshot, existing| {
-                action(snapshot, existing)
-                    .map(|(value, create, upload_id_key)| (value, create, Some(upload_id_key)))
+                action(snapshot, existing).map(|(value, input)| {
+                    (value, MultipartUploadCreatePreparation::Authorized(input))
+                })
             },
         )
     }
@@ -13122,8 +13255,7 @@ impl super::StorageCluster {
         mut action: impl FnMut(
             BucketSnapshot,
             Option<StoredObject>,
-        )
-            -> Result<(T, CreateMultipartUploadReq, Option<MultipartUploadIdKey>), E>,
+        ) -> Result<(T, MultipartUploadCreatePreparation), E>,
     ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
         crate::metadata_command::metadata_command_publisher!(CreateMultipartUpload);
         enum Attempt<T> {
@@ -13138,6 +13270,7 @@ impl super::StorageCluster {
             effect_fence,
         } = route;
         let pg_id = object_pg_id.pg_id();
+        let mut authorized_issuance = AuthorizedMultipartUploadCreateIssuance::default();
         loop {
             require_valid_route()?;
             let applied_commands = self
@@ -13166,6 +13299,7 @@ impl super::StorageCluster {
                     bucket,
                     request,
                 )?;
+                let upload_id_key = snapshot.bucket.multipart_upload_id_key.clone();
 
                 let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
                 let multipart_creation_route = mutation_client
@@ -13192,9 +13326,25 @@ impl super::StorageCluster {
                     Some(StoredObject::DeleteMarker(_)) | None => None,
                 };
 
-                let (value, create, upload_id_key) = match action(snapshot, existing_object) {
+                let (value, preparation) = match action(snapshot, existing_object) {
                     Ok(prepared) => prepared,
                     Err(error) => return Ok(Err(error)),
+                };
+                let (create, ordered_id_key) = match preparation {
+                    #[cfg(test)]
+                    MultipartUploadCreatePreparation::Durable {
+                        request,
+                        ordered_id_key,
+                    } => (request, ordered_id_key),
+                    MultipartUploadCreatePreparation::Authorized(input) => {
+                        let create = authorized_issuance
+                            .prepare(&upload_id_key, bucket, key, input)
+                            .map_err(BucketSnapshotLoadError::Store)?;
+                        self.maybe_run_after_multipart_create_upload_id_prepared_hook(
+                            &create.upload_id,
+                        );
+                        (create, Some(upload_id_key))
+                    }
                 };
                 if create.bucket != *bucket || create.key != *key {
                     return Err(BucketSnapshotLoadError::Store(
@@ -13243,7 +13393,7 @@ impl super::StorageCluster {
                         ));
                     }
                 };
-                if let Some(upload_id_key) = upload_id_key {
+                if let Some(upload_id_key) = ordered_id_key {
                     let MetadataCommandPayload::CreateMultipartUpload(provisional_command) =
                         command.payload()
                     else {
@@ -13263,6 +13413,7 @@ impl super::StorageCluster {
                         MetadataCommandPayload::CreateMultipartUpload(Box::new(ordered_command)),
                     );
                 }
+                self.maybe_run_before_multipart_create_command_install_hook(&command);
                 require_valid_route()?;
                 match self
                     .install_snapshot_sensitive_metadata_command_or_drain(

@@ -829,6 +829,12 @@ type RetainedStreamAbortHook = Arc<dyn Fn() -> Result<(), ObjectPgActionError> +
 #[cfg(any(test, feature = "test-hooks"))]
 type MetadataCommandPendingInstallHook = Arc<dyn Fn() + Send + Sync>;
 
+#[cfg(test)]
+type MultipartCreateUploadIdPreparedTestHook = Arc<dyn Fn(&UploadId) + Send + Sync>;
+
+#[cfg(test)]
+type MultipartCreateCommandInstallTestHook = Arc<dyn Fn(&MetadataCommandEnvelope) + Send + Sync>;
+
 #[cfg(any(test, feature = "test-hooks"))]
 type DirectPutCommandIdHook = Arc<dyn Fn() + Send + Sync>;
 
@@ -881,6 +887,10 @@ struct StorageClusterTestHooks {
     after_retained_stream_cleanup_capability: Option<StreamAbortHook>,
     before_retained_stream_abort: Option<RetainedStreamAbortHook>,
     before_metadata_command_pending_install: Option<MetadataCommandPendingInstallHook>,
+    #[cfg(test)]
+    after_multipart_create_upload_id_prepared: Option<MultipartCreateUploadIdPreparedTestHook>,
+    #[cfg(test)]
+    before_multipart_create_command_install: Option<MultipartCreateCommandInstallTestHook>,
     before_direct_put_command_id: Option<DirectPutCommandIdHook>,
     #[cfg(test)]
     before_direct_put_abandoned_log_inspection: Option<DirectPutAbandonedLogInspectionHook>,
@@ -923,6 +933,16 @@ pub struct AfterRetainedStreamCleanupCapabilityTestHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct MetadataCommandPendingInstallHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(test)]
+pub(crate) struct MultipartCreateUploadIdPreparedTestHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(test)]
+pub(crate) struct MultipartCreateCommandInstallTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -1045,6 +1065,26 @@ impl Drop for MetadataCommandPendingInstallHookGuard {
             .lock()
             .unwrap()
             .before_metadata_command_pending_install = None;
+    }
+}
+
+#[cfg(test)]
+impl Drop for MultipartCreateUploadIdPreparedTestHookGuard {
+    fn drop(&mut self) {
+        self.hooks
+            .lock()
+            .unwrap()
+            .after_multipart_create_upload_id_prepared = None;
+    }
+}
+
+#[cfg(test)]
+impl Drop for MultipartCreateCommandInstallTestHookGuard {
+    fn drop(&mut self) {
+        self.hooks
+            .lock()
+            .unwrap()
+            .before_multipart_create_command_install = None;
     }
 }
 
@@ -3325,14 +3365,7 @@ impl ActiveMultipartObjectRoute<'_> {
         action: impl FnMut(
             BucketSnapshot,
             Option<StoredObject>,
-        ) -> Result<
-            (
-                T,
-                crate::CreateMultipartUploadReq,
-                crate::MultipartUploadIdKey,
-            ),
-            E,
-        >,
+        ) -> Result<(T, crate::CreateMultipartUploadInput), E>,
     ) -> Result<Result<crate::CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
         self.admission
             .cluster
@@ -8719,6 +8752,45 @@ impl StorageCluster {
         }
     }
 
+    #[cfg(test)]
+    fn maybe_run_after_multipart_create_upload_id_prepared_hook(&self, upload_id: &UploadId) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .after_multipart_create_upload_id_prepared
+            .clone();
+        if let Some(hook) = hook {
+            hook(upload_id);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn maybe_run_after_multipart_create_upload_id_prepared_hook(&self, _upload_id: &UploadId) {}
+
+    #[cfg(test)]
+    fn maybe_run_before_multipart_create_command_install_hook(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_multipart_create_command_install
+            .clone();
+        if let Some(hook) = hook {
+            hook(command);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn maybe_run_before_multipart_create_command_install_hook(
+        &self,
+        _command: &MetadataCommandEnvelope,
+    ) {
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn maybe_run_after_metadata_listing_pg_complete_hook(&self, pg_id: u32) {
         let hook = self
@@ -10938,6 +11010,34 @@ impl StorageCluster {
             .unwrap()
             .before_metadata_command_pending_install = Some(hook);
         MetadataCommandPendingInstallHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_after_multipart_create_upload_id_prepared_hook(
+        &self,
+        hook: MultipartCreateUploadIdPreparedTestHook,
+    ) -> MultipartCreateUploadIdPreparedTestHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .after_multipart_create_upload_id_prepared = Some(hook);
+        MultipartCreateUploadIdPreparedTestHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_before_multipart_create_command_install_hook(
+        &self,
+        hook: MultipartCreateCommandInstallTestHook,
+    ) -> MultipartCreateCommandInstallTestHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .before_multipart_create_command_install = Some(hook);
+        MultipartCreateCommandInstallTestHookGuard {
             hooks: Arc::clone(&self.test_hooks),
         }
     }

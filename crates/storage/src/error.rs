@@ -255,6 +255,9 @@ pub enum StoreError {
     #[error("{operation} subject does not match its admitted route capability")]
     RouteCapabilitySubjectMismatch { operation: &'static str },
 
+    #[error("failed to issue a multipart upload ID")]
+    MultipartUploadIdIssuanceFailed,
+
     #[error(
         "metadata command for local node {node_id} PG {pg_id} has epoch {command_epoch}, current cluster epoch is {current_epoch}"
     )]
@@ -653,6 +656,7 @@ impl StoreError {
             Self::RouteMapExpired { .. } => "route_map_expired",
             Self::RouteAdmissionClusterMismatch { .. } => "route_admission_cluster_mismatch",
             Self::RouteCapabilitySubjectMismatch { .. } => "route_capability_subject_mismatch",
+            Self::MultipartUploadIdIssuanceFailed => "multipart_upload_id_issuance_failed",
             Self::StaleMetadataCommand { .. } => "stale_metadata_command",
             Self::MetadataCommandWrongPg { .. } => "metadata_command_wrong_pg",
             Self::MetadataCommandFromNonPrimary { .. } => "metadata_command_from_non_primary",

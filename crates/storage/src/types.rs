@@ -5251,12 +5251,12 @@ pub struct ObjectPartRangeRecord {
     pub object_offset_start: u64,
 }
 
-/// Request to create a multipart upload.
+/// Logical authorized input for creating a multipart upload.
+///
+/// Bucket and key are derived from the admitted storage route rather than
+/// supplied by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateMultipartUploadReq {
-    pub upload_id: UploadId,
-    pub bucket: BucketName,
-    pub key: ObjectKey,
+pub struct CreateMultipartUploadInput {
     pub tags: Option<SerializedTagSet>,
     pub metadata_blob: SerializedMetadataBlob,
     pub system_metadata_blob: SerializedSystemMetadataBlob,
@@ -5268,6 +5268,49 @@ pub struct CreateMultipartUploadReq {
     pub object_lock: ObjectLockState,
     pub checksum: Option<MultipartChecksumConfig>,
     pub encryption: ObjectEncryption,
+}
+
+/// Private storage command input for creating a multipart upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CreateMultipartUploadReq {
+    pub upload_id: UploadId,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+    pub tags: Option<SerializedTagSet>,
+    pub metadata_blob: SerializedMetadataBlob,
+    pub system_metadata_blob: SerializedSystemMetadataBlob,
+    pub initiator: OwnerIdentity,
+    pub owner: OwnerIdentity,
+    pub acl_grants: AclGrants,
+    pub public_read: bool,
+    pub object_lock: ObjectLockState,
+    pub checksum: Option<MultipartChecksumConfig>,
+    pub encryption: ObjectEncryption,
+}
+
+impl CreateMultipartUploadReq {
+    pub(crate) fn from_authorized_input(
+        upload_id: UploadId,
+        bucket: BucketName,
+        key: ObjectKey,
+        input: CreateMultipartUploadInput,
+    ) -> Self {
+        Self {
+            upload_id,
+            bucket,
+            key,
+            tags: input.tags,
+            metadata_blob: input.metadata_blob,
+            system_metadata_blob: input.system_metadata_blob,
+            initiator: input.initiator,
+            owner: input.owner,
+            acl_grants: input.acl_grants,
+            public_read: input.public_read,
+            object_lock: input.object_lock,
+            checksum: input.checksum,
+            encryption: input.encryption,
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -1,10 +1,10 @@
 use checksum::{ChecksumAlgorithm, ChecksumBytes, ChecksumType, MultipartChecksumConfig};
 use std::time::{Duration, Instant};
 use storage::{
-    BucketName, CreateMultipartUploadOutcome, CreateMultipartUploadReq, FinalizeStreamPartOutcome,
-    MultipartCompletionPart, ObjectKey, PreparedStreamPartCommit, SerializedMetadataBlob,
-    SerializedSystemMetadataBlob, SessionId, StreamPartFinalizeInput, StreamPartFinalizeSnapshot,
-    UploadId,
+    BucketName, CreateMultipartUploadInput, CreateMultipartUploadOutcome,
+    FinalizeStreamPartOutcome, MultipartCompletionPart, ObjectKey, PreparedStreamPartCommit,
+    SerializedMetadataBlob, SerializedSystemMetadataBlob, SessionId, StreamPartFinalizeInput,
+    StreamPartFinalizeSnapshot, UploadId,
 };
 
 fn multipart_completion_fingerprint(
@@ -582,19 +582,7 @@ impl Coordinator {
                         &bucket_handle,
                         existing_object.as_ref(),
                     )?;
-                    let typed_upload_id = authorized
-                        .bucket_info
-                        .multipart_upload_id_key
-                        .issue(
-                            &authorized.bucket,
-                            &authorized.key,
-                            &authorized.initiator.principal,
-                        )
-                        .map_err(|reason| ServerError::InternalError { reason })?;
-                    let create = CreateMultipartUploadReq {
-                        upload_id: typed_upload_id.clone(),
-                        bucket: authorized.bucket.clone(),
-                        key: authorized.key.clone(),
+                    let create = CreateMultipartUploadInput {
                         tags: Self::stored_object_tags(authorized.tags.as_ref())?,
                         metadata_blob: SerializedMetadataBlob::from(metadata_blob.clone()),
                         system_metadata_blob: SerializedSystemMetadataBlob::from(
@@ -608,8 +596,7 @@ impl Coordinator {
                         checksum: authorized.checksum,
                         encryption: authorized.write_encryption.object_encryption(),
                     };
-                    let upload_id_key = authorized.bucket_info.multipart_upload_id_key.clone();
-                    Ok::<_, ServerError>((authorized, create, upload_id_key))
+                    Ok::<_, ServerError>((authorized, create))
                 },
             )
             .map_err(BucketHandleLoader::map_bucket_snapshot_error)??;
@@ -617,12 +604,15 @@ impl Coordinator {
         self.maybe_run_multipart_create_committed_hook(req.object.bucket_name());
         let AuthorizedCreateMultipartUpload {
             lifecycle,
-            key,
             write_encryption,
             ..
         } = authorized;
         let lifecycle_abort = lifecycle.as_ref().and_then(|config| {
-            Self::evaluate_multipart_lifecycle_abort_headers(config, key.as_str(), initiated_at)
+            Self::evaluate_multipart_lifecycle_abort_headers(
+                config,
+                req.object.key_typed().as_str(),
+                initiated_at,
+            )
         });
 
         Ok(CreateMultipartUploadResult {

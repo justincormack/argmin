@@ -1085,6 +1085,26 @@ derived equality in the public aggregate. Multipart initiation, authorization/ab
 remaining public physical record representations are still pending, so implementation-order item
 3 is not yet complete.
 
+The fifteenth bounded slice continues implementation-order item 3 with multipart initiation. The
+coordinator callback now supplies `CreateMultipartUploadInput`, containing only the authorized
+logical tags, metadata, identities, ACL, Object Lock state, checksum configuration, and encryption
+state. Upload ID, bucket, and key cannot be supplied or crossed by the callback: storage issues a
+stable provisional upload ID from the bucket-owned key and derives the subject from the admitted
+multipart-object route when it constructs its private durable request. Storage retains that
+issuance identity across internal retries and binds the final ordered ID to the published command.
+An owner-local deterministic contention regression inserts a same-log-index command at the
+production route's pre-install boundary, proves authorization is rerun, and proves the final
+ordered ID retains the first provisional issuance identity.
+Storage continues to derive initiation time, in-progress state, reserved object generation,
+current-object identity, ordered upload ID, reservation proof, and command identity. Existing SQL,
+metadata-command, and storage RPC representations remain unchanged. Raw multipart-create request
+types and test mutation entry points are crate-private; owner-local impossible-state tests may
+still exercise them directly. Compiler visibility is the primary boundary, with checks rejecting
+the durable request in the production coordinator, public raw mutation surfaces, or caller-
+supplied subject and durable-state fields in the logical input. Multipart authorization/abort and
+remaining public physical record representations are still pending, so implementation-order item
+3 is not yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
