@@ -6,6 +6,7 @@ use crate::metadata_command::{
     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
     UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+    UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
 };
 
 struct UnixObjectReadMetadataRoute<'a> {
@@ -108,6 +109,26 @@ struct UnixStreamUploadSessionMetadataRoute<'a> {
     bucket: BucketName,
     key: ObjectKey,
     session_id: SessionId,
+}
+
+struct UnixStreamPutFinalizationMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+    session_id: SessionId,
+}
+
+struct UnixStreamPartFinalizationMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+    upload_id: UploadId,
+    session_id: SessionId,
+    part_number: u32,
 }
 
 struct UnixObjectListingMetadataRoute<'a> {
@@ -3844,6 +3865,261 @@ impl StreamUploadSessionMetadataRoute for UnixStreamUploadSessionMetadataRoute<'
     }
 }
 
+impl StreamPutFinalizationMetadataRoute for UnixStreamPutFinalizationMetadataRoute<'_> {
+    fn load_snapshot(&self) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError> {
+        let request = StorageRpcStreamPutFinalizeSnapshotRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            session_id: self.session_id.clone(),
+        };
+        let payload = encode_stream_put_finalize_snapshot_request(&request);
+        let response = self
+            .client
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamPutFinalizeSnapshotLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_stream_put_finalize_snapshot_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode stream PUT finalize snapshot response",
+                    error.to_string(),
+                ))
+            })?;
+        self.client.validate_stream_put_finalize_snapshot_response(
+            &response.snapshot,
+            &self.bucket,
+            &self.key,
+            &self.session_id,
+        )?;
+        Ok(response.snapshot)
+    }
+
+    fn build_commit_command(
+        &self,
+        request: BuildStreamPutCommitCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        if !request
+            .bucket_write_reservation
+            .matches_exact_mutation_subject(
+                self.route_cluster_epoch,
+                &self.bucket,
+                PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+                Some(self.key.as_str()),
+            )
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build stream PUT commit command",
+            }
+            .into());
+        }
+        let rpc_request = StorageRpcStreamPutCommitCommandBuildRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            session_id: self.session_id.clone(),
+            total_size: request.total_size,
+            expected_snapshot: request.expected_snapshot.clone(),
+            commit: request.commit.clone(),
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+            effect_deadline: effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
+        };
+        let payload =
+            encode_stream_put_commit_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "encode stream PUT commit command build request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .client
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamPutCommitCommandBuild,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_object_metadata_command_build_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode stream PUT commit command build response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
+                self.client.validate_stream_put_commit_command_response(
+                    &command,
+                    &rpc_request,
+                    &request,
+                )?;
+                Ok(*command)
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => {
+                Err(ObjectPgActionError::StaleStreamFinalizeSnapshot)
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::Missing => {
+                Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode stream PUT commit command build response",
+                    "stream PUT commit command build cannot return missing".to_string(),
+                )))
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(self.client.metadata_command_log_conflict_error(
+                self.pg_id.pg_id(),
+                "decode stream PUT commit command build response",
+                node_id,
+                conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            )),
+        }
+    }
+}
+
+impl StreamPartFinalizationMetadataRoute for UnixStreamPartFinalizationMetadataRoute<'_> {
+    fn load_snapshot(&self) -> Result<StreamUploadPartStorageSnapshot, ObjectPgActionError> {
+        let request = StorageRpcStreamPartFinalizeSnapshotRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            upload_id: self.upload_id.clone(),
+            session_id: self.session_id.clone(),
+            part_number: self.part_number,
+        };
+        let payload = encode_stream_part_finalize_snapshot_request(&request);
+        let response = self
+            .client
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamPartFinalizeSnapshotLoad,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_stream_part_finalize_snapshot_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode stream part finalize snapshot response",
+                    error.to_string(),
+                ))
+            })?;
+        self.client
+            .validate_stream_part_finalize_snapshot_response(
+                &response.snapshot,
+                &self.bucket,
+                &self.key,
+                &self.upload_id,
+                &self.session_id,
+                self.part_number,
+            )?;
+        Ok(response.snapshot)
+    }
+
+    fn build_commit_command(
+        &self,
+        request: BuildStreamPartCommitCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        if !request
+            .bucket_write_reservation
+            .matches_exact_mutation_subject(
+                self.route_cluster_epoch,
+                &self.bucket,
+                UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
+                Some(self.key.as_str()),
+            )
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build stream part commit command",
+            }
+            .into());
+        }
+        let rpc_request = StorageRpcStreamPartCommitCommandBuildRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            upload_id: self.upload_id.clone(),
+            session_id: self.session_id.clone(),
+            part_number: self.part_number,
+            expected_snapshot: request.expected_snapshot.clone(),
+            part: request.part.clone(),
+            segments: request.segments.to_vec(),
+            bucket_write_reservation: request.bucket_write_reservation.clone(),
+            effect_deadline: effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
+        };
+        let payload =
+            encode_stream_part_commit_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "encode stream part commit command build request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self
+            .client
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamPartCommitCommandBuild,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_object_metadata_command_build_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode stream part commit command build response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
+                self.client.validate_stream_part_commit_command_response(
+                    &command,
+                    &rpc_request,
+                    &request,
+                )?;
+                Ok(*command)
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => {
+                Err(ObjectPgActionError::StaleStreamFinalizeSnapshot)
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::Missing => {
+                Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode stream part commit command build response",
+                    "stream part commit command build cannot return missing".to_string(),
+                )))
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(self.client.metadata_command_log_conflict_error(
+                self.pg_id.pg_id(),
+                "decode stream part commit command build response",
+                node_id,
+                conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            )),
+        }
+    }
+}
+
 impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
     fn open_put_object_metadata_route(
         &self,
@@ -4036,6 +4312,62 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             bucket: bucket.clone(),
             key: key.clone(),
             session_id: session_id.clone(),
+        }))
+    }
+
+    fn open_stream_put_finalization_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Box<dyn StreamPutFinalizationMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixStreamPutFinalizationMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            session_id: session_id.clone(),
+        }))
+    }
+
+    fn open_stream_part_finalization_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        session_id: &SessionId,
+        part_number: u32,
+    ) -> Result<Box<dyn StreamPartFinalizationMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixStreamPartFinalizationMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+            session_id: session_id.clone(),
+            part_number,
         }))
     }
 
@@ -4395,206 +4727,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             }
         }
         Ok(response.record)
-    }
-
-    fn load_stream_put_finalize_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError> {
-        let request = StorageRpcStreamPutFinalizeSnapshotRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
-            session_id: session_id.clone(),
-        };
-        let payload = encode_stream_put_finalize_snapshot_request(&request);
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectStreamPutFinalizeSnapshotLoad,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_stream_put_finalize_snapshot_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode stream PUT finalize snapshot response",
-                    error.to_string(),
-                ))
-            })?;
-        self.validate_stream_put_finalize_snapshot_response(
-            &response.snapshot,
-            bucket,
-            key,
-            session_id,
-        )?;
-        Ok(response.snapshot)
-    }
-
-    fn build_stream_put_commit_command(
-        &self,
-        request: BuildStreamPutCommitCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let rpc_request = StorageRpcStreamPutCommitCommandBuildRequest {
-            object: self.object_request(request.pg_id.pg_id(), request.bucket, request.key),
-            session_id: request.session_id.clone(),
-            total_size: request.total_size,
-            expected_snapshot: request.expected_snapshot.clone(),
-            commit: request.commit.clone(),
-            bucket_write_reservation: request.bucket_write_reservation.clone(),
-        };
-        let payload =
-            encode_stream_put_commit_command_build_request(&rpc_request).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "encode stream PUT commit command build request",
-                    error.to_string(),
-                ))
-            })?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectStreamPutCommitCommandBuild,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_object_metadata_command_build_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode stream PUT commit command build response",
-                    error.to_string(),
-                ))
-            })?;
-        match response.outcome {
-            StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
-                self.validate_stream_put_commit_command_response(&command, &request)?;
-                Ok(*command)
-            }
-            StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => {
-                Err(ObjectPgActionError::StaleStreamFinalizeSnapshot)
-            }
-            StorageRpcObjectMetadataCommandBuildOutcome::Missing => {
-                Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode stream PUT commit command build response",
-                    "stream PUT commit command build cannot return missing".to_string(),
-                )))
-            }
-            StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
-                node_id,
-                pg_id: conflict_pg_id,
-                cluster_epoch,
-                log_index,
-            } => Err(self.metadata_command_log_conflict_error(
-                request.pg_id.pg_id(),
-                "decode stream PUT commit command build response",
-                node_id,
-                conflict_pg_id,
-                cluster_epoch,
-                log_index,
-            )),
-        }
-    }
-
-    fn load_stream_part_finalize_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-        session_id: &SessionId,
-        part_number: u32,
-    ) -> Result<StreamUploadPartStorageSnapshot, ObjectPgActionError> {
-        let request = StorageRpcStreamPartFinalizeSnapshotRequest {
-            object: self.object_request(pg_id.pg_id(), bucket, key),
-            upload_id: upload_id.clone(),
-            session_id: session_id.clone(),
-            part_number,
-        };
-        let payload = encode_stream_part_finalize_snapshot_request(&request);
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectStreamPartFinalizeSnapshotLoad,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_stream_part_finalize_snapshot_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode stream part finalize snapshot response",
-                    error.to_string(),
-                ))
-            })?;
-        self.validate_stream_part_finalize_snapshot_response(
-            &response.snapshot,
-            bucket,
-            key,
-            upload_id,
-            session_id,
-            part_number,
-        )?;
-        Ok(response.snapshot)
-    }
-
-    fn build_stream_part_commit_command(
-        &self,
-        request: BuildStreamPartCommitCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let rpc_request = StorageRpcStreamPartCommitCommandBuildRequest {
-            object: self.object_request(request.pg_id.pg_id(), request.bucket, request.key),
-            upload_id: request.upload_id.clone(),
-            session_id: request.session_id.clone(),
-            part_number: request.part_number,
-            expected_snapshot: request.expected_snapshot.clone(),
-            part: request.part.clone(),
-            segments: request.segments.to_vec(),
-            bucket_write_reservation: request.bucket_write_reservation.clone(),
-        };
-        let payload =
-            encode_stream_part_commit_command_build_request(&rpc_request).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "encode stream part commit command build request",
-                    error.to_string(),
-                ))
-            })?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectStreamPartCommitCommandBuild,
-                payload,
-            )
-            .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_object_metadata_command_build_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode stream part commit command build response",
-                    error.to_string(),
-                ))
-            })?;
-        match response.outcome {
-            StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
-                self.validate_stream_part_commit_command_response(&command, &request)?;
-                Ok(*command)
-            }
-            StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => {
-                Err(ObjectPgActionError::StaleStreamFinalizeSnapshot)
-            }
-            StorageRpcObjectMetadataCommandBuildOutcome::Missing => {
-                Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode stream part commit command build response",
-                    "stream part commit command build cannot return missing".to_string(),
-                )))
-            }
-            StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
-                node_id,
-                pg_id: conflict_pg_id,
-                cluster_epoch,
-                log_index,
-            } => Err(self.metadata_command_log_conflict_error(
-                request.pg_id.pg_id(),
-                "decode stream part commit command build response",
-                node_id,
-                conflict_pg_id,
-                cluster_epoch,
-                log_index,
-            )),
-        }
     }
 
     fn open_object_delete_metadata_route(

@@ -485,7 +485,7 @@ The same nested bytes are embedded in these storage-owned containing formats:
 | --- | --- | --- |
 | PG SQLite schema | schema version 1 | `objects`, `multipart_uploads`, and `stream_uploads` store user and system metadata blob columns. |
 | Metadata command | encoding version 5 | Object, multipart-upload, and stream-session command values carry both opaque blobs. |
-| Storage-node RPC | frame encoding version 11 | Logical object, multipart, and stream request/response payloads carry both opaque blobs. |
+| Storage-node RPC | frame encoding version 12 | Logical object, multipart, and stream request/response payloads carry both opaque blobs. |
 | Canonical PG state | encoding version 4 | The metadata columns participate in canonical row and state digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry the metadata columns and bind them into row, table, state, and checkpoint digests. |
 
@@ -521,7 +521,7 @@ The object-tag XML is embedded in these storage-owned containing formats:
 | --- | --- | --- |
 | PG SQLite schema | schema version 1 | `objects`, `multipart_uploads`, and `stream_uploads` store optional canonical object-tag XML. |
 | Metadata command | encoding version 5 | Object, multipart-upload, and stream-session command values carry the opaque tag set. |
-| Storage-node RPC | frame encoding version 11 | Logical object, multipart, stream, mutation, and tag-read payloads carry the opaque tag set. |
+| Storage-node RPC | frame encoding version 12 | Logical object, multipart, stream, mutation, and tag-read payloads carry the opaque tag set. |
 | Canonical PG state | encoding version 4 | The tag columns participate in canonical row and state digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry tag columns and bind them into row, table, state, and checkpoint digests. |
 
@@ -549,7 +549,7 @@ The bucket-tag XML is embedded in these storage-owned containing formats:
 | --- | --- | --- |
 | PG SQLite schema | schema version 1 | `bucket_subresources` stores canonical bucket-tag XML under the private tagging discriminator. |
 | Metadata command | encoding version 5 | Bucket-subresource put/delete commands carry the discriminated typed tag mutation. |
-| Storage-node RPC | frame encoding version 11 | Bucket snapshots, typed reads, and subresource mutations carry the opaque bucket-tag set. |
+| Storage-node RPC | frame encoding version 12 | Bucket snapshots, typed reads, and subresource mutations carry the opaque bucket-tag set. |
 | Canonical PG state | encoding version 4 | The bucket-subresource body participates in canonical row and state digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry the bucket-subresource row and bind it into row, table, state, and checkpoint digests. |
 
@@ -582,7 +582,7 @@ The ACL representation is embedded in these storage-owned containing formats:
 | --- | --- | --- |
 | PG SQLite schema | schema version 1 | `buckets`, `objects`, and `multipart_uploads` store canonical ACL strings. |
 | Metadata command | encoding version 5 | Bucket, object, multipart-upload, create, commit, and ACL mutation records carry canonical ACL strings. |
-| Storage-node RPC | frame encoding version 11 | Logical bucket, object, multipart, stream-commit, and ACL mutation messages carry canonical ACL strings. |
+| Storage-node RPC | frame encoding version 12 | Logical bucket, object, multipart, stream-commit, and ACL mutation messages carry canonical ACL strings. |
 | Canonical PG state | encoding version 4 | The three persisted ACL columns participate in canonical row and state digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry all three ACL columns and bind them into row, table, state, and checkpoint digests. |
 
@@ -613,7 +613,7 @@ The same nested bytes are embedded in these storage-owned containing formats:
 | --- | --- | --- |
 | PG SQLite schema | schema version 1 | `objects`, `multipart_uploads`, and `stream_uploads` store `encryption_type` plus `encryption_state`. |
 | Metadata command | encoding version 5 | Object, multipart-upload, and stream-session command values carry the discriminator and nested state bytes. |
-| Storage-node RPC | frame encoding version 11 | Logical object, multipart, and stream request/response payloads carry the discriminator and nested state bytes. |
+| Storage-node RPC | frame encoding version 12 | Logical object, multipart, and stream request/response payloads carry the discriminator and nested state bytes. |
 | Canonical PG state | encoding version 4 | The three table representations above include both encryption columns in canonical digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry the raw encryption columns and bind them into row, table, state, and checkpoint digests. |
 
@@ -639,7 +639,7 @@ but no version negotiation or supported compatibility window:
 
 | Surface | Current wire baseline | Authentication baseline | Negotiation and current disposition |
 | --- | --- | --- | --- |
-| Storage-node RPC | `STORAGE_RPC_FRAME_ENCODING_VERSION = 11` in `storage_rpc.rs`; frame magic, message-kind tags, checksums, and payload codecs are crate-private. | Binding version 2 and transport-envelope version 1 in `storage_rpc_auth.rs`. | Exact versions are required before dispatch. There is no negotiation. Treat any other version as incompatible until mixed-version operation is designed. |
+| Storage-node RPC | `STORAGE_RPC_FRAME_ENCODING_VERSION = 12` in `storage_rpc.rs`; frame magic, message-kind tags, checksums, and payload codecs are crate-private. | Binding version 2 and transport-envelope version 1 in `storage_rpc_auth.rs`. | Exact versions are required before dispatch. There is no negotiation. Treat any other version as incompatible until mixed-version operation is designed. |
 | Control-plane RPC | `CONTROL_PLANE_RPC_VERSION = 12` in `control_plane.rs`; the frame contains magic, version, request kind, length, checksum, and payload. | Shared control-plane authentication-envelope version 1 in `control_plane_auth.rs`. | The frame and auth decoders reject non-current versions before logical dispatch. There is no negotiation. Treat any other version as incompatible. |
 | Raft peer RPC | `CONTROL_PLANE_RAFT_PEER_RPC_VERSION = 2` in `control_plane_raft.rs`; request, response, snapshot, peer-identity, checksum, and numeric OpenRaft tags share this baseline. | Shared control-plane authentication-envelope version 1, with the authenticated operation and peer identity bound to the inner frame. | The decoder rejects non-current versions before OpenRaft dispatch. There is no negotiation, and OpenRaft peers currently require the same binary. Treat any other version as incompatible. |
 

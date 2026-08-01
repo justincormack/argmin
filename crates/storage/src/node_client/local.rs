@@ -7,6 +7,7 @@ use crate::metadata_command::{
     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
     UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+    UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::BucketAclSummary;
 
@@ -179,6 +180,26 @@ struct LocalStreamUploadSessionMetadataRoute<'a> {
     bucket: BucketName,
     key: ObjectKey,
     session_id: SessionId,
+}
+
+struct LocalStreamPutFinalizationMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+    session_id: SessionId,
+}
+
+struct LocalStreamPartFinalizationMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+    upload_id: UploadId,
+    session_id: SessionId,
+    part_number: u32,
 }
 
 struct LocalObjectListingMetadataRoute {
@@ -2987,6 +3008,85 @@ impl StreamUploadSessionMetadataRoute for LocalStreamUploadSessionMetadataRoute<
     }
 }
 
+impl StreamPutFinalizationMetadataRoute for LocalStreamPutFinalizationMetadataRoute<'_> {
+    fn load_snapshot(&self) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError> {
+        self.client.load_stream_put_finalize_snapshot(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            &self.session_id,
+        )
+    }
+
+    fn build_commit_command(
+        &self,
+        request: BuildStreamPutCommitCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        if !request
+            .bucket_write_reservation
+            .matches_exact_mutation_subject(
+                self.route_cluster_epoch,
+                &self.bucket,
+                PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+                Some(self.key.as_str()),
+            )
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build stream PUT commit command",
+            }
+            .into());
+        }
+        self.client
+            .build_stream_put_commit_command(self, request, effect_fence)
+    }
+}
+
+impl StreamPartFinalizationMetadataRoute for LocalStreamPartFinalizationMetadataRoute<'_> {
+    fn load_snapshot(&self) -> Result<StreamUploadPartStorageSnapshot, ObjectPgActionError> {
+        self.client.load_stream_part_finalize_snapshot(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            &self.upload_id,
+            &self.session_id,
+            self.part_number,
+        )
+    }
+
+    fn build_commit_command(
+        &self,
+        request: BuildStreamPartCommitCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        if request.part.upload_id != self.upload_id || request.part.part_number != self.part_number
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build stream part commit command",
+            }
+            .into());
+        }
+        if !request
+            .bucket_write_reservation
+            .matches_exact_mutation_subject(
+                self.route_cluster_epoch,
+                &self.bucket,
+                UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
+                Some(self.key.as_str()),
+            )
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "build stream part commit command",
+            }
+            .into());
+        }
+        self.client
+            .build_stream_part_commit_command(self, request, effect_fence)
+    }
+}
+
 impl MultipartUploadLookupMetadataRoute for LocalMultipartUploadLookupMetadataRoute<'_> {
     fn load_multipart_upload(
         &self,
@@ -3402,6 +3502,60 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         }))
     }
 
+    fn open_stream_put_finalization_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Box<dyn StreamPutFinalizationMetadataRoute + '_>, ObjectPgActionError> {
+        if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open stream PUT finalization metadata route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalStreamPutFinalizationMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            session_id: session_id.clone(),
+        }))
+    }
+
+    fn open_stream_part_finalization_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        session_id: &SessionId,
+        part_number: u32,
+    ) -> Result<Box<dyn StreamPartFinalizationMetadataRoute + '_>, ObjectPgActionError> {
+        if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open stream part finalization metadata route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalStreamPartFinalizationMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+            session_id: session_id.clone(),
+            part_number,
+        }))
+    }
+
     fn list_stream_uploads_for_bucket_page(
         &self,
         pg_id: ObjectMetadataScanPgId,
@@ -3493,50 +3647,6 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
             lease_deadline,
             now,
         )
-    }
-
-    fn load_stream_put_finalize_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError> {
-        Self::load_stream_put_finalize_snapshot(self, pg_id, bucket, key, session_id)
-    }
-
-    fn build_stream_put_commit_command(
-        &self,
-        request: BuildStreamPutCommitCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        Self::build_stream_put_commit_command(self, request)
-    }
-
-    fn load_stream_part_finalize_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-        session_id: &SessionId,
-        part_number: u32,
-    ) -> Result<StreamUploadPartStorageSnapshot, ObjectPgActionError> {
-        Self::load_stream_part_finalize_snapshot(
-            self,
-            pg_id,
-            bucket,
-            key,
-            upload_id,
-            session_id,
-            part_number,
-        )
-    }
-
-    fn build_stream_part_commit_command(
-        &self,
-        request: BuildStreamPartCommitCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        Self::build_stream_part_commit_command(self, request)
     }
 }
 
@@ -4059,14 +4169,16 @@ impl LocalStorageNodeClient {
 
     fn build_stream_put_commit_command(
         &self,
+        route: &LocalStreamPutFinalizationMetadataRoute<'_>,
         request: BuildStreamPutCommitCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let pg = self.storage_node.get_pg(route.pg_id.get())?;
         let current = load_stream_put_finalize_snapshot_from_pg(
             &pg,
-            request.bucket,
-            request.key,
-            request.session_id,
+            &route.bucket,
+            &route.key,
+            &route.session_id,
         )?;
         if &current != request.expected_snapshot {
             return Err(ObjectPgActionError::StaleStreamFinalizeSnapshot);
@@ -4116,13 +4228,14 @@ impl LocalStorageNodeClient {
         }
         let generation_id = current.generation_id;
         let last_modified_millis = crate::clock::current_time_millis();
+        effect_fence.require_valid_for(route.route_cluster_epoch)?;
         let write_sequence =
-            pg.next_object_write_sequence(request.bucket.as_str(), request.key.as_str())?;
+            pg.next_object_write_sequence(route.bucket.as_str(), route.key.as_str())?;
         let stale_payload = if version_id.is_null() {
             snapshot_direct_put_stale_payload_command(
                 &pg,
-                request.bucket,
-                request.key,
+                &route.bucket,
+                &route.key,
                 last_modified_millis,
             )?
         } else {
@@ -4132,8 +4245,8 @@ impl LocalStorageNodeClient {
             .staging_segments
             .iter()
             .map(|segment| ObjectSegmentRecord {
-                bucket: request.bucket.clone(),
-                key: request.key.clone(),
+                bucket: route.bucket.clone(),
+                key: route.key.clone(),
                 version_id,
                 segment_index: segment.segment_index,
                 size: segment.size,
@@ -4147,14 +4260,14 @@ impl LocalStorageNodeClient {
             })
             .collect();
         let object = PutLiveObjectReq {
-            bucket: request.bucket.clone(),
-            key: request.key.clone(),
+            bucket: route.bucket.clone(),
+            key: route.key.clone(),
             version_id,
             owner: request.commit.owner.clone(),
             acl_grants: request.commit.acl_grants.clone(),
             public_read: request.commit.public_read,
             generation_id,
-            size: request.commit.size,
+            size: request.total_size,
             etag: ObjectEtag::single_part(request.commit.etag_crc64),
             ec: current.staging_segments.first().map_or(
                 self.storage_node.default_ec_shape(),
@@ -4170,9 +4283,10 @@ impl LocalStorageNodeClient {
             object_lock: request.commit.object_lock,
             encryption: request.commit.encryption.clone(),
         };
+        effect_fence.require_valid_for(route.route_cluster_epoch)?;
         let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
+            route.pg_id.pg_id(),
+            route.route_cluster_epoch,
             &pg,
         )?;
         Ok(MetadataCommandEnvelope::new(
@@ -4180,7 +4294,7 @@ impl LocalStorageNodeClient {
             MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
                 object,
                 segments: committed_segments,
-                generation_reservation_id: request.session_id.clone(),
+                generation_reservation_id: route.session_id.clone(),
                 write_sequence,
                 last_modified_millis,
                 stale_payload,
@@ -4211,16 +4325,18 @@ impl LocalStorageNodeClient {
 
     fn build_stream_part_commit_command(
         &self,
+        route: &LocalStreamPartFinalizationMetadataRoute<'_>,
         request: BuildStreamPartCommitCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(request.pg_id.get())?;
+        let pg = self.storage_node.get_pg(route.pg_id.get())?;
         let current = load_stream_part_finalize_snapshot_from_pg(
             &pg,
-            request.bucket,
-            request.key,
-            request.upload_id,
-            request.session_id,
-            request.part_number,
+            &route.bucket,
+            &route.key,
+            &route.upload_id,
+            &route.session_id,
+            route.part_number,
         )?;
         if &current != request.expected_snapshot {
             return Err(ObjectPgActionError::StaleStreamFinalizeSnapshot);
@@ -4247,11 +4363,11 @@ impl LocalStorageNodeClient {
         let committed_segments: Vec<MultipartPartSegmentRecord> = staged_segments
             .iter()
             .map(|segment| MultipartPartSegmentRecord {
-                bucket: request.bucket.clone(),
-                key: request.key.clone(),
-                upload_id: request.upload_id.clone(),
+                bucket: route.bucket.clone(),
+                key: route.key.clone(),
+                upload_id: route.upload_id.clone(),
                 version_id: crate::MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
-                part_number: request.part_number,
+                part_number: route.part_number,
                 segment_index: segment.segment_index,
                 size: segment.size,
                 segment_crc64: segment.segment_crc64,
@@ -4269,17 +4385,18 @@ impl LocalStorageNodeClient {
                     .to_string(),
             });
         }
+        effect_fence.require_valid_for(route.route_cluster_epoch)?;
         let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
+            route.pg_id.pg_id(),
+            route.route_cluster_epoch,
             &pg,
         )?;
         Ok(MetadataCommandEnvelope::new(
             command_id,
             MetadataCommandPayload::CommitStreamPart(Box::new(CommitStreamPartCommand {
-                bucket: request.bucket.clone(),
-                key: request.key.clone(),
-                session_id: request.session_id.clone(),
+                bucket: route.bucket.clone(),
+                key: route.key.clone(),
+                session_id: route.session_id.clone(),
                 upload: current.auth_snapshot.upload,
                 part: request.part.clone(),
                 segments: committed_segments,

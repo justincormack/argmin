@@ -12853,6 +12853,13 @@ impl super::StorageCluster {
         } = route;
         let pg_id = object_pg_id.pg_id();
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+        let finalization_route = mutation_client.open_stream_put_finalization_metadata_route(
+            self.operation_epoch(),
+            object_pg_id,
+            bucket,
+            key,
+            session_id,
+        )?;
         let mut stale_snapshot_work_budget =
             super::RequestWorkBudget::new(super::STREAM_PUT_STALE_COMMIT_RETRY_BUDGET, None)
                 .for_operation("finalize_stream_put")
@@ -12882,12 +12889,7 @@ impl super::StorageCluster {
                     )
                 });
 
-            let storage_snapshot = match mutation_client.load_stream_put_finalize_snapshot(
-                object_pg_id,
-                bucket,
-                key,
-                session_id,
-            ) {
+            let storage_snapshot = match finalization_route.load_snapshot() {
                 Ok(snapshot) => snapshot,
                 Err(
                     error @ ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
@@ -12953,7 +12955,6 @@ impl super::StorageCluster {
                         owner: prepared.owner.clone(),
                         acl_grants: prepared.acl_grants.clone(),
                         public_read: prepared.public_read,
-                        size: prepared.size,
                         etag_crc64: prepared.etag_crc64,
                         tags: prepared.tags.clone(),
                         metadata_blob: prepared.metadata_blob.clone(),
@@ -12966,18 +12967,14 @@ impl super::StorageCluster {
                         self.metadata_command_apply_test_hook_scope_id(),
                     );
                     require_valid_route().map_err(ObjectPgActionError::Store)?;
-                    let command = match mutation_client.build_stream_put_commit_command(
+                    let command = match finalization_route.build_commit_command(
                         BuildStreamPutCommitCommandReq {
-                            pg_id: object_pg_id,
-                            cluster_epoch: self.operation_epoch(),
-                            bucket,
-                            key,
-                            session_id,
                             total_size,
                             expected_snapshot: &storage_snapshot,
                             commit: &commit,
                             bucket_write_reservation: effective_bucket_write_reservation,
                         },
+                        effect_fence,
                     ) {
                         Ok(command) => command,
                         Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => {
@@ -14560,6 +14557,15 @@ impl super::StorageCluster {
         } = input;
         let pg_id = object_pg_id.pg_id();
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+        let finalization_route = mutation_client.open_stream_part_finalization_metadata_route(
+            self.operation_epoch(),
+            object_pg_id,
+            bucket,
+            key,
+            upload_id,
+            session_id,
+            part_number,
+        )?;
 
         loop {
             require_valid_route().map_err(ObjectPgActionError::Store)?;
@@ -14615,14 +14621,7 @@ impl super::StorageCluster {
                 release_bucket_write_proof_if_unowned!()?;
                 return Err(ObjectPgActionError::Store(error));
             }
-            let storage_snapshot = match mutation_client.load_stream_part_finalize_snapshot(
-                object_pg_id,
-                bucket,
-                key,
-                upload_id,
-                session_id,
-                part_number,
-            ) {
+            let storage_snapshot = match finalization_route.load_snapshot() {
                 Ok(snapshot) => snapshot,
                 Err(
                     error @ ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
@@ -14789,20 +14788,14 @@ impl super::StorageCluster {
                     release_bucket_write_proof_if_unowned!()?;
                     return Err(ObjectPgActionError::Store(error));
                 }
-                let command = match mutation_client.build_stream_part_commit_command(
+                let command = match finalization_route.build_commit_command(
                     BuildStreamPartCommitCommandReq {
-                        pg_id: object_pg_id,
-                        cluster_epoch: self.operation_epoch(),
-                        bucket,
-                        key,
-                        upload_id,
-                        session_id,
-                        part_number,
                         expected_snapshot: &storage_snapshot,
                         part: &part,
                         segments: &segments,
                         bucket_write_reservation: &expected_command_bucket_write_reservation,
                     },
+                    effect_fence,
                 ) {
                     Ok(command) => command,
                     Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => {

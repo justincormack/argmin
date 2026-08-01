@@ -79,7 +79,7 @@ use std::io::{Read, Write};
 use std::num::{NonZeroU16, NonZeroU32};
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 11;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 12;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -2162,6 +2162,7 @@ pub(crate) struct StorageRpcStreamPutCommitCommandBuildRequest {
     pub(crate) expected_snapshot: StreamPutFinalizeStorageSnapshot,
     pub(crate) commit: StreamPutCommitInput,
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2187,6 +2188,7 @@ pub(crate) struct StorageRpcStreamPartCommitCommandBuildRequest {
     pub(crate) part: MultipartPartRecord,
     pub(crate) segments: Vec<MultipartPartSegmentRecord>,
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
 }
 
 #[derive(Debug, Clone)]
@@ -6284,6 +6286,7 @@ pub(crate) fn encode_stream_put_commit_command_build_request(
     put_stream_put_finalize_storage_snapshot(&mut out, &request.expected_snapshot);
     put_stream_put_commit_input(&mut out, &request.commit);
     put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
+    put_admitted_route_effect_deadline(&mut out, request.effect_deadline);
     Ok(out)
 }
 
@@ -6297,6 +6300,8 @@ pub(crate) fn decode_stream_put_commit_command_build_request(
     let expected_snapshot = decoder.read_stream_put_finalize_storage_snapshot()?;
     let commit = decoder.read_stream_put_commit_input()?;
     let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
+    let effect_deadline =
+        decoder.read_admitted_route_effect_deadline("stream PUT commit command build")?;
     decoder.finish()?;
     validate_stream_put_finalize_snapshot_identity(&object, &session_id, &expected_snapshot)?;
     if bucket_write_reservation.bucket != object.bucket {
@@ -6311,6 +6316,7 @@ pub(crate) fn decode_stream_put_commit_command_build_request(
         expected_snapshot,
         commit,
         bucket_write_reservation,
+        effect_deadline,
     })
 }
 
@@ -6424,6 +6430,7 @@ pub(crate) fn encode_stream_part_commit_command_build_request(
         put_multipart_part_segment_record(&mut out, segment);
     }
     put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
+    put_admitted_route_effect_deadline(&mut out, request.effect_deadline);
     Ok(out)
 }
 
@@ -6446,6 +6453,8 @@ pub(crate) fn decode_stream_part_commit_command_build_request(
         segments.push(decoder.read_multipart_part_segment_record()?);
     }
     let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
+    let effect_deadline =
+        decoder.read_admitted_route_effect_deadline("stream part commit command build")?;
     decoder.finish()?;
     validate_stream_part_finalize_snapshot_identity(
         &object,
@@ -6482,6 +6491,7 @@ pub(crate) fn decode_stream_part_commit_command_build_request(
         part,
         segments,
         bucket_write_reservation,
+        effect_deadline,
     })
 }
 
@@ -14934,7 +14944,6 @@ impl<'a> StorageRpcDecoder<'a> {
             owner: self.read_owner_identity()?,
             acl_grants: self.read_acl_grants()?,
             public_read: self.read_bool()?,
-            size: self.read_u64()?,
             etag_crc64: self.read_u64()?,
             tags: self.read_optional_serialized_tag_set()?,
             metadata_blob: SerializedMetadataBlob::new(self.read_bytes()?.to_vec()),
@@ -16998,7 +17007,6 @@ fn put_stream_put_commit_input(out: &mut Vec<u8>, commit: &StreamPutCommitInput)
     put_owner_identity(out, &commit.owner);
     put_string(out, &commit.acl_grants.to_current_storage_string());
     put_bool(out, commit.public_read);
-    put_u64(out, commit.size);
     put_u64(out, commit.etag_crc64);
     put_optional_string(out, commit.tags.as_ref().map(|tags| tags.as_str()));
     put_bytes(out, commit.metadata_blob.as_slice());
@@ -18108,7 +18116,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&11u16.to_le_bytes());
+        expected.extend_from_slice(&12u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -18119,15 +18127,15 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_rejects_version_ten_fixture() {
+    fn storage_rpc_frame_rejects_version_eleven_fixture() {
         let mut bytes =
             encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
         let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&10_u16.to_le_bytes());
+        bytes[version_offset..version_offset + 2].copy_from_slice(&11_u16.to_le_bytes());
 
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnsupportedVersion(10))
+            Err(StorageRpcFrameError::UnsupportedVersion(11))
         );
     }
 

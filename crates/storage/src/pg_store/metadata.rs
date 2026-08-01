@@ -3052,11 +3052,7 @@ impl PgStore {
         &self,
         command: &CommitStreamPartCommand,
     ) -> Result<(), MetadataError> {
-        if command.upload.bucket != command.bucket
-            || command.upload.key != command.key
-            || command.upload.state != UploadState::InProgress
-            || command.part.upload_id != command.upload.upload_id
-        {
+        if !command.has_consistent_subject() {
             return Err(MetadataError::InvariantViolation {
                 context: "commit stream part command upload binding mismatch",
                 reason: "metadata state does not satisfy the operation invariant".into(),

@@ -1456,6 +1456,28 @@ pub(crate) struct CommitStreamPartCommand {
 }
 
 impl CommitStreamPartCommand {
+    pub(crate) fn has_consistent_subject(&self) -> bool {
+        self.upload.bucket == self.bucket
+            && self.upload.key == self.key
+            && self.upload.state == crate::UploadState::InProgress
+            && self.part.upload_id == self.upload.upload_id
+            && self.segments.iter().all(|segment| {
+                segment.bucket == self.bucket
+                    && segment.key == self.key
+                    && segment.upload_id == self.upload.upload_id
+                    && segment.part_number == self.part.part_number
+            })
+            && self.existing_part.as_ref().is_none_or(|part| {
+                part.upload_id == self.upload.upload_id && part.part_number == self.part.part_number
+            })
+            && self.displaced_segments.iter().all(|segment| {
+                segment.bucket == self.bucket
+                    && segment.key == self.key
+                    && segment.upload_id == self.upload.upload_id
+                    && segment.part_number == self.part.part_number
+            })
+    }
+
     pub(crate) fn matches_request(
         &self,
         bucket: &BucketName,

@@ -49,6 +49,7 @@ use crate::metadata_command::{
     PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
     UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+    UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
@@ -10652,6 +10653,15 @@ impl StorageCluster {
                     },
                     Some(create.session.key.as_str()),
                 ),
+            MetadataCommandPayload::CommitStreamPart(commit) => {
+                commit.has_consistent_subject()
+                    && proof.matches_exact_mutation_subject(
+                        command.id().cluster_epoch(),
+                        &commit.bucket,
+                        UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
+                        Some(commit.key.as_str()),
+                    )
+            }
             MetadataCommandPayload::AbortMultipartUpload(abort) => {
                 abort.has_consistent_subject()
                     && proof.matches_exact_mutation_subject(

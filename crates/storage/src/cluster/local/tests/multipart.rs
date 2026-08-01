@@ -3010,7 +3010,7 @@ fn multipart_abort_pending_install_conflict_cleans_committed_stream_part() {
     let proof_for_hook = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "test-stream-part-commit-race",
+        crate::metadata_command::UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let command_epoch = cluster.operation_epoch();

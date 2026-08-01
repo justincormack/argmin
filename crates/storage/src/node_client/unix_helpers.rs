@@ -1025,13 +1025,14 @@ impl UnixStorageNodeClient {
     pub(super) fn validate_stream_put_commit_command_response(
         &self,
         command: &MetadataCommandEnvelope,
+        rpc_request: &StorageRpcStreamPutCommitCommandBuildRequest,
         request: &BuildStreamPutCommitCommandReq<'_>,
     ) -> Result<(), ObjectPgActionError> {
         let context = "validate stream PUT commit command build response";
         self.validate_object_metadata_command_route(
             command,
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
+            rpc_request.object.pg_id,
+            rpc_request.object.cluster_epoch,
             context,
         )?;
         let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() else {
@@ -1041,9 +1042,9 @@ impl UnixStorageNodeClient {
             )));
         };
         if !commit.matches_request(
-            request.bucket,
-            request.key,
-            request.session_id,
+            &rpc_request.object.bucket,
+            &rpc_request.object.key,
+            &rpc_request.session_id,
             request.expected_snapshot.generation_id,
         ) || commit.bucket_write_reservation != *request.bucket_write_reservation
         {
@@ -1059,7 +1060,7 @@ impl UnixStorageNodeClient {
             || object.owner != request.commit.owner
             || object.acl_grants != request.commit.acl_grants
             || object.public_read != request.commit.public_read
-            || object.size != request.commit.size
+            || object.size != request.total_size
             || object.etag != expected_etag
             || object.layout != ObjectLayout::Standard
             || object.tags != request.commit.tags
@@ -1092,8 +1093,8 @@ impl UnixStorageNodeClient {
             .iter()
             .zip(request.expected_snapshot.staging_segments.iter())
         {
-            if actual.bucket != *request.bucket
-                || actual.key != *request.key
+            if actual.bucket != rpc_request.object.bucket
+                || actual.key != rpc_request.object.key
                 || actual.version_id != request.commit.version_id
                 || actual.segment_index != expected.segment_index
                 || actual.size != expected.size
@@ -1132,13 +1133,14 @@ impl UnixStorageNodeClient {
     pub(super) fn validate_stream_part_commit_command_response(
         &self,
         command: &MetadataCommandEnvelope,
+        rpc_request: &StorageRpcStreamPartCommitCommandBuildRequest,
         request: &BuildStreamPartCommitCommandReq<'_>,
     ) -> Result<(), ObjectPgActionError> {
         let context = "validate stream part commit command build response";
         self.validate_object_metadata_command_route(
             command,
-            request.pg_id.pg_id(),
-            request.cluster_epoch,
+            rpc_request.object.pg_id,
+            rpc_request.object.cluster_epoch,
             context,
         )?;
         let MetadataCommandPayload::CommitStreamPart(commit) = command.payload() else {
@@ -1148,11 +1150,11 @@ impl UnixStorageNodeClient {
             )));
         };
         if !commit.matches_request(
-            request.bucket,
-            request.key,
-            request.upload_id,
-            request.session_id,
-            request.part_number,
+            &rpc_request.object.bucket,
+            &rpc_request.object.key,
+            &rpc_request.upload_id,
+            &rpc_request.session_id,
+            rpc_request.part_number,
         ) || commit.upload != request.expected_snapshot.auth_snapshot.upload
             || commit.part != *request.part
             || commit.segments != request.segments

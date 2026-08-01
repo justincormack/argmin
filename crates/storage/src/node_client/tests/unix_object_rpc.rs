@@ -2130,7 +2130,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..24)
+    let server_threads: Vec<_> = (0..22)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -2178,6 +2178,46 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         stream_upload_session_route(&client, wrong_pg, &bucket, &key, &session_id);
     let part_stream_session_route =
         stream_upload_session_route(&client, correct_pg, &bucket, &key, &part_session_id);
+    let correct_put_finalization_route = client
+        .open_stream_put_finalization_metadata_route(
+            ClusterEpoch::new(1).unwrap(),
+            correct_pg,
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap();
+    let wrong_put_finalization_route = client
+        .open_stream_put_finalization_metadata_route(
+            ClusterEpoch::new(1).unwrap(),
+            wrong_pg,
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap();
+    let correct_part_finalization_route = client
+        .open_stream_part_finalization_metadata_route(
+            ClusterEpoch::new(1).unwrap(),
+            correct_pg,
+            &bucket,
+            &key,
+            &upload_id,
+            &part_session_id,
+            1,
+        )
+        .unwrap();
+    let wrong_part_finalization_route = client
+        .open_stream_part_finalization_metadata_route(
+            ClusterEpoch::new(1).unwrap(),
+            wrong_pg,
+            &bucket,
+            &key,
+            &upload_id,
+            &part_session_id,
+            1,
+        )
+        .unwrap();
     let future_epoch = ClusterEpoch::new(client.cluster_epoch.get() + 1).unwrap();
     assert!(matches!(
         client
@@ -2190,6 +2230,42 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             )
             .err()
             .expect("future stream route epoch must fail before RPC"),
+        ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        }) if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
+    assert!(matches!(
+        client
+            .open_stream_put_finalization_metadata_route(
+                future_epoch,
+                correct_pg,
+                &bucket,
+                &key,
+                &session_id,
+            )
+            .err()
+            .expect("future stream PUT finalization epoch must fail before RPC"),
+        ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        }) if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
+    assert!(matches!(
+        client
+            .open_stream_part_finalization_metadata_route(
+                future_epoch,
+                correct_pg,
+                &bucket,
+                &key,
+                &upload_id,
+                &part_session_id,
+                1,
+            )
+            .err()
+            .expect("future stream part finalization epoch must fail before RPC"),
         ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
             operation_epoch,
             current_epoch,
@@ -2271,23 +2347,9 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         })
     ));
 
-    let snapshot = ObjectMutationMetadataNodeClient::load_stream_put_finalize_snapshot(
-        &client,
-        correct_pg,
-        &bucket,
-        &key,
-        &session_id,
-    )
-    .unwrap();
+    let snapshot = correct_put_finalization_route.load_snapshot().unwrap();
     assert_eq!(snapshot.generation_id, reserved_generation.unwrap());
-    let wrong_snapshot_error = ObjectMutationMetadataNodeClient::load_stream_put_finalize_snapshot(
-        &client,
-        wrong_pg,
-        &bucket,
-        &key,
-        &session_id,
-    )
-    .unwrap_err();
+    let wrong_snapshot_error = wrong_put_finalization_route.load_snapshot().unwrap_err();
     assert!(matches!(
         wrong_snapshot_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
@@ -2332,14 +2394,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         ),
         "{part_target_update_error:?}"
     );
-    let snapshot = ObjectMutationMetadataNodeClient::load_stream_put_finalize_snapshot(
-        &client,
-        correct_pg,
-        &bucket,
-        &key,
-        &session_id,
-    )
-    .unwrap();
+    let snapshot = correct_put_finalization_route.load_snapshot().unwrap();
 
     let commit = StreamPutCommitInput {
         versioning: BucketVersioningState::Suspended,
@@ -2347,7 +2402,6 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         owner: OwnerIdentity::from_principal("owner"),
         acl_grants: AclGrants::default(),
         public_read: false,
-        size: 0,
         etag_crc64: 0,
         tags: None,
         metadata_blob: SerializedMetadataBlob::default(),
@@ -2355,42 +2409,34 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         object_lock: ObjectLockState::default(),
         encryption: ObjectEncryption::None,
     };
-    let correct_command = ObjectMutationMetadataNodeClient::build_stream_put_commit_command(
-        &client,
-        BuildStreamPutCommitCommandReq {
-            pg_id: correct_pg,
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
-            bucket: &bucket,
-            key: &key,
-            session_id: &session_id,
-            total_size: 0,
-            expected_snapshot: &snapshot,
-            commit: &commit,
-            bucket_write_reservation: &renewed_proof,
-        },
-    )
-    .unwrap();
+    let correct_command = correct_put_finalization_route
+        .build_commit_command(
+            BuildStreamPutCommitCommandReq {
+                total_size: 0,
+                expected_snapshot: &snapshot,
+                commit: &commit,
+                bucket_write_reservation: &renewed_proof,
+            },
+            effect_fence,
+        )
+        .unwrap();
     assert!(matches!(
         correct_command.payload(),
         MetadataCommandPayload::CommitDirectPutObject(command)
             if command.matches_request(&bucket, &key, &session_id, snapshot.generation_id)
                 && command.bucket_write_reservation == renewed_proof
     ));
-    let wrong_command_error = ObjectMutationMetadataNodeClient::build_stream_put_commit_command(
-        &client,
-        BuildStreamPutCommitCommandReq {
-            pg_id: wrong_pg,
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
-            bucket: &bucket,
-            key: &key,
-            session_id: &session_id,
-            total_size: 0,
-            expected_snapshot: &snapshot,
-            commit: &commit,
-            bucket_write_reservation: &renewed_proof,
-        },
-    )
-    .unwrap_err();
+    let wrong_command_error = wrong_put_finalization_route
+        .build_commit_command(
+            BuildStreamPutCommitCommandReq {
+                total_size: 0,
+                expected_snapshot: &snapshot,
+                commit: &commit,
+                bucket_write_reservation: &renewed_proof,
+            },
+            effect_fence,
+        )
+        .unwrap_err();
     assert!(matches!(
         wrong_command_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
@@ -2398,43 +2444,32 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             ..
         })
     ));
-    let crossed_put_proof_error =
-        ObjectMutationMetadataNodeClient::build_stream_put_commit_command(
-            &client,
+    let crossed_put_proof_error = correct_put_finalization_route
+        .build_commit_command(
             BuildStreamPutCommitCommandReq {
-                pg_id: correct_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                session_id: &session_id,
                 total_size: 0,
                 expected_snapshot: &snapshot,
                 commit: &commit,
                 bucket_write_reservation: &part_finalize_proof,
             },
+            effect_fence,
         )
         .unwrap_err();
     assert!(matches!(
         crossed_put_proof_error,
-        ObjectPgActionError::Store(StoreError::StorageRpc {
-            failure: StorageRpcErrorCode::PayloadDecode,
-            ..
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "build stream PUT commit command",
         })
     ));
-    let substituted_put_proof_error =
-        ObjectMutationMetadataNodeClient::build_stream_put_commit_command(
-            &client,
+    let substituted_put_proof_error = correct_put_finalization_route
+        .build_commit_command(
             BuildStreamPutCommitCommandReq {
-                pg_id: correct_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                session_id: &session_id,
                 total_size: 0,
                 expected_snapshot: &snapshot,
                 commit: &commit,
                 bucket_write_reservation: &substituted_put_proof,
             },
+            effect_fence,
         )
         .unwrap_err();
     assert!(matches!(
@@ -2486,32 +2521,13 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         }
     ));
 
-    let part_snapshot = ObjectMutationMetadataNodeClient::load_stream_part_finalize_snapshot(
-        &client,
-        correct_pg,
-        &bucket,
-        &key,
-        &upload_id,
-        &part_session_id,
-        1,
-    )
-    .unwrap();
+    let part_snapshot = correct_part_finalization_route.load_snapshot().unwrap();
     assert_eq!(part_snapshot.auth_snapshot.upload.upload_id, upload_id);
     assert_eq!(
         part_snapshot.auth_snapshot.session.session_id,
         part_session_id
     );
-    let wrong_part_snapshot_error =
-        ObjectMutationMetadataNodeClient::load_stream_part_finalize_snapshot(
-            &client,
-            wrong_pg,
-            &bucket,
-            &key,
-            &upload_id,
-            &part_session_id,
-            1,
-        )
-        .unwrap_err();
+    let wrong_part_snapshot_error = wrong_part_finalization_route.load_snapshot().unwrap_err();
     assert!(matches!(
         wrong_part_snapshot_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
@@ -2534,44 +2550,31 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         last_modified: 1,
         checksum: None,
     };
-    let correct_part_command = ObjectMutationMetadataNodeClient::build_stream_part_commit_command(
-        &client,
-        BuildStreamPartCommitCommandReq {
-            pg_id: correct_pg,
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
-            bucket: &bucket,
-            key: &key,
-            upload_id: &upload_id,
-            session_id: &part_session_id,
-            part_number: 1,
-            expected_snapshot: &part_snapshot,
-            part: &part,
-            segments: &[],
-            bucket_write_reservation: &part_finalize_proof,
-        },
-    )
-    .unwrap();
-    assert!(matches!(
-        correct_part_command.payload(),
-        MetadataCommandPayload::CommitStreamPart(commit)
-            if commit.upload.upload_id == upload_id && commit.session_id == part_session_id
-    ));
-    let wrong_part_command_error =
-        ObjectMutationMetadataNodeClient::build_stream_part_commit_command(
-            &client,
+    let correct_part_command = correct_part_finalization_route
+        .build_commit_command(
             BuildStreamPartCommitCommandReq {
-                pg_id: wrong_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                upload_id: &upload_id,
-                session_id: &part_session_id,
-                part_number: 1,
                 expected_snapshot: &part_snapshot,
                 part: &part,
                 segments: &[],
                 bucket_write_reservation: &part_finalize_proof,
             },
+            effect_fence,
+        )
+        .unwrap();
+    assert!(matches!(
+        correct_part_command.payload(),
+        MetadataCommandPayload::CommitStreamPart(commit)
+            if commit.upload.upload_id == upload_id && commit.session_id == part_session_id
+    ));
+    let wrong_part_command_error = wrong_part_finalization_route
+        .build_commit_command(
+            BuildStreamPartCommitCommandReq {
+                expected_snapshot: &part_snapshot,
+                part: &part,
+                segments: &[],
+                bucket_write_reservation: &part_finalize_proof,
+            },
+            effect_fence,
         )
         .unwrap_err();
     assert!(matches!(
@@ -2581,29 +2584,21 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             ..
         })
     ));
-    let crossed_part_proof_error =
-        ObjectMutationMetadataNodeClient::build_stream_part_commit_command(
-            &client,
+    let crossed_part_proof_error = correct_part_finalization_route
+        .build_commit_command(
             BuildStreamPartCommitCommandReq {
-                pg_id: correct_pg,
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                bucket: &bucket,
-                key: &key,
-                upload_id: &upload_id,
-                session_id: &part_session_id,
-                part_number: 1,
                 expected_snapshot: &part_snapshot,
                 part: &part,
                 segments: &[],
                 bucket_write_reservation: &current_proof,
             },
+            effect_fence,
         )
         .unwrap_err();
     assert!(matches!(
         crossed_part_proof_error,
-        ObjectPgActionError::Store(StoreError::StorageRpc {
-            failure: StorageRpcErrorCode::PayloadDecode,
-            ..
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "build stream part commit command",
         })
     ));
 
@@ -5403,7 +5398,6 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
         owner: OwnerIdentity::from_principal("owner"),
         acl_grants: AclGrants::default(),
         public_read: false,
-        size: 12,
         etag_crc64: 99,
         tags: None,
         metadata_blob: SerializedMetadataBlob::default(),
@@ -5426,7 +5420,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
                 acl_grants: commit_input.acl_grants.clone(),
                 public_read: commit_input.public_read,
                 generation_id: snapshot.generation_id,
-                size: commit_input.size,
+                size: 12,
                 etag: ObjectEtag::single_part(commit_input.etag_crc64),
                 ec: EcShape { k: 4, m: 2 },
                 layout: ObjectLayout::Standard,
@@ -5458,18 +5452,36 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
         })),
     );
     let request = BuildStreamPutCommitCommandReq {
-        pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-        cluster_epoch: ClusterEpoch::new(1).unwrap(),
-        bucket: &bucket,
-        key: &key,
-        session_id: &session_id,
         total_size: 12,
         expected_snapshot: &snapshot,
         commit: &commit_input,
         bucket_write_reservation: &proof,
     };
+    let pg_id = ObjectMetadataPgId::new_for_test(PgId::new(0));
+    let rpc_request = StorageRpcStreamPutCommitCommandBuildRequest {
+        object: client.object_request(pg_id.pg_id(), &bucket, &key),
+        session_id: session_id.clone(),
+        total_size: request.total_size,
+        expected_snapshot: snapshot.clone(),
+        commit: commit_input.clone(),
+        bucket_write_reservation: proof.clone(),
+        effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+            authority_valid_until_ms: 5_000,
+            portable_wall_valid_until_ms: 4_000,
+        }),
+    };
+    let encoded_rpc_request =
+        crate::storage_rpc::encode_stream_put_commit_command_build_request(&rpc_request).unwrap();
+    let decoded_rpc_request =
+        crate::storage_rpc::decode_stream_put_commit_command_build_request(&encoded_rpc_request)
+            .unwrap();
+    assert_eq!(
+        decoded_rpc_request.effect_deadline,
+        rpc_request.effect_deadline
+    );
+    let rpc_request = decoded_rpc_request;
     client
-        .validate_stream_put_commit_command_response(&command, &request)
+        .validate_stream_put_commit_command_response(&command, &rpc_request, &request)
         .unwrap();
 
     let mut substituted_proof_payload = command.payload().clone();
@@ -5483,7 +5495,11 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
     let substituted_proof_command =
         MetadataCommandEnvelope::new(command.id(), substituted_proof_payload);
     let err = client
-        .validate_stream_put_commit_command_response(&substituted_proof_command, &request)
+        .validate_stream_put_commit_command_response(
+            &substituted_proof_command,
+            &rpc_request,
+            &request,
+        )
         .unwrap_err();
     assert!(matches!(
         err,
@@ -5500,7 +5516,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
     bad_commit.object.generation_id = GenerationId::new(21).unwrap();
     let bad_command = MetadataCommandEnvelope::new(command.id(), bad_payload);
     let err = client
-        .validate_stream_put_commit_command_response(&bad_command, &request)
+        .validate_stream_put_commit_command_response(&bad_command, &rpc_request, &request)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -5530,18 +5546,13 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
     stale_commit.stale_payload = snapshot_with_stale.stale_payload.clone();
     let stale_command = MetadataCommandEnvelope::new(command.id(), stale_payload);
     let stale_request = BuildStreamPutCommitCommandReq {
-        pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-        cluster_epoch: ClusterEpoch::new(1).unwrap(),
-        bucket: &bucket,
-        key: &key,
-        session_id: &session_id,
         total_size: 12,
         expected_snapshot: &snapshot_with_stale,
         commit: &commit_input,
         bucket_write_reservation: &proof,
     };
     client
-        .validate_stream_put_commit_command_response(&stale_command, &stale_request)
+        .validate_stream_put_commit_command_response(&stale_command, &rpc_request, &stale_request)
         .unwrap();
 
     let mut bad_payload = command.payload().clone();
@@ -5555,7 +5566,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_put_commit_response() {
     ));
     let bad_command = MetadataCommandEnvelope::new(command.id(), bad_payload);
     let err = client
-        .validate_stream_put_commit_command_response(&bad_command, &stale_request)
+        .validate_stream_put_commit_command_response(&bad_command, &rpc_request, &stale_request)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -5687,20 +5698,38 @@ fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
         })),
     );
     let request = BuildStreamPartCommitCommandReq {
-        pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-        cluster_epoch: ClusterEpoch::new(1).unwrap(),
-        bucket: &bucket,
-        key: &key,
-        upload_id: &upload_id,
-        session_id: &session_id,
-        part_number: 1,
         expected_snapshot: &snapshot,
         part: &part,
         segments: &segments,
         bucket_write_reservation: &proof,
     };
+    let pg_id = ObjectMetadataPgId::new_for_test(PgId::new(0));
+    let rpc_request = StorageRpcStreamPartCommitCommandBuildRequest {
+        object: client.object_request(pg_id.pg_id(), &bucket, &key),
+        upload_id: upload_id.clone(),
+        session_id: session_id.clone(),
+        part_number: 1,
+        expected_snapshot: snapshot.clone(),
+        part: part.clone(),
+        segments: segments.clone(),
+        bucket_write_reservation: proof.clone(),
+        effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+            authority_valid_until_ms: 5_000,
+            portable_wall_valid_until_ms: 4_000,
+        }),
+    };
+    let encoded_rpc_request =
+        crate::storage_rpc::encode_stream_part_commit_command_build_request(&rpc_request).unwrap();
+    let decoded_rpc_request =
+        crate::storage_rpc::decode_stream_part_commit_command_build_request(&encoded_rpc_request)
+            .unwrap();
+    assert_eq!(
+        decoded_rpc_request.effect_deadline,
+        rpc_request.effect_deadline
+    );
+    let rpc_request = decoded_rpc_request;
     client
-        .validate_stream_part_commit_command_response(&command, &request)
+        .validate_stream_part_commit_command_response(&command, &rpc_request, &request)
         .unwrap();
 
     let mut bad_payload = command.payload().clone();
@@ -5710,7 +5739,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
     bad_commit.segments[0].key = crate::tests::object_key("wrong-stream-part-key");
     let bad_command = MetadataCommandEnvelope::new(command.id(), bad_payload);
     let err = client
-        .validate_stream_part_commit_command_response(&bad_command, &request)
+        .validate_stream_part_commit_command_response(&bad_command, &rpc_request, &request)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -5733,6 +5762,7 @@ fn unix_object_mutation_client_rejects_stale_stream_part_commit_command_epoch() 
     let bucket = crate::tests::bucket_name("stale-stream-part-rpc-bucket");
     let key = crate::tests::object_key("stale-stream-part-rpc-key");
     let mut proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+    proof.cluster_epoch = stale_epoch;
     proof.operation_kind =
         crate::metadata_command::UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND
             .to_string();
@@ -5800,23 +5830,28 @@ fn unix_object_mutation_client_rejects_stale_stream_part_commit_command_epoch() 
         ec_m: 2,
     }];
 
-    let err = ObjectMutationMetadataNodeClient::build_stream_part_commit_command(
-        &client,
-        BuildStreamPartCommitCommandReq {
-            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
-            cluster_epoch: stale_epoch,
-            bucket: &bucket,
-            key: &key,
-            upload_id: &upload_id,
-            session_id: &session_id,
-            part_number: 1,
-            expected_snapshot: &snapshot,
-            part: &part,
-            segments: &segments,
-            bucket_write_reservation: &proof,
-        },
-    )
-    .unwrap_err();
+    let route = client
+        .open_stream_part_finalization_metadata_route(
+            stale_epoch,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+            &upload_id,
+            &session_id,
+            1,
+        )
+        .unwrap();
+    let err = route
+        .build_commit_command(
+            BuildStreamPartCommitCommandReq {
+                expected_snapshot: &snapshot,
+                part: &part,
+                segments: &segments,
+                bucket_write_reservation: &proof,
+            },
+            AdmittedRouteEffectFence::unbounded(stale_epoch),
+        )
+        .unwrap_err();
 
     assert!(
         matches!(

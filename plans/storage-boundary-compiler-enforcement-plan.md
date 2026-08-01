@@ -4760,6 +4760,56 @@ One-hundred-and-nineteenth Phase 3 slice:
   Workspace-wide strict Clippy and the transitional storage boundary checker
   also pass.
 
+One-hundred-and-twentieth Phase 3 slice:
+
+- PutObject and UploadPart stream-finalization snapshot loading and commit
+  command construction now use distinct scoped metadata routes. The PUT route
+  owns the exact object PG, epoch, bucket, key, and stream session; the part
+  route additionally owns the upload ID and part number. Their build requests
+  no longer carry independently substitutable route or target fields.
+- embedded and Unix builders require the target-specific canonical reservation
+  operation and derive every store or wire identity from the scoped route.
+  The embedded UploadPart route also rejects a part record whose upload ID or
+  part number differs from its captured target before allocating a command ID.
+  The storage-node adapter independently validates the authenticated active
+  route, snapshot, payload, and reservation before delegating through the same
+  scoped embedded interface. Unix response validation is bound to the exact
+  serialized request rather than a second independently supplied identity.
+- finalization command construction now carries the admission's immutable
+  effect fence to the storage node. PUT revalidates it immediately before both
+  object write-sequence selection and command-ID allocation; UploadPart
+  revalidates immediately before command-ID allocation. A regression invokes
+  the embedded scoped builders after the conservative monotonic deadline but
+  before the raw authority timestamp and proves neither path allocates a
+  command ID.
+- Unix requests carry only the portable authority/effective wall deadline; the
+  storage process conservatively binds it to its own monotonic clock. Exact
+  PUT and UploadPart codec round trips pin this field. Storage RPC frame
+  encoding advances to version 12 with explicit version-11 rejection; the
+  current-format inventory is updated accordingly.
+- installed-Unix coverage proves correct finalization commands, wrong-PG
+  rejection through the server, future-epoch rejection before RPC, crossed
+  operation rejection, substituted PUT proof rejection, and malformed response
+  rejection for both finalization targets. The transitional boundary checker
+  now permits finalization access only through the scoped routes.
+- central fanout/recovery validation now binds every `CommitStreamPart`
+  reservation to the command epoch, bucket, key, and canonical UploadPart
+  finalize operation. A live-session recovery regression rejects valid
+  reservations crossed by operation, key, or bucket, then inserts the
+  crossed-operation envelope and proves the session and reservation remain
+  exact while no part is published.
+- streamed PutObject has one authoritative payload size: the body-derived
+  `total_size` passed to finalization. The independently supplied size fields
+  have been removed from both `PreparedStreamPutCommit` and
+  `StreamPutCommitInput`; segment-total validation and published object size
+  therefore cannot disagree by construction. The version-12 RPC layout
+  encodes only this single size.
+- abort command construction and payload-reclaim families remain open in
+  Phase 3.
+- all 2,560 storage tests and the full 7,880-test workspace suite pass.
+  Workspace-wide strict Clippy and the transitional storage boundary checker
+  also pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

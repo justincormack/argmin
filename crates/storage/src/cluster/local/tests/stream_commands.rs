@@ -2401,7 +2401,6 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
                 owner: crate::OwnerIdentity::from_principal("owner"),
                 acl_grants: crate::AclGrants::default(),
                 public_read: false,
-                size: payload.len() as u64,
                 etag_crc64: payload_crc64,
                 tags: None,
                 metadata_blob: crate::SerializedMetadataBlob::default(),
@@ -2480,7 +2479,6 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
                     owner: crate::OwnerIdentity::from_principal("owner"),
                     acl_grants: crate::AclGrants::default(),
                     public_read: false,
-                    size: 0,
                     etag_crc64: checksum::crc64::checksum(&[]),
                     tags: None,
                     metadata_blob: crate::SerializedMetadataBlob::default(),
@@ -2736,7 +2734,6 @@ fn control_plane_peering_stream_put_finalize_old_primary_fails_closed_and_preser
                 owner: crate::OwnerIdentity::from_principal("owner"),
                 acl_grants: crate::AclGrants::default(),
                 public_read: false,
-                size: payload.len() as u64,
                 etag_crc64: payload_crc64,
                 tags: None,
                 metadata_blob: crate::SerializedMetadataBlob::default(),
@@ -2862,7 +2859,6 @@ fn stream_put_finalize_missing_session_same_pg_does_not_call_action() {
                 owner: crate::OwnerIdentity::from_principal("owner"),
                 acl_grants: crate::AclGrants::default(),
                 public_read: false,
-                size: 0,
                 etag_crc64: checksum::crc64::checksum(&[]),
                 tags: None,
                 metadata_blob: crate::SerializedMetadataBlob::default(),
@@ -3010,7 +3006,6 @@ fn stream_put_finalize_releases_only_its_session_write_proof() {
                 owner: crate::OwnerIdentity::from_principal("owner"),
                 acl_grants: crate::AclGrants::default(),
                 public_read: false,
-                size: 0,
                 etag_crc64: checksum::crc64::checksum(&[]),
                 tags: None,
                 metadata_blob: crate::SerializedMetadataBlob::default(),
@@ -3313,7 +3308,6 @@ fn stream_put_finalize_rejects_unencrypted_etag_crc64_mismatch() {
                 owner: crate::OwnerIdentity::from_principal("owner"),
                 acl_grants: crate::AclGrants::default(),
                 public_read: false,
-                size: total_size,
                 etag_crc64: expected_crc64 ^ 1,
                 tags: None,
                 metadata_blob: crate::SerializedMetadataBlob::default(),
@@ -3415,7 +3409,6 @@ fn stream_put_finalize_rejects_encrypted_payload_crc64_mismatch() {
                 owner: crate::OwnerIdentity::from_principal("owner"),
                 acl_grants: crate::AclGrants::default(),
                 public_read: false,
-                size: payload.len() as u64,
                 etag_crc64: payload_crc64 ^ 1,
                 tags: None,
                 metadata_blob: crate::SerializedMetadataBlob::default(),
@@ -3722,7 +3715,6 @@ fn stream_put_finalize_matching_pending_install_race_returns_success() {
                 owner: crate::OwnerIdentity::from_principal("owner"),
                 acl_grants: crate::AclGrants::default(),
                 public_read: false,
-                size: payload.len() as u64,
                 etag_crc64: payload_crc64,
                 tags: None,
                 metadata_blob: crate::SerializedMetadataBlob::default(),
@@ -3840,7 +3832,6 @@ fn versioned_stream_put_finalize_reserves_object_version_through_command_stream(
                 owner: crate::OwnerIdentity::from_principal("owner"),
                 acl_grants: crate::AclGrants::default(),
                 public_read: false,
-                size: payload.len() as u64,
                 etag_crc64: payload_crc64,
                 tags: None,
                 metadata_blob: crate::SerializedMetadataBlob::default(),
@@ -4224,7 +4215,7 @@ fn stream_part_finalize_matching_pending_install_race_returns_success() {
     let hook_proof = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "test-stream-part-terminal-race",
+        crate::metadata_command::UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
     let pg_id = PgId::new(object_pg);
@@ -4524,6 +4515,8 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
+    let crossed_bucket = crate::tests::bucket_name("stream-part-finalize-crossed-bucket");
+    create_test_bucket(&cluster, &crossed_bucket);
     let upload_id = upload_id_from_label("terminalslot");
     let create = crate::CreateMultipartUploadReq {
         upload_id: upload_id.clone(),
@@ -4628,30 +4621,157 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
         ec_m: segment.ec_m,
     }];
     let pg_id = PgId::new(object_pg);
-    let proof = acquire_test_bucket_write_proof(
+    let correct_proof = acquire_test_bucket_write_proof(
         &cluster,
         &bucket,
-        "test-stream-part-open-converge",
+        crate::metadata_command::UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
         Some(key.as_str()),
     );
-    let command = MetadataCommandEnvelope::new(
+    let crossed_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let crossed_target_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
+        Some("stream-part-finalize-crossed-key"),
+    );
+    let crossed_bucket_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &crossed_bucket,
+        crate::metadata_command::UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let command = |proof| {
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                map.test_next_metadata_command_log_index(pg_id),
+            ),
+            MetadataCommandPayload::CommitStreamPart(Box::new(CommitStreamPartCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                session_id: session_id.clone(),
+                upload: upload.clone(),
+                part: part.clone(),
+                segments: segments.clone(),
+                existing_part: None,
+                displaced_segments: Vec::new(),
+                bucket_write_reservation: proof,
+            })),
+        )
+    };
+    cluster
+        .validate_metadata_command_bucket_write_reservation(&command(correct_proof.clone()))
+        .unwrap();
+    for (case, proof) in [
+        ("operation", crossed_proof.clone()),
+        ("target", crossed_target_proof.clone()),
+        ("bucket", crossed_bucket_proof.clone()),
+    ] {
+        let crossed_error = cluster
+            .validate_metadata_command_bucket_write_reservation(&command(proof))
+            .unwrap_err();
+        assert!(
+            matches!(
+                crossed_error,
+                crate::BucketSnapshotLoadError::Metadata(
+                    crate::MetadataError::BucketWriteReservationConflict { .. }
+                )
+            ),
+            "crossed stream-part {case} proof must fail: {crossed_error:?}"
+        );
+    }
+    let mut co_crossed_payload = command(crossed_bucket_proof.clone()).payload().clone();
+    let MetadataCommandPayload::CommitStreamPart(co_crossed) = &mut co_crossed_payload else {
+        panic!("expected stream-part commit command");
+    };
+    co_crossed.bucket = crossed_bucket.clone();
+    let co_crossed_command = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
             ClusterEpoch::INITIAL,
             pg_id,
             map.test_next_metadata_command_log_index(pg_id),
         ),
-        MetadataCommandPayload::CommitStreamPart(Box::new(CommitStreamPartCommand {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            session_id: session_id.clone(),
-            upload,
-            part: part.clone(),
-            segments: segments.clone(),
-            existing_part: None,
-            displaced_segments: Vec::new(),
-            bucket_write_reservation: proof,
-        })),
+        co_crossed_payload,
     );
+    let co_crossed_error = cluster
+        .validate_metadata_command_bucket_write_reservation(&co_crossed_command)
+        .unwrap_err();
+    assert!(
+        matches!(
+            co_crossed_error,
+            crate::BucketSnapshotLoadError::Metadata(
+                crate::MetadataError::BucketWriteReservationConflict { .. }
+            )
+        ),
+        "co-crossed stream-part command and proof must fail internal subject validation: {co_crossed_error:?}"
+    );
+    let reservations_before = node_ids.map(|node_id| {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*pg, &bucket).unwrap()
+    });
+    let sessions_before = node_ids.map(|node_id| {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap()
+    });
+    let malformed = command(crossed_proof.clone());
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &malformed);
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .unwrap();
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for ((node_id, expected_reservations), expected_session) in node_ids
+        .into_iter()
+        .zip(&reservations_before)
+        .zip(&sessions_before)
+    {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).unwrap(),
+            *expected_session,
+            "crossed stream-part recovery must preserve the session on node {node_id:?}"
+        );
+        assert!(matches!(
+            crate::PgMetadataStore::get_multipart_part(&*pg, &upload_id, 1),
+            Err(crate::MetadataError::PartNotFound { .. })
+        ));
+        assert_eq!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*pg, &bucket).unwrap(),
+            *expected_reservations,
+            "crossed stream-part recovery must not release the unrelated reservation on node {node_id:?}"
+        );
+    }
+    cluster
+        .release_bucket_write_reservation_proof(&crossed_proof)
+        .unwrap();
+    cluster
+        .release_bucket_write_reservation_proof(&crossed_target_proof)
+        .unwrap();
+    cluster
+        .release_bucket_write_reservation_proof(&crossed_bucket_proof)
+        .unwrap();
+
+    let command = command(correct_proof);
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
     cluster
         .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)

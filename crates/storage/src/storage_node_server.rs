@@ -4867,13 +4867,15 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::load_stream_put_finalize_snapshot(
+        ObjectMutationMetadataNodeClient::open_stream_put_finalization_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
             session_id,
         )
+        .and_then(|route| route.load_snapshot())
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -4884,6 +4886,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         expected_snapshot: &crate::StreamPutFinalizeStorageSnapshot,
         commit: &crate::StreamPutCommitInput,
         bucket_write_reservation: &BucketWriteReservationProof,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
         self.require_stream_put_finalize_snapshot_subject(
             session_id,
@@ -4910,20 +4913,25 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::build_stream_put_commit_command(
+        ObjectMutationMetadataNodeClient::open_stream_put_finalization_metadata_route(
             &local_client,
-            BuildStreamPutCommitCommandReq {
-                pg_id: self.route.pg_id,
-                cluster_epoch: self.route.fence.cluster_epoch,
-                bucket: self.route.bucket,
-                key: self.route.key,
-                session_id,
-                total_size,
-                expected_snapshot,
-                commit,
-                bucket_write_reservation,
-            },
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            session_id,
         )
+        .and_then(|route| {
+            route.build_commit_command(
+                BuildStreamPutCommitCommandReq {
+                    total_size,
+                    expected_snapshot,
+                    commit,
+                    bucket_write_reservation,
+                },
+                effect_fence,
+            )
+        })
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -4988,8 +4996,9 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::load_stream_part_finalize_snapshot(
+        ObjectMutationMetadataNodeClient::open_stream_part_finalization_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
@@ -4997,6 +5006,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             session_id,
             part_number,
         )
+        .and_then(|route| route.load_snapshot())
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -5010,6 +5020,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         part: &crate::MultipartPartRecord,
         segments: &[crate::MultipartPartSegmentRecord],
         bucket_write_reservation: &BucketWriteReservationProof,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
         self.require_stream_part_finalize_snapshot_subject(
             upload_id,
@@ -5043,22 +5054,27 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::build_stream_part_commit_command(
+        ObjectMutationMetadataNodeClient::open_stream_part_finalization_metadata_route(
             &local_client,
-            BuildStreamPartCommitCommandReq {
-                pg_id: self.route.pg_id,
-                cluster_epoch: self.route.fence.cluster_epoch,
-                bucket: self.route.bucket,
-                key: self.route.key,
-                upload_id,
-                session_id,
-                part_number,
-                expected_snapshot,
-                part,
-                segments,
-                bucket_write_reservation,
-            },
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            upload_id,
+            session_id,
+            part_number,
         )
+        .and_then(|route| {
+            route.build_commit_command(
+                BuildStreamPartCommitCommandReq {
+                    expected_snapshot,
+                    part,
+                    segments,
+                    bucket_write_reservation,
+                },
+                effect_fence,
+            )
+        })
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
@@ -11815,12 +11831,15 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
+        let effect_fence =
+            admitted_route_effect_fence(request.object.cluster_epoch, request.effect_deadline);
         let response = match route.build_stream_put_commit_command(
             &request.session_id,
             request.total_size,
             &request.expected_snapshot,
             &request.commit,
             &request.bucket_write_reservation,
+            effect_fence,
         ) {
             Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
             Err(StorageNodeObjectRouteError::Object(
@@ -11891,6 +11910,8 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
+        let effect_fence =
+            admitted_route_effect_fence(request.object.cluster_epoch, request.effect_deadline);
         let response = match route.build_stream_part_commit_command(
             &request.upload_id,
             &request.session_id,
@@ -11899,6 +11920,7 @@ impl StorageNodeConnectionHandler {
             &request.part,
             &request.segments,
             &request.bucket_write_reservation,
+            effect_fence,
         ) {
             Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
             Err(StorageNodeObjectRouteError::Object(
@@ -25573,7 +25595,6 @@ mod tests {
             owner: crate::OwnerIdentity::from_principal("active-object-route-owner"),
             acl_grants: AclGrants::default(),
             public_read: false,
-            size: 0,
             etag_crc64: 0,
             tags: None,
             metadata_blob: crate::SerializedMetadataBlob::default(),
@@ -25589,6 +25610,7 @@ mod tests {
                     &put_finalize_snapshot,
                     &put_commit,
                     &renewed_stream_proof,
+                    AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                 )
                 .unwrap()
         });
@@ -25630,6 +25652,7 @@ mod tests {
                     &finalized_part,
                     &[],
                     &upload_part_finalize_proof,
+                    AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                 )
                 .unwrap()
         });
@@ -25657,6 +25680,7 @@ mod tests {
                 &mismatched_put_finalize_snapshot,
                 &put_commit,
                 &renewed_stream_proof,
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
             )
         });
         match mismatched_put_finalize {
@@ -25673,6 +25697,7 @@ mod tests {
                 &put_finalize_snapshot,
                 &put_commit,
                 &upload_part_finalize_proof,
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
             )
         });
         match crossed_put_finalize_proof {
@@ -25692,6 +25717,7 @@ mod tests {
                 &put_finalize_snapshot,
                 &put_commit,
                 &substituted_put_finalize_proof,
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
             )
         });
         match substituted_put_finalize {
@@ -25703,20 +25729,25 @@ mod tests {
         }
         let local_client = LocalStorageNodeClient::new(config.node_id, Arc::clone(&server._node));
         let substituted_local_put_finalize = crate::clock::with_time_override(1_000, || {
-            ObjectMutationMetadataNodeClient::build_stream_put_commit_command(
+            ObjectMutationMetadataNodeClient::open_stream_put_finalization_metadata_route(
                 &local_client,
-                BuildStreamPutCommitCommandReq {
-                    pg_id: primary_route.route.pg_id,
-                    cluster_epoch: config.cluster_epoch,
-                    bucket: &bucket,
-                    key: &key,
-                    session_id: &reservation_id,
-                    total_size: 0,
-                    expected_snapshot: &put_finalize_snapshot,
-                    commit: &put_commit,
-                    bucket_write_reservation: &substituted_put_finalize_proof,
-                },
+                config.cluster_epoch,
+                primary_route.route.pg_id,
+                &bucket,
+                &key,
+                &reservation_id,
             )
+            .and_then(|route| {
+                route.build_commit_command(
+                    BuildStreamPutCommitCommandReq {
+                        total_size: 0,
+                        expected_snapshot: &put_finalize_snapshot,
+                        commit: &put_commit,
+                        bucket_write_reservation: &substituted_put_finalize_proof,
+                    },
+                    AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                )
+            })
         });
         assert!(matches!(
             substituted_local_put_finalize,
@@ -25736,6 +25767,7 @@ mod tests {
                 &finalized_part,
                 &[],
                 &upload_part_finalize_proof,
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
             )
         });
         match mismatched_part_finalize {
@@ -25757,6 +25789,7 @@ mod tests {
                 &mismatched_finalized_part,
                 &[],
                 &upload_part_finalize_proof,
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
             )
         });
         match mismatched_part_payload {
@@ -25766,6 +25799,53 @@ mod tests {
             }
             other => panic!("mismatched stream part payload must fail: {other:?}"),
         }
+        let command_log_index_before_local_part_mismatch = server
+            ._node
+            .get_pg(primary_route.route.pg_id.get())
+            .unwrap()
+            .max_metadata_command_log_index(config.cluster_epoch)
+            .unwrap();
+        let mismatched_local_part_payload = crate::clock::with_time_override(1_000, || {
+            ObjectMutationMetadataNodeClient::open_stream_part_finalization_metadata_route(
+                &local_client,
+                config.cluster_epoch,
+                primary_route.route.pg_id,
+                &bucket,
+                &key,
+                &upload_id,
+                &upload_part_stream_session_id,
+                1,
+            )
+            .and_then(|route| {
+                route.build_commit_command(
+                    BuildStreamPartCommitCommandReq {
+                        expected_snapshot: &part_finalize_snapshot,
+                        part: &mismatched_finalized_part,
+                        segments: &[],
+                        bucket_write_reservation: &upload_part_finalize_proof,
+                    },
+                    AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                )
+            })
+        });
+        assert!(matches!(
+            mismatched_local_part_payload,
+            Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "build stream part commit command",
+                }
+            ))
+        ));
+        assert_eq!(
+            server
+                ._node
+                .get_pg(primary_route.route.pg_id.get())
+                .unwrap()
+                .max_metadata_command_log_index(config.cluster_epoch)
+                .unwrap(),
+            command_log_index_before_local_part_mismatch,
+            "embedded route must reject a crossed part before allocating a command ID"
+        );
         let crossed_part_finalize_proof = crate::clock::with_time_override(1_000, || {
             primary_route.build_stream_part_commit_command(
                 &upload_id,
@@ -25775,6 +25855,7 @@ mod tests {
                 &finalized_part,
                 &[],
                 &renewed_stream_proof,
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
             )
         });
         match crossed_part_finalize_proof {
@@ -25784,6 +25865,85 @@ mod tests {
             }
             other => panic!("crossed stream part finalize proof must fail: {other:?}"),
         }
+
+        let command_log_index_before_expired_builds = server
+            ._node
+            .get_pg(primary_route.route.pg_id.get())
+            .unwrap()
+            .max_metadata_command_log_index(config.cluster_epoch)
+            .unwrap();
+        let expired_effect_fence =
+            AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 4_000);
+        let expired_local_put_finalize = crate::clock::with_time_override(4_500, || {
+            ObjectMutationMetadataNodeClient::open_stream_put_finalization_metadata_route(
+                &local_client,
+                config.cluster_epoch,
+                primary_route.route.pg_id,
+                &bucket,
+                &key,
+                &reservation_id,
+            )
+            .and_then(|route| {
+                route.build_commit_command(
+                    BuildStreamPutCommitCommandReq {
+                        total_size: 0,
+                        expected_snapshot: &put_finalize_snapshot,
+                        commit: &put_commit,
+                        bucket_write_reservation: &renewed_stream_proof,
+                    },
+                    expired_effect_fence,
+                )
+            })
+        });
+        assert!(matches!(
+            expired_local_put_finalize,
+            Err(ObjectPgActionError::Store(StoreError::RouteMapExpired {
+                cluster_epoch,
+                valid_until_ms: 5_000,
+                now_ms: 4_500,
+            })) if cluster_epoch == config.cluster_epoch
+        ));
+        let expired_local_part_finalize = crate::clock::with_time_override(4_500, || {
+            ObjectMutationMetadataNodeClient::open_stream_part_finalization_metadata_route(
+                &local_client,
+                config.cluster_epoch,
+                primary_route.route.pg_id,
+                &bucket,
+                &key,
+                &upload_id,
+                &upload_part_stream_session_id,
+                1,
+            )
+            .and_then(|route| {
+                route.build_commit_command(
+                    BuildStreamPartCommitCommandReq {
+                        expected_snapshot: &part_finalize_snapshot,
+                        part: &finalized_part,
+                        segments: &[],
+                        bucket_write_reservation: &upload_part_finalize_proof,
+                    },
+                    expired_effect_fence,
+                )
+            })
+        });
+        assert!(matches!(
+            expired_local_part_finalize,
+            Err(ObjectPgActionError::Store(StoreError::RouteMapExpired {
+                cluster_epoch,
+                valid_until_ms: 5_000,
+                now_ms: 4_500,
+            })) if cluster_epoch == config.cluster_epoch
+        ));
+        assert_eq!(
+            server
+                ._node
+                .get_pg(primary_route.route.pg_id.get())
+                .unwrap()
+                .max_metadata_command_log_index(config.cluster_epoch)
+                .unwrap(),
+            command_log_index_before_expired_builds,
+            "expired finalization command builds must not allocate command IDs"
+        );
 
         let put_stream_command = crate::clock::with_time_override(1_000, || {
             primary_route
@@ -26609,6 +26769,7 @@ mod tests {
                             &put_finalize_snapshot,
                             &put_commit,
                             &renewed_stream_proof,
+                            AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                         )
                         .map(|_| ()),
                 ),
@@ -26633,6 +26794,7 @@ mod tests {
                             &finalized_part,
                             &[],
                             &upload_part_finalize_proof,
+                            AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                         )
                         .map(|_| ()),
                 ),

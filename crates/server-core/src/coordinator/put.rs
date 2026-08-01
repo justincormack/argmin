@@ -1036,7 +1036,6 @@ impl Coordinator {
                     owner,
                     acl_grants: acl_grants.clone(),
                     public_read: Self::acl_grants_public_read(&acl_grants),
-                    size: total_size,
                     etag_crc64: crc64,
                     tags: Self::stored_object_tags(tags)?,
                     metadata_blob,

@@ -589,6 +589,27 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         session_id: &SessionId,
     ) -> Result<Box<dyn StreamUploadSessionMetadataRoute + '_>, ObjectPgActionError>;
 
+    fn open_stream_put_finalization_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Box<dyn StreamPutFinalizationMetadataRoute + '_>, ObjectPgActionError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_stream_part_finalization_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        session_id: &SessionId,
+        part_number: u32,
+    ) -> Result<Box<dyn StreamPartFinalizationMetadataRoute + '_>, ObjectPgActionError>;
+
     fn list_stream_uploads_for_bucket_page(
         &self,
         pg_id: ObjectMetadataScanPgId,
@@ -652,34 +673,6 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         lease_deadline: Option<u64>,
         now: u64,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
-
-    fn load_stream_put_finalize_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError>;
-
-    fn build_stream_put_commit_command(
-        &self,
-        request: BuildStreamPutCommitCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
-
-    fn load_stream_part_finalize_snapshot(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-        session_id: &SessionId,
-        part_number: u32,
-    ) -> Result<StreamUploadPartStorageSnapshot, ObjectPgActionError>;
-
-    fn build_stream_part_commit_command(
-        &self,
-        request: BuildStreamPartCommitCommandReq<'_>,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 }
 
 pub(crate) trait PutObjectMetadataRoute: Send {
@@ -747,6 +740,26 @@ pub(crate) trait StreamUploadSessionMetadataRoute: Send {
         renewed: &BucketWriteReservationProof,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(), ObjectPgActionError>;
+}
+
+pub(crate) trait StreamPutFinalizationMetadataRoute: Send {
+    fn load_snapshot(&self) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError>;
+
+    fn build_commit_command(
+        &self,
+        request: BuildStreamPutCommitCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+}
+
+pub(crate) trait StreamPartFinalizationMetadataRoute: Send {
+    fn load_snapshot(&self) -> Result<StreamUploadPartStorageSnapshot, ObjectPgActionError>;
+
+    fn build_commit_command(
+        &self,
+        request: BuildStreamPartCommitCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 }
 
 pub(crate) trait ObjectDeleteMetadataRoute: Send {
@@ -890,11 +903,6 @@ pub(crate) trait ObjectReadMetadataRoute: Send {
 }
 
 pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
-    pub(crate) pg_id: ObjectMetadataPgId,
-    pub(crate) cluster_epoch: ClusterEpoch,
-    pub(crate) bucket: &'a BucketName,
-    pub(crate) key: &'a ObjectKey,
-    pub(crate) session_id: &'a SessionId,
     pub(crate) total_size: u64,
     pub(crate) expected_snapshot: &'a StreamPutFinalizeStorageSnapshot,
     pub(crate) commit: &'a StreamPutCommitInput,
@@ -935,13 +943,6 @@ pub(crate) struct BuildCreateMultipartUploadCommandReq<'a> {
 }
 
 pub(crate) struct BuildStreamPartCommitCommandReq<'a> {
-    pub(crate) pg_id: ObjectMetadataPgId,
-    pub(crate) cluster_epoch: ClusterEpoch,
-    pub(crate) bucket: &'a BucketName,
-    pub(crate) key: &'a ObjectKey,
-    pub(crate) upload_id: &'a UploadId,
-    pub(crate) session_id: &'a SessionId,
-    pub(crate) part_number: u32,
     pub(crate) expected_snapshot: &'a StreamUploadPartStorageSnapshot,
     pub(crate) part: &'a MultipartPartRecord,
     pub(crate) segments: &'a [MultipartPartSegmentRecord],
