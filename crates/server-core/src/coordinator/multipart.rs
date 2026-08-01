@@ -1218,7 +1218,7 @@ impl Coordinator {
                     Ok(())
                 } else {
                     Err(ServerError::NoSuchUpload {
-                        upload_id: upload.upload_id.to_string(),
+                        upload_id: upload.upload_id().to_string(),
                     })
                 }
             }

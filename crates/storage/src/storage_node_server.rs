@@ -5412,7 +5412,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
 
     fn require_authorized_multipart_upload_subject(
         &self,
-        authorized_upload: &crate::types::AuthorizedMultipartUploadRecord,
+        authorized_upload: &crate::types::MultipartUploadRecord,
         operation: &'static str,
     ) -> Result<(), StorageNodeObjectRouteError> {
         self.route.require_valid_now()?;
@@ -5512,7 +5512,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         requested_part_numbers: &[u32],
     ) -> Result<crate::MultipartCompletionSnapshot, StorageNodeObjectRouteError> {
         self.require_authorized_multipart_upload_subject(
-            authorized_upload,
+            authorized_upload.record(),
             "multipart completion snapshot load",
         )?;
         let local_client = LocalStorageNodeClient::new(
@@ -5534,7 +5534,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         authorized_upload: &crate::types::AuthorizedMultipartUploadRecord,
     ) -> Result<crate::MultipartCompletionPreflight, StorageNodeObjectRouteError> {
         self.require_authorized_multipart_upload_subject(
-            authorized_upload,
+            authorized_upload.record(),
             "multipart completion preflight load",
         )?;
         let local_client = LocalStorageNodeClient::new(
@@ -5558,7 +5558,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         max_parts: u32,
     ) -> Result<crate::ListedMultipartParts, StorageNodeObjectRouteError> {
         self.require_authorized_multipart_upload_subject(
-            authorized_upload,
+            authorized_upload.record(),
             "multipart parts list",
         )?;
         let local_client = LocalStorageNodeClient::new(
@@ -5850,13 +5850,13 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
 
     fn build_authorized_abort_multipart_upload_command(
         &self,
-        authorized_upload: &crate::types::AuthorizedMultipartUploadRecord,
+        authorized_upload: &crate::types::AuthorizedMultipartUploadAbort,
         expected_cleanup: Option<&crate::AbortMultipartUploadCleanup>,
         bucket_write_reservation: &BucketWriteReservationProof,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<MetadataCommandEnvelope>, StorageNodeObjectRouteError> {
         self.require_authorized_multipart_upload_subject(
-            authorized_upload,
+            authorized_upload.record(),
             "authorized abort multipart command build",
         )?;
         self.require_object_mutation_proof(
@@ -12196,7 +12196,7 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        let authorized_upload = crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
+        let authorized_upload = crate::types::AuthorizedMultipartUploadAbort::assume_authorized(
             request.authorized_upload,
         );
         let effect_fence =
@@ -24124,7 +24124,7 @@ mod tests {
                 (upload, cleanup, command_log_index)
             });
         let authorized_upload =
-            crate::types::AuthorizedMultipartUploadRecord::assume_authorized(upload);
+            crate::types::AuthorizedMultipartUploadAbort::assume_authorized(upload);
         let mut proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
         proof.operation_kind = ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
 
@@ -26204,7 +26204,7 @@ mod tests {
                 .expect("active upload must have abort cleanup")
         });
         let expired_authorized_upload =
-            crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
+            crate::types::AuthorizedMultipartUploadAbort::assume_authorized(
                 multipart_upload.clone(),
             );
         let command_log_index_before_expired_builds = server
@@ -26512,6 +26512,9 @@ mod tests {
         let authorized_upload = crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
             multipart_upload.clone(),
         );
+        let authorized_abort = crate::types::AuthorizedMultipartUploadAbort::assume_authorized(
+            multipart_upload.clone(),
+        );
         let (completion_snapshot, abort_cleanup) = crate::clock::with_time_override(1_000, || {
             let completion_snapshot = primary_route
                 .load_multipart_completion_snapshot(&authorized_upload, &[2])
@@ -26611,7 +26614,7 @@ mod tests {
         let authorized_abort_command = crate::clock::with_time_override(1_000, || {
             primary_route
                 .build_authorized_abort_multipart_upload_command(
-                    &authorized_upload,
+                    &authorized_abort,
                     Some(&abort_cleanup),
                     &abort_multipart_proof,
                     AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
@@ -26677,7 +26680,7 @@ mod tests {
         }
         let crossed_abort_proof = crate::clock::with_time_override(1_000, || {
             primary_route.build_authorized_abort_multipart_upload_command(
-                &authorized_upload,
+                &authorized_abort,
                 Some(&abort_cleanup),
                 &complete_multipart_proof,
                 AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
@@ -27316,7 +27319,7 @@ mod tests {
                     "authorized abort multipart command build",
                     primary_route
                         .build_authorized_abort_multipart_upload_command(
-                            &authorized_upload,
+                            &authorized_abort,
                             Some(&abort_cleanup),
                             &abort_multipart_proof,
                             AdmittedRouteEffectFence::unbounded(config.cluster_epoch),

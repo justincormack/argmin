@@ -223,7 +223,7 @@ fn multipart_abort_route_rejects_a_crossed_object_subject_before_mutation() {
         .unwrap();
     let error = route
         .abort_authorized_multipart_upload(
-            &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload.clone()),
+            &crate::AuthorizedMultipartUploadAbort::assume_authorized(upload.clone()),
         )
         .unwrap_err();
     assert!(matches!(
@@ -2346,7 +2346,7 @@ fn assert_multipart_abort_matching_pending_install_race_returns_success(authoriz
     let aborted = if authorized {
         cluster
             .abort_authorized_multipart_upload(
-                &crate::AuthorizedMultipartUploadRecord::assume_authorized(authorized_upload),
+                &crate::AuthorizedMultipartUploadAbort::assume_authorized(authorized_upload),
             )
             .unwrap()
     } else {
@@ -2429,7 +2429,7 @@ fn authorized_multipart_abort_rejects_stale_upload_row() {
         .unwrap()
         .unwrap();
 
-    let authorized = crate::AuthorizedMultipartUploadRecord::assume_authorized(
+    let authorized = crate::AuthorizedMultipartUploadAbort::assume_authorized(
         cluster
             .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
             .unwrap(),

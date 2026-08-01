@@ -897,29 +897,28 @@ impl Coordinator {
         #[cfg(test)]
         super::maybe_run_abort_multipart_bucket_summary_hook(bucket.as_str(), key.as_str());
         let authorized = match multipart_route
-            .lookup_multipart_upload_management(upload_id)
+            .lookup_multipart_upload_for_abort(upload_id)
             .map_err(Self::map_object_pg_action_error)?
         {
-            storage::MultipartUploadManagementLookup::InProgress(upload) => {
-                let upload = *upload;
-                if !Self::requester_can_manage_multipart_upload(
+            storage::MultipartUploadAbortLookup::InProgress(upload) => {
+                if !Self::requester_can_manage_multipart_upload_identity(
                     req.object.requester(),
                     &bucket_info,
-                    &upload,
+                    upload.owner(),
+                    upload.initiator(),
                 ) {
                     return Err(ServerError::AccessDenied);
                 }
                 AuthorizedAbortMultipartUpload::InProgress {
-                    upload: Box::new(storage::AuthorizedMultipartUploadRecord::assume_authorized(
-                        upload,
-                    )),
+                    upload: Box::new(upload.into_authorized_abort()),
                 }
             }
-            storage::MultipartUploadManagementLookup::NonInProgress(upload) => {
-                if !Self::requester_can_manage_multipart_upload(
+            storage::MultipartUploadAbortLookup::NonInProgress(upload) => {
+                if !Self::requester_can_manage_multipart_upload_identity(
                     req.object.requester(),
                     &bucket_info,
-                    &upload,
+                    upload.owner(),
+                    upload.initiator(),
                 ) {
                     return Err(ServerError::AccessDenied);
                 }
@@ -927,17 +926,17 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
-            storage::MultipartUploadManagementLookup::Replay(replay) => {
+            storage::MultipartUploadAbortLookup::Replay(replay_upload_id) => {
                 if !Self::requester_can_manage_authenticated_multipart_upload_id(
                     req.object.requester(),
                     &bucket_info,
-                    &replay.upload_id,
+                    &replay_upload_id,
                 ) {
                     return Err(ServerError::AccessDenied);
                 }
                 AuthorizedAbortMultipartUpload::Terminal
             }
-            storage::MultipartUploadManagementLookup::Missing => {
+            storage::MultipartUploadAbortLookup::Missing => {
                 if !bucket_info
                     .multipart_upload_id_authority
                     .authenticates(bucket, key, upload_id)

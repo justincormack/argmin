@@ -3392,6 +3392,21 @@ impl ActiveMultipartObjectRoute<'_> {
             )
     }
 
+    /// Classify one multipart upload through the logical abort-authorization boundary.
+    pub fn lookup_multipart_upload_for_abort(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<crate::MultipartUploadAbortLookup, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .lookup_multipart_upload_management_with_route_validation(
+                self.effect_route(),
+                upload_id,
+                || self.admission.require_valid_now(),
+            )
+            .map(crate::MultipartUploadAbortLookup::from_management_lookup)
+    }
+
     /// Load an in-progress upload through this exact admitted object route.
     pub fn load_in_progress_multipart_upload(
         &self,
@@ -3564,7 +3579,7 @@ impl ActiveMultipartObjectRoute<'_> {
     /// Abort the exact upload authorized through this admitted object route.
     pub fn abort_authorized_multipart_upload(
         &self,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
+        authorized_upload: &crate::AuthorizedMultipartUploadAbort,
     ) -> Result<bool, ObjectPgActionError> {
         self.admission
             .cluster

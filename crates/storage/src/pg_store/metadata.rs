@@ -3632,7 +3632,7 @@ impl PgStore {
 
     pub(crate) fn prepare_authorized_abort_multipart_upload_cleanup(
         &self,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
+        authorized_upload: &crate::AuthorizedMultipartUploadAbort,
     ) -> Result<Option<AbortMultipartUploadCleanup>, MetadataError> {
         self.with_immediate_txn(
             "prepare authorized abort multipart upload cleanup (begin txn)",

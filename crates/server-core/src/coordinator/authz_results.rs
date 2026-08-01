@@ -325,7 +325,7 @@ pub(super) enum AuthorizedCompleteMultipartUpload {
 #[derive(Debug)]
 pub(super) enum AuthorizedAbortMultipartUpload {
     InProgress {
-        upload: Box<AuthorizedMultipartUploadRecord>,
+        upload: Box<storage::AuthorizedMultipartUploadAbort>,
     },
     Terminal,
 }

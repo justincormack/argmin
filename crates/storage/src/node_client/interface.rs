@@ -1050,7 +1050,7 @@ pub(crate) struct MultipartAbortMutationSubject<'a> {
 
 pub(crate) fn require_multipart_abort_mutation_subject(
     subject: MultipartAbortMutationSubject<'_>,
-    authorized_upload: Option<&AuthorizedMultipartUploadRecord>,
+    authorized_record: Option<&crate::MultipartUploadRecord>,
     expected_cleanup: Option<&AbortMultipartUploadCleanup>,
     bucket_write_reservation: &BucketWriteReservationProof,
     operation: &'static str,
@@ -1061,7 +1061,6 @@ pub(crate) fn require_multipart_abort_mutation_subject(
         key,
         upload_id,
     } = subject;
-    let authorized_record = authorized_upload.map(AuthorizedMultipartUploadRecord::record);
     let invalid_authorized_upload = authorized_record.is_some_and(|upload| {
         upload.bucket != *bucket || upload.key != *key || upload.upload_id != *upload_id
     });
@@ -1099,7 +1098,7 @@ pub(crate) struct BuildAbortMultipartUploadCommandReq<'a> {
 }
 
 pub(crate) struct BuildAuthorizedAbortMultipartUploadCommandReq<'a> {
-    pub(crate) authorized_upload: &'a AuthorizedMultipartUploadRecord,
+    pub(crate) authorized_upload: &'a crate::AuthorizedMultipartUploadAbort,
     pub(crate) expected_cleanup: Option<&'a AbortMultipartUploadCleanup>,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
 }

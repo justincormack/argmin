@@ -3179,7 +3179,7 @@ impl MultipartAbortMutationMetadataRoute for UnixMultipartAbortMutationMetadataR
                 key: &self.key,
                 upload_id: &self.upload_id,
             },
-            Some(request.authorized_upload),
+            Some(request.authorized_upload.record()),
             request.expected_cleanup,
             request.bucket_write_reservation,
             "build authorized abort multipart upload command",

@@ -15612,7 +15612,7 @@ impl super::StorageCluster {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn abort_authorized_multipart_upload(
         &self,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
+        authorized_upload: &crate::AuthorizedMultipartUploadAbort,
     ) -> Result<bool, ObjectPgActionError> {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
@@ -15631,7 +15631,7 @@ impl super::StorageCluster {
     pub(super) fn abort_authorized_multipart_upload_locked(
         &self,
         route: super::MultipartObjectMutationEffectRoute<'_>,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
+        authorized_upload: &crate::AuthorizedMultipartUploadAbort,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<bool, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(AbortAuthorizedMultipartUploadLocked);
@@ -15793,7 +15793,7 @@ impl super::StorageCluster {
     fn prepare_authorized_abort_multipart_upload_command(
         &self,
         pg_id: ObjectMetadataPgId,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
+        authorized_upload: &crate::AuthorizedMultipartUploadAbort,
         bucket_write_reservation: BucketWriteReservationProof,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {

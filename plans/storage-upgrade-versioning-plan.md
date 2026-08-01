@@ -1121,6 +1121,22 @@ helpers; they do not provide raw key bytes or reproduce the ID encoding.
 Multipart authorization and abort still expose durable upload/management records and remain the
 next containment slice, so implementation-order item 3 is not yet complete.
 
+The seventeenth bounded slice continues implementation-order item 3 with
+AbortMultipartUpload authorization and mutation. Storage now consumes its broad management lookup
+into an abort-specific result before crossing the crate boundary. Active uploads expose only the
+owner and initiator identities needed for the S3 authorization decision and can be consumed once
+into an opaque abort capability. Non-active uploads expose an identity-only projection with no
+path to that capability; completed-upload replay state is reduced to the logical upload ID needed
+for terminal authorization. The coordinator cannot clone, compare, inspect, or construct the
+capability and can read only its upload ID for the S3-visible failure path. Storage retains the
+complete durable upload record through local and Unix RPC command construction, cleanup
+validation, and mutation. Existing database, metadata-command, and storage RPC representations
+remain unchanged. Compiler visibility is the primary boundary, with checks rejecting broad
+management/durable records in the abort authorization and result seams, raw-record accessors, and
+derived clone/equality over the opaque candidate or capability. Multipart UploadPart, completion,
+and ListParts authorization still expose the broad authorized durable upload wrapper and remain
+pending, so implementation-order item 3 is not yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

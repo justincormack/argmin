@@ -930,9 +930,23 @@ impl Coordinator {
         bucket: &BucketSummary,
         upload: &MultipartUploadRecord,
     ) -> bool {
+        Self::requester_can_manage_multipart_upload_identity(
+            requester,
+            bucket,
+            &upload.owner,
+            &upload.initiator,
+        )
+    }
+
+    pub(super) fn requester_can_manage_multipart_upload_identity(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        owner: &OwnerIdentity,
+        initiator: &OwnerIdentity,
+    ) -> bool {
         Self::requester_can_bucket_owner_account_admin(requester, bucket)
-            || Self::requester_matches_owner_identity(requester, &upload.owner)
-            || Self::requester_matches_owner_identity(requester, &upload.initiator)
+            || Self::requester_matches_owner_identity(requester, owner)
+            || Self::requester_matches_owner_identity(requester, initiator)
     }
 
     pub(super) fn requester_can_manage_authenticated_multipart_upload_id(

@@ -3045,10 +3045,12 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
         ))
     ));
 
+    let authorized_abort =
+        crate::types::AuthorizedMultipartUploadAbort::assume_authorized(upload.clone());
     correct_multipart_abort_route
         .build_authorized_abort_multipart_upload_command(
             BuildAuthorizedAbortMultipartUploadCommandReq {
-                authorized_upload: &authorized_upload,
+                authorized_upload: &authorized_abort,
                 expected_cleanup: Some(&cleanup),
                 bucket_write_reservation: &abort_proof,
             },
@@ -3059,7 +3061,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
     assert_object_payload_decode!(wrong_multipart_abort_route
         .build_authorized_abort_multipart_upload_command(
             BuildAuthorizedAbortMultipartUploadCommandReq {
-                authorized_upload: &authorized_upload,
+                authorized_upload: &authorized_abort,
                 expected_cleanup: Some(&cleanup),
                 bucket_write_reservation: &abort_proof,
             },
@@ -3068,7 +3070,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
     assert!(matches!(
         correct_multipart_abort_route.build_authorized_abort_multipart_upload_command(
             BuildAuthorizedAbortMultipartUploadCommandReq {
-                authorized_upload: &authorized_upload,
+                authorized_upload: &authorized_abort,
                 expected_cleanup: Some(&cleanup),
                 bucket_write_reservation: &complete_proof,
             },
@@ -3080,10 +3082,10 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
             }
         ))
     ));
-    let mut crossed_authorized_record = authorized_upload.record().clone();
+    let mut crossed_authorized_record = authorized_abort.record().clone();
     crossed_authorized_record.upload_id = crate::tests::multipart_upload_id("crossed-authorized");
     let crossed_authorized_upload =
-        AuthorizedMultipartUploadRecord::assume_authorized(crossed_authorized_record);
+        crate::types::AuthorizedMultipartUploadAbort::assume_authorized(crossed_authorized_record);
     assert!(matches!(
         correct_multipart_abort_route.build_authorized_abort_multipart_upload_command(
             BuildAuthorizedAbortMultipartUploadCommandReq {

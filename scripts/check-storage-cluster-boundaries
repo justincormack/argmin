@@ -2469,6 +2469,111 @@ fail_with_matches \
     "Multipart upload ID test authorities must be constructed opaquely without exposing raw key bytes or lengths" \
     "$multipart_upload_id_raw_test_authority_constructors"
 
+server_core_abort_multipart_durable_leaks=$(
+    awk '
+    /fn authorize_abort_multipart_upload_on_admitted_route\(/ {
+        in_abort_authorization = 1
+        depth = 0
+    }
+    in_abort_authorization {
+        if ($0 ~ /MultipartUploadManagementLookup|MultipartUploadRecord|AuthorizedMultipartUploadRecord|lookup_multipart_upload_management|assume_authorized/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_abort_authorization = 0
+        }
+    }
+    ' crates/server-core/src/coordinator/authz/acl.rs
+)
+fail_with_matches \
+    "AbortMultipartUpload authorization must use the storage-owned logical lookup and opaque abort capability rather than durable upload or management records" \
+    "$server_core_abort_multipart_durable_leaks"
+
+server_core_authorized_abort_result_durable_leaks=$(
+    awk '
+    /enum AuthorizedAbortMultipartUpload[[:space:]]*\{/ {
+        in_abort_result = 1
+        depth = 0
+    }
+    in_abort_result {
+        if ($0 ~ /MultipartUploadManagementLookup|MultipartUploadRecord|AuthorizedMultipartUploadRecord/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_abort_result = 0
+        }
+    }
+    ' crates/server-core/src/coordinator/authz_results.rs
+)
+fail_with_matches \
+    "Authorized AbortMultipartUpload results must retain only the opaque storage-owned abort capability" \
+    "$server_core_authorized_abort_result_durable_leaks"
+
+multipart_abort_opaque_capability_leaks=$(
+    {
+        rg -n --color=never \
+            'pub struct (MultipartUploadAbortCandidate|AuthorizedMultipartUploadAbort)\(pub|impl[[:space:]]+(Clone|PartialEq|Eq)[[:space:]]+for[[:space:]]+(MultipartUploadAbortCandidate|AuthorizedMultipartUploadAbort)' \
+            crates/storage/src/types.rs \
+            || true
+        awk '
+        /impl (MultipartUploadAbortCandidate|AuthorizedMultipartUploadAbort)[[:space:]]*\{/ {
+            in_opaque_impl = 1
+            opaque_impl = $0
+            sub(/^.*impl /, "", opaque_impl)
+            sub(/[[:space:]]*\{.*/, "", opaque_impl)
+            depth = 0
+        }
+        in_opaque_impl {
+            if ($0 ~ /^[[:space:]]*pub[[:space:]]+fn[[:space:]]+/) {
+                method = $0
+                sub(/^.*fn[[:space:]]+/, "", method)
+                sub(/\(.*/, "", method)
+                if ((opaque_impl == "MultipartUploadAbortCandidate" && method != "owner" && method != "initiator" && method != "into_authorized_abort") || (opaque_impl == "AuthorizedMultipartUploadAbort" && method != "upload_id")) {
+                    print FILENAME ":" FNR ":" $0
+                }
+            }
+            line = $0
+            depth += gsub(/\{/, "{", line)
+            depth -= gsub(/\}/, "}", line)
+            if (depth == 0 && $0 ~ /\}/) {
+                in_opaque_impl = 0
+            }
+        }
+        /#\[derive\(/ {
+            derive = $0
+            in_derive = ($0 !~ /\)\]/)
+            next
+        }
+        in_derive {
+            derive = derive $0
+            if ($0 ~ /\)\]/) {
+                in_derive = 0
+            }
+            next
+        }
+        /pub struct (MultipartUploadAbortCandidate|AuthorizedMultipartUploadAbort)/ {
+            if (derive ~ /Clone|PartialEq|Eq/) {
+                print FILENAME ":" FNR ":" derive
+            }
+        }
+        {
+            if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^#\[derive\(/) {
+                derive = ""
+            }
+        }
+        ' crates/storage/src/types.rs
+    }
+)
+fail_with_matches \
+    "AbortMultipartUpload candidates and capabilities must not expose, clone, or compare their retained durable upload records" \
+    "$multipart_abort_opaque_capability_leaks"
+
 multipart_upload_id_authority_derived_equality=$(
     awk '
     /#\[derive\(/ {
