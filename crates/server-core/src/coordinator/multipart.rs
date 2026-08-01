@@ -1370,11 +1370,11 @@ impl Coordinator {
             )
             .map_err(Self::map_object_pg_action_error)?;
 
-        let next_marker = match listed.next_marker {
+        let next_marker = match listed.next_marker() {
             Some(storage::MultipartUploadListMarker::Upload { key, upload_id }) => {
                 Some(ListMultipartUploadsNextMarker::Upload {
                     key: key.to_string(),
-                    upload_id,
+                    upload_id: upload_id.clone(),
                 })
             }
             Some(storage::MultipartUploadListMarker::CommonPrefix(_)) => {
@@ -1384,28 +1384,28 @@ impl Coordinator {
         };
 
         let uploads = listed
-            .uploads
-            .into_iter()
+            .uploads()
+            .iter()
             .map(|u| MultipartUploadEntry {
                 key: u.key.to_string(),
-                upload_id: u.upload_id,
+                upload_id: u.upload_id.clone(),
                 initiated: u.initiated_at,
-                owner: u.owner,
-                initiator: u.initiator,
+                owner: u.owner.clone(),
+                initiator: u.initiator.clone(),
                 checksum_algorithm: u.checksum.map(MultipartChecksumConfig::algorithm),
                 checksum_type: u.checksum.map(MultipartChecksumConfig::checksum_type),
             })
             .collect();
         let common_prefixes = listed
-            .common_prefixes
-            .into_iter()
+            .common_prefixes()
+            .iter()
             .map(|prefix| prefix.to_string())
             .collect();
 
         Ok(ListMultipartUploadsResult {
             uploads,
             common_prefixes,
-            is_truncated: listed.is_truncated,
+            is_truncated: listed.is_truncated(),
             next_marker,
         })
     }

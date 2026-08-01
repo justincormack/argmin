@@ -1071,6 +1071,20 @@ request/response representations, and physical fields in the opaque result's `De
 Multipart initiation, upload-listing, authorization/abort, and remaining public physical record
 representations are still pending, so implementation-order item 3 is not yet complete.
 
+The fourteenth bounded slice continues implementation-order item 3 with bucket-level multipart
+upload listing. Per-PG SQL and storage RPC pagination continue to use complete durable upload
+records privately inside storage, but the final cross-PG merge consumes those records into a
+logical projection containing only key, upload ID, initiation time, owner, initiator, and checksum
+configuration. The public aggregate exposes that projection, logical common prefixes, truncation,
+and the logical continuation marker through read-only accessors. Raw page requests, page starts,
+and physical responses are crate-private; the aggregate has a logical-only `Debug` view and no
+equality implementation that could reveal hidden state. The RPC representation is unchanged.
+Compiler visibility is the primary boundary, with checks rejecting raw listing types or direct
+aggregate-field access in the production coordinator and rejecting durable upload records or
+derived equality in the public aggregate. Multipart initiation, authorization/abort, and
+remaining public physical record representations are still pending, so implementation-order item
+3 is not yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

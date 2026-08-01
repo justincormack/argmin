@@ -14902,12 +14902,12 @@ impl super::StorageCluster {
     ) -> Result<ListedBucketMultipartUploads, ObjectPgActionError> {
         let bucket = scan.bucket;
         if max_uploads == 0 {
-            return Ok(ListedBucketMultipartUploads {
-                uploads: Vec::new(),
-                common_prefixes: Vec::new(),
-                is_truncated: false,
-                next_marker: None,
-            });
+            return Ok(ListedBucketMultipartUploads::from_storage(
+                Vec::new(),
+                Vec::new(),
+                false,
+                None,
+            ));
         }
 
         let fetch_limit = max_uploads.saturating_add(1);
@@ -14955,12 +14955,12 @@ impl super::StorageCluster {
                     key: upload.key.clone(),
                     upload_id: upload.upload_id.clone(),
                 });
-            return Ok(ListedBucketMultipartUploads {
+            return Ok(ListedBucketMultipartUploads::from_storage(
                 uploads,
-                common_prefixes: Vec::new(),
+                Vec::new(),
                 is_truncated,
                 next_marker,
-            });
+            ));
         }
 
         let prefix_str = prefix.as_ref().map_or("", ObjectKey::as_str);
@@ -15142,12 +15142,12 @@ impl super::StorageCluster {
             refill_cursor(&mut cursors[cursor_index])?;
         }
 
-        Ok(ListedBucketMultipartUploads {
+        Ok(ListedBucketMultipartUploads::from_storage(
             uploads,
             common_prefixes,
             is_truncated,
             next_marker,
-        })
+        ))
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

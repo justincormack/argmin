@@ -165,19 +165,24 @@ fn object_and_multipart_listing_select_global_first_page_at_production_cap_volum
     let listed_uploads = cluster
         .list_multipart_uploads_for_bucket(&bucket, None, None, None, None, MAX_KEYS)
         .unwrap();
-    assert!(listed_uploads.is_truncated);
+    assert!(listed_uploads.is_truncated());
     let expected_last_upload = &expected_smallest_pg_uploads[MAX_KEYS as usize - 1];
     assert_eq!(
-        listed_uploads.next_marker,
-        Some(crate::MultipartUploadListMarker::Upload {
+        listed_uploads.next_marker(),
+        Some(&crate::MultipartUploadListMarker::Upload {
             key: expected_last_upload.0.clone(),
             upload_id: expected_last_upload.1.clone(),
         })
     );
+    let listed_debug = format!("{listed_uploads:?}");
+    assert!(!listed_debug.contains("object_generation_id"));
+    assert!(!listed_debug.contains("metadata_blob"));
+    assert!(!listed_debug.contains("system_metadata_blob"));
+    assert!(!listed_debug.contains("encryption"));
     let listed_uploads = listed_uploads
-        .uploads
-        .into_iter()
-        .map(|upload| (upload.key, upload.upload_id))
+        .uploads()
+        .iter()
+        .map(|upload| (upload.key.clone(), upload.upload_id.clone()))
         .collect::<Vec<_>>();
     assert_eq!(
         listed_uploads,

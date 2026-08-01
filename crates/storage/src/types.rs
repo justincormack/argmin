@@ -5278,7 +5278,7 @@ pub struct CreateMultipartUploadOutcome<T> {
 }
 
 /// Request to list multipart uploads.
-pub struct ListMultipartUploadsReq {
+pub(crate) struct ListMultipartUploadsReq {
     pub bucket: BucketName,
     pub prefix: Option<ObjectKey>,
     pub page_start: Option<ListMultipartUploadsPageStart>,
@@ -5286,7 +5286,7 @@ pub struct ListMultipartUploadsReq {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ListMultipartUploadsPageStart {
+pub(crate) enum ListMultipartUploadsPageStart {
     After {
         key_marker: ObjectKey,
         upload_id_marker: Option<UploadId>,
@@ -5296,19 +5296,91 @@ pub enum ListMultipartUploadsPageStart {
 }
 
 /// Response from listing multipart uploads.
-pub struct ListMultipartUploadsResp {
+pub(crate) struct ListMultipartUploadsResp {
     pub uploads: Vec<MultipartUploadRecord>,
     pub is_truncated: bool,
     pub next_key_marker: Option<ObjectKey>,
     pub next_upload_id_marker: Option<UploadId>,
 }
 
-#[derive(Debug, Clone)]
+/// Logical S3 fields for one listed multipart upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedMultipartUpload {
+    pub key: ObjectKey,
+    pub upload_id: UploadId,
+    pub initiated_at: u64,
+    pub owner: OwnerIdentity,
+    pub initiator: OwnerIdentity,
+    pub checksum: Option<MultipartChecksumConfig>,
+}
+
+/// Opaque storage-owned result of listing multipart uploads for a bucket.
+///
+/// Complete durable multipart-upload records remain private to storage.
+#[derive(Clone)]
 pub struct ListedBucketMultipartUploads {
-    pub uploads: Vec<MultipartUploadRecord>,
-    pub common_prefixes: Vec<ObjectKey>,
-    pub is_truncated: bool,
-    pub next_marker: Option<MultipartUploadListMarker>,
+    pub(crate) uploads: Vec<ListedMultipartUpload>,
+    pub(crate) common_prefixes: Vec<ObjectKey>,
+    pub(crate) is_truncated: bool,
+    pub(crate) next_marker: Option<MultipartUploadListMarker>,
+}
+
+impl ListedBucketMultipartUploads {
+    pub(crate) fn from_storage(
+        uploads: Vec<MultipartUploadRecord>,
+        common_prefixes: Vec<ObjectKey>,
+        is_truncated: bool,
+        next_marker: Option<MultipartUploadListMarker>,
+    ) -> Self {
+        let uploads = uploads
+            .into_iter()
+            .map(|upload| ListedMultipartUpload {
+                key: upload.key,
+                upload_id: upload.upload_id,
+                initiated_at: upload.initiated_at,
+                owner: upload.owner,
+                initiator: upload.initiator,
+                checksum: upload.checksum,
+            })
+            .collect();
+        Self {
+            uploads,
+            common_prefixes,
+            is_truncated,
+            next_marker,
+        }
+    }
+
+    #[must_use]
+    pub fn uploads(&self) -> &[ListedMultipartUpload] {
+        &self.uploads
+    }
+
+    #[must_use]
+    pub fn common_prefixes(&self) -> &[ObjectKey] {
+        &self.common_prefixes
+    }
+
+    #[must_use]
+    pub fn is_truncated(&self) -> bool {
+        self.is_truncated
+    }
+
+    #[must_use]
+    pub fn next_marker(&self) -> Option<&MultipartUploadListMarker> {
+        self.next_marker.as_ref()
+    }
+}
+
+impl std::fmt::Debug for ListedBucketMultipartUploads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ListedBucketMultipartUploads")
+            .field("uploads", &self.uploads)
+            .field("common_prefixes", &self.common_prefixes)
+            .field("is_truncated", &self.is_truncated)
+            .field("next_marker", &self.next_marker)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

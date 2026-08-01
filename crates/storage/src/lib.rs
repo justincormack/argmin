@@ -463,10 +463,9 @@ pub use types::{
     FinalizeDirectPutObjectOutcome, FinalizeStreamPartCleanup, FinalizeStreamPartOutcome,
     FinalizeStreamPutOutcome, GenerationId, InsertCurrentDeleteMarkerOutcome,
     InvalidChecksumConfig, LegalHoldStatus, LifecycleSweepBuckets, LifecycleSweepClaimRecord,
-    LifecycleSweepRoot, LifecycleSweepRootSource, ListMultipartUploadsPageStart,
-    ListMultipartUploadsReq, ListMultipartUploadsResp, ListObjectVersionsReq,
-    ListObjectVersionsResp, ListObjectsReq, ListObjectsResp, ListedBucketMultipartUploads,
-    ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartPart, ListedMultipartParts,
+    LifecycleSweepRoot, LifecycleSweepRootSource, ListObjectVersionsReq, ListObjectVersionsResp,
+    ListObjectsReq, ListObjectsResp, ListedBucketMultipartUploads, ListedBucketObjectVersions,
+    ListedBucketObjects, ListedMultipartPart, ListedMultipartParts, ListedMultipartUpload,
     LiveObjectRecord, LoadedBucketSubresource, ManagedEncryptionAlgorithm, MultipartChecksumConfig,
     MultipartCompletionFingerprint, MultipartCompletionPart, MultipartCompletionPreflight,
     MultipartCompletionReplay, MultipartCompletionSnapshot, MultipartObjectIdentity,
@@ -507,6 +506,9 @@ pub(crate) use types::{
     BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketSubresourceKind,
     ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, PayloadReclaimRoot,
     BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN,
+};
+pub(crate) use types::{
+    ListMultipartUploadsPageStart, ListMultipartUploadsReq, ListMultipartUploadsResp,
 };
 #[cfg(test)]
 pub(crate) use types::{

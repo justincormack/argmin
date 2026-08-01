@@ -2370,6 +2370,56 @@ fail_with_matches \
     "Opaque multipart listing equality must not expose differences in private durable state" \
     "$multipart_listing_derived_equality"
 
+server_core_multipart_upload_listing_physical_leaks=$(
+    rg -n --color=never \
+        '\b(ListMultipartUploadsReq|ListMultipartUploadsResp|MultipartUploadRecord)\b|listed\.(uploads|common_prefixes|is_truncated|next_marker)([[:space:]]*[.,;{}]|[[:space:]]*$)' \
+        crates/server-core/src/coordinator/multipart.rs \
+        || true
+)
+fail_with_matches \
+    "Server-core multipart-upload listing must use the logical storage-owned view rather than durable upload records" \
+    "$server_core_multipart_upload_listing_physical_leaks"
+
+public_multipart_upload_listing_physical_surfaces=$(
+    rg -n --color=never \
+        '^[[:space:]]*pub[[:space:]]+(struct[[:space:]]+(ListMultipartUploadsReq|ListMultipartUploadsResp)|enum[[:space:]]+ListMultipartUploadsPageStart|use.*\b(ListMultipartUploadsReq|ListMultipartUploadsResp|ListMultipartUploadsPageStart)\b)' \
+        crates/storage/src/types.rs \
+        crates/storage/src/lib.rs \
+        || true
+)
+fail_with_matches \
+    "Multipart-upload listing request, page, and physical response representations must remain private to storage" \
+    "$public_multipart_upload_listing_physical_surfaces"
+
+multipart_upload_listing_opaque_surface_leaks=$(
+    awk '
+    /#\[derive\(/ {
+        derive = $0
+        next
+    }
+    /pub struct ListedBucketMultipartUploads[[:space:]]*\{/ {
+        in_listing = 1
+        if (derive ~ /PartialEq|Eq/) {
+            print FILENAME ":" FNR ":" derive
+        }
+    }
+    in_listing && /MultipartUploadRecord/ {
+        print FILENAME ":" FNR ":" $0
+    }
+    in_listing && /^[[:space:]]*}/ {
+        in_listing = 0
+    }
+    {
+        if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^#\[derive\(/) {
+            derive = ""
+        }
+    }
+    ' crates/storage/src/types.rs
+)
+fail_with_matches \
+    "Opaque multipart-upload listing results must contain only logical projections and must not derive equality over hidden state" \
+    "$multipart_upload_listing_opaque_surface_leaks"
+
 public_stream_append_hash_surfaces=$(
     rg -n --color=never \
         '^[[:space:]]*pub[[:space:]]+(mod[[:space:]]+shard_key_hash|fn[[:space:]]+stream_segment_key_hash)\b' \
