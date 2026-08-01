@@ -93,23 +93,13 @@ pub(super) fn map_store_error(error: storage::StoreError) -> ServerError {
 
 pub(crate) struct StreamSegmentAppendPayload<'a> {
     pub(crate) storage_bytes: &'a [u8],
-    pub(crate) segment_crc64: u64,
     pub(crate) payload_crc64: u64,
 }
 
 impl<'a> StreamSegmentAppendPayload<'a> {
-    pub(crate) fn maybe_encrypted(
-        storage_bytes: &'a [u8],
-        payload_crc64: u64,
-        storage_matches_payload: bool,
-    ) -> Self {
+    pub(crate) fn new(storage_bytes: &'a [u8], payload_crc64: u64) -> Self {
         Self {
             storage_bytes,
-            segment_crc64: if storage_matches_payload {
-                payload_crc64
-            } else {
-                checksum::crc64::checksum(storage_bytes)
-            },
             payload_crc64,
         }
     }

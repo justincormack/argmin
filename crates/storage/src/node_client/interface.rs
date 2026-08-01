@@ -664,6 +664,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         now: u64,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
 
+    #[cfg(test)]
     fn prepare_stream_segment_append(
         &self,
         pg_id: ObjectMetadataPgId,

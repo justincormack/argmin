@@ -41,7 +41,7 @@ pub(crate) mod metadata_command;
 mod node_runtime;
 pub(crate) mod peering;
 pub mod pg_topology;
-pub mod shard_key_hash;
+mod shard_key_hash;
 mod standalone;
 #[allow(dead_code)]
 pub(crate) mod storage_rpc;
@@ -423,10 +423,8 @@ pub use pg_store::{
 };
 pub use pg_topology::PgTopology;
 pub use placement::NodeId;
-pub(crate) use shard_key_hash::direct_put_segment_key_hash;
-pub use shard_key_hash::{
-    multipart_part_segment_key_hash, object_key_hash, segment_key_hash, stream_segment_key_hash,
-};
+pub(crate) use shard_key_hash::{direct_put_segment_key_hash, stream_segment_key_hash};
+pub use shard_key_hash::{multipart_part_segment_key_hash, object_key_hash, segment_key_hash};
 pub use standalone::{
     StandaloneRouteIdentity, StandaloneRouteIdentityError, StandaloneRouteIdentityLock,
     StandaloneRouteIdentityPreparation,
@@ -488,11 +486,12 @@ pub use types::{
     ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
     ShardStat, ShardStatus, SseCustomerObjectState, SseS3ObjectState, StorageClass,
     StoredLegalHoldStatus, StoredObject, StreamPutCommitInput, StreamPutFinalizeSnapshot,
-    StreamPutFinalizeStorageSnapshot, StreamUploadCommandRecord, StreamUploadKind,
-    StreamUploadPartSnapshot, StreamUploadPartStorageSnapshot, StreamUploadRecord,
-    StreamUploadRecordPage, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
-    TerminalStreamCleanupRecord, UploadId, UploadIdError, UploadState, VersionId, WriteAck,
-    WrittenShardAck, MULTIPART_PART_SEGMENT_STAGING_VERSION_ID, MULTIPART_UPLOAD_ID_KEY_LEN,
+    StreamPutFinalizeStorageSnapshot, StreamSegmentAppendInput, StreamSegmentAppendOutcome,
+    StreamUploadCommandRecord, StreamUploadKind, StreamUploadPartSnapshot,
+    StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadRecordPage,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord,
+    UploadId, UploadIdError, UploadState, VersionId, WriteAck, WrittenShardAck,
+    MULTIPART_PART_SEGMENT_STAGING_VERSION_ID, MULTIPART_UPLOAD_ID_KEY_LEN,
     OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN, OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN,
     OBJECT_ENCRYPTION_SEGMENT_NONCE_SCOPE_LEN, OBJECT_ENCRYPTION_SEGMENT_TAG_LEN,
     OBJECT_ENCRYPTION_WRAPPED_DEK_LEN, OBJECT_ENCRYPTION_WRAP_NONCE_LEN, SESSION_ID_LEN,

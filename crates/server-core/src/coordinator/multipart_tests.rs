@@ -6902,17 +6902,15 @@ fn finalize_stream_put_rejects_mismatched_sse_c_write_context() {
         ObjectLockState::default(),
     )
     .unwrap();
-    let write_encryption = coord
-        .load_stream_put_write_encryption(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("obj"),
-            &session_id,
-            Some(&sse_customer),
-        )
-        .unwrap();
-    let storage_data = write_encryption.encrypt_segment(0, b"hello").unwrap();
     coord
-        .append_stream_segment("bucket", "obj", &session_id, 0, &storage_data)
+        .append_stream_put_data(&AppendStreamPutRequest {
+            bucket: &trusted_bucket_name("bucket"),
+            key: &trusted_object_key("obj"),
+            session_id: &session_id,
+            segment_index: 0,
+            data: b"hello",
+            sse_customer: Some(&sse_customer),
+        })
         .unwrap();
 
     let mut system_metadata = SystemMetadata::new();

@@ -5361,6 +5361,38 @@ pub struct PrepareStreamUploadSegmentAppendReq {
     pub segment_okh: [u8; 16],
 }
 
+/// Logical input for writing and publishing one streaming-upload segment.
+///
+/// Storage derives the physical payload identity, placement, erasure-coding
+/// shape, stored-byte checksum, shard acknowledgements, and durable segment
+/// record. Callers provide the transformed bytes and the S3-visible plaintext
+/// checksum without choosing their physical representation.
+#[derive(Clone, Copy)]
+pub struct StreamSegmentAppendInput<'a> {
+    pub session_id: &'a SessionId,
+    pub segment_index: u32,
+    /// CRC64-NVME over the user-visible plaintext payload bytes.
+    pub payload_crc64: u64,
+    pub storage_bytes: &'a [u8],
+}
+
+impl std::fmt::Debug for StreamSegmentAppendInput<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StreamSegmentAppendInput")
+            .field("session_id", self.session_id)
+            .field("segment_index", &self.segment_index)
+            .field("storage_bytes_len", &self.storage_bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamSegmentAppendOutcome {
+    pub target: StreamUploadTarget,
+    pub logical_size: u64,
+}
+
 /// Staging segment record for an in-progress streaming session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamUploadSegmentRecord {

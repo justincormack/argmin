@@ -444,14 +444,7 @@ impl Coordinator {
                 authorized.key_typed(),
                 session_id,
                 idx as u32,
-                super::StreamSegmentAppendPayload::maybe_encrypted(
-                    &chunk_storage,
-                    chunk_crc64,
-                    matches!(
-                        write_encryption.as_ref(),
-                        super::ActiveWriteEncryptionRef::None
-                    ),
-                ),
+                super::StreamSegmentAppendPayload::new(&chunk_storage, chunk_crc64),
             )?;
         }
         self.finalize_stream_put_with_authorized_write_tags_on_admitted_route(
@@ -663,17 +656,11 @@ impl Coordinator {
             req.key,
             req.session_id,
             req.segment_index,
-            super::StreamSegmentAppendPayload::maybe_encrypted(
-                &storage_data,
-                payload_crc64,
-                matches!(
-                    write_encryption.as_ref(),
-                    super::ActiveWriteEncryptionRef::None
-                ),
-            ),
+            super::StreamSegmentAppendPayload::new(&storage_data, payload_crc64),
         )
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn append_stream_put_data_with_storage_node(
         &self,
         storage_node: &std::sync::Arc<storage::StorageCluster>,
@@ -694,14 +681,7 @@ impl Coordinator {
             req.key,
             req.session_id,
             req.segment_index,
-            super::StreamSegmentAppendPayload::maybe_encrypted(
-                &storage_data,
-                payload_crc64,
-                matches!(
-                    write_encryption.as_ref(),
-                    super::ActiveWriteEncryptionRef::None
-                ),
-            ),
+            super::StreamSegmentAppendPayload::new(&storage_data, payload_crc64),
         )
     }
 
@@ -731,14 +711,7 @@ impl Coordinator {
             req.key,
             req.session_id,
             req.segment_index,
-            super::StreamSegmentAppendPayload::maybe_encrypted(
-                &storage_data,
-                payload_crc64,
-                matches!(
-                    write_encryption.as_ref(),
-                    super::ActiveWriteEncryptionRef::None
-                ),
-            ),
+            super::StreamSegmentAppendPayload::new(&storage_data, payload_crc64),
         )
     }
 

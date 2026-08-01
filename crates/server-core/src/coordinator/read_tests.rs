@@ -3,7 +3,8 @@ use super::test_support::*;
 use super::*;
 use ec::EcConfig;
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread;
 use storage::{segment_key_hash, EcShape, GenerationId, PgTopology, ShardKey, StoreError};
 
 #[test]
@@ -510,53 +511,32 @@ fn stream_put_abort_cleans_segment_committed_during_abort_window() {
         .unwrap()
         .object_generation_segment_data_pg(&bucket, &key, generation_id, segment_index)
         .get();
-    let hook_storage = Arc::clone(&coord.storage_node());
-    let hook_bucket = bucket.clone();
-    let hook_key = key.clone();
-    let hook_session_id = session_id.clone();
+    let abort_reached_storage = Arc::new(Barrier::new(2));
+    let allow_abort_storage = Arc::new(Barrier::new(2));
+    let abort_reached_storage_hook = Arc::clone(&abort_reached_storage);
+    let allow_abort_storage_hook = Arc::clone(&allow_abort_storage);
     let _guard = coord
         .storage_node()
         .test_install_before_stream_abort_storage_hook(Arc::new(move || {
-            let data = b"race-data";
-            let (_, segment_record) = hook_storage
-                .prepare_stream_segment_append(
-                    &hook_bucket,
-                    &hook_key,
-                    &storage::PrepareStreamUploadSegmentAppendReq {
-                        session_id: hook_session_id.clone(),
-                        segment_index,
-                        size: data.len() as u64,
-                        segment_crc64: checksum::crc64::checksum(data),
-                        payload_crc64: checksum::crc64::checksum(data),
-                        segment_okh: storage::stream_segment_key_hash(
-                            &hook_session_id,
-                            segment_index,
-                        ),
-                    },
-                )
-                .unwrap();
-            let written_shards = hook_storage
-                .write_stream_segment_payload_shards(&segment_record, data)
-                .unwrap();
-            let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
-                .iter()
-                .map(|written| (&written.key, written.ack))
-                .collect();
-            hook_storage
-                .commit_stream_segment_append(
-                    &hook_bucket,
-                    &hook_key,
-                    &hook_session_id,
-                    segment_index,
-                    &segment_record,
-                    &shard_batch,
-                )
-                .unwrap();
+            abort_reached_storage_hook.wait();
+            allow_abort_storage_hook.wait();
         }));
 
-    coord
-        .abort_stream_put("bucket", "key", &session_id)
-        .unwrap();
+    thread::scope(|scope| {
+        let abort = scope.spawn(|| coord.abort_stream_put("bucket", "key", &session_id));
+        abort_reached_storage.wait();
+        coord
+            .append_plaintext_stream_segment_for_test(
+                "bucket",
+                "key",
+                &session_id,
+                segment_index,
+                b"race-data",
+            )
+            .unwrap();
+        allow_abort_storage.wait();
+        abort.join().unwrap().unwrap();
+    });
 
     for shard_index in 0..ec.k + ec.m {
         let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), shard_index);

@@ -19,7 +19,7 @@ pub fn object_key_hash(bucket: &str, key: &str) -> [u8; 16] {
 /// Compute the 16-byte segment key hash for streaming upload shard keys.
 ///
 /// `segment_okh = SHA-256("segment/" + session_id + "/" + segment_index)[:16]`
-pub fn stream_segment_key_hash(session_id: &SessionId, segment_index: u32) -> [u8; 16] {
+pub(crate) fn stream_segment_key_hash(session_id: &SessionId, segment_index: u32) -> [u8; 16] {
     sha256_truncated_16(format!("segment/{}/{segment_index}", session_id.as_str()).as_bytes())
 }
 

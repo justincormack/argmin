@@ -4100,6 +4100,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         Ok(response.record)
     }
 
+    #[cfg(test)]
     fn prepare_stream_segment_append(
         &self,
         pg_id: ObjectMetadataPgId,

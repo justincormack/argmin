@@ -1005,6 +1005,24 @@ test-only DTO. The boundary checker rejects their reintroduction into the produc
 seam or as public storage APIs. Streaming append/finalization and multipart physical write/commit
 fields remain pending, so implementation-order item 3 is not yet complete.
 
+The tenth bounded slice continues implementation-order item 3 with streaming segment append for
+both PutObject and UploadPart. `server-core` supplies only the session, logical segment index,
+the plaintext checksum and transformed storage bytes through `StreamSegmentAppendInput`; storage
+derives the stored-byte checksum itself.
+Storage reloads the session while the admitted route is valid, derives the logical size from the
+session encryption state, derives the segment hash and generation, prepares the durable record,
+selects the data PG and EC placement, writes and validates shard acknowledgements, and publishes
+the append command as one logical operation. The result exposes only the logical upload target and
+logical size needed for S3-facing tracing. The former admitted-route prepare/write/ack/commit
+sequence is removed; raw physical steps and the segment-hash helper are owner-test-only. The
+existing prepare-boundary race hook now enters through an explicitly test-only storage operation,
+so abort, duplicate-append, route-expiry, and cleanup regressions still exercise the same internal
+boundary without returning physical records to `server-core`. The boundary checker rejects
+prepared segment records, shard keys/acks, placement fields, hashes, or raw mutation steps in the
+production streaming coordinator seam. Stream finalization, multipart completion, and remaining
+public physical record representations are still pending, so implementation-order item 3 is not
+yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

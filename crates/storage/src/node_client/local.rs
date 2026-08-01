@@ -3256,6 +3256,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         )
     }
 
+    #[cfg(test)]
     fn prepare_stream_segment_append(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -3857,6 +3858,7 @@ impl LocalStorageNodeClient {
         Ok(pg.list_stream_uploads_for_bucket_page(bucket, session_id_marker, limit)?)
     }
 
+    #[cfg(test)]
     fn prepare_stream_segment_append(
         &self,
         pg_id: ObjectMetadataPgId,

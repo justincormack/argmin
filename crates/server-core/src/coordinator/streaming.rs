@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 use storage::{
-    stream_segment_key_hash, BucketName, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey,
-    PrepareStreamUploadSegmentAppendReq, SessionId, ShardKey, StreamUploadTarget,
+    BucketName, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey, SessionId,
+    StreamSegmentAppendInput, StreamUploadTarget,
 };
 
 #[cfg(feature = "deep-tracing")]
@@ -16,166 +16,93 @@ use crate::sse::{
     prepare_managed_encryption_write, prepare_sse_customer_write, resume_managed_encryption_write,
     resume_sse_customer_write, validate_sse_customer_read, ManagedEncryptionWriteContext,
     SseCustomerRequest, SseCustomerResponseHeaders, SseCustomerSegmentScope,
-    SseCustomerWriteContext, SSE_C_SEGMENT_TAG_LEN,
+    SseCustomerWriteContext,
 };
 
 trait StreamSegmentMutationRoute {
-    fn load_session(
+    #[cfg(not(test))]
+    fn append_segment(
         &self,
-        session_id: &SessionId,
-    ) -> Result<storage::StreamUploadRecord, storage::ObjectPgActionError>;
+        input: StreamSegmentAppendInput<'_>,
+    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError>;
 
-    fn prepare_append(
+    #[cfg(test)]
+    fn append_segment_with_after_prepare(
         &self,
-        request: &PrepareStreamUploadSegmentAppendReq,
-    ) -> Result<
-        (StreamUploadTarget, storage::StreamUploadSegmentRecord),
-        storage::ObjectPgActionError,
-    >;
-
-    fn write_payload(
-        &self,
-        session_id: &SessionId,
-        segment: &storage::StreamUploadSegmentRecord,
-        data: &[u8],
-    ) -> Result<Vec<storage::WrittenShardAck>, storage::StoreError>;
-
-    fn commit_append(
-        &self,
-        session_id: &SessionId,
-        segment_index: u32,
-        segment: &storage::StreamUploadSegmentRecord,
-        shard_batch: &[(&ShardKey, storage::WriteAck)],
-    ) -> Result<(), storage::ObjectPgActionError>;
+        input: StreamSegmentAppendInput<'_>,
+        after_prepare: impl FnMut(),
+    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError>;
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 struct RawStreamSegmentMutationRoute<'a> {
     storage_node: &'a std::sync::Arc<storage::StorageCluster>,
     bucket: &'a BucketName,
     key: &'a ObjectKey,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl StreamSegmentMutationRoute for RawStreamSegmentMutationRoute<'_> {
-    fn load_session(
+    #[cfg(not(test))]
+    fn append_segment(
         &self,
-        session_id: &SessionId,
-    ) -> Result<storage::StreamUploadRecord, storage::ObjectPgActionError> {
+        input: StreamSegmentAppendInput<'_>,
+    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError> {
         self.storage_node
-            .load_stream_upload_session(self.bucket, self.key, session_id)
+            .append_stream_segment(self.bucket, self.key, input)
     }
 
-    fn prepare_append(
+    #[cfg(test)]
+    fn append_segment_with_after_prepare(
         &self,
-        request: &PrepareStreamUploadSegmentAppendReq,
-    ) -> Result<
-        (StreamUploadTarget, storage::StreamUploadSegmentRecord),
-        storage::ObjectPgActionError,
-    > {
+        input: StreamSegmentAppendInput<'_>,
+        after_prepare: impl FnMut(),
+    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError> {
         self.storage_node
-            .prepare_stream_segment_append(self.bucket, self.key, request)
-    }
-
-    fn write_payload(
-        &self,
-        _session_id: &SessionId,
-        segment: &storage::StreamUploadSegmentRecord,
-        data: &[u8],
-    ) -> Result<Vec<storage::WrittenShardAck>, storage::StoreError> {
-        self.storage_node
-            .write_stream_segment_payload_shards(segment, data)
-    }
-
-    fn commit_append(
-        &self,
-        session_id: &SessionId,
-        segment_index: u32,
-        segment: &storage::StreamUploadSegmentRecord,
-        shard_batch: &[(&ShardKey, storage::WriteAck)],
-    ) -> Result<(), storage::ObjectPgActionError> {
-        self.storage_node.commit_stream_segment_append(
-            self.bucket,
-            self.key,
-            session_id,
-            segment_index,
-            segment,
-            shard_batch,
-        )
+            .test_append_stream_segment_with_after_prepare(
+                self.bucket,
+                self.key,
+                input,
+                after_prepare,
+            )
     }
 }
 
 impl StreamSegmentMutationRoute for storage::ActivePutObjectRoute<'_> {
-    fn load_session(
+    #[cfg(not(test))]
+    fn append_segment(
         &self,
-        session_id: &SessionId,
-    ) -> Result<storage::StreamUploadRecord, storage::ObjectPgActionError> {
-        self.load_stream_session(session_id)
+        input: StreamSegmentAppendInput<'_>,
+    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError> {
+        self.append_stream_segment(input)
     }
 
-    fn prepare_append(
+    #[cfg(test)]
+    fn append_segment_with_after_prepare(
         &self,
-        request: &PrepareStreamUploadSegmentAppendReq,
-    ) -> Result<
-        (StreamUploadTarget, storage::StreamUploadSegmentRecord),
-        storage::ObjectPgActionError,
-    > {
-        self.prepare_stream_segment_append(request)
-    }
-
-    fn write_payload(
-        &self,
-        session_id: &SessionId,
-        segment: &storage::StreamUploadSegmentRecord,
-        data: &[u8],
-    ) -> Result<Vec<storage::WrittenShardAck>, storage::StoreError> {
-        self.write_stream_segment_payload_shards(session_id, segment, data)
-    }
-
-    fn commit_append(
-        &self,
-        session_id: &SessionId,
-        segment_index: u32,
-        segment: &storage::StreamUploadSegmentRecord,
-        shard_batch: &[(&ShardKey, storage::WriteAck)],
-    ) -> Result<(), storage::ObjectPgActionError> {
-        self.commit_stream_segment_append(session_id, segment_index, segment, shard_batch)
+        input: StreamSegmentAppendInput<'_>,
+        after_prepare: impl FnMut(),
+    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError> {
+        self.test_append_stream_segment_with_after_prepare(input, after_prepare)
     }
 }
 
 impl StreamSegmentMutationRoute for storage::ActiveMultipartObjectRoute<'_> {
-    fn load_session(
+    #[cfg(not(test))]
+    fn append_segment(
         &self,
-        session_id: &SessionId,
-    ) -> Result<storage::StreamUploadRecord, storage::ObjectPgActionError> {
-        self.load_stream_session(session_id)
+        input: StreamSegmentAppendInput<'_>,
+    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError> {
+        self.append_stream_segment(input)
     }
 
-    fn prepare_append(
+    #[cfg(test)]
+    fn append_segment_with_after_prepare(
         &self,
-        request: &PrepareStreamUploadSegmentAppendReq,
-    ) -> Result<
-        (StreamUploadTarget, storage::StreamUploadSegmentRecord),
-        storage::ObjectPgActionError,
-    > {
-        self.prepare_stream_segment_append(request)
-    }
-
-    fn write_payload(
-        &self,
-        session_id: &SessionId,
-        segment: &storage::StreamUploadSegmentRecord,
-        data: &[u8],
-    ) -> Result<Vec<storage::WrittenShardAck>, storage::StoreError> {
-        self.write_stream_segment_payload_shards(session_id, segment, data)
-    }
-
-    fn commit_append(
-        &self,
-        session_id: &SessionId,
-        segment_index: u32,
-        segment: &storage::StreamUploadSegmentRecord,
-        shard_batch: &[(&ShardKey, storage::WriteAck)],
-    ) -> Result<(), storage::ObjectPgActionError> {
-        self.commit_stream_segment_append(session_id, segment_index, segment, shard_batch)
+        input: StreamSegmentAppendInput<'_>,
+        after_prepare: impl FnMut(),
+    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError> {
+        self.test_append_stream_segment_with_after_prepare(input, after_prepare)
     }
 }
 
@@ -518,14 +445,7 @@ impl Coordinator {
             &trusted_object_key(key),
             session_id,
             segment_index,
-            super::StreamSegmentAppendPayload::maybe_encrypted(
-                &storage_data,
-                payload_crc64,
-                matches!(
-                    write_encryption.as_ref(),
-                    super::ActiveWriteEncryptionRef::None
-                ),
-            ),
+            super::StreamSegmentAppendPayload::new(&storage_data, payload_crc64),
         )
     }
 
@@ -723,6 +643,7 @@ impl Coordinator {
         )
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub(super) fn append_stream_segment_for_storage_node(
         &self,
         storage_node: &std::sync::Arc<storage::StorageCluster>,
@@ -789,87 +710,34 @@ impl Coordinator {
             segment_index,
             payload.storage_bytes.len()
         );
-        let segment_okh = stream_segment_key_hash(session_id, segment_index);
-
-        let logical_size = if payload.storage_bytes.is_empty() {
-            0
-        } else {
-            match route
-                .load_session(session_id)
-                .map_err(Self::map_object_pg_action_error)?
-                .encryption
-            {
-                ObjectEncryption::None => payload.storage_bytes.len() as u64,
-                ObjectEncryption::SseCustomer(_) | ObjectEncryption::SseS3(_) => {
-                    let ciphertext_len = payload.storage_bytes.len();
-                    let logical_len = ciphertext_len.checked_sub(SSE_C_SEGMENT_TAG_LEN).ok_or(
-                        ServerError::InvalidRequest {
-                            reason: "encrypted stream segment shorter than authentication tag"
-                                .to_string(),
-                        },
-                    )?;
-                    logical_len as u64
-                }
-            }
+        let input = StreamSegmentAppendInput {
+            session_id,
+            segment_index,
+            payload_crc64: payload.payload_crc64,
+            storage_bytes: payload.storage_bytes,
         };
 
-        let (target, segment_record) = route
-            .prepare_append(&PrepareStreamUploadSegmentAppendReq {
-                session_id: session_id.clone(),
-                segment_index,
-                size: logical_size,
-                segment_crc64: payload.segment_crc64,
-                payload_crc64: payload.payload_crc64,
-                segment_okh,
+        #[cfg(test)]
+        let outcome = route
+            .append_segment_with_after_prepare(input, || {
+                self.maybe_run_stream_append_prepare_hook(session_id, segment_index);
             })
+            .map_err(Self::map_object_pg_action_error)?;
+        #[cfg(not(test))]
+        let outcome = route
+            .append_segment(input)
             .map_err(Self::map_object_pg_action_error)?;
 
         Self::emit_stream_segment_layout(
-            &target,
+            &outcome.target,
             bucket.as_str(),
             key.as_str(),
             session_id,
             segment_index,
-            logical_size as usize,
+            outcome.logical_size as usize,
         );
 
-        #[cfg(test)]
-        self.maybe_run_stream_append_prepare_hook(session_id, segment_index);
-
-        let written_shards = route
-            .write_payload(session_id, &segment_record, payload.storage_bytes)
-            .map_err(super::map_store_error)?;
-
-        let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
-            .iter()
-            .map(|written| (&written.key, written.ack))
-            .collect();
-
-        route
-            .commit_append(session_id, segment_index, &segment_record, &shard_batch)
-            .map_err(Self::map_object_pg_action_error)
-    }
-
-    #[cfg(test)]
-    pub fn append_stream_segment(
-        &self,
-        bucket: &str,
-        key: &str,
-        session_id: &SessionId,
-        segment_index: u32,
-        data: &[u8],
-    ) -> Result<(), ServerError> {
-        self.append_stream_segment_for(
-            &trusted_bucket_name(bucket),
-            &trusted_object_key(key),
-            session_id,
-            segment_index,
-            super::StreamSegmentAppendPayload::maybe_encrypted(
-                data,
-                checksum::crc64::checksum(data),
-                true,
-            ),
-        )
+        Ok(())
     }
 
     #[cfg(test)]

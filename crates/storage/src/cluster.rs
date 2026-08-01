@@ -104,9 +104,10 @@ use crate::types::{
     ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
     ShardScavengerObservationRecord, ShardScavengerPayloadReference,
     ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus, StoredObject,
-    StreamPutFinalizeSnapshot, StreamUploadCommandRecord, StreamUploadPartSnapshot,
-    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
-    VersionId, WriteAck, WrittenShardAck, PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT,
+    StreamPutFinalizeSnapshot, StreamSegmentAppendInput, StreamSegmentAppendOutcome,
+    StreamUploadCommandRecord, StreamUploadPartSnapshot, StreamUploadRecord,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, VersionId,
+    WriteAck, WrittenShardAck, PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT,
 };
 #[cfg(test)]
 use crate::types::{
@@ -3090,6 +3091,37 @@ impl ActivePutObjectRoute<'_> {
             .load_stream_upload_session_on_route(self.effect_route(), session_id)
     }
 
+    pub fn append_stream_segment(
+        &self,
+        input: StreamSegmentAppendInput<'_>,
+    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .append_stream_segment_with_route_validation(
+                self.effect_route(),
+                input,
+                || self.admission.require_valid_now(),
+                || {},
+            )
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn test_append_stream_segment_with_after_prepare(
+        &self,
+        input: StreamSegmentAppendInput<'_>,
+        after_prepare: impl FnMut(),
+    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .append_stream_segment_with_route_validation(
+                self.effect_route(),
+                input,
+                || self.admission.require_valid_now(),
+                after_prepare,
+            )
+    }
+
     pub fn heartbeat_stream_session(
         &self,
         session_id: &SessionId,
@@ -3099,59 +3131,6 @@ impl ActivePutObjectRoute<'_> {
             .heartbeat_put_object_stream_session_with_route_validation(
                 self.effect_route(),
                 session_id,
-                || self.admission.require_valid_now(),
-            )
-    }
-
-    pub fn prepare_stream_segment_append(
-        &self,
-        request: &PrepareStreamUploadSegmentAppendReq,
-    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        self.admission
-            .cluster
-            .prepare_stream_segment_append_with_route_validation(
-                self.effect_route(),
-                request,
-                || self.admission.require_valid_now(),
-            )
-    }
-
-    pub fn write_stream_segment_payload_shards(
-        &self,
-        session_id: &SessionId,
-        segment_record: &StreamUploadSegmentRecord,
-        data: &[u8],
-    ) -> Result<Vec<WrittenShardAck>, StoreError> {
-        if segment_record.session_id != *session_id {
-            return Err(StoreError::RouteCapabilitySubjectMismatch {
-                operation: "write put object stream segment payload",
-            });
-        }
-        self.admission
-            .cluster
-            .write_stream_segment_payload_shards_with_route_validation(
-                segment_record,
-                data,
-                self.admission.effect_fence(),
-                || self.admission.require_valid_now(),
-            )
-    }
-
-    pub fn commit_stream_segment_append(
-        &self,
-        session_id: &SessionId,
-        segment_index: u32,
-        segment_record: &StreamUploadSegmentRecord,
-        shard_batch: &[(&ShardKey, WriteAck)],
-    ) -> Result<(), ObjectPgActionError> {
-        self.admission
-            .cluster
-            .commit_stream_segment_append_with_route_validation(
-                self.effect_route(),
-                session_id,
-                segment_index,
-                segment_record,
-                shard_batch,
                 || self.admission.require_valid_now(),
             )
     }
@@ -3420,56 +3399,34 @@ impl ActiveMultipartObjectRoute<'_> {
             .load_stream_upload_session_on_route(self.stream_effect_route(), session_id)
     }
 
-    pub fn prepare_stream_segment_append(
+    pub fn append_stream_segment(
         &self,
-        request: &PrepareStreamUploadSegmentAppendReq,
-    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        input: StreamSegmentAppendInput<'_>,
+    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
         self.admission
             .cluster
-            .prepare_stream_segment_append_with_route_validation(
+            .append_stream_segment_with_route_validation(
                 self.stream_effect_route(),
-                request,
+                input,
                 || self.admission.require_valid_now(),
+                || {},
             )
     }
 
-    pub fn write_stream_segment_payload_shards(
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn test_append_stream_segment_with_after_prepare(
         &self,
-        session_id: &SessionId,
-        segment_record: &StreamUploadSegmentRecord,
-        data: &[u8],
-    ) -> Result<Vec<WrittenShardAck>, StoreError> {
-        if segment_record.session_id != *session_id {
-            return Err(StoreError::RouteCapabilitySubjectMismatch {
-                operation: "write UploadPart stream segment payload",
-            });
-        }
+        input: StreamSegmentAppendInput<'_>,
+        after_prepare: impl FnMut(),
+    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
         self.admission
             .cluster
-            .write_stream_segment_payload_shards_with_route_validation(
-                segment_record,
-                data,
-                self.admission.effect_fence(),
-                || self.admission.require_valid_now(),
-            )
-    }
-
-    pub fn commit_stream_segment_append(
-        &self,
-        session_id: &SessionId,
-        segment_index: u32,
-        segment_record: &StreamUploadSegmentRecord,
-        shard_batch: &[(&ShardKey, WriteAck)],
-    ) -> Result<(), ObjectPgActionError> {
-        self.admission
-            .cluster
-            .commit_stream_segment_append_with_route_validation(
+            .append_stream_segment_with_route_validation(
                 self.stream_effect_route(),
-                session_id,
-                segment_index,
-                segment_record,
-                shard_batch,
+                input,
                 || self.admission.require_valid_now(),
+                after_prepare,
             )
     }
 
@@ -11453,6 +11410,7 @@ impl StorageCluster {
         })
     }
 
+    #[cfg(test)]
     fn write_placed_segment_payload_shards(
         &self,
         data_pg: DataPgId,
@@ -14885,7 +14843,8 @@ impl StorageCluster {
             .load_stream_upload_session(route.object_pg_id, route.bucket, route.key, session_id)
     }
 
-    pub fn prepare_stream_segment_append(
+    #[cfg(test)]
+    pub(crate) fn prepare_stream_segment_append(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -14899,6 +14858,110 @@ impl StorageCluster {
             mutation_client.prepare_stream_segment_append(object_pg_id, bucket, key, request)?;
         segment_record.placement_cluster_epoch = self.operation_epoch();
         Ok((target, segment_record))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn append_stream_segment(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        input: StreamSegmentAppendInput<'_>,
+    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+        self.append_stream_segment_with_route_validation(
+            PutObjectMutationEffectRoute {
+                bucket_pg_id: self.bucket_metadata_pg(bucket),
+                object_pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            input,
+            || Ok(()),
+            || {},
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_append_stream_segment_with_after_prepare(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        input: StreamSegmentAppendInput<'_>,
+        after_prepare: impl FnMut(),
+    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+        self.append_stream_segment_with_route_validation(
+            PutObjectMutationEffectRoute {
+                bucket_pg_id: self.bucket_metadata_pg(bucket),
+                object_pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            input,
+            || Ok(()),
+            after_prepare,
+        )
+    }
+
+    fn append_stream_segment_with_route_validation(
+        &self,
+        route: PutObjectMutationEffectRoute<'_>,
+        input: StreamSegmentAppendInput<'_>,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
+        mut after_prepare: impl FnMut(),
+    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+        require_valid_route().map_err(ObjectPgActionError::Store)?;
+        let session = self.load_stream_upload_session_on_route(route, input.session_id)?;
+        let logical_size = if input.storage_bytes.is_empty() {
+            0
+        } else {
+            input
+                .storage_bytes
+                .len()
+                .checked_sub(session.encryption.segment_ciphertext_extra_len())
+                .ok_or_else(|| ObjectPgActionError::InvalidRequest {
+                    reason: "encrypted stream segment shorter than authentication tag".to_string(),
+                })? as u64
+        };
+        let segment_okh = crate::stream_segment_key_hash(input.session_id, input.segment_index);
+        let (target, segment_record) = self.prepare_stream_segment_append_with_route_validation(
+            route,
+            &PrepareStreamUploadSegmentAppendReq {
+                session_id: input.session_id.clone(),
+                segment_index: input.segment_index,
+                size: logical_size,
+                segment_crc64: checksum::crc64::checksum(input.storage_bytes),
+                payload_crc64: input.payload_crc64,
+                segment_okh,
+            },
+            &mut require_valid_route,
+        )?;
+        after_prepare();
+        let written_shards = self
+            .write_stream_segment_payload_shards_with_route_validation(
+                &segment_record,
+                input.storage_bytes,
+                route.effect_fence,
+                &mut require_valid_route,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let shard_batch = written_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect::<Vec<_>>();
+        self.commit_stream_segment_append_with_route_validation(
+            route,
+            input.session_id,
+            input.segment_index,
+            &segment_record,
+            &shard_batch,
+            require_valid_route,
+        )?;
+        Ok(StreamSegmentAppendOutcome {
+            target,
+            logical_size,
+        })
     }
 
     fn prepare_stream_segment_append_with_route_validation(
@@ -14925,7 +14988,8 @@ impl StorageCluster {
         Ok((target, segment_record))
     }
 
-    pub fn write_stream_segment_payload_shards(
+    #[cfg(test)]
+    pub(crate) fn write_stream_segment_payload_shards(
         &self,
         segment_record: &StreamUploadSegmentRecord,
         data: &[u8],
@@ -14972,7 +15036,8 @@ impl StorageCluster {
         )
     }
 
-    pub fn commit_stream_segment_append(
+    #[cfg(test)]
+    pub(crate) fn commit_stream_segment_append(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

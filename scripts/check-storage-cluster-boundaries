@@ -2188,6 +2188,27 @@ fail_with_matches \
     "Server-core direct PutObject must use the opaque storage-owned payload write rather than placement, shard acknowledgements, hashes, or the durable commit request" \
     "$server_core_direct_put_placement_leaks"
 
+server_core_stream_append_placement_leaks=$(
+    rg -n --color=never \
+        '\b(PrepareStreamUploadSegmentAppendReq|StreamUploadSegmentRecord|WrittenShardAck|ShardKey|WriteAck|stream_segment_key_hash)\b|prepare_stream_segment_append|write_stream_segment_payload_shards|commit_stream_segment_append|\.(data_pg_id|placement_cluster_epoch|ec_k|ec_m|segment_okh|segment_vid|written_shards)\b' \
+        crates/server-core/src/coordinator/streaming.rs \
+        || true
+)
+fail_with_matches \
+    "Server-core streaming appends must use the logical storage-owned append operation rather than prepared records, placement, shard acknowledgements, or physical mutation steps" \
+    "$server_core_stream_append_placement_leaks"
+
+public_stream_append_hash_surfaces=$(
+    rg -n --color=never \
+        '^[[:space:]]*pub[[:space:]]+(mod[[:space:]]+shard_key_hash|fn[[:space:]]+stream_segment_key_hash)\b' \
+        crates/storage/src/lib.rs \
+        crates/storage/src/shard_key_hash.rs \
+        || true
+)
+fail_with_matches \
+    "The streaming segment placement hash must remain private to storage" \
+    "$public_stream_append_hash_surfaces"
+
 public_direct_put_representation_surfaces=$(
     rg -n --color=never \
         '^[[:space:]]*pub[[:space:]].*\b(CommitDirectPutObjectReq|DirectPutWrittenSegment|direct_put_segment_key_hash|write_direct_put_segment_payload_shards|commit_direct_put_object_from_payload_shards|delete_direct_put_segment_payload_shards)\b' \
