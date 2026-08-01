@@ -5778,6 +5778,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         upload_id: &UploadId,
         expected_cleanup: Option<&crate::AbortMultipartUploadCleanup>,
         bucket_write_reservation: &BucketWriteReservationProof,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<MetadataCommandEnvelope>, StorageNodeObjectRouteError> {
         self.require_object_mutation_proof(
             bucket_write_reservation,
@@ -5804,10 +5805,13 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             upload_id,
         )
         .and_then(|route| {
-            route.build_abort_multipart_upload_command(BuildAbortMultipartUploadCommandReq {
-                expected_cleanup,
-                bucket_write_reservation,
-            })
+            route.build_abort_multipart_upload_command(
+                BuildAbortMultipartUploadCommandReq {
+                    expected_cleanup,
+                    bucket_write_reservation,
+                },
+                effect_fence,
+            )
         })
         .map_err(StorageNodeObjectRouteError::Object)
     }
@@ -5817,6 +5821,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         authorized_upload: &crate::types::AuthorizedMultipartUploadRecord,
         expected_cleanup: Option<&crate::AbortMultipartUploadCleanup>,
         bucket_write_reservation: &BucketWriteReservationProof,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<MetadataCommandEnvelope>, StorageNodeObjectRouteError> {
         self.require_authorized_multipart_upload_subject(
             authorized_upload,
@@ -5863,6 +5868,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
                     expected_cleanup,
                     bucket_write_reservation,
                 },
+                effect_fence,
             )
         })
         .map_err(StorageNodeObjectRouteError::Object)
@@ -12026,10 +12032,13 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
+        let effect_fence =
+            admitted_route_effect_fence(request.object.cluster_epoch, request.effect_deadline);
         let response = match route.build_abort_multipart_upload_command(
             &request.upload_id,
             request.expected_cleanup.as_ref(),
             &request.bucket_write_reservation,
+            effect_fence,
         ) {
             Ok(Some(command)) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command))
@@ -12103,10 +12112,13 @@ impl StorageNodeConnectionHandler {
         let authorized_upload = crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
             request.authorized_upload,
         );
+        let effect_fence =
+            admitted_route_effect_fence(request.object.cluster_epoch, request.effect_deadline);
         let response = match route.build_authorized_abort_multipart_upload_command(
             &authorized_upload,
             request.expected_cleanup.as_ref(),
             &request.bucket_write_reservation,
+            effect_fence,
         ) {
             Ok(Some(command)) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command))
@@ -19027,6 +19039,9 @@ fn object_pg_error_response(error: ObjectPgActionError) -> StorageRpcErrorRespon
                 message: format!("metadata command contention during {context}"),
             }
         }
+        ObjectPgActionError::Store(error @ StoreError::RouteMapExpired { .. }) => {
+            store_error_response(error)
+        }
         error => StorageRpcErrorResponse {
             code: StorageRpcErrorCode::Internal,
             message: error.to_string(),
@@ -23980,6 +23995,134 @@ mod tests {
     }
 
     #[test]
+    fn unix_multipart_abort_build_rebinds_and_rejects_expired_effect_deadline() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_and_monotonic_override(1_000, 900_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("unix-expired-abort-bucket");
+        let key = crate::tests::object_key("unix-expired-abort-key");
+        let upload_id = crate::tests::multipart_upload_id("unix-expired-abort-upload");
+        let create = CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: crate::OwnerIdentity::from_principal("unix-expired-abort-owner"),
+            owner: crate::OwnerIdentity::from_principal("unix-expired-abort-owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        let node = Arc::clone(&server._node);
+        let (upload, cleanup, command_log_index_before) =
+            crate::clock::with_time_override(1_000, || {
+                let pg = node.get_pg(0).unwrap();
+                PgMetadataStore::create_multipart_upload(&*pg, &create).unwrap();
+                let upload = PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
+                let cleanup = pg
+                    .prepare_abort_multipart_upload_cleanup(&bucket, &key, &upload_id)
+                    .unwrap()
+                    .expect("in-progress upload must have abort cleanup");
+                let command_log_index = pg
+                    .max_metadata_command_log_index(config.cluster_epoch)
+                    .unwrap();
+                (upload, cleanup, command_log_index)
+            });
+        let authorized_upload =
+            crate::types::AuthorizedMultipartUploadRecord::assume_authorized(upload);
+        let mut proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+        proof.operation_kind = ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
+
+        let serving = thread::spawn(move || {
+            for _ in 0..2 {
+                crate::clock::with_time_and_monotonic_override(4_500, 903_500, || {
+                    server.accept_one().unwrap();
+                });
+            }
+        });
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let route = ObjectMutationMetadataNodeClient::open_multipart_abort_mutation_metadata_route(
+            &client,
+            config.cluster_epoch,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+            &upload_id,
+        )
+        .unwrap();
+        // The frontend still has 1,500 ms on its local monotonic clock and
+        // projects a portable wall deadline of 4,000 ms. The storage host
+        // receives the request at 4,500 ms and must reject it after rebinding
+        // that portable deadline to its unrelated monotonic clock.
+        let effect_fence = AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 11_500);
+        let ordinary_error = crate::clock::with_time_and_monotonic_override(2_500, 10_000, || {
+            route
+                .build_abort_multipart_upload_command(
+                    BuildAbortMultipartUploadCommandReq {
+                        expected_cleanup: Some(&cleanup),
+                        bucket_write_reservation: &proof,
+                    },
+                    effect_fence,
+                )
+                .unwrap_err()
+        });
+        assert!(
+            matches!(
+                &ordinary_error,
+                ObjectPgActionError::Store(StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                })
+            ),
+            "{ordinary_error:?}"
+        );
+        let authorized_error =
+            crate::clock::with_time_and_monotonic_override(2_500, 10_000, || {
+                route
+                    .build_authorized_abort_multipart_upload_command(
+                        BuildAuthorizedAbortMultipartUploadCommandReq {
+                            authorized_upload: &authorized_upload,
+                            expected_cleanup: Some(&cleanup),
+                            bucket_write_reservation: &proof,
+                        },
+                        effect_fence,
+                    )
+                    .unwrap_err()
+            });
+        assert!(
+            matches!(
+                &authorized_error,
+                ObjectPgActionError::Store(StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                })
+            ),
+            "{authorized_error:?}"
+        );
+        serving.join().unwrap();
+
+        let pg = node.get_pg(0).unwrap();
+        assert_eq!(
+            pg.max_metadata_command_log_index(config.cluster_epoch)
+                .unwrap(),
+            command_log_index_before,
+            "expired Unix abort builds must not advance the PG command log"
+        );
+    }
+
+    #[test]
     fn stalled_tls_handshake_does_not_block_the_next_storage_rpc_connection() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
@@ -25866,6 +26009,16 @@ mod tests {
             other => panic!("crossed stream part finalize proof must fail: {other:?}"),
         }
 
+        let expired_abort_cleanup = crate::clock::with_time_override(1_000, || {
+            primary_route
+                .load_abort_multipart_upload_cleanup(&upload_id)
+                .unwrap()
+                .expect("active upload must have abort cleanup")
+        });
+        let expired_authorized_upload =
+            crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
+                multipart_upload.clone(),
+            );
         let command_log_index_before_expired_builds = server
             ._node
             .get_pg(primary_route.route.pg_id.get())
@@ -25934,6 +26087,61 @@ mod tests {
                 now_ms: 4_500,
             })) if cluster_epoch == config.cluster_epoch
         ));
+        let expired_local_abort = crate::clock::with_time_override(4_500, || {
+            ObjectMutationMetadataNodeClient::open_multipart_abort_mutation_metadata_route(
+                &local_client,
+                config.cluster_epoch,
+                primary_route.route.pg_id,
+                &bucket,
+                &key,
+                &upload_id,
+            )
+            .and_then(|route| {
+                route.build_abort_multipart_upload_command(
+                    BuildAbortMultipartUploadCommandReq {
+                        expected_cleanup: Some(&expired_abort_cleanup),
+                        bucket_write_reservation: &abort_multipart_proof,
+                    },
+                    expired_effect_fence,
+                )
+            })
+        });
+        assert!(matches!(
+            expired_local_abort,
+            Err(ObjectPgActionError::Store(StoreError::RouteMapExpired {
+                cluster_epoch,
+                valid_until_ms: 5_000,
+                now_ms: 4_500,
+            })) if cluster_epoch == config.cluster_epoch
+        ));
+        let expired_local_authorized_abort = crate::clock::with_time_override(4_500, || {
+            ObjectMutationMetadataNodeClient::open_multipart_abort_mutation_metadata_route(
+                &local_client,
+                config.cluster_epoch,
+                primary_route.route.pg_id,
+                &bucket,
+                &key,
+                &upload_id,
+            )
+            .and_then(|route| {
+                route.build_authorized_abort_multipart_upload_command(
+                    BuildAuthorizedAbortMultipartUploadCommandReq {
+                        authorized_upload: &expired_authorized_upload,
+                        expected_cleanup: Some(&expired_abort_cleanup),
+                        bucket_write_reservation: &abort_multipart_proof,
+                    },
+                    expired_effect_fence,
+                )
+            })
+        });
+        assert!(matches!(
+            expired_local_authorized_abort,
+            Err(ObjectPgActionError::Store(StoreError::RouteMapExpired {
+                cluster_epoch,
+                valid_until_ms: 5_000,
+                now_ms: 4_500,
+            })) if cluster_epoch == config.cluster_epoch
+        ));
         assert_eq!(
             server
                 ._node
@@ -25942,7 +26150,7 @@ mod tests {
                 .max_metadata_command_log_index(config.cluster_epoch)
                 .unwrap(),
             command_log_index_before_expired_builds,
-            "expired finalization command builds must not allocate command IDs"
+            "expired finalization and abort command builds must not allocate command IDs"
         );
 
         let put_stream_command = crate::clock::with_time_override(1_000, || {
@@ -26201,6 +26409,7 @@ mod tests {
                     &upload_id,
                     Some(&abort_cleanup),
                     &abort_multipart_proof,
+                    AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                 )
                 .unwrap()
                 .expect("active upload must produce an abort command")
@@ -26217,6 +26426,7 @@ mod tests {
                     &authorized_upload,
                     Some(&abort_cleanup),
                     &abort_multipart_proof,
+                    AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                 )
                 .unwrap()
                 .expect("authorized active upload must produce an abort command")
@@ -26267,6 +26477,7 @@ mod tests {
                 &upload_id,
                 Some(&mismatched_abort_cleanup),
                 &abort_multipart_proof,
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
             )
         });
         match mismatched_abort {
@@ -26281,6 +26492,7 @@ mod tests {
                 &authorized_upload,
                 Some(&abort_cleanup),
                 &complete_multipart_proof,
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
             )
         });
         match crossed_abort_proof {
@@ -26908,6 +27120,7 @@ mod tests {
                             &upload_id,
                             Some(&abort_cleanup),
                             &abort_multipart_proof,
+                            AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                         )
                         .map(|_| ()),
                 ),
@@ -26918,6 +27131,7 @@ mod tests {
                             &authorized_upload,
                             Some(&abort_cleanup),
                             &abort_multipart_proof,
+                            AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                         )
                         .map(|_| ()),
                 ),

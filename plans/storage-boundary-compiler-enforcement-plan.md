@@ -4810,6 +4810,32 @@ One-hundred-and-twentieth Phase 3 slice:
   Workspace-wide strict Clippy and the transitional storage boundary checker
   also pass.
 
+One-hundred-and-twenty-first Phase 3 slice:
+
+- ordinary and authorization-bound multipart abort command construction now
+  carries the request admission's immutable effect fence through the scoped
+  embedded and Unix routes. The storage node conservatively rebinds the
+  portable wall deadline and the embedded builder revalidates immediately
+  before allocating the metadata command ID, after confirming the durable
+  cleanup snapshot.
+- raw storage/lifecycle abort entry points explicitly use unbounded internal
+  authority; the admitted server request path passes its captured fence. An
+  expired-fence regression covers both abort builders after the conservative
+  monotonic deadline but before the raw authority timestamp and proves that
+  neither allocates a command ID.
+- exact ordinary and authorized abort codec round trips pin the portable
+  deadline. Storage RPC frame encoding advances to version 13 with explicit
+  version-12 rejection, and the current-format inventory is updated.
+- an installed Unix regression sends a fence that remains valid on the
+  frontend but has expired when conservatively rebound to the storage host's
+  unrelated monotonic clock. Both ordinary and authorization-bound abort
+  command builds fail as stale-route requests, and the object PG command-log
+  index remains unchanged.
+- payload-reclaim command construction remains open in Phase 3.
+- all 2,561 storage tests and the full 7,883-test workspace suite pass.
+  Workspace-wide strict Clippy and the transitional storage boundary checker
+  also pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

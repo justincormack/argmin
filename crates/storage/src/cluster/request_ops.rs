@@ -15368,6 +15368,7 @@ impl super::StorageCluster {
                 key,
                 upload_id,
                 proof.clone(),
+                AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
             ) {
                 Ok(Some(command)) => command,
                 Ok(None) => {
@@ -15521,6 +15522,7 @@ impl super::StorageCluster {
                 object_pg_id,
                 authorized_upload,
                 proof.clone(),
+                effect_fence,
             ) {
                 Ok(Some(command)) => command,
                 Ok(None) => {
@@ -15608,6 +15610,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
         bucket_write_reservation: BucketWriteReservationProof,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let multipart_abort_route = mutation_client.open_multipart_abort_mutation_metadata_route(
@@ -15623,6 +15626,7 @@ impl super::StorageCluster {
                 expected_cleanup: expected_cleanup.as_ref(),
                 bucket_write_reservation: &bucket_write_reservation,
             },
+            effect_fence,
         )
     }
 
@@ -15631,6 +15635,7 @@ impl super::StorageCluster {
         pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         bucket_write_reservation: BucketWriteReservationProof,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
         let mutation_client = self.object_mutation_metadata_primary_client(
             &authorized_upload.record().bucket,
@@ -15656,6 +15661,7 @@ impl super::StorageCluster {
                 expected_cleanup: expected_cleanup.as_ref(),
                 bucket_write_reservation: &bucket_write_reservation,
             },
+            effect_fence,
         )
     }
 

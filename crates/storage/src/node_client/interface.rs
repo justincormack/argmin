@@ -702,11 +702,13 @@ pub(crate) trait MultipartAbortMutationMetadataRoute: Send {
     fn build_abort_multipart_upload_command(
         &self,
         request: BuildAbortMultipartUploadCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
 
     fn build_authorized_abort_multipart_upload_command(
         &self,
         request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
 }
 

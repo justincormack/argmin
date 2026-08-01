@@ -3205,7 +3205,9 @@ impl MultipartAbortMutationMetadataRoute for LocalMultipartAbortMutationMetadata
     fn build_abort_multipart_upload_command(
         &self,
         request: BuildAbortMultipartUploadCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
         require_multipart_abort_mutation_subject(
             MultipartAbortMutationSubject {
                 route_cluster_epoch: self.route_cluster_epoch,
@@ -3227,6 +3229,7 @@ impl MultipartAbortMutationMetadataRoute for LocalMultipartAbortMutationMetadata
         let Some(cleanup) = cleanup else {
             return Ok(None);
         };
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
         let command_id = self.client.next_metadata_command_id_from_locked_pg(
             self.pg_id.pg_id(),
             self.route_cluster_epoch,
@@ -3247,7 +3250,9 @@ impl MultipartAbortMutationMetadataRoute for LocalMultipartAbortMutationMetadata
     fn build_authorized_abort_multipart_upload_command(
         &self,
         request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
         require_multipart_abort_mutation_subject(
             MultipartAbortMutationSubject {
                 route_cluster_epoch: self.route_cluster_epoch,
@@ -3269,6 +3274,7 @@ impl MultipartAbortMutationMetadataRoute for LocalMultipartAbortMutationMetadata
         let Some(cleanup) = cleanup else {
             return Ok(None);
         };
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
         let command_id = self.client.next_metadata_command_id_from_locked_pg(
             self.pg_id.pg_id(),
             self.route_cluster_epoch,

@@ -3098,7 +3098,9 @@ impl MultipartAbortMutationMetadataRoute for UnixMultipartAbortMutationMetadataR
     fn build_abort_multipart_upload_command(
         &self,
         request: BuildAbortMultipartUploadCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
         require_multipart_abort_mutation_subject(
             MultipartAbortMutationSubject {
                 route_cluster_epoch: self.route_cluster_epoch,
@@ -3118,6 +3120,12 @@ impl MultipartAbortMutationMetadataRoute for UnixMultipartAbortMutationMetadataR
             upload_id: self.upload_id.clone(),
             expected_cleanup: request.expected_cleanup.cloned(),
             bucket_write_reservation: request.bucket_write_reservation.clone(),
+            effect_deadline: effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
         };
         let payload =
             encode_abort_multipart_command_build_request(&rpc_request).map_err(|error| {
@@ -3152,7 +3160,9 @@ impl MultipartAbortMutationMetadataRoute for UnixMultipartAbortMutationMetadataR
     fn build_authorized_abort_multipart_upload_command(
         &self,
         request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
         require_multipart_abort_mutation_subject(
             MultipartAbortMutationSubject {
                 route_cluster_epoch: self.route_cluster_epoch,
@@ -3172,6 +3182,12 @@ impl MultipartAbortMutationMetadataRoute for UnixMultipartAbortMutationMetadataR
             authorized_upload: request.authorized_upload.record().clone(),
             expected_cleanup: request.expected_cleanup.cloned(),
             bucket_write_reservation: request.bucket_write_reservation.clone(),
+            effect_deadline: effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
         };
         let payload = encode_authorized_abort_multipart_command_build_request(&rpc_request)
             .map_err(|error| {

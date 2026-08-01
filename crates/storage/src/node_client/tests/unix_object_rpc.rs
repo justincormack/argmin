@@ -2986,10 +2986,13 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
     ));
 
     let abort_command = correct_multipart_abort_route
-        .build_abort_multipart_upload_command(BuildAbortMultipartUploadCommandReq {
-            expected_cleanup: Some(&cleanup),
-            bucket_write_reservation: &abort_proof,
-        })
+        .build_abort_multipart_upload_command(
+            BuildAbortMultipartUploadCommandReq {
+                expected_cleanup: Some(&cleanup),
+                bucket_write_reservation: &abort_proof,
+            },
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
+        )
         .unwrap()
         .expect("in-progress upload produces abort command");
     assert!(matches!(
@@ -2998,10 +3001,13 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
             if abort.upload_id == upload_id
     ));
     assert_object_payload_decode!(wrong_multipart_abort_route
-        .build_abort_multipart_upload_command(BuildAbortMultipartUploadCommandReq {
-            expected_cleanup: Some(&cleanup),
-            bucket_write_reservation: &abort_proof,
-        },));
+        .build_abort_multipart_upload_command(
+            BuildAbortMultipartUploadCommandReq {
+                expected_cleanup: Some(&cleanup),
+                bucket_write_reservation: &abort_proof,
+            },
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL)
+        ));
     let mut crossed_abort_target_proof = abort_proof.clone();
     crossed_abort_target_proof.target_context = Some("crossed-abort-key".to_string());
     let mut crossed_abort_epoch_proof = abort_proof.clone();
@@ -3017,6 +3023,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
                     expected_cleanup: Some(&cleanup),
                     bucket_write_reservation: crossed_proof,
                 },
+                AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             ),
             Err(ObjectPgActionError::Store(
                 StoreError::RouteCapabilitySubjectMismatch {
@@ -3033,6 +3040,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
                 expected_cleanup: Some(&crossed_abort_cleanup),
                 bucket_write_reservation: &abort_proof,
             },
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
         ),
         Err(ObjectPgActionError::Store(
             StoreError::RouteCapabilitySubjectMismatch {
@@ -3048,6 +3056,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
                 expected_cleanup: Some(&cleanup),
                 bucket_write_reservation: &abort_proof,
             },
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
         )
         .unwrap()
         .expect("authorized in-progress upload produces abort command");
@@ -3058,6 +3067,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
                 expected_cleanup: Some(&cleanup),
                 bucket_write_reservation: &abort_proof,
             },
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
         ));
     assert!(matches!(
         correct_multipart_abort_route.build_authorized_abort_multipart_upload_command(
@@ -3066,6 +3076,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
                 expected_cleanup: Some(&cleanup),
                 bucket_write_reservation: &complete_proof,
             },
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
         ),
         Err(ObjectPgActionError::Store(
             StoreError::RouteCapabilitySubjectMismatch {
@@ -3084,6 +3095,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
                 expected_cleanup: Some(&cleanup),
                 bucket_write_reservation: &abort_proof,
             },
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
         ),
         Err(ObjectPgActionError::Store(
             StoreError::RouteCapabilitySubjectMismatch {
@@ -6379,6 +6391,39 @@ fn unix_object_mutation_client_rejects_malformed_abort_multipart_response() {
         stream_uploads: Vec::new(),
         stream_upload_segments: Vec::new(),
     };
+    let effect_deadline = Some(StorageRpcAdmittedRouteEffectDeadline {
+        authority_valid_until_ms: 5_000,
+        portable_wall_valid_until_ms: 4_000,
+    });
+    let rpc_request = StorageRpcAbortMultipartCommandBuildRequest {
+        object: client.object_request(PgId::new(0), &bucket, &key),
+        upload_id: upload_id.clone(),
+        expected_cleanup: Some(cleanup.clone()),
+        bucket_write_reservation: proof.clone(),
+        effect_deadline,
+    };
+    let encoded =
+        crate::storage_rpc::encode_abort_multipart_command_build_request(&rpc_request).unwrap();
+    assert_eq!(
+        crate::storage_rpc::decode_abort_multipart_command_build_request(&encoded).unwrap(),
+        rpc_request
+    );
+    let authorized_rpc_request = StorageRpcAuthorizedAbortMultipartCommandBuildRequest {
+        object: client.object_request(PgId::new(0), &bucket, &key),
+        authorized_upload: cleanup.upload.clone(),
+        expected_cleanup: Some(cleanup.clone()),
+        bucket_write_reservation: proof.clone(),
+        effect_deadline,
+    };
+    let encoded = crate::storage_rpc::encode_authorized_abort_multipart_command_build_request(
+        &authorized_rpc_request,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::storage_rpc::decode_authorized_abort_multipart_command_build_request(&encoded)
+            .unwrap(),
+        authorized_rpc_request
+    );
     let command = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
             ClusterEpoch::new(1).unwrap(),

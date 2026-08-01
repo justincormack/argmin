@@ -79,7 +79,7 @@ use std::io::{Read, Write};
 use std::num::{NonZeroU16, NonZeroU32};
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 12;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 13;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -2205,6 +2205,7 @@ pub(crate) struct StorageRpcAbortMultipartCommandBuildRequest {
     pub(crate) upload_id: UploadId,
     pub(crate) expected_cleanup: Option<AbortMultipartUploadCleanup>,
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2224,6 +2225,7 @@ pub(crate) struct StorageRpcAuthorizedAbortMultipartCommandBuildRequest {
     pub(crate) authorized_upload: MultipartUploadRecord,
     pub(crate) expected_cleanup: Option<AbortMultipartUploadCleanup>,
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
 }
 
 fn object_payload_reclaim_matches_object(
@@ -6547,6 +6549,7 @@ pub(crate) fn encode_abort_multipart_command_build_request(
     put_string(&mut out, request.upload_id.as_str());
     put_optional_abort_multipart_upload_cleanup(&mut out, request.expected_cleanup.as_ref());
     put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
+    put_admitted_route_effect_deadline(&mut out, request.effect_deadline);
     Ok(out)
 }
 
@@ -6558,6 +6561,8 @@ pub(crate) fn decode_abort_multipart_command_build_request(
     let upload_id = decoder.read_upload_id()?;
     let expected_cleanup = decoder.read_optional_abort_multipart_upload_cleanup()?;
     let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
+    let effect_deadline =
+        decoder.read_admitted_route_effect_deadline("abort multipart command build")?;
     decoder.finish()?;
     if bucket_write_reservation.bucket != object.bucket {
         return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
@@ -6577,6 +6582,7 @@ pub(crate) fn decode_abort_multipart_command_build_request(
         upload_id,
         expected_cleanup,
         bucket_write_reservation,
+        effect_deadline,
     })
 }
 
@@ -6630,6 +6636,7 @@ pub(crate) fn encode_authorized_abort_multipart_command_build_request(
     put_multipart_upload_record(&mut out, &request.authorized_upload);
     put_optional_abort_multipart_upload_cleanup(&mut out, request.expected_cleanup.as_ref());
     put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
+    put_admitted_route_effect_deadline(&mut out, request.effect_deadline);
     Ok(out)
 }
 
@@ -6641,6 +6648,8 @@ pub(crate) fn decode_authorized_abort_multipart_command_build_request(
     let authorized_upload = decoder.read_multipart_upload_record()?;
     let expected_cleanup = decoder.read_optional_abort_multipart_upload_cleanup()?;
     let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
+    let effect_deadline =
+        decoder.read_admitted_route_effect_deadline("authorized abort multipart command build")?;
     decoder.finish()?;
     if authorized_upload.bucket != object.bucket
         || authorized_upload.key != object.key
@@ -6668,6 +6677,7 @@ pub(crate) fn decode_authorized_abort_multipart_command_build_request(
         authorized_upload,
         expected_cleanup,
         bucket_write_reservation,
+        effect_deadline,
     })
 }
 
@@ -18120,7 +18130,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&12u16.to_le_bytes());
+        expected.extend_from_slice(&13u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -18131,15 +18141,15 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_rejects_version_eleven_fixture() {
+    fn storage_rpc_frame_rejects_version_twelve_fixture() {
         let mut bytes =
             encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
         let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&11_u16.to_le_bytes());
+        bytes[version_offset..version_offset + 2].copy_from_slice(&12_u16.to_le_bytes());
 
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnsupportedVersion(11))
+            Err(StorageRpcFrameError::UnsupportedVersion(12))
         );
     }
 
