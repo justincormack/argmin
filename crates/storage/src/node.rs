@@ -55,9 +55,9 @@ use crate::types::CreateBucketConfig;
 use crate::types::ListMultipartUploadsReq;
 #[cfg(test)]
 use crate::types::{
-    AuthorizedMultipartUploadRecord, BucketState, ListObjectVersionsReq, ListedMultipartParts,
-    MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartUploadManagementLookup,
-    ObjectReadSnapshotOutcome,
+    AuthorizedMultipartUploadRecord, BucketState, ListObjectVersionsReq, ListPartsReq,
+    ListedMultipartParts, MultipartCompletionPreflight, MultipartCompletionSnapshot,
+    MultipartUploadManagementLookup, ObjectReadSnapshotOutcome,
 };
 use crate::types::{
     BucketDeleteFinalizeRoot, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotRequest,
@@ -67,10 +67,10 @@ use crate::types::{
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
-    CreateStreamUploadReq, ListPartsReq, ListPartsResp, MultipartPartRecord,
-    MultipartPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord, ObjectPartRecord,
-    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, PayloadReclaimRoot, PutLiveObjectReq,
-    SessionId, StreamUploadRecord, StreamUploadSegmentRecord, UploadId, UploadState,
+    CreateStreamUploadReq, MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimRecord,
+    MultipartUploadRecord, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    PayloadReclaimRoot, PutLiveObjectReq, SessionId, StreamUploadRecord, StreamUploadSegmentRecord,
+    UploadId, UploadState,
 };
 #[cfg(test)]
 use crate::types::{StreamUploadState, StreamUploadTarget};
@@ -1057,18 +1057,6 @@ impl SharedStorageNode {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
         Ok(pg.get_multipart_part(upload_id, u32::from(part_number))?)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_list_multipart_parts(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        req: &ListPartsReq,
-    ) -> Result<ListPartsResp, ObjectPgActionError> {
-        let pg_id = self.test_object_pg_id_for(bucket, key);
-        let pg = self.get_pg(pg_id)?;
-        Ok(pg.list_multipart_parts(req)?)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

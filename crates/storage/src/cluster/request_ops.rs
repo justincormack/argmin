@@ -16175,17 +16175,6 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_list_multipart_parts(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        req: &ListPartsReq,
-    ) -> Result<ListPartsResp, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
-            .test_list_multipart_parts(bucket, key, req)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_list_multipart_uploads_for_bucket(
         &self,
         bucket: &BucketName,

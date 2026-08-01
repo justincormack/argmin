@@ -14778,9 +14778,10 @@ impl<'a> StorageRpcDecoder<'a> {
     fn read_listed_multipart_parts(
         &mut self,
     ) -> Result<ListedMultipartParts, StorageRpcPayloadError> {
-        Ok(ListedMultipartParts {
-            upload: self.read_multipart_upload_record()?,
-            response: self.read_list_parts_resp()?,
+        let upload = self.read_multipart_upload_record()?;
+        let response = self.read_list_parts_resp()?;
+        ListedMultipartParts::from_storage(upload, response).map_err(|_| {
+            StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid multipart parts listing")
         })
     }
 

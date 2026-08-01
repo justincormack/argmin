@@ -252,7 +252,7 @@ fn multipart_trace_upload_snapshot(
     let parts = if upload_exists {
         crate::PgMetadataStore::list_multipart_parts(
             &*pg,
-            &crate::ListPartsReq {
+            &crate::types::ListPartsReq {
                 upload_id: upload.upload_id.clone(),
                 part_number_marker: None,
                 max_parts: 1000,

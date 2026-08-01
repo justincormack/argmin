@@ -121,7 +121,7 @@ impl SharedStorageNode {
             .collect::<std::collections::BTreeSet<_>>();
         let all_parts = PgMetadataStore::list_multipart_parts(
             &*pg,
-            &crate::ListPartsReq {
+            &crate::types::ListPartsReq {
                 upload_id: upload_id.clone(),
                 part_number_marker: None,
                 max_parts: u32::MAX,
@@ -252,7 +252,13 @@ impl SharedStorageNode {
             part_number_marker,
             max_parts,
         })?;
-        Ok(ListedMultipartParts { upload, response })
+        ListedMultipartParts::from_storage(upload, response).map_err(|reason| {
+            crate::error::MetadataError::InvariantViolation {
+                context: "project multipart parts listing",
+                reason: reason.to_string(),
+            }
+            .into()
+        })
     }
 
     #[cfg(test)]

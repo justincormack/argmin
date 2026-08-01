@@ -5318,7 +5318,7 @@ pub enum MultipartUploadListMarker {
 }
 
 /// Request to list parts of a multipart upload.
-pub struct ListPartsReq {
+pub(crate) struct ListPartsReq {
     pub upload_id: UploadId,
     pub part_number_marker: Option<u32>,
     pub max_parts: u32,
@@ -5326,16 +5326,113 @@ pub struct ListPartsReq {
 
 /// Response from listing parts of a multipart upload.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ListPartsResp {
+pub(crate) struct ListPartsResp {
     pub parts: Vec<MultipartPartRecord>,
     pub is_truncated: bool,
     pub next_part_number_marker: Option<u32>,
 }
 
+/// Logical S3 fields for one listed multipart part.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedMultipartPart {
+    pub part_number: u32,
+    pub size: u64,
+    pub etag: String,
+    pub last_modified: u64,
+    pub checksum: Option<ChecksumBytes>,
+}
+
+/// Opaque storage-owned result of listing parts for an authorized upload.
+///
+/// Durable upload and part records remain private to storage. Callers receive
+/// only the logical fields needed to render the S3 ListParts response.
+#[derive(Clone)]
 pub struct ListedMultipartParts {
-    pub upload: MultipartUploadRecord,
-    pub response: ListPartsResp,
+    pub(crate) upload: MultipartUploadRecord,
+    pub(crate) response: ListPartsResp,
+    parts: Vec<ListedMultipartPart>,
+}
+
+impl ListedMultipartParts {
+    pub(crate) fn from_storage(
+        upload: MultipartUploadRecord,
+        response: ListPartsResp,
+    ) -> Result<Self, &'static str> {
+        let parts = response
+            .parts
+            .iter()
+            .map(|part| {
+                let etag = ObjectEtag::from_parts(&part.etag, part.etag_kind, None)?.format();
+                Ok(ListedMultipartPart {
+                    part_number: part.part_number,
+                    size: part.size,
+                    etag,
+                    last_modified: part.last_modified,
+                    checksum: part.checksum.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, &'static str>>()?;
+        Ok(Self {
+            upload,
+            response,
+            parts,
+        })
+    }
+
+    #[must_use]
+    pub fn parts(&self) -> &[ListedMultipartPart] {
+        &self.parts
+    }
+
+    #[must_use]
+    pub fn is_truncated(&self) -> bool {
+        self.response.is_truncated
+    }
+
+    #[must_use]
+    pub fn next_part_number_marker(&self) -> Option<u32> {
+        self.response.next_part_number_marker
+    }
+
+    #[must_use]
+    pub fn owner(&self) -> &OwnerIdentity {
+        &self.upload.owner
+    }
+
+    #[must_use]
+    pub fn initiator(&self) -> &OwnerIdentity {
+        &self.upload.initiator
+    }
+
+    #[must_use]
+    pub fn checksum_config(&self) -> Option<MultipartChecksumConfig> {
+        self.upload.checksum
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &ObjectKey {
+        &self.upload.key
+    }
+
+    #[must_use]
+    pub fn initiated_at(&self) -> u64 {
+        self.upload.initiated_at
+    }
+}
+
+impl std::fmt::Debug for ListedMultipartParts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ListedMultipartParts")
+            .field("parts", &self.parts)
+            .field("is_truncated", &self.is_truncated())
+            .field("next_part_number_marker", &self.next_part_number_marker())
+            .field("owner", self.owner())
+            .field("initiator", self.initiator())
+            .field("checksum_config", &self.checksum_config())
+            .field("key", self.key())
+            .field("initiated_at", &self.initiated_at())
+            .finish()
+    }
 }
 
 /// Staging version id for multipart part segment rows before

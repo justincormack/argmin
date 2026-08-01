@@ -1057,6 +1057,20 @@ physical fields, or caller-supplied subject fields. Multipart initiation, listin
 remaining public physical record representations are still pending, so implementation-order item
 3 is not yet complete.
 
+The thirteenth bounded slice continues implementation-order item 3 with ListParts. Storage now
+retains the complete durable multipart-upload record and physical part records, and exposes only
+the upload identity fields and logical per-part number, size, S3 ETag, timestamp, and checksum
+needed to render the response. The storage-owned projection validates each stored ETag rather than
+allowing malformed durable bytes to become a zero ETag in the coordinator. The storage RPC bytes
+remain unchanged: encoding uses the private physical records, while decoding reconstructs the
+logical view before the result can cross the crate boundary. The raw list request/response types
+and the former cross-crate test hook are private or removed; the coordinator regression now tests
+through the supported ListParts operation. Compiler visibility is the primary boundary, with
+checks rejecting physical listing types or fields in the production coordinator, public raw
+request/response representations, and physical fields in the opaque result's `Debug` output.
+Multipart initiation, upload-listing, authorization/abort, and remaining public physical record
+representations are still pending, so implementation-order item 3 is not yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

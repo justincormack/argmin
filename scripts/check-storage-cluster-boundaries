@@ -2310,6 +2310,66 @@ fail_with_matches \
     "Multipart completion subject and generation must come from the opaque snapshot rather than caller-supplied commit input" \
     "$multipart_completion_caller_supplied_subject_fields"
 
+server_core_multipart_listing_physical_leaks=$(
+    rg -n --color=never \
+        '\b(ListPartsReq|ListPartsResp|MultipartPartRecord)\b|listed\.(upload|response)\b' \
+        crates/server-core/src/coordinator/multipart.rs \
+        || true
+)
+fail_with_matches \
+    "Server-core multipart listing must use the logical storage-owned listing view rather than durable upload or part records" \
+    "$server_core_multipart_listing_physical_leaks"
+
+public_multipart_listing_physical_surfaces=$(
+    rg -n --color=never \
+        '^[[:space:]]*pub[[:space:]]+(struct[[:space:]]+(ListPartsReq|ListPartsResp)|use.*\b(ListPartsReq|ListPartsResp)\b)' \
+        crates/storage/src/types.rs \
+        crates/storage/src/lib.rs \
+        || true
+)
+fail_with_matches \
+    "Multipart listing request and physical response representations must remain private to storage" \
+    "$public_multipart_listing_physical_surfaces"
+
+multipart_listing_physical_debug_leaks=$(
+    awk '
+    /impl std::fmt::Debug for ListedMultipartParts[[:space:]]*\{/ {
+        in_opaque_debug = 1
+    }
+    in_opaque_debug && /self\.(upload|response)/ {
+        print FILENAME ":" FNR ":" $0
+    }
+    in_opaque_debug && /^}/ {
+        in_opaque_debug = 0
+    }
+    ' crates/storage/src/types.rs
+)
+fail_with_matches \
+    "Opaque multipart listing Debug output must not expose durable upload or part records" \
+    "$multipart_listing_physical_debug_leaks"
+
+multipart_listing_derived_equality=$(
+    awk '
+    /#\[derive\(/ {
+        derive = $0
+        next
+    }
+    /pub struct ListedMultipartParts[[:space:]]*\{/ {
+        if (derive ~ /PartialEq|Eq/) {
+            print FILENAME ":" FNR ":" derive
+        }
+    }
+    {
+        if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^#\[derive\(/) {
+            derive = ""
+        }
+    }
+    ' crates/storage/src/types.rs
+)
+fail_with_matches \
+    "Opaque multipart listing equality must not expose differences in private durable state" \
+    "$multipart_listing_derived_equality"
+
 public_stream_append_hash_surfaces=$(
     rg -n --color=never \
         '^[[:space:]]*pub[[:space:]]+(mod[[:space:]]+shard_key_hash|fn[[:space:]]+stream_segment_key_hash)\b' \

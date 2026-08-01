@@ -2824,6 +2824,10 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
         .list_multipart_parts(None, 10)
         .unwrap();
     assert_eq!(listed.response.parts, vec![part.clone()]);
+    assert_eq!(listed.parts().len(), 1);
+    assert_eq!(listed.parts()[0].part_number, part.part_number);
+    assert_eq!(listed.parts()[0].size, part.size);
+    assert_eq!(listed.parts()[0].etag, "\"0101010101010101\"");
     assert_object_payload_decode!(wrong_authorized_upload_route.list_multipart_parts(None, 10));
 
     assert!(matches!(
@@ -4555,14 +4559,36 @@ fn unix_object_mutation_client_rejects_malformed_multipart_read_responses() {
         })
     ));
 
-    let listed = ListedMultipartParts {
-        upload: upload.clone(),
-        response: crate::types::ListPartsResp {
+    let listed = ListedMultipartParts::from_storage(
+        upload.clone(),
+        crate::types::ListPartsResp {
             parts: vec![part.clone()],
             is_truncated: false,
             next_part_number_marker: Some(1),
         },
-    };
+    )
+    .unwrap();
+    assert_eq!(listed.parts().len(), 1);
+    assert_eq!(listed.parts()[0].part_number, 1);
+    assert_eq!(listed.parts()[0].etag, "\"0101010101010101\"");
+    let listed_debug = format!("{listed:?}");
+    assert!(!listed_debug.contains(upload_id.as_str()));
+    assert!(!listed_debug.contains("placement_cluster_epoch"));
+
+    let mut malformed_part = part.clone();
+    malformed_part.etag.pop();
+    assert_eq!(
+        ListedMultipartParts::from_storage(
+            upload.clone(),
+            crate::types::ListPartsResp {
+                parts: vec![malformed_part],
+                is_truncated: false,
+                next_part_number_marker: Some(1),
+            },
+        )
+        .unwrap_err(),
+        "etag must be exactly 8 bytes"
+    );
     client
         .validate_listed_multipart_parts_response(&listed, &authorized_upload, None, 1)
         .unwrap();
@@ -4651,14 +4677,15 @@ fn unix_object_mutation_client_rejects_malformed_multipart_read_responses() {
             ..
         })
     ));
-    let zero_page_listed = ListedMultipartParts {
-        upload: upload.clone(),
-        response: crate::types::ListPartsResp {
+    let zero_page_listed = ListedMultipartParts::from_storage(
+        upload.clone(),
+        crate::types::ListPartsResp {
             parts: Vec::new(),
             is_truncated: false,
             next_part_number_marker: Some(0),
         },
-    };
+    )
+    .unwrap();
     client
         .validate_listed_multipart_parts_response(&zero_page_listed, &authorized_upload, None, 0)
         .unwrap();

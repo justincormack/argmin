@@ -1990,17 +1990,17 @@ fn upload_part_multiple_parts() {
 
     // Verify all three parts exist.
     let parts_resp = coord
-        .storage_node()
-        .test_list_multipart_parts(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            &storage::ListPartsReq {
-                upload_id: UploadId::try_from(create.upload_id.as_str())
-                    .expect("generated multipart upload ID is valid"),
-                part_number_marker: None,
-                max_parts: 100,
-            },
-        )
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &create.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number_marker: None,
+            max_parts: 100,
+        })
         .unwrap();
     assert_eq!(parts_resp.parts.len(), 3);
     assert_eq!(parts_resp.parts[0].part_number, 1);

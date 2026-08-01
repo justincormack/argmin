@@ -1275,26 +1275,27 @@ impl Coordinator {
             .map_err(Self::map_object_pg_action_error)?;
         #[cfg(test)]
         super::maybe_run_list_parts_storage_list_hook(req.upload.bucket_name(), req.upload.key());
-        let upload = listed.upload;
-        let resp = listed.response;
-        let upload_initiated_at = upload.initiated_at;
-        let checksum_algorithm = upload.checksum.map(MultipartChecksumConfig::algorithm);
-        let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);
+        let upload_initiated_at = listed.initiated_at();
+        let checksum_algorithm = listed
+            .checksum_config()
+            .map(MultipartChecksumConfig::algorithm);
+        let checksum_type = listed
+            .checksum_config()
+            .map(MultipartChecksumConfig::checksum_type);
 
-        let parts = resp
-            .parts
+        let parts = listed
+            .parts()
             .iter()
             .map(|p| {
                 use base64::Engine;
-                let etag_crc = etag_bytes_to_crc64(&p.etag).unwrap_or(0);
                 let checksum = p
                     .checksum
                     .as_ref()
-                    .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes));
+                    .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes.as_ref()));
                 PartEntry {
                     part_number: p.part_number,
                     size: p.size,
-                    etag: format_etag(etag_crc),
+                    etag: p.etag.clone(),
                     last_modified: p.last_modified,
                     checksum,
                 }
@@ -1303,16 +1304,16 @@ impl Coordinator {
 
         Ok(ListPartsResult {
             parts,
-            is_truncated: resp.is_truncated,
-            next_part_number_marker: resp.next_part_number_marker,
-            owner: upload.owner.clone(),
-            initiator: upload.initiator.clone(),
+            is_truncated: listed.is_truncated(),
+            next_part_number_marker: listed.next_part_number_marker(),
+            owner: listed.owner().clone(),
+            initiator: listed.initiator().clone(),
             checksum_algorithm,
             checksum_type,
             lifecycle_abort: self.multipart_lifecycle_abort_headers_on_admitted_route(
                 admission,
                 &bucket_info,
-                upload.key.as_str(),
+                listed.key().as_str(),
                 upload_initiated_at,
             )?,
         })

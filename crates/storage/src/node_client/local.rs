@@ -3942,7 +3942,13 @@ impl LocalStorageNodeClient {
             part_number_marker,
             max_parts,
         })?;
-        Ok(ListedMultipartParts { upload, response })
+        ListedMultipartParts::from_storage(upload, response).map_err(|reason| {
+            MetadataError::InvariantViolation {
+                context: "project multipart parts listing",
+                reason: reason.to_string(),
+            }
+            .into()
+        })
     }
 
     fn lookup_multipart_upload_management(
