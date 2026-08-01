@@ -44,21 +44,21 @@ use crate::metadata_command::{
 use crate::node_client::MetadataCommandNodeClient;
 use crate::node_client::{
     complete_multipart_expected_object_parts, AcquireObjectPayloadReclaimClaimReq,
-    BucketMetadataNodeClient, BucketMetadataScanRoute, BucketWriteReservationNodeClient,
-    BuildAbortMultipartUploadCommandReq, BuildAuthorizedAbortMultipartUploadCommandReq,
-    BuildCompleteMultipartObjectCommandReq, BuildCreateMultipartUploadCommandReq,
-    BuildCreateStreamUploadCommandReq, BuildDeleteCurrentObjectCommandReq,
-    BuildDeleteObjectPayloadReclaimCommandReq, BuildDeleteSpecificObjectVersionCommandReq,
-    BuildDirectPutCommitCommandReq, BuildInsertDeleteMarkerCommandReq,
-    BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
-    BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
-    DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
-    ObjectDeleteStorageSnapshot, ObjectGenerationMetadataNodeClient,
-    ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
-    ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
-    RetainedBucketWriteReservationNodeClient, RetainedMetadataCommandNodeClient,
-    RetainedObjectMutationMetadataNodeClient, ShardAckNodeClient, ShardScavengerNodeClient,
-    ShardScavengerObservationNodeClient,
+    BucketMetadataNodeClient, BucketMetadataRoute, BucketMetadataScanRoute,
+    BucketWriteReservationNodeClient, BuildAbortMultipartUploadCommandReq,
+    BuildAuthorizedAbortMultipartUploadCommandReq, BuildCompleteMultipartObjectCommandReq,
+    BuildCreateMultipartUploadCommandReq, BuildCreateStreamUploadCommandReq,
+    BuildDeleteCurrentObjectCommandReq, BuildDeleteObjectPayloadReclaimCommandReq,
+    BuildDeleteSpecificObjectVersionCommandReq, BuildDirectPutCommitCommandReq,
+    BuildInsertDeleteMarkerCommandReq, BuildPutObjectMetadataCommandReq,
+    BuildStreamPartCommitCommandReq, BuildStreamPutCommitCommandReq, CreateBucketCommandBuild,
+    CreateStreamUploadPrecondition, DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload,
+    MarkBucketDeletingCommandBuild, ObjectDeleteStorageSnapshot,
+    ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
+    ObjectMutationMetadataNodeClient, ObjectReadMetadataNodeClient,
+    ObjectVersionMetadataNodeClient, RetainedBucketWriteReservationNodeClient,
+    RetainedMetadataCommandNodeClient, RetainedObjectMutationMetadataNodeClient,
+    ShardAckNodeClient, ShardScavengerNodeClient, ShardScavengerObservationNodeClient,
 };
 use crate::node_runtime::pg_store::{
     initialize_pg_durable_identity, inspect_pg_shard_inventory, sync_initialized_pg_store_layout,
@@ -4189,16 +4189,30 @@ impl StorageNodeActiveBucketRoute<'_> {
             .map_err(StorageNodeBucketRouteError::Route)
     }
 
+    fn open_local_metadata_route<'a>(
+        &self,
+        client: &'a LocalStorageNodeClient,
+    ) -> Result<Box<dyn BucketMetadataRoute + 'a>, StorageNodeBucketRouteError> {
+        BucketMetadataNodeClient::open_bucket_metadata_route(
+            client,
+            self.fence.cluster_epoch,
+            self.pg_id,
+            self.bucket,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+
     fn head_bucket(&self, filtered: bool) -> Result<BucketInfo, StorageNodeBucketRouteError> {
         self.require_valid_now()?;
         let local_client = LocalStorageNodeClient::new(
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
+        let route = self.open_local_metadata_route(&local_client)?;
         let result = if filtered {
-            BucketMetadataNodeClient::head_bucket_info(&local_client, self.pg_id, self.bucket)
+            route.head_bucket_info()
         } else {
-            BucketMetadataNodeClient::head_bucket_raw(&local_client, self.pg_id, self.bucket)
+            route.head_bucket_raw()
         };
         result.map_err(StorageNodeBucketRouteError::Bucket)
     }
@@ -4212,13 +4226,11 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketMetadataNodeClient::get_bucket_subresource(
-            &local_client,
-            self.pg_id,
-            self.bucket,
-            kind,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let result = self
+            .open_local_metadata_route(&local_client)?
+            .get_bucket_subresource(kind)
+            .map_err(StorageNodeBucketRouteError::Bucket);
+        result
     }
 
     fn load_snapshot(
@@ -4230,13 +4242,11 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketMetadataNodeClient::load_bucket_snapshot(
-            &local_client,
-            self.pg_id,
-            self.bucket,
-            request,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let result = self
+            .open_local_metadata_route(&local_client)?
+            .load_bucket_snapshot(request)
+            .map_err(StorageNodeBucketRouteError::Bucket);
+        result
     }
 
     fn acquire_write_reservation(
@@ -4689,8 +4699,16 @@ impl StorageNodeBucketDeleteReplicaHeadRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketMetadataNodeClient::head_bucket_raw(&local_client, self.pg_id, self.bucket)
-            .map_err(StorageNodeBucketRouteError::Bucket)
+        let result = BucketMetadataNodeClient::open_bucket_delete_replica_metadata_route(
+            &local_client,
+            self.fence.cluster_epoch,
+            self.pg_id,
+            self.bucket,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)?
+        .head_bucket_replica_for_delete()
+        .map_err(StorageNodeBucketRouteError::Bucket);
+        result
     }
 }
 
@@ -4706,14 +4724,18 @@ impl StorageNodeActiveBucketRoutePair<'_> {
             self.source.handler.config.node_id,
             Arc::clone(&self.source.handler.node),
         );
-        BucketMetadataNodeClient::load_bucket_snapshot_pair(
+        let result = BucketMetadataNodeClient::open_bucket_metadata_route_pair(
             &local_client,
+            self.source.fence.cluster_epoch,
             self.source.pg_id,
-            (self.source.bucket, source_request),
+            self.source.bucket,
             self.destination.pg_id,
-            (self.destination.bucket, destination_request),
+            self.destination.bucket,
         )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        .map_err(StorageNodeBucketRouteError::Bucket)?
+        .load_bucket_snapshot_pair(source_request, destination_request)
+        .map_err(StorageNodeBucketRouteError::Bucket);
+        result
     }
 }
 
@@ -12745,13 +12767,18 @@ impl StorageNodeConnectionHandler {
         let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let config = request.config.as_create_bucket_config();
-        match BucketMetadataNodeClient::build_create_bucket_command(
+        let route = match BucketMetadataNodeClient::open_bucket_metadata_route(
             &local_client,
+            request.cluster_epoch,
             bucket_pg_id,
             &request.bucket,
-            request.command_id,
-            &config,
         ) {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
+            }
+        };
+        match route.build_create_bucket_command(request.command_id, &config) {
             Ok(CreateBucketCommandBuild::Exists(info)) => {
                 let payload = encode_create_bucket_command_build_response(
                     &StorageRpcCreateBucketCommandBuildResponse {
@@ -12790,10 +12817,18 @@ impl StorageNodeConnectionHandler {
         }
         let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketMetadataNodeClient::build_advance_multipart_completion_barrier_command(
+        let route = match BucketMetadataNodeClient::open_bucket_metadata_route(
             &local_client,
+            request.cluster_epoch,
             bucket_pg_id,
             &request.bucket,
+        ) {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
+            }
+        };
+        match route.build_advance_multipart_completion_barrier_command(
             request.command_id,
             &request.completion_target_context,
             &request.bucket_write_reservation,
@@ -12823,50 +12858,39 @@ impl StorageNodeConnectionHandler {
         }
         let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket.bucket);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let route = match BucketMetadataNodeClient::open_bucket_metadata_route(
+            &local_client,
+            request.bucket.cluster_epoch,
+            bucket_pg_id,
+            &request.bucket.bucket,
+        ) {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
+            }
+        };
         let result = match (&request.mutation, request.command.payload()) {
             (
                 StorageRpcBucketMetadataControlMutation::MarkDeleting,
                 MetadataCommandPayload::MarkBucketDeleting(command),
-            ) => BucketMetadataNodeClient::pending_mark_bucket_deleting_command_matches_current(
-                &local_client,
-                bucket_pg_id,
-                &request.bucket.bucket,
-                command,
-            ),
+            ) => route.pending_mark_bucket_deleting_command_matches_current(command),
             (
                 StorageRpcBucketMetadataControlMutation::Versioning(state),
                 MetadataCommandPayload::PutBucketVersioning(command),
-            ) => BucketMetadataNodeClient::pending_put_bucket_versioning_command_matches_current(
-                &local_client,
-                bucket_pg_id,
-                &request.bucket.bucket,
-                command,
-                *state,
-            ),
+            ) => route.pending_put_bucket_versioning_command_matches_current(command, *state),
             (
                 StorageRpcBucketMetadataControlMutation::Acl {
                     acl_grants,
                     summary,
                 },
                 MetadataCommandPayload::PutBucketAcl(command),
-            ) => BucketMetadataNodeClient::pending_put_bucket_acl_command_matches_current(
-                &local_client,
-                bucket_pg_id,
-                &request.bucket.bucket,
-                command,
-                acl_grants,
-                *summary,
-            ),
+            ) => {
+                route.pending_put_bucket_acl_command_matches_current(command, acl_grants, *summary)
+            }
             (
                 StorageRpcBucketMetadataControlMutation::Property(mutation),
                 MetadataCommandPayload::PutBucketProperty(command),
-            ) => BucketMetadataNodeClient::pending_put_bucket_property_command_matches_current(
-                &local_client,
-                bucket_pg_id,
-                &request.bucket.bucket,
-                command,
-                mutation,
-            ),
+            ) => route.pending_put_bucket_property_command_matches_current(command, mutation),
             _ => {
                 return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                     code: StorageRpcErrorCode::PayloadDecode,
@@ -12898,6 +12922,17 @@ impl StorageNodeConnectionHandler {
         }
         let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket.bucket);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let route = match BucketMetadataNodeClient::open_bucket_metadata_route(
+            &local_client,
+            request.bucket.cluster_epoch,
+            bucket_pg_id,
+            &request.bucket.bucket,
+        ) {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
+            }
+        };
         let result = match &request.mutation {
             StorageRpcBucketMetadataControlMutation::MarkDeleting => {
                 return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
@@ -12906,42 +12941,17 @@ impl StorageNodeConnectionHandler {
                 });
             }
             StorageRpcBucketMetadataControlMutation::Versioning(state) => {
-                BucketMetadataNodeClient::build_put_bucket_versioning_command(
-                    &local_client,
-                    bucket_pg_id,
-                    &request.bucket.bucket,
-                    request.command_id,
-                    *state,
-                )
+                route.build_put_bucket_versioning_command(request.command_id, *state)
             }
             StorageRpcBucketMetadataControlMutation::Acl {
                 acl_grants,
                 summary,
-            } => BucketMetadataNodeClient::build_put_bucket_acl_command(
-                &local_client,
-                bucket_pg_id,
-                &request.bucket.bucket,
-                request.command_id,
-                acl_grants,
-                *summary,
-            ),
+            } => route.build_put_bucket_acl_command(request.command_id, acl_grants, *summary),
             StorageRpcBucketMetadataControlMutation::Property(mutation) => {
-                BucketMetadataNodeClient::build_put_bucket_property_command(
-                    &local_client,
-                    bucket_pg_id,
-                    &request.bucket.bucket,
-                    request.command_id,
-                    mutation,
-                )
+                route.build_put_bucket_property_command(request.command_id, mutation)
             }
             StorageRpcBucketMetadataControlMutation::Subresource(mutation) => {
-                BucketMetadataNodeClient::build_put_bucket_subresource_command(
-                    &local_client,
-                    bucket_pg_id,
-                    &request.bucket.bucket,
-                    request.command_id,
-                    mutation,
-                )
+                route.build_put_bucket_subresource_command(request.command_id, mutation)
             }
         };
         match result {
@@ -12967,18 +12977,20 @@ impl StorageNodeConnectionHandler {
         }
         let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket.bucket);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketMetadataNodeClient::build_mark_bucket_deleting_command(
+        let route = match BucketMetadataNodeClient::open_bucket_metadata_route(
             &local_client,
+            request.bucket.cluster_epoch,
             bucket_pg_id,
             &request.bucket.bucket,
-            request.command_id,
         ) {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
+            }
+        };
+        match route.build_mark_bucket_deleting_command(request.command_id) {
             Ok(MarkBucketDeletingCommandBuild::AlreadyDeleting) => {
-                let info = match BucketMetadataNodeClient::head_bucket_raw(
-                    &local_client,
-                    bucket_pg_id,
-                    &request.bucket.bucket,
-                ) {
+                let info = match route.head_bucket_raw() {
                     Ok(info) if info.state == BucketState::Deleting => info,
                     Ok(_) => {
                         return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
@@ -19329,6 +19341,12 @@ fn bucket_snapshot_error_response(error: BucketSnapshotLoadError) -> StorageRpcE
         BucketSnapshotLoadError::Store(error @ StoreError::RouteMapExpired { .. }) => {
             store_error_response(error)
         }
+        BucketSnapshotLoadError::Store(
+            error @ StoreError::RouteCapabilitySubjectMismatch { .. },
+        ) => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::PayloadDecode,
+            message: error.to_string(),
+        },
         error => StorageRpcErrorResponse {
             code: StorageRpcErrorCode::Internal,
             message: error.to_string(),

@@ -1655,6 +1655,9 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let metadata_route = primary_store
+            .bucket_metadata_client()
+            .open_bucket_metadata_route(self.operation_epoch(), bucket_pg_id, &bucket)?;
         let mut work_budget = super::RequestWorkBudget::new(
             std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
             None,
@@ -1695,10 +1698,7 @@ impl super::StorageCluster {
                 }
                 None => {
                     require_valid_route()?;
-                    match primary_store
-                        .bucket_metadata_client()
-                        .head_bucket_raw(bucket_pg_id, &bucket)
-                    {
+                    match metadata_route.head_bucket_raw() {
                         Ok(info) => {
                             return Ok(BucketCreateAttemptOutcome::Exists(info));
                         }
@@ -1717,15 +1717,13 @@ impl super::StorageCluster {
                         continue;
                     };
                     require_valid_route()?;
-                    let command = match primary_store
-                        .bucket_metadata_client()
-                        .build_create_bucket_command(bucket_pg_id, &bucket, command_id, config)?
-                    {
-                        CreateBucketCommandBuild::Exists(info) => {
-                            return Ok(BucketCreateAttemptOutcome::Exists(info));
-                        }
-                        CreateBucketCommandBuild::Command(command) => *command,
-                    };
+                    let command =
+                        match metadata_route.build_create_bucket_command(command_id, config)? {
+                            CreateBucketCommandBuild::Exists(info) => {
+                                return Ok(BucketCreateAttemptOutcome::Exists(info));
+                            }
+                            CreateBucketCommandBuild::Command(command) => *command,
+                        };
                     if !self
                         .try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence(
                         pg_id,
@@ -1756,9 +1754,7 @@ impl super::StorageCluster {
                 FinishPendingMetadataCommandResult::Abandoned => continue,
             }
 
-            let info = primary_store
-                .bucket_metadata_client()
-                .head_bucket_info(bucket_pg_id, &bucket)?;
+            let info = metadata_route.head_bucket_info()?;
             return Ok(BucketCreateAttemptOutcome::Created(info));
         }
     }
@@ -3016,9 +3012,16 @@ impl super::StorageCluster {
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), pg_id)
                 .map_err(BucketWriteDrainError::Store)?;
-            let current_info = match primary
+            let metadata_route = primary
                 .bucket_metadata_client()
-                .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)
+                .open_bucket_metadata_route(
+                    self.operation_epoch(),
+                    self.validated_bucket_metadata_pg(pg_id),
+                    bucket,
+                )
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+            let current_info = match metadata_route
+                .head_bucket_raw()
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)
             {
                 Ok(info) => {
@@ -3198,9 +3201,16 @@ impl super::StorageCluster {
         .map_err(BucketWriteDrainError::Store)?;
         let mut found_deleting = false;
         for node in nodes {
-            match node
+            let route = node
                 .bucket_metadata_client()
-                .head_bucket_replica_for_delete(self.validated_bucket_metadata_pg(pg_id), bucket)
+                .open_bucket_delete_replica_metadata_route(
+                    self.operation_epoch(),
+                    self.validated_bucket_metadata_pg(pg_id),
+                    bucket,
+                )
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+            match route
+                .head_bucket_replica_for_delete()
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)
             {
                 Ok(info)
@@ -3232,9 +3242,16 @@ impl super::StorageCluster {
             .map_err(BucketWriteDrainError::Store)?;
         let mut found_deleting = false;
         for node in nodes {
-            match node
+            let route = node
                 .bucket_metadata_client()
-                .head_bucket_replica_for_delete(self.validated_bucket_metadata_pg(pg_id), bucket)
+                .open_bucket_delete_replica_metadata_route(
+                    self.operation_epoch(),
+                    self.validated_bucket_metadata_pg(pg_id),
+                    bucket,
+                )
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+            match route
+                .head_bucket_replica_for_delete()
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)
             {
                 Ok(info) if info.state == BucketState::Deleting => {
@@ -3258,10 +3275,15 @@ impl super::StorageCluster {
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .bucket_metadata_client()
-            .load_bucket_snapshot(self.validated_bucket_metadata_pg(pg_id), bucket, request)
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let route = node.bucket_metadata_client().open_bucket_metadata_route(
+            self.operation_epoch(),
+            self.validated_bucket_metadata_pg(pg_id),
+            bucket,
+        )?;
+        route.load_bucket_snapshot(request)
     }
 
     /// Load the raw authorization snapshot used only by DeleteBucket retries
@@ -3308,36 +3330,30 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let client = node.bucket_metadata_client();
+        let metadata_route =
+            client.open_bucket_metadata_route(self.operation_epoch(), bucket_pg_id, bucket)?;
         require_valid_route()?;
-        let bucket_info = client.head_bucket_raw(bucket_pg_id, bucket)?;
+        let bucket_info = metadata_route.head_bucket_raw()?;
         require_valid_route()?;
         let policy = Self::load_bucket_delete_authorization_subresource(
-            &**client,
-            bucket_pg_id,
-            &bucket_info.name,
+            metadata_route.as_ref(),
             request.policy,
             BucketSubresourceKind::Policy,
         )?;
         require_valid_route()?;
         let tags = Self::load_bucket_delete_authorization_tags(
-            &**client,
-            bucket_pg_id,
-            &bucket_info.name,
+            metadata_route.as_ref(),
             request.tags.should_load(&bucket_info),
         )?;
         require_valid_route()?;
         let lifecycle = Self::load_bucket_delete_authorization_subresource(
-            &**client,
-            bucket_pg_id,
-            &bucket_info.name,
+            metadata_route.as_ref(),
             request.lifecycle,
             BucketSubresourceKind::Lifecycle,
         )?;
         require_valid_route()?;
         let cors = Self::load_bucket_delete_authorization_subresource(
-            &**client,
-            bucket_pg_id,
-            &bucket_info.name,
+            metadata_route.as_ref(),
             request.cors,
             BucketSubresourceKind::Cors,
         )?;
@@ -3441,31 +3457,27 @@ impl super::StorageCluster {
     }
 
     fn load_bucket_delete_authorization_subresource(
-        client: &dyn crate::node_client::BucketMetadataNodeClient,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
+        route: &dyn crate::node_client::BucketMetadataRoute,
         requested: bool,
         kind: BucketSubresourceKind,
     ) -> Result<LoadedBucketSubresource<String>, BucketSnapshotLoadError> {
         if !requested {
             return Ok(LoadedBucketSubresource::NotRequested);
         }
-        Ok(match client.get_bucket_subresource(pg_id, bucket, kind)? {
+        Ok(match route.get_bucket_subresource(kind)? {
             Some(body) => LoadedBucketSubresource::Loaded(body),
             None => LoadedBucketSubresource::Missing,
         })
     }
 
     fn load_bucket_delete_authorization_tags(
-        client: &dyn crate::node_client::BucketMetadataNodeClient,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
+        route: &dyn crate::node_client::BucketMetadataRoute,
         requested: bool,
     ) -> Result<LoadedBucketSubresource<SerializedBucketTagSet>, BucketSnapshotLoadError> {
         if !requested {
             return Ok(LoadedBucketSubresource::NotRequested);
         }
-        Ok(match client.get_bucket_tags(pg_id, bucket)? {
+        Ok(match route.get_bucket_tags()? {
             Some(tags) => LoadedBucketSubresource::Loaded(tags),
             None => LoadedBucketSubresource::Missing,
         })
@@ -3590,11 +3602,12 @@ impl super::StorageCluster {
             let proof = BucketWriteReservationProof::from(&reservation.record);
 
             let result = (|| {
-                let snapshot = reservation.node.load_bucket_snapshot(
+                let route = reservation.node.open_bucket_metadata_route(
+                    self.operation_epoch(),
                     self.validated_bucket_metadata_pg(PgId::new(reservation.pg_id)),
                     bucket,
-                    request,
                 )?;
+                let snapshot = route.load_bucket_snapshot(request)?;
                 action(snapshot, proof)
             })();
             let (result, release_result) = match result {
@@ -3656,8 +3669,12 @@ impl super::StorageCluster {
             let result = (|| {
                 require_valid_route()?;
                 let storage_client = &reservation.node;
-                let snapshot =
-                    storage_client.load_bucket_snapshot(bucket_pg_id, bucket, request)?;
+                let metadata_route = storage_client.open_bucket_metadata_route(
+                    self.operation_epoch(),
+                    bucket_pg_id,
+                    bucket,
+                )?;
+                let snapshot = metadata_route.load_bucket_snapshot(request)?;
                 Ok(action(snapshot, proof))
             })();
             let (result, release_result) = match result {
@@ -3714,8 +3731,12 @@ impl super::StorageCluster {
             let result = (|| {
                 require_valid_route()?;
                 let storage_client = &reservation.node;
-                let snapshot =
-                    storage_client.load_bucket_snapshot(bucket_pg_id, bucket, request)?;
+                let metadata_route = storage_client.open_bucket_metadata_route(
+                    self.operation_epoch(),
+                    bucket_pg_id,
+                    bucket,
+                )?;
+                let snapshot = metadata_route.load_bucket_snapshot(request)?;
                 action(snapshot)
             })();
             let release_result = self.release_durable_bucket_write_reservation(reservation);
@@ -3994,10 +4015,12 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        match node
-            .bucket_metadata_client()
-            .head_bucket_info(self.validated_bucket_metadata_pg(pg_id), bucket)
-        {
+        let metadata_route = node.bucket_metadata_client().open_bucket_metadata_route(
+            self.operation_epoch(),
+            self.validated_bucket_metadata_pg(pg_id),
+            bucket,
+        )?;
+        match metadata_route.head_bucket_info() {
             Ok(_) => {}
             Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { .. })) => {
                 return Err(MetadataError::BucketNotFound {
@@ -4181,10 +4204,15 @@ impl super::StorageCluster {
                         )
                         .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                     {
-                        match node.bucket_metadata_client().head_bucket_raw(
-                            self.validated_bucket_metadata_pg(PgId::new(pg_id)),
-                            bucket,
-                        ) {
+                        let metadata_route = node
+                            .bucket_metadata_client()
+                            .open_bucket_metadata_route(
+                                self.operation_epoch(),
+                                self.validated_bucket_metadata_pg(PgId::new(pg_id)),
+                                bucket,
+                            )
+                            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                        match metadata_route.head_bucket_raw() {
                             Ok(current)
                                 if current.state == BucketState::Active
                                     && current.bucket_execution_generation
@@ -4260,10 +4288,15 @@ impl super::StorageCluster {
                             }
                         }
                     }
-                    match node.bucket_metadata_client().head_bucket_raw(
-                        self.validated_bucket_metadata_pg(PgId::new(pg_id)),
-                        bucket,
-                    ) {
+                    let metadata_route = node
+                        .bucket_metadata_client()
+                        .open_bucket_metadata_route(
+                            self.operation_epoch(),
+                            self.validated_bucket_metadata_pg(PgId::new(pg_id)),
+                            bucket,
+                        )
+                        .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                    match metadata_route.head_bucket_raw() {
                         Ok(current) if current.state == BucketState::Deleting => {
                             return Ok(super::DurableBucketDeleteDrainBegin::AlreadyDeleting);
                         }
@@ -5325,40 +5358,57 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), destination_pg_id)?;
         if source_node.node_id() == destination_node.node_id() {
-            return source_node
+            let route = source_node
                 .bucket_metadata_client()
-                .load_bucket_snapshot_pair(
-                    source_bucket_pg_id,
-                    source,
-                    destination_bucket_pg_id,
-                    destination,
-                );
-        }
-
-        let (source_snapshot, destination_snapshot) = if source_pg_id.get()
-            < destination_pg_id.get()
-        {
-            (
-                source_node.bucket_metadata_client().load_bucket_snapshot(
+                .open_bucket_metadata_route_pair(
+                    self.operation_epoch(),
                     source_bucket_pg_id,
                     source.0,
-                    source.1,
-                )?,
-                destination_node
+                    destination_bucket_pg_id,
+                    destination.0,
+                )?;
+            return route.load_bucket_snapshot_pair(source.1, destination.1);
+        }
+
+        let (source_snapshot, destination_snapshot) =
+            if source_pg_id.get() < destination_pg_id.get() {
+                let source_route = source_node
                     .bucket_metadata_client()
-                    .load_bucket_snapshot(destination_bucket_pg_id, destination.0, destination.1)?,
-            )
-        } else {
-            let destination_snapshot = destination_node
-                .bucket_metadata_client()
-                .load_bucket_snapshot(destination_bucket_pg_id, destination.0, destination.1)?;
-            let source_snapshot = source_node.bucket_metadata_client().load_bucket_snapshot(
-                source_bucket_pg_id,
-                source.0,
-                source.1,
-            )?;
-            (source_snapshot, destination_snapshot)
-        };
+                    .open_bucket_metadata_route(
+                        self.operation_epoch(),
+                        source_bucket_pg_id,
+                        source.0,
+                    )?;
+                let destination_route = destination_node
+                    .bucket_metadata_client()
+                    .open_bucket_metadata_route(
+                        self.operation_epoch(),
+                        destination_bucket_pg_id,
+                        destination.0,
+                    )?;
+                (
+                    source_route.load_bucket_snapshot(source.1)?,
+                    destination_route.load_bucket_snapshot(destination.1)?,
+                )
+            } else {
+                let destination_route = destination_node
+                    .bucket_metadata_client()
+                    .open_bucket_metadata_route(
+                        self.operation_epoch(),
+                        destination_bucket_pg_id,
+                        destination.0,
+                    )?;
+                let destination_snapshot = destination_route.load_bucket_snapshot(destination.1)?;
+                let source_route = source_node
+                    .bucket_metadata_client()
+                    .open_bucket_metadata_route(
+                        self.operation_epoch(),
+                        source_bucket_pg_id,
+                        source.0,
+                    )?;
+                let source_snapshot = source_route.load_bucket_snapshot(source.1)?;
+                (source_snapshot, destination_snapshot)
+            };
 
         Ok(BucketSnapshotPair::Distinct {
             source: Box::new(source_snapshot),
@@ -5448,6 +5498,10 @@ impl super::StorageCluster {
                 return Err(error.into());
             }
         };
+        let metadata_route = node_store
+            .bucket_metadata_client()
+            .open_bucket_metadata_route(self.operation_epoch(), bucket_pg_id, bucket)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
         let current_bucket_execution_generation;
         let current_bucket_incarnation_generation;
         {
@@ -5463,10 +5517,7 @@ impl super::StorageCluster {
                     started.elapsed().as_micros()
                 ),
             );
-            let current = match node_store
-                .bucket_metadata_client()
-                .head_bucket_raw(bucket_pg_id, bucket)
-            {
+            let current = match metadata_route.head_bucket_raw() {
                 Ok(current) => {
                     let _ = observability::emit_flight_event(
                         super::TRACE_TARGET,
@@ -5867,13 +5918,8 @@ impl super::StorageCluster {
                             "mark_matches_current_start",
                             format!("iteration={loop_iteration}"),
                         );
-                        if !node_store
-                            .bucket_metadata_client()
-                            .pending_mark_bucket_deleting_command_matches_current(
-                                self.validated_bucket_metadata_pg(pg_id),
-                                bucket,
-                                mark,
-                            )
+                        if !metadata_route
+                            .pending_mark_bucket_deleting_command_matches_current(mark)
                             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                         {
                             return Err(bucket_snapshot_error_to_bucket_write_drain_error(
@@ -6671,13 +6717,8 @@ impl super::StorageCluster {
                     "build_mark_deleting_start",
                     format!("iteration={loop_iteration} command_id={command_id:?}"),
                 );
-                let command = match node_store
-                    .bucket_metadata_client()
-                    .build_mark_bucket_deleting_command(
-                        self.validated_bucket_metadata_pg(pg_id),
-                        bucket,
-                        command_id,
-                    )
+                let command = match metadata_route
+                    .build_mark_bucket_deleting_command(command_id)
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                 {
                     MarkBucketDeletingCommandBuild::AlreadyDeleting => return Ok(()),
@@ -6850,10 +6891,7 @@ impl super::StorageCluster {
                     error,
                     BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
                 ) {
-                    match node_store
-                        .bucket_metadata_client()
-                        .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)
-                    {
+                    match metadata_route.head_bucket_raw() {
                         Ok(current)
                             if current.state == BucketState::Deleting
                                 && current.bucket_incarnation_generation
@@ -7093,10 +7131,15 @@ impl super::StorageCluster {
         let bucket_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(bucket_pg_id))?;
-        let info = match bucket_store
+        let metadata_route = bucket_store
             .bucket_metadata_client()
-            .head_bucket_raw(self.bucket_metadata_pg(bucket), bucket)
-        {
+            .open_bucket_metadata_route(
+                self.operation_epoch(),
+                self.bucket_metadata_pg(bucket),
+                bucket,
+            )
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        let info = match metadata_route.head_bucket_raw() {
             Ok(info) => info,
             Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { .. })) => {
                 return if self.bucket_name_absent_on_acting_set(PgId::new(bucket_pg_id), bucket)? {
@@ -7130,6 +7173,14 @@ impl super::StorageCluster {
         let bucket_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(bucket_pg_id))?;
+        let metadata_route = bucket_store
+            .bucket_metadata_client()
+            .open_bucket_metadata_route(
+                self.operation_epoch(),
+                self.bucket_metadata_pg(bucket),
+                bucket,
+            )
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
         let _ = observability::event(
             super::TRACE_TARGET,
             "bucket_finalize_start",
@@ -7140,10 +7191,7 @@ impl super::StorageCluster {
             )),
         );
         let bucket_incarnation_generation = {
-            let info = match bucket_store
-                .bucket_metadata_client()
-                .head_bucket_raw(self.bucket_metadata_pg(bucket), bucket)
-            {
+            let info = match metadata_route.head_bucket_raw() {
                 Ok(info) => info,
                 Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound {
                     ..
@@ -7304,9 +7352,16 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), bucket_pg_id)?;
         let progress_client = bucket_store.bucket_write_reservation_client();
-        let bucket_info = bucket_store
+        let metadata_route = bucket_store
             .bucket_metadata_client()
-            .head_bucket_raw(self.validated_bucket_metadata_pg(bucket_pg_id), bucket)
+            .open_bucket_metadata_route(
+                self.operation_epoch(),
+                self.validated_bucket_metadata_pg(bucket_pg_id),
+                bucket,
+            )
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        let bucket_info = metadata_route
+            .head_bucket_raw()
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
         if bucket_info.bucket_incarnation_generation != bucket_incarnation_generation
             || bucket_info.state != BucketState::Deleting
@@ -7607,10 +7662,15 @@ impl super::StorageCluster {
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .bucket_metadata_client()
-            .head_bucket_info(self.validated_bucket_metadata_pg(pg_id), bucket)
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let route = node.bucket_metadata_client().open_bucket_metadata_route(
+            self.operation_epoch(),
+            self.validated_bucket_metadata_pg(pg_id),
+            bucket,
+        )?;
+        route.head_bucket_info()
     }
 
     pub fn get_bucket_subresource(
@@ -7619,14 +7679,15 @@ impl super::StorageCluster {
         kind: OpaqueBucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .bucket_metadata_client()
-            .get_bucket_subresource(
-                self.validated_bucket_metadata_pg(pg_id),
-                bucket,
-                kind.stored_kind(),
-            )
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let route = node.bucket_metadata_client().open_bucket_metadata_route(
+            self.operation_epoch(),
+            self.validated_bucket_metadata_pg(pg_id),
+            bucket,
+        )?;
+        route.get_bucket_subresource(kind.stored_kind())
     }
 
     pub fn get_bucket_tags(
@@ -7634,10 +7695,15 @@ impl super::StorageCluster {
         bucket: &BucketName,
     ) -> Result<Option<SerializedBucketTagSet>, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .bucket_metadata_client()
-            .get_bucket_tags(self.validated_bucket_metadata_pg(pg_id), bucket)
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let route = node.bucket_metadata_client().open_bucket_metadata_route(
+            self.operation_epoch(),
+            self.validated_bucket_metadata_pg(pg_id),
+            bucket,
+        )?;
+        route.get_bucket_tags()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -7673,11 +7739,12 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let metadata_route = primary_store
+            .bucket_metadata_client()
+            .open_bucket_metadata_route(self.operation_epoch(), bucket_pg_id, bucket)?;
         {
             require_valid_route()?;
-            let info = primary_store
-                .bucket_metadata_client()
-                .head_bucket_raw(bucket_pg_id, bucket)?;
+            let info = metadata_route.head_bucket_raw()?;
             if state == BucketVersioningState::Disabled
                 && info.versioning != BucketVersioningState::Disabled
             {
@@ -7714,15 +7781,9 @@ impl super::StorageCluster {
                         if versioning.bucket_name() == bucket =>
                     {
                         let same_request = versioning.bucket.versioning == state;
-                        if !primary_store
-                            .bucket_metadata_client()
-                            .pending_put_bucket_versioning_command_matches_current(
-                                self.validated_bucket_metadata_pg(pg_id),
-                                bucket,
-                                versioning,
-                                state,
-                            )?
-                        {
+                        if !metadata_route.pending_put_bucket_versioning_command_matches_current(
+                            versioning, state,
+                        )? {
                             if same_request {
                                 return Err(conflicting_pending_metadata_command(
                                     "conflicting pending put bucket versioning command",
@@ -7766,9 +7827,8 @@ impl super::StorageCluster {
                 else {
                     continue;
                 };
-                let command = primary_store
-                    .bucket_metadata_client()
-                    .build_put_bucket_versioning_command(bucket_pg_id, bucket, command_id, state)?;
+                let command =
+                    metadata_route.build_put_bucket_versioning_command(command_id, state)?;
                 require_valid_route()?;
                 if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
                     pg_id,
@@ -7791,9 +7851,7 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let info = primary_store
-                .bucket_metadata_client()
-                .head_bucket_raw(bucket_pg_id, bucket)?;
+            let info = metadata_route.head_bucket_raw()?;
             return Ok(info);
         }
     }
@@ -7916,11 +7974,12 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let metadata_route = primary_store
+            .bucket_metadata_client()
+            .open_bucket_metadata_route(self.operation_epoch(), bucket_pg_id, bucket)?;
         {
             require_valid_route()?;
-            primary_store
-                .bucket_metadata_client()
-                .head_bucket_raw(bucket_pg_id, bucket)?;
+            metadata_route.head_bucket_raw()?;
         }
 
         let mut work_budget = super::RequestWorkBudget::new(
@@ -7948,16 +8007,9 @@ impl super::StorageCluster {
                         let same_request = acl.bucket.acl_grants == *acl_grants
                             && acl.bucket.public_read == summary.public_read
                             && acl.bucket.public_write == summary.public_write;
-                        if !primary_store
-                            .bucket_metadata_client()
-                            .pending_put_bucket_acl_command_matches_current(
-                                self.validated_bucket_metadata_pg(pg_id),
-                                bucket,
-                                acl,
-                                acl_grants,
-                                summary,
-                            )?
-                        {
+                        if !metadata_route.pending_put_bucket_acl_command_matches_current(
+                            acl, acl_grants, summary,
+                        )? {
                             if same_request {
                                 return Err(conflicting_pending_metadata_command(
                                     "conflicting pending put bucket acl command",
@@ -8001,15 +8053,8 @@ impl super::StorageCluster {
                 else {
                     continue;
                 };
-                let command = primary_store
-                    .bucket_metadata_client()
-                    .build_put_bucket_acl_command(
-                        bucket_pg_id,
-                        bucket,
-                        command_id,
-                        acl_grants,
-                        summary,
-                    )?;
+                let command =
+                    metadata_route.build_put_bucket_acl_command(command_id, acl_grants, summary)?;
                 require_valid_route()?;
                 if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
                     pg_id,
@@ -8032,9 +8077,7 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let info = primary_store
-                .bucket_metadata_client()
-                .head_bucket_raw(bucket_pg_id, bucket)?;
+            let info = metadata_route.head_bucket_raw()?;
             return Ok(info);
         }
     }
@@ -8072,11 +8115,12 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let metadata_route = primary_store
+            .bucket_metadata_client()
+            .open_bucket_metadata_route(self.operation_epoch(), bucket_pg_id, bucket)?;
         {
             require_valid_route()?;
-            primary_store
-                .bucket_metadata_client()
-                .head_bucket_raw(bucket_pg_id, bucket)?;
+            metadata_route.head_bucket_raw()?;
         }
 
         let mut work_budget = super::RequestWorkBudget::new(
@@ -8104,15 +8148,9 @@ impl super::StorageCluster {
                         if property.bucket_name() == bucket
                             && property.effect == mutation.effect() =>
                     {
-                        if !primary_store
-                            .bucket_metadata_client()
-                            .pending_put_bucket_property_command_matches_current(
-                                self.validated_bucket_metadata_pg(pg_id),
-                                bucket,
-                                property,
-                                &mutation,
-                            )?
-                        {
+                        if !metadata_route.pending_put_bucket_property_command_matches_current(
+                            property, &mutation,
+                        )? {
                             self.drain_pending_metadata_command_pg_slot_with_work_budget(
                                 pg_id,
                                 bucket,
@@ -8151,14 +8189,8 @@ impl super::StorageCluster {
                 else {
                     continue;
                 };
-                let command = primary_store
-                    .bucket_metadata_client()
-                    .build_put_bucket_property_command(
-                        bucket_pg_id,
-                        bucket,
-                        command_id,
-                        &mutation,
-                    )?;
+                let command =
+                    metadata_route.build_put_bucket_property_command(command_id, &mutation)?;
                 require_valid_route()?;
                 if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
                     pg_id,
@@ -8181,9 +8213,7 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let info = primary_store
-                .bucket_metadata_client()
-                .head_bucket_raw(bucket_pg_id, bucket)?;
+            let info = metadata_route.head_bucket_raw()?;
             return Ok(info);
         }
     }
@@ -8286,11 +8316,12 @@ impl super::StorageCluster {
         let primary_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let metadata_route = primary_store
+            .bucket_metadata_client()
+            .open_bucket_metadata_route(self.operation_epoch(), bucket_pg_id, bucket)?;
         {
             require_valid_route()?;
-            primary_store
-                .bucket_metadata_client()
-                .head_bucket_raw(bucket_pg_id, bucket)?;
+            metadata_route.head_bucket_raw()?;
         }
         let mut work_budget = super::RequestWorkBudget::new(
             std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
@@ -8346,14 +8377,8 @@ impl super::StorageCluster {
                 else {
                     continue;
                 };
-                let command = primary_store
-                    .bucket_metadata_client()
-                    .build_put_bucket_subresource_command(
-                        bucket_pg_id,
-                        bucket,
-                        command_id,
-                        &mutation,
-                    )?;
+                let command =
+                    metadata_route.build_put_bucket_subresource_command(command_id, &mutation)?;
                 require_valid_route()?;
                 if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
                     pg_id,
@@ -8376,9 +8401,7 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let info = primary_store
-                .bucket_metadata_client()
-                .head_bucket_raw(bucket_pg_id, bucket)?;
+            let info = metadata_route.head_bucket_raw()?;
             return Ok(info);
         }
     }
@@ -9922,10 +9945,15 @@ impl super::StorageCluster {
         let bucket_store = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let bucket_info = match bucket_store
+        let metadata_route = bucket_store
             .bucket_metadata_client()
-            .head_bucket_info(self.validated_bucket_metadata_pg(pg_id), bucket)
-        {
+            .open_bucket_metadata_route(
+                self.operation_epoch(),
+                self.validated_bucket_metadata_pg(pg_id),
+                bucket,
+            )
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+        let bucket_info = match metadata_route.head_bucket_info() {
             Ok(info) => info,
             Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { .. })) => {
                 return Ok(None)
@@ -9941,13 +9969,8 @@ impl super::StorageCluster {
             return Ok(None);
         }
         let raw_lifecycle = if bucket_info.bucket_lifecycle_present {
-            bucket_store
-                .bucket_metadata_client()
-                .get_bucket_subresource(
-                    self.validated_bucket_metadata_pg(pg_id),
-                    bucket,
-                    BucketSubresourceKind::Lifecycle,
-                )
+            metadata_route
+                .get_bucket_subresource(BucketSubresourceKind::Lifecycle)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
         } else {
             None
@@ -12038,9 +12061,16 @@ impl super::StorageCluster {
             let bucket_store = self
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), bucket_pg_id)?;
-            match bucket_store
+            let metadata_route = bucket_store
                 .bucket_metadata_client()
-                .head_bucket_raw(self.validated_bucket_metadata_pg(bucket_pg_id), bucket)
+                .open_bucket_metadata_route(
+                    self.operation_epoch(),
+                    self.validated_bucket_metadata_pg(bucket_pg_id),
+                    bucket,
+                )
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+            match metadata_route
+                .head_bucket_raw()
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
             {
                 Ok(bucket) => bucket.bucket_incarnation_generation,
@@ -12743,10 +12773,12 @@ impl super::StorageCluster {
             let mut disposition = super::BucketWriteReservationDisposition::ReleaseByCaller;
             let result = (|| {
                 require_valid_route()?;
-                let snapshot =
-                    reservation
-                        .node
-                        .load_bucket_snapshot(bucket_pg_id, bucket, request)?;
+                let metadata_route = reservation.node.open_bucket_metadata_route(
+                    self.operation_epoch(),
+                    bucket_pg_id,
+                    bucket,
+                )?;
+                let snapshot = metadata_route.load_bucket_snapshot(request)?;
 
                 let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
                 let stream_creation_route = mutation_client
@@ -13352,11 +13384,12 @@ impl super::StorageCluster {
             let mut disposition = super::BucketWriteReservationDisposition::ReleaseByCaller;
             let result = (|| {
                 require_valid_route()?;
-                let snapshot = reservation.node.load_bucket_snapshot(
+                let metadata_route = reservation.node.open_bucket_metadata_route(
+                    self.operation_epoch(),
                     self.validated_bucket_metadata_pg(PgId::new(reservation.pg_id)),
                     bucket,
-                    request,
                 )?;
+                let snapshot = metadata_route.load_bucket_snapshot(request)?;
                 let upload_id_key = snapshot.bucket.multipart_upload_id_key.clone();
 
                 let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
@@ -14156,6 +14189,13 @@ impl super::StorageCluster {
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .bucket_metadata_client()
             .clone();
+        let metadata_route = bucket_metadata_client
+            .open_bucket_metadata_route(
+                self.operation_epoch(),
+                self.validated_bucket_metadata_pg(pg_id),
+                bucket,
+            )
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
         loop {
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             work_budget.check("multipart completion barrier reservation budget exhausted")?;
@@ -14222,10 +14262,8 @@ impl super::StorageCluster {
             else {
                 continue;
             };
-            let (barrier_sequence, command) = bucket_metadata_client
+            let (barrier_sequence, command) = metadata_route
                 .build_advance_multipart_completion_barrier_command(
-                    self.validated_bucket_metadata_pg(pg_id),
-                    bucket,
                     command_id,
                     completion_target_context,
                     bucket_write_reservation,
@@ -16019,11 +16057,12 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-
-        let bucket_row = match node
-            .bucket_metadata_client()
-            .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)
-        {
+        let metadata_route = node.bucket_metadata_client().open_bucket_metadata_route(
+            self.operation_epoch(),
+            self.validated_bucket_metadata_pg(pg_id),
+            bucket,
+        )?;
+        let bucket_row = match metadata_route.head_bucket_raw() {
             Ok(info) => Some(BucketDeleteDebugBucketRow {
                 state: info.state,
                 bucket_execution_generation: info.bucket_execution_generation,
@@ -16610,11 +16649,19 @@ impl super::StorageCluster {
         bucket: &BucketName,
     ) -> Result<(), BucketWriteDrainError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
-        let info = self
+        let node = self
             .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let metadata_route = node
             .bucket_metadata_client()
-            .head_bucket_raw(self.validated_bucket_metadata_pg(pg_id), bucket)
+            .open_bucket_metadata_route(
+                self.operation_epoch(),
+                self.validated_bucket_metadata_pg(pg_id),
+                bucket,
+            )
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        let info = metadata_route
+            .head_bucket_raw()
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
         let root = BucketDeleteFinalizeRoot {
             bucket: bucket.clone(),

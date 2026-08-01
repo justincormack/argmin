@@ -15,51 +15,54 @@ pub(crate) enum CreateBucketCommandBuild {
 }
 
 pub(crate) trait BucketMetadataNodeClient: Send + Sync {
-    fn head_bucket_replica_for_delete(
+    fn open_bucket_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: BucketPgId,
         bucket: &BucketName,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError>;
+    ) -> Result<Box<dyn BucketMetadataRoute + '_>, BucketSnapshotLoadError>;
 
-    fn head_bucket_raw(
+    fn open_bucket_metadata_route_pair(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError>;
+        route_cluster_epoch: ClusterEpoch,
+        source_pg_id: BucketPgId,
+        source_bucket: &BucketName,
+        destination_pg_id: BucketPgId,
+        destination_bucket: &BucketName,
+    ) -> Result<Box<dyn BucketMetadataRoutePair + '_>, BucketSnapshotLoadError>;
 
-    fn head_bucket_info(
+    fn open_bucket_delete_replica_metadata_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: BucketPgId,
         bucket: &BucketName,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError>;
+    ) -> Result<Box<dyn BucketDeleteReplicaMetadataRoute + '_>, BucketSnapshotLoadError>;
+
+    fn open_bucket_metadata_scan_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+    ) -> Result<Box<dyn BucketMetadataScanRoute + '_>, BucketSnapshotLoadError>;
+}
+
+pub(crate) trait BucketMetadataRoute: Send {
+    fn head_bucket_raw(&self) -> Result<BucketInfo, BucketSnapshotLoadError>;
+
+    fn head_bucket_info(&self) -> Result<BucketInfo, BucketSnapshotLoadError>;
 
     fn load_bucket_snapshot(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError>;
 
-    fn load_bucket_snapshot_pair(
-        &self,
-        source_pg_id: BucketPgId,
-        source: (&BucketName, BucketSnapshotRequest),
-        destination_pg_id: BucketPgId,
-        destination: (&BucketName, BucketSnapshotRequest),
-    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError>;
-
     fn build_create_bucket_command(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
         command_id: MetadataCommandId,
         config: &CreateBucketConfig<'_>,
     ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError>;
 
     fn build_advance_multipart_completion_barrier_command(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
         command_id: MetadataCommandId,
         completion_target_context: &str,
         bucket_write_reservation: &BucketWriteReservationProof,
@@ -67,38 +70,28 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
 
     fn pending_mark_bucket_deleting_command_matches_current(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
         command: &MarkBucketDeletingCommand,
     ) -> Result<bool, BucketSnapshotLoadError>;
 
     fn build_mark_bucket_deleting_command(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
         command_id: MetadataCommandId,
     ) -> Result<MarkBucketDeletingCommandBuild, BucketSnapshotLoadError>;
 
     fn pending_put_bucket_versioning_command_matches_current(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
         command: &PutBucketVersioningCommand,
         state: BucketVersioningState,
     ) -> Result<bool, BucketSnapshotLoadError>;
 
     fn build_put_bucket_versioning_command(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
         command_id: MetadataCommandId,
         state: BucketVersioningState,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError>;
 
     fn pending_put_bucket_acl_command_matches_current(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
         command: &PutBucketAclCommand,
         acl_grants: &AclGrants,
         summary: BucketAclSummary,
@@ -106,8 +99,6 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
 
     fn build_put_bucket_acl_command(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
         command_id: MetadataCommandId,
         acl_grants: &AclGrants,
         summary: BucketAclSummary,
@@ -115,41 +106,29 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
 
     fn pending_put_bucket_property_command_matches_current(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
         command: &PutBucketPropertyCommand,
         mutation: &BucketPropertyMutation,
     ) -> Result<bool, BucketSnapshotLoadError>;
 
     fn build_put_bucket_property_command(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
         command_id: MetadataCommandId,
         mutation: &BucketPropertyMutation,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError>;
 
     fn build_put_bucket_subresource_command(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
         command_id: MetadataCommandId,
         mutation: &BucketSubresourceMutation,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError>;
 
     fn get_bucket_subresource(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError>;
 
-    fn get_bucket_tags(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-    ) -> Result<Option<SerializedBucketTagSet>, BucketSnapshotLoadError> {
-        self.get_bucket_subresource(pg_id, bucket, BucketSubresourceKind::Tagging)?
+    fn get_bucket_tags(&self) -> Result<Option<SerializedBucketTagSet>, BucketSnapshotLoadError> {
+        self.get_bucket_subresource(BucketSubresourceKind::Tagging)?
             .map(SerializedBucketTagSet::from_current_xml)
             .transpose()
             .map_err(|error| {
@@ -160,12 +139,18 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
                 .into()
             })
     }
+}
 
-    fn open_bucket_metadata_scan_route(
+pub(crate) trait BucketMetadataRoutePair: Send {
+    fn load_bucket_snapshot_pair(
         &self,
-        route_cluster_epoch: ClusterEpoch,
-        pg_id: BucketPgId,
-    ) -> Result<Box<dyn BucketMetadataScanRoute + '_>, BucketSnapshotLoadError>;
+        source_request: BucketSnapshotRequest,
+        destination_request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError>;
+}
+
+pub(crate) trait BucketDeleteReplicaMetadataRoute: Send {
+    fn head_bucket_replica_for_delete(&self) -> Result<BucketInfo, BucketSnapshotLoadError>;
 }
 
 pub(crate) trait BucketMetadataScanRoute: Send {

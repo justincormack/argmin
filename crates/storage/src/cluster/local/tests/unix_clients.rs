@@ -2379,12 +2379,17 @@ fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows
             .unwrap(),
         crate::BucketDeleteFinalizeOutcome::Finalized
     );
+    let reopened_node = reopened_map.node(node_id).unwrap();
+    let route = reopened_node
+        .bucket_metadata_client()
+        .open_bucket_metadata_route(
+            ClusterEpoch::INITIAL,
+            crate::BucketPgId::new_for_test(PgId::new(0)),
+            &bucket,
+        )
+        .unwrap();
     assert!(matches!(
-        reopened_map
-            .node(node_id)
-            .unwrap()
-            .bucket_metadata_client()
-            .head_bucket_raw(crate::BucketPgId::new_for_test(PgId::new(0)), &bucket),
+        route.head_bucket_raw(),
         Err(crate::BucketSnapshotLoadError::Metadata(
             crate::MetadataError::BucketNotFound { .. }
         ))
@@ -2570,13 +2575,17 @@ fn frontend_unix_delete_bucket_reaps_expired_reservation_from_older_epoch() {
         .durable_bucket_write_reservations(crate::BucketPgId::new_for_test(PgId::new(0)), &bucket,)
         .unwrap()
         .is_empty());
+    let node = map.node(node_id).unwrap();
+    let route = node
+        .bucket_metadata_client()
+        .open_bucket_metadata_route(
+            route_epoch,
+            crate::BucketPgId::new_for_test(PgId::new(0)),
+            &bucket,
+        )
+        .unwrap();
     assert_eq!(
-        map.node(node_id)
-            .unwrap()
-            .bucket_metadata_client()
-            .head_bucket_raw(crate::BucketPgId::new_for_test(PgId::new(0)), &bucket)
-            .unwrap()
-            .state,
+        route.head_bucket_raw().unwrap().state,
         crate::BucketState::Deleting
     );
 }
@@ -2678,13 +2687,17 @@ fn frontend_unix_delete_bucket_adopts_live_drain_from_older_epoch() {
     assert_eq!(drain.cluster_epoch, drain_epoch);
     assert_eq!(drain.drain_id, "live-drain-before-route-change");
     assert!(drain.lease_deadline > crate::clock::current_time_millis());
+    let node = map.node(node_id).unwrap();
+    let route = node
+        .bucket_metadata_client()
+        .open_bucket_metadata_route(
+            route_epoch,
+            crate::BucketPgId::new_for_test(PgId::new(0)),
+            &bucket,
+        )
+        .unwrap();
     assert_eq!(
-        map.node(node_id)
-            .unwrap()
-            .bucket_metadata_client()
-            .head_bucket_raw(crate::BucketPgId::new_for_test(PgId::new(0)), &bucket)
-            .unwrap()
-            .state,
+        route.head_bucket_raw().unwrap().state,
         crate::BucketState::Deleting
     );
 }

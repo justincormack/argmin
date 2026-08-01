@@ -2874,15 +2874,16 @@ fn multipart_completion_barrier_rejects_non_completion_bucket_write_reservation(
         MetadataCommandLogIndex::new(1).unwrap(),
     );
     let proof = BucketWriteReservationProof::from(&reservation);
-    let err = BucketMetadataNodeClient::build_advance_multipart_completion_barrier_command(
-        &client,
-        BucketPgId::new_for_test(PgId::new(0)),
-        &bucket,
-        command_id,
-        "object-key",
-        &proof,
-    )
-    .unwrap_err();
+    let route = client
+        .open_bucket_metadata_route(
+            ClusterEpoch::new(1).unwrap(),
+            BucketPgId::new_for_test(PgId::new(0)),
+            &bucket,
+        )
+        .unwrap();
+    let err = route
+        .build_advance_multipart_completion_barrier_command(command_id, "object-key", &proof)
+        .unwrap_err();
 
     assert!(matches!(
         err,

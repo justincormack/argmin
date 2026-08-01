@@ -1411,9 +1411,17 @@ impl UnixStorageNodeClient {
                 }
                 Ok(info)
             }
-            StorageRpcBucketInfoOutcome::BucketNotFound { name } => Err(
-                BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name }),
-            ),
+            StorageRpcBucketInfoOutcome::BucketNotFound { name } => {
+                if name != *bucket {
+                    return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                        "validate bucket info response",
+                        "bucket-not-found response name does not match request".to_string(),
+                    )));
+                }
+                Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::BucketNotFound { name },
+                ))
+            }
         }
     }
 

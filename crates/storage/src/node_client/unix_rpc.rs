@@ -43,6 +43,29 @@ struct UnixBucketMetadataScanRoute<'a> {
     pg_topology: Arc<PgTopology>,
 }
 
+struct UnixBucketMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: BucketPgId,
+    bucket: BucketName,
+}
+
+struct UnixBucketMetadataRoutePair<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    source_pg_id: BucketPgId,
+    source_bucket: BucketName,
+    destination_pg_id: BucketPgId,
+    destination_bucket: BucketName,
+}
+
+struct UnixBucketDeleteReplicaMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: BucketPgId,
+    bucket: BucketName,
+}
+
 impl UnixStorageNodeClient {
     fn write_placed_shard(
         &self,
@@ -3992,7 +4015,7 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
     }
 }
 
-impl BucketMetadataNodeClient for UnixStorageNodeClient {
+impl UnixStorageNodeClient {
     fn head_bucket_replica_for_delete(
         &self,
         pg_id: BucketPgId,
@@ -4055,9 +4078,17 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
                 }
                 Ok(*snapshot)
             }
-            StorageRpcBucketSnapshotOutcome::BucketNotFound { name } => Err(
-                BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name }),
-            ),
+            StorageRpcBucketSnapshotOutcome::BucketNotFound { name } => {
+                if name != *bucket {
+                    return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                        "validate bucket snapshot response",
+                        "bucket-not-found response name does not match request".to_string(),
+                    )));
+                }
+                Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::BucketNotFound { name },
+                ))
+            }
         }
     }
 
@@ -4102,9 +4133,20 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
                 self.validate_bucket_snapshot_pair_response(&pair, source, destination)?;
                 Ok(*pair)
             }
-            StorageRpcBucketSnapshotPairOutcome::BucketNotFound { name } => Err(
-                BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name }),
-            ),
+            StorageRpcBucketSnapshotPairOutcome::BucketNotFound { name } => {
+                if name != *source.0 && name != *destination.0 {
+                    return Err(BucketSnapshotLoadError::Store(
+                        self.rpc_payload_error(
+                            "validate bucket snapshot pair response",
+                            "bucket-not-found response name does not match either request bucket"
+                                .to_string(),
+                        ),
+                    ));
+                }
+                Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::BucketNotFound { name },
+                ))
+            }
         }
     }
 
@@ -4441,7 +4483,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         Ok(response.body)
     }
 
-    fn open_bucket_metadata_scan_route(
+    fn open_bucket_metadata_scan_route_impl(
         &self,
         route_cluster_epoch: ClusterEpoch,
         pg_id: BucketPgId,
@@ -4466,6 +4508,382 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
             pg_id,
             pg_topology: Arc::clone(pg_topology),
         }))
+    }
+}
+
+impl UnixStorageNodeClient {
+    fn validate_bucket_metadata_route_subject(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        let pg_topology = self.pg_topology.as_ref().ok_or_else(|| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                operation,
+                "bucket metadata client has no installed PG topology".to_string(),
+            ))
+        })?;
+        if pg_topology.bucket_pg_for(bucket) != pg_id.get() {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                operation,
+                "bucket does not belong to the scoped bucket metadata PG".to_string(),
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl BucketMetadataNodeClient for UnixStorageNodeClient {
+    fn open_bucket_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+    ) -> Result<Box<dyn BucketMetadataRoute + '_>, BucketSnapshotLoadError> {
+        self.validate_bucket_metadata_route_subject(
+            route_cluster_epoch,
+            pg_id,
+            bucket,
+            "open bucket metadata route",
+        )?;
+        Ok(Box::new(UnixBucketMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+        }))
+    }
+
+    fn open_bucket_metadata_route_pair(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        source_pg_id: BucketPgId,
+        source_bucket: &BucketName,
+        destination_pg_id: BucketPgId,
+        destination_bucket: &BucketName,
+    ) -> Result<Box<dyn BucketMetadataRoutePair + '_>, BucketSnapshotLoadError> {
+        self.validate_bucket_metadata_route_subject(
+            route_cluster_epoch,
+            source_pg_id,
+            source_bucket,
+            "open source bucket metadata route pair",
+        )?;
+        self.validate_bucket_metadata_route_subject(
+            route_cluster_epoch,
+            destination_pg_id,
+            destination_bucket,
+            "open destination bucket metadata route pair",
+        )?;
+        Ok(Box::new(UnixBucketMetadataRoutePair {
+            client: self,
+            route_cluster_epoch,
+            source_pg_id,
+            source_bucket: source_bucket.clone(),
+            destination_pg_id,
+            destination_bucket: destination_bucket.clone(),
+        }))
+    }
+
+    fn open_bucket_delete_replica_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+    ) -> Result<Box<dyn BucketDeleteReplicaMetadataRoute + '_>, BucketSnapshotLoadError> {
+        self.validate_bucket_metadata_route_subject(
+            route_cluster_epoch,
+            pg_id,
+            bucket,
+            "open bucket delete replica metadata route",
+        )?;
+        Ok(Box::new(UnixBucketDeleteReplicaMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+        }))
+    }
+
+    fn open_bucket_metadata_scan_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+    ) -> Result<Box<dyn BucketMetadataScanRoute + '_>, BucketSnapshotLoadError> {
+        self.open_bucket_metadata_scan_route_impl(route_cluster_epoch, pg_id)
+    }
+}
+
+impl UnixBucketMetadataRoute<'_> {
+    fn require_command_id(
+        &self,
+        command_id: MetadataCommandId,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if command_id.cluster_epoch() != self.route_cluster_epoch
+            || command_id.pg_id() != self.pg_id.pg_id()
+        {
+            return Err(BucketSnapshotLoadError::Store(
+                self.client.rpc_payload_error(
+                    operation,
+                    "metadata command ID does not match the scoped bucket metadata route"
+                        .to_string(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_bucket(
+        &self,
+        bucket: &BucketName,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if bucket != &self.bucket {
+            return Err(BucketSnapshotLoadError::Store(
+                self.client.rpc_payload_error(
+                    operation,
+                    "command bucket does not match the scoped bucket metadata route".to_string(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl BucketMetadataRoute for UnixBucketMetadataRoute<'_> {
+    fn head_bucket_raw(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.client.head_bucket_raw(self.pg_id, &self.bucket)
+    }
+
+    fn head_bucket_info(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.client.head_bucket_info(self.pg_id, &self.bucket)
+    }
+
+    fn load_bucket_snapshot(
+        &self,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        self.client
+            .load_bucket_snapshot(self.pg_id, &self.bucket, request)
+    }
+
+    fn build_create_bucket_command(
+        &self,
+        command_id: MetadataCommandId,
+        config: &CreateBucketConfig<'_>,
+    ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError> {
+        self.require_command_id(command_id, "build create bucket command")?;
+        if config.name != self.bucket.as_str() {
+            return Err(BucketSnapshotLoadError::Store(
+                self.client.rpc_payload_error(
+                    "build create bucket command",
+                    "create-bucket config does not match the scoped bucket metadata route"
+                        .to_string(),
+                ),
+            ));
+        }
+        self.client
+            .build_create_bucket_command(self.pg_id, &self.bucket, command_id, config)
+    }
+
+    fn build_advance_multipart_completion_barrier_command(
+        &self,
+        command_id: MetadataCommandId,
+        completion_target_context: &str,
+        bucket_write_reservation: &BucketWriteReservationProof,
+    ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError> {
+        self.require_command_id(command_id, "build multipart completion barrier command")?;
+        if !bucket_write_reservation.matches_exact_mutation_subject(
+            self.route_cluster_epoch,
+            &self.bucket,
+            crate::metadata_command::COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+            Some(completion_target_context),
+        ) {
+            return Err(MetadataError::BucketWriteReservationConflict {
+                reservation_id: bucket_write_reservation.reservation_id.clone(),
+            }
+            .into());
+        }
+        self.client
+            .build_advance_multipart_completion_barrier_command(
+                self.pg_id,
+                &self.bucket,
+                command_id,
+                completion_target_context,
+                bucket_write_reservation,
+            )
+    }
+
+    fn pending_mark_bucket_deleting_command_matches_current(
+        &self,
+        command: &MarkBucketDeletingCommand,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        self.require_bucket(
+            command.bucket_name(),
+            "match pending mark bucket deleting command",
+        )?;
+        self.client
+            .pending_mark_bucket_deleting_command_matches_current(self.pg_id, &self.bucket, command)
+    }
+
+    fn build_mark_bucket_deleting_command(
+        &self,
+        command_id: MetadataCommandId,
+    ) -> Result<MarkBucketDeletingCommandBuild, BucketSnapshotLoadError> {
+        self.require_command_id(command_id, "build mark bucket deleting command")?;
+        self.client
+            .build_mark_bucket_deleting_command(self.pg_id, &self.bucket, command_id)
+    }
+
+    fn pending_put_bucket_versioning_command_matches_current(
+        &self,
+        command: &PutBucketVersioningCommand,
+        state: BucketVersioningState,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        self.require_bucket(
+            command.bucket_name(),
+            "match pending put bucket versioning command",
+        )?;
+        self.client
+            .pending_put_bucket_versioning_command_matches_current(
+                self.pg_id,
+                &self.bucket,
+                command,
+                state,
+            )
+    }
+
+    fn build_put_bucket_versioning_command(
+        &self,
+        command_id: MetadataCommandId,
+        state: BucketVersioningState,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        self.require_command_id(command_id, "build put bucket versioning command")?;
+        self.client
+            .build_put_bucket_versioning_command(self.pg_id, &self.bucket, command_id, state)
+    }
+
+    fn pending_put_bucket_acl_command_matches_current(
+        &self,
+        command: &PutBucketAclCommand,
+        acl_grants: &AclGrants,
+        summary: BucketAclSummary,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        self.require_bucket(
+            command.bucket_name(),
+            "match pending put bucket ACL command",
+        )?;
+        self.client.pending_put_bucket_acl_command_matches_current(
+            self.pg_id,
+            &self.bucket,
+            command,
+            acl_grants,
+            summary,
+        )
+    }
+
+    fn build_put_bucket_acl_command(
+        &self,
+        command_id: MetadataCommandId,
+        acl_grants: &AclGrants,
+        summary: BucketAclSummary,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        self.require_command_id(command_id, "build put bucket ACL command")?;
+        self.client.build_put_bucket_acl_command(
+            self.pg_id,
+            &self.bucket,
+            command_id,
+            acl_grants,
+            summary,
+        )
+    }
+
+    fn pending_put_bucket_property_command_matches_current(
+        &self,
+        command: &PutBucketPropertyCommand,
+        mutation: &BucketPropertyMutation,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        self.require_bucket(
+            command.bucket_name(),
+            "match pending put bucket property command",
+        )?;
+        self.client
+            .pending_put_bucket_property_command_matches_current(
+                self.pg_id,
+                &self.bucket,
+                command,
+                mutation,
+            )
+    }
+
+    fn build_put_bucket_property_command(
+        &self,
+        command_id: MetadataCommandId,
+        mutation: &BucketPropertyMutation,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        self.require_command_id(command_id, "build put bucket property command")?;
+        self.client.build_put_bucket_property_command(
+            self.pg_id,
+            &self.bucket,
+            command_id,
+            mutation,
+        )
+    }
+
+    fn build_put_bucket_subresource_command(
+        &self,
+        command_id: MetadataCommandId,
+        mutation: &BucketSubresourceMutation,
+    ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
+        self.require_command_id(command_id, "build put bucket subresource command")?;
+        self.client.build_put_bucket_subresource_command(
+            self.pg_id,
+            &self.bucket,
+            command_id,
+            mutation,
+        )
+    }
+
+    fn get_bucket_subresource(
+        &self,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<String>, BucketSnapshotLoadError> {
+        self.client
+            .get_bucket_subresource(self.pg_id, &self.bucket, kind)
+    }
+}
+
+impl BucketMetadataRoutePair for UnixBucketMetadataRoutePair<'_> {
+    fn load_bucket_snapshot_pair(
+        &self,
+        source_request: BucketSnapshotRequest,
+        destination_request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
+        debug_assert_eq!(self.route_cluster_epoch, self.client.cluster_epoch);
+        self.client.load_bucket_snapshot_pair(
+            self.source_pg_id,
+            (&self.source_bucket, source_request),
+            self.destination_pg_id,
+            (&self.destination_bucket, destination_request),
+        )
+    }
+}
+
+impl BucketDeleteReplicaMetadataRoute for UnixBucketDeleteReplicaMetadataRoute<'_> {
+    fn head_bucket_replica_for_delete(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        debug_assert_eq!(self.route_cluster_epoch, self.client.cluster_epoch);
+        self.client
+            .head_bucket_replica_for_delete(self.pg_id, &self.bucket)
     }
 }
 

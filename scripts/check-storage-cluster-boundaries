@@ -629,35 +629,6 @@ migrated_bucket_snapshot_read_bypasses=$(
         if ($0 ~ /SharedStorageNode::load_bucket_snapshot_from_pg\(/) {
             print FILENAME ":" FNR ":" $0
         }
-        if ($0 ~ /\.load_bucket_snapshot_pair\(/) {
-            if (pending_bucket_metadata_client \
-                || $0 ~ /\.bucket_metadata_client\(\)/ \
-                || $0 ~ /bucket_metadata_client\./ \
-                || $0 ~ /self\.load_bucket_snapshot_pair\(/) {
-                pending_storage_client = 0
-                pending_bucket_metadata_client = 0
-                pending_reservation_node = 0
-                next
-            }
-            print FILENAME ":" FNR ":" $0
-        }
-        if ($0 ~ /\.load_bucket_snapshot\(/) {
-            if (pending_bucket_metadata_client \
-                || pending_reservation_node == 2 \
-                || $0 ~ /\.bucket_metadata_client\(\)/ \
-                || $0 ~ /bucket_metadata_client\./ \
-                || $0 ~ /storage_client\.load_bucket_snapshot\(/ \
-                || $0 ~ /reservation\.node\.load_bucket_snapshot\(/) {
-                pending_storage_client = 0
-                pending_bucket_metadata_client = 0
-                pending_reservation_node = 0
-                next
-            }
-            if ($0 ~ /self\.load_bucket_snapshot\(/) {
-                next
-            }
-            print FILENAME ":" FNR ":" $0
-        }
         if ($0 ~ /;/) {
             pending_storage_client = 0
             pending_bucket_metadata_client = 0
@@ -724,19 +695,6 @@ migrated_bucket_raw_read_bypasses=$(
             || $0 ~ /bucket_metadata_client[[:space:]]*$/) {
             pending_bucket_metadata_client = 1
         }
-        if ($0 ~ /\.(head_bucket_raw|head_bucket_record_raw)\(/) {
-            if (pending_storage_client \
-                || pending_bucket_metadata_client \
-                || $0 ~ /\.storage_client\(\)/ \
-                || $0 ~ /storage_client\./ \
-                || $0 ~ /\.bucket_metadata_client\(\)/ \
-                || $0 ~ /bucket_metadata_client\./) {
-                pending_storage_client = 0
-                pending_bucket_metadata_client = 0
-                next
-            }
-            print FILENAME ":" FNR ":" $0
-        }
         if ($0 ~ /PgMetadataStore::(head_bucket_raw|head_bucket_record_raw)\(/) {
             print FILENAME ":" FNR ":" $0
         }
@@ -802,19 +760,6 @@ migrated_bucket_public_read_bypasses=$(
         if ($0 ~ /\.bucket_metadata_client\(\)/ \
             || $0 ~ /bucket_metadata_client[[:space:]]*$/) {
             pending_bucket_metadata_client = 1
-        }
-        if ($0 ~ /\.(head_bucket_info|get_bucket_subresource)\(/) {
-            if (pending_bucket_metadata_client \
-                || $0 ~ /\.bucket_metadata_client\(\)/ \
-                || $0 ~ /bucket_metadata_client\./) {
-                pending_storage_client = 0
-                pending_bucket_metadata_client = 0
-                next
-            }
-            if ($0 ~ /self\.head_bucket_info\(/) {
-                next
-            }
-            print FILENAME ":" FNR ":" $0
         }
         if ($0 ~ /PgMetadataStore::(head_bucket|get_bucket_subresource|list_buckets)\(/) {
             print FILENAME ":" FNR ":" $0
@@ -889,16 +834,6 @@ migrated_simple_object_read_bypasses=$(
         if ($0 ~ /\.bucket_metadata_client\(\)/ \
             || $0 ~ /bucket_metadata_client[[:space:]]*$/) {
             pending_bucket_metadata_client = 1
-        }
-        if ($0 ~ /\.(pending_mark_bucket_deleting_command_matches_current|build_mark_bucket_deleting_command|pending_put_bucket_versioning_command_matches_current|build_put_bucket_versioning_command|pending_put_bucket_acl_command_matches_current|build_put_bucket_acl_command|pending_put_bucket_property_command_matches_current|build_put_bucket_property_command|build_put_bucket_subresource_command|get_bucket_subresource)\(/) {
-            if (pending_bucket_metadata_client \
-                || $0 ~ /\.bucket_metadata_client\(\)/ \
-                || $0 ~ /bucket_metadata_client\./) {
-                pending_bucket_metadata_client = 0
-                next
-            }
-            print FILENAME ":" FNR ":" $0
-            next
         }
         if ($0 ~ /\.object_read_metadata_client\(\)/ \
             || $0 ~ /object_read_metadata_client[[:space:]]*$/) {

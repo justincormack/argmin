@@ -54,7 +54,7 @@ use crate::metadata_command::{
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
 use crate::node_client::{
-    BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
+    BucketMetadataRoute, BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
     CreateStreamUploadPrecondition, MetadataCommandInspectionNodeClient, MetadataCommandNodeClient,
     MetadataCommandPeeringNodeClient, ObjectListingMetadataRoute, ObjectPayloadLeaseNodeLease,
     RetainedShardAckNodeClient, ShardAckRoute,
@@ -3756,6 +3756,23 @@ impl ActiveBucketRoute<'_> {
         }
     }
 
+    fn with_metadata_route<T>(
+        &self,
+        action: impl FnOnce(&dyn BucketMetadataRoute) -> Result<T, BucketSnapshotLoadError>,
+    ) -> Result<T, BucketSnapshotLoadError> {
+        self.admission.require_valid_now()?;
+        let cluster = &self.admission.cluster;
+        let node = cluster
+            .local_map
+            .metadata_pg_primary_node(cluster.operation_epoch(), self.pg_id.pg_id())?;
+        let route = node.bucket_metadata_client().open_bucket_metadata_route(
+            cluster.operation_epoch(),
+            self.pg_id,
+            &self.bucket,
+        )?;
+        action(route.as_ref())
+    }
+
     pub fn create_bucket_with_config_and_load_info(
         &self,
         config: &crate::CreateBucketConfig<'_>,
@@ -3801,51 +3818,27 @@ impl ActiveBucketRoute<'_> {
     }
 
     pub fn head_bucket_info(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.admission.require_valid_now()?;
-        let cluster = &self.admission.cluster;
-        cluster
-            .local_map
-            .metadata_pg_primary_node(cluster.operation_epoch(), self.pg_id.pg_id())?
-            .bucket_metadata_client()
-            .head_bucket_info(self.pg_id, &self.bucket)
+        self.with_metadata_route(|route| route.head_bucket_info())
     }
 
     pub fn get_bucket_subresource(
         &self,
         kind: crate::OpaqueBucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
-        self.admission.require_valid_now()?;
-        let cluster = &self.admission.cluster;
-        cluster
-            .local_map
-            .metadata_pg_primary_node(cluster.operation_epoch(), self.pg_id.pg_id())?
-            .bucket_metadata_client()
-            .get_bucket_subresource(self.pg_id, &self.bucket, kind.stored_kind())
+        self.with_metadata_route(|route| route.get_bucket_subresource(kind.stored_kind()))
     }
 
     pub fn get_bucket_tags(
         &self,
     ) -> Result<Option<SerializedBucketTagSet>, BucketSnapshotLoadError> {
-        self.admission.require_valid_now()?;
-        let cluster = &self.admission.cluster;
-        cluster
-            .local_map
-            .metadata_pg_primary_node(cluster.operation_epoch(), self.pg_id.pg_id())?
-            .bucket_metadata_client()
-            .get_bucket_tags(self.pg_id, &self.bucket)
+        self.with_metadata_route(|route| route.get_bucket_tags())
     }
 
     pub fn load_bucket_snapshot(
         &self,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
-        self.admission.require_valid_now()?;
-        let cluster = &self.admission.cluster;
-        cluster
-            .local_map
-            .metadata_pg_primary_node(cluster.operation_epoch(), self.pg_id.pg_id())?
-            .bucket_metadata_client()
-            .load_bucket_snapshot(self.pg_id, &self.bucket, request)
+        self.with_metadata_route(|route| route.load_bucket_snapshot(request))
     }
 
     pub fn load_bucket_delete_authorization_snapshot(
@@ -4057,11 +4050,15 @@ impl ActiveBucketRoutePair<'_> {
             let merged_request = source_request.union(destination_request);
             self.admission.require_valid_now()?;
             let cluster = &self.admission.cluster;
-            let bucket = cluster
+            let node = cluster
                 .local_map
-                .metadata_pg_primary_node(cluster.operation_epoch(), self.source_pg_id.pg_id())?
-                .bucket_metadata_client()
-                .load_bucket_snapshot(self.source_pg_id, &self.source, merged_request)?;
+                .metadata_pg_primary_node(cluster.operation_epoch(), self.source_pg_id.pg_id())?;
+            let route = node.bucket_metadata_client().open_bucket_metadata_route(
+                cluster.operation_epoch(),
+                self.source_pg_id,
+                &self.source,
+            )?;
+            let bucket = route.load_bucket_snapshot(merged_request)?;
             return Ok(BucketSnapshotPair::Same {
                 bucket: Box::new(bucket),
             });
@@ -4078,48 +4075,60 @@ impl ActiveBucketRoutePair<'_> {
             .metadata_pg_primary_node(cluster.operation_epoch(), self.destination_pg_id.pg_id())?;
         if source_node.node_id() == destination_node.node_id() {
             self.admission.require_valid_now()?;
-            return source_node
+            let route = source_node
                 .bucket_metadata_client()
-                .load_bucket_snapshot_pair(
+                .open_bucket_metadata_route_pair(
+                    cluster.operation_epoch(),
                     self.source_pg_id,
-                    (&self.source, source_request),
+                    &self.source,
                     self.destination_pg_id,
-                    (&self.destination, destination_request),
-                );
+                    &self.destination,
+                )?;
+            return route.load_bucket_snapshot_pair(source_request, destination_request);
         }
 
         let (source_snapshot, destination_snapshot) =
             if self.source_pg_id.pg_id().get() < self.destination_pg_id.pg_id().get() {
                 self.admission.require_valid_now()?;
-                let source_snapshot = source_node.bucket_metadata_client().load_bucket_snapshot(
-                    self.source_pg_id,
-                    &self.source,
-                    source_request,
-                )?;
-                self.admission.require_valid_now()?;
-                let destination_snapshot = destination_node
+                let source_route = source_node
                     .bucket_metadata_client()
-                    .load_bucket_snapshot(
+                    .open_bucket_metadata_route(
+                        cluster.operation_epoch(),
+                        self.source_pg_id,
+                        &self.source,
+                    )?;
+                let source_snapshot = source_route.load_bucket_snapshot(source_request)?;
+                self.admission.require_valid_now()?;
+                let destination_route = destination_node
+                    .bucket_metadata_client()
+                    .open_bucket_metadata_route(
+                        cluster.operation_epoch(),
                         self.destination_pg_id,
                         &self.destination,
-                        destination_request,
                     )?;
+                let destination_snapshot =
+                    destination_route.load_bucket_snapshot(destination_request)?;
                 (source_snapshot, destination_snapshot)
             } else {
                 self.admission.require_valid_now()?;
-                let destination_snapshot = destination_node
+                let destination_route = destination_node
                     .bucket_metadata_client()
-                    .load_bucket_snapshot(
+                    .open_bucket_metadata_route(
+                        cluster.operation_epoch(),
                         self.destination_pg_id,
                         &self.destination,
-                        destination_request,
                     )?;
+                let destination_snapshot =
+                    destination_route.load_bucket_snapshot(destination_request)?;
                 self.admission.require_valid_now()?;
-                let source_snapshot = source_node.bucket_metadata_client().load_bucket_snapshot(
-                    self.source_pg_id,
-                    &self.source,
-                    source_request,
-                )?;
+                let source_route = source_node
+                    .bucket_metadata_client()
+                    .open_bucket_metadata_route(
+                        cluster.operation_epoch(),
+                        self.source_pg_id,
+                        &self.source,
+                    )?;
+                let source_snapshot = source_route.load_bucket_snapshot(source_request)?;
                 (source_snapshot, destination_snapshot)
             };
 

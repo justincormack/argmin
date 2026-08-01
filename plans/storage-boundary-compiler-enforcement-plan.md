@@ -647,7 +647,7 @@ Node-client role classification (2026-07-19):
 
 | Interface | PG role | Capability direction |
 | --- | --- | --- |
-| `BucketMetadataNodeClient` | bucket metadata | exact reads/mutations use an active bucket route; owner listing and batch generation/fast-path reads open a separate active scan route bound to one epoch and bucket PG |
+| `BucketMetadataNodeClient` | bucket metadata | exact reads/mutations use an active route bound to one epoch, bucket PG, and bucket; paired snapshots and delete-replica inspection use separate narrower routes; owner listing and batch generation/fast-path reads open an active scan route bound to one epoch and bucket PG |
 | `BucketWriteReservationNodeClient` | bucket metadata | active bucket route for acquisition, heartbeat, worker scans, and claim creation |
 | `RetainedBucketWriteReservationNodeClient` | bucket metadata | opens a retained cleanup route bound to one bucket metadata PG and exact bucket; the returned interface releases exact reservation proofs, drains, and worker claims without accepting a replacement PG or bucket |
 | `ObjectGenerationMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; reservation lookup and next-generation inspection cannot replace that subject |
@@ -4978,6 +4978,47 @@ One-hundred-and-twenty-fifth Phase 3 slice:
   interface for these operations; direct `PgMetadataStore` bucket reads remain
   banned in cluster code.
 - all 2,585 storage tests and the full 7,907-test workspace suite pass.
+  Workspace-wide strict Clippy and the transitional storage boundary checker
+  also pass.
+
+One-hundred-and-twenty-sixth Phase 3 slice:
+
+- exact bucket metadata operations now open a `BucketMetadataRoute` bound to
+  one route epoch, installed bucket-metadata PG, and bucket. Bucket heads,
+  snapshots, subresources, tags, create/barrier construction, and bucket
+  control command construction/matching no longer accept replacement PG or
+  bucket arguments after route construction.
+- paired snapshot loading and delete-replica inspection retain separate,
+  narrower `BucketMetadataRoutePair` and
+  `BucketDeleteReplicaMetadataRoute` authorities. The exceptional replica
+  inspection path therefore cannot acquire ordinary primary mutation or read
+  authority, while paired loading cannot issue unrelated exact operations.
+- embedded and Unix exact routes validate bucket placement before storage or
+  transport access. Command builders additionally bind command IDs to the
+  route epoch and PG, create configuration to the route bucket, and pending
+  command subjects to the route bucket. Storage-node dispatch constructs its
+  local exact route only after the existing RPC route validation and renders
+  subject mismatches as `PayloadDecode` rather than an internal error.
+- active cluster routes, cross-bucket snapshot loading, bucket deletion,
+  lifecycle and authorization reads, multipart barriers, bucket-control
+  mutation, and diagnostic/test adapters now consume the scoped interfaces.
+  A no-server Unix regression proves crossed epoch, PG, and bucket builder
+  subjects fail before transport, while the installed wrong-PG suite retains
+  its positive exact-snapshot canary.
+- the transitional checker no longer bans the removed raw operation names.
+  The production trait now makes an unscoped exact call a compiler error;
+  direct `SharedStorageNode` and `PgMetadataStore` bucket access remains
+  checked explicitly.
+- review corrections bind negative Unix responses as strictly as successful
+  ones: exact head/snapshot `BucketNotFound` names must equal the route bucket,
+  while pair responses must name either the source or destination. Foreign
+  subjects fail as `PayloadDecode`; matching single and destination-pair
+  canaries preserve the public `BucketNotFound` result.
+- multipart-completion barrier construction now validates the reservation's
+  epoch, bucket, canonical operation, and target context in the scoped Unix
+  route before encoding or transport. A no-server regression crosses each
+  field independently and proves that no RPC attempt starts.
+- all 2,588 storage tests and the full 7,910-test workspace suite pass.
   Workspace-wide strict Clippy and the transitional storage boundary checker
   also pass.
 
