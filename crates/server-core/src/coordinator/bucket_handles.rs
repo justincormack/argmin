@@ -128,7 +128,7 @@ impl<T> LoadedBucketValue<T> {
 /// This is intentionally snapshot-oriented: it owns bucket metadata and the
 /// requested bucket subresources, but it does not keep a PG mutex for the
 /// lifetime of the request.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) struct LoadedBucketHandle {
     bucket: BucketSummary,
     bucket_execution_generation: u64,
@@ -249,7 +249,7 @@ impl LoadedBucketHandle {
 }
 
 /// Request-scoped object handle derived from a loaded bucket handle.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) struct LoadedObjectHandle<'a> {
     bucket: &'a LoadedBucketHandle,
     key: ObjectKey,
@@ -274,7 +274,7 @@ impl<'a> LoadedObjectHandle<'a> {
 ///
 /// Same-bucket source/destination flows deliberately collapse to one
 /// underlying bucket handle with the union of both roles' declared needs.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) enum LoadedBucketPair {
     Same {
         bucket: Box<LoadedBucketHandle>,

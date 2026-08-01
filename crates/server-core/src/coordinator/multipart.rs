@@ -1135,7 +1135,7 @@ impl Coordinator {
                     upload.bucket_name_typed(),
                     upload.expected_bucket_owner(),
                 )?;
-                if bucket_info.multipart_upload_id_key.authenticates(
+                if bucket_info.multipart_upload_id_authority.authenticates(
                     upload.bucket_name_typed(),
                     upload.key_typed(),
                     upload.upload_id(),

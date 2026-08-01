@@ -943,7 +943,7 @@ impl Coordinator {
         Self::requester_can_bucket_owner_account_admin(requester, bucket)
             || requester.configured_principal().is_some_and(|principal| {
                 bucket
-                    .multipart_upload_id_key
+                    .multipart_upload_id_authority
                     .was_issued_for_principal(upload_id, principal)
             })
     }

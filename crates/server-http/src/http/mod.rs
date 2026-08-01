@@ -10067,7 +10067,7 @@ mod tests {
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
 
-        let invalid_upload_id = "a".repeat(storage::UPLOAD_ID_LEN + 1);
+        let invalid_upload_id = storage::UploadId::overlong_for_test();
         let req = make_req(&format!("partNumber=1&uploadId={invalid_upload_id}"));
         let op = S3Operation::UploadPart {
             bucket: test_bucket_name("mybucket"),
@@ -11186,7 +11186,7 @@ mod tests {
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
 
-        let invalid_upload_id = "a".repeat(storage::UPLOAD_ID_LEN + 1);
+        let invalid_upload_id = storage::UploadId::overlong_for_test();
         let req = make_req(&format!("uploadId={invalid_upload_id}"));
         let op = S3Operation::CompleteMultipartUpload {
             bucket: test_bucket_name("mybucket"),
@@ -11445,7 +11445,7 @@ mod tests {
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
 
-        let invalid_upload_id = "a".repeat(storage::UPLOAD_ID_LEN + 1);
+        let invalid_upload_id = storage::UploadId::overlong_for_test();
         let req = make_req(&format!("uploadId={invalid_upload_id}"));
         let op = S3Operation::AbortMultipartUpload {
             bucket: test_bucket_name("mybucket"),

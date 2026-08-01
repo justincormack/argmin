@@ -33,7 +33,7 @@ use storage::{
 use storage::{
     BucketObjectLockConfig, BucketOwnershipControls, BucketState, EcShape, GenerationId,
     ManagedEncryptionAlgorithm, PublicAccessBlockConfig, SessionId, StoredObject,
-    StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_LEN,
+    StreamUploadTarget, UploadId, UploadState,
 };
 
 use self::authz_results::*;
@@ -210,16 +210,7 @@ fn trusted_object_key(key: impl Into<String>) -> ObjectKey {
 
 #[cfg(test)]
 fn trusted_upload_id(seed: &str) -> UploadId {
-    let mut bytes = [b'.'; UPLOAD_ID_LEN];
-    let mut encoded = String::with_capacity(seed.len() * 2);
-    for byte in seed.bytes() {
-        use std::fmt::Write;
-        write!(encoded, "{byte:02x}").unwrap();
-    }
-    let take = encoded.len().min(UPLOAD_ID_LEN);
-    bytes[..take].copy_from_slice(&encoded.as_bytes()[..take]);
-    UploadId::try_from(String::from_utf8(bytes.to_vec()).unwrap())
-        .expect("coordinator tests must use valid upload IDs")
+    UploadId::for_test(seed)
 }
 
 fn parse_list_object_key(value: &str) -> Result<ObjectKey, ServerError> {
@@ -672,7 +663,7 @@ mod bucket_fast_path_cache_tests {
             bucket_lifecycle_generation: 0,
             bucket_execution_generation: 0,
             bucket_incarnation_generation: 0,
-            multipart_upload_id_key: storage::MultipartUploadIdKey::from_bytes([1; 32]),
+            multipart_upload_id_authority: storage::MultipartUploadIdAuthority::for_test(),
             bucket_abac_enabled: false,
             tags: storage::BucketFastPathTags::NotApplicable,
             encryption: storage::EffectiveBucketEncryptionConfig::default(),

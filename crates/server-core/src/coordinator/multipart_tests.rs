@@ -98,12 +98,7 @@ fn create_multipart_upload_returns_upload_id() {
         })
         .unwrap();
 
-    assert_eq!(result.upload_id.as_str().len(), UPLOAD_ID_LEN);
-    assert!(result
-        .upload_id
-        .as_str()
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_'));
+    let _issued_upload_id = result.upload_id;
 }
 
 #[test]

@@ -400,7 +400,7 @@ impl Coordinator {
             storage::MultipartUploadManagementLookup::Replay(replay) => {
                 let replay = *replay;
                 if !bucket_info
-                    .multipart_upload_id_key
+                    .multipart_upload_id_authority
                     .authenticates(bucket, key, upload_id)
                 {
                     return Err(ServerError::NoSuchUpload {
@@ -447,7 +447,7 @@ impl Coordinator {
             storage::MultipartUploadManagementLookup::NonInProgress(_)
             | storage::MultipartUploadManagementLookup::Missing => {
                 if bucket_info
-                    .multipart_upload_id_key
+                    .multipart_upload_id_authority
                     .authenticates(bucket, key, upload_id)
                     && !Self::requester_can_manage_authenticated_multipart_upload_id(
                         req.upload.requester(),
@@ -1353,7 +1353,7 @@ mod tests {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
-            multipart_upload_id_key: storage::MultipartUploadIdKey::from_bytes([1; 32]),
+            multipart_upload_id_authority: storage::MultipartUploadIdAuthority::for_test(),
             bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         }

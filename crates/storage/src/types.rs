@@ -324,10 +324,10 @@ pub enum SessionIdError {
     InvalidCharacterSet,
 }
 
-pub const UPLOAD_ID_LEN: usize = 128;
-pub const UPLOAD_ID_ALPHABET: &[u8; 64] =
+pub(crate) const UPLOAD_ID_LEN: usize = 128;
+const UPLOAD_ID_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._";
-pub const MULTIPART_UPLOAD_ID_KEY_LEN: usize = 32;
+pub(crate) const MULTIPART_UPLOAD_ID_KEY_LEN: usize = 32;
 pub const SESSION_ID_LEN: usize = 32;
 
 /// Per-bucket secret used to authenticate multipart upload IDs.
@@ -337,7 +337,7 @@ pub const SESSION_ID_LEN: usize = 32;
 /// key, making upload IDs from the previous incarnation invalid without
 /// retaining terminal upload records.
 #[derive(Clone, PartialEq, Eq)]
-pub struct MultipartUploadIdKey([u8; MULTIPART_UPLOAD_ID_KEY_LEN]);
+pub(crate) struct MultipartUploadIdKey([u8; MULTIPART_UPLOAD_ID_KEY_LEN]);
 
 impl MultipartUploadIdKey {
     // The fixed 128-character ID encodes two 64-bit listing coordinates, a
@@ -349,7 +349,7 @@ impl MultipartUploadIdKey {
     const INITIATOR_CLAIM_HEX_LEN: usize = 32;
     const AUTH_TAG_LEN: usize = 24;
 
-    pub fn generate() -> Result<Self, String> {
+    pub(crate) fn generate() -> Result<Self, String> {
         let mut bytes = [0u8; MULTIPART_UPLOAD_ID_KEY_LEN];
         ring::rand::SystemRandom::new()
             .fill(&mut bytes)
@@ -357,7 +357,7 @@ impl MultipartUploadIdKey {
         Ok(Self(bytes))
     }
 
-    pub fn from_bytes(bytes: [u8; MULTIPART_UPLOAD_ID_KEY_LEN]) -> Self {
+    pub(crate) fn from_bytes(bytes: [u8; MULTIPART_UPLOAD_ID_KEY_LEN]) -> Self {
         Self(bytes)
     }
 
@@ -365,7 +365,7 @@ impl MultipartUploadIdKey {
         &self.0
     }
 
-    pub fn issue(
+    pub(crate) fn issue(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -466,7 +466,7 @@ impl MultipartUploadIdKey {
         UploadId::try_from(encoded).expect("encoded multipart upload ID should remain valid")
     }
 
-    pub fn authenticates(
+    pub(crate) fn authenticates(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -507,7 +507,7 @@ impl MultipartUploadIdKey {
         hmac::verify(&comparison_key, &tag, expected_comparison_tag.as_ref()).is_ok()
     }
 
-    pub fn was_issued_for_principal(
+    pub(crate) fn was_issued_for_principal(
         &self,
         upload_id: &UploadId,
         initiator_principal: &str,
@@ -601,6 +601,53 @@ const fn decode_hex_nibble(byte: u8) -> Option<u8> {
 impl std::fmt::Debug for MultipartUploadIdKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("MultipartUploadIdKey(<redacted>)")
+    }
+}
+
+/// Opaque authority for interpreting multipart upload IDs issued by one bucket incarnation.
+///
+/// The durable signing key, ID encoding, and issuance operations remain private to storage.
+/// Higher layers may ask only the logical authorization questions needed to reproduce S3
+/// behavior for terminal or nonexistent uploads.
+#[derive(Clone)]
+pub struct MultipartUploadIdAuthority(MultipartUploadIdKey);
+
+impl MultipartUploadIdAuthority {
+    fn new(key: MultipartUploadIdKey) -> Self {
+        Self(key)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn for_test() -> Self {
+        Self(MultipartUploadIdKey::from_bytes(
+            [1; MULTIPART_UPLOAD_ID_KEY_LEN],
+        ))
+    }
+
+    #[must_use]
+    pub fn authenticates(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> bool {
+        self.0.authenticates(bucket, key, upload_id)
+    }
+
+    #[must_use]
+    pub fn was_issued_for_principal(
+        &self,
+        upload_id: &UploadId,
+        initiator_principal: &str,
+    ) -> bool {
+        self.0
+            .was_issued_for_principal(upload_id, initiator_principal)
+    }
+}
+
+impl std::fmt::Debug for MultipartUploadIdAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MultipartUploadIdAuthority(<opaque>)")
     }
 }
 
@@ -868,6 +915,28 @@ validated_string_newtype!(
     UploadIdError,
     validate_upload_id
 );
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl UploadId {
+    /// Construct a deterministic valid upload ID without exposing its encoding.
+    pub fn for_test(seed: &str) -> Self {
+        let mut encoded_seed = String::with_capacity(seed.len() * 2);
+        for byte in seed.bytes() {
+            use std::fmt::Write as _;
+            write!(encoded_seed, "{byte:02x}")
+                .expect("writing a test upload ID into String cannot fail");
+        }
+        let mut encoded = String::with_capacity(UPLOAD_ID_LEN);
+        encoded.push_str(&encoded_seed[..encoded_seed.len().min(UPLOAD_ID_LEN)]);
+        encoded.extend(std::iter::repeat_n('.', UPLOAD_ID_LEN - encoded.len()));
+        Self::try_from(encoded).expect("storage must construct a valid test upload ID")
+    }
+
+    /// Construct a raw upload-ID value that fails only the length constraint.
+    pub fn overlong_for_test() -> String {
+        "a".repeat(UPLOAD_ID_LEN + 1)
+    }
+}
 
 /// Streaming upload session identifier.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -3886,8 +3955,8 @@ pub struct BucketInfo {
 }
 
 impl BucketInfo {
-    pub fn multipart_upload_id_key(&self) -> &MultipartUploadIdKey {
-        &self.multipart_upload_id_key
+    pub fn multipart_upload_id_authority(&self) -> MultipartUploadIdAuthority {
+        MultipartUploadIdAuthority::new(self.multipart_upload_id_key.clone())
     }
 }
 
@@ -4060,7 +4129,7 @@ pub struct CreateBucketConfig<'a> {
 }
 
 /// Authoritative in-memory subset of bucket metadata used on hot object paths.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct BucketFastPathInfo {
     pub name: BucketName,
     pub owner_principal: String,
@@ -4079,7 +4148,7 @@ pub struct BucketFastPathInfo {
     pub bucket_lifecycle_generation: u64,
     pub bucket_execution_generation: u64,
     pub bucket_incarnation_generation: u64,
-    pub multipart_upload_id_key: MultipartUploadIdKey,
+    pub multipart_upload_id_authority: MultipartUploadIdAuthority,
     pub bucket_abac_enabled: bool,
     pub tags: BucketFastPathTags,
     pub encryption: EffectiveBucketEncryptionConfig,
@@ -4166,7 +4235,10 @@ impl std::fmt::Debug for BucketFastPathInfo {
                 "bucket_incarnation_generation",
                 &self.bucket_incarnation_generation,
             )
-            .field("multipart_upload_id_key", &self.multipart_upload_id_key)
+            .field(
+                "multipart_upload_id_authority",
+                &self.multipart_upload_id_authority,
+            )
             .field("bucket_abac_enabled", &self.bucket_abac_enabled)
             .field("tags", &self.tags)
             .field("encryption", &self.encryption)
@@ -4245,7 +4317,7 @@ impl From<&BucketSnapshot> for BucketFastPathInfo {
             bucket_lifecycle_generation: snapshot.bucket.bucket_lifecycle_generation,
             bucket_execution_generation: snapshot.bucket.bucket_execution_generation,
             bucket_incarnation_generation: snapshot.bucket.bucket_incarnation_generation,
-            multipart_upload_id_key: snapshot.bucket.multipart_upload_id_key.clone(),
+            multipart_upload_id_authority: snapshot.bucket.multipart_upload_id_authority(),
             bucket_abac_enabled: snapshot.bucket.bucket_abac_enabled,
             tags: match &snapshot.tags {
                 LoadedBucketSubresource::Loaded(tags) => BucketFastPathTags::Loaded(tags.clone()),
@@ -6548,7 +6620,7 @@ mod tests {
                 bucket_lifecycle_generation: info.bucket_lifecycle_generation,
                 bucket_execution_generation: info.bucket_execution_generation,
                 bucket_incarnation_generation: info.bucket_incarnation_generation,
-                multipart_upload_id_key: info.multipart_upload_id_key.clone(),
+                multipart_upload_id_authority: info.multipart_upload_id_authority(),
                 bucket_abac_enabled: info.bucket_abac_enabled,
                 tags: BucketFastPathTags::Loaded(SerializedBucketTagSet::new(
                     "<Tagging><TagSet><Tag><Key>secret</Key><Value>tags</Value></Tag></TagSet></Tagging>".to_string(),
@@ -6693,6 +6765,17 @@ mod tests {
     }
 
     #[test]
+    fn upload_id_test_helpers_produce_logical_valid_and_overlong_values() {
+        let first = UploadId::for_test("first");
+        let second = UploadId::for_test("second");
+        assert_ne!(first, second);
+        assert!(matches!(
+            UploadId::try_from(UploadId::overlong_for_test()),
+            Err(UploadIdError::InvalidLength { .. })
+        ));
+    }
+
+    #[test]
     fn multipart_upload_id_key_binds_issued_id_to_bucket_and_key() {
         let signing_key = MultipartUploadIdKey::from_bytes([0x5a; 32]);
         let bucket = BucketName::try_from("bucket-one").unwrap();
@@ -6745,6 +6828,23 @@ mod tests {
             Some((7, 42))
         );
         assert!(!signing_key.authenticates(&bucket, &key, &mutated_sequence));
+    }
+
+    #[test]
+    fn multipart_upload_id_authority_exposes_only_logical_id_checks() {
+        let signing_key = MultipartUploadIdKey::from_bytes([1; MULTIPART_UPLOAD_ID_KEY_LEN]);
+        let authority = MultipartUploadIdAuthority::for_test();
+        let bucket = BucketName::try_from("bucket-one").unwrap();
+        let key = ObjectKey::try_from("path/to/object").unwrap();
+        let upload_id = signing_key.issue(&bucket, &key, "primary").unwrap();
+
+        assert!(authority.authenticates(&bucket, &key, &upload_id));
+        assert!(authority.was_issued_for_principal(&upload_id, "primary"));
+        assert!(!authority.was_issued_for_principal(&upload_id, "alternate"));
+        assert_eq!(
+            format!("{authority:?}"),
+            "MultipartUploadIdAuthority(<opaque>)"
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use storage::{
     BucketName, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey, ObjectLockState,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(super) struct ValidatedBucket(pub(super) BucketSummary);
 
 impl ValidatedBucket {

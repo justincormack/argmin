@@ -1105,6 +1105,22 @@ supplied subject and durable-state fields in the logical input. Multipart author
 remaining public physical record representations are still pending, so implementation-order item
 3 is not yet complete.
 
+The sixteenth bounded slice continues implementation-order item 3 by containing the per-bucket
+multipart upload ID signing key. Key bytes, generation, durable encoding, ID issuance, listing
+coordinates, encoding length/alphabet, and issuance-identity comparison are private to storage.
+Higher layers retain only a
+cloneable, opaque `MultipartUploadIdAuthority` and may ask the two logical questions required by
+S3 authorization and terminal-upload behavior: whether an ID authenticates for a bucket/object
+target and whether it was issued for a principal. The authority has a redacted `Debug` view and no
+equality implementation, so key identity cannot be recovered indirectly through containing bucket
+summaries or request handles. Existing metadata-command, database, and storage RPC representations
+remain unchanged. Compiler visibility is the primary boundary, with checks rejecting key types or
+field names outside storage, public key exports, and derived equality on the opaque authority.
+Test-only callers receive an opaque deterministic authority and logical valid/overlong upload-ID
+helpers; they do not provide raw key bytes or reproduce the ID encoding.
+Multipart authorization and abort still expose durable upload/management records and remain the
+next containment slice, so implementation-order item 3 is not yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

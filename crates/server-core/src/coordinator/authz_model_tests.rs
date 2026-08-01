@@ -2393,7 +2393,7 @@ mod harness {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
-            multipart_upload_id_key: storage::MultipartUploadIdKey::from_bytes([1; 32]),
+            multipart_upload_id_authority: storage::MultipartUploadIdAuthority::for_test(),
             bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         }
@@ -3874,7 +3874,7 @@ mod phase4_harness {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
-            multipart_upload_id_key: storage::MultipartUploadIdKey::from_bytes([1; 32]),
+            multipart_upload_id_authority: storage::MultipartUploadIdAuthority::for_test(),
             bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         }

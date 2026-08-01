@@ -227,7 +227,7 @@ impl Coordinator {
             bucket_policy_generation: info.bucket_policy_generation,
             bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
-            multipart_upload_id_key: info.multipart_upload_id_key().clone(),
+            multipart_upload_id_authority: info.multipart_upload_id_authority(),
             bucket_abac_enabled: info.bucket_abac_enabled,
             encryption: info.encryption,
         }
@@ -248,7 +248,7 @@ impl Coordinator {
             bucket_policy_generation: info.bucket_policy_generation,
             bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
-            multipart_upload_id_key: info.multipart_upload_id_key,
+            multipart_upload_id_authority: info.multipart_upload_id_authority,
             bucket_abac_enabled: info.bucket_abac_enabled,
             encryption: info.encryption,
         }
@@ -274,7 +274,7 @@ impl Coordinator {
             bucket_policy_generation: info.bucket_policy_generation,
             bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
-            multipart_upload_id_key: info.multipart_upload_id_key,
+            multipart_upload_id_authority: info.multipart_upload_id_authority,
             bucket_abac_enabled: info.bucket_abac_enabled,
             encryption: info.encryption,
         }

@@ -2440,6 +2440,57 @@ fail_with_matches \
     "Multipart upload IDs must be issued by storage rather than from a bucket key exposed to server-core" \
     "$server_core_multipart_upload_id_issuance_leaks"
 
+multipart_upload_id_key_boundary_leaks=$(
+    {
+        rg -n --color=never \
+            '\bMultipartUploadIdKey\b|\bmultipart_upload_id_key\b|\b(MULTIPART_UPLOAD_ID_KEY_LEN|UPLOAD_ID_ALPHABET|UPLOAD_ID_LEN)\b|\bfrom_test_key_bytes\b' \
+            crates \
+            -g '*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            '^[[:space:]]*pub[[:space:]]+(struct[[:space:]]+MultipartUploadIdKey|const[[:space:]]+(MULTIPART_UPLOAD_ID_KEY_LEN|UPLOAD_ID_ALPHABET|UPLOAD_ID_LEN)\b|use.*\b(MultipartUploadIdKey|MULTIPART_UPLOAD_ID_KEY_LEN|UPLOAD_ID_ALPHABET|UPLOAD_ID_LEN)\b)' \
+            crates/storage/src/types.rs \
+            crates/storage/src/lib.rs \
+            || true
+    }
+)
+fail_with_matches \
+    "Multipart upload ID key material, durable encoding constants, and issuance are private to storage; higher layers may retain only MultipartUploadIdAuthority and logical test helpers" \
+    "$multipart_upload_id_key_boundary_leaks"
+
+multipart_upload_id_raw_test_authority_constructors=$(
+    rg -n --color=never \
+        'pub[[:space:]]+fn[[:space:]]+[A-Za-z0-9_]*test[A-Za-z0-9_]*\([^)]*\[u8' \
+        crates/storage/src/types.rs \
+        || true
+)
+fail_with_matches \
+    "Multipart upload ID test authorities must be constructed opaquely without exposing raw key bytes or lengths" \
+    "$multipart_upload_id_raw_test_authority_constructors"
+
+multipart_upload_id_authority_derived_equality=$(
+    awk '
+    /#\[derive\(/ {
+        derive = $0
+        next
+    }
+    /pub struct MultipartUploadIdAuthority/ {
+        if (derive ~ /PartialEq|Eq/) {
+            print FILENAME ":" FNR ":" derive
+        }
+    }
+    {
+        if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^#\[derive\(/) {
+            derive = ""
+        }
+    }
+    ' crates/storage/src/types.rs
+)
+fail_with_matches \
+    "Opaque multipart upload ID authority must not expose hidden signing-key equality" \
+    "$multipart_upload_id_authority_derived_equality"
+
 public_multipart_create_durable_request_surfaces=$(
     rg -n --color=never \
         '^[[:space:]]*pub[[:space:]]+(struct[[:space:]]+CreateMultipartUploadReq|use.*\bCreateMultipartUploadReq\b|fn[[:space:]]+create_multipart_upload(_with_ordered_id)?\b)' \

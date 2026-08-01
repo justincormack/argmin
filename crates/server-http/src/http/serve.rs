@@ -8105,7 +8105,7 @@ Connection: close\r\n\r\n",
 
     #[test]
     fn streaming_upload_part_invalid_upload_id_is_preserved_for_later_validation() {
-        let invalid_upload_id = "a".repeat(storage::UPLOAD_ID_LEN + 1);
+        let invalid_upload_id = storage::UploadId::overlong_for_test();
         let parts = make_parts(
             "PUT",
             &format!("/mybucket/mykey?partNumber=3&uploadId={invalid_upload_id}"),

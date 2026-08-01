@@ -768,7 +768,7 @@ impl Coordinator {
             storage::MultipartUploadManagementLookup::Replay(replay) => {
                 let replay = *replay;
                 if !bucket_info
-                    .multipart_upload_id_key
+                    .multipart_upload_id_authority
                     .authenticates(bucket, key, upload_id)
                 {
                     return Err(ServerError::NoSuchUpload {
@@ -815,7 +815,7 @@ impl Coordinator {
             storage::MultipartUploadManagementLookup::NonInProgress(_)
             | storage::MultipartUploadManagementLookup::Missing => {
                 if bucket_info
-                    .multipart_upload_id_key
+                    .multipart_upload_id_authority
                     .authenticates(bucket, key, upload_id)
                     && !Self::requester_can_manage_authenticated_multipart_upload_id(
                         req.upload.requester(),
@@ -939,7 +939,7 @@ impl Coordinator {
             }
             storage::MultipartUploadManagementLookup::Missing => {
                 if !bucket_info
-                    .multipart_upload_id_key
+                    .multipart_upload_id_authority
                     .authenticates(bucket, key, upload_id)
                 {
                     return Err(ServerError::NoSuchUpload {
@@ -1030,7 +1030,7 @@ impl Coordinator {
             }
             storage::MultipartUploadManagementLookup::Missing => {
                 if bucket_info
-                    .multipart_upload_id_key
+                    .multipart_upload_id_authority
                     .authenticates(bucket, key, upload_id)
                     && !Self::requester_can_manage_authenticated_multipart_upload_id(
                         req.upload.requester(),

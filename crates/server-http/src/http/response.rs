@@ -4185,7 +4185,7 @@ mod tests {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
-            multipart_upload_id_key: storage::MultipartUploadIdKey::from_bytes([1; 32]),
+            multipart_upload_id_authority: storage::MultipartUploadIdAuthority::for_test(),
             bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         };
@@ -4394,7 +4394,7 @@ mod tests {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
-            multipart_upload_id_key: storage::MultipartUploadIdKey::from_bytes([1; 32]),
+            multipart_upload_id_authority: storage::MultipartUploadIdAuthority::for_test(),
             bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         }];
@@ -4434,7 +4434,7 @@ mod tests {
 
     #[test]
     fn create_multipart_upload_response_includes_lifecycle_abort_headers() {
-        let upload_id = UploadId::try_from(".".repeat(storage::UPLOAD_ID_LEN)).unwrap();
+        let upload_id = UploadId::for_test("lifecycle-response");
         let resp = S3Response::create_multipart_upload(
             "bucket",
             "key",
@@ -4472,7 +4472,7 @@ mod tests {
 
     #[test]
     fn create_multipart_upload_response_includes_managed_encryption_header() {
-        let upload_id = UploadId::try_from(".".repeat(storage::UPLOAD_ID_LEN)).unwrap();
+        let upload_id = UploadId::for_test("managed-encryption-response");
         let resp = S3Response::create_multipart_upload(
             "bucket",
             "key",

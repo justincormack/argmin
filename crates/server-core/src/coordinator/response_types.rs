@@ -48,7 +48,7 @@ pub(super) struct DeleteMarkerLifecycleExpiration {
 }
 
 /// Core-owned bucket summary exposed above the storage layer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct BucketSummary {
     pub name: BucketName,
     pub owner_principal: String,
@@ -66,13 +66,13 @@ pub struct BucketSummary {
     pub bucket_policy_generation: u64,
     pub bucket_lifecycle_present: bool,
     pub bucket_lifecycle_generation: u64,
-    pub multipart_upload_id_key: storage::MultipartUploadIdKey,
+    pub multipart_upload_id_authority: storage::MultipartUploadIdAuthority,
     pub bucket_abac_enabled: bool,
     pub encryption: EffectiveBucketEncryptionConfig,
 }
 
 /// ACL-free bucket execution context used by modern hot-path auth.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ModernBucketSummary {
     pub name: BucketName,
     pub owner_principal: String,
@@ -87,7 +87,7 @@ pub struct ModernBucketSummary {
     pub bucket_policy_generation: u64,
     pub bucket_lifecycle_present: bool,
     pub bucket_lifecycle_generation: u64,
-    pub multipart_upload_id_key: storage::MultipartUploadIdKey,
+    pub multipart_upload_id_authority: storage::MultipartUploadIdAuthority,
     pub bucket_abac_enabled: bool,
     pub encryption: EffectiveBucketEncryptionConfig,
 }
@@ -108,7 +108,7 @@ impl From<&BucketSummary> for ModernBucketSummary {
             bucket_policy_generation: bucket.bucket_policy_generation,
             bucket_lifecycle_present: bucket.bucket_lifecycle_present,
             bucket_lifecycle_generation: bucket.bucket_lifecycle_generation,
-            multipart_upload_id_key: bucket.multipart_upload_id_key.clone(),
+            multipart_upload_id_authority: bucket.multipart_upload_id_authority.clone(),
             bucket_abac_enabled: bucket.bucket_abac_enabled,
             encryption: bucket.encryption,
         }
