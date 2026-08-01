@@ -378,6 +378,143 @@ An internal private CA is the normal convenient deployment model, but a
 deliberately selected public-PKI root bundle is also supported. CA private keys
 are provisioning material and must not be installed on Argmin hosts.
 
+#### Private CA and host certificate example
+
+The following OpenSSL 3 commands create a private P-256 root CA and one
+server certificate per host for the replicated example below. Run them on a
+protected provisioning machine, not an Argmin host:
+
+```bash
+mkdir -m 0700 argmin-internal-pki
+cd argmin-internal-pki
+umask 077
+
+openssl genpkey \
+  -algorithm EC \
+  -aes-256-cbc \
+  -pkeyopt ec_paramgen_curve:P-256 \
+  -out cluster-ca.key
+
+openssl req -new -x509 \
+  -key cluster-ca.key \
+  -sha256 \
+  -days 3650 \
+  -subj '/CN=Argmin Internal Root CA' \
+  -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' \
+  -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+  -addext 'subjectKeyIdentifier=hash' \
+  -out cluster-ca.crt
+```
+
+`openssl genpkey` prompts for a passphrase. Use a strong passphrase stored
+separately from the encrypted CA key and its backups. Keep the CA key offline
+except while issuing certificates. A managed HSM or an existing offline PKI is
+preferred where available; filesystem mode and directory ownership alone are
+not sufficient protection for a long-lived root key.
+
+Issue the three host certificates. Each certificate includes both internal DNS
+names advertised by that host's control-plane and storage endpoints:
+
+```bash
+for number in 1 2 3; do
+  openssl genpkey \
+    -algorithm EC \
+    -pkeyopt ec_paramgen_curve:P-256 \
+    -out "host-${number}.key"
+
+  openssl req -new \
+    -key "host-${number}.key" \
+    -subj "/CN=control-${number}.internal" \
+    -addext 'basicConstraints=critical,CA:FALSE' \
+    -addext 'keyUsage=critical,digitalSignature' \
+    -addext 'extendedKeyUsage=serverAuth' \
+    -addext "subjectAltName=DNS:control-${number}.internal,DNS:storage-${number}.internal" \
+    -out "host-${number}.csr"
+
+  openssl x509 -req \
+    -in "host-${number}.csr" \
+    -CA cluster-ca.crt \
+    -CAkey cluster-ca.key \
+    -set_serial "0x$(openssl rand -hex 16)" \
+    -sha256 \
+    -days 397 \
+    -copy_extensions copy \
+    -out "host-${number}.crt"
+
+  rm "host-${number}.csr"
+done
+```
+
+The SAN entries, rather than the certificate common name, establish endpoint
+identity. Every TCP endpoint's advertised host and `tls_server_name` must match
+one SAN in its selected certificate. For an advertised IP address, use an
+`IP:192.0.2.10` SAN instead of `DNS:...`.
+
+Verify the issued files before deployment:
+
+```bash
+for number in 1 2 3; do
+  openssl verify \
+    -CAfile cluster-ca.crt \
+    -purpose sslserver \
+    -verify_hostname "control-${number}.internal" \
+    "host-${number}.crt"
+  openssl verify \
+    -CAfile cluster-ca.crt \
+    -purpose sslserver \
+    -verify_hostname "storage-${number}.internal" \
+    "host-${number}.crt"
+  openssl x509 \
+    -in "host-${number}.crt" \
+    -noout \
+    -subject \
+    -issuer \
+    -dates \
+    -ext subjectAltName
+done
+```
+
+For an IP endpoint, perform the corresponding identity check with
+`-verify_ip 192.0.2.10` instead of `-verify_hostname`.
+
+Install the public root and the applicable host identity as files owned by the
+service user. Replace `argmin:argmin` with the actual service account:
+
+```bash
+sudo install -d -o argmin -g argmin -m 0700 /etc/argmin/tls
+sudo install -o argmin -g argmin -m 0644 \
+  cluster-ca.crt /etc/argmin/tls/cluster-ca.crt
+sudo install -o argmin -g argmin -m 0644 \
+  host-1.crt /etc/argmin/tls/host-1.crt
+sudo install -o argmin -g argmin -m 0600 \
+  host-1.key /etc/argmin/tls/host-1.key
+```
+
+Install `host-2.crt` and `host-2.key` only on host 2, and the corresponding
+host 3 files only on host 3. Never deploy `cluster-ca.key`. If an existing PKI
+issues the certificates, require the same SANs, `CA:FALSE`, digital-signature
+key usage, and TLS server-auth extended key usage. Every certificate placed in
+an Argmin trust bundle must have a critical `basicConstraints` extension with
+`CA:TRUE` and a critical `keyUsage` extension containing `keyCertSign`; Argmin
+rejects a bundle that relies only on ordinary chain validation. A certificate
+file may contain the leaf followed by intermediate CA certificates; the
+configured trust bundle contains the trusted CA certificates. Version 1 reads
+material at startup, so certificate renewal requires a controlled process
+restart.
+
+Finally, run material validation for every process identity on its selected
+host. This catches incompatible keys, expired or not-yet-valid certificates,
+untrusted chains, invalid CA constraints, and SAN mismatches before startup:
+
+```bash
+argmin-s3 validate-cluster-material \
+  /etc/argmin/cluster.toml control-1
+argmin-s3 validate-cluster-material \
+  /etc/argmin/cluster.toml storage-1
+argmin-s3 validate-cluster-material \
+  /etc/argmin/cluster.toml frontend-1
+```
+
 Credential identity consists of the principal, principal id, credential id,
 and nonzero version. `accept_from_ms` and optional `accept_until_ms` define the
 startup-static acceptance window. Overlapping verify-only credentials support
