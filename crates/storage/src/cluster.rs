@@ -9621,6 +9621,24 @@ impl StorageCluster {
         self.operation_epoch
     }
 
+    pub(super) fn current_route_effect_fence(&self) -> AdmittedRouteEffectFence {
+        let lease = self.local_map.route_map_lease_snapshot();
+        match (
+            lease.validity.valid_until_ms(),
+            lease.local_valid_until_monotonic_ms,
+        ) {
+            (Some(authority_valid_until_ms), Some(local_valid_until_monotonic_ms)) => {
+                AdmittedRouteEffectFence::bounded(
+                    self.operation_epoch,
+                    authority_valid_until_ms,
+                    local_valid_until_monotonic_ms,
+                )
+            }
+            (None, None) => AdmittedRouteEffectFence::unbounded(self.operation_epoch),
+            _ => unreachable!("route-map deadline representations must agree"),
+        }
+    }
+
     pub fn route_map_valid_until_ms(&self) -> Option<u64> {
         self.local_map.route_map_valid_until_ms()
     }
@@ -9903,8 +9921,14 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
     ) -> Result<bool, ObjectPgActionError> {
-        match self.try_set_pending_metadata_command_for_bucket(pg_id, bucket, command) {
+        match self.try_set_pending_metadata_command_for_bucket_with_effect_fence(
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+        ) {
             Ok(Some(())) => Ok(true),
             Ok(None) | Err(StoreError::MetadataCommandLogConflict { .. }) => {
                 self.drain_one_pending_object_metadata_command(pg_id, bucket)?;
@@ -9919,9 +9943,10 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
     ) -> Result<bool, ObjectPgActionError> {
         self.maybe_run_before_metadata_command_pending_install_hook();
-        self.try_set_object_pg_pending_command_or_drain(pg_id, bucket, command)
+        self.try_set_object_pg_pending_command_or_drain(pg_id, bucket, command, effect_fence)
     }
 
     fn pending_metadata_command_for_bucket(
@@ -13540,7 +13565,7 @@ impl StorageCluster {
                     ),
                 ),
             );
-            if !self.try_set_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
+            if !self.try_set_object_pg_pending_command_or_drain(pg_id, bucket, &command, None)? {
                 work_budget
                     .sleep_after_contention(
                         "object generation release pending install retry budget exhausted",
@@ -16066,7 +16091,9 @@ impl StorageCluster {
                         .clone(),
                 })),
             );
-            if !self.try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
+            if !self
+                .try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command, None)?
+            {
                 continue;
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;

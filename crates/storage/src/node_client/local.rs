@@ -1,6 +1,6 @@
 use super::*;
 use crate::metadata_command::{
-    AbortStreamUploadCommand, DeleteObjectVersionMode,
+    AbortStreamUploadCommand, DeleteObjectPayloadReclaimCommand, DeleteObjectVersionMode,
     CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
@@ -163,6 +163,15 @@ struct LocalMultipartAbortMutationMetadataRoute<'a> {
     bucket: BucketName,
     key: ObjectKey,
     upload_id: UploadId,
+}
+
+struct LocalObjectPayloadReclaimCommandMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+    generation_id: GenerationId,
 }
 
 struct LocalStreamUploadCreationMetadataRoute<'a> {
@@ -3293,6 +3302,58 @@ impl MultipartAbortMutationMetadataRoute for LocalMultipartAbortMutationMetadata
     }
 }
 
+impl ObjectPayloadReclaimCommandMetadataRoute
+    for LocalObjectPayloadReclaimCommandMetadataRoute<'_>
+{
+    fn build_delete_object_payload_reclaim_command(
+        &self,
+        request: BuildDeleteObjectPayloadReclaimCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        require_object_payload_reclaim_command_subject(
+            self.route_cluster_epoch,
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            self.generation_id,
+            &request,
+        )?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        let current_payload = match request.payload {
+            ObjectPayloadReclaimCommand::Segments(_) => pg
+                .get_object_segments_reclaim(&self.bucket, &self.key, self.generation_id)?
+                .map(ObjectPayloadReclaimCommand::Segments),
+            ObjectPayloadReclaimCommand::Multipart(_) => pg
+                .get_multipart_reclaim(&self.bucket, &self.key, self.generation_id)?
+                .map(ObjectPayloadReclaimCommand::Multipart),
+        };
+        if current_payload.as_ref() != Some(request.payload)
+            || pg.object_payload_reclaim_claim()?.as_ref() != Some(request.claim)
+        {
+            return Err(ObjectPgActionError::StaleObjectReadSubject);
+        }
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        let command_id = self.client.next_metadata_command_id_from_locked_pg(
+            self.pg_id.pg_id(),
+            self.route_cluster_epoch,
+            &pg,
+        )?;
+        Ok(MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::DeleteObjectPayloadReclaim(Box::new(
+                DeleteObjectPayloadReclaimCommand::new(
+                    self.bucket.clone(),
+                    self.key.clone(),
+                    self.generation_id,
+                    request.payload.clone(),
+                    ObjectPayloadReclaimClaimProof::from(request.claim),
+                ),
+            )),
+        ))
+    }
+}
+
 impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
     fn open_put_object_metadata_route(
         &self,
@@ -3457,6 +3518,31 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
             bucket: bucket.clone(),
             key: key.clone(),
             upload_id: upload_id.clone(),
+        }))
+    }
+
+    fn open_object_payload_reclaim_command_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<Box<dyn ObjectPayloadReclaimCommandMetadataRoute + '_>, ObjectPgActionError> {
+        if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open object payload reclaim command metadata route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalObjectPayloadReclaimCommandMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
         }))
     }
 

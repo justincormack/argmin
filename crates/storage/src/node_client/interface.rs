@@ -572,6 +572,15 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         upload_id: &UploadId,
     ) -> Result<Box<dyn MultipartAbortMutationMetadataRoute + '_>, ObjectPgActionError>;
 
+    fn open_object_payload_reclaim_command_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<Box<dyn ObjectPayloadReclaimCommandMetadataRoute + '_>, ObjectPgActionError>;
+
     fn open_stream_upload_creation_metadata_route(
         &self,
         route_cluster_epoch: ClusterEpoch,
@@ -710,6 +719,14 @@ pub(crate) trait MultipartAbortMutationMetadataRoute: Send {
         request: BuildAuthorizedAbortMultipartUploadCommandReq<'_>,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
+}
+
+pub(crate) trait ObjectPayloadReclaimCommandMetadataRoute: Send {
+    fn build_delete_object_payload_reclaim_command(
+        &self,
+        request: BuildDeleteObjectPayloadReclaimCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 }
 
 pub(crate) trait StreamUploadCreationMetadataRoute: Send {
@@ -1085,6 +1102,44 @@ pub(crate) struct BuildAuthorizedAbortMultipartUploadCommandReq<'a> {
     pub(crate) authorized_upload: &'a AuthorizedMultipartUploadRecord,
     pub(crate) expected_cleanup: Option<&'a AbortMultipartUploadCleanup>,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
+}
+
+pub(crate) struct BuildDeleteObjectPayloadReclaimCommandReq<'a> {
+    pub(crate) payload: &'a ObjectPayloadReclaimCommand,
+    pub(crate) claim: &'a ObjectPayloadReclaimClaimRecord,
+}
+
+pub(crate) fn require_object_payload_reclaim_command_subject(
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    generation_id: GenerationId,
+    request: &BuildDeleteObjectPayloadReclaimCommandReq<'_>,
+) -> Result<(), ObjectPgActionError> {
+    let payload_matches = match request.payload {
+        ObjectPayloadReclaimCommand::Segments(record) => {
+            record.bucket == *bucket && record.key == *key && record.generation_id == generation_id
+        }
+        ObjectPayloadReclaimCommand::Multipart(record) => {
+            record.bucket == *bucket && record.key == *key && record.generation_id == generation_id
+        }
+    };
+    let claim = request.claim;
+    if !payload_matches
+        || claim.pg_id != pg_id.get()
+        || claim.cluster_epoch != route_cluster_epoch
+        || claim.bucket != *bucket
+        || claim.key != *key
+        || claim.generation_id != generation_id
+        || claim.reclaim_kind != request.payload.kind()
+    {
+        return Err(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "build delete object payload reclaim command",
+        }
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) struct BuildPutObjectMetadataCommandReq<'a> {

@@ -456,6 +456,88 @@ fn object_payload_reclaim_acquires_and_releases_durable_claim() {
 }
 
 #[test]
+fn object_payload_reclaim_expiry_between_build_and_pending_install_preserves_root() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    let committed =
+        write_committed_direct_segment_for(&cluster, &bucket, &key, b"expired reclaim install");
+    cluster
+        .delete_current_object_if(&bucket, &key, |_| Ok::<(), ()>(()))
+        .unwrap()
+        .unwrap();
+    assert!(cluster
+        .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+        .unwrap());
+
+    let pg_id = PgId::new(object_pg);
+    let command_stream_before = collect_metadata_replay_snapshot(&map, &node_ids, &[object_pg]);
+    let clock = Arc::new(crate::clock::test_time_override_guard(1_000));
+    cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
+
+    let hook_cluster = Arc::clone(&cluster);
+    let hook_clock = Arc::clone(&clock);
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_ran_for_hook = Arc::clone(&hook_ran);
+    let _hook_guard =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            hook_cluster.test_store_route_map_lease(
+                RouteMapValidity::until_ms(10_000).unwrap(),
+                Some(9_000),
+            );
+            hook_clock.set(4_500);
+            hook_ran_for_hook.store(true, Ordering::SeqCst);
+        }));
+
+    let error = cluster
+        .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
+    ));
+    assert!(
+        hook_ran.load(Ordering::SeqCst),
+        "test must expire the captured fence after command construction"
+    );
+    assert!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket).is_none(),
+        "expired authority must not install a pending reclaim command"
+    );
+    assert_eq!(
+        collect_metadata_replay_snapshot(&map, &node_ids, &[object_pg]),
+        command_stream_before,
+        "expired pending-slot insertion must not advance any replica log"
+    );
+    assert_eq!(
+        object_payload_reclaim_claim_count_for_test(&map, pg_id),
+        0,
+        "failed insertion must release the frontend-owned reclaim claim"
+    );
+    assert!(
+        cluster
+            .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+            .unwrap(),
+        "failed insertion must preserve durable reclaim state for retry"
+    );
+}
+
+#[test]
 fn object_payload_reclaim_retry_releases_surviving_terminal_claim() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

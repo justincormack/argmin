@@ -47,17 +47,17 @@ use crate::node_client::{
     BucketWriteReservationNodeClient, BuildAbortMultipartUploadCommandReq,
     BuildAuthorizedAbortMultipartUploadCommandReq, BuildCompleteMultipartObjectCommandReq,
     BuildCreateMultipartUploadCommandReq, BuildCreateStreamUploadCommandReq,
-    BuildDeleteCurrentObjectCommandReq, BuildDeleteSpecificObjectVersionCommandReq,
-    BuildDirectPutCommitCommandReq, BuildInsertDeleteMarkerCommandReq,
-    BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
-    BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
-    DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
-    ObjectDeleteStorageSnapshot, ObjectGenerationMetadataNodeClient,
-    ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
-    ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
-    RetainedBucketWriteReservationNodeClient, RetainedMetadataCommandNodeClient,
-    RetainedObjectMutationMetadataNodeClient, ShardAckNodeClient, ShardScavengerNodeClient,
-    ShardScavengerObservationNodeClient,
+    BuildDeleteCurrentObjectCommandReq, BuildDeleteObjectPayloadReclaimCommandReq,
+    BuildDeleteSpecificObjectVersionCommandReq, BuildDirectPutCommitCommandReq,
+    BuildInsertDeleteMarkerCommandReq, BuildPutObjectMetadataCommandReq,
+    BuildStreamPartCommitCommandReq, BuildStreamPutCommitCommandReq, CreateBucketCommandBuild,
+    CreateStreamUploadPrecondition, DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload,
+    MarkBucketDeletingCommandBuild, ObjectDeleteStorageSnapshot,
+    ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
+    ObjectMutationMetadataNodeClient, ObjectReadMetadataNodeClient,
+    ObjectVersionMetadataNodeClient, RetainedBucketWriteReservationNodeClient,
+    RetainedMetadataCommandNodeClient, RetainedObjectMutationMetadataNodeClient,
+    ShardAckNodeClient, ShardScavengerNodeClient, ShardScavengerObservationNodeClient,
 };
 use crate::node_runtime::pg_store::{
     initialize_pg_durable_identity, inspect_pg_shard_inventory, sync_initialized_pg_store_layout,
@@ -113,6 +113,7 @@ use crate::storage_rpc::{
     decode_object_generation_reservation_request, decode_object_payload_lease_control_request,
     decode_object_payload_reclaim_claim_acquire_request,
     decode_object_payload_reclaim_claim_record_request,
+    decode_object_payload_reclaim_command_build_request,
     decode_object_payload_reclaim_exists_request, decode_object_read_auth_subject_request,
     decode_object_read_snapshot_request, decode_object_request,
     decode_object_tags_for_subject_request, decode_placed_segment_backfill_reference_page_request,
@@ -285,7 +286,8 @@ use crate::storage_rpc::{
     StorageRpcObjectPayloadLeaseControlRequest, StorageRpcObjectPayloadLeaseControlResponse,
     StorageRpcObjectPayloadReclaimClaimAcquireRequest,
     StorageRpcObjectPayloadReclaimClaimOptionalRecordResponse,
-    StorageRpcObjectPayloadReclaimClaimRecordRequest, StorageRpcObjectPayloadReclaimExistsRequest,
+    StorageRpcObjectPayloadReclaimClaimRecordRequest,
+    StorageRpcObjectPayloadReclaimCommandBuildRequest, StorageRpcObjectPayloadReclaimExistsRequest,
     StorageRpcObjectPayloadReclaimResponse, StorageRpcObjectReadAuthSubjectOutcome,
     StorageRpcObjectReadAuthSubjectRequest, StorageRpcObjectReadAuthSubjectResponse,
     StorageRpcObjectReadSnapshotOutcome, StorageRpcObjectReadSnapshotRequest,
@@ -4697,6 +4699,36 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)
     }
 
+    fn build_delete_object_payload_reclaim_command(
+        &self,
+        generation_id: GenerationId,
+        payload: &ObjectPayloadReclaimCommand,
+        claim: &ObjectPayloadReclaimClaimRecord,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        let route =
+            ObjectMutationMetadataNodeClient::open_object_payload_reclaim_command_metadata_route(
+                &local_client,
+                self.route.fence.cluster_epoch,
+                self.route.pg_id,
+                self.route.bucket,
+                self.route.key,
+                generation_id,
+            )
+            .map_err(StorageNodeObjectRouteError::Object)?;
+        route
+            .build_delete_object_payload_reclaim_command(
+                BuildDeleteObjectPayloadReclaimCommandReq { payload, claim },
+                effect_fence,
+            )
+            .map_err(StorageNodeObjectRouteError::Object)
+    }
+
     fn require_create_stream_upload_subject(
         &self,
         request: &CreateStreamUploadReq,
@@ -8461,6 +8493,17 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::ObjectPayloadReclaimCommandBuild => {
+                match decode_object_payload_reclaim_command_build_request(&frame.payload) {
+                    Ok(request) => {
+                        self.object_payload_reclaim_command_build_response(route_permit, request)
+                    }
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::ObjectMultipartAbortCleanupLoad => {
                 match decode_abort_multipart_cleanup_request(&frame.payload) {
                     Ok(request) => self.abort_multipart_cleanup_response(route_permit, request),
@@ -12092,6 +12135,50 @@ impl StorageNodeConnectionHandler {
             encode_abort_multipart_cleanup_response(&StorageRpcAbortMultipartCleanupResponse {
                 cleanup,
             });
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn object_payload_reclaim_command_build_response(
+        &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
+        request: StorageRpcObjectPayloadReclaimCommandBuildRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
+            "object payload reclaim command build",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let effect_fence =
+            admitted_route_effect_fence(request.object.cluster_epoch, request.effect_deadline);
+        let response = match route.build_delete_object_payload_reclaim_command(
+            request.generation_id,
+            &request.payload,
+            &request.claim,
+            effect_fence,
+        ) {
+            Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleObjectReadSubject,
+            )) => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                match object_metadata_command_build_error_outcome(
+                    error,
+                    Some("DeleteObjectPayloadReclaim"),
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                }
+            }
+        };
+        let payload = encode_object_metadata_command_build_response(
+            &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
+        );
         Ok(encode_storage_rpc_success_response(&payload))
     }
 
@@ -24119,6 +24206,107 @@ mod tests {
                 .unwrap(),
             command_log_index_before,
             "expired Unix abort builds must not advance the PG command log"
+        );
+    }
+
+    #[test]
+    fn unix_payload_reclaim_build_rebinds_and_rejects_expired_effect_deadline() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_and_monotonic_override(1_000, 900_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("unix-expired-reclaim-build-bucket");
+        let key = crate::tests::object_key("unix-expired-reclaim-build-key");
+        let generation_id = GenerationId::new(91).unwrap();
+        let reclaim = ObjectPayloadReclaimCommand::Segments(crate::ObjectSegmentsReclaimRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at: 1_000,
+            segments: Vec::new(),
+        });
+        let node = Arc::clone(&server._node);
+        let (claim, command_log_index_before) = {
+            let pg = node.get_pg(0).unwrap();
+            let ObjectPayloadReclaimCommand::Segments(record) = &reclaim else {
+                unreachable!("test reclaim uses the object-segments layout")
+            };
+            PgMetadataStore::put_object_segments_reclaim(&*pg, record).unwrap();
+            let claim = PgMetadataStore::acquire_object_payload_reclaim_claim(
+                &*pg,
+                &bucket,
+                1,
+                &key,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "unix-expired-reclaim-build-claim",
+                "unix-expired-reclaim-build-owner",
+                config.cluster_epoch,
+                1_000,
+                Some(9_000),
+                1_000,
+            )
+            .unwrap()
+            .expect("seeded reclaim must be claimable");
+            let command_log_index = pg
+                .max_metadata_command_log_index(config.cluster_epoch)
+                .unwrap();
+            (claim, command_log_index)
+        };
+
+        let serving = thread::spawn(move || {
+            crate::clock::with_time_and_monotonic_override(4_500, 903_500, || {
+                server.accept_one().unwrap();
+            });
+        });
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let route =
+            ObjectMutationMetadataNodeClient::open_object_payload_reclaim_command_metadata_route(
+                &client,
+                config.cluster_epoch,
+                ObjectMetadataPgId::new_for_test(PgId::new(0)),
+                &bucket,
+                &key,
+                generation_id,
+            )
+            .unwrap();
+        let effect_fence = AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 11_500);
+        let error = crate::clock::with_time_and_monotonic_override(2_500, 10_000, || {
+            route
+                .build_delete_object_payload_reclaim_command(
+                    BuildDeleteObjectPayloadReclaimCommandReq {
+                        payload: &reclaim,
+                        claim: &claim,
+                    },
+                    effect_fence,
+                )
+                .unwrap_err()
+        });
+        assert!(
+            matches!(
+                &error,
+                ObjectPgActionError::Store(StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+        serving.join().unwrap();
+
+        let pg = node.get_pg(0).unwrap();
+        assert_eq!(
+            pg.max_metadata_command_log_index(config.cluster_epoch)
+                .unwrap(),
+            command_log_index_before,
+            "expired Unix reclaim build must not advance the PG command log"
         );
     }
 

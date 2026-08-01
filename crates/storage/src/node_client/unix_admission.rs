@@ -635,6 +635,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::ObjectMultipartCompleteCommandBuild
         | StorageRpcMessageKind::ObjectMultipartAbortCommandBuild
         | StorageRpcMessageKind::ObjectMultipartAuthorizedAbortCommandBuild
+        | StorageRpcMessageKind::ObjectPayloadReclaimCommandBuild
         | StorageRpcMessageKind::ObjectMultipartCompletionStaleSourceLoad
         | StorageRpcMessageKind::ObjectMultipartAbortCleanupLoad
         | StorageRpcMessageKind::ObjectMultipartCompletionSnapshotLoad

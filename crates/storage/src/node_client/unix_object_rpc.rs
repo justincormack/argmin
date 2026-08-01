@@ -94,6 +94,15 @@ struct UnixMultipartAbortMutationMetadataRoute<'a> {
     upload_id: UploadId,
 }
 
+struct UnixObjectPayloadReclaimCommandMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+    generation_id: GenerationId,
+}
+
 struct UnixStreamUploadCreationMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
     route_cluster_epoch: ClusterEpoch,
@@ -3220,6 +3229,85 @@ impl MultipartAbortMutationMetadataRoute for UnixMultipartAbortMutationMetadataR
     }
 }
 
+impl ObjectPayloadReclaimCommandMetadataRoute for UnixObjectPayloadReclaimCommandMetadataRoute<'_> {
+    fn build_delete_object_payload_reclaim_command(
+        &self,
+        request: BuildDeleteObjectPayloadReclaimCommandReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        require_object_payload_reclaim_command_subject(
+            self.route_cluster_epoch,
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            self.generation_id,
+            &request,
+        )?;
+        let rpc_request = StorageRpcObjectPayloadReclaimCommandBuildRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            generation_id: self.generation_id,
+            payload: request.payload.clone(),
+            claim: request.claim.clone(),
+            effect_deadline: effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
+        };
+        let payload =
+            encode_object_payload_reclaim_command_build_request(&rpc_request).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "encode object payload reclaim command build request",
+                    error.to_string(),
+                ))
+            })?;
+        let command = self
+            .client
+            .object_metadata_command_build_request(
+                StorageRpcMessageKind::ObjectPayloadReclaimCommandBuild,
+                self.pg_id.pg_id(),
+                payload,
+                "decode object payload reclaim command build response",
+                ObjectPgActionError::StaleObjectReadSubject,
+                |command| {
+                    let valid = command.id().cluster_epoch() == self.route_cluster_epoch
+                        && command.id().pg_id() == self.pg_id.pg_id()
+                        && matches!(
+                            command.payload(),
+                            MetadataCommandPayload::DeleteObjectPayloadReclaim(delete)
+                                if delete.matches_request(
+                                    &self.bucket,
+                                    &self.key,
+                                    self.generation_id,
+                                )
+                                    && delete.payload == *request.payload
+                                    && delete.reclaim_claim
+                                        == ObjectPayloadReclaimClaimProof::from(request.claim)
+                        );
+                    if valid {
+                        Ok(())
+                    } else {
+                        Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                            "validate object payload reclaim command build response",
+                            "response command does not match requested reclaim subject".to_string(),
+                        )))
+                    }
+                },
+            )?
+            .ok_or_else(|| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode object payload reclaim command build response",
+                    "object payload reclaim command build cannot return missing".to_string(),
+                ))
+            })?;
+        Ok(command)
+    }
+}
+
 impl UnixMultipartUploadLookupMetadataRoute<'_> {
     fn object_request(&self) -> StorageRpcObjectRequest {
         self.client
@@ -4281,6 +4369,32 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             bucket: bucket.clone(),
             key: key.clone(),
             upload_id: upload_id.clone(),
+        }))
+    }
+
+    fn open_object_payload_reclaim_command_metadata_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<Box<dyn ObjectPayloadReclaimCommandMetadataRoute + '_>, ObjectPgActionError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        Ok(Box::new(UnixObjectPayloadReclaimCommandMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
         }))
     }
 

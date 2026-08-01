@@ -4337,7 +4337,7 @@ fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..16)
+    let server_threads: Vec<_> = (0..18)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -4455,6 +4455,52 @@ fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
     assert_bucket_payload_decode!(
         ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(&client, wrong_scan_pg)
     );
+
+    let reclaim_command_route =
+        ObjectMutationMetadataNodeClient::open_object_payload_reclaim_command_metadata_route(
+            &client,
+            ClusterEpoch::new(1).unwrap(),
+            correct_pg,
+            &bucket,
+            &key,
+            generation_id,
+        )
+        .unwrap();
+    let command = reclaim_command_route
+        .build_delete_object_payload_reclaim_command(
+            BuildDeleteObjectPayloadReclaimCommandReq {
+                payload: &reclaim,
+                claim: &correct_claim,
+            },
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::new(1).unwrap()),
+        )
+        .unwrap();
+    assert!(matches!(
+        command.payload(),
+        MetadataCommandPayload::DeleteObjectPayloadReclaim(delete)
+            if delete.matches_request(&bucket, &key, generation_id)
+                && delete.payload == reclaim
+                && delete.reclaim_claim == ObjectPayloadReclaimClaimProof::from(&correct_claim)
+    ));
+
+    let wrong_reclaim_command_route =
+        ObjectMutationMetadataNodeClient::open_object_payload_reclaim_command_metadata_route(
+            &client,
+            ClusterEpoch::new(1).unwrap(),
+            wrong_pg,
+            &bucket,
+            &key,
+            generation_id,
+        )
+        .unwrap();
+    assert_object_payload_decode!(wrong_reclaim_command_route
+        .build_delete_object_payload_reclaim_command(
+            BuildDeleteObjectPayloadReclaimCommandReq {
+                payload: &reclaim,
+                claim: &wrong_claim,
+            },
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::new(1).unwrap()),
+        ));
 
     assert_bucket_payload_decode!(
         retained_object_mutation_route(&client, wrong_pg, &bucket, &key)
@@ -6424,6 +6470,7 @@ fn unix_object_mutation_client_rejects_malformed_abort_multipart_response() {
             .unwrap(),
         authorized_rpc_request
     );
+
     let command = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
             ClusterEpoch::new(1).unwrap(),
@@ -6559,5 +6606,46 @@ fn unix_object_mutation_client_rejects_malformed_abort_multipart_response() {
             operation: "validate abort multipart command build response",
             ..
         })
+    ));
+}
+
+#[test]
+fn object_payload_reclaim_command_build_codec_binds_full_subject() {
+    let client = test_unix_storage_node_client();
+    let bucket = crate::tests::bucket_name("reclaim-command-codec-bucket");
+    let key = crate::tests::object_key("reclaim-command-codec-key");
+    let generation_id = GenerationId::new(4).unwrap();
+    let request = StorageRpcObjectPayloadReclaimCommandBuildRequest {
+        object: client.object_request(PgId::new(0), &bucket, &key),
+        generation_id,
+        payload: ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at: 1,
+            segments: Vec::new(),
+        }),
+        claim: test_object_payload_reclaim_claim(bucket, key, 0),
+        effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+            authority_valid_until_ms: 5_000,
+            portable_wall_valid_until_ms: 4_000,
+        }),
+    };
+    let encoded =
+        crate::storage_rpc::encode_object_payload_reclaim_command_build_request(&request).unwrap();
+    assert_eq!(
+        crate::storage_rpc::decode_object_payload_reclaim_command_build_request(&encoded).unwrap(),
+        request
+    );
+
+    let mut crossed = request.clone();
+    crossed.claim.key = crate::tests::object_key("crossed-reclaim-key");
+    assert!(matches!(
+        crate::storage_rpc::encode_object_payload_reclaim_command_build_request(&crossed),
+        Err(
+            crate::storage_rpc::StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "object payload reclaim command build request identity mismatch"
+            )
+        )
     ));
 }

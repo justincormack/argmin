@@ -450,6 +450,20 @@ const STORAGE_RPC_MAX_STREAM_FINALIZE_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize =
 const STORAGE_RPC_MAX_MULTIPART_COMPLETION_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize =
     2 * 1024 * 1024;
 const STORAGE_RPC_MAX_MULTIPART_ABORT_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
+// A supported reclaim payload can consume nearly the entire metadata-command
+// byte budget. The build request carries that payload plus routing, generation,
+// full-claim, and portable-deadline fields which are not part of the payload
+// itself, so those fields need their own admission budget.
+const STORAGE_RPC_OBJECT_PAYLOAD_RECLAIM_COMMAND_BUILD_REQUEST_OVERHEAD_LEN: usize =
+    STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN
+        + 8
+        + STORAGE_RPC_OBJECT_PAYLOAD_RECLAIM_CLAIM_RECORD_MAX_LEN
+        + 1
+        + 8
+        + 8;
+const STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN
+        + STORAGE_RPC_OBJECT_PAYLOAD_RECLAIM_COMMAND_BUILD_REQUEST_OVERHEAD_LEN;
 const STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN: usize =
     4 + 4 + 8 + 4 + 8 + 8 + 4 + 16 + 8 + 4 + 8 + 2;
 const STORAGE_RPC_MIN_OBJECT_PART_RECORD_LEN: usize =
@@ -680,6 +694,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandRecoveryPendingSlotReplace = 163,
     MetadataCommandRecoveryRecordAbandoned = 168,
     PlacedSegmentBackfillReferencePage = 169,
+    ObjectPayloadReclaimCommandBuild = 170,
     MetadataCommandRetainedAbortApply = 165,
     MetadataCommandRetainedAbortFinish = 166,
     BucketDeleteReplicaHead = 167,
@@ -1072,6 +1087,7 @@ impl StorageRpcMessageKind {
             Self::ObjectStreamPartCommitCommandBuild => "object stream part commit command build",
             Self::ObjectMultipartCompleteCommandBuild => "object multipart complete command build",
             Self::ObjectMultipartAbortCommandBuild => "object multipart abort command build",
+            Self::ObjectPayloadReclaimCommandBuild => "object payload reclaim command build",
             Self::ObjectMultipartAuthorizedAbortCommandBuild => {
                 "object multipart authorized abort command build"
             }
@@ -1215,6 +1231,7 @@ impl StorageRpcMessageKind {
             163 => Ok(Self::MetadataCommandRecoveryPendingSlotReplace),
             168 => Ok(Self::MetadataCommandRecoveryRecordAbandoned),
             169 => Ok(Self::PlacedSegmentBackfillReferencePage),
+            170 => Ok(Self::ObjectPayloadReclaimCommandBuild),
             165 => Ok(Self::MetadataCommandRetainedAbortApply),
             166 => Ok(Self::MetadataCommandRetainedAbortFinish),
             167 => Ok(Self::BucketDeleteReplicaHead),
@@ -1692,6 +1709,15 @@ pub(crate) struct StorageRpcObjectPayloadLeaseControlResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcObjectPayloadReclaimResponse {
     pub(crate) reclaim: Option<ObjectPayloadReclaimCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectPayloadReclaimCommandBuildRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) generation_id: GenerationId,
+    pub(crate) payload: ObjectPayloadReclaimCommand,
+    pub(crate) claim: ObjectPayloadReclaimClaimRecord,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3978,6 +4004,9 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ObjectMultipartAbortCommandBuild
         | StorageRpcMessageKind::ObjectMultipartAuthorizedAbortCommandBuild => {
             STORAGE_RPC_MAX_MULTIPART_ABORT_COMMAND_BUILD_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectPayloadReclaimCommandBuild => {
+            STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_COMMAND_BUILD_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectGenerationNext => {
             STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN
@@ -6584,6 +6613,72 @@ pub(crate) fn decode_abort_multipart_command_build_request(
         bucket_write_reservation,
         effect_deadline,
     })
+}
+
+fn validate_object_payload_reclaim_command_build_request(
+    request: &StorageRpcObjectPayloadReclaimCommandBuildRequest,
+) -> Result<(), StorageRpcPayloadError> {
+    validate_object_payload_reclaim_claim_record(&request.claim)?;
+    let payload_matches = match &request.payload {
+        ObjectPayloadReclaimCommand::Segments(record) => {
+            record.bucket == request.object.bucket
+                && record.key == request.object.key
+                && record.generation_id == request.generation_id
+        }
+        ObjectPayloadReclaimCommand::Multipart(record) => {
+            record.bucket == request.object.bucket
+                && record.key == request.object.key
+                && record.generation_id == request.generation_id
+        }
+    };
+    let claim = &request.claim;
+    if !payload_matches
+        || claim.pg_id != request.object.pg_id.get()
+        || claim.cluster_epoch != request.object.cluster_epoch
+        || claim.bucket != request.object.bucket
+        || claim.key != request.object.key
+        || claim.generation_id != request.generation_id
+        || claim.reclaim_kind != request.payload.kind()
+    {
+        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "object payload reclaim command build request identity mismatch",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn encode_object_payload_reclaim_command_build_request(
+    request: &StorageRpcObjectPayloadReclaimCommandBuildRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_object_payload_reclaim_command_build_request(request)?;
+    let mut out = encode_object_request(&request.object);
+    put_u64(&mut out, request.generation_id.get());
+    put_object_payload_reclaim(&mut out, &request.payload);
+    put_object_payload_reclaim_claim_record(&mut out, &request.claim);
+    put_admitted_route_effect_deadline(&mut out, request.effect_deadline);
+    Ok(out)
+}
+
+pub(crate) fn decode_object_payload_reclaim_command_build_request(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectPayloadReclaimCommandBuildRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let generation_id = decoder.read_generation_id()?;
+    let payload = decoder.read_object_payload_reclaim()?;
+    let claim = decoder.read_object_payload_reclaim_claim_record()?;
+    let effect_deadline =
+        decoder.read_admitted_route_effect_deadline("object payload reclaim command build")?;
+    decoder.finish()?;
+    let request = StorageRpcObjectPayloadReclaimCommandBuildRequest {
+        object,
+        generation_id,
+        payload,
+        claim,
+        effect_deadline,
+    };
+    validate_object_payload_reclaim_command_build_request(&request)?;
+    Ok(request)
 }
 
 pub(crate) fn encode_abort_multipart_cleanup_request(
@@ -20633,6 +20728,11 @@ mod tests {
                 STORAGE_RPC_MAX_OBJECT_PAYLOAD_LEASE_CONTROL_REQUEST_PAYLOAD_LEN,
             ),
             (
+                StorageRpcMessageKind::ObjectPayloadReclaimCommandBuild,
+                STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_COMMAND_BUILD_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_COMMAND_BUILD_REQUEST_PAYLOAD_LEN,
+            ),
+            (
                 StorageRpcMessageKind::ShardRead,
                 STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN,
@@ -21052,6 +21152,25 @@ mod tests {
                 })) if len == payload_len && actual_limit == limit
             ));
         }
+    }
+
+    #[test]
+    fn object_payload_reclaim_command_build_frame_accepts_exact_kind_cap() {
+        let payload =
+            vec![0; STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_COMMAND_BUILD_REQUEST_PAYLOAD_LEN];
+        let encoded = encode_storage_rpc_frame(
+            11,
+            StorageRpcMessageKind::ObjectPayloadReclaimCommandBuild,
+            &payload,
+        )
+        .unwrap();
+        let decoded = read_storage_rpc_request_frame_from(&mut Cursor::new(encoded)).unwrap();
+
+        assert_eq!(
+            decoded.kind,
+            StorageRpcMessageKind::ObjectPayloadReclaimCommandBuild
+        );
+        assert_eq!(decoded.payload.len(), payload.len());
     }
 
     #[test]

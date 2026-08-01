@@ -17,10 +17,10 @@ use super::{
 use crate::metadata_command::{
     BucketPropertyMutation, BucketSubresourceMutation, BucketWriteReservationProof,
     CommitMultipartObjectCommand, CommitStreamPartCommand, DeleteFinalizedBucketCommand,
-    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionTarget, MetadataCommandAcceptance,
-    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
-    ObjectPayloadReclaimClaimProof, ObjectPayloadReclaimCommand, PutObjectMetadataCommand,
-    PutObjectMetadataMutation, ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+    DeleteObjectVersionTarget, MetadataCommandAcceptance, MetadataCommandEnvelope,
+    MetadataCommandId, MetadataCommandPayload, ObjectPayloadReclaimClaimProof,
+    ObjectPayloadReclaimCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
+    ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
@@ -12029,6 +12029,15 @@ impl super::StorageCluster {
             return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
         };
         let reclaim_authority = ObjectPayloadReclaimClaimProof::from(&claim);
+        let reclaim_command_route = mutation_client
+            .open_object_payload_reclaim_command_metadata_route(
+                self.operation_epoch(),
+                object_pg_id,
+                bucket,
+                key,
+                generation_id,
+            )?;
+        let reclaim_effect_fence = self.current_route_effect_fence();
 
         let retained_reclaim_route = retained_mutation_client
             .open_retained_object_mutation_route(object_pg_id, self.operation_epoch(), bucket, key)
@@ -12107,8 +12116,15 @@ impl super::StorageCluster {
                     continue;
                 }
 
-                let command_id = match self.next_object_metadata_command_id(pg_id) {
-                    Ok(command_id) => command_id,
+                let command = match reclaim_command_route
+                    .build_delete_object_payload_reclaim_command(
+                        crate::node_client::BuildDeleteObjectPayloadReclaimCommandReq {
+                            payload: &reclaim,
+                            claim: &claim,
+                        },
+                        reclaim_effect_fence,
+                    ) {
+                    Ok(command) => command,
                     Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                         ..
                     })) => {
@@ -12117,19 +12133,12 @@ impl super::StorageCluster {
                     }
                     Err(error) => return Err(error),
                 };
-                let command = MetadataCommandEnvelope::new(
-                    command_id,
-                    MetadataCommandPayload::DeleteObjectPayloadReclaim(Box::new(
-                        DeleteObjectPayloadReclaimCommand::new(
-                            bucket.clone(),
-                            key.clone(),
-                            generation_id,
-                            reclaim.clone(),
-                            reclaim_authority.clone(),
-                        ),
-                    )),
-                );
-                if !self.try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command)? {
+                if !self.try_install_object_pg_pending_command_or_drain(
+                    pg_id,
+                    bucket,
+                    &command,
+                    Some(reclaim_effect_fence),
+                )? {
                     continue;
                 }
                 command_owns_reclaim_claim = true;

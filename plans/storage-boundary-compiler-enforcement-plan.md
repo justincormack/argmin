@@ -4836,6 +4836,49 @@ One-hundred-and-twenty-first Phase 3 slice:
   Workspace-wide strict Clippy and the transitional storage boundary checker
   also pass.
 
+One-hundred-and-twenty-second Phase 3 slice:
+
+- payload-reclaim deletion command construction now goes through a scoped
+  `ObjectPayloadReclaimCommandMetadataRoute` bound to the route epoch, object
+  PG, bucket, key, and generation. The builder accepts the complete durable
+  reclaim root and claim record, derives the command's claim proof itself,
+  and rejects crossed PG, epoch, object, generation, or reclaim-layout
+  subjects before command-ID allocation.
+- the embedded builder reloads and requires exact equality with both the
+  durable reclaim root and singleton claim immediately before constructing
+  the command. The Unix client validates the returned command against the
+  same complete request subject, so an authenticated faulty peer cannot
+  substitute another reclaim root or claim.
+- the maintenance worker captures one immutable route-map effect fence after
+  claim acquisition and before deleting payload shards. The same fence
+  reaches both the embedded command-ID allocation boundary and the final
+  pending-slot insertion boundary; a same-generation route renewal cannot
+  extend an in-flight reclaim attempt's authority between command construction
+  and its first durable publication.
+- storage RPC adds the maintenance-only
+  `ObjectPayloadReclaimCommandBuild` operation. Its request carries a
+  host-portable deadline, full reclaim root, and full claim record; codecs
+  reject inconsistent subjects and the storage node conservatively rebinds
+  the deadline to its own monotonic clock. Its per-kind admission cap is the
+  supported metadata-command byte limit plus the maximum routing, generation,
+  full-claim, and deadline overhead, so a near-limit supported reclaim command
+  cannot be rejected merely because the build request carries more context.
+- installed Unix coverage proves a correct command build, rejects equivalent
+  wrong-PG durable state as `PayloadDecode`, and rejects a deadline that is
+  still valid on the frontend but expired after storage-host rebinding without
+  advancing the PG command log. Codec coverage also rejects a crossed claim
+  before transport, and framed admission accepts the exact reclaim-build cap
+  while rejecting one byte over it. A deterministic local interleaving renews
+  the raw same-epoch route, expires the captured fence after command build in
+  the pre-install hook, and proves the pending slot and every replica log stay
+  unchanged while the claim is released and the reclaim root remains
+  retryable.
+- scoped payload-reclaim discovery and claim acquisition remain open in
+  Phase 3; this slice removes only the raw command-construction authority.
+- all 2,565 storage tests and the full 7,887-test workspace suite pass.
+  Workspace-wide strict Clippy and the transitional storage boundary checker
+  also pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
