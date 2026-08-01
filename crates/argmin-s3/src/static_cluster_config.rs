@@ -7,9 +7,6 @@ use crate::config::{
     ConfiguredStorageNodeSocket, ServerConfig,
 };
 use ec::EcConfig;
-use placement::{
-    ClusterMap, Level, NodeId, NodeInfo, PlacementConfig, PlacementConstraint, Placer, TopologyKey,
-};
 use rustls::client::danger::ServerCertVerifier;
 use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::pem::{PemObject, SectionKind};
@@ -44,8 +41,9 @@ use storage::control_plane_raft::{
 use storage::storage_node_server::StorageNodeRpcListenerConfig;
 use storage::storage_rpc_transport::{StorageRpcClientEndpoint, STORAGE_RPC_TLS_ALPN};
 use storage::{
-    FrontendStorageRpcClientCapability, MaintenanceStorageRpcClientCapability, PgId,
-    StorageNodeStorageRpcClientCapability, StorageRpcServerAuthConfig, StorageRpcTransportLimits,
+    FrontendStorageRpcClientCapability, MaintenanceStorageRpcClientCapability, NodeId, PgId,
+    StaticStorageFailureDomain, StaticStoragePlacementNode, StorageNodeStorageRpcClientCapability,
+    StorageRpcServerAuthConfig, StorageRpcTransportLimits,
 };
 use x509_cert::der::Decode;
 use x509_cert::ext::pkix::{BasicConstraints, KeyUsage};
@@ -71,7 +69,6 @@ const CLUSTER_MANIFEST_MAX_TLS_PRIVATE_KEY_BYTES: u64 = 64 * 1024;
 const CLUSTER_MANIFEST_MAX_TLS_TRUST_BUNDLE_BYTES: u64 = 1024 * 1024;
 const CLUSTER_MANIFEST_MAX_SELECTED_MATERIAL_FILES: usize = 256;
 const CLUSTER_MANIFEST_MAX_SELECTED_MATERIAL_BYTES: u64 = 16 * 1024 * 1024;
-const INITIAL_PG_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin-initial-pg-placement-v1";
 const TOPOLOGY_IDENTITY_DOMAIN: &str = "argmin-static-cluster-topology-v1";
 const PROCESS_IDENTITY_DOMAIN: &str = "argmin-static-cluster-process-identity-v1";
 const FULL_CONFIG_FINGERPRINT_DOMAIN: &str = "argmin-static-cluster-full-config-v1";
@@ -4943,96 +4940,39 @@ fn validate_initial_pg_placement(
     processes: &BTreeMap<&str, &ProcessInput>,
     storage_nodes: &BTreeMap<u32, &StorageNodeInput>,
 ) -> Result<Vec<Vec<u32>>, String> {
-    let pg_count = usize::try_from(manifest.storage.pg_count)
-        .map_err(|_| "storage PG count does not fit this platform".to_string())?;
-    validate_collection_len(pg_count, "storage PG count")?;
-    let host_domains: BTreeMap<&str, u32> = hosts
-        .iter()
-        .enumerate()
-        .map(|(index, host_id)| {
-            let domain = u32::try_from(index + 1)
-                .expect("manifest collection bound guarantees a u32 host domain");
-            (*host_id, domain)
-        })
-        .collect();
-    let disk_domains: BTreeMap<&str, u32> = disks
-        .keys()
-        .enumerate()
-        .map(|(index, disk_id)| {
-            let domain = u32::try_from(index + 1)
-                .expect("manifest collection bound guarantees a u32 disk domain");
-            (*disk_id, domain)
-        })
-        .collect();
-    let placement_nodes: Vec<NodeInfo> = storage_nodes
+    let placement_nodes = storage_nodes
         .values()
         .map(|storage_node| {
             let process = processes[storage_node.process_id.as_str()];
-            let location = TopologyKey::new(&[
-                (Level::MACHINE, host_domains[process.host_id.as_str()]),
-                (Level::DISK, disk_domains[storage_node.disk_id.as_str()]),
-            ])
-            .expect("distinct built-in topology levels");
-            NodeInfo {
-                id: NodeId::new(storage_node.node_id),
-                location,
-                weight: 1.0,
-            }
+            StaticStoragePlacementNode::new(
+                storage_node.node_id,
+                process.host_id.clone(),
+                storage_node.disk_id.clone(),
+            )
         })
-        .collect();
-    let cluster_map = ClusterMap::new(&placement_nodes)
-        .map_err(|error| format!("initial PG placement cluster map is invalid: {error}"))?;
-    let total_shards = usize::from(manifest.storage.ec_data_shards)
-        + usize::from(manifest.storage.ec_parity_shards);
-    let placement_config = PlacementConfig::new(total_shards)
-        .map_err(|error| format!("initial PG placement shape is invalid: {error}"))?;
-    let constraint = match manifest.deployment.failure_domain {
-        FailureDomain::None => PlacementConstraint::none(),
-        FailureDomain::Disk => PlacementConstraint::level_cap(Level::DISK, 1),
-        FailureDomain::Host => PlacementConstraint::level_cap(Level::MACHINE, 1),
+        .collect::<Vec<_>>();
+    let failure_domain = match manifest.deployment.failure_domain {
+        FailureDomain::None => StaticStorageFailureDomain::None,
+        FailureDomain::Disk => StaticStorageFailureDomain::Disk,
+        FailureDomain::Host => StaticStorageFailureDomain::Host,
     };
-    let placer = Placer::new(placement_config, &cluster_map, constraint)
-        .map_err(|error| format!("initial PG placement is impossible: {error}"))?;
-    let node_domains: BTreeMap<u32, &str> = storage_nodes
-        .values()
-        .map(|storage_node| {
-            let process = processes[storage_node.process_id.as_str()];
-            let domain = match manifest.deployment.failure_domain {
-                FailureDomain::None => process.host_id.as_str(),
-                FailureDomain::Disk => storage_node.disk_id.as_str(),
-                FailureDomain::Host => process.host_id.as_str(),
-            };
-            (storage_node.node_id, domain)
-        })
-        .collect();
-
-    let mut acting_sets = Vec::with_capacity(pg_count);
-    let mut placement_key =
-        Vec::with_capacity(INITIAL_PG_PLACEMENT_KEY_DOMAIN.len() + std::mem::size_of::<u32>());
-    for pg_id in 0..manifest.storage.pg_count {
-        placement_key.clear();
-        placement_key.extend_from_slice(INITIAL_PG_PLACEMENT_KEY_DOMAIN);
-        placement_key.extend_from_slice(&pg_id.to_be_bytes());
-        let mut acting_set = vec![NodeId::new(0); total_shards];
-        placer
-            .place(&placement_key, &mut acting_set)
-            .map_err(|error| {
-                format!("initial placement for PG {pg_id} violates deployment policy: {error}")
-            })?;
-        if manifest.deployment.failure_domain != FailureDomain::None {
-            let distinct_domains: BTreeSet<&str> = acting_set
-                .iter()
-                .map(|node_id| node_domains[&node_id.as_u32()])
-                .collect();
-            if distinct_domains.len() != total_shards {
-                return Err(format!(
-                    "initial placement for PG {pg_id} does not occupy {total_shards} distinct failure domains"
-                ));
-            }
-        }
-        acting_sets.push(acting_set.into_iter().map(NodeId::as_u32).collect());
-    }
-    Ok(acting_sets)
+    storage::derive_static_initial_pg_placement(
+        manifest.storage.pg_count,
+        manifest.storage.ec_data_shards,
+        manifest.storage.ec_parity_shards,
+        failure_domain,
+        &hosts
+            .iter()
+            .map(|host| (*host).to_owned())
+            .collect::<Vec<_>>(),
+        &disks
+            .keys()
+            .map(|disk| (*disk).to_owned())
+            .collect::<Vec<_>>(),
+        &placement_nodes,
+    )
+    .map(storage::StaticInitialPgPlacement::into_logical_acting_sets)
+    .map_err(|error| error.to_string())
 }
 
 fn validate_auth_credentials(

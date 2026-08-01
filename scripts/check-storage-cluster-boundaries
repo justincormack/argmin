@@ -3055,6 +3055,23 @@ fail_with_matches \
     "Object-read multipart parts must expose only the bounded logical projection and must not derive Debug or equality over hidden durable state" \
     "$object_read_multipart_part_surface_leaks"
 
+argmin_static_storage_placement_leaks=$(
+    {
+        rg -n --color=never \
+            '^[[:space:]]*placement[[:space:]]*=' \
+            crates/argmin-s3/Cargo.toml \
+            || true
+        rg -n --color=never \
+            '\bplacement::|\b(ClusterMap|PlacementConfig|PlacementConstraint|Placer|TopologyKey|NodeInfo)\b|Level::(MACHINE|DISK)' \
+            crates/argmin-s3/src \
+            -g '*.rs' \
+            || true
+    }
+)
+fail_with_matches \
+    "Static storage placement interpretation and placement-engine topology must remain owned by storage" \
+    "$argmin_static_storage_placement_leaks"
+
 multipart_upload_id_authority_derived_equality=$(
     awk '
     /#\[derive\(/ {

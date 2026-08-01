@@ -23,7 +23,6 @@ auth = { path = "../auth" }
 ec = { path = "../ec", default-features = false }
 libc = "0.2"
 observability = { path = "../observability" }
-placement = { path = "../placement" }
 server-core = { path = "../server-core", default-features = false }
 server-http = { path = "../server-http", default-features = false }
 storage = { path = "../storage", default-features = false }

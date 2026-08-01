@@ -43,6 +43,7 @@ pub(crate) mod peering;
 pub mod pg_topology;
 mod shard_key_hash;
 mod standalone;
+mod static_topology;
 #[allow(dead_code)]
 pub(crate) mod storage_rpc;
 pub(crate) mod storage_rpc_auth;
@@ -603,6 +604,10 @@ pub use shard_key_hash::{multipart_part_segment_key_hash, object_key_hash, segme
 pub use standalone::{
     StandaloneRouteIdentity, StandaloneRouteIdentityError, StandaloneRouteIdentityLock,
     StandaloneRouteIdentityPreparation,
+};
+pub use static_topology::{
+    derive_static_initial_pg_placement, StaticInitialPgPlacement, StaticStorageFailureDomain,
+    StaticStoragePlacementError, StaticStoragePlacementNode,
 };
 pub use storage_rpc::StorageNodeFailure;
 pub(crate) use storage_rpc_auth::StorageRpcClientAuthConfig;

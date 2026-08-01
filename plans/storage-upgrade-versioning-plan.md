@@ -877,9 +877,11 @@ The bounded implementation order is:
 3. Replace physical segment fields and requests in `server-core` with opaque storage-owned payload
    handles and logical lease/read/write operations. Retain encryption transformation at the
    appropriate S3/storage seam without exposing placement.
-4. Move control-plane topology transitions and live metadata-transfer orchestration behind a
-   storage-owned admin/service facade. Then move static storage-topology interpretation behind a
-   storage-owned builder while leaving outer manifest/process configuration in `argmin-s3`.
+4. Move deterministic static storage-placement interpretation behind a storage-owned builder so
+   subsequent administration receives owner-validated topology input. Then move control-plane
+   topology transitions and live metadata-transfer orchestration behind a storage-owned
+   admin/service facade, and contain the remaining static certificate/bootstrap assembly while
+   leaving outer manifest/process configuration in `argmin-s3`.
 5. Replace cross-crate `StoreError` destructuring with exhaustive storage-owned semantic
    classifications and opaque diagnostics. Error translation into S3 outcomes remains contextual
    in `server-core`, but cannot depend on PG, database, shard, route, or wire variants.
@@ -1247,6 +1249,21 @@ rejecting raw manifest rows outside `storage`, public raw definitions or exports
 replacement, public projection fields, unapproved projection accessors, and derived `Debug` or
 equality over the retained row. Remaining test-only physical observations are bounded facilities
 for placement and manifest assertions rather than production representation seams.
+
+The twenty-fourth bounded slice begins implementation-order item 4 with deterministic static
+storage placement. `argmin-s3` retains the outer manifest schema and validates its host, disk,
+process, and storage-node references, but no longer imports the placement engine, constructs
+placement topology levels, assigns internal domain IDs, selects placement constraints, or derives
+PG acting sets. It passes only logical node IDs plus host/disk labels, the EC shape, PG count, and
+selected deployment failure domain and complete declared host/disk domain lists to `storage`. The
+storage-owned builder validates node-domain references, performs deterministic domain assignment,
+bounds the PG allocation, constructs the placement-engine topology, derives
+the acting sets with the existing placement-key domain, and returns only the logical node-ID sets
+needed by the outer manifest digest and the next initial-map boundary. Its error type is opaque and
+owner-formatted, and its placement result has a count-only `Debug` view. A repository check rejects
+an `argmin-s3` placement dependency or direct placement-engine types. Initial topology certificate
+assembly, raw control-plane commands, live topology transitions, and metadata-transfer
+orchestration remain pending parts of item 4.
 
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
