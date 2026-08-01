@@ -4511,38 +4511,6 @@ impl UnixStorageNodeClient {
     }
 }
 
-impl UnixStorageNodeClient {
-    fn validate_bucket_metadata_route_subject(
-        &self,
-        route_cluster_epoch: ClusterEpoch,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        operation: &'static str,
-    ) -> Result<(), BucketSnapshotLoadError> {
-        if route_cluster_epoch != self.cluster_epoch {
-            return Err(StoreError::StaleMetadataOperation {
-                pg_id: pg_id.get(),
-                operation_epoch: route_cluster_epoch,
-                current_epoch: self.cluster_epoch,
-            }
-            .into());
-        }
-        let pg_topology = self.pg_topology.as_ref().ok_or_else(|| {
-            BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                operation,
-                "bucket metadata client has no installed PG topology".to_string(),
-            ))
-        })?;
-        if pg_topology.bucket_pg_for(bucket) != pg_id.get() {
-            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                operation,
-                "bucket does not belong to the scoped bucket metadata PG".to_string(),
-            )));
-        }
-        Ok(())
-    }
-}
-
 impl BucketMetadataNodeClient for UnixStorageNodeClient {
     fn open_bucket_metadata_route(
         &self,
@@ -4550,7 +4518,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Box<dyn BucketMetadataRoute + '_>, BucketSnapshotLoadError> {
-        self.validate_bucket_metadata_route_subject(
+        self.validate_bucket_route_subject(
             route_cluster_epoch,
             pg_id,
             bucket,
@@ -4572,13 +4540,13 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         destination_pg_id: BucketPgId,
         destination_bucket: &BucketName,
     ) -> Result<Box<dyn BucketMetadataRoutePair + '_>, BucketSnapshotLoadError> {
-        self.validate_bucket_metadata_route_subject(
+        self.validate_bucket_route_subject(
             route_cluster_epoch,
             source_pg_id,
             source_bucket,
             "open source bucket metadata route pair",
         )?;
-        self.validate_bucket_metadata_route_subject(
+        self.validate_bucket_route_subject(
             route_cluster_epoch,
             destination_pg_id,
             destination_bucket,
@@ -4600,7 +4568,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Box<dyn BucketDeleteReplicaMetadataRoute + '_>, BucketSnapshotLoadError> {
-        self.validate_bucket_metadata_route_subject(
+        self.validate_bucket_route_subject(
             route_cluster_epoch,
             pg_id,
             bucket,

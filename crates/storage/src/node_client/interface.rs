@@ -171,134 +171,12 @@ pub(crate) trait BucketMetadataScanRoute: Send {
 }
 
 pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
-    fn durable_bucket_write_drain_exists(
+    fn open_bucket_write_reservation_route(
         &self,
+        route_cluster_epoch: ClusterEpoch,
         pg_id: BucketPgId,
         bucket: &BucketName,
-    ) -> Result<bool, BucketSnapshotLoadError>;
-
-    fn durable_bucket_write_drain(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-    ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
-
-    fn record_bucket_delete_attempt_outcome(
-        &self,
-        pg_id: BucketPgId,
-        record: &BucketDeleteAttemptOutcomeRecord,
-    ) -> Result<(), BucketSnapshotLoadError>;
-
-    fn bucket_delete_attempt_outcome(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-    ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError>;
-
-    fn acquire_durable_bucket_write_reservation(
-        &self,
-        pg_id: BucketPgId,
-        acquire: DurableBucketWriteReservationAcquire<'_>,
-    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
-
-    fn acquire_durable_bucket_write_reservation_with_effect_fence(
-        &self,
-        pg_id: BucketPgId,
-        acquire: DurableBucketWriteReservationAcquire<'_>,
-        effect_fence: AdmittedRouteEffectFence,
-    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
-
-    #[cfg(test)]
-    fn acquire_completion_durable_bucket_write_reservation(
-        &self,
-        pg_id: BucketPgId,
-        acquire: DurableBucketWriteReservationAcquire<'_>,
-    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
-        self.acquire_durable_bucket_write_reservation(pg_id, acquire)
-    }
-
-    fn acquire_completion_durable_bucket_write_reservation_with_effect_fence(
-        &self,
-        pg_id: BucketPgId,
-        acquire: DurableBucketWriteReservationAcquire<'_>,
-        effect_fence: AdmittedRouteEffectFence,
-    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
-        self.acquire_durable_bucket_write_reservation_with_effect_fence(
-            pg_id,
-            acquire,
-            effect_fence,
-        )
-    }
-
-    fn validate_bucket_write_reservation_proof(
-        &self,
-        pg_id: BucketPgId,
-        proof: &BucketWriteReservationProof,
-    ) -> Result<(), BucketSnapshotLoadError>;
-
-    #[allow(clippy::too_many_arguments)]
-    fn begin_durable_bucket_write_drain(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        drain_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        created_at: u64,
-        lease_deadline: u64,
-    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
-        self.begin_durable_bucket_write_drain_with_effect_fence(
-            pg_id,
-            bucket,
-            drain_id,
-            owner_token,
-            cluster_epoch,
-            created_at,
-            lease_deadline,
-            AdmittedRouteEffectFence::unbounded(cluster_epoch),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn begin_durable_bucket_write_drain_with_effect_fence(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        drain_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        created_at: u64,
-        lease_deadline: u64,
-        effect_fence: AdmittedRouteEffectFence,
-    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError>;
-
-    fn clear_expired_durable_bucket_write_drain(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        now: u64,
-    ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
-
-    fn heartbeat_durable_bucket_write_drain(
-        &self,
-        pg_id: BucketPgId,
-        record: &BucketWriteDrainRecord,
-        lease_deadline: u64,
-    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError>;
-
-    fn durable_bucket_write_reservations(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-    ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError>;
-
-    fn heartbeat_durable_bucket_write_reservation_with_effect_fence(
-        &self,
-        pg_id: BucketPgId,
-        proof: &BucketWriteReservationProof,
-        lease_deadline: u64,
-        effect_fence: AdmittedRouteEffectFence,
-    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
+    ) -> Result<Box<dyn BucketWriteReservationRoute + '_>, BucketSnapshotLoadError>;
 
     fn get_bucket_delete_finalize_roots(
         &self,
@@ -315,26 +193,6 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         limit: usize,
     ) -> Result<Vec<BucketDeleteBeginRoot>, BucketSnapshotLoadError>;
 
-    #[allow(clippy::too_many_arguments)]
-    fn acquire_bucket_delete_finalize_claim(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        bucket_incarnation_generation: u64,
-        claim_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        claimed_at: u64,
-        lease_deadline: Option<u64>,
-        now: u64,
-    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
-
-    fn bucket_delete_finalize_claim(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
-
     fn get_lifecycle_sweep_roots(
         &self,
         pg_id: BucketPgId,
@@ -346,16 +204,118 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         &self,
         pg_id: BucketPgId,
     ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError>;
+}
+
+pub(crate) trait BucketWriteReservationRoute: Send {
+    fn durable_bucket_write_drain_exists(&self) -> Result<bool, BucketSnapshotLoadError>;
+
+    fn durable_bucket_write_drain(
+        &self,
+    ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
+
+    fn record_bucket_delete_attempt_outcome(
+        &self,
+        record: &BucketDeleteAttemptOutcomeRecord,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
+    fn bucket_delete_attempt_outcome(
+        &self,
+    ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError>;
+
+    fn acquire_durable_bucket_write_reservation(
+        &self,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
+
+    fn acquire_durable_bucket_write_reservation_with_effect_fence(
+        &self,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
+
+    #[cfg(test)]
+    fn acquire_completion_durable_bucket_write_reservation(
+        &self,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        self.acquire_durable_bucket_write_reservation(acquire)
+    }
+
+    fn acquire_completion_durable_bucket_write_reservation_with_effect_fence(
+        &self,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        self.acquire_durable_bucket_write_reservation_with_effect_fence(acquire, effect_fence)
+    }
+
+    fn validate_bucket_write_reservation_proof(
+        &self,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_durable_bucket_write_drain(
+        &self,
+        drain_id: &str,
+        owner_token: &str,
+        created_at: u64,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_durable_bucket_write_drain_with_effect_fence(
+        &self,
+        drain_id: &str,
+        owner_token: &str,
+        created_at: u64,
+        lease_deadline: u64,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError>;
+
+    fn clear_expired_durable_bucket_write_drain(
+        &self,
+        now: u64,
+    ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
+
+    fn heartbeat_durable_bucket_write_drain(
+        &self,
+        record: &BucketWriteDrainRecord,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError>;
+
+    fn durable_bucket_write_reservations(
+        &self,
+    ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError>;
+
+    fn heartbeat_durable_bucket_write_reservation_with_effect_fence(
+        &self,
+        proof: &BucketWriteReservationProof,
+        lease_deadline: u64,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_bucket_delete_finalize_claim(
+        &self,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
+
+    fn bucket_delete_finalize_claim(
+        &self,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
 
     #[allow(clippy::too_many_arguments)]
     fn acquire_lifecycle_sweep_claim(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
         bucket_incarnation_generation: u64,
         claim_id: &str,
         owner_token: &str,
-        cluster_epoch: ClusterEpoch,
         claimed_at: u64,
         lease_deadline: Option<u64>,
         now: u64,
@@ -363,7 +323,6 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
 
     fn heartbeat_lifecycle_sweep_claim(
         &self,
-        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
         heartbeat_at: u64,
         lease_deadline: Option<u64>,
@@ -371,7 +330,6 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
 
     fn record_lifecycle_sweep_claim_error(
         &self,
-        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
         last_error: &str,
     ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError>;

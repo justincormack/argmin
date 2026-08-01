@@ -10767,10 +10767,12 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
         node.bucket_write_reservation_client()
-            .validate_bucket_write_reservation_proof(
+            .open_bucket_write_reservation_route(
+                self.operation_epoch(),
                 self.validated_bucket_metadata_pg(PgId::new(pg_id)),
-                proof,
+                &proof.bucket,
             )
+            .and_then(|route| route.validate_bucket_write_reservation_proof(proof))
     }
 
     fn metadata_command_bucket_write_reservation_subject_matches(

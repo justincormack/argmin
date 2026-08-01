@@ -2994,6 +2994,7 @@ impl LocalClusterMap {
     ) -> Result<(), ClusterBuildError> {
         let configs: Vec<LocalUnixBucketWriteReservationNodeClientConfig> =
             configs.into_iter().collect();
+        let pg_topology = Arc::new(self.pg_topology.clone());
         let mut seen = BTreeSet::<NodeId>::new();
         for config in &configs {
             if !seen.insert(config.node_id) {
@@ -3047,11 +3048,10 @@ impl LocalClusterMap {
                 .nodes
                 .get_mut(&config.node_id)
                 .expect("validated remote bucket write reservation client node must exist");
-            let client = Arc::new(UnixStorageNodeClient::new(
-                config.node_id,
-                self.epoch,
-                config.socket_path.clone(),
-            ));
+            let client = Arc::new(
+                UnixStorageNodeClient::new(config.node_id, self.epoch, config.socket_path.clone())
+                    .with_pg_topology(Arc::clone(&pg_topology)),
+            );
             let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> =
                 client.clone();
             let retained_bucket_write_reservation_client: Arc<
@@ -5135,7 +5135,8 @@ fn validate_open_metadata_command_bucket_write_reservation(
         .expect("validated route primary must be in local node set");
     let bucket_pg = node.runtime().bucket_metadata_pg_for(&proof.bucket);
     node.bucket_write_reservation_client()
-        .validate_bucket_write_reservation_proof(bucket_pg, proof)
+        .open_bucket_write_reservation_route(proof.cluster_epoch, bucket_pg, &proof.bucket)
+        .and_then(|route| route.validate_bucket_write_reservation_proof(proof))
         .map_err(|source| ClusterBuildError::OpenLocalNode {
             node_id: primary_node_id.as_u32(),
             source: StoreError::Io {

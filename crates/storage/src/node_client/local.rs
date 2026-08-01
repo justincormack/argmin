@@ -1191,11 +1191,7 @@ impl LocalStorageNodeClient {
             }
             .into());
         }
-        <Self as BucketWriteReservationNodeClient>::validate_bucket_write_reservation_proof(
-            self,
-            pg_id,
-            bucket_write_reservation,
-        )?;
+        self.validate_bucket_write_reservation_proof(pg_id, bucket_write_reservation)?;
         let pg = self.storage_node.get_pg(pg_id.get())?;
         let current_sequence = pg.multipart_completion_barrier_sequence_for_bucket(bucket)?;
         let barrier_sequence =
@@ -1832,7 +1828,7 @@ impl BucketMetadataScanRoute for LocalBucketMetadataScanRoute {
     }
 }
 
-impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
+impl LocalStorageNodeClient {
     fn durable_bucket_write_drain_exists(
         &self,
         pg_id: BucketPgId,
@@ -1939,6 +1935,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // Private adapter mirrors the durable drain record fields.
     fn begin_durable_bucket_write_drain(
         &self,
         pg_id: BucketPgId,
@@ -1961,6 +1958,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         )?)
     }
 
+    #[allow(clippy::too_many_arguments)] // Private adapter adds the effect authority to that record.
     fn begin_durable_bucket_write_drain_with_effect_fence(
         &self,
         pg_id: BucketPgId,
@@ -1973,8 +1971,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
         effect_fence.require_valid_for(cluster_epoch)?;
-        <Self as BucketWriteReservationNodeClient>::begin_durable_bucket_write_drain(
-            self,
+        self.begin_durable_bucket_write_drain(
             pg_id,
             bucket,
             drain_id,
@@ -2051,6 +2048,76 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
             },
         )?)
     }
+}
+
+struct LocalBucketWriteReservationRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: BucketPgId,
+    bucket: BucketName,
+}
+
+impl LocalBucketWriteReservationRoute<'_> {
+    fn require_bucket_subject(
+        &self,
+        bucket: &BucketName,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if bucket != &self.bucket {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
+    }
+
+    fn require_current_subject(
+        &self,
+        bucket: &BucketName,
+        cluster_epoch: ClusterEpoch,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_bucket_subject(bucket, operation)?;
+        if cluster_epoch != self.route_cluster_epoch {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
+    }
+
+    fn require_claim_subject(
+        &self,
+        bucket: &BucketName,
+        cluster_epoch: ClusterEpoch,
+        pg_id: u32,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_current_subject(bucket, cluster_epoch, operation)?;
+        if pg_id != self.pg_id.get() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
+    }
+}
+
+impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
+    fn open_bucket_write_reservation_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+    ) -> Result<Box<dyn BucketWriteReservationRoute + '_>, BucketSnapshotLoadError> {
+        self.storage_node.require_open_pg(pg_id.get())?;
+        if self.storage_node.bucket_metadata_pg_for(bucket) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open bucket write reservation route",
+            }
+            .into());
+        }
+        Ok(Box::new(LocalBucketWriteReservationRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+        }))
+    }
 
     fn get_bucket_delete_finalize_roots(
         &self,
@@ -2071,40 +2138,6 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         Self::get_bucket_delete_begin_roots(self, pg_id, now, start_after_bucket, limit)
     }
 
-    fn acquire_bucket_delete_finalize_claim(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        bucket_incarnation_generation: u64,
-        claim_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        claimed_at: u64,
-        lease_deadline: Option<u64>,
-        now: u64,
-    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
-        Self::acquire_bucket_delete_finalize_claim(
-            self,
-            pg_id,
-            bucket,
-            bucket_incarnation_generation,
-            claim_id,
-            owner_token,
-            cluster_epoch,
-            claimed_at,
-            lease_deadline,
-            now,
-        )
-    }
-
-    fn bucket_delete_finalize_claim(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
-        Self::bucket_delete_finalize_claim(self, pg_id, bucket)
-    }
-
     fn get_lifecycle_sweep_roots(
         &self,
         pg_id: BucketPgId,
@@ -2120,27 +2153,205 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
     ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError> {
         Self::list_lifecycle_sweep_buckets(self, pg_id)
     }
+}
 
-    fn acquire_lifecycle_sweep_claim(
+impl BucketWriteReservationRoute for LocalBucketWriteReservationRoute<'_> {
+    fn durable_bucket_write_drain_exists(&self) -> Result<bool, BucketSnapshotLoadError> {
+        self.client
+            .durable_bucket_write_drain_exists(self.pg_id, &self.bucket)
+    }
+
+    fn durable_bucket_write_drain(
         &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
+    ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError> {
+        self.client
+            .durable_bucket_write_drain(self.pg_id, &self.bucket)
+    }
+
+    fn record_bucket_delete_attempt_outcome(
+        &self,
+        record: &BucketDeleteAttemptOutcomeRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_bucket_subject(&record.bucket, "record bucket delete attempt outcome")?;
+        self.client
+            .record_bucket_delete_attempt_outcome(self.pg_id, record)
+    }
+
+    fn bucket_delete_attempt_outcome(
+        &self,
+    ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError> {
+        self.client
+            .bucket_delete_attempt_outcome(self.pg_id, &self.bucket)
+    }
+
+    fn acquire_durable_bucket_write_reservation(
+        &self,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        self.require_current_subject(
+            acquire.name,
+            acquire.cluster_epoch,
+            "acquire durable bucket write reservation",
+        )?;
+        self.client
+            .acquire_durable_bucket_write_reservation(self.pg_id, acquire)
+    }
+
+    fn acquire_durable_bucket_write_reservation_with_effect_fence(
+        &self,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        self.require_current_subject(
+            acquire.name,
+            acquire.cluster_epoch,
+            "acquire durable bucket write reservation",
+        )?;
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        self.client
+            .acquire_durable_bucket_write_reservation_with_effect_fence(
+                self.pg_id,
+                acquire,
+                effect_fence,
+            )
+    }
+
+    fn validate_bucket_write_reservation_proof(
+        &self,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_bucket_subject(&proof.bucket, "validate bucket write reservation proof")?;
+        self.client
+            .validate_bucket_write_reservation_proof(self.pg_id, proof)
+    }
+
+    fn begin_durable_bucket_write_drain(
+        &self,
+        drain_id: &str,
+        owner_token: &str,
+        created_at: u64,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
+        self.client.begin_durable_bucket_write_drain(
+            self.pg_id,
+            &self.bucket,
+            drain_id,
+            owner_token,
+            self.route_cluster_epoch,
+            created_at,
+            lease_deadline,
+        )
+    }
+
+    fn begin_durable_bucket_write_drain_with_effect_fence(
+        &self,
+        drain_id: &str,
+        owner_token: &str,
+        created_at: u64,
+        lease_deadline: u64,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        self.client
+            .begin_durable_bucket_write_drain_with_effect_fence(
+                self.pg_id,
+                &self.bucket,
+                drain_id,
+                owner_token,
+                self.route_cluster_epoch,
+                created_at,
+                lease_deadline,
+                effect_fence,
+            )
+    }
+
+    fn clear_expired_durable_bucket_write_drain(
+        &self,
+        now: u64,
+    ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError> {
+        self.client
+            .clear_expired_durable_bucket_write_drain(self.pg_id, &self.bucket, now)
+    }
+
+    fn heartbeat_durable_bucket_write_drain(
+        &self,
+        record: &BucketWriteDrainRecord,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
+        self.require_bucket_subject(&record.bucket, "heartbeat durable bucket write drain")?;
+        self.client
+            .heartbeat_durable_bucket_write_drain(self.pg_id, record, lease_deadline)
+    }
+
+    fn durable_bucket_write_reservations(
+        &self,
+    ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError> {
+        self.client
+            .durable_bucket_write_reservations(self.pg_id, &self.bucket)
+    }
+
+    fn heartbeat_durable_bucket_write_reservation_with_effect_fence(
+        &self,
+        proof: &BucketWriteReservationProof,
+        lease_deadline: u64,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
+        self.require_bucket_subject(&proof.bucket, "heartbeat durable bucket write reservation")?;
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        self.client
+            .heartbeat_durable_bucket_write_reservation_with_effect_fence(
+                self.pg_id,
+                proof,
+                lease_deadline,
+                effect_fence,
+            )
+    }
+
+    fn acquire_bucket_delete_finalize_claim(
+        &self,
         bucket_incarnation_generation: u64,
         claim_id: &str,
         owner_token: &str,
-        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
+        self.client.acquire_bucket_delete_finalize_claim(
+            self.pg_id,
+            &self.bucket,
+            bucket_incarnation_generation,
+            claim_id,
+            owner_token,
+            self.route_cluster_epoch,
+            claimed_at,
+            lease_deadline,
+            now,
+        )
+    }
+
+    fn bucket_delete_finalize_claim(
+        &self,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
+        self.client
+            .bucket_delete_finalize_claim(self.pg_id, &self.bucket)
+    }
+
+    fn acquire_lifecycle_sweep_claim(
+        &self,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
         claimed_at: u64,
         lease_deadline: Option<u64>,
         now: u64,
     ) -> Result<Option<LifecycleSweepClaimRecord>, BucketSnapshotLoadError> {
-        Self::acquire_lifecycle_sweep_claim(
-            self,
-            pg_id,
-            bucket,
+        self.client.acquire_lifecycle_sweep_claim(
+            self.pg_id,
+            &self.bucket,
             bucket_incarnation_generation,
             claim_id,
             owner_token,
-            cluster_epoch,
+            self.route_cluster_epoch,
             claimed_at,
             lease_deadline,
             now,
@@ -2149,21 +2360,33 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn heartbeat_lifecycle_sweep_claim(
         &self,
-        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
         heartbeat_at: u64,
         lease_deadline: Option<u64>,
     ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError> {
-        Self::heartbeat_lifecycle_sweep_claim(self, pg_id, claim, heartbeat_at, lease_deadline)
+        self.require_claim_subject(
+            &claim.bucket,
+            claim.cluster_epoch,
+            claim.pg_id,
+            "heartbeat lifecycle sweep claim",
+        )?;
+        self.client
+            .heartbeat_lifecycle_sweep_claim(self.pg_id, claim, heartbeat_at, lease_deadline)
     }
 
     fn record_lifecycle_sweep_claim_error(
         &self,
-        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
         last_error: &str,
     ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError> {
-        Self::record_lifecycle_sweep_claim_error(self, pg_id, claim, last_error)
+        self.require_claim_subject(
+            &claim.bucket,
+            claim.cluster_epoch,
+            claim.pg_id,
+            "record lifecycle sweep claim error",
+        )?;
+        self.client
+            .record_lifecycle_sweep_claim_error(self.pg_id, claim, last_error)
     }
 }
 

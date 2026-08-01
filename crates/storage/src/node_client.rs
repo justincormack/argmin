@@ -1380,6 +1380,36 @@ struct LocalStorageNodeReadHandleLease;
 
 #[allow(dead_code)]
 impl UnixStorageNodeClient {
+    fn validate_bucket_route_subject(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        let pg_topology = self.pg_topology.as_ref().ok_or_else(|| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                operation,
+                "bucket client has no installed PG topology".to_string(),
+            ))
+        })?;
+        if pg_topology.bucket_pg_for(bucket) != pg_id.get() {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                operation,
+                "bucket does not belong to the scoped bucket metadata PG".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
     fn head_bucket_with_kind(
         &self,
         kind: StorageRpcMessageKind,

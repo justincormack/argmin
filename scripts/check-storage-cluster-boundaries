@@ -1825,7 +1825,11 @@ lifecycle_sweep_coordination_broad_client_bypasses=$(
             || $0 ~ /(retained_)?bucket_write_reservation_client[[:space:]]*$/) {
             pending_bucket_write_client = 1
         }
-        if ($0 ~ /\.(durable_bucket_write_drain_exists|list_lifecycle_sweep_buckets|get_lifecycle_sweep_roots|acquire_lifecycle_sweep_claim|heartbeat_lifecycle_sweep_claim|record_lifecycle_sweep_claim_error|release_lifecycle_sweep_claim)\(/) {
+        # Exact drain and lifecycle-claim operations now exist only on the
+        # compiler-scoped BucketWriteReservationRoute. Keep this transitional
+        # lexical check for the PG-wide scan and retained-release operations
+        # that still live on distinct broad interfaces.
+        if ($0 ~ /\.(list_lifecycle_sweep_buckets|get_lifecycle_sweep_roots|release_lifecycle_sweep_claim)\(/) {
             if ($0 ~ /self\.list_lifecycle_sweep_buckets\(/) {
                 next
             }
@@ -1847,7 +1851,7 @@ lifecycle_sweep_coordination_broad_client_bypasses=$(
       crates/storage/src/cluster/local.rs
 )
 fail_with_matches \
-    "Production lifecycle sweep coordination must use its active or retained reservation role" \
+    "Production lifecycle sweep scans/releases must use their scan or retained reservation role" \
     "$lifecycle_sweep_coordination_broad_client_bypasses"
 
 # Temporary migration prohibition: physical deletion stays behind the

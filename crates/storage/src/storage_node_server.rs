@@ -45,20 +45,21 @@ use crate::node_client::MetadataCommandNodeClient;
 use crate::node_client::{
     complete_multipart_expected_object_parts, AcquireObjectPayloadReclaimClaimReq,
     BucketMetadataNodeClient, BucketMetadataRoute, BucketMetadataScanRoute,
-    BucketWriteReservationNodeClient, BuildAbortMultipartUploadCommandReq,
-    BuildAuthorizedAbortMultipartUploadCommandReq, BuildCompleteMultipartObjectCommandReq,
-    BuildCreateMultipartUploadCommandReq, BuildCreateStreamUploadCommandReq,
-    BuildDeleteCurrentObjectCommandReq, BuildDeleteObjectPayloadReclaimCommandReq,
-    BuildDeleteSpecificObjectVersionCommandReq, BuildDirectPutCommitCommandReq,
-    BuildInsertDeleteMarkerCommandReq, BuildPutObjectMetadataCommandReq,
-    BuildStreamPartCommitCommandReq, BuildStreamPutCommitCommandReq, CreateBucketCommandBuild,
-    CreateStreamUploadPrecondition, DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload,
-    MarkBucketDeletingCommandBuild, ObjectDeleteStorageSnapshot,
-    ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
-    ObjectMutationMetadataNodeClient, ObjectReadMetadataNodeClient,
-    ObjectVersionMetadataNodeClient, RetainedBucketWriteReservationNodeClient,
-    RetainedMetadataCommandNodeClient, RetainedObjectMutationMetadataNodeClient,
-    ShardAckNodeClient, ShardScavengerNodeClient, ShardScavengerObservationNodeClient,
+    BucketWriteReservationNodeClient, BucketWriteReservationRoute,
+    BuildAbortMultipartUploadCommandReq, BuildAuthorizedAbortMultipartUploadCommandReq,
+    BuildCompleteMultipartObjectCommandReq, BuildCreateMultipartUploadCommandReq,
+    BuildCreateStreamUploadCommandReq, BuildDeleteCurrentObjectCommandReq,
+    BuildDeleteObjectPayloadReclaimCommandReq, BuildDeleteSpecificObjectVersionCommandReq,
+    BuildDirectPutCommitCommandReq, BuildInsertDeleteMarkerCommandReq,
+    BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
+    BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
+    DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
+    ObjectDeleteStorageSnapshot, ObjectGenerationMetadataNodeClient,
+    ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
+    ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
+    RetainedBucketWriteReservationNodeClient, RetainedMetadataCommandNodeClient,
+    RetainedObjectMutationMetadataNodeClient, ShardAckNodeClient, ShardScavengerNodeClient,
+    ShardScavengerObservationNodeClient,
 };
 use crate::node_runtime::pg_store::{
     initialize_pg_durable_identity, inspect_pg_shard_inventory, sync_initialized_pg_store_layout,
@@ -4202,6 +4203,15 @@ impl StorageNodeActiveBucketRoute<'_> {
         .map_err(StorageNodeBucketRouteError::Bucket)
     }
 
+    fn open_local_bucket_write_reservation_route<'a>(
+        &self,
+        client: &'a LocalStorageNodeClient,
+    ) -> Result<Box<dyn BucketWriteReservationRoute + 'a>, StorageNodeBucketRouteError> {
+        client
+            .open_bucket_write_reservation_route(self.fence.cluster_epoch, self.pg_id, self.bucket)
+            .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+
     fn head_bucket(&self, filtered: bool) -> Result<BucketInfo, StorageNodeBucketRouteError> {
         self.require_valid_now()?;
         let local_client = LocalStorageNodeClient::new(
@@ -4268,13 +4278,10 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation_with_effect_fence(
-            &local_client,
-            self.pg_id,
-            acquire,
-            effect_fence,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route = self.open_local_bucket_write_reservation_route(&local_client)?;
+        route
+            .acquire_durable_bucket_write_reservation_with_effect_fence(acquire, effect_fence)
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 
     fn validate_write_reservation(
@@ -4295,12 +4302,10 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::validate_bucket_write_reservation_proof(
-            &local_client,
-            self.pg_id,
-            proof,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route = self.open_local_bucket_write_reservation_route(&local_client)?;
+        route
+            .validate_bucket_write_reservation_proof(proof)
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 
     fn heartbeat_write_reservation(
@@ -4328,14 +4333,14 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation_with_effect_fence(
-            &local_client,
-            self.pg_id,
-            proof,
-            lease_deadline,
-            effect_fence,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route = self.open_local_bucket_write_reservation_route(&local_client)?;
+        route
+            .heartbeat_durable_bucket_write_reservation_with_effect_fence(
+                proof,
+                lease_deadline,
+                effect_fence,
+            )
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4362,18 +4367,16 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::begin_durable_bucket_write_drain_with_effect_fence(
-            &local_client,
-            self.pg_id,
-            self.bucket,
-            drain_id,
-            owner_token,
-            cluster_epoch,
-            created_at,
-            lease_deadline,
-            effect_fence,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route = self.open_local_bucket_write_reservation_route(&local_client)?;
+        route
+            .begin_durable_bucket_write_drain_with_effect_fence(
+                drain_id,
+                owner_token,
+                created_at,
+                lease_deadline,
+                effect_fence,
+            )
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 
     fn clear_expired_write_drain(
@@ -4385,13 +4388,10 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::clear_expired_durable_bucket_write_drain(
-            &local_client,
-            self.pg_id,
-            self.bucket,
-            now,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route = self.open_local_bucket_write_reservation_route(&local_client)?;
+        route
+            .clear_expired_durable_bucket_write_drain(now)
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 
     fn heartbeat_write_drain(
@@ -4413,13 +4413,10 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_drain(
-            &local_client,
-            self.pg_id,
-            record,
-            lease_deadline,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route = self.open_local_bucket_write_reservation_route(&local_client)?;
+        route
+            .heartbeat_durable_bucket_write_drain(record, lease_deadline)
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 
     fn write_drain_exists(&self) -> Result<bool, StorageNodeBucketRouteError> {
@@ -4428,12 +4425,10 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::durable_bucket_write_drain_exists(
-            &local_client,
-            self.pg_id,
-            self.bucket,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route = self.open_local_bucket_write_reservation_route(&local_client)?;
+        route
+            .durable_bucket_write_drain_exists()
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 
     fn write_drain(&self) -> Result<Option<BucketWriteDrainRecord>, StorageNodeBucketRouteError> {
@@ -4442,12 +4437,10 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::durable_bucket_write_drain(
-            &local_client,
-            self.pg_id,
-            self.bucket,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route = self.open_local_bucket_write_reservation_route(&local_client)?;
+        route
+            .durable_bucket_write_drain()
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4475,19 +4468,17 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::acquire_bucket_delete_finalize_claim(
-            &local_client,
-            self.pg_id,
-            self.bucket,
-            bucket_incarnation_generation,
-            claim_id,
-            owner_token,
-            cluster_epoch,
-            claimed_at,
-            lease_deadline,
-            now,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route = self.open_local_bucket_write_reservation_route(&local_client)?;
+        route
+            .acquire_bucket_delete_finalize_claim(
+                bucket_incarnation_generation,
+                claim_id,
+                owner_token,
+                claimed_at,
+                lease_deadline,
+                now,
+            )
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 
     fn bucket_delete_finalize_claim(
@@ -4498,12 +4489,10 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::bucket_delete_finalize_claim(
-            &local_client,
-            self.pg_id,
-            self.bucket,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route = self.open_local_bucket_write_reservation_route(&local_client)?;
+        route
+            .bucket_delete_finalize_claim()
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4530,19 +4519,17 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::acquire_lifecycle_sweep_claim(
-            &local_client,
-            self.pg_id,
-            self.bucket,
-            bucket_incarnation_generation,
-            claim_id,
-            owner_token,
-            cluster_epoch,
-            claimed_at,
-            lease_deadline,
-            now,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route = self.open_local_bucket_write_reservation_route(&local_client)?;
+        route
+            .acquire_lifecycle_sweep_claim(
+                bucket_incarnation_generation,
+                claim_id,
+                owner_token,
+                claimed_at,
+                lease_deadline,
+                now,
+            )
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 
     fn validate_lifecycle_sweep_claim_subject(
@@ -4576,14 +4563,10 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::heartbeat_lifecycle_sweep_claim(
-            &local_client,
-            self.pg_id,
-            claim,
-            heartbeat_at,
-            lease_deadline,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route = self.open_local_bucket_write_reservation_route(&local_client)?;
+        route
+            .heartbeat_lifecycle_sweep_claim(claim, heartbeat_at, lease_deadline)
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 
     fn record_lifecycle_sweep_claim_error(
@@ -4597,13 +4580,10 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        BucketWriteReservationNodeClient::record_lifecycle_sweep_claim_error(
-            &local_client,
-            self.pg_id,
-            claim,
-            last_error,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
+        let route = self.open_local_bucket_write_reservation_route(&local_client)?;
+        route
+            .record_lifecycle_sweep_claim_error(claim, last_error)
+            .map_err(StorageNodeBucketRouteError::Bucket)
     }
 }
 
@@ -10234,11 +10214,17 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&error);
         }
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::record_bucket_delete_attempt_outcome(
-            &local_client,
+        let route = match local_client.open_bucket_write_reservation_route(
+            request.cluster_epoch,
             self.validated_bucket_metadata_pg(request.pg_id),
-            &request.record,
+            &request.record.bucket,
         ) {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
+            }
+        };
+        match route.record_bucket_delete_attempt_outcome(&request.record) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
         }
@@ -10261,11 +10247,17 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&error);
         }
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::bucket_delete_attempt_outcome(
-            &local_client,
+        let route = match local_client.open_bucket_write_reservation_route(
+            request.cluster_epoch,
             self.validated_bucket_metadata_pg(request.pg_id),
             &request.bucket,
         ) {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
+            }
+        };
+        match route.bucket_delete_attempt_outcome() {
             Ok(record) => {
                 let payload = encode_bucket_delete_attempt_outcome_optional_record_response(
                     &StorageRpcBucketDeleteAttemptOutcomeOptionalRecordResponse { record },
@@ -10293,11 +10285,17 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&error);
         }
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::durable_bucket_write_reservations(
-            &local_client,
+        let route = match local_client.open_bucket_write_reservation_route(
+            request.cluster_epoch,
             self.validated_bucket_metadata_pg(request.pg_id),
             &request.bucket,
         ) {
+            Ok(route) => route,
+            Err(error) => {
+                return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
+            }
+        };
+        match route.durable_bucket_write_reservations() {
             Ok(records) => {
                 let payload = encode_bucket_write_reservations_list_response(
                     &StorageRpcBucketWriteReservationsListResponse { records },
@@ -24188,16 +24186,37 @@ mod tests {
             endpoint,
             LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
             Some(storage_rpc_client_auth(credential, 9)),
-        );
+        )
+        .with_pg_topology(Arc::new(crate::PgTopology::new(&config.pg_ids).unwrap()));
+        let reservation_route = client
+            .open_bucket_write_reservation_route(
+                config.cluster_epoch,
+                BucketPgId::new_for_test(PgId::new(0)),
+                &bucket,
+            )
+            .unwrap();
+        let drain_route = client
+            .open_bucket_write_reservation_route(
+                config.cluster_epoch,
+                BucketPgId::new_for_test(PgId::new(0)),
+                &drain_bucket,
+            )
+            .unwrap();
+        let expired_drain_route = client
+            .open_bucket_write_reservation_route(
+                config.cluster_epoch,
+                BucketPgId::new_for_test(PgId::new(0)),
+                &expired_drain_bucket,
+            )
+            .unwrap();
         // The frontend's captured deadline is 1,500 ms away on its local
         // monotonic clock. The production client must project that to the
         // portable wall deadline (4,000 ms); no monotonic timestamp may cross
         // the TLS/TCP boundary.
         let effect_fence = AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 11_500);
         let reservation = crate::clock::with_time_and_monotonic_override(2_500, 10_000, || {
-            BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation_with_effect_fence(
-                    &client,
-                    BucketPgId::new_for_test(PgId::new(0)),
+            reservation_route
+                .acquire_durable_bucket_write_reservation_with_effect_fence(
                     DurableBucketWriteReservationAcquire {
                         name: &bucket,
                         reservation_id: "tcp-portable-reservation",
@@ -24215,18 +24234,15 @@ mod tests {
         assert_eq!(reservation.bucket, bucket);
 
         let drain = crate::clock::with_time_and_monotonic_override(2_600, 10_100, || {
-            BucketWriteReservationNodeClient::begin_durable_bucket_write_drain_with_effect_fence(
-                &client,
-                BucketPgId::new_for_test(PgId::new(0)),
-                &drain_bucket,
-                "tcp-portable-drain",
-                "tcp-portable-drain-owner",
-                config.cluster_epoch,
-                1_000,
-                9_000,
-                effect_fence,
-            )
-            .unwrap()
+            drain_route
+                .begin_durable_bucket_write_drain_with_effect_fence(
+                    "tcp-portable-drain",
+                    "tcp-portable-drain-owner",
+                    1_000,
+                    9_000,
+                    effect_fence,
+                )
+                .unwrap()
         });
         assert_eq!(drain.bucket, drain_bucket);
 
@@ -24252,18 +24268,15 @@ mod tests {
         assert_eq!(node.read_shard_file(0, &shard_key).unwrap(), shard_payload);
 
         let drain_error = crate::clock::with_time_and_monotonic_override(3_500, 11_000, || {
-            BucketWriteReservationNodeClient::begin_durable_bucket_write_drain_with_effect_fence(
-                &client,
-                BucketPgId::new_for_test(PgId::new(0)),
-                &expired_drain_bucket,
-                "tcp-expired-drain",
-                "tcp-expired-drain-owner",
-                config.cluster_epoch,
-                1_000,
-                9_000,
-                effect_fence,
-            )
-            .unwrap_err()
+            expired_drain_route
+                .begin_durable_bucket_write_drain_with_effect_fence(
+                    "tcp-expired-drain",
+                    "tcp-expired-drain-owner",
+                    1_000,
+                    9_000,
+                    effect_fence,
+                )
+                .unwrap_err()
         });
         assert!(
             matches!(

@@ -5022,6 +5022,39 @@ One-hundred-and-twenty-sixth Phase 3 slice:
   Workspace-wide strict Clippy and the transitional storage boundary checker
   also pass.
 
+One-hundred-and-twenty-seventh Phase 3 slice:
+
+- exact bucket-write reservation, drain, DeleteBucket progress/finalizer, and
+  lifecycle-claim operations now open a `BucketWriteReservationRoute` bound
+  to one route epoch, installed bucket-metadata PG, and bucket. Once opened,
+  the route no longer accepts replacement PG or bucket arguments. The parent
+  `BucketWriteReservationNodeClient` retains only route construction and the
+  four PG-wide worker-discovery scans, which will move to a separate scan
+  capability rather than weakening the exact route.
+- embedded and Unix route construction validates bucket placement through the
+  installed topology. New reservation/drain/claim acquisition is also bound
+  to the route epoch, while validation and heartbeat deliberately preserve a
+  durable reservation or drain's older creation epoch across an active-route
+  transition. The route therefore distinguishes current transport/publication
+  authority from the stable identity of previously persisted work.
+- active cluster writers, DeleteBucket progress and finalization, lifecycle
+  workers, diagnostics, local-cluster recovery validation, and storage-node
+  dispatch now consume the scoped interface. The role-specific Unix installer
+  transfers the immutable PG topology into its client, matching the full and
+  bucket-metadata installers.
+- a no-server Unix regression proves crossed buckets and a crossed epoch for a
+  new acquisition fail as `PayloadDecode` without starting transport. Existing
+  installed-Unix tests retain positive acquisition, validation, heartbeat,
+  drain, finalizer, lifecycle, current-route/old-durable-epoch, and equivalent
+  wrong-PG non-mutation canaries. Malicious-response coverage also rejects
+  duplicate reservation identities and a finalizer claim outside the route's
+  bucket/PG subject.
+- all 2,592 storage tests and all 7,914 workspace tests pass, together with
+  workspace-wide strict Clippy, formatting, and the transitional storage
+  boundary checker. The checker now relies on the compiler-scoped exact route
+  for drain/lifecycle claim operations and retains its lexical guard only for
+  the still-broad PG scan and retained-release interfaces.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

@@ -1,13 +1,17 @@
 use super::*;
 use crate::control_plane::{PendingMetadataCommandObservation, PendingMetadataCommandRecovery};
 use crate::storage_rpc::{
+    encode_bucket_delete_finalize_claim_optional_record_response,
     encode_bucket_execution_generations_response, encode_bucket_fast_path_identities_response,
     encode_bucket_info_outcome_response, encode_bucket_list_response,
     encode_bucket_snapshot_pair_response, encode_bucket_snapshot_response,
+    encode_bucket_write_reservations_list_response,
+    StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse,
     StorageRpcBucketExecutionGenerationsResponse, StorageRpcBucketFastPathIdentitiesResponse,
     StorageRpcBucketInfoOutcome, StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketListResponse,
     StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
     StorageRpcBucketSnapshotPairResponse, StorageRpcBucketSnapshotResponse,
+    StorageRpcBucketWriteReservationsListResponse,
 };
 
 #[derive(Clone, Copy)]
@@ -644,6 +648,17 @@ fn retained_bucket_write_route<'a>(
         .unwrap()
 }
 
+fn bucket_write_reservation_route<'a>(
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: BucketPgId,
+    bucket: &BucketName,
+) -> Box<dyn BucketWriteReservationRoute + 'a> {
+    client
+        .open_bucket_write_reservation_route(route_cluster_epoch, pg_id, bucket)
+        .unwrap()
+}
+
 #[test]
 fn unix_retained_bucket_write_route_rejects_foreign_subject_before_rpc() {
     let client = test_unix_storage_node_client();
@@ -703,6 +718,173 @@ fn unix_retained_bucket_write_route_rejects_foreign_subject_before_rpc() {
             .unwrap_err(),
         "release lifecycle sweep claim",
     );
+}
+
+#[test]
+fn unix_bucket_write_reservation_route_rejects_foreign_subjects_before_rpc() {
+    let client = test_unix_storage_node_client();
+    let bound_bucket = crate::tests::bucket_name("unix-write-route-bound-bucket");
+    let foreign_bucket = crate::tests::bucket_name("unix-write-route-foreign-bucket");
+    let pg_id = bucket_pg_id_for_test(0);
+    let route =
+        bucket_write_reservation_route(&client, ClusterEpoch::INITIAL, pg_id, &bound_bucket);
+    let foreign = test_retained_bucket_write_subjects(foreign_bucket.clone(), pg_id.get());
+    let requests_started = rpc_requests_started_for_test(&client);
+    let assert_payload_decode = |error: BucketSnapshotLoadError, operation: &str| {
+        assert!(
+            matches!(
+                error,
+                BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::PayloadDecode,
+                    ..
+                })
+            ),
+            "foreign {operation} must fail with PayloadDecode"
+        );
+    };
+
+    assert_payload_decode(
+        route
+            .acquire_durable_bucket_write_reservation(DurableBucketWriteReservationAcquire {
+                name: &foreign_bucket,
+                reservation_id: "foreign-reservation",
+                owner_token: "foreign-owner",
+                cluster_epoch: ClusterEpoch::INITIAL,
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline: 20,
+                target_context: Some("key"),
+            })
+            .unwrap_err(),
+        "reservation acquire",
+    );
+    assert_payload_decode(
+        route
+            .validate_bucket_write_reservation_proof(&foreign.proof)
+            .unwrap_err(),
+        "reservation validation",
+    );
+    assert_payload_decode(
+        route
+            .heartbeat_durable_bucket_write_drain(&foreign.drain, 30)
+            .unwrap_err(),
+        "drain heartbeat",
+    );
+    assert_payload_decode(
+        route
+            .heartbeat_lifecycle_sweep_claim(&foreign.lifecycle_claim, 30, Some(40))
+            .unwrap_err(),
+        "lifecycle claim heartbeat",
+    );
+    assert_payload_decode(
+        route
+            .record_lifecycle_sweep_claim_error(&foreign.lifecycle_claim, "foreign")
+            .unwrap_err(),
+        "lifecycle claim error",
+    );
+
+    assert_payload_decode(
+        route
+            .acquire_durable_bucket_write_reservation(DurableBucketWriteReservationAcquire {
+                name: &bound_bucket,
+                reservation_id: "wrong-epoch-reservation",
+                owner_token: "wrong-epoch-owner",
+                cluster_epoch: ClusterEpoch::new(2).unwrap(),
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline: 20,
+                target_context: Some("key"),
+            })
+            .unwrap_err(),
+        "reservation acquire epoch",
+    );
+    assert_eq!(rpc_requests_started_for_test(&client), requests_started);
+}
+
+#[test]
+fn unix_bucket_write_reservation_route_rejects_foreign_or_duplicate_response_subjects() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    let bucket = crate::tests::bucket_name("write-route-response-bucket");
+    let foreign_bucket = crate::tests::bucket_name("write-route-response-foreign");
+    let reservation = BucketWriteReservationRecord {
+        bucket: bucket.clone(),
+        reservation_id: "duplicate-reservation".to_string(),
+        owner_token: "reservation-owner".to_string(),
+        cluster_epoch: config.cluster_epoch,
+        bucket_execution_generation: 2,
+        bucket_incarnation_generation: 3,
+        operation_kind: "put-object".to_string(),
+        created_at: 10,
+        lease_deadline: 20,
+        target_context: Some("key".to_string()),
+    };
+    let foreign_claim = BucketDeleteFinalizeClaimRecord {
+        bucket: foreign_bucket,
+        bucket_incarnation_generation: 3,
+        claim_id: "foreign-claim".to_string(),
+        owner_token: "claim-owner".to_string(),
+        cluster_epoch: config.cluster_epoch,
+        pg_id: 0,
+        claimed_at: 10,
+        lease_deadline: Some(20),
+        attempt_count: 1,
+        last_error: None,
+    };
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&config.socket_path).unwrap();
+    let server_thread = thread::spawn(move || {
+        for (expected_kind, payload) in [
+            (
+                StorageRpcMessageKind::BucketWriteReservationsList,
+                encode_bucket_write_reservations_list_response(
+                    &StorageRpcBucketWriteReservationsListResponse {
+                        records: vec![reservation.clone(), reservation],
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::BucketDeleteFinalizeClaimGet,
+                encode_bucket_delete_finalize_claim_optional_record_response(
+                    &StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse {
+                        record: Some(foreign_claim),
+                    },
+                )
+                .unwrap(),
+            ),
+        ] {
+            let (mut connection, _) = listener.accept().unwrap();
+            let request = read_storage_rpc_frame_from(&mut connection).unwrap();
+            assert_eq!(request.kind, expected_kind);
+            write_storage_rpc_frame_to(
+                &mut connection,
+                &StorageRpcFrame {
+                    request_id: request.request_id,
+                    kind: request.kind,
+                    payload: encode_storage_rpc_success_response(&payload),
+                },
+            )
+            .unwrap();
+        }
+    });
+
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    )
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    let route = bucket_write_reservation_route(
+        &client,
+        config.cluster_epoch,
+        bucket_pg_id_for_test(0),
+        &bucket,
+    );
+    assert_bucket_metadata_payload_decode(route.durable_bucket_write_reservations().unwrap_err());
+    assert_bucket_metadata_payload_decode(route.bucket_delete_finalize_claim().unwrap_err());
+    server_thread.join().unwrap();
 }
 
 #[test]
@@ -1879,41 +2061,41 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
         NodeId::new(7),
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
+    )
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    let route = bucket_write_reservation_route(
+        &client,
+        ClusterEpoch::new(1).unwrap(),
+        bucket_pg_id_for_test(0),
+        &bucket,
     );
 
     let lease_deadline = crate::clock::current_time_millis().saturating_add(60_000);
-    let record = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
-        &client,
-        bucket_pg_id_for_test(0),
-        crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
-            name: &bucket,
-            reservation_id: "reservation-remote-1",
-            owner_token: "owner-token-remote-1",
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
-            operation_kind: "put-object",
-            created_at: 10,
-            lease_deadline,
-            target_context: Some("key=a"),
-        },
-    )
-    .unwrap();
+    let record = route
+        .acquire_durable_bucket_write_reservation(
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-remote-1",
+                owner_token: "owner-token-remote-1",
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline,
+                target_context: Some("key=a"),
+            },
+        )
+        .unwrap();
     assert_eq!(record.bucket, bucket);
     assert_eq!(record.reservation_id, "reservation-remote-1");
 
-    BucketWriteReservationNodeClient::validate_bucket_write_reservation_proof(
-        &client,
-        bucket_pg_id_for_test(0),
-        &BucketWriteReservationProof::from(&record),
-    )
-    .unwrap();
+    route
+        .validate_bucket_write_reservation_proof(&BucketWriteReservationProof::from(&record))
+        .unwrap();
     let mut conflicting_proof = BucketWriteReservationProof::from(&record);
     conflicting_proof.owner_token = "wrong-owner-token".to_string();
-    let conflict = BucketWriteReservationNodeClient::validate_bucket_write_reservation_proof(
-        &client,
-        bucket_pg_id_for_test(0),
-        &conflicting_proof,
-    )
-    .unwrap_err();
+    let conflict = route
+        .validate_bucket_write_reservation_proof(&conflicting_proof)
+        .unwrap_err();
     assert!(matches!(
         conflict,
         BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteReservationConflict {
@@ -1921,18 +2103,17 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
         }) if reservation_id == record.reservation_id
     ));
     let renewed_deadline = lease_deadline.saturating_add(60_000);
-    let renewed = BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation_with_effect_fence(
-        &client,
-        bucket_pg_id_for_test(0),
-        &BucketWriteReservationProof::from(&record),
-        renewed_deadline,
-        crate::types::AdmittedRouteEffectFence::bounded(
-            ClusterEpoch::new(1).unwrap(),
-            crate::clock::current_time_millis().saturating_add(120_000),
-            crate::clock::monotonic_time_millis().saturating_add(119_000),
-        ),
-    )
-    .unwrap();
+    let renewed = route
+        .heartbeat_durable_bucket_write_reservation_with_effect_fence(
+            &BucketWriteReservationProof::from(&record),
+            renewed_deadline,
+            crate::types::AdmittedRouteEffectFence::bounded(
+                ClusterEpoch::new(1).unwrap(),
+                crate::clock::current_time_millis().saturating_add(120_000),
+                crate::clock::monotonic_time_millis().saturating_add(119_000),
+            ),
+        )
+        .unwrap();
     assert_eq!(renewed.lease_deadline, renewed_deadline);
     retained_bucket_write_route(&client, bucket_pg_id_for_test(0), &bucket)
         .release_durable_bucket_write_reservation(&renewed)
@@ -2013,27 +2194,26 @@ fn unix_bucket_write_reservation_identity_uses_current_route_after_epoch_change(
         })
         .collect();
     let client =
-        UnixStorageNodeClient::new(config.node_id, route_epoch, config.socket_path.clone());
+        UnixStorageNodeClient::new(config.node_id, route_epoch, config.socket_path.clone())
+            .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    let route =
+        bucket_write_reservation_route(&client, route_epoch, bucket_pg_id_for_test(0), &bucket);
 
     let proof = BucketWriteReservationProof::from(&record);
-    BucketWriteReservationNodeClient::validate_bucket_write_reservation_proof(
-        &client,
-        bucket_pg_id_for_test(0),
-        &proof,
-    )
-    .unwrap();
-    let renewed = BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation_with_effect_fence(
-        &client,
-        bucket_pg_id_for_test(0),
-        &proof,
-        lease_deadline.saturating_add(60_000),
-        crate::types::AdmittedRouteEffectFence::bounded(
-            route_epoch,
-            crate::clock::current_time_millis().saturating_add(120_000),
-            crate::clock::monotonic_time_millis().saturating_add(119_000),
-        ),
-    )
-    .unwrap();
+    route
+        .validate_bucket_write_reservation_proof(&proof)
+        .unwrap();
+    let renewed = route
+        .heartbeat_durable_bucket_write_reservation_with_effect_fence(
+            &proof,
+            lease_deadline.saturating_add(60_000),
+            crate::types::AdmittedRouteEffectFence::bounded(
+                route_epoch,
+                crate::clock::current_time_millis().saturating_add(120_000),
+                crate::clock::monotonic_time_millis().saturating_add(119_000),
+            ),
+        )
+        .unwrap();
     retained_bucket_write_route(&client, bucket_pg_id_for_test(0), &bucket)
         .release_durable_bucket_write_reservation(&renewed)
         .unwrap();
@@ -2100,23 +2280,29 @@ fn unix_bucket_write_reservation_client_preserves_draining_signal() {
         NodeId::new(7),
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
+    )
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    let route = bucket_write_reservation_route(
+        &client,
+        ClusterEpoch::new(1).unwrap(),
+        bucket_pg_id_for_test(0),
+        &bucket,
     );
 
-    let err = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
-        &client,
-        bucket_pg_id_for_test(0),
-        crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
-            name: &bucket,
-            reservation_id: "reservation-remote-1",
-            owner_token: "owner-token-remote-1",
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
-            operation_kind: "put-object",
-            created_at: 30,
-            lease_deadline: 40,
-            target_context: Some("key=a"),
-        },
-    )
-    .unwrap_err();
+    let err = route
+        .acquire_durable_bucket_write_reservation(
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-remote-1",
+                owner_token: "owner-token-remote-1",
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                operation_kind: "put-object",
+                created_at: 30,
+                lease_deadline: 40,
+                target_context: Some("key=a"),
+            },
+        )
+        .unwrap_err();
     assert!(matches!(
         err,
         BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)
@@ -2136,23 +2322,29 @@ fn unix_bucket_write_reservation_client_preserves_bucket_not_found() {
         NodeId::new(7),
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
+    )
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    let route = bucket_write_reservation_route(
+        &client,
+        ClusterEpoch::new(1).unwrap(),
+        bucket_pg_id_for_test(0),
+        &bucket,
     );
 
-    let err = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
-        &client,
-        bucket_pg_id_for_test(0),
-        crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
-            name: &bucket,
-            reservation_id: "reservation-remote-1",
-            owner_token: "owner-token-remote-1",
-            cluster_epoch: ClusterEpoch::new(1).unwrap(),
-            operation_kind: "put-object",
-            created_at: 30,
-            lease_deadline: 40,
-            target_context: Some("key=a"),
-        },
-    )
-    .unwrap_err();
+    let err = route
+        .acquire_durable_bucket_write_reservation(
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-remote-1",
+                owner_token: "owner-token-remote-1",
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                operation_kind: "put-object",
+                created_at: 30,
+                lease_deadline: 40,
+                target_context: Some("key=a"),
+            },
+        )
+        .unwrap_err();
     assert!(matches!(
         err,
         BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name })
@@ -2229,102 +2421,61 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         NodeId::new(7),
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
-    );
-
-    let reservations = BucketWriteReservationNodeClient::durable_bucket_write_reservations(
+    )
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    let route = bucket_write_reservation_route(
         &client,
+        ClusterEpoch::new(1).unwrap(),
         bucket_pg_id_for_test(0),
         &bucket,
-    )
-    .unwrap();
+    );
+
+    let reservations = route.durable_bucket_write_reservations().unwrap();
     assert_eq!(reservations.len(), 1);
     assert_eq!(reservations[0].reservation_id, "reservation-for-drain-list");
 
-    let drain = BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
-        &client,
-        bucket_pg_id_for_test(0),
-        &bucket,
-        "drain-rpc-1",
-        "drain-owner-rpc-1",
-        ClusterEpoch::new(1).unwrap(),
-        30,
-        40,
-    )
-    .unwrap();
+    let drain = route
+        .begin_durable_bucket_write_drain("drain-rpc-1", "drain-owner-rpc-1", 30, 40)
+        .unwrap();
     assert_eq!(drain.bucket, bucket);
     assert_eq!(drain.drain_id, "drain-rpc-1");
-    assert!(
-        BucketWriteReservationNodeClient::durable_bucket_write_drain_exists(
-            &client,
-            bucket_pg_id_for_test(0),
-            &bucket,
-        )
-        .unwrap()
-    );
+    assert!(route.durable_bucket_write_drain_exists().unwrap());
     assert_eq!(
-        BucketWriteReservationNodeClient::durable_bucket_write_drain(
-            &client,
-            bucket_pg_id_for_test(0),
-            &bucket,
-        )
-        .unwrap()
-        .as_ref()
-        .map(|record| record.drain_id.as_str()),
+        route
+            .durable_bucket_write_drain()
+            .unwrap()
+            .as_ref()
+            .map(|record| record.drain_id.as_str()),
         Some("drain-rpc-1")
     );
     retained_bucket_write_route(&client, bucket_pg_id_for_test(0), &bucket)
         .clear_durable_bucket_write_drain(&drain)
         .unwrap();
-    assert!(
-        !BucketWriteReservationNodeClient::durable_bucket_write_drain_exists(
-            &client,
-            bucket_pg_id_for_test(0),
-            &bucket,
-        )
-        .unwrap()
-    );
-    assert!(
-        BucketWriteReservationNodeClient::durable_bucket_write_drain(
-            &client,
-            bucket_pg_id_for_test(0),
-            &bucket,
-        )
-        .unwrap()
-        .is_none()
-    );
+    assert!(!route.durable_bucket_write_drain_exists().unwrap());
+    assert!(route.durable_bucket_write_drain().unwrap().is_none());
 
-    BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
-        &client,
-        bucket_pg_id_for_test(0),
-        &bucket,
-        "expired-drain-rpc-1",
-        "expired-drain-owner-rpc-1",
-        ClusterEpoch::new(1).unwrap(),
-        50,
-        55,
-    )
-    .unwrap();
-    let expired = BucketWriteReservationNodeClient::clear_expired_durable_bucket_write_drain(
-        &client,
-        bucket_pg_id_for_test(0),
-        &bucket,
-        60,
-    )
-    .unwrap()
-    .expect("expired drain should clear");
+    route
+        .begin_durable_bucket_write_drain(
+            "expired-drain-rpc-1",
+            "expired-drain-owner-rpc-1",
+            50,
+            55,
+        )
+        .unwrap();
+    let expired = route
+        .clear_expired_durable_bucket_write_drain(60)
+        .unwrap()
+        .expect("expired drain should clear");
     assert_eq!(expired.drain_id, "expired-drain-rpc-1");
 
-    let live_begin_drain = BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
-        &client,
-        bucket_pg_id_for_test(0),
-        &bucket,
-        "active-begin-drain-rpc-1",
-        "active-begin-drain-owner-rpc-1",
-        ClusterEpoch::new(1).unwrap(),
-        61,
-        120,
-    )
-    .unwrap();
+    let live_begin_drain = route
+        .begin_durable_bucket_write_drain(
+            "active-begin-drain-rpc-1",
+            "active-begin-drain-owner-rpc-1",
+            61,
+            120,
+        )
+        .unwrap();
     let begin_roots = BucketWriteReservationNodeClient::get_bucket_delete_begin_roots(
         &client,
         bucket_pg_id_for_test(0),
@@ -2338,17 +2489,14 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         .clear_durable_bucket_write_drain(&live_begin_drain)
         .unwrap();
 
-    let expired_begin_drain = BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
-        &client,
-        bucket_pg_id_for_test(0),
-        &bucket,
-        "expired-begin-drain-rpc-1",
-        "expired-begin-drain-owner-rpc-1",
-        ClusterEpoch::new(1).unwrap(),
-        61,
-        80,
-    )
-    .unwrap();
+    let expired_begin_drain = route
+        .begin_durable_bucket_write_drain(
+            "expired-begin-drain-rpc-1",
+            "expired-begin-drain-owner-rpc-1",
+            61,
+            80,
+        )
+        .unwrap();
     let begin_roots = BucketWriteReservationNodeClient::get_bucket_delete_begin_roots(
         &client,
         bucket_pg_id_for_test(0),
@@ -2363,43 +2511,40 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         .clear_durable_bucket_write_drain(&expired_begin_drain)
         .unwrap();
 
-    let claim = BucketWriteReservationNodeClient::acquire_bucket_delete_finalize_claim(
+    let finalize_exact_route = bucket_write_reservation_route(
         &client,
+        ClusterEpoch::new(1).unwrap(),
         bucket_pg_id_for_test(0),
         &finalize_bucket,
-        finalize_bucket_incarnation_generation,
-        "finalize-claim-rpc-1",
-        "finalize-claim-owner-rpc-1",
-        ClusterEpoch::new(1).unwrap(),
-        70,
-        Some(80),
-        70,
-    )
-    .unwrap()
-    .expect("finalize claim should acquire");
+    );
+    let claim = finalize_exact_route
+        .acquire_bucket_delete_finalize_claim(
+            finalize_bucket_incarnation_generation,
+            "finalize-claim-rpc-1",
+            "finalize-claim-owner-rpc-1",
+            70,
+            Some(80),
+            70,
+        )
+        .unwrap()
+        .expect("finalize claim should acquire");
     assert_eq!(claim.bucket, finalize_bucket);
     assert_eq!(claim.claim_id, "finalize-claim-rpc-1");
-    let replacement_claim = BucketWriteReservationNodeClient::acquire_bucket_delete_finalize_claim(
-        &client,
-        bucket_pg_id_for_test(0),
-        &finalize_bucket,
-        finalize_bucket_incarnation_generation,
-        "finalize-claim-rpc-2",
-        "finalize-claim-owner-rpc-2",
-        ClusterEpoch::new(1).unwrap(),
-        81,
-        Some(100),
-        81,
-    )
-    .unwrap()
-    .expect("expired finalizer claim should be stealable");
-    let observed_claim = BucketWriteReservationNodeClient::bucket_delete_finalize_claim(
-        &client,
-        bucket_pg_id_for_test(0),
-        &finalize_bucket,
-    )
-    .unwrap()
-    .expect("finalize claim read should return current claim");
+    let replacement_claim = finalize_exact_route
+        .acquire_bucket_delete_finalize_claim(
+            finalize_bucket_incarnation_generation,
+            "finalize-claim-rpc-2",
+            "finalize-claim-owner-rpc-2",
+            81,
+            Some(100),
+            81,
+        )
+        .unwrap()
+        .expect("expired finalizer claim should be stealable");
+    let observed_claim = finalize_exact_route
+        .bucket_delete_finalize_claim()
+        .unwrap()
+        .expect("finalize claim read should return current claim");
     assert_eq!(observed_claim.bucket, finalize_bucket);
     assert_eq!(observed_claim.claim_id, replacement_claim.claim_id);
     assert_eq!(
@@ -2418,15 +2563,10 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     finalize_route
         .release_bucket_delete_finalize_claim(&replacement_claim)
         .unwrap();
-    assert!(
-        BucketWriteReservationNodeClient::bucket_delete_finalize_claim(
-            &client,
-            bucket_pg_id_for_test(0),
-            &finalize_bucket,
-        )
+    assert!(finalize_exact_route
+        .bucket_delete_finalize_claim()
         .unwrap()
-        .is_none()
-    );
+        .is_none());
 
     let roots = BucketWriteReservationNodeClient::get_bucket_delete_finalize_roots(
         &client,
@@ -2497,6 +2637,13 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
         NodeId::new(7),
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
+    )
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    let route = bucket_write_reservation_route(
+        &client,
+        ClusterEpoch::new(1).unwrap(),
+        bucket_pg_id_for_test(0),
+        &bucket,
     );
 
     let buckets = BucketWriteReservationNodeClient::list_lifecycle_sweep_buckets(
@@ -2522,41 +2669,29 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
         crate::types::LifecycleSweepRootSource::LifecycleConfig
     );
 
-    let claim = BucketWriteReservationNodeClient::acquire_lifecycle_sweep_claim(
-        &client,
-        bucket_pg_id_for_test(0),
-        &bucket,
-        bucket_incarnation_generation,
-        "lifecycle-claim-rpc-1",
-        "lifecycle-owner-rpc-1",
-        ClusterEpoch::new(1).unwrap(),
-        20,
-        Some(40),
-        20,
-    )
-    .unwrap()
-    .expect("lifecycle claim should acquire");
+    let claim = route
+        .acquire_lifecycle_sweep_claim(
+            bucket_incarnation_generation,
+            "lifecycle-claim-rpc-1",
+            "lifecycle-owner-rpc-1",
+            20,
+            Some(40),
+            20,
+        )
+        .unwrap()
+        .expect("lifecycle claim should acquire");
     assert_eq!(claim.bucket, bucket);
     assert_eq!(claim.claim_id, "lifecycle-claim-rpc-1");
 
-    let heartbeat = BucketWriteReservationNodeClient::heartbeat_lifecycle_sweep_claim(
-        &client,
-        bucket_pg_id_for_test(0),
-        &claim,
-        30,
-        Some(50),
-    )
-    .unwrap();
+    let heartbeat = route
+        .heartbeat_lifecycle_sweep_claim(&claim, 30, Some(50))
+        .unwrap();
     assert_eq!(heartbeat.heartbeat_at, 30);
     assert_eq!(heartbeat.lease_deadline, Some(50));
 
-    let error_record = BucketWriteReservationNodeClient::record_lifecycle_sweep_claim_error(
-        &client,
-        bucket_pg_id_for_test(0),
-        &heartbeat,
-        "transient lifecycle error",
-    )
-    .unwrap();
+    let error_record = route
+        .record_lifecycle_sweep_claim_error(&heartbeat, "transient lifecycle error")
+        .unwrap();
     assert_eq!(
         error_record.last_error.as_deref(),
         Some("transient lifecycle error")
@@ -3431,9 +3566,9 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
     // Exact bucket capabilities reject crossed PG subjects before transport.
-    // Only the correct snapshot and the two legacy reservation-boundary RPCs
-    // below reach the server.
-    let server_threads: Vec<_> = (0..3)
+    // Only the correct snapshot and the retained reservation release below
+    // reach the server.
+    let server_threads: Vec<_> = (0..2)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -3523,22 +3658,10 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
         })
     ));
 
-    let reservation_error =
-        BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
-            &client,
-            wrong_bucket_pg,
-            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
-                name: &bucket,
-                reservation_id: "wrong-pg-reservation",
-                owner_token: "wrong-pg-owner",
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                operation_kind: "put-object",
-                created_at: 10,
-                lease_deadline: 20,
-                target_context: Some("key"),
-            },
-        )
-        .unwrap_err();
+    let reservation_error = client
+        .open_bucket_write_reservation_route(route_epoch, wrong_bucket_pg, &bucket)
+        .err()
+        .expect("wrong-PG reservation route must be rejected");
     assert!(
         matches!(
             reservation_error,
@@ -3797,7 +3920,7 @@ fn unix_bucket_write_drain_operations_reject_wrong_bucket_pg_before_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..6)
+    let server_threads: Vec<_> = (0..1)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -3807,7 +3930,8 @@ fn unix_bucket_write_drain_operations_reject_wrong_bucket_pg_before_access() {
         config.node_id,
         config.cluster_epoch,
         config.socket_path.clone(),
-    );
+    )
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
     let wrong_pg = bucket_pg_id_for_test(wrong_pg_id);
     let assert_payload_decode = |error: BucketSnapshotLoadError, operation: &str| {
         assert!(
@@ -3838,45 +3962,11 @@ fn unix_bucket_write_drain_operations_reject_wrong_bucket_pg_before_access() {
         }
     };
 
-    let error = BucketWriteReservationNodeClient::durable_bucket_write_drain_exists(
-        &client, wrong_pg, &bucket,
-    )
-    .unwrap_err();
-    assert_payload_decode(error, "drain exists");
-    assert_drains_unchanged();
-
-    let error =
-        BucketWriteReservationNodeClient::durable_bucket_write_drain(&client, wrong_pg, &bucket)
-            .unwrap_err();
-    assert_payload_decode(error, "drain get");
-    assert_drains_unchanged();
-
-    let error = BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
-        &client,
-        wrong_pg,
-        &bucket,
-        "other-wrong-pg-drain",
-        "other-wrong-pg-drain-owner",
-        config.cluster_epoch,
-        20,
-        90,
-    )
-    .unwrap_err();
-    assert_payload_decode(error, "drain begin");
-    assert_drains_unchanged();
-
-    let error = BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_drain(
-        &client, wrong_pg, &drain, 90,
-    )
-    .unwrap_err();
-    assert_payload_decode(error, "drain heartbeat");
-    assert_drains_unchanged();
-
-    let error = BucketWriteReservationNodeClient::clear_expired_durable_bucket_write_drain(
-        &client, wrong_pg, &bucket, 100,
-    )
-    .unwrap_err();
-    assert_payload_decode(error, "expired drain clear");
+    let error = client
+        .open_bucket_write_reservation_route(config.cluster_epoch, wrong_pg, &bucket)
+        .err()
+        .expect("wrong-PG drain route must be rejected before transport");
+    assert_payload_decode(error, "route construction");
     assert_drains_unchanged();
 
     let error = retained_bucket_write_route(&client, wrong_pg, &bucket)
@@ -3914,7 +4004,7 @@ fn unix_bucket_delete_finalize_claim_operations_reject_wrong_bucket_pg_before_ac
         },
     ];
     let owner = crate::CanonicalUserId::from_principal("owner");
-    let (bucket, correct_pg_id, wrong_pg_id, generation, correct_claim, wrong_claim) = {
+    let (bucket, correct_pg_id, wrong_pg_id, correct_claim, wrong_claim) = {
         let node = SharedStorageNode::open_with_default_ec_shape(
             &config.data_dir,
             &config.pg_ids,
@@ -3974,7 +4064,6 @@ fn unix_bucket_delete_finalize_claim_operations_reject_wrong_bucket_pg_before_ac
             bucket,
             correct_pg_id,
             wrong_pg_id,
-            generations[0],
             claims.remove(0),
             claims.remove(0),
         )
@@ -3982,7 +4071,7 @@ fn unix_bucket_delete_finalize_claim_operations_reject_wrong_bucket_pg_before_ac
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..3)
+    let server_threads: Vec<_> = (0..1)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -3992,7 +4081,8 @@ fn unix_bucket_delete_finalize_claim_operations_reject_wrong_bucket_pg_before_ac
         config.node_id,
         config.cluster_epoch,
         config.socket_path.clone(),
-    );
+    )
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
     let wrong_pg = bucket_pg_id_for_test(wrong_pg_id);
     let assert_payload_decode = |error: BucketSnapshotLoadError, operation: &str| {
         assert!(
@@ -4023,26 +4113,11 @@ fn unix_bucket_delete_finalize_claim_operations_reject_wrong_bucket_pg_before_ac
         }
     };
 
-    let error = BucketWriteReservationNodeClient::acquire_bucket_delete_finalize_claim(
-        &client,
-        wrong_pg,
-        &bucket,
-        generation,
-        &wrong_claim.claim_id,
-        &wrong_claim.owner_token,
-        config.cluster_epoch,
-        wrong_claim.claimed_at,
-        wrong_claim.lease_deadline,
-        wrong_claim.claimed_at,
-    )
-    .unwrap_err();
-    assert_payload_decode(error, "finalizer claim acquire");
-    assert_claims_unchanged();
-
-    let error =
-        BucketWriteReservationNodeClient::bucket_delete_finalize_claim(&client, wrong_pg, &bucket)
-            .unwrap_err();
-    assert_payload_decode(error, "finalizer claim get");
+    let error = client
+        .open_bucket_write_reservation_route(config.cluster_epoch, wrong_pg, &bucket)
+        .err()
+        .expect("wrong-PG finalizer route must be rejected before transport");
+    assert_payload_decode(error, "route construction");
     assert_claims_unchanged();
 
     let error = retained_bucket_write_route(&client, wrong_pg, &bucket)
@@ -4157,7 +4232,7 @@ fn unix_lifecycle_sweep_claim_operations_reject_wrong_bucket_pg_before_access() 
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..4)
+    let server_threads: Vec<_> = (0..1)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -4167,7 +4242,8 @@ fn unix_lifecycle_sweep_claim_operations_reject_wrong_bucket_pg_before_access() 
         config.node_id,
         config.cluster_epoch,
         config.socket_path.clone(),
-    );
+    )
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
     let wrong_pg = bucket_pg_id_for_test(wrong_pg_id);
     let assert_payload_decode = |error: BucketSnapshotLoadError, operation: &str| {
         assert!(
@@ -4209,41 +4285,11 @@ fn unix_lifecycle_sweep_claim_operations_reject_wrong_bucket_pg_before_access() 
         }
     };
 
-    let error = BucketWriteReservationNodeClient::acquire_lifecycle_sweep_claim(
-        &client,
-        wrong_pg,
-        &bucket,
-        generation,
-        &wrong_claim.claim_id,
-        &wrong_claim.owner_token,
-        config.cluster_epoch,
-        wrong_claim.claimed_at,
-        wrong_claim.lease_deadline,
-        20,
-    )
-    .unwrap_err();
-    assert_payload_decode(error, "lifecycle claim acquire");
-    assert_claims_unchanged();
-
-    let error = BucketWriteReservationNodeClient::heartbeat_lifecycle_sweep_claim(
-        &client,
-        wrong_pg,
-        &wrong_claim,
-        20,
-        Some(80),
-    )
-    .unwrap_err();
-    assert_payload_decode(error, "lifecycle claim heartbeat");
-    assert_claims_unchanged();
-
-    let error = BucketWriteReservationNodeClient::record_lifecycle_sweep_claim_error(
-        &client,
-        wrong_pg,
-        &wrong_claim,
-        "must not be recorded",
-    )
-    .unwrap_err();
-    assert_payload_decode(error, "lifecycle claim error");
+    let error = client
+        .open_bucket_write_reservation_route(config.cluster_epoch, wrong_pg, &bucket)
+        .err()
+        .expect("wrong-PG lifecycle route must be rejected before transport");
+    assert_payload_decode(error, "route construction");
     assert_claims_unchanged();
 
     let error = retained_bucket_write_route(&client, wrong_pg, &bucket)
