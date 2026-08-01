@@ -3370,7 +3370,7 @@ fn test_unix_storage_node_client() -> UnixStorageNodeClient {
         ClusterEpoch::new(1).unwrap(),
         tmp.path().join("unused.sock"),
     )
-    .with_object_listing_topology(Arc::new(PgTopology::new(&[0]).unwrap()))
+    .with_pg_topology(Arc::new(PgTopology::new(&[0]).unwrap()))
 }
 
 fn test_unix_storage_node_client_with_rpc_admission_timeout(

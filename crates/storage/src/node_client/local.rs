@@ -223,6 +223,12 @@ struct LocalObjectMutationScanMetadataRoute<'a> {
     pg_id: ObjectMetadataScanPgId,
 }
 
+struct LocalBucketMetadataScanRoute {
+    storage_node: Arc<SharedStorageNode>,
+    _route_cluster_epoch: ClusterEpoch,
+    pg_id: BucketPgId,
+}
+
 impl ObjectPayloadLeaseNodeLease for LocalObjectPayloadLease {
     fn release(&mut self) -> Result<usize, StoreError> {
         if self.released {
@@ -1397,31 +1403,92 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         Ok(PgMetadataStore::get_bucket_subresource(&*pg, bucket, kind)?.map(|stored| stored.body))
     }
 
+    fn open_bucket_metadata_scan_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+    ) -> Result<Box<dyn BucketMetadataScanRoute + '_>, BucketSnapshotLoadError> {
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalBucketMetadataScanRoute {
+            storage_node: Arc::clone(&self.storage_node),
+            _route_cluster_epoch: route_cluster_epoch,
+            pg_id,
+        }))
+    }
+}
+
+impl LocalBucketMetadataScanRoute {
+    fn require_bucket(
+        &self,
+        bucket: &BucketName,
+        operation: &'static str,
+    ) -> Result<(), StoreError> {
+        if self.storage_node.bucket_metadata_pg_for(bucket) != self.pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation });
+        }
+        Ok(())
+    }
+}
+
+impl BucketMetadataScanRoute for LocalBucketMetadataScanRoute {
     fn list_buckets(
         &self,
-        pg_id: BucketPgId,
         owner_canonical_id: &str,
     ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::list_buckets(&*pg, owner_canonical_id)?)
+        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let buckets = PgMetadataStore::list_buckets(&*pg, owner_canonical_id)?;
+        for bucket in &buckets {
+            if bucket.owner_canonical_id.as_str() != owner_canonical_id {
+                return Err(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "list buckets for owner",
+                }
+                .into());
+            }
+            self.require_bucket(&bucket.name, "list buckets for owner")?;
+        }
+        Ok(buckets)
     }
 
     fn load_bucket_execution_generations(
         &self,
-        pg_id: BucketPgId,
         buckets: &[BucketName],
     ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(pg.load_bucket_execution_generations(buckets)?)
+        for bucket in buckets {
+            self.require_bucket(bucket, "load bucket execution generations")?;
+        }
+        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let generations = pg.load_bucket_execution_generations(buckets)?;
+        for bucket in generations.keys() {
+            if !buckets.iter().any(|requested| requested == bucket) {
+                return Err(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "load bucket execution generations",
+                }
+                .into());
+            }
+            self.require_bucket(bucket, "load bucket execution generations")?;
+        }
+        Ok(generations)
     }
 
     fn load_bucket_fast_path_identities(
         &self,
-        pg_id: BucketPgId,
         buckets: &[BucketName],
     ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(pg.load_bucket_fast_path_identities(buckets)?)
+        for bucket in buckets {
+            self.require_bucket(bucket, "load bucket fast-path identities")?;
+        }
+        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let identities = pg.load_bucket_fast_path_identities(buckets)?;
+        for bucket in identities.keys() {
+            if !buckets.iter().any(|requested| requested == bucket) {
+                return Err(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "load bucket fast-path identities",
+                }
+                .into());
+            }
+            self.require_bucket(bucket, "load bucket fast-path identities")?;
+        }
+        Ok(identities)
     }
 }
 

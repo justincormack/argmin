@@ -1293,7 +1293,7 @@ pub(crate) struct UnixStorageNodeClient {
     node_id: NodeId,
     cluster_epoch: ClusterEpoch,
     endpoint: StorageRpcClientEndpoint,
-    object_listing_topology: Option<Arc<PgTopology>>,
+    pg_topology: Option<Arc<PgTopology>>,
     next_request_id: AtomicU64,
     rpc_admission: Arc<UnixStorageNodeRpcAdmission>,
     rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,

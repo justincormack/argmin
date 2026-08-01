@@ -161,21 +161,26 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
             })
     }
 
+    fn open_bucket_metadata_scan_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+    ) -> Result<Box<dyn BucketMetadataScanRoute + '_>, BucketSnapshotLoadError>;
+}
+
+pub(crate) trait BucketMetadataScanRoute: Send {
     fn list_buckets(
         &self,
-        pg_id: BucketPgId,
         owner_canonical_id: &str,
     ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError>;
 
     fn load_bucket_execution_generations(
         &self,
-        pg_id: BucketPgId,
         buckets: &[BucketName],
     ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError>;
 
     fn load_bucket_fast_path_identities(
         &self,
-        pg_id: BucketPgId,
         buckets: &[BucketName],
     ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, BucketSnapshotLoadError>;
 }

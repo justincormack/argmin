@@ -853,7 +853,7 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
     )
-    .with_object_listing_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
     let bucket = crate::tests::bucket_name("object-listing-scan-pg-bucket");
     let installed_scan_pg = ObjectMetadataScanPgId::new_for_test(PgId::new(1));
     let unknown_scan_pg = ObjectMetadataScanPgId::new_for_test(PgId::new(2));
@@ -1191,7 +1191,7 @@ fn unix_object_mutation_scan_route_rejects_foreign_response_subjects() {
         config.cluster_epoch,
         config.socket_path.clone(),
     )
-    .with_object_listing_topology(topology);
+    .with_pg_topology(topology);
     let route =
         object_mutation_scan_route(&client, ObjectMetadataScanPgId::new_for_test(PgId::new(0)));
 
@@ -3338,7 +3338,7 @@ fn installed_unix_object_listing_routes_reject_misplaced_durable_rows_as_payload
         config.cluster_epoch,
         config.socket_path.clone(),
     )
-    .with_object_listing_topology(pg_topology);
+    .with_pg_topology(pg_topology);
     let route = client
         .open_object_listing_metadata_route(
             config.cluster_epoch,
@@ -3614,7 +3614,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
     )
-    .with_object_listing_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
     let proof = BucketWriteReservationProof {
         bucket: bucket.clone(),
         reservation_id: "reservation-id".to_string(),
@@ -4129,7 +4129,7 @@ fn unix_stream_uploads_list_requires_pg_primary() {
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
     )
-    .with_object_listing_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
 
     let bucket = crate::tests::bucket_name("stream-upload-list-primary");
     let scan_route =
@@ -4228,7 +4228,7 @@ fn unix_stream_uploads_list_rejects_wrong_pg_rows() {
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
     )
-    .with_object_listing_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
 
     let scan_route = object_mutation_scan_route(
         &client,
@@ -4312,7 +4312,7 @@ fn unix_bucket_payload_reclaim_root_requires_pg_primary() {
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
     )
-    .with_object_listing_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
     let bucket = crate::tests::bucket_name("bucket-reclaim-primary-rpc-bucket");
 
     let err =
@@ -4344,7 +4344,7 @@ fn unix_object_payload_reclaim_root_requires_pg_primary() {
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
     )
-    .with_object_listing_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
 
     let err =
         object_mutation_scan_route(&client, ObjectMetadataScanPgId::new_for_test(PgId::new(0)))
@@ -4402,7 +4402,7 @@ fn unix_object_payload_reclaim_route_rejects_crossed_kind_before_claim_mutation(
         config.cluster_epoch,
         config.socket_path.clone(),
     )
-    .with_object_listing_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
     let route = ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
         &client,
         config.cluster_epoch,
@@ -4573,7 +4573,7 @@ fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
         ClusterEpoch::new(1).unwrap(),
         config.socket_path.clone(),
     )
-    .with_object_listing_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
 
     assert!(
         object_payload_reclaim_route(&client, correct_pg, &bucket, &key, generation_id,)

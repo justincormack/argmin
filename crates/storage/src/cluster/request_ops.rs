@@ -3492,13 +3492,14 @@ impl super::StorageCluster {
             else {
                 continue;
             };
-            let Ok(generations) = node
-                .bucket_metadata_client()
-                .load_bucket_execution_generations(
-                    self.validated_bucket_metadata_pg(pg_id),
-                    &buckets,
-                )
-            else {
+            let client = node.bucket_metadata_client();
+            let Ok(route) = client.open_bucket_metadata_scan_route(
+                self.operation_epoch(),
+                self.validated_bucket_metadata_pg(pg_id),
+            ) else {
+                continue;
+            };
+            let Ok(generations) = route.load_bucket_execution_generations(&buckets) else {
                 continue;
             };
             batches.push((buckets, generations));
@@ -3514,12 +3515,13 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let mut identities = node
-            .bucket_metadata_client()
-            .load_bucket_fast_path_identities(
-                self.validated_bucket_metadata_pg(pg_id),
-                std::slice::from_ref(bucket),
-            )?;
+        let client = node.bucket_metadata_client();
+        let route = client.open_bucket_metadata_scan_route(
+            self.operation_epoch(),
+            self.validated_bucket_metadata_pg(pg_id),
+        )?;
+        let mut identities =
+            route.load_bucket_fast_path_identities(std::slice::from_ref(bucket))?;
         Ok(identities.remove(bucket))
     }
 
@@ -8393,9 +8395,15 @@ impl super::StorageCluster {
             let node = self
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-            let mut page = node
-                .bucket_metadata_client()
-                .list_buckets(self.validated_bucket_metadata_pg(pg_id), owner_canonical_id)
+            let client = node.bucket_metadata_client();
+            let route = client
+                .open_bucket_metadata_scan_route(
+                    self.operation_epoch(),
+                    self.validated_bucket_metadata_pg(pg_id),
+                )
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+            let mut page = route
+                .list_buckets(owner_canonical_id)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
             self.validate_bucket_list_page_for_pg(pg_id, node.node_id(), &page)?;
             #[cfg(any(test, feature = "test-hooks"))]

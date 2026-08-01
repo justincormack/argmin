@@ -647,7 +647,7 @@ Node-client role classification (2026-07-19):
 
 | Interface | PG role | Capability direction |
 | --- | --- | --- |
-| `BucketMetadataNodeClient` | bucket metadata | active bucket route; reads may later receive a read-only projection |
+| `BucketMetadataNodeClient` | bucket metadata | exact reads/mutations use an active bucket route; owner listing and batch generation/fast-path reads open a separate active scan route bound to one epoch and bucket PG |
 | `BucketWriteReservationNodeClient` | bucket metadata | active bucket route for acquisition, heartbeat, worker scans, and claim creation |
 | `RetainedBucketWriteReservationNodeClient` | bucket metadata | opens a retained cleanup route bound to one bucket metadata PG and exact bucket; the returned interface releases exact reservation proofs, drains, and worker claims without accepting a replacement PG or bucket |
 | `ObjectGenerationMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; reservation lookup and next-generation inspection cannot replace that subject |
@@ -4946,6 +4946,38 @@ One-hundred-and-twenty-fourth Phase 3 slice:
   compiler error, while retaining a receiver-name exception would merely
   duplicate that stronger boundary textually.
 - all 2,579 storage tests and the full 7,901-test workspace suite pass.
+  Workspace-wide strict Clippy and the transitional storage boundary checker
+  also pass.
+
+One-hundred-and-twenty-fifth Phase 3 slice:
+
+- bucket owner listing and batch execution-generation/fast-path reads now open
+  a `BucketMetadataScanRoute` bound to one route epoch and one installed
+  bucket-metadata PG. The three operations no longer accept a replacement PG,
+  and the full and role-specific Unix client installers bind the immutable PG
+  topology used by the route.
+- embedded and Unix routes validate every requested or returned bucket against
+  the scoped PG. Owner-list responses additionally retain their owner binding,
+  reject duplicate bucket names, while batch responses must remain a subset of
+  the requested buckets. An authenticated Unix peer cannot return a duplicate
+  or foreign-PG bucket through any of the three result shapes.
+- the storage-node RPC handlers now consume the frame's active admission
+  permit and construct an active bucket-scan capability carrying the captured
+  route fence. This closes the previous path that validated only the renewable
+  raw route tuple; scans now reject a foreign admission domain, retained
+  admission, and use after their immutable deadline even when the underlying
+  same-epoch route has been renewed.
+- deterministic coverage rejects foreign-epoch and foreign-PG requests before
+  transport, all three malicious response shapes at the Unix client boundary,
+  duplicate owner-list rows, a misplaced durable bucket as `PayloadDecode`
+  through an installed Unix server, and all three operations after the
+  storage-node capability deadline. The existing role-specific Unix routing
+  test remains a positive canary for owner filtering and both batch reads.
+- the transitional source checker no longer recognizes the removed raw scan
+  method names. The scoped route is now the only compiler-visible production
+  interface for these operations; direct `PgMetadataStore` bucket reads remain
+  banned in cluster code.
+- all 2,585 storage tests and the full 7,907-test workspace suite pass.
   Workspace-wide strict Clippy and the transitional storage boundary checker
   also pass.
 

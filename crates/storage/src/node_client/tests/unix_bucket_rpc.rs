@@ -1,5 +1,10 @@
 use super::*;
 use crate::control_plane::{PendingMetadataCommandObservation, PendingMetadataCommandRecovery};
+use crate::storage_rpc::{
+    encode_bucket_execution_generations_response, encode_bucket_fast_path_identities_response,
+    encode_bucket_list_response, StorageRpcBucketExecutionGenerationsResponse,
+    StorageRpcBucketFastPathIdentitiesResponse, StorageRpcBucketListResponse,
+};
 
 #[derive(Clone, Copy)]
 enum HistoricalReplicaHeadAuthorization {
@@ -101,6 +106,252 @@ fn historical_bucket_delete_replica_head(
 
 fn bucket_pg_id_for_test(pg_id: u32) -> BucketPgId {
     BucketPgId::new_for_test(PgId::new(pg_id))
+}
+
+fn bucket_for_pg(topology: &PgTopology, target_pg: u32, prefix: &str) -> BucketName {
+    (0..10_000)
+        .map(|suffix| crate::tests::bucket_name(format!("{prefix}-{suffix}")))
+        .find(|bucket| topology.bucket_pg_for(bucket) == target_pg)
+        .expect("test topology must route a generated bucket to the target PG")
+}
+
+fn bucket_metadata_scan_route<'a>(
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: BucketPgId,
+) -> Box<dyn BucketMetadataScanRoute + 'a> {
+    client
+        .open_bucket_metadata_scan_route(route_cluster_epoch, pg_id)
+        .unwrap()
+}
+
+fn assert_bucket_scan_payload_decode(error: BucketSnapshotLoadError) {
+    assert!(matches!(
+        error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn unix_bucket_metadata_scan_route_rejects_foreign_epoch_and_request_subject_before_rpc() {
+    let tmp = test_util::tempdir();
+    let topology = Arc::new(PgTopology::new(&[0, 1]).unwrap());
+    let foreign_bucket = bucket_for_pg(&topology, 1, "bucket-scan-foreign-request");
+    let client = UnixStorageNodeClient::new(
+        NodeId::new(7),
+        ClusterEpoch::new(1).unwrap(),
+        tmp.path().join("unused.sock"),
+    )
+    .with_pg_topology(Arc::clone(&topology));
+    let requests_started = rpc_requests_started_for_test(&client);
+
+    let route = bucket_metadata_scan_route(
+        &client,
+        ClusterEpoch::new(1).unwrap(),
+        bucket_pg_id_for_test(0),
+    );
+    assert_bucket_scan_payload_decode(
+        route
+            .load_bucket_execution_generations(std::slice::from_ref(&foreign_bucket))
+            .unwrap_err(),
+    );
+    assert_bucket_scan_payload_decode(
+        route
+            .load_bucket_fast_path_identities(std::slice::from_ref(&foreign_bucket))
+            .unwrap_err(),
+    );
+    drop(route);
+
+    match client
+        .open_bucket_metadata_scan_route(ClusterEpoch::new(2).unwrap(), bucket_pg_id_for_test(0))
+    {
+        Err(BucketSnapshotLoadError::Store(StoreError::StaleMetadataOperation { .. })) => {}
+        Err(error) => panic!("unexpected foreign-epoch route error: {error}"),
+        Ok(_) => panic!("foreign epoch opened a bucket metadata scan route"),
+    }
+    assert_eq!(rpc_requests_started_for_test(&client), requests_started);
+}
+
+#[test]
+fn unix_bucket_metadata_scan_route_rejects_foreign_response_subjects() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.pg_ids = vec![0, 1];
+    let topology = Arc::new(PgTopology::new(&config.pg_ids).unwrap());
+    let requested_bucket = bucket_for_pg(&topology, 0, "bucket-scan-requested");
+    let foreign_bucket = bucket_for_pg(&topology, 1, "bucket-scan-foreign-response");
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let acl = crate::AclGrants::default();
+    let foreign_info = test_bucket_info(foreign_bucket.clone(), &owner, &acl);
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&config.socket_path).unwrap();
+    let foreign_for_server = foreign_bucket.clone();
+    let server_thread = thread::spawn(move || {
+        for (expected_kind, payload) in [
+            (
+                StorageRpcMessageKind::BucketList,
+                encode_bucket_list_response(&StorageRpcBucketListResponse {
+                    buckets: vec![foreign_info],
+                })
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::BucketExecutionGenerations,
+                encode_bucket_execution_generations_response(
+                    &StorageRpcBucketExecutionGenerationsResponse {
+                        generations: HashMap::from([(foreign_for_server.clone(), 11)]),
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::BucketFastPathIdentities,
+                encode_bucket_fast_path_identities_response(
+                    &StorageRpcBucketFastPathIdentitiesResponse {
+                        identities: HashMap::from([(
+                            foreign_for_server.clone(),
+                            BucketFastPathIdentity {
+                                bucket_execution_generation: 11,
+                                bucket_incarnation_generation: 17,
+                            },
+                        )]),
+                    },
+                )
+                .unwrap(),
+            ),
+        ] {
+            let (mut connection, _) = listener.accept().unwrap();
+            let request = read_storage_rpc_frame_from(&mut connection).unwrap();
+            assert_eq!(request.kind, expected_kind);
+            write_storage_rpc_frame_to(
+                &mut connection,
+                &StorageRpcFrame {
+                    request_id: request.request_id,
+                    kind: request.kind,
+                    payload: encode_storage_rpc_success_response(&payload),
+                },
+            )
+            .unwrap();
+        }
+    });
+
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    )
+    .with_pg_topology(topology);
+    let route = bucket_metadata_scan_route(&client, config.cluster_epoch, bucket_pg_id_for_test(0));
+    assert_bucket_scan_payload_decode(route.list_buckets(owner.as_str()).unwrap_err());
+    assert_bucket_scan_payload_decode(
+        route
+            .load_bucket_execution_generations(std::slice::from_ref(&requested_bucket))
+            .unwrap_err(),
+    );
+    assert_bucket_scan_payload_decode(
+        route
+            .load_bucket_fast_path_identities(std::slice::from_ref(&requested_bucket))
+            .unwrap_err(),
+    );
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn unix_bucket_metadata_scan_route_rejects_duplicate_bucket_list_rows() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    let topology = Arc::new(PgTopology::new(&config.pg_ids).unwrap());
+    let bucket = bucket_for_pg(&topology, 0, "bucket-scan-duplicate-response");
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let bucket_info = test_bucket_info(bucket, &owner, &crate::AclGrants::default());
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&config.socket_path).unwrap();
+    let server_thread = thread::spawn(move || {
+        let (mut connection, _) = listener.accept().unwrap();
+        let request = read_storage_rpc_frame_from(&mut connection).unwrap();
+        assert_eq!(request.kind, StorageRpcMessageKind::BucketList);
+        let payload = encode_bucket_list_response(&StorageRpcBucketListResponse {
+            buckets: vec![bucket_info.clone(), bucket_info],
+        })
+        .unwrap();
+        write_storage_rpc_frame_to(
+            &mut connection,
+            &StorageRpcFrame {
+                request_id: request.request_id,
+                kind: request.kind,
+                payload: encode_storage_rpc_success_response(&payload),
+            },
+        )
+        .unwrap();
+    });
+
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    )
+    .with_pg_topology(topology);
+    let route = bucket_metadata_scan_route(&client, config.cluster_epoch, bucket_pg_id_for_test(0));
+
+    assert_bucket_scan_payload_decode(route.list_buckets(owner.as_str()).unwrap_err());
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn unix_bucket_metadata_scan_rejects_misplaced_durable_bucket_as_payload_decode() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.pg_ids = vec![0, 1];
+    config.pg_routes.push(StorageNodePgRoute {
+        pg_id: 1,
+        cluster_epoch: config.cluster_epoch,
+        state: crate::types::PgState::Active,
+        primary_node_id: config.node_id,
+        metadata_transfer_destination_epoch: None,
+        acting_set: vec![config.node_id],
+    });
+    let topology = Arc::new(PgTopology::new(&config.pg_ids).unwrap());
+    let misplaced_bucket = bucket_for_pg(&topology, 1, "bucket-scan-misplaced-durable");
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let wrong_pg = node.get_pg(0).unwrap();
+        PgMetadataStore::create_bucket(
+            &*wrong_pg,
+            &misplaced_bucket,
+            "owner",
+            &owner,
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        wrong_pg.refresh_metadata_command_state_digest().unwrap();
+    }
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    )
+    .with_pg_topology(topology);
+    let route = bucket_metadata_scan_route(&client, config.cluster_epoch, bucket_pg_id_for_test(0));
+
+    assert_bucket_scan_payload_decode(route.list_buckets(owner.as_str()).unwrap_err());
+    server_thread.join().unwrap();
 }
 
 fn retained_bucket_write_route<'a>(

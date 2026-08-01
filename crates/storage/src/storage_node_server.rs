@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -44,7 +44,7 @@ use crate::metadata_command::{
 use crate::node_client::MetadataCommandNodeClient;
 use crate::node_client::{
     complete_multipart_expected_object_parts, AcquireObjectPayloadReclaimClaimReq,
-    BucketMetadataNodeClient, BucketWriteReservationNodeClient,
+    BucketMetadataNodeClient, BucketMetadataScanRoute, BucketWriteReservationNodeClient,
     BuildAbortMultipartUploadCommandReq, BuildAuthorizedAbortMultipartUploadCommandReq,
     BuildCompleteMultipartObjectCommandReq, BuildCreateMultipartUploadCommandReq,
     BuildCreateStreamUploadCommandReq, BuildDeleteCurrentObjectCommandReq,
@@ -355,7 +355,7 @@ use crate::{
     PayloadReclaimRoot, PrepareStreamUploadSegmentAppendReq, RouteMapValidity, ShardKey,
     ShardLocation, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadTarget, UploadId,
 };
-use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
+use crate::{BucketFastPathIdentity, BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 use checksum::{ChecksumAlgorithm, ChecksumHasher};
 
 #[cfg(test)]
@@ -3951,6 +3951,13 @@ struct StorageNodeActiveBucketRoute<'a> {
     bucket: &'a BucketName,
 }
 
+struct StorageNodeActiveBucketScanRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    _route_permit: &'a StorageNodeRouteAdmissionPermit,
+    fence: StorageNodeRouteFence,
+    pg_id: BucketPgId,
+}
+
 struct StorageNodeBucketDeleteReplicaHeadRoute<'a> {
     handler: &'a StorageNodeConnectionHandler,
     _route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -4587,6 +4594,86 @@ impl StorageNodeActiveBucketRoute<'_> {
             last_error,
         )
         .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+}
+
+impl StorageNodeActiveBucketScanRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageNodeBucketRouteError> {
+        self.fence
+            .validate_rpc_at(
+                crate::clock::current_time_millis(),
+                crate::clock::monotonic_time_millis(),
+            )
+            .map_err(StorageNodeBucketRouteError::Route)
+    }
+
+    fn map_scan_error(error: BucketSnapshotLoadError) -> StorageNodeBucketRouteError {
+        match error {
+            BucketSnapshotLoadError::Store(
+                error @ StoreError::RouteCapabilitySubjectMismatch { .. },
+            ) => StorageNodeBucketRouteError::Route(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: error.to_string(),
+            }),
+            error => StorageNodeBucketRouteError::Bucket(error),
+        }
+    }
+
+    fn open_local_route<'a>(
+        &self,
+        client: &'a LocalStorageNodeClient,
+    ) -> Result<Box<dyn BucketMetadataScanRoute + 'a>, StorageNodeBucketRouteError> {
+        BucketMetadataNodeClient::open_bucket_metadata_scan_route(
+            client,
+            self.fence.cluster_epoch,
+            self.pg_id,
+        )
+        .map_err(Self::map_scan_error)
+    }
+
+    fn list_buckets(
+        &self,
+        owner_canonical_id: &str,
+    ) -> Result<Vec<BucketInfo>, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        let route = self.open_local_route(&local_client)?;
+        route
+            .list_buckets(owner_canonical_id)
+            .map_err(Self::map_scan_error)
+    }
+
+    fn load_bucket_execution_generations(
+        &self,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, u64>, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        let route = self.open_local_route(&local_client)?;
+        route
+            .load_bucket_execution_generations(buckets)
+            .map_err(Self::map_scan_error)
+    }
+
+    fn load_bucket_fast_path_identities(
+        &self,
+        buckets: &[BucketName],
+    ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        let route = self.open_local_route(&local_client)?;
+        route
+            .load_bucket_fast_path_identities(buckets)
+            .map_err(Self::map_scan_error)
     }
 }
 
@@ -9427,7 +9514,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::BucketList => match decode_bucket_list_request(&frame.payload) {
-                Ok(request) => self.bucket_list_response(request),
+                Ok(request) => self.bucket_list_response(route_permit, request),
                 Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                     code: StorageRpcErrorCode::PayloadDecode,
                     message: error.to_string(),
@@ -9435,7 +9522,9 @@ impl StorageNodeConnectionHandler {
             },
             StorageRpcMessageKind::BucketExecutionGenerations => {
                 match decode_bucket_batch_request(&frame.payload) {
-                    Ok(request) => self.bucket_execution_generations_response(request),
+                    Ok(request) => {
+                        self.bucket_execution_generations_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -9444,7 +9533,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketFastPathIdentities => {
                 match decode_bucket_batch_request(&frame.payload) {
-                    Ok(request) => self.bucket_fast_path_identities_response(request),
+                    Ok(request) => self.bucket_fast_path_identities_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -12954,90 +13043,93 @@ impl StorageNodeConnectionHandler {
 
     fn bucket_list_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketListRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg(request.pg_id, "bucket list") {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let bucket_pg_id = self
-            .node
-            .bucket_metadata_pg(request.pg_id)
-            .expect("validated bucket-list PG must belong to the installed topology");
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketMetadataNodeClient::list_buckets(
-            &local_client,
-            bucket_pg_id,
-            &request.owner_canonical_id,
+        let route = match self.active_bucket_scan_route(
+            route_permit,
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+            "bucket list",
         ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.list_buckets(&request.owner_canonical_id) {
             Ok(buckets) => {
                 let payload =
                     encode_bucket_list_response(&StorageRpcBucketListResponse { buckets })?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn bucket_execution_generations_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketBatchRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_bucket_batch_route(&request, "bucket execution generations")
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let bucket_pg_id = self
-            .node
-            .bucket_metadata_pg(request.pg_id)
-            .expect("validated bucket-batch PG must belong to the installed topology");
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketMetadataNodeClient::load_bucket_execution_generations(
-            &local_client,
-            bucket_pg_id,
-            &request.buckets,
+        let route = match self.active_bucket_scan_route(
+            route_permit,
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+            "bucket execution generations",
         ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.load_bucket_execution_generations(&request.buckets) {
             Ok(generations) => {
                 let payload = encode_bucket_execution_generations_response(
                     &StorageRpcBucketExecutionGenerationsResponse { generations },
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn bucket_fast_path_identities_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketBatchRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_bucket_batch_route(&request, "bucket fast-path identities")
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let bucket_pg_id = self
-            .node
-            .bucket_metadata_pg(request.pg_id)
-            .expect("validated bucket-batch PG must belong to the installed topology");
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketMetadataNodeClient::load_bucket_fast_path_identities(
-            &local_client,
-            bucket_pg_id,
-            &request.buckets,
+        let route = match self.active_bucket_scan_route(
+            route_permit,
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+            "bucket fast-path identities",
         ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.load_bucket_fast_path_identities(&request.buckets) {
             Ok(identities) => {
                 let payload = encode_bucket_fast_path_identities_response(
                     &StorageRpcBucketFastPathIdentitiesResponse { identities },
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
@@ -17208,6 +17300,50 @@ impl StorageNodeConnectionHandler {
         )
     }
 
+    fn active_bucket_scan_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        operation: &'static str,
+    ) -> Result<StorageNodeActiveBucketScanRoute<'a>, StorageRpcErrorResponse> {
+        if !Arc::ptr_eq(&route_permit.gate.inner, &self.route_admission.inner) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: format!(
+                    "{operation} route permit belongs to a different admission domain"
+                ),
+            });
+        }
+        if route_permit.class != StorageNodeRouteAdmissionClass::Active {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: format!(
+                    "{operation} requires active route admission, got {:?}",
+                    route_permit.class
+                ),
+            });
+        }
+        self.validate_pg_route(node_id, cluster_epoch, pg_id)?;
+        self.validate_primary_pg(pg_id, operation)?;
+        let fence = StorageNodeRouteFence::current(&self.config, self.current_route_map_lease());
+        fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )?;
+        let pg_id = self
+            .node
+            .bucket_metadata_pg(pg_id)
+            .expect("validated bucket scan PG must belong to the installed topology");
+        Ok(StorageNodeActiveBucketScanRoute {
+            handler: self,
+            _route_permit: route_permit,
+            fence,
+            pg_id,
+        })
+    }
+
     fn active_bucket_route_for_parts<'a>(
         &'a self,
         route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -18443,19 +18579,6 @@ impl StorageNodeConnectionHandler {
             source,
             destination,
         })
-    }
-
-    fn validate_bucket_batch_route(
-        &self,
-        request: &StorageRpcBucketBatchRequest,
-        operation: &'static str,
-    ) -> Result<(), StorageRpcErrorResponse> {
-        self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)?;
-        self.validate_primary_pg(request.pg_id, operation)?;
-        for bucket in &request.buckets {
-            self.validate_pg_for_bucket(request.pg_id, bucket, operation)?;
-        }
-        Ok(())
     }
 
     fn unsupported_operation_response(
@@ -25160,6 +25283,118 @@ mod tests {
         );
         drop(admitted);
         installer.join().unwrap();
+    }
+
+    #[test]
+    fn bucket_metadata_scan_capability_binds_admission_domain_and_deadline() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("bucket-metadata-scan-capability");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+
+        let handler = server.connection_handler();
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_bucket_scan_route(
+                    &active_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    "test bucket metadata scan",
+                )
+                .unwrap()
+        });
+        crate::clock::with_time_override(1_000, || {
+            assert_eq!(route.list_buckets(owner.as_str()).unwrap().len(), 1);
+            assert!(route
+                .load_bucket_execution_generations(std::slice::from_ref(&bucket))
+                .unwrap()
+                .contains_key(&bucket));
+            assert!(route
+                .load_bucket_fast_path_identities(std::slice::from_ref(&bucket))
+                .unwrap()
+                .contains_key(&bucket));
+        });
+
+        let foreign_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        match handler.active_bucket_scan_route(
+            &foreign_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            "test bucket metadata scan",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("different admission domain"));
+            }
+            Ok(_) => panic!("foreign admission created a bucket metadata scan route"),
+        }
+
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.active_bucket_scan_route(
+            &retained_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            "test bucket metadata scan",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires active route admission"));
+            }
+            Ok(_) => panic!("retained admission created a bucket metadata scan route"),
+        }
+
+        let mut extended = config.clone();
+        extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        crate::clock::with_time_override(1_000, || {
+            server
+                .install_control_plane_runtime_config(extended)
+                .unwrap();
+        });
+        crate::clock::with_time_override(6_000, || {
+            fn assert_expired<T>(result: Result<T, StorageNodeBucketRouteError>) {
+                match result {
+                    Err(StorageNodeBucketRouteError::Route(error)) => {
+                        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                    }
+                    Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                        panic!("expired scan reached bucket storage: {error}")
+                    }
+                    Ok(_) => panic!("expired bucket metadata scan route remained usable"),
+                }
+            }
+
+            assert_expired(route.list_buckets(owner.as_str()));
+            assert_expired(route.load_bucket_execution_generations(std::slice::from_ref(&bucket)));
+            assert_expired(route.load_bucket_fast_path_identities(std::slice::from_ref(&bucket)));
+        });
     }
 
     #[test]

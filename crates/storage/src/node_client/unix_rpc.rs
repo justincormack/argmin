@@ -36,6 +36,13 @@ struct UnixShardScavengerObjectScanRoute<'a> {
     pg_id: ObjectMetadataScanPgId,
 }
 
+struct UnixBucketMetadataScanRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: BucketPgId,
+    pg_topology: Arc<PgTopology>,
+}
+
 impl UnixStorageNodeClient {
     fn write_placed_shard(
         &self,
@@ -1703,15 +1710,15 @@ impl UnixStorageNodeClient {
             node_id,
             cluster_epoch,
             endpoint,
-            object_listing_topology: None,
+            pg_topology: None,
             next_request_id: AtomicU64::new(1),
             rpc_admission,
             rpc_auth,
         }
     }
 
-    pub(crate) fn with_object_listing_topology(mut self, pg_topology: Arc<PgTopology>) -> Self {
-        self.object_listing_topology = Some(pg_topology);
+    pub(crate) fn with_pg_topology(mut self, pg_topology: Arc<PgTopology>) -> Self {
+        self.pg_topology = Some(pg_topology);
         self
     }
 
@@ -4434,115 +4441,191 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         Ok(response.body)
     }
 
+    fn open_bucket_metadata_scan_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+    ) -> Result<Box<dyn BucketMetadataScanRoute + '_>, BucketSnapshotLoadError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        let pg_topology = self.pg_topology.as_ref().ok_or_else(|| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "open bucket metadata scan route",
+                "bucket metadata scan client has no installed PG topology".to_string(),
+            ))
+        })?;
+        Ok(Box::new(UnixBucketMetadataScanRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            pg_topology: Arc::clone(pg_topology),
+        }))
+    }
+}
+
+impl UnixBucketMetadataScanRoute<'_> {
+    fn require_bucket(
+        &self,
+        bucket: &BucketName,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if self.pg_topology.bucket_pg_for(bucket) != self.pg_id.get() {
+            return Err(BucketSnapshotLoadError::Store(
+                self.client.rpc_payload_error(
+                    operation,
+                    "bucket does not belong to the scoped bucket metadata PG".to_string(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl BucketMetadataScanRoute for UnixBucketMetadataScanRoute<'_> {
     fn list_buckets(
         &self,
-        pg_id: BucketPgId,
         owner_canonical_id: &str,
     ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError> {
         let request = StorageRpcBucketListRequest {
-            node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
-            pg_id: pg_id.pg_id(),
+            node_id: self.client.node_id,
+            cluster_epoch: self.route_cluster_epoch,
+            pg_id: self.pg_id.pg_id(),
             owner_canonical_id: owner_canonical_id.to_string(),
         };
         let payload = encode_bucket_list_request(&request).map_err(|error| {
             BucketSnapshotLoadError::Store(
-                self.rpc_payload_error("encode bucket list request", error.to_string()),
+                self.client
+                    .rpc_payload_error("encode bucket list request", error.to_string()),
             )
         })?;
         let response = self
+            .client
             .rpc_request(StorageRpcMessageKind::BucketList, payload)
             .map_err(BucketSnapshotLoadError::Store)?;
         let response = decode_bucket_list_response(&response).map_err(|error| {
             BucketSnapshotLoadError::Store(
-                self.rpc_payload_error("decode bucket list response", error.to_string()),
+                self.client
+                    .rpc_payload_error("decode bucket list response", error.to_string()),
             )
         })?;
+        let mut seen_bucket_names = BTreeSet::new();
         for bucket in &response.buckets {
-            if bucket.owner_canonical_id.as_str() != owner_canonical_id {
-                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "validate bucket list response",
-                    format!(
-                        "bucket {} owner does not match requested owner",
-                        bucket.name.as_str()
+            if !seen_bucket_names.insert(&bucket.name) {
+                return Err(BucketSnapshotLoadError::Store(
+                    self.client.rpc_payload_error(
+                        "validate bucket list response",
+                        format!(
+                            "bucket {} appears more than once in the response",
+                            bucket.name.as_str()
+                        ),
                     ),
-                )));
+                ));
             }
+            if bucket.owner_canonical_id.as_str() != owner_canonical_id {
+                return Err(BucketSnapshotLoadError::Store(
+                    self.client.rpc_payload_error(
+                        "validate bucket list response",
+                        format!(
+                            "bucket {} owner does not match requested owner",
+                            bucket.name.as_str()
+                        ),
+                    ),
+                ));
+            }
+            self.require_bucket(&bucket.name, "validate bucket list response")?;
         }
         Ok(response.buckets)
     }
 
     fn load_bucket_execution_generations(
         &self,
-        pg_id: BucketPgId,
         buckets: &[BucketName],
     ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError> {
+        for bucket in buckets {
+            self.require_bucket(bucket, "load bucket execution generations")?;
+        }
         let request = StorageRpcBucketBatchRequest {
-            node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
-            pg_id: pg_id.pg_id(),
+            node_id: self.client.node_id,
+            cluster_epoch: self.route_cluster_epoch,
+            pg_id: self.pg_id.pg_id(),
             buckets: buckets.to_vec(),
         };
         let payload = encode_bucket_batch_request(&request).map_err(|error| {
-            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+            BucketSnapshotLoadError::Store(self.client.rpc_payload_error(
                 "encode bucket execution generations request",
                 error.to_string(),
             ))
         })?;
         let response = self
+            .client
             .rpc_request(StorageRpcMessageKind::BucketExecutionGenerations, payload)
             .map_err(BucketSnapshotLoadError::Store)?;
         let response =
             decode_bucket_execution_generations_response(&response).map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                BucketSnapshotLoadError::Store(self.client.rpc_payload_error(
                     "decode bucket execution generations response",
                     error.to_string(),
                 ))
             })?;
         for bucket in response.generations.keys() {
             if !buckets.iter().any(|requested| requested == bucket) {
-                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "validate bucket execution generations response",
-                    format!("unexpected bucket {}", bucket.as_str()),
-                )));
+                return Err(BucketSnapshotLoadError::Store(
+                    self.client.rpc_payload_error(
+                        "validate bucket execution generations response",
+                        format!("unexpected bucket {}", bucket.as_str()),
+                    ),
+                ));
             }
+            self.require_bucket(bucket, "validate bucket execution generations response")?;
         }
         Ok(response.generations)
     }
 
     fn load_bucket_fast_path_identities(
         &self,
-        pg_id: BucketPgId,
         buckets: &[BucketName],
     ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, BucketSnapshotLoadError> {
+        for bucket in buckets {
+            self.require_bucket(bucket, "load bucket fast-path identities")?;
+        }
         let request = StorageRpcBucketBatchRequest {
-            node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
-            pg_id: pg_id.pg_id(),
+            node_id: self.client.node_id,
+            cluster_epoch: self.route_cluster_epoch,
+            pg_id: self.pg_id.pg_id(),
             buckets: buckets.to_vec(),
         };
         let payload = encode_bucket_batch_request(&request).map_err(|error| {
-            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+            BucketSnapshotLoadError::Store(self.client.rpc_payload_error(
                 "encode bucket fast-path identities request",
                 error.to_string(),
             ))
         })?;
         let response = self
+            .client
             .rpc_request(StorageRpcMessageKind::BucketFastPathIdentities, payload)
             .map_err(BucketSnapshotLoadError::Store)?;
         let response = decode_bucket_fast_path_identities_response(&response).map_err(|error| {
-            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+            BucketSnapshotLoadError::Store(self.client.rpc_payload_error(
                 "decode bucket fast-path identities response",
                 error.to_string(),
             ))
         })?;
         for bucket in response.identities.keys() {
             if !buckets.iter().any(|requested| requested == bucket) {
-                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "validate bucket fast-path identities response",
-                    format!("unexpected bucket {}", bucket.as_str()),
-                )));
+                return Err(BucketSnapshotLoadError::Store(
+                    self.client.rpc_payload_error(
+                        "validate bucket fast-path identities response",
+                        format!("unexpected bucket {}", bucket.as_str()),
+                    ),
+                ));
             }
+            self.require_bucket(bucket, "validate bucket fast-path identities response")?;
         }
         Ok(response.identities)
     }

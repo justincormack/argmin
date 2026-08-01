@@ -294,7 +294,7 @@ impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
                 },
             ));
         }
-        let pg_topology = self.object_listing_topology.as_ref().ok_or_else(|| {
+        let pg_topology = self.pg_topology.as_ref().ok_or_else(|| {
             BucketSnapshotLoadError::Store(self.rpc_payload_error(
                 "open object listing metadata route",
                 "object listing client has no installed PG topology".to_string(),
@@ -4648,7 +4648,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             }
             .into());
         }
-        let pg_topology = self.object_listing_topology.as_ref().ok_or_else(|| {
+        let pg_topology = self.pg_topology.as_ref().ok_or_else(|| {
             ObjectPgActionError::Store(self.rpc_payload_error(
                 "open object mutation scan metadata route",
                 "object mutation scan client has no installed PG topology".to_string(),

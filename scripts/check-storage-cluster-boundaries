@@ -626,16 +626,6 @@ migrated_bucket_snapshot_read_bypasses=$(
         } else if (pending_reservation_node && $0 ~ /^[[:space:]]*\.node[[:space:]]*$/) {
             pending_reservation_node = 2
         }
-        if ($0 ~ /\.(load_bucket_execution_generations|load_bucket_fast_path_identities|load_bucket_execution_generations_for_pg|load_bucket_fast_path_identities_for_pg)\(/) {
-            if (pending_bucket_metadata_client \
-                || $0 ~ /\.bucket_metadata_client\(\)/ \
-                || $0 ~ /bucket_metadata_client\./) {
-                pending_bucket_metadata_client = 0
-                next
-            }
-            print FILENAME ":" FNR ":" $0
-            next
-        }
         if ($0 ~ /SharedStorageNode::load_bucket_snapshot_from_pg\(/) {
             print FILENAME ":" FNR ":" $0
         }
@@ -812,16 +802,6 @@ migrated_bucket_public_read_bypasses=$(
         if ($0 ~ /\.bucket_metadata_client\(\)/ \
             || $0 ~ /bucket_metadata_client[[:space:]]*$/) {
             pending_bucket_metadata_client = 1
-        }
-        if ($0 ~ /\.list_buckets\(/) {
-            if (pending_bucket_metadata_client \
-                || $0 ~ /\.bucket_metadata_client\(\)/ \
-                || $0 ~ /bucket_metadata_client\./) {
-                pending_storage_client = 0
-                pending_bucket_metadata_client = 0
-                next
-            }
-            print FILENAME ":" FNR ":" $0
         }
         if ($0 ~ /\.(head_bucket_info|get_bucket_subresource)\(/) {
             if (pending_bucket_metadata_client \
