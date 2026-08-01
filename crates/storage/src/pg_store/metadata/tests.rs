@@ -5492,8 +5492,9 @@ fn pending_metadata_command_slot_rejects_huge_repeated_count_before_allocation()
         .conn
         .execute(
             "INSERT INTO metadata_command_pending_slot \
-             (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) \
-             VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6)",
+             (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
+              placed_segment_reference_count, scope_bucket) \
+             VALUES (0, ?1, ?2, ?3, ?4, ?5, 0, ?6)",
             params![
                 ClusterEpoch::INITIAL.get() as i64,
                 1_i64,
@@ -5586,8 +5587,9 @@ fn pending_metadata_command_slot_rejects_proofless_create_multipart_upload() {
         .conn
         .execute(
             "INSERT INTO metadata_command_pending_slot \
-             (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) \
-             VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6)",
+             (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
+              placed_segment_reference_count, scope_bucket) \
+             VALUES (0, ?1, ?2, ?3, ?4, ?5, 0, ?6)",
             params![
                 ClusterEpoch::INITIAL.get() as i64,
                 1_i64,
@@ -5688,8 +5690,9 @@ fn pending_slot_finalization_rejects_mismatched_scope_bucket() {
         .conn
         .execute(
             "INSERT INTO metadata_command_pending_slot \
-             (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) \
-             VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6)",
+             (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
+              placed_segment_reference_count, scope_bucket) \
+             VALUES (0, ?1, ?2, ?3, ?4, ?5, 0, ?6)",
             params![
                 command.id().cluster_epoch().get() as i64,
                 command.id().pg_id().get() as i64,

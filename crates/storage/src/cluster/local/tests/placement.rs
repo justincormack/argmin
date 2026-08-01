@@ -3345,7 +3345,9 @@ fn shard_scavenger_backfill_candidate_scan_bounds_pg_enumeration() {
         .enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
             &mut cursor,
             256,
+            usize::MAX,
             1,
+            None,
         )
         .unwrap();
     assert_eq!(first_scan.scanned, 0);
@@ -3357,7 +3359,9 @@ fn shard_scavenger_backfill_candidate_scan_bounds_pg_enumeration() {
         .enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
             &mut cursor,
             256,
+            usize::MAX,
             1,
+            None,
         )
         .unwrap();
     assert_eq!(second_scan.enqueued, 1);
@@ -3369,6 +3373,64 @@ fn shard_scavenger_backfill_candidate_scan_bounds_pg_enumeration() {
             desired_cluster_epoch: fixture.desired_route.cluster_epoch(),
         })
         .unwrap());
+}
+
+#[test]
+fn shard_scavenger_backfill_candidate_scan_bounds_current_epoch_reference_rows() {
+    let fixture = backfill_route_fixture(b"bounded-backfill-current-epoch-rows");
+    for (index, suffix) in ["a", "b", "c"].into_iter().enumerate() {
+        let mut request = fixture.req;
+        request.segment_okh[0] = u8::try_from(index + 1).unwrap();
+        request.segment_vid = crate::GenerationId::new(100 + index as u64).unwrap();
+        record_backfill_scavenger_object_segment_reference_on_pg(
+            &fixture.desired_cluster,
+            PgId::new(1),
+            fixture.desired_route.cluster_epoch(),
+            request,
+            crate::BucketName::try_from(format!("bounded-current-epoch-{suffix}")).unwrap(),
+            crate::ObjectKey::try_from(format!("bounded-current-epoch-{suffix}")).unwrap(),
+        );
+    }
+
+    let mut cursor = crate::cluster::PlacedSegmentShardBackfillCandidateScanCursor::default();
+    let first = fixture
+        .desired_cluster
+        .enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
+            &mut cursor,
+            usize::MAX,
+            2,
+            usize::MAX,
+            None,
+        )
+        .unwrap();
+    assert!(first.scanned <= 2);
+    assert!(first.current_epoch <= first.scanned);
+    assert!(first.limit_reached);
+    assert_eq!(cursor.active_pg_id, Some(PgId::new(1)));
+
+    let mut total_scanned = first.scanned;
+    let mut total_current_epoch = first.current_epoch;
+    for _ in 0..4 {
+        let next = fixture
+            .desired_cluster
+            .enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
+                &mut cursor,
+                usize::MAX,
+                2,
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+        assert!(next.scanned <= 2);
+        total_scanned += next.scanned;
+        total_current_epoch += next.current_epoch;
+        if !next.limit_reached {
+            break;
+        }
+    }
+    assert!(total_scanned >= 3);
+    assert!(total_current_epoch >= 3);
+    assert_eq!(cursor.active_pg_id, None);
 }
 
 #[test]
@@ -3440,6 +3502,8 @@ fn shard_scavenger_backfill_candidate_scan_cursor_advances_past_complete_candida
             &mut cursor,
             1,
             usize::MAX,
+            usize::MAX,
+            None,
         )
         .unwrap();
     assert_eq!(first_scan.already_complete, 1);
@@ -3452,6 +3516,8 @@ fn shard_scavenger_backfill_candidate_scan_cursor_advances_past_complete_candida
             &mut cursor,
             1,
             usize::MAX,
+            usize::MAX,
+            None,
         )
         .unwrap();
     assert_eq!(second_scan.enqueued, 1);

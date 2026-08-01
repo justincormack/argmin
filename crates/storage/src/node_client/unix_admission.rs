@@ -511,6 +511,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::ObjectStreamUploadsPgList
         | StorageRpcMessageKind::ShardScavengerShardRows
         | StorageRpcMessageKind::ShardScavengerPayloadReferences
+        | StorageRpcMessageKind::PlacedSegmentBackfillReferencePage
         | StorageRpcMessageKind::ShardScavengerObservations
         | StorageRpcMessageKind::PlacedSegmentShardRepairs
         | StorageRpcMessageKind::PlacedSegmentShardBackfills

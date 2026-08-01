@@ -369,6 +369,36 @@ impl UnixStorageNodeClient {
         })
     }
 
+    fn list_placed_segment_backfill_reference_page(
+        &self,
+        pg_id: ObjectMetadataScanPgId,
+        after: Option<&PlacedSegmentBackfillReferenceCursor>,
+        limit: std::num::NonZeroU16,
+    ) -> Result<PlacedSegmentBackfillReferencePage, StoreError> {
+        let request = StorageRpcPlacedSegmentBackfillReferencePageRequest {
+            route: self.bucket_pg_request(pg_id.pg_id()),
+            after: after.cloned(),
+            limit,
+        };
+        let payload =
+            encode_placed_segment_backfill_reference_page_request(&request).map_err(|error| {
+                self.rpc_payload_error(
+                    "encode placed segment backfill reference page request",
+                    error.to_string(),
+                )
+            })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::PlacedSegmentBackfillReferencePage,
+            payload,
+        )?;
+        decode_placed_segment_backfill_reference_page_response(&response).map_err(|error| {
+            self.rpc_payload_error(
+                "decode placed segment backfill reference page response",
+                error.to_string(),
+            )
+        })
+    }
+
     fn record_shard_scavenger_observation(
         &self,
         data_pg_id: DataPgId,
@@ -1539,6 +1569,19 @@ impl ShardScavengerDataRoute for UnixShardScavengerDataRoute<'_> {
 }
 
 impl ShardScavengerObjectScanRoute for UnixShardScavengerObjectScanRoute<'_> {
+    fn list_placed_segment_backfill_reference_page(
+        &self,
+        after: Option<&PlacedSegmentBackfillReferenceCursor>,
+        limit: std::num::NonZeroU16,
+    ) -> Result<PlacedSegmentBackfillReferencePage, StoreError> {
+        UnixStorageNodeClient::list_placed_segment_backfill_reference_page(
+            self.client,
+            self.pg_id,
+            after,
+            limit,
+        )
+    }
+
     fn list_shard_scavenger_payload_references(
         &self,
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {

@@ -917,6 +917,16 @@ impl ShardScavengerDataRoute for LocalShardScavengerDataRoute {
 }
 
 impl ShardScavengerObjectScanRoute for LocalShardScavengerObjectScanRoute {
+    fn list_placed_segment_backfill_reference_page(
+        &self,
+        after: Option<&PlacedSegmentBackfillReferenceCursor>,
+        limit: std::num::NonZeroU16,
+    ) -> Result<PlacedSegmentBackfillReferencePage, StoreError> {
+        self.storage_node
+            .get_pg(self.pg_id.get())?
+            .list_placed_segment_backfill_reference_page(after, limit)
+    }
+
     fn list_shard_scavenger_payload_references(
         &self,
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {

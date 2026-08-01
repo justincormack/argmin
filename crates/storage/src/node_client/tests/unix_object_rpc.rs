@@ -801,7 +801,7 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
     });
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..18)
+    let server_threads: Vec<_> = (0..20)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -1025,6 +1025,36 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
             unknown_scan_pg,
         )
         .and_then(|route| route.list_shard_scavenger_payload_references())
+        .unwrap_err(),
+        StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::UnknownPg,
+            ..
+        }
+    ));
+    assert!(
+        ShardScavengerNodeClient::open_shard_scavenger_object_scan_route(
+            &client,
+            ClusterEpoch::INITIAL,
+            installed_scan_pg,
+        )
+        .and_then(|route| route.list_placed_segment_backfill_reference_page(
+            None,
+            std::num::NonZeroU16::new(1).unwrap(),
+        ))
+        .unwrap()
+        .items
+        .is_empty()
+    );
+    assert!(matches!(
+        ShardScavengerNodeClient::open_shard_scavenger_object_scan_route(
+            &client,
+            ClusterEpoch::INITIAL,
+            unknown_scan_pg,
+        )
+        .and_then(|route| route.list_placed_segment_backfill_reference_page(
+            None,
+            std::num::NonZeroU16::new(1).unwrap(),
+        ))
         .unwrap_err(),
         StoreError::StorageRpc {
             failure: StorageRpcErrorCode::UnknownPg,

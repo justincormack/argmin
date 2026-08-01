@@ -696,7 +696,23 @@ CREATE TABLE metadata_command_pending_slot (
     log_index        INTEGER NOT NULL CHECK (log_index > 0),
     command_checksum INTEGER NOT NULL,
     command_bytes    BLOB NOT NULL,
+    placed_segment_reference_count INTEGER NOT NULL \
+        CHECK (placed_segment_reference_count BETWEEN 0 AND 4294967295),
     scope_bucket     TEXT
+) STRICT";
+
+/// Fixed-size pages of placed references extracted from the pending command.
+///
+/// Keeping each BLOB to at most one public discovery page makes SQLite reads
+/// bounded without requiring incremental-BLOB handles in the request path.
+const CREATE_METADATA_COMMAND_PENDING_PLACED_REFERENCE_PAGES_TABLE: &str = "\
+CREATE TABLE metadata_command_pending_placed_reference_pages (
+    singleton         INTEGER NOT NULL CHECK (singleton = 0),
+    page_index        INTEGER NOT NULL CHECK (page_index >= 0),
+    reference_count   INTEGER NOT NULL CHECK (reference_count BETWEEN 1 AND 64),
+    encoded_references BLOB NOT NULL CHECK (length(encoded_references) = reference_count * 54),
+    PRIMARY KEY (singleton, page_index),
+    FOREIGN KEY (singleton) REFERENCES metadata_command_pending_slot(singleton) ON DELETE CASCADE
 ) STRICT";
 
 /// Per-PG durable metadata command replay state for this replica.
@@ -925,6 +941,10 @@ fn create_current_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_PG_DURABLE_IDENTITY_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_LOG_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_PENDING_SLOT_TABLE, [])?;
+    conn.execute(
+        CREATE_METADATA_COMMAND_PENDING_PLACED_REFERENCE_PAGES_TABLE,
+        [],
+    )?;
     conn.execute(CREATE_METADATA_COMMAND_REPLICA_STATE_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_CHECKPOINTS_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_CHECKPOINTS_SELECT_INDEX, [])?;

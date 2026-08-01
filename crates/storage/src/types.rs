@@ -2960,6 +2960,54 @@ pub(crate) struct ShardScavengerPlacedShardSetReference {
     pub ec: EcShape,
 }
 
+pub(crate) const PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT: u16 = 64;
+
+/// Stable, storage-owned resume position for placed-segment backfill discovery.
+///
+/// Each variant follows the native primary-key order of one metadata table so
+/// the PG store can resume with an indexed keyset query. The cursor is opaque
+/// outside storage and is safe to discard; a later pass will rediscover any
+/// rows inserted before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PlacedSegmentBackfillReferenceCursor {
+    ObjectSegment {
+        bucket: BucketName,
+        key: ObjectKey,
+        version_id: u64,
+        segment_index: u32,
+    },
+    StreamUploadSegment {
+        session_id: SessionId,
+        segment_index: u32,
+    },
+    MultipartPartSegment {
+        bucket: BucketName,
+        key: ObjectKey,
+        upload_id: UploadId,
+        part_number: u32,
+        segment_index: u32,
+    },
+    PendingCommand {
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        log_index: u64,
+        command_checksum: u64,
+        reference_index: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlacedSegmentBackfillReferencePageItem {
+    pub cursor: PlacedSegmentBackfillReferenceCursor,
+    pub reference: ShardScavengerPlacedShardSetReference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlacedSegmentBackfillReferencePage {
+    pub items: Vec<PlacedSegmentBackfillReferencePageItem>,
+    pub complete: bool,
+}
+
 /// A payload shard set referenced only by reclaim metadata.
 ///
 /// Reclaim references prevent live shard-scavenger scans from treating cleanup

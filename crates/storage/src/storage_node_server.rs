@@ -65,6 +65,8 @@ use crate::node_runtime::pg_store::{
 };
 use crate::node_runtime::traits::DurableBucketWriteReservationAcquire;
 use crate::node_runtime::traits::ShardStore;
+#[cfg(test)]
+use crate::storage_rpc::encode_placed_segment_backfill_reference_page_request;
 use crate::storage_rpc::{
     decode_abort_multipart_cleanup_request, decode_abort_multipart_command_build_request,
     decode_authorized_abort_multipart_command_build_request, decode_bucket_batch_request,
@@ -113,7 +115,7 @@ use crate::storage_rpc::{
     decode_object_payload_reclaim_claim_record_request,
     decode_object_payload_reclaim_exists_request, decode_object_read_auth_subject_request,
     decode_object_read_snapshot_request, decode_object_request,
-    decode_object_tags_for_subject_request,
+    decode_object_tags_for_subject_request, decode_placed_segment_backfill_reference_page_request,
     decode_placed_segment_shard_backfill_claim_acquire_request,
     decode_placed_segment_shard_backfill_claim_error_request,
     decode_placed_segment_shard_backfill_claim_record_request,
@@ -177,6 +179,7 @@ use crate::storage_rpc::{
     encode_object_payload_reclaim_response, encode_object_read_auth_subject_response,
     encode_object_read_snapshot_response, encode_object_tags_for_subject_response,
     encode_object_version_response, encode_payload_reclaim_root_response,
+    encode_placed_segment_backfill_reference_page_response,
     encode_placed_segment_shard_backfill_claim_optional_record_response,
     encode_placed_segment_shard_backfill_count_response,
     encode_placed_segment_shard_backfills_response,
@@ -289,7 +292,8 @@ use crate::storage_rpc::{
     StorageRpcObjectReadSnapshotResponse, StorageRpcObjectRequest,
     StorageRpcObjectTagsForSubjectOutcome, StorageRpcObjectTagsForSubjectRequest,
     StorageRpcObjectTagsForSubjectResponse, StorageRpcObjectVersionResponse,
-    StorageRpcPayloadReclaimRootResponse, StorageRpcPlacedSegmentShardBackfillClaimAcquireRequest,
+    StorageRpcPayloadReclaimRootResponse, StorageRpcPlacedSegmentBackfillReferencePageRequest,
+    StorageRpcPlacedSegmentShardBackfillClaimAcquireRequest,
     StorageRpcPlacedSegmentShardBackfillClaimErrorRequest,
     StorageRpcPlacedSegmentShardBackfillClaimOptionalRecordResponse,
     StorageRpcPlacedSegmentShardBackfillClaimRecordRequest,
@@ -6601,6 +6605,27 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
         .and_then(|route| route.list_shard_scavenger_payload_references())
         .map_err(StorageNodeObjectScanStoreError::Store)
     }
+
+    fn list_placed_segment_backfill_reference_page(
+        &self,
+        after: Option<&crate::types::PlacedSegmentBackfillReferenceCursor>,
+        limit: std::num::NonZeroU16,
+    ) -> Result<crate::types::PlacedSegmentBackfillReferencePage, StorageNodeObjectScanStoreError>
+    {
+        self.require_valid_now()
+            .map_err(StorageNodeObjectScanStoreError::Route)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        ShardScavengerNodeClient::open_shard_scavenger_object_scan_route(
+            &local_client,
+            self.handler.config.cluster_epoch,
+            self.pg_id,
+        )
+        .and_then(|route| route.list_placed_segment_backfill_reference_page(after, limit))
+        .map_err(StorageNodeObjectScanStoreError::Store)
+    }
 }
 
 impl StorageNodeActiveDataScanRoute<'_> {
@@ -8562,6 +8587,17 @@ impl StorageNodeConnectionHandler {
                 match decode_bucket_pg_request(&frame.payload) {
                     Ok(request) => {
                         self.shard_scavenger_payload_references_response(route_permit, request)
+                    }
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::PlacedSegmentBackfillReferencePage => {
+                match decode_placed_segment_backfill_reference_page_request(&frame.payload) {
+                    Ok(request) => {
+                        self.placed_segment_backfill_reference_page_response(route_permit, request)
                     }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
@@ -13182,6 +13218,36 @@ impl StorageNodeConnectionHandler {
         match route.list_shard_scavenger_payload_references() {
             Ok(references) => Ok(encode_storage_rpc_success_response(
                 &encode_scavenger_payload_references_response(&references),
+            )),
+            Err(StorageNodeObjectScanStoreError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectScanStoreError::Store(error)) => {
+                encode_storage_rpc_error_response(&store_error_response(error))
+            }
+        }
+    }
+
+    fn placed_segment_backfill_reference_page_response(
+        &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
+        request: StorageRpcPlacedSegmentBackfillReferencePageRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let route = match self.active_primary_object_scan_route(
+            route_permit,
+            request.route.node_id,
+            request.route.cluster_epoch,
+            request.route.pg_id,
+            "placed segment backfill reference page",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route
+            .list_placed_segment_backfill_reference_page(request.after.as_ref(), request.limit)
+        {
+            Ok(page) => Ok(encode_storage_rpc_success_response(
+                &encode_placed_segment_backfill_reference_page_response(&page)?,
             )),
             Err(StorageNodeObjectScanStoreError::Route(error)) => {
                 encode_storage_rpc_error_response(&error)
@@ -30494,6 +30560,17 @@ mod tests {
                 encode_bucket_pg_request(&unknown_route).unwrap(),
             ),
             (
+                StorageRpcMessageKind::PlacedSegmentBackfillReferencePage,
+                encode_placed_segment_backfill_reference_page_request(
+                    &StorageRpcPlacedSegmentBackfillReferencePageRequest {
+                        route: unknown_route.clone(),
+                        after: None,
+                        limit: std::num::NonZeroU16::new(1).unwrap(),
+                    },
+                )
+                .unwrap(),
+            ),
+            (
                 StorageRpcMessageKind::ShardScavengerObservations,
                 encode_bucket_pg_request(&unknown_route).unwrap(),
             ),
@@ -30575,6 +30652,17 @@ mod tests {
             (
                 StorageRpcMessageKind::ShardScavengerPayloadReferences,
                 encode_bucket_pg_request(&route).unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::PlacedSegmentBackfillReferencePage,
+                encode_placed_segment_backfill_reference_page_request(
+                    &StorageRpcPlacedSegmentBackfillReferencePageRequest {
+                        route: route.clone(),
+                        after: None,
+                        limit: std::num::NonZeroU16::new(1).unwrap(),
+                    },
+                )
+                .unwrap(),
             ),
             (
                 StorageRpcMessageKind::ShardScavengerObservationRecord,

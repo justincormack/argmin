@@ -28,12 +28,19 @@ backfill discovery and routine metadata-command checkpoint maintenance:
   immediately at worker startup
 - backfill discovery and metadata-command checkpoint scans retain canonical PG
   cursors across runtime-map publication and inspect at most eight PGs per tick
+- backfill discovery reads only placed segment references through native-table
+  keyset pages; pending metadata commands atomically publish indexed,
+  fixed-width child pages of at most 64 placed references, and pending cursors
+  bind the command epoch, log index, and checksum so slot replacement restarts
+  traversal; discovery has a 64-row RPC page cap, a 256-row per-tick budget, a
+  separate 256-candidate verification budget, and a 50 ms cooperative time
+  budget; the full scavenger inventory remains an audit-only operation
 - the accelerated backfill UAT cadence applies only to bounded candidate
   discovery, rather than also accelerating full shard audits and checkpoint
   scans
 
-Full file-tree audit cursors, time/item budgets, static manifest controls, and
-the complete observability model below remain pending. The remaining issue is
+Full file-tree audit cursors and budgets, static manifest controls, and the
+complete observability model below remain pending. The remaining issue is
 resource competition, not S3-visible correctness.
 
 ## Goals
@@ -208,8 +215,9 @@ Keep the scope narrow:
 Teach the shard scavenger to scan incrementally using an in-memory cursor and
 time/item budgets.
 
-Status: in progress. PG-level incremental cursors are implemented for backfill
-candidate discovery and routine metadata-command checkpoint maintenance. The
+Status: in progress. Backfill candidate discovery now has PG and native
+metadata-row cursors plus row, candidate, RPC-page, and cooperative time
+budgets. Routine metadata-command checkpoint maintenance has a PG cursor. The
 full file-tree audit still needs the node/prefix/file cursor and budgets
 described above.
 

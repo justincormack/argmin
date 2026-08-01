@@ -43,20 +43,23 @@ use crate::{
         ObjectPayloadReclaimKind, ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity,
         ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention, ObjectSegmentRecord,
         ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
-        PayloadReclaimRoot, PgId, PlacedSegmentShardBackfillClaimRecord,
-        PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
-        PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
-        PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
-        PublicAccessBlockConfig, SegmentStoredBytesRequest, SerializedBucketTagSet,
-        SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId,
-        ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
-        ShardScavengerObservationReason, ShardScavengerObservationRecord,
-        ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference,
-        ShardScavengerReclaimShardSetReference, StorageClass, StoredLegalHoldStatus, StoredObject,
-        StreamPutCommitInput, StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
+        PayloadReclaimRoot, PgId, PlacedSegmentBackfillReferenceCursor,
+        PlacedSegmentBackfillReferencePage, PlacedSegmentBackfillReferencePageItem,
+        PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
+        PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimRecord,
+        PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
+        PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig, SegmentStoredBytesRequest,
+        SerializedBucketTagSet, SerializedMetadataBlob, SerializedSystemMetadataBlob,
+        SerializedTagSet, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
+        ShardScavengerObservationKey, ShardScavengerObservationReason,
+        ShardScavengerObservationRecord, ShardScavengerPayloadReference,
+        ShardScavengerPlacedShardSetReference, ShardScavengerReclaimShardSetReference,
+        StorageClass, StoredLegalHoldStatus, StoredObject, StreamPutCommitInput,
+        StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
         StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
         StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
         VersionId, WriteAck, BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN,
+        PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT,
         PLACED_SEGMENT_SHARD_BACKFILL_CLAIM_ID_MAX_LEN,
         PLACED_SEGMENT_SHARD_BACKFILL_LAST_ERROR_MAX_LEN, PLACED_SEGMENT_SHARD_BACKFILL_LIST_LIMIT,
         PLACED_SEGMENT_SHARD_BACKFILL_OWNER_TOKEN_MAX_LEN,
@@ -73,7 +76,7 @@ use s3_types::{
 };
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
 pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 11;
@@ -103,6 +106,7 @@ const STORAGE_RPC_MAX_SHARD_ACK_BATCH_PAYLOAD_LEN: usize = STORAGE_RPC_SHARD_ACK
 const STORAGE_RPC_MAX_SCAVENGER_SCAN_ERRORS: usize = 4096;
 const STORAGE_RPC_MAX_SCAVENGER_SCAN_ERROR_LEN: usize = 4096;
 const STORAGE_RPC_MAX_SCAVENGER_LIST_FILES_PAYLOAD_LEN: usize = STORAGE_RPC_SHARD_ACK_ROUTE_LEN;
+const STORAGE_RPC_MAX_PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_REQUEST_PAYLOAD_LEN: usize = 4096;
 const STORAGE_RPC_SCAVENGER_FILE_RESPONSE_LEN: usize = STORAGE_RPC_SHARD_KEY_FIELD_LEN + 8;
 const STORAGE_RPC_MAX_SCAVENGER_METADATA_ITEMS: usize = 100_000;
 const STORAGE_RPC_SCAVENGER_OBSERVATION_KEY_LEN: usize =
@@ -675,6 +679,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandRecoveryApplyAndRecord = 162,
     MetadataCommandRecoveryPendingSlotReplace = 163,
     MetadataCommandRecoveryRecordAbandoned = 168,
+    PlacedSegmentBackfillReferencePage = 169,
     MetadataCommandRetainedAbortApply = 165,
     MetadataCommandRetainedAbortFinish = 166,
     BucketDeleteReplicaHead = 167,
@@ -957,6 +962,7 @@ impl StorageRpcMessageKind {
             Self::ShardScavengerListFiles => "shard scavenger list files",
             Self::ShardScavengerShardRows => "shard scavenger shard rows",
             Self::ShardScavengerPayloadReferences => "shard scavenger payload references",
+            Self::PlacedSegmentBackfillReferencePage => "placed segment backfill reference page",
             Self::ShardScavengerObservationRecord => "shard scavenger observation record",
             Self::ShardScavengerObservations => "shard scavenger observations",
             Self::ShardScavengerObservationResolve => "shard scavenger observation resolve",
@@ -1208,6 +1214,7 @@ impl StorageRpcMessageKind {
             162 => Ok(Self::MetadataCommandRecoveryApplyAndRecord),
             163 => Ok(Self::MetadataCommandRecoveryPendingSlotReplace),
             168 => Ok(Self::MetadataCommandRecoveryRecordAbandoned),
+            169 => Ok(Self::PlacedSegmentBackfillReferencePage),
             165 => Ok(Self::MetadataCommandRetainedAbortApply),
             166 => Ok(Self::MetadataCommandRetainedAbortFinish),
             167 => Ok(Self::BucketDeleteReplicaHead),
@@ -1477,6 +1484,13 @@ pub(crate) struct StorageRpcBucketPgRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcPlacedSegmentBackfillReferencePageRequest {
+    pub(crate) route: StorageRpcBucketPgRequest,
+    pub(crate) after: Option<PlacedSegmentBackfillReferenceCursor>,
+    pub(crate) limit: NonZeroU16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3714,6 +3728,9 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::ShardScavengerPayloadReferences
         | StorageRpcMessageKind::ShardScavengerObservations => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::PlacedSegmentBackfillReferencePage => {
+            STORAGE_RPC_MAX_PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ShardScavengerObservationRecord => {
             STORAGE_RPC_MAX_SCAVENGER_OBSERVATION_RECORD_PAYLOAD_LEN
@@ -10679,6 +10696,105 @@ pub(crate) fn decode_scavenger_payload_references_response(
     Ok(references)
 }
 
+pub(crate) fn encode_placed_segment_backfill_reference_page_request(
+    request: &StorageRpcPlacedSegmentBackfillReferencePageRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.limit.get() > PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: usize::from(request.limit.get()),
+            limit: usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT),
+        });
+    }
+    let mut out = encode_bucket_pg_request(&request.route)?;
+    match &request.after {
+        None => put_u8(&mut out, 0),
+        Some(cursor) => {
+            put_u8(&mut out, 1);
+            put_placed_segment_backfill_reference_cursor(&mut out, cursor);
+        }
+    }
+    put_u16(&mut out, request.limit.get());
+    Ok(out)
+}
+
+pub(crate) fn decode_placed_segment_backfill_reference_page_request(
+    bytes: &[u8],
+) -> Result<StorageRpcPlacedSegmentBackfillReferencePageRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let after = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(decoder.read_placed_segment_backfill_reference_cursor()?),
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid backfill reference cursor option tag",
+            ));
+        }
+    };
+    let limit = NonZeroU16::new(decoder.read_u16()?).ok_or(
+        StorageRpcPayloadError::InvalidObjectMetadataRequest(
+            "backfill reference page limit must not be zero",
+        ),
+    )?;
+    decoder.finish()?;
+    if limit.get() > PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: usize::from(limit.get()),
+            limit: usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT),
+        });
+    }
+    Ok(StorageRpcPlacedSegmentBackfillReferencePageRequest {
+        route,
+        after,
+        limit,
+    })
+}
+
+pub(crate) fn encode_placed_segment_backfill_reference_page_response(
+    page: &PlacedSegmentBackfillReferencePage,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if page.items.len() > usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT) {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: page.items.len(),
+            limit: usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT),
+        });
+    }
+    let mut out = Vec::new();
+    put_bool(&mut out, page.complete);
+    put_u16(
+        &mut out,
+        u16::try_from(page.items.len()).expect("bounded backfill reference page fits in u16"),
+    );
+    for item in &page.items {
+        put_placed_segment_backfill_reference_cursor(&mut out, &item.cursor);
+        put_placed_scavenger_reference(&mut out, &item.reference);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_placed_segment_backfill_reference_page_response(
+    bytes: &[u8],
+) -> Result<PlacedSegmentBackfillReferencePage, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let complete = decoder.read_bool()?;
+    let count = usize::from(decoder.read_u16()?);
+    if count > usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT) {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: count,
+            limit: usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT),
+        });
+    }
+    let mut items = Vec::with_capacity(count);
+    for _ in 0..count {
+        items.push(PlacedSegmentBackfillReferencePageItem {
+            cursor: decoder.read_placed_segment_backfill_reference_cursor()?,
+            reference: decoder.read_placed_scavenger_reference()?,
+        });
+    }
+    decoder.finish()?;
+    Ok(PlacedSegmentBackfillReferencePage { items, complete })
+}
+
 pub(crate) fn encode_scavenger_observation_record_request(
     request: &StorageRpcScavengerObservationRecordRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
@@ -15782,6 +15898,54 @@ impl<'a> StorageRpcDecoder<'a> {
         }
     }
 
+    fn read_placed_scavenger_reference(
+        &mut self,
+    ) -> Result<ShardScavengerPlacedShardSetReference, StorageRpcPayloadError> {
+        Ok(ShardScavengerPlacedShardSetReference {
+            data_pg_id: self.read_u32()?,
+            okh: self.read_16_bytes()?,
+            generation_id: self.read_generation_id()?,
+            placement_cluster_epoch: self.read_cluster_epoch()?,
+            stored_size: self.read_u64()?,
+            crc64: self.read_u64()?,
+            ec: self.read_ec_shape()?,
+        })
+    }
+
+    fn read_placed_segment_backfill_reference_cursor(
+        &mut self,
+    ) -> Result<PlacedSegmentBackfillReferenceCursor, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(PlacedSegmentBackfillReferenceCursor::ObjectSegment {
+                bucket: self.read_bucket_name()?,
+                key: self.read_object_key()?,
+                version_id: self.read_u64()?,
+                segment_index: self.read_u32()?,
+            }),
+            1 => Ok(PlacedSegmentBackfillReferenceCursor::StreamUploadSegment {
+                session_id: self.read_session_id()?,
+                segment_index: self.read_u32()?,
+            }),
+            2 => Ok(PlacedSegmentBackfillReferenceCursor::MultipartPartSegment {
+                bucket: self.read_bucket_name()?,
+                key: self.read_object_key()?,
+                upload_id: self.read_upload_id()?,
+                part_number: self.read_u32()?,
+                segment_index: self.read_u32()?,
+            }),
+            3 => Ok(PlacedSegmentBackfillReferenceCursor::PendingCommand {
+                cluster_epoch: self.read_cluster_epoch()?,
+                pg_id: PgId::new(self.read_u32()?),
+                log_index: self.read_u64()?,
+                command_checksum: self.read_u64()?,
+                reference_index: self.read_u32()?,
+            }),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid backfill reference cursor tag",
+            )),
+        }
+    }
+
     fn read_object_etag(&mut self) -> Result<ObjectEtag, StorageRpcPayloadError> {
         match self.read_u8()? {
             0 => {
@@ -17547,6 +17711,75 @@ fn put_scavenger_payload_reference(out: &mut Vec<u8>, reference: &ShardScavenger
             out.extend_from_slice(&reference.okh);
             put_u64(out, reference.generation_id.get());
             put_ec_shape(out, reference.ec);
+        }
+    }
+}
+
+fn put_placed_scavenger_reference(
+    out: &mut Vec<u8>,
+    reference: &ShardScavengerPlacedShardSetReference,
+) {
+    put_u32(out, reference.data_pg_id);
+    out.extend_from_slice(&reference.okh);
+    put_u64(out, reference.generation_id.get());
+    put_u64(out, reference.placement_cluster_epoch.get());
+    put_u64(out, reference.stored_size);
+    put_u64(out, reference.crc64);
+    put_ec_shape(out, reference.ec);
+}
+
+fn put_placed_segment_backfill_reference_cursor(
+    out: &mut Vec<u8>,
+    cursor: &PlacedSegmentBackfillReferenceCursor,
+) {
+    match cursor {
+        PlacedSegmentBackfillReferenceCursor::ObjectSegment {
+            bucket,
+            key,
+            version_id,
+            segment_index,
+        } => {
+            put_u8(out, 0);
+            put_string(out, bucket.as_str());
+            put_string(out, key.as_str());
+            put_u64(out, *version_id);
+            put_u32(out, *segment_index);
+        }
+        PlacedSegmentBackfillReferenceCursor::StreamUploadSegment {
+            session_id,
+            segment_index,
+        } => {
+            put_u8(out, 1);
+            put_string(out, session_id.as_str());
+            put_u32(out, *segment_index);
+        }
+        PlacedSegmentBackfillReferenceCursor::MultipartPartSegment {
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            segment_index,
+        } => {
+            put_u8(out, 2);
+            put_string(out, bucket.as_str());
+            put_string(out, key.as_str());
+            put_string(out, upload_id.as_str());
+            put_u32(out, *part_number);
+            put_u32(out, *segment_index);
+        }
+        PlacedSegmentBackfillReferenceCursor::PendingCommand {
+            cluster_epoch,
+            pg_id,
+            log_index,
+            command_checksum,
+            reference_index,
+        } => {
+            put_u8(out, 3);
+            put_u64(out, cluster_epoch.get());
+            put_u32(out, pg_id.get());
+            put_u64(out, *log_index);
+            put_u64(out, *command_checksum);
+            put_u32(out, *reference_index);
         }
     }
 }
@@ -19926,6 +20159,84 @@ mod tests {
             references
         );
 
+        let page_cursor = PlacedSegmentBackfillReferenceCursor::ObjectSegment {
+            bucket: crate::tests::bucket_name("page-bucket"),
+            key: crate::tests::object_key("page-key"),
+            version_id: 7,
+            segment_index: 2,
+        };
+        let page_request = StorageRpcPlacedSegmentBackfillReferencePageRequest {
+            route: route.clone(),
+            after: Some(page_cursor.clone()),
+            limit: NonZeroU16::new(32).unwrap(),
+        };
+        assert_eq!(
+            decode_placed_segment_backfill_reference_page_request(
+                &encode_placed_segment_backfill_reference_page_request(&page_request).unwrap()
+            )
+            .unwrap(),
+            page_request
+        );
+        for cursor in [
+            PlacedSegmentBackfillReferenceCursor::StreamUploadSegment {
+                session_id: crate::tests::stream_session_id("page-session"),
+                segment_index: 3,
+            },
+            PlacedSegmentBackfillReferenceCursor::MultipartPartSegment {
+                bucket: crate::tests::bucket_name("page-bucket"),
+                key: crate::tests::object_key("page-key"),
+                upload_id: crate::tests::multipart_upload_id("page-upload"),
+                part_number: 4,
+                segment_index: 5,
+            },
+            PlacedSegmentBackfillReferenceCursor::PendingCommand {
+                cluster_epoch: ClusterEpoch::new(7).unwrap(),
+                pg_id: PgId::new(3),
+                log_index: 8,
+                command_checksum: 9,
+                reference_index: 6,
+            },
+        ] {
+            let request = StorageRpcPlacedSegmentBackfillReferencePageRequest {
+                route: route.clone(),
+                after: Some(cursor),
+                limit: NonZeroU16::new(32).unwrap(),
+            };
+            assert_eq!(
+                decode_placed_segment_backfill_reference_page_request(
+                    &encode_placed_segment_backfill_reference_page_request(&request).unwrap()
+                )
+                .unwrap(),
+                request
+            );
+        }
+        let page = PlacedSegmentBackfillReferencePage {
+            items: vec![PlacedSegmentBackfillReferencePageItem {
+                cursor: page_cursor,
+                reference: match &references[0] {
+                    ShardScavengerPayloadReference::Placed(reference) => reference.clone(),
+                    ShardScavengerPayloadReference::ReclaimOnly(_) => unreachable!(),
+                },
+            }],
+            complete: false,
+        };
+        assert_eq!(
+            decode_placed_segment_backfill_reference_page_response(
+                &encode_placed_segment_backfill_reference_page_response(&page).unwrap()
+            )
+            .unwrap(),
+            page
+        );
+        let oversized_request = StorageRpcPlacedSegmentBackfillReferencePageRequest {
+            route: route.clone(),
+            after: None,
+            limit: NonZeroU16::new(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT + 1).unwrap(),
+        };
+        assert!(matches!(
+            encode_placed_segment_backfill_reference_page_request(&oversized_request),
+            Err(StorageRpcPayloadError::PayloadTooLarge { .. })
+        ));
+
         let observation_key = ShardScavengerObservationKey {
             node_id: 7,
             data_pg_id: 3,
@@ -20344,6 +20655,11 @@ mod tests {
                 StorageRpcMessageKind::ShardScavengerPayloadReferences,
                 STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::PlacedSegmentBackfillReferencePage,
+                STORAGE_RPC_MAX_PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_REQUEST_PAYLOAD_LEN,
             ),
             (
                 StorageRpcMessageKind::ShardScavengerObservations,

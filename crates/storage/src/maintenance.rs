@@ -573,6 +573,8 @@ impl StorageBackfillCandidateScanner {
                 &mut cursor,
                 scan_limit,
                 usize::MAX,
+                usize::MAX,
+                None,
             )
     }
 }

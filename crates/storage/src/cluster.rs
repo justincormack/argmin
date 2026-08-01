@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU16, NonZeroU64};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::thread;
@@ -93,19 +93,20 @@ use crate::types::{
     MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEncryption, ObjectKey,
     ObjectLayout, ObjectPayloadSegment, ObjectReadSnapshot, ObjectReadSnapshotMode,
     ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord, OwnerIdentity, PgId, PgState,
-    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
-    PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillWorkItem,
-    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,
-    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
-    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
-    PreparedDirectPutObjectCommit, PreparedStreamPartCommit, PreparedStreamPutCommit,
-    PublicAccessBlockConfig, RouteMapValidity, SegmentStoredBytesRequest, SerializedBucketTagSet,
-    SerializedTagSet, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
-    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
-    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus,
-    StoredObject, StreamPutFinalizeSnapshot, StreamUploadCommandRecord, StreamUploadPartSnapshot,
+    PlacedSegmentBackfillReferenceCursor, PlacedSegmentShardBackfillClaimAcquire,
+    PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
+    PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
+    PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,
+    PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
+    PrepareStreamUploadSegmentAppendReq, PreparedDirectPutObjectCommit, PreparedStreamPartCommit,
+    PreparedStreamPutCommit, PublicAccessBlockConfig, RouteMapValidity, SegmentStoredBytesRequest,
+    SerializedBucketTagSet, SerializedTagSet, SessionId, ShardIndex, ShardKey,
+    ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
+    ShardScavengerObservationRecord, ShardScavengerPayloadReference,
+    ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus, StoredObject,
+    StreamPutFinalizeSnapshot, StreamUploadCommandRecord, StreamUploadPartSnapshot,
     StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
-    VersionId, WriteAck, WrittenShardAck,
+    VersionId, WriteAck, WrittenShardAck, PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT,
 };
 #[cfg(test)]
 use crate::types::{
@@ -160,7 +161,9 @@ const STREAM_SEGMENT_APPEND_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const METADATA_CONTENTION_BACKOFF_INITIAL: Duration = Duration::from_millis(1);
 const METADATA_CONTENTION_BACKOFF_MAX: Duration = Duration::from_millis(25);
 const PLACED_SEGMENT_SHARD_BACKFILL_CANDIDATE_SCAN_LIMIT: usize = 256;
+const PLACED_SEGMENT_SHARD_BACKFILL_REFERENCE_SCAN_LIMIT: usize = 256;
 const PLACED_SEGMENT_SHARD_BACKFILL_PG_SCAN_LIMIT: usize = 8;
+const PLACED_SEGMENT_SHARD_BACKFILL_SCAN_TIME_BUDGET: Duration = Duration::from_millis(50);
 pub(crate) const METADATA_COMMAND_CHECKPOINT_RECORD_LIMIT: usize = 4;
 const METADATA_COMMAND_CHECKPOINT_MIN_LOG_DISTANCE: u64 = 64;
 const METADATA_COMMAND_CHECKPOINT_FRAME_RISK_BYTES: usize = STORAGE_RPC_MAX_PAYLOAD_LEN * 3 / 4;
@@ -1285,7 +1288,7 @@ pub(crate) struct PlacedSegmentShardBackfillCandidateEnqueueSummary {
     pub limit_reached: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PlacedSegmentShardBackfillCandidateKey {
     source_cluster_epoch: ClusterEpoch,
     data_pg_id: u32,
@@ -1317,7 +1320,7 @@ impl PlacedSegmentShardBackfillCandidateKey {
 pub(crate) struct PlacedSegmentShardBackfillCandidateScanCursor {
     after_pg_id: Option<PgId>,
     active_pg_id: Option<PgId>,
-    after: Option<PlacedSegmentShardBackfillCandidateKey>,
+    reference_after: Option<PlacedSegmentBackfillReferenceCursor>,
 }
 
 impl PlacedSegmentShardBackfillPlan {
@@ -16364,7 +16367,9 @@ impl StorageCluster {
         self.enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
             cursor,
             PLACED_SEGMENT_SHARD_BACKFILL_CANDIDATE_SCAN_LIMIT,
+            PLACED_SEGMENT_SHARD_BACKFILL_REFERENCE_SCAN_LIMIT,
             PLACED_SEGMENT_SHARD_BACKFILL_PG_SCAN_LIMIT,
+            Some(PLACED_SEGMENT_SHARD_BACKFILL_SCAN_TIME_BUDGET),
         )
     }
 
@@ -16377,7 +16382,9 @@ impl StorageCluster {
         self.enqueue_placed_segment_shard_backfills_from_scavenger_references_with_cursor_and_limit(
             &mut cursor,
             scan_limit,
+            PLACED_SEGMENT_SHARD_BACKFILL_REFERENCE_SCAN_LIMIT,
             usize::MAX,
+            None,
         )
     }
 
@@ -16385,14 +16392,17 @@ impl StorageCluster {
         &self,
         cursor: &mut PlacedSegmentShardBackfillCandidateScanCursor,
         scan_limit: usize,
+        reference_scan_limit: usize,
         pg_scan_limit: usize,
+        time_budget: Option<Duration>,
     ) -> Result<PlacedSegmentShardBackfillCandidateEnqueueSummary, StoreError> {
         let mut summary = PlacedSegmentShardBackfillCandidateEnqueueSummary::default();
-        if scan_limit == 0 || pg_scan_limit == 0 {
+        if scan_limit == 0 || reference_scan_limit == 0 || pg_scan_limit == 0 {
             return Ok(summary);
         }
 
         let desired_epoch = self.operation_epoch();
+        let deadline = time_budget.and_then(|budget| Instant::now().checked_add(budget));
         let mut routes: Vec<_> = self.local_pg_routes().collect();
         routes.sort_by_key(|route| route.pg_id());
         if routes.is_empty() {
@@ -16407,7 +16417,7 @@ impl StorageCluster {
                     .position(|route| route.pg_id() == active_pg_id)
             })
             .unwrap_or_else(|| {
-                cursor.after = None;
+                cursor.reference_after = None;
                 cursor.active_pg_id = None;
                 cursor.after_pg_id.map_or(0, |after_pg_id| {
                     let next = routes.partition_point(|route| route.pg_id() <= after_pg_id);
@@ -16419,15 +16429,18 @@ impl StorageCluster {
                 })
             });
         let routes_to_scan = routes.len().min(pg_scan_limit);
-        let batch_start_pg_id = routes[start].pg_id();
         let mut verified_candidates = 0usize;
-        let mut candidates = BTreeMap::new();
+        let mut scanned_references = 0usize;
+        let mut seen_candidates = HashSet::new();
         let mut last_scanned_pg_id = None;
 
         for offset in 0..routes_to_scan {
             let route = routes[(start + offset) % routes.len()];
             last_scanned_pg_id = Some(route.pg_id());
             if route.state() != PgState::Active {
+                cursor.active_pg_id = None;
+                cursor.reference_after = None;
+                cursor.after_pg_id = Some(route.pg_id());
                 continue;
             }
             let node = match self
@@ -16437,148 +16450,234 @@ impl StorageCluster {
                 Ok(node) => node,
                 Err(error) if shard_backfill_candidate_error_is_deferred(&error) => {
                     summary.deferred += 1;
+                    cursor.active_pg_id = None;
+                    cursor.reference_after = None;
+                    cursor.after_pg_id = Some(route.pg_id());
                     continue;
                 }
                 Err(error) => return Err(error),
             };
-            let references = match node
+            let scan_route = match node
                 .shard_scavenger_client()
                 .open_shard_scavenger_object_scan_route(
                     self.operation_epoch(),
                     self.object_metadata_scan_pg(route.pg_id()),
-                )
-                .and_then(|route| route.list_shard_scavenger_payload_references())
-            {
-                Ok(references) => references,
+                ) {
+                Ok(route) => route,
                 Err(error) if shard_backfill_candidate_error_is_deferred(&error) => {
                     summary.deferred += 1;
+                    cursor.active_pg_id = None;
+                    cursor.reference_after = None;
+                    cursor.after_pg_id = Some(route.pg_id());
                     continue;
                 }
                 Err(error) => return Err(error),
             };
-            for reference in references {
-                let Some((request, source_epoch)) =
-                    self.backfill_candidate_from_scavenger_reference(reference)
-                else {
-                    continue;
-                };
-                candidates
-                    .entry(PlacedSegmentShardBackfillCandidateKey::new(
-                        request,
-                        source_epoch,
-                    ))
-                    .or_insert((request, source_epoch));
-            }
-        }
 
-        let candidates: Vec<_> = candidates.into_iter().collect();
-        let candidate_start = if cursor.active_pg_id == Some(batch_start_pg_id) {
-            cursor.after.as_ref().map_or(0, |after| {
-                candidates.partition_point(|(candidate, _)| candidate <= after)
-            })
-        } else {
-            0
-        };
-        for (candidate_key, (request, source_epoch)) in candidates.into_iter().skip(candidate_start)
-        {
-            summary.scanned += 1;
-            if source_epoch == desired_epoch {
-                cursor.active_pg_id = Some(batch_start_pg_id);
-                cursor.after = Some(candidate_key);
-                summary.current_epoch += 1;
-                continue;
-            }
-            let work_item = PlacedSegmentShardBackfillWorkItem {
-                request,
-                source_cluster_epoch: source_epoch,
-                desired_cluster_epoch: desired_epoch,
+            let mut reference_after = if cursor.active_pg_id == Some(route.pg_id()) {
+                cursor.reference_after.clone()
+            } else {
+                None
             };
-            match self.placed_segment_shard_backfill_exists(&work_item) {
-                Ok(true) => {
-                    cursor.active_pg_id = Some(batch_start_pg_id);
-                    cursor.after = Some(candidate_key);
-                    summary.already_queued += 1;
-                    continue;
+            loop {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    cursor.active_pg_id = Some(route.pg_id());
+                    cursor.reference_after = reference_after;
+                    summary.limit_reached = true;
+                    return Ok(summary);
                 }
-                Ok(false) => {}
-                Err(error) => {
-                    note_shard_backfill_candidate_error(&mut summary, &error);
-                    continue;
+                let remaining = reference_scan_limit - scanned_references;
+                if remaining == 0 {
+                    cursor.active_pg_id = Some(route.pg_id());
+                    cursor.reference_after = reference_after;
+                    summary.limit_reached = true;
+                    return Ok(summary);
                 }
-            }
-            if verified_candidates >= scan_limit {
-                cursor.active_pg_id = Some(batch_start_pg_id);
-                summary.limit_reached = true;
-                return Ok(summary);
-            }
-            verified_candidates += 1;
-            cursor.active_pg_id = Some(batch_start_pg_id);
-            cursor.after = Some(candidate_key);
-            let pg_id = PgId::new(request.data_pg_id);
-            let source_route = match self.reconstructed_pg_route_at_epoch(pg_id, source_epoch) {
-                Ok(route) => route,
-                Err(error) => {
-                    note_shard_backfill_candidate_error(&mut summary, &error);
-                    continue;
-                }
-            };
-            let desired_route = match self.reconstructed_pg_route_at_epoch(pg_id, desired_epoch) {
-                Ok(route) => route,
-                Err(error) => {
-                    note_shard_backfill_candidate_error(&mut summary, &error);
-                    continue;
-                }
-            };
-            match self.placed_segment_payload_shard_locations_are_equal(
-                &source_route,
-                &desired_route,
-                request,
-            ) {
-                Ok(true) => {
-                    summary.already_complete += 1;
-                    continue;
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    note_shard_backfill_candidate_error(&mut summary, &error);
-                    continue;
-                }
-            }
-            let plan = match self.placed_segment_payload_shard_backfill_plan(
-                &source_route,
-                &desired_route,
-                request,
-            ) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    note_shard_backfill_candidate_error(&mut summary, &error);
-                    continue;
-                }
-            };
-            if !plan.unrecoverable_targets.is_empty() {
-                summary.unrecoverable += 1;
-                continue;
-            }
-            if plan.is_complete() {
-                summary.already_complete += 1;
-                continue;
-            }
-            if self
-                .record_placed_segment_shard_backfill_with_remaining_tolerance(
-                    &work_item,
-                    plan.source_remaining_tolerance(),
-                    None,
+                let page_limit =
+                    remaining.min(usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT));
+                let page_limit = NonZeroU16::new(
+                    u16::try_from(page_limit).expect("bounded backfill page limit fits in u16"),
                 )
-                .map_err(|error| note_shard_backfill_candidate_error(&mut summary, &error))
-                .is_err()
-            {
-                continue;
+                .expect("backfill page limit is nonzero");
+                let page = match scan_route.list_placed_segment_backfill_reference_page(
+                    reference_after.as_ref(),
+                    page_limit,
+                ) {
+                    Ok(page) => page,
+                    Err(error) if shard_backfill_candidate_error_is_deferred(&error) => {
+                        summary.deferred += 1;
+                        cursor.active_pg_id = None;
+                        cursor.reference_after = None;
+                        cursor.after_pg_id = Some(route.pg_id());
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+
+                for item in page.items {
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        cursor.active_pg_id = Some(route.pg_id());
+                        cursor.reference_after = reference_after;
+                        summary.limit_reached = true;
+                        return Ok(summary);
+                    }
+                    scanned_references += 1;
+                    let source_epoch = item.reference.placement_cluster_epoch;
+                    let stored_size = match usize::try_from(item.reference.stored_size) {
+                        Ok(stored_size) => stored_size,
+                        Err(error) => {
+                            note_shard_backfill_candidate_error(
+                                &mut summary,
+                                &StoreError::PayloadShardSetMismatch {
+                                    reason: format!(
+                                        "placed segment stored size exceeds local range: {error}"
+                                    ),
+                                },
+                            );
+                            reference_after = Some(item.cursor.clone());
+                            cursor.active_pg_id = Some(route.pg_id());
+                            cursor.reference_after = Some(item.cursor);
+                            continue;
+                        }
+                    };
+                    let request = SegmentStoredBytesRequest {
+                        data_pg_id: item.reference.data_pg_id,
+                        segment_okh: item.reference.okh,
+                        segment_vid: item.reference.generation_id,
+                        stored_size,
+                        segment_crc64: item.reference.crc64,
+                        ec: item.reference.ec,
+                    };
+                    let candidate_key =
+                        PlacedSegmentShardBackfillCandidateKey::new(request, source_epoch);
+                    if !seen_candidates.insert(candidate_key) {
+                        reference_after = Some(item.cursor.clone());
+                        cursor.active_pg_id = Some(route.pg_id());
+                        cursor.reference_after = Some(item.cursor);
+                        continue;
+                    }
+                    summary.scanned += 1;
+                    if source_epoch == desired_epoch {
+                        summary.current_epoch += 1;
+                        reference_after = Some(item.cursor.clone());
+                        cursor.active_pg_id = Some(route.pg_id());
+                        cursor.reference_after = Some(item.cursor);
+                        continue;
+                    }
+                    let work_item = PlacedSegmentShardBackfillWorkItem {
+                        request,
+                        source_cluster_epoch: source_epoch,
+                        desired_cluster_epoch: desired_epoch,
+                    };
+                    match self.placed_segment_shard_backfill_exists(&work_item) {
+                        Ok(true) => {
+                            summary.already_queued += 1;
+                            reference_after = Some(item.cursor.clone());
+                            cursor.active_pg_id = Some(route.pg_id());
+                            cursor.reference_after = Some(item.cursor);
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            note_shard_backfill_candidate_error(&mut summary, &error);
+                            reference_after = Some(item.cursor.clone());
+                            cursor.active_pg_id = Some(route.pg_id());
+                            cursor.reference_after = Some(item.cursor);
+                            continue;
+                        }
+                    }
+                    if verified_candidates >= scan_limit {
+                        cursor.active_pg_id = Some(route.pg_id());
+                        cursor.reference_after = reference_after;
+                        summary.limit_reached = true;
+                        return Ok(summary);
+                    }
+                    verified_candidates += 1;
+                    reference_after = Some(item.cursor.clone());
+                    cursor.active_pg_id = Some(route.pg_id());
+                    cursor.reference_after = Some(item.cursor);
+                    let pg_id = PgId::new(request.data_pg_id);
+                    let source_route =
+                        match self.reconstructed_pg_route_at_epoch(pg_id, source_epoch) {
+                            Ok(route) => route,
+                            Err(error) => {
+                                note_shard_backfill_candidate_error(&mut summary, &error);
+                                continue;
+                            }
+                        };
+                    let desired_route =
+                        match self.reconstructed_pg_route_at_epoch(pg_id, desired_epoch) {
+                            Ok(route) => route,
+                            Err(error) => {
+                                note_shard_backfill_candidate_error(&mut summary, &error);
+                                continue;
+                            }
+                        };
+                    match self.placed_segment_payload_shard_locations_are_equal(
+                        &source_route,
+                        &desired_route,
+                        request,
+                    ) {
+                        Ok(true) => {
+                            summary.already_complete += 1;
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            note_shard_backfill_candidate_error(&mut summary, &error);
+                            continue;
+                        }
+                    }
+                    let plan = match self.placed_segment_payload_shard_backfill_plan(
+                        &source_route,
+                        &desired_route,
+                        request,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            note_shard_backfill_candidate_error(&mut summary, &error);
+                            continue;
+                        }
+                    };
+                    if !plan.unrecoverable_targets.is_empty() {
+                        summary.unrecoverable += 1;
+                        continue;
+                    }
+                    if plan.is_complete() {
+                        summary.already_complete += 1;
+                        continue;
+                    }
+                    if self
+                        .record_placed_segment_shard_backfill_with_remaining_tolerance(
+                            &work_item,
+                            plan.source_remaining_tolerance(),
+                            None,
+                        )
+                        .map_err(|error| note_shard_backfill_candidate_error(&mut summary, &error))
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    summary.enqueued += 1;
+                }
+
+                if page.complete {
+                    cursor.active_pg_id = None;
+                    cursor.reference_after = None;
+                    cursor.after_pg_id = Some(route.pg_id());
+                    break;
+                }
+                if scanned_references >= reference_scan_limit {
+                    cursor.active_pg_id = Some(route.pg_id());
+                    cursor.reference_after = reference_after;
+                    summary.limit_reached = true;
+                    return Ok(summary);
+                }
             }
-            summary.enqueued += 1;
         }
 
         cursor.active_pg_id = None;
-        cursor.after = None;
+        cursor.reference_after = None;
         cursor.after_pg_id = last_scanned_pg_id;
         if routes_to_scan < routes.len() {
             summary.limit_reached = true;
@@ -16619,26 +16718,6 @@ impl StorageCluster {
                         && source.shard_index() == desired.shard_index()
                         && source.node_id() == desired.node_id()
                 }))
-    }
-
-    fn backfill_candidate_from_scavenger_reference(
-        &self,
-        reference: ShardScavengerPayloadReference,
-    ) -> Option<(SegmentStoredBytesRequest, ClusterEpoch)> {
-        match reference {
-            ShardScavengerPayloadReference::Placed(reference) => Some((
-                SegmentStoredBytesRequest {
-                    data_pg_id: reference.data_pg_id,
-                    segment_okh: reference.okh,
-                    segment_vid: reference.generation_id,
-                    stored_size: reference.stored_size as usize,
-                    segment_crc64: reference.crc64,
-                    ec: reference.ec,
-                },
-                reference.placement_cluster_epoch,
-            )),
-            ShardScavengerPayloadReference::ReclaimOnly(_) => None,
-        }
     }
 
     pub(crate) fn placed_segment_shard_backfill_source_is_referenced(

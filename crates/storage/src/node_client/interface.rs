@@ -1402,6 +1402,12 @@ pub(crate) trait ShardScavengerDataRoute: Send {
 }
 
 pub(crate) trait ShardScavengerObjectScanRoute: Send {
+    fn list_placed_segment_backfill_reference_page(
+        &self,
+        after: Option<&PlacedSegmentBackfillReferenceCursor>,
+        limit: std::num::NonZeroU16,
+    ) -> Result<PlacedSegmentBackfillReferencePage, StoreError>;
+
     fn list_shard_scavenger_payload_references(
         &self,
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError>;

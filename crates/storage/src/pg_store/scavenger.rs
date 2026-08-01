@@ -1,5 +1,7 @@
 use super::*;
 
+const PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN: usize = 54;
+
 fn shard_scavenger_observation_reason_name(
     reason: ShardScavengerObservationReason,
 ) -> &'static str {
@@ -1143,6 +1145,532 @@ impl PgStore {
         }
 
         self.list_shard_scavenger_observations()
+    }
+
+    pub(crate) fn list_placed_segment_backfill_reference_page(
+        &self,
+        after: Option<&PlacedSegmentBackfillReferenceCursor>,
+        limit: std::num::NonZeroU16,
+    ) -> Result<PlacedSegmentBackfillReferencePage, StoreError> {
+        debug_assert!(limit.get() <= PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT);
+        let limit = usize::from(
+            limit
+                .get()
+                .min(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT),
+        );
+        let mut items = Vec::with_capacity(limit);
+        let start_phase = match after {
+            None | Some(PlacedSegmentBackfillReferenceCursor::ObjectSegment { .. }) => 0,
+            Some(PlacedSegmentBackfillReferenceCursor::StreamUploadSegment { .. }) => 1,
+            Some(PlacedSegmentBackfillReferenceCursor::MultipartPartSegment { .. }) => 2,
+            Some(PlacedSegmentBackfillReferenceCursor::PendingCommand { .. }) => 3,
+        };
+
+        if start_phase == 0 {
+            let object_after = match after {
+                Some(PlacedSegmentBackfillReferenceCursor::ObjectSegment {
+                    bucket,
+                    key,
+                    version_id,
+                    segment_index,
+                }) => (bucket.as_str(), key.as_str(), *version_id, *segment_index),
+                _ => ("", "", 0, 0),
+            };
+            let remaining = limit - items.len();
+            self.extend_placed_segment_backfill_object_page(&mut items, object_after, remaining)?;
+            if items.len() == limit {
+                return Ok(PlacedSegmentBackfillReferencePage {
+                    items,
+                    complete: false,
+                });
+            }
+        }
+
+        if start_phase <= 1 {
+            let stream_after = match after {
+                Some(PlacedSegmentBackfillReferenceCursor::StreamUploadSegment {
+                    session_id,
+                    segment_index,
+                }) => (session_id.as_str(), *segment_index),
+                _ => ("", 0),
+            };
+            let remaining = limit - items.len();
+            self.extend_placed_segment_backfill_stream_page(&mut items, stream_after, remaining)?;
+            if items.len() == limit {
+                return Ok(PlacedSegmentBackfillReferencePage {
+                    items,
+                    complete: false,
+                });
+            }
+        }
+
+        if start_phase <= 2 {
+            let multipart_after = match after {
+                Some(PlacedSegmentBackfillReferenceCursor::MultipartPartSegment {
+                    bucket,
+                    key,
+                    upload_id,
+                    part_number,
+                    segment_index,
+                }) => (
+                    bucket.as_str(),
+                    key.as_str(),
+                    upload_id.as_str(),
+                    *part_number,
+                    *segment_index,
+                ),
+                _ => ("", "", "", 0, 0),
+            };
+            let remaining = limit - items.len();
+            self.extend_placed_segment_backfill_multipart_page(
+                &mut items,
+                multipart_after,
+                remaining,
+            )?;
+            if items.len() == limit {
+                return Ok(PlacedSegmentBackfillReferencePage {
+                    items,
+                    complete: false,
+                });
+            }
+        }
+
+        let remaining = limit - items.len();
+        let complete =
+            self.extend_placed_segment_backfill_pending_page(&mut items, after, remaining)?;
+        Ok(PlacedSegmentBackfillReferencePage { items, complete })
+    }
+
+    fn extend_placed_segment_backfill_object_page(
+        &self,
+        items: &mut Vec<PlacedSegmentBackfillReferencePageItem>,
+        after: (&str, &str, u64, u32),
+        limit: usize,
+    ) -> Result<(), StoreError> {
+        if limit == 0 {
+            return Ok(());
+        }
+        let version_id = i64::try_from(after.2).map_err(|_| StoreError::Db {
+            context: "list object segment backfill reference page",
+            source: crate::error::DatabaseError::new("object version cursor exceeds SQLite range"),
+        })?;
+        let mut statement = self
+            .conn
+            .prepare_cached(
+                "SELECT s.bucket, s.key, s.version_id, s.segment_index, \
+                        s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type \
+                 FROM object_segments s \
+                 JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id \
+                 WHERE (s.bucket, s.key, s.version_id, s.segment_index) > (?1, ?2, ?3, ?4) \
+                 ORDER BY s.bucket, s.key, s.version_id, s.segment_index \
+                 LIMIT ?5",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list object segment backfill reference page",
+                source: source.into(),
+            })?;
+        let sql_limit = i64::try_from(limit).expect("backfill reference page limit fits in i64");
+        let rows = statement
+            .query_map(
+                params![after.0, after.1, version_id, i64::from(after.3), sql_limit],
+                |row| {
+                    let bucket: BucketName = row.get(0)?;
+                    let key: ObjectKey = row.get(1)?;
+                    let raw_version_id = row.get::<_, i64>(2)?;
+                    let version_id = u64::try_from(raw_version_id)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, raw_version_id))?;
+                    let segment_index = row.get(3)?;
+                    Ok(PlacedSegmentBackfillReferencePageItem {
+                        cursor: PlacedSegmentBackfillReferenceCursor::ObjectSegment {
+                            bucket,
+                            key,
+                            version_id,
+                            segment_index,
+                        },
+                        reference: self.placed_segment_backfill_reference_from_row(row, 4, 12)?,
+                    })
+                },
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list object segment backfill reference page",
+                source: source.into(),
+            })?;
+        for row in rows {
+            items.push(row.map_err(|source| StoreError::Db {
+                context: "list object segment backfill reference page",
+                source: source.into(),
+            })?);
+        }
+        Ok(())
+    }
+
+    fn extend_placed_segment_backfill_stream_page(
+        &self,
+        items: &mut Vec<PlacedSegmentBackfillReferencePageItem>,
+        after: (&str, u32),
+        limit: usize,
+    ) -> Result<(), StoreError> {
+        if limit == 0 {
+            return Ok(());
+        }
+        let mut statement = self
+            .conn
+            .prepare_cached(
+                "SELECT s.session_id, s.segment_index, \
+                        s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, u.encryption_type \
+                 FROM stream_upload_segments s \
+                 JOIN stream_uploads u ON u.session_id = s.session_id \
+                 WHERE (s.session_id, s.segment_index) > (?1, ?2) \
+                 ORDER BY s.session_id, s.segment_index \
+                 LIMIT ?3",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list stream segment backfill reference page",
+                source: source.into(),
+            })?;
+        let sql_limit = i64::try_from(limit).expect("backfill reference page limit fits in i64");
+        let rows = statement
+            .query_map(params![after.0, i64::from(after.1), sql_limit], |row| {
+                Ok(PlacedSegmentBackfillReferencePageItem {
+                    cursor: PlacedSegmentBackfillReferenceCursor::StreamUploadSegment {
+                        session_id: row.get(0)?,
+                        segment_index: row.get(1)?,
+                    },
+                    reference: self.placed_segment_backfill_reference_from_row(row, 2, 10)?,
+                })
+            })
+            .map_err(|source| StoreError::Db {
+                context: "list stream segment backfill reference page",
+                source: source.into(),
+            })?;
+        for row in rows {
+            items.push(row.map_err(|source| StoreError::Db {
+                context: "list stream segment backfill reference page",
+                source: source.into(),
+            })?);
+        }
+        Ok(())
+    }
+
+    fn extend_placed_segment_backfill_multipart_page(
+        &self,
+        items: &mut Vec<PlacedSegmentBackfillReferencePageItem>,
+        after: (&str, &str, &str, u32, u32),
+        limit: usize,
+    ) -> Result<(), StoreError> {
+        if limit == 0 {
+            return Ok(());
+        }
+        let mut statement = self
+            .conn
+            .prepare_cached(
+                "SELECT s.bucket, s.key, s.upload_id, s.part_number, s.segment_index, \
+                        s.data_pg_id, s.segment_okh, s.segment_vid, s.size, s.segment_crc64, \
+                        s.placement_cluster_epoch, s.ec_k, s.ec_m, o.encryption_type \
+                 FROM multipart_part_segments s \
+                 JOIN objects o ON o.bucket = s.bucket AND o.key = s.key AND o.version_id = s.version_id \
+                 WHERE (s.bucket, s.key, s.upload_id, s.part_number, s.segment_index) \
+                       > (?1, ?2, ?3, ?4, ?5) \
+                 ORDER BY s.bucket, s.key, s.upload_id, s.part_number, s.segment_index \
+                 LIMIT ?6",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list multipart segment backfill reference page",
+                source: source.into(),
+            })?;
+        let sql_limit = i64::try_from(limit).expect("backfill reference page limit fits in i64");
+        let rows = statement
+            .query_map(
+                params![
+                    after.0,
+                    after.1,
+                    after.2,
+                    i64::from(after.3),
+                    i64::from(after.4),
+                    sql_limit
+                ],
+                |row| {
+                    Ok(PlacedSegmentBackfillReferencePageItem {
+                        cursor: PlacedSegmentBackfillReferenceCursor::MultipartPartSegment {
+                            bucket: row.get(0)?,
+                            key: row.get(1)?,
+                            upload_id: row.get(2)?,
+                            part_number: row.get(3)?,
+                            segment_index: row.get(4)?,
+                        },
+                        reference: self.placed_segment_backfill_reference_from_row(row, 5, 13)?,
+                    })
+                },
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list multipart segment backfill reference page",
+                source: source.into(),
+            })?;
+        for row in rows {
+            items.push(row.map_err(|source| StoreError::Db {
+                context: "list multipart segment backfill reference page",
+                source: source.into(),
+            })?);
+        }
+        Ok(())
+    }
+
+    fn extend_placed_segment_backfill_pending_page(
+        &self,
+        items: &mut Vec<PlacedSegmentBackfillReferencePageItem>,
+        after: Option<&PlacedSegmentBackfillReferenceCursor>,
+        limit: usize,
+    ) -> Result<bool, StoreError> {
+        if limit == 0 {
+            return Ok(false);
+        }
+        let slot = self.query_row_cached_optional(
+            "SELECT cluster_epoch, pg_id, log_index, command_checksum, \
+                    placed_segment_reference_count \
+             FROM metadata_command_pending_slot WHERE singleton = 0",
+            [],
+            "load pending command identity for placed segment backfill reference page",
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
+        let Some((cluster_epoch, pg_id, log_index, command_checksum, reference_count)) = slot
+        else {
+            return Ok(true);
+        };
+        let cluster_epoch = u64::try_from(cluster_epoch)
+            .ok()
+            .and_then(ClusterEpoch::new)
+            .ok_or_else(|| Self::invalid_pending_placed_reference_index("invalid cluster epoch"))?;
+        let pg_id = u32::try_from(pg_id)
+            .map(PgId::new)
+            .map_err(|_| Self::invalid_pending_placed_reference_index("invalid PG ID"))?;
+        if pg_id.get() != self.pg_id {
+            return Err(Self::invalid_pending_placed_reference_index(
+                "pending command belongs to another PG",
+            ));
+        }
+        let log_index = u64::try_from(log_index)
+            .map_err(|_| Self::invalid_pending_placed_reference_index("negative log index"))?;
+        let command_checksum = command_checksum as u64;
+        let total_references = u32::try_from(reference_count)
+            .map_err(|_| Self::invalid_pending_placed_reference_index("invalid reference count"))?
+            as usize;
+        let start = match after {
+            Some(PlacedSegmentBackfillReferenceCursor::PendingCommand {
+                cluster_epoch: cursor_epoch,
+                pg_id: cursor_pg_id,
+                log_index: cursor_log_index,
+                command_checksum: cursor_checksum,
+                reference_index,
+            }) if *cursor_epoch == cluster_epoch
+                && *cursor_pg_id == pg_id
+                && *cursor_log_index == log_index
+                && *cursor_checksum == command_checksum =>
+            {
+                *reference_index as usize + 1
+            }
+            _ => 0,
+        };
+        if start >= total_references {
+            return Ok(true);
+        }
+
+        let references_per_page = usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT);
+        let first_page = start / references_per_page;
+        let mut statement = self
+            .conn
+            .prepare_cached(
+                "SELECT page_index, reference_count, encoded_references \
+                 FROM metadata_command_pending_placed_reference_pages \
+                 WHERE singleton = 0 AND page_index >= ?1 \
+                 ORDER BY page_index LIMIT 2",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "list pending command placed segment backfill reference pages",
+                source: source.into(),
+            })?;
+        let rows = statement
+            .query_map(params![first_page as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|source| StoreError::Db {
+                context: "list pending command placed segment backfill reference pages",
+                source: source.into(),
+            })?;
+        let mut next_reference = start;
+        for row in rows {
+            let (page_index, page_reference_count, encoded_page) =
+                row.map_err(|source| StoreError::Db {
+                    context: "read pending command placed segment backfill reference page",
+                    source: source.into(),
+                })?;
+            let page_index = usize::try_from(page_index)
+                .map_err(|_| Self::invalid_pending_placed_reference_index("negative page index"))?;
+            let expected_page_index = next_reference / references_per_page;
+            if page_index != expected_page_index {
+                return Err(Self::invalid_pending_placed_reference_index(
+                    "non-contiguous page index",
+                ));
+            }
+            let page_reference_count = usize::try_from(page_reference_count).map_err(|_| {
+                Self::invalid_pending_placed_reference_index("negative page reference count")
+            })?;
+            let page_start = page_index * references_per_page;
+            let expected_page_count = (total_references - page_start).min(references_per_page);
+            if page_reference_count != expected_page_count
+                || encoded_page.len()
+                    != page_reference_count * PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN
+            {
+                return Err(Self::invalid_pending_placed_reference_index(
+                    "malformed fixed-width page",
+                ));
+            }
+            let skip = next_reference - page_start;
+            for encoded in encoded_page
+                .chunks_exact(PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN)
+                .skip(skip)
+                .take(limit - (next_reference - start))
+            {
+                let reference_index = next_reference;
+                items.push(PlacedSegmentBackfillReferencePageItem {
+                    cursor: PlacedSegmentBackfillReferenceCursor::PendingCommand {
+                        cluster_epoch,
+                        pg_id,
+                        log_index,
+                        command_checksum,
+                        reference_index: u32::try_from(reference_index)
+                            .expect("metadata command reference count must fit in u32"),
+                    },
+                    reference: Self::decode_pending_placed_reference(encoded)?,
+                });
+                next_reference += 1;
+            }
+            if next_reference - start == limit || next_reference == total_references {
+                break;
+            }
+        }
+        if next_reference == start {
+            return Err(Self::invalid_pending_placed_reference_index(
+                "missing encoded reference page",
+            ));
+        }
+        Ok(next_reference >= total_references)
+    }
+
+    pub(super) fn encode_pending_placed_segment_reference_pages(
+        &self,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(u32, Vec<Vec<u8>>), StoreError> {
+        let mut references = Vec::new();
+        self.extend_scavenger_command_payload_references(&mut references, command.payload())?;
+        let references_per_page = usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT);
+        let mut reference_count = 0u32;
+        let mut pages: Vec<Vec<u8>> = Vec::new();
+        for reference in references {
+            let ShardScavengerPayloadReference::Placed(reference) = reference else {
+                continue;
+            };
+            if (reference_count as usize).is_multiple_of(references_per_page) {
+                pages.push(Vec::with_capacity(
+                    references_per_page * PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN,
+                ));
+            }
+            let encoded = pages.last_mut().expect("placed reference page exists");
+            encoded.extend_from_slice(&reference.data_pg_id.to_be_bytes());
+            encoded.extend_from_slice(&reference.okh);
+            encoded.extend_from_slice(&reference.generation_id.get().to_be_bytes());
+            encoded.extend_from_slice(&reference.placement_cluster_epoch.get().to_be_bytes());
+            encoded.extend_from_slice(&reference.stored_size.to_be_bytes());
+            encoded.extend_from_slice(&reference.crc64.to_be_bytes());
+            encoded.push(reference.ec.k);
+            encoded.push(reference.ec.m);
+            reference_count = reference_count.checked_add(1).ok_or_else(|| {
+                Self::invalid_pending_placed_reference_index("reference count overflow")
+            })?;
+        }
+        Ok((reference_count, pages))
+    }
+
+    fn decode_pending_placed_reference(
+        encoded: &[u8],
+    ) -> Result<ShardScavengerPlacedShardSetReference, StoreError> {
+        debug_assert_eq!(encoded.len(), PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN);
+        let data_pg_id = u32::from_be_bytes(encoded[0..4].try_into().unwrap());
+        let okh = encoded[4..20].try_into().unwrap();
+        let generation_id = GenerationId::new(u64::from_be_bytes(
+            encoded[20..28].try_into().unwrap(),
+        ))
+        .ok_or_else(|| Self::invalid_pending_placed_reference_index("zero generation id"))?;
+        let placement_cluster_epoch = ClusterEpoch::new(u64::from_be_bytes(
+            encoded[28..36].try_into().unwrap(),
+        ))
+        .ok_or_else(|| Self::invalid_pending_placed_reference_index("zero placement epoch"))?;
+        let stored_size = u64::from_be_bytes(encoded[36..44].try_into().unwrap());
+        let crc64 = u64::from_be_bytes(encoded[44..52].try_into().unwrap());
+        Ok(ShardScavengerPlacedShardSetReference {
+            data_pg_id,
+            okh,
+            generation_id,
+            placement_cluster_epoch,
+            stored_size,
+            crc64,
+            ec: EcShape {
+                k: encoded[52],
+                m: encoded[53],
+            },
+        })
+    }
+
+    fn invalid_pending_placed_reference_index(reason: &str) -> StoreError {
+        StoreError::ShardScavengerScanIncomplete {
+            context: "decode pending command placed segment reference index",
+            errors: reason.to_owned(),
+        }
+    }
+
+    fn placed_segment_backfill_reference_from_row(
+        &self,
+        row: &rusqlite::Row<'_>,
+        reference_start: usize,
+        encryption_type_index: usize,
+    ) -> rusqlite::Result<ShardScavengerPlacedShardSetReference> {
+        let okh_blob: Vec<u8> = row.get(reference_start + 1)?;
+        Ok(ShardScavengerPlacedShardSetReference {
+            data_pg_id: row.get(reference_start)?,
+            okh: Self::parse_okh_blob(&okh_blob, reference_start + 1)?,
+            generation_id: Self::parse_generation_id(
+                row.get(reference_start + 2)?,
+                reference_start + 2,
+                "backfill reference generation",
+            )?,
+            stored_size: Self::stored_segment_size_for_encryption_type(
+                row.get::<_, i64>(reference_start + 3)? as u64,
+                row.get(encryption_type_index)?,
+            )?,
+            crc64: row.get::<_, i64>(reference_start + 4)? as u64,
+            placement_cluster_epoch: Self::parse_cluster_epoch(
+                row.get(reference_start + 5)?,
+                reference_start + 5,
+                "placement_cluster_epoch",
+            )?,
+            ec: EcShape {
+                k: row.get(reference_start + 6)?,
+                m: row.get(reference_start + 7)?,
+            },
+        })
     }
 
     pub(crate) fn list_shard_scavenger_payload_references(
@@ -2742,6 +3270,33 @@ mod tests {
             .unwrap();
 
         let references = store.list_shard_scavenger_payload_references().unwrap();
+        let mut page_after = None;
+        let mut paged_placed = Vec::new();
+        loop {
+            let page = store
+                .list_placed_segment_backfill_reference_page(
+                    page_after.as_ref(),
+                    std::num::NonZeroU16::new(1).unwrap(),
+                )
+                .unwrap();
+            if let Some(item) = page.items.into_iter().next() {
+                page_after = Some(item.cursor);
+                paged_placed.push(item.reference);
+            }
+            if page.complete {
+                break;
+            }
+        }
+        assert_eq!(paged_placed.len(), 2);
+        assert!(paged_placed
+            .iter()
+            .any(|reference| reference.okh == [0x44; 16]));
+        assert!(paged_placed
+            .iter()
+            .any(|reference| reference.okh == [0x11; 16]));
+        assert!(paged_placed
+            .iter()
+            .all(|reference| reference.okh != [0x33; 16]));
         let object_segment = references
             .iter()
             .find_map(|reference| match reference {
@@ -2798,6 +3353,174 @@ mod tests {
         assert_eq!(reclaim.data_pg_id, 7);
         assert_eq!(reclaim.generation_id, GenerationId::new(44).unwrap());
         assert_eq!(reclaim.ec, EcShape { k: 4, m: 2 });
+    }
+
+    #[test]
+    fn pending_command_backfill_reference_pages_are_bounded_and_restart_after_replacement() {
+        const REFERENCE_COUNT: usize = 512;
+
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 7).unwrap();
+        let bucket = trusted_bucket_name("pending-backfill-page");
+        let key = trusted_object_key("large-object");
+        let segments = (0..REFERENCE_COUNT)
+            .map(|index| {
+                let mut okh = [0u8; 16];
+                okh[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                ObjectSegmentRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    segment_index: index as u32,
+                    size: 1024 + index as u64,
+                    segment_crc64: index as u64,
+                    segment_okh: okh,
+                    segment_vid: GenerationId::new(index as u64 + 1).unwrap(),
+                    data_pg_id: 7,
+                    placement_cluster_epoch: ClusterEpoch::INITIAL,
+                    ec_k: 4,
+                    ec_m: 2,
+                }
+            })
+            .collect();
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(7),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+                object: PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    owner: OwnerIdentity::from_principal("owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::MIN,
+                    size: 0,
+                    etag: ObjectEtag::single_part(0),
+                    ec: EcShape { k: 4, m: 2 },
+                    layout: ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: Some(SerializedMetadataBlob::default()),
+                    system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+                    object_lock: ObjectLockState::default(),
+                    encryption: ObjectEncryption::None,
+                },
+                segments,
+                generation_reservation_id: SessionId::try_from("12".repeat(16)).unwrap(),
+                write_sequence: 1,
+                last_modified_millis: 1,
+                stale_payload: None,
+                bucket_write_reservation: BucketWriteReservationProof {
+                    bucket: bucket.clone(),
+                    reservation_id: "pending-page-proof".to_owned(),
+                    owner_token: "pending-page-owner".to_owned(),
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    bucket_execution_generation: 1,
+                    bucket_incarnation_generation: 1,
+                    operation_kind: "direct-put-commit".to_owned(),
+                    created_at: 1,
+                    lease_deadline: 2,
+                    target_context: Some(key.as_str().to_owned()),
+                },
+            })),
+        );
+        store
+            .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
+            .unwrap();
+        let (indexed_references, indexed_pages, largest_page_bytes): (i64, i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT placed_segment_reference_count, \
+                        (SELECT count(*) \
+                         FROM metadata_command_pending_placed_reference_pages), \
+                        (SELECT max(length(encoded_references)) \
+                         FROM metadata_command_pending_placed_reference_pages) \
+                 FROM metadata_command_pending_slot WHERE singleton = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(indexed_references as usize, REFERENCE_COUNT);
+        assert_eq!(indexed_pages, 8);
+        assert_eq!(
+            largest_page_bytes as usize,
+            usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT)
+                * PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN
+        );
+
+        // The candidate path must consume only the fixed-width sidecar page.
+        // Corrupting the large command proves it is neither decoded nor
+        // canonically re-encoded for each page.
+        store
+            .test_set_pending_metadata_command_bytes(b"not a metadata command")
+            .unwrap();
+        let mut cursor = None;
+        let mut first_page_cursor = None;
+        let mut seen = 0usize;
+        loop {
+            let page = store
+                .list_placed_segment_backfill_reference_page(
+                    cursor.as_ref(),
+                    std::num::NonZeroU16::new(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT)
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(page.items.len() <= usize::from(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT));
+            if first_page_cursor.is_none() {
+                first_page_cursor = page.items.last().map(|item| item.cursor.clone());
+            }
+            seen += page.items.len();
+            cursor = page.items.last().map(|item| item.cursor.clone());
+            if page.complete {
+                break;
+            }
+        }
+        assert_eq!(seen, REFERENCE_COUNT);
+        assert!(matches!(
+            first_page_cursor.as_ref(),
+            Some(PlacedSegmentBackfillReferenceCursor::PendingCommand {
+                log_index: 1,
+                reference_index: 63,
+                ..
+            })
+        ));
+
+        let mut replacement_payload = command.payload().clone();
+        let MetadataCommandPayload::CommitDirectPutObject(replacement) = &mut replacement_payload
+        else {
+            unreachable!("test command is a direct PUT");
+        };
+        replacement.segments.truncate(2);
+        let replacement = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(7),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            replacement_payload,
+        );
+        store
+            .test_replace_pending_metadata_command_slot(&replacement, Some(&bucket))
+            .unwrap();
+        let restarted = store
+            .list_placed_segment_backfill_reference_page(
+                first_page_cursor.as_ref(),
+                std::num::NonZeroU16::new(PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT).unwrap(),
+            )
+            .unwrap();
+        assert!(restarted.complete);
+        assert_eq!(restarted.items.len(), 2);
+        assert!(matches!(
+            restarted.items[0].cursor,
+            PlacedSegmentBackfillReferenceCursor::PendingCommand {
+                log_index: 2,
+                reference_index: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
